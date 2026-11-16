@@ -3,8 +3,8 @@
 //! decisions 16 to 18 and "SQLite rules" in docs/design/server.md.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -162,25 +162,38 @@ impl Drop for Writer {
     }
 }
 
-/// The read side of a database: connections that cannot write.
-///
-/// It is one connection for now. How many a server needs is measured on a
-/// real library in M1 (docs/design/server.md, "Deferred").
+/// How many read connections a database has: enough that a slow read, such
+/// as a window of a large list, does not hold up the covers being found
+/// beside it. Measured on M1's walls (docs/design/server.md, "Deferred").
+const READERS: usize = 4;
+
+/// The read side of a database: a few connections that cannot write. With
+/// a write-ahead log, reads on them run at once and beside the writer.
 #[derive(Debug)]
 pub(crate) struct Reader {
-    connection: Mutex<Connection>,
+    /// The connection a read waits for when every one is in use.
+    first: Mutex<Connection>,
+    others: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
 }
 
 impl Reader {
     /// Opens the read side. The writer must have opened the database first.
     pub(crate) fn open(location: &Location) -> Result<Self, Error> {
-        let connection = location.open(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let open = || {
+            location
+                .open(OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map(Mutex::new)
+        };
         Ok(Self {
-            connection: Mutex::new(connection),
+            first: open()?,
+            others: (1..READERS).map(|_| open()).collect::<Result<_, _>>()?,
+            next: AtomicUsize::new(0),
         })
     }
 
-    /// Runs a short read.
+    /// Runs a short read, on a connection no other read is using if there
+    /// is one, and otherwise waits for one.
     pub(crate) fn call<T>(
         &self,
         work: impl FnOnce(&Connection) -> Result<T, Error>,
@@ -189,10 +202,25 @@ impl Reader {
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
-        // A read that panicked has left the connection as good as it was.
-        self.connection
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        // Each read starts looking at the next connection, so that reads
+        // spread over them.
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let all: Vec<&Mutex<Connection>> =
+            std::iter::once(&self.first).chain(&self.others).collect();
+        for offset in 0..all.len() {
+            let Some(connection) = all.get((start + offset) % all.len()) else {
+                continue;
+            };
+            match connection.try_lock() {
+                Ok(guard) => return guard,
+                // A read that panicked has left the connection as good as
+                // it was.
+                Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
+        // Every one is in use: wait for the first.
+        self.first.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -289,6 +317,39 @@ mod tests {
                 "{refused:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_slow_read_does_not_hold_up_another() {
+        let location = Location::memory();
+        let writer = Writer::start(&location, "test writer").unwrap();
+        writer
+            .call(|connection| Ok(connection.execute_batch("CREATE TABLE note (body)")?))
+            .unwrap();
+        let reader = Reader::open(&location).unwrap();
+        let (holding, held) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let reader = &reader;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                reader
+                    .call(|_| {
+                        holding.send(()).unwrap();
+                        released.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            held.recv().unwrap();
+            // Another read goes ahead while the first is still reading.
+            let count: i64 = reader
+                .call(|connection| {
+                    Ok(connection.query_row("SELECT count(*) FROM note", [], |row| row.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(count, 0);
+            release.send(()).unwrap();
+        });
     }
 
     #[test]

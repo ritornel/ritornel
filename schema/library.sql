@@ -5,6 +5,7 @@
 -- Migrations, each with the SHA-256 recorded when it is applied. A checksum
 -- that changes here means a migration that has shipped was edited.
 --   0001_library  5a72aa0a6f7da030ece148d3b4669da867ca722f4c659f5600b47fd648100b45
+--   0002_list_indexes  1789bf26cc0c33c9bb95b6c24293e838237ffe0695bdcc7a1818c0b79212d0cb
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -732,3 +733,15 @@ SELECT
   id   AS play_event_id
 FROM play_event
 WHERE counts = 1 AND excluded = 0 AND event_at_utc_ms IS NOT NULL;
+
+CREATE INDEX track_appearance_release ON track_appearance (release_id);
+
+CREATE INDEX release_release_group ON release (release_group_id);
+
+CREATE INDEX release_display_artist_credit ON release (display_artist_credit_id);
+
+CREATE INDEX assignment_current_appearance
+  ON assignment (appearance_id)
+  WHERE superseded_at_ms IS NULL;
+
+CREATE INDEX revision_picture_picture ON revision_picture (picture_id);

@@ -55,6 +55,43 @@ pub fn core(text: &str) -> String {
     }
 }
 
+/// A key with its accents taken off: each Latin letter decomposed and its
+/// marks dropped, and the few Latin letters that have no decomposition
+/// written as the letters they are read as. Marks on letters of other
+/// scripts stay, because there they make a different letter: `й` is not
+/// `и`, and `が` is not `か`. It is a switch of the resolver's policy,
+/// applied to candidate text only, and never to a stored name.
+pub fn fold_accents(key: &str) -> String {
+    let latin = |c: char| {
+        c.is_ascii_alphabetic()
+            || ('\u{00c0}'..='\u{024f}').contains(&c)
+            || ('\u{1e00}'..='\u{1eff}').contains(&c)
+    };
+    let mut folded = String::with_capacity(key.len());
+    let mut after_latin = false;
+    for c in key.nfd() {
+        if unicode_normalization::char::is_combining_mark(c) {
+            if !after_latin {
+                folded.push(c);
+            }
+            continue;
+        }
+        after_latin = latin(c);
+        match c {
+            'ø' => folded.push('o'),
+            'ł' => folded.push('l'),
+            'đ' | 'ð' => folded.push('d'),
+            'ı' => folded.push('i'),
+            'æ' => folded.push_str("ae"),
+            'œ' => folded.push_str("oe"),
+            'ß' => folded.push_str("ss"),
+            'þ' => folded.push_str("th"),
+            _ => folded.push(c),
+        }
+    }
+    folded.nfc().collect()
+}
+
 /// How far apart two keys are, from 0 (the same) to 1 (nothing in common):
 /// the edit distance over the length of the longer.
 pub fn difference(a: &str, b: &str) -> f64 {
@@ -112,6 +149,17 @@ mod tests {
         assert_eq!(core("Lantern [Live] (Radio Edit)"), "lantern");
         assert_eq!(core("(Untitled)"), "untitled");
         assert_eq!(core("Lantern"), "lantern");
+    }
+
+    #[test]
+    fn folding_takes_accents_off_a_key_and_leaves_the_rest() {
+        assert_eq!(fold_accents(&normalize("Été à Noël")), "ete a noel");
+        assert_eq!(fold_accents("søren łódź straße"), "soren lodz strasse");
+        assert_eq!(fold_accents("ünïcödé"), "unicode");
+        assert_eq!(fold_accents("plain 42"), "plain 42");
+        // Letters of other scripts keep what is not a mark.
+        assert_eq!(fold_accents("東京"), "東京");
+        assert_eq!(fold_accents("がй"), "がй");
     }
 
     #[test]

@@ -49,6 +49,11 @@ $FF -i a.flac -map 0:a -c copy -map_metadata -1 "${OTHER[@]}" a.retagged.flac
 # An ID3v1 tag after the last frame, which the demuxer would read as audio.
 { cat a.flac; printf 'TAG%-125s' 'Paper Kites'; } > a.id3v1.flac
 $FF -i "$tmp/b.wav" -c:a flac "${PLAIN[@]}" b.flac
+# The same song as b.flac by its tags, on a compilation: another album.
+$FF -i b.flac -map 0:a -c copy -map_metadata -1 -metadata "title=Paper Kites" \
+    -metadata "artist=Moss Arcade" -metadata "album=Night Drives" \
+    -metadata "album_artist=Various Artists" -metadata "compilation=1" -metadata "track=7" \
+    b.compilation.flac
 
 # MP3: ID3v2.4, with Picard's user-defined frames.
 $FF -i "$tmp/a.wav" -c:a libmp3lame -b:a 32k -id3v2_version 4 "${PLAIN[@]}" \
@@ -62,6 +67,20 @@ $FF -i "$tmp/a.wav" -c:a aac -b:a 32k "${PLAIN[@]}" -metadata "album_artist=Moss
     -metadata "disc=1/2" -metadata "compilation=1" a.m4a
 $FF -i a.m4a -c copy -map_metadata -1 -movflags +faststart "${OTHER[@]}" a.retagged.m4a
 $FF -i "$tmp/a.wav" -c:a alac "${PLAIN[@]}" a.alac.m4a
+# Picard's identifiers in an M4A, as iTunes freeform atoms. ffmpeg cannot
+# write those, so freeform.py adds them to a copy of a.m4a, audio untouched.
+python3 freeform.py a.m4a a.musicbrainz.m4a \
+    "MusicBrainz Track Id=11111111-2222-4333-8444-555555555555" \
+    "MusicBrainz Release Track Id=33333333-4444-4555-8666-777777777777" \
+    "MusicBrainz Album Id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" \
+    "MusicBrainz Release Group Id=99999999-8888-4777-8666-555555555555" \
+    "MusicBrainz Artist Id=12121212-3434-4565-8787-909090909090" \
+    "MusicBrainz Album Artist Id=12121212-3434-4565-8787-909090909090" \
+    "MusicBrainz Album Type=album" \
+    "ARTISTS=Moss Arcade" \
+    "ORIGINALDATE=2004-10-11" \
+    "ISRC=XXA000000001" \
+    "Acoustid Id=56565656-7878-4909-8121-343434343434"
 
 # A file with no audio packets: an MP4 cut where its audio data begins.
 $FF -i "$tmp/b.wav" -c:a aac -b:a 32k -movflags +faststart "${PLAIN[@]}" "$tmp/whole.m4a"

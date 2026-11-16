@@ -18,6 +18,7 @@ export const ROUTES = {
   ticket: "/v1/ticket",
   descriptor: "/v1/descriptor",
   health: "/v1/health",
+  art: "/v1/art",
 } as const;
 
 /**
@@ -29,6 +30,9 @@ export const TICKET_PARAM = "ticket";
 /** The capability flags a server may list in its descriptor. */
 export const CAPABILITIES = {
   eventsServers: "events.servers",
+  eventsLibrary: "events.library",
+  lists: "lists",
+  mediaArt: "media.art",
 } as const;
 
 /** The method of every event notification. */
@@ -36,6 +40,21 @@ export const EVENT_METHOD = "event";
 
 /** The longest a client's name or version may be, in characters. */
 export const MAX_CLIENT_TEXT = 100;
+
+/**
+ * The name of the query parameter that carries a media token on a media
+ * route.
+ */
+export const MEDIA_TOKEN_PARAM = "token";
+
+/**
+ * The sizes a cover is served at, in pixels on its longer side. The
+ * descriptor lists the ones a server serves.
+ */
+export const ART_SIZES = [64, 96, 128, 192, 256, 384, 512, 768, 1024] as const;
+
+/** The version of the filter language a filter is written in. */
+export const FILTER_VERSION = 1;
 
 /**
  * Every method, in the order of the contract's call list: what kind of call
@@ -55,10 +74,18 @@ export const METHODS = {
   "jobs.get": { kind: "query", needsFull: true },
   "jobs.cancel": { kind: "command", needsFull: true },
   "library.stats": { kind: "query", needsFull: false },
+  "identity.dryRun": { kind: "query", needsFull: true },
+  "identity.review": { kind: "query", needsFull: true },
+  "list.open": { kind: "session", needsFull: false },
+  "list.window": { kind: "query", needsFull: false },
+  "list.sections": { kind: "query", needsFull: false },
+  "list.locate": { kind: "query", needsFull: false },
+  "list.close": { kind: "session", needsFull: false },
+  "media.token": { kind: "session", needsFull: false },
 } as const;
 
 /** Every topic a client can subscribe to. */
-export const TOPICS = ["servers", "jobs", "library"] as const;
+export const TOPICS = ["servers", "jobs", "library", "list"] as const;
 
 /** The params and the result of each method. */
 export type MethodMap = {
@@ -75,6 +102,14 @@ export type MethodMap = {
   "jobs.get": { params: JobGetParams; result: JobDetail };
   "jobs.cancel": { params: JobCancelParams; result: JobCancelled };
   "library.stats": { params: NoParams; result: LibraryStats };
+  "identity.dryRun": { params: DryRunParams; result: DryRun };
+  "identity.review": { params: NoParams; result: ReviewList };
+  "list.open": { params: ListOpenParams; result: ListOpened };
+  "list.window": { params: ListWindowParams; result: ListWindow };
+  "list.sections": { params: ViewParams; result: ListSections };
+  "list.locate": { params: ListLocateParams; result: ListLocated };
+  "list.close": { params: ViewParams; result: ListClosed };
+  "media.token": { params: NoParams; result: MediaToken };
 };
 
 /** The name of a method. */
@@ -88,6 +123,7 @@ export type EventMap = {
   "servers": Extract<Event, { topic: "servers" }>;
   "jobs": Extract<Event, { topic: "jobs" }>;
   "library": Extract<Event, { topic: "library" }>;
+  "list": Extract<Event, { topic: "list" }>;
 };
 
 /**
@@ -123,10 +159,149 @@ export type EventFrame = { jsonrpc: "2.0"; method: typeof EVENT_METHOD; params: 
 export type ServerFrame = ResponseFrame | EventFrame;
 
 /**
+ * What an Albums tile points at.
+ */
+export type AlbumRef = { "type": "release_group",
+  /**
+   * The release group.
+   */
+  id: string, } | { "type": "release",
+  /**
+   * The release.
+   */
+  id: string,
+};
+
+/**
+ * One tile of the Albums list.
+ */
+export type AlbumTile = {
+  /**
+   * What the tile is.
+   */
+  ref: AlbumRef,
+  /**
+   * The title of the release it shows. `null` until the library has one.
+   */
+  title: string | null,
+  /**
+   * Who it is by.
+   */
+  artistCredit: Credit | null,
+  /**
+   * The year it first came out, for a group shown as one tile, or the
+   * release's own year.
+   */
+  year: number | null,
+  /**
+   * How many tracks the release it shows has.
+   */
+  trackCount: number,
+  /**
+   * How long they are together.
+   */
+  durationMs: number,
+  /**
+   * How many versions its group has. 1 for a record with one.
+   */
+  versionCount: number,
+  /**
+   * Its cover, for `GET /v1/art/{artId}/{size}`. `null` when it has none.
+   */
+  artId: string | null,
+  /**
+   * The best copy across its tracks. `null` when none of its tracks has
+   * a copy the library has read.
+   */
+  quality: Quality | null,
+};
+
+/**
+ * One artist.
+ */
+export type ArtistRow = {
+  /**
+   * The artist.
+   */
+  artistId: string,
+  /**
+   * Their name, as displayed. `null` until the library has one.
+   */
+  name: string | null,
+  /**
+   * The name they are filed under, where it differs from how it is
+   * written, such as "Beatles, The".
+   */
+  sortName: string | null,
+  /**
+   * How many records name them in their credit, counted as the Albums
+   * list shows them.
+   */
+  albumCount: number,
+  /**
+   * How many songs on those records there are, and loose songs of
+   * theirs.
+   */
+  trackCount: number,
+  /**
+   * A picture to draw them with until there are photographs: the cover
+   * of their earliest record that has one. `null` when none has.
+   */
+  artId: string | null,
+};
+
+/**
+ * One side of a dry run's comparison: what an item is bound to, and how
+ * that was decided.
+ */
+export type Binding = {
+  /**
+   * The recording, after redirects. Left out for one the run would
+   * create.
+   */
+  recordingId?: string,
+  /**
+   * How it was decided: `user`, `same_audio`, `identifier`,
+   * `tags_duration` or `new`. Left out where nothing was decided.
+   */
+  method?: string,
+  /**
+   * The distance it was decided at: 0 for an exact method.
+   */
+  score?: number,
+  /**
+   * Whether it is marked for review.
+   */
+  needsReview: boolean,
+  /**
+   * The release it is on. Left out for a loose track, and for one the
+   * run would create.
+   */
+  releaseId?: string,
+  /**
+   * That release's title.
+   */
+  releaseTitle?: string,
+  /**
+   * The disc it is on there.
+   */
+  disc?: number,
+  /**
+   * The candidate it was nearest to, for a decision by tags.
+   */
+  nearest?: Nearest,
+};
+
+/**
  * What sort of program a client is. It is for logs and for display, and
  * never decides access: the session does.
  */
 export type ClientKind = "desktop" | "browser" | "phone" | "cli" | "agent";
+
+/**
+ * Which copy of a track a copy is.
+ */
+export type CopyRole = "master" | "derived";
 
 /**
  * One named count.
@@ -140,6 +315,20 @@ export type Count = {
    * How many.
    */
   count: number,
+};
+
+/**
+ * An artist credit as it is written, and the artists it names.
+ */
+export type Credit = {
+  /**
+   * The whole credit as one string, such as "Simon & Garfunkel".
+   */
+  text: string,
+  /**
+   * The artists it names, in order.
+   */
+  artistIds: Array<string>,
 };
 
 /**
@@ -178,6 +367,123 @@ export type Descriptor = {
    * The limits a client must stay within.
    */
   limits: Limits,
+  /**
+   * What each kind of list supports: its orders and the predicates a
+   * filter on it may use. Empty from a server that has no lists.
+   */
+  lists: Array<ListSupport>,
+  /**
+   * The sizes a cover is served at, in pixels on its longer side: what
+   * `{size}` in `GET /v1/art/{artId}/{size}` may be. Empty from a server
+   * that serves no covers.
+   */
+  artSizes: Array<number>,
+};
+
+/**
+ * The result of `identity.dryRun`: the resolver run again over the stored
+ * revisions, compared with the assignments in force. Nothing is written.
+ */
+export type DryRun = {
+  /**
+   * The policy it decided by.
+   */
+  policy: PolicyValues,
+  /**
+   * The library revision it read.
+   */
+  libraryRevision: number,
+  /**
+   * Whether the claims it read were made by another version of the
+   * extractor, which the next scan rebuilds before it resolves.
+   */
+  claimsStale: boolean,
+  /**
+   * Whether applying the result would write anything at all, what the
+   * catalog shows included.
+   */
+  wouldWrite: boolean,
+  /**
+   * Files the library has, retired ones included.
+   */
+  items: number,
+  /**
+   * Of them, those whose result is the assignment they have. A file
+   * that cannot be read, or is retired, is one.
+   */
+  unchanged: number,
+  /**
+   * Those whose result differs.
+   */
+  wouldChange: number,
+  /**
+   * Of those, the ones bound to another recording. The rest keep their
+   * recording and move on a release.
+   */
+  recordingsChanged: number,
+  /**
+   * Those the owner's own assignment holds.
+   */
+  pinned: number,
+  /**
+   * Those an owner's exclusion kept from a candidate.
+   */
+  blocked: number,
+  /**
+   * Recordings that would be joined to another: for each recording of
+   * the result, the recordings its files have now, less one.
+   */
+  merges: number,
+  /**
+   * Recordings that would be parted: for each recording files have now,
+   * the recordings of the result they would have, less one.
+   */
+  splits: number,
+  /**
+   * Files whose binding in force is marked for review.
+   */
+  reviewsNow: number,
+  /**
+   * Files the run's decisions mark for review.
+   */
+  reviewsAfter: number,
+  /**
+   * Files marked now and not by the run.
+   */
+  reviewsCleared: number,
+  /**
+   * Files marked by the run and not now.
+   */
+  reviewsAdded: number,
+  /**
+   * Releases with a file on them now.
+   */
+  releasesNow: number,
+  /**
+   * Releases the run's files would be on.
+   */
+  releasesAfter: number,
+  /**
+   * With `detail`, every item that is not unchanged, in first-seen
+   * order.
+   */
+  changes: Array<ItemChange>,
+};
+
+/**
+ * The params of `identity.dryRun`.
+ */
+export type DryRunParams = {
+  /**
+   * What to decide by: the policy scans use, unless it names another
+   * or puts values in place of its own.
+   */
+  policy: PolicyOverrides,
+  /**
+   * Whether to list every item that is not unchanged. Without it the
+   * answer is counts alone.
+   */
+  detail: boolean,
 };
 
 /**
@@ -208,7 +514,87 @@ export type ErrorData = {
 /**
  * The params of an event notification: the topic, and what it carries.
  */
-export type Event = { "topic": "servers" } & ServersEvent | { "topic": "jobs" } & JobsEvent | { "topic": "library" } & LibraryEvent;
+export type Event = { "topic": "servers" } & ServersEvent | { "topic": "jobs" } & JobsEvent | { "topic": "library" } & LibraryEvent | { "topic": "list" } & ListEvent;
+
+/**
+ * A file as the owner judges it: where it is and what its tags say.
+ */
+export type FileFacts = {
+  /**
+   * The source item's ID.
+   */
+  itemId: string,
+  /**
+   * The file's path under its root.
+   */
+  path: string,
+  /**
+   * The title its tags give, or its file name gives.
+   */
+  title?: string,
+  /**
+   * The artist its tags give.
+   */
+  artist?: string,
+  /**
+   * The album its tags give.
+   */
+  album?: string,
+  /**
+   * The disc number its tags give.
+   */
+  disc?: number,
+  /**
+   * The track number its tags give.
+   */
+  track?: number,
+  /**
+   * Its length in milliseconds, from the audio read.
+   */
+  durationMs?: number,
+};
+
+/**
+ * A filter: the versioned query tree of decision 10 in
+ * docs/design/contract.md. Version 1 has one predicate.
+ */
+export type Filter = {
+  /**
+   * The version of the filter language it is written in. A server
+   * refuses a version it does not read with `unsupported`.
+   */
+  version: number,
+  /**
+   * What a row must satisfy.
+   */
+  where: Predicate,
+};
+
+/**
+ * A format, as a copy of a track has it.
+ */
+export type Format = {
+  /**
+   * The codec, such as `flac` or `mp3`.
+   */
+  codec: string,
+  /**
+   * Whether it is lossless.
+   */
+  lossless: boolean,
+  /**
+   * Bits a sample, for a format that has them.
+   */
+  bitDepth: number | null,
+  /**
+   * Samples a second.
+   */
+  sampleRateHz: number,
+  /**
+   * The bit rate, for a lossy format.
+   */
+  bitrateKbps: number | null,
+};
 
 /**
  * Free disk space, in bytes.
@@ -219,6 +605,16 @@ export type FreeDisk = {
    * directory. It is left out when the system would not say.
    */
   dataBytes?: number,
+};
+
+/**
+ * A row the library no longer has.
+ */
+export type GoneRow = {
+  /**
+   * Always `true`.
+   */
+  gone: boolean,
 };
 
 /**
@@ -260,6 +656,33 @@ export type HelloParams = {
    */
   contractVersion: number,
 };
+
+/**
+ * One item that the dry run does not find unchanged.
+ */
+export type ItemChange = {
+  /**
+   * What the run says of it.
+   */
+  outcome: ItemOutcome,
+  /**
+   * The file.
+   */
+  file: FileFacts,
+  /**
+   * What it is bound to now.
+   */
+  now?: Binding,
+  /**
+   * What the run would bind it to.
+   */
+  after?: Binding,
+};
+
+/**
+ * What the dry run says of one item.
+ */
+export type ItemOutcome = "unchanged" | "would_change" | "pinned" | "blocked";
 
 /**
  * One job: a durable resource, readable after clients disconnect and
@@ -442,7 +865,8 @@ export type JobsList = {
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
 /**
- * What about the library changed.
+ * What kind of change a library write made, for a client deciding what to
+ * read again.
  */
 export type LibraryChange = "membership" | "metadata" | "stats";
 
@@ -481,16 +905,18 @@ export type LibraryCreated = {
 };
 
 /**
- * What an event on the `library` topic carries: a bare hint to read
- * again whatever is on screen and older than the revision.
+ * What an event on the `library` topic carries. Events that were not yet
+ * sent are merged: the highest revision, and every kind of change either
+ * had.
  */
 export type LibraryEvent = {
   /**
-   * The library revision after the change.
+   * The library revision after the change. A client that has read
+   * something at this revision or a later one may keep it.
    */
   libraryRevision: number,
   /**
-   * What changed.
+   * What kind of change it was, in order and each once.
    */
   changed: Array<LibraryChange>,
 };
@@ -624,6 +1050,250 @@ export type Limits = {
    * that sends a larger one.
    */
   maxMessageBytes: number,
+  /**
+   * How many views a session may hold. Opening one more ends the one
+   * used least recently, and a call on it fails with `view_expired`.
+   * 0 from a server that has no lists.
+   */
+  maxViews: number,
+  /**
+   * The most rows one `list.window` sends.
+   */
+  maxWindowRows: number,
+  /**
+   * How long a view lasts unused, in milliseconds, before the server
+   * ends it.
+   */
+  viewIdleMs: number,
+};
+
+/**
+ * The result of `list.close`.
+ */
+export type ListClosed = {
+  /**
+   * Whether a view by that ID was open. Closing one that is not changes
+   * nothing.
+   */
+  closed: boolean,
+};
+
+/**
+ * What an event on the `list` topic carries: one view this session holds
+ * may be out of date.
+ */
+export type ListEvent = {
+  /**
+   * The view.
+   */
+  view: string,
+  /**
+   * The library revision after the change.
+   */
+  libraryRevision: number,
+  /**
+   * `false`: only what rows say changed, and the client reads the
+   * windows on screen again in place. `true`: which rows the view should
+   * hold, or their order, may have changed, and the client opens a view
+   * that replaces it.
+   */
+  reorder: boolean,
+};
+
+/**
+ * What a list holds.
+ */
+export type ListKind = "artists" | "albums" | "songs";
+
+/**
+ * The params of `list.locate`: a view, and a row's ID or the start of its
+ * name. Exactly one of the two is given.
+ */
+export type ListLocateParams = {
+  /**
+   * The view.
+   */
+  view: string,
+  /**
+   * The row's ID: an `artistId`, an album's `ref` ID or an
+   * `appearanceId`.
+   */
+  id?: string,
+  /**
+   * The start of what the view is ordered by, as typed, for
+   * type-to-find. It finds the first row whose sort text begins with it,
+   * or else the first row after where it would be.
+   */
+  prefix?: string,
+};
+
+/**
+ * The result of `list.locate`.
+ */
+export type ListLocated = {
+  /**
+   * The row's index, or `null` when the view does not hold it.
+   */
+  index: number | null,
+};
+
+/**
+ * The params of `list.open`.
+ */
+export type ListOpenParams = {
+  /**
+   * What the list holds.
+   */
+  kind: ListKind,
+  /**
+   * Which rows, and in what order.
+   */
+  query: Query,
+  /**
+   * The rows to send with the answer, so that a screen can draw at once.
+   * Left out, none are sent.
+   */
+  window?: Window,
+  /**
+   * The view this one replaces.
+   */
+  replaces?: Replaces,
+};
+
+/**
+ * The result of `list.open`.
+ */
+export type ListOpened = {
+  /**
+   * The view's ID, for the calls that read it.
+   */
+  view: string,
+  /**
+   * How many rows the view has. It never changes: a scrollbar can be
+   * exact.
+   */
+  total: number,
+  /**
+   * The library revision the view was resolved at.
+   */
+  libraryRevision: number,
+  /**
+   * The index of the first row in `rows`.
+   */
+  offset: number,
+  /**
+   * The rows of the window asked for, in order. Empty when none was.
+   */
+  rows: Array<Row>,
+  /**
+   * Where the anchor row of the view this replaces is in this one. It is
+   * left out when nothing was replaced, no anchor was named, or the
+   * anchor is not in this view.
+   */
+  anchorIndex?: number,
+};
+
+/**
+ * The result of `list.sections`.
+ */
+export type ListSections = {
+  /**
+   * The sections, in the view's order. Letters for an order by name or
+   * title, years for an order by year, stretches of time for an order
+   * by when. Empty for an order that has none.
+   */
+  sections: Array<Section>,
+};
+
+/**
+ * What a list of each kind supports, as the descriptor says.
+ */
+export type ListSupport = {
+  /**
+   * The kind.
+   */
+  kind: ListKind,
+  /**
+   * The orders it can be read in, the first being the one it takes
+   * when none is named.
+   */
+  sorts: Array<SortKey>,
+  /**
+   * The predicates a filter on it may use.
+   */
+  predicates: Array<PredicateName>,
+};
+
+/**
+ * The result of `list.window`.
+ */
+export type ListWindow = {
+  /**
+   * The view.
+   */
+  view: string,
+  /**
+   * The index of the first row in `rows`.
+   */
+  offset: number,
+  /**
+   * The rows, in order. Fewer than asked for at the end of the view.
+   */
+  rows: Array<Row>,
+};
+
+/**
+ * The params of `list.window`.
+ */
+export type ListWindowParams = {
+  /**
+   * The view.
+   */
+  view: string,
+  /**
+   * The index of the first row.
+   */
+  offset: number,
+  /**
+   * How many rows, at most the descriptor's `maxWindowRows`.
+   */
+  limit: number,
+};
+
+/**
+ * The result of `media.token`: what a page puts in the query string of a
+ * media URL.
+ */
+export type MediaToken = {
+  /**
+   * The token. It reads media and nothing else, and works until the
+   * session that asked for it ends.
+   */
+  token: string,
+};
+
+/**
+ * The candidate an item was nearest to.
+ */
+export type Nearest = {
+  /**
+   * The file whose claims it was compared with.
+   */
+  file: FileFacts,
+  /**
+   * The distance, from 0 to 1.
+   */
+  distance: number,
+  /**
+   * What made the distance up, when the resolver can say.
+   */
+  penalties?: Penalties,
+  /**
+   * The recording it nearly matched, after redirects, where one exists:
+   * for a review, the one the decision names, or else the one that file
+   * is bound to now.
+   */
+  recordingId?: string,
 };
 
 /**
@@ -631,6 +1301,175 @@ export type Limits = {
  * be left out of the frame.
  */
 export type NoParams = Record<symbol, never>;
+
+/**
+ * What made a tags-and-duration distance, each from 0 to 1.
+ */
+export type Penalties = {
+  /**
+   * The titles differ in a bracketed note.
+   */
+  title: number,
+  /**
+   * How far apart the artists are.
+   */
+  artist: number,
+  /**
+   * How far apart the lengths are, beyond the free band.
+   */
+  duration: number,
+  /**
+   * Whether the albums differ: 1, or 0.5 when one has none.
+   */
+  album: number,
+  /**
+   * Whether a shared ISRC or AcoustID halved the distance.
+   */
+  sharedIdentifier: boolean,
+};
+
+/**
+ * The policy one dry run decides by: a named policy, and values to put in
+ * place of its own. A value left out is the named policy's.
+ */
+export type PolicyOverrides = {
+  /**
+   * The named policy, 1 or 2. Left out, it is the one scans resolve by.
+   */
+  version?: number,
+  /**
+   * A tags-and-duration match binds at this distance or less: 0 to 1.
+   */
+  bindMax?: number,
+  /**
+   * And only if the runner-up is at least this much further: 0 to 1.
+   */
+  minGap?: number,
+  /**
+   * A new recording is marked for review if a candidate scored under
+   * this: 0 to 1.
+   */
+  reviewBelow?: number,
+  /**
+   * A difference in duration costs nothing up to this, in milliseconds:
+   * at most a minute.
+   */
+  durationGraceMs?: number,
+  /**
+   * Whether candidate text has its accents taken off before it is
+   * compared.
+   */
+  foldAccents?: boolean,
+  /**
+   * Whether sibling folders of one album whose track numbers collide,
+   * which share no title and no year, and whose names each give a disc,
+   * are discs of one release.
+   */
+  discsFromFolders?: boolean,
+  /**
+   * Whether a trailing "Disc 2" or "CD 2" in an album title is the
+   * disc number.
+   */
+  discFromAlbumTitle?: boolean,
+  /**
+   * Whether a match on tags and length alone may bind a file to a
+   * recording on another album.
+   */
+  tagsBindAcrossAlbums?: boolean,
+  /**
+   * When they may not, the largest difference in length, in
+   * milliseconds, at which they still may: at most a minute, and 0 for
+   * none.
+   */
+  acrossAlbumsWithinMs?: number,
+  /**
+   * Whether two different tracks of one release are never one recording
+   * by tags.
+   */
+  tracksOfOneReleaseDiffer?: boolean,
+  /**
+   * Which list of version markers: 1 or 2.
+   */
+  markerList?: number,
+};
+
+/**
+ * The policy a dry run decided by: a named policy with any values put in
+ * its place.
+ */
+export type PolicyValues = {
+  /**
+   * The named policy the values are, or are a variant of: the resolver
+   * version its decisions record.
+   */
+  resolverVersion: number,
+  /**
+   * Whether every value is that policy's own.
+   */
+  exact: boolean,
+  /**
+   * The bind distance.
+   */
+  bindMax: number,
+  /**
+   * The gap to the runner-up.
+   */
+  minGap: number,
+  /**
+   * The review threshold.
+   */
+  reviewBelow: number,
+  /**
+   * The free duration band, in milliseconds.
+   */
+  durationGraceMs: number,
+  /**
+   * Whether candidate text is accent-folded.
+   */
+  foldAccents: boolean,
+  /**
+   * Whether sibling folders can be discs of one release.
+   */
+  discsFromFolders: boolean,
+  /**
+   * Whether a disc marker in an album title is the disc number.
+   */
+  discFromAlbumTitle: boolean,
+  /**
+   * Whether a match on tags alone may bind across albums.
+   */
+  tagsBindAcrossAlbums: boolean,
+  /**
+   * When it may not, the difference in length within which it still
+   * may, in milliseconds. 0 is none.
+   */
+  acrossAlbumsWithinMs: number,
+  /**
+   * Whether two different tracks of one release are never one
+   * recording by tags.
+   */
+  tracksOfOneReleaseDiffer: boolean,
+  /**
+   * The list of version markers: 1, or 2 with every spelling of "a
+   * cappella" and part numbers.
+   */
+  markerList: number,
+};
+
+/**
+ * A condition on a row.
+ */
+export type Predicate = { "is": "by_artist",
+  /**
+   * The artist.
+   */
+  artistId: string,
+};
+
+/**
+ * The name of a predicate, as the descriptor lists what a list supports.
+ */
+export type PredicateName = "by_artist";
 
 /**
  * The public descriptor: what a server says about itself to anyone who
@@ -665,6 +1504,55 @@ export type PublicDescriptor = {
    * The limits a client must stay within.
    */
   limits: Limits,
+  /**
+   * What each kind of list supports: its orders and the predicates a
+   * filter on it may use. Empty from a server that has no lists.
+   */
+  lists: Array<ListSupport>,
+  /**
+   * The sizes a cover is served at, in pixels on its longer side: what
+   * `{size}` in `GET /v1/art/{artId}/{size}` may be. Empty from a server
+   * that serves no covers.
+   */
+  artSizes: Array<number>,
+};
+
+/**
+ * The quality of a record: the best copy across its tracks, and whether
+ * the tracks differ.
+ */
+export type Quality = {
+  /**
+   * The best format any of its tracks has: lossless before lossy, then
+   * more bits, a higher rate, a higher bit rate.
+   */
+  best: Format,
+  /**
+   * Whether its tracks are in more than one format.
+   */
+  varies: boolean,
+};
+
+/**
+ * What a list is of, and in what order.
+ */
+export type Query = {
+  /**
+   * A substring that the row's title, artist or album must contain,
+   * ignoring case and accents. A query of one or two characters matches
+   * the start of a word instead, since nearly every row contains a
+   * letter or two.
+   */
+  text?: string,
+  /**
+   * A condition every row must satisfy.
+   */
+  filter?: Filter,
+  /**
+   * The order. At most one key in this version: each key carries its
+   * own tiebreak. Left out, a list takes its kind's first order.
+   */
+  sort?: Array<Sort>,
 };
 
 /**
@@ -695,6 +1583,83 @@ export type Receipt = {
  * How far a command has got.
  */
 export type ReceiptStatus = "accepted" | "done";
+
+/**
+ * The view a new one replaces, and the row to keep in place.
+ */
+export type Replaces = {
+  /**
+   * The view. It is closed when the new one opens, and calls on it fail
+   * with `view_expired` from then on.
+   */
+  view: string,
+  /**
+   * The ID of the row the client wants to keep where it is on screen,
+   * such as the first one visible: an `artistId`, an album's `ref` ID
+   * or an `appearanceId`.
+   */
+  anchor?: string,
+};
+
+/**
+ * One decision marked for review.
+ */
+export type Review = {
+  /**
+   * Why it was marked.
+   */
+  cause: ReviewCause,
+  /**
+   * The file.
+   */
+  file: FileFacts,
+  /**
+   * The candidate it nearly matched.
+   */
+  nearest?: Nearest,
+  /**
+   * The gap from that candidate to the runner-up.
+   */
+  runnerUpGap?: number,
+  /**
+   * How many candidates were weighed, at most five.
+   */
+  candidates: number,
+  /**
+   * What stopped an identifier from binding.
+   */
+  contradictions: Array<string>,
+};
+
+/**
+ * Why a decision was marked for review, from what made up the distance
+ * to the candidate it nearly matched.
+ */
+export type ReviewCause = "contradiction" | "other_album" | "same_release" | "close_runner_up" | "artist_spelling" | "title_note" | "length_other_album" | "length_same_album" | "other";
+
+/**
+ * The result of `identity.review`: every current binding marked for
+ * review, grouped by cause.
+ */
+export type ReviewList = {
+  /**
+   * The library revision it read.
+   */
+  libraryRevision: number,
+  /**
+   * How many there are by cause, in the order they are listed.
+   */
+  causes: Array<Count>,
+  /**
+   * Each one, by cause and then by path.
+   */
+  reviews: Array<Review>,
+};
+
+/**
+ * One row of a view.
+ */
+export type Row = { "type": "artist" } & ArtistRow | { "type": "album" } & AlbumTile | { "type": "song" } & SongRow | { "type": "gone" } & GoneRow;
 
 /**
  * A JSON-RPC error object.
@@ -813,6 +1778,22 @@ export type ScanSummary = {
    * Releases created.
    */
   releases: number,
+};
+
+/**
+ * Where one section of a view begins.
+ */
+export type Section = {
+  /**
+   * What the section is: a letter, `#` for names that begin with no
+   * letter, a year, or a stretch of time such as "This week" or
+   * "October".
+   */
+  label: string,
+  /**
+   * The index of its first row.
+   */
+  index: number,
 };
 
 /**
@@ -937,6 +1918,86 @@ export type SocketTicket = {
 };
 
 /**
+ * One row of the Songs list: a track appearance.
+ */
+export type SongRow = {
+  /**
+   * The track appearance.
+   */
+  appearanceId: string,
+  /**
+   * The recording it is of.
+   */
+  recordingId: string,
+  /**
+   * The release it is on. `null` for a loose file.
+   */
+  releaseId: string | null,
+  /**
+   * Its title.
+   */
+  title: string | null,
+  /**
+   * Who it is by.
+   */
+  artistCredit: Credit | null,
+  /**
+   * The title of its release.
+   */
+  albumTitle: string | null,
+  /**
+   * Its disc number.
+   */
+  disc: number | null,
+  /**
+   * Its track number.
+   */
+  track: number | null,
+  /**
+   * The year of its release.
+   */
+  year: number | null,
+  /**
+   * How long it is.
+   */
+  durationMs: number | null,
+  /**
+   * How many times its recording has been played, by the current rule.
+   */
+  playCount: number,
+  /**
+   * When its recording was last played, or `null` when no dated play
+   * exists.
+   */
+  lastPlayedAt: number | null,
+  /**
+   * When it came into the library.
+   */
+  addedAt: number | null,
+  /**
+   * The copies of it that exist, and where.
+   */
+  copies: Array<TrackCopy>,
+};
+
+/**
+ * One key of a query's order.
+ */
+export type Sort = {
+  /**
+   * The order.
+   */
+  key: SortKey,
+};
+
+/**
+ * An order a list can be read in. Every order ends in a fixed tiebreak,
+ * so that it is total and a view of the same query twice has the same
+ * order.
+ */
+export type SortKey = "name" | "artist" | "title" | "year" | "added" | "album";
+
+/**
  * One place the library's items come from.
  */
 export type Source = {
@@ -1030,7 +2091,7 @@ export type Subscriptions = {
 /**
  * What a client can subscribe to.
  */
-export type Topic = "servers" | "jobs" | "library";
+export type Topic = "servers" | "jobs" | "library" | "list";
 
 /**
  * The params of `events.subscribe` and `events.unsubscribe`.
@@ -1041,6 +2102,41 @@ export type TopicsParams = {
    * session has, or removing one it has not, changes nothing.
    */
   topics: Array<Topic>,
+};
+
+/**
+ * One copy of a track: which server has it, and its format.
+ */
+export type TrackCopy = {
+  /**
+   * The server that has it. `servers.list` says whether it can be
+   * reached.
+   */
+  server: string,
+  /**
+   * Which copy it is.
+   */
+  role: CopyRole,
+  /**
+   * The codec, such as `flac` or `mp3`.
+   */
+  codec: string,
+  /**
+   * Whether it is lossless.
+   */
+  lossless: boolean,
+  /**
+   * Bits a sample, for a format that has them.
+   */
+  bitDepth: number | null,
+  /**
+   * Samples a second.
+   */
+  sampleRateHz: number,
+  /**
+   * The bit rate, for a lossy format.
+   */
+  bitrateKbps: number | null,
 };
 
 /**
@@ -1068,4 +2164,29 @@ export type Versions = {
    * when the server holds no library.
    */
   librarySchema?: number,
+};
+
+/**
+ * The params of a call that names only a view: `list.sections` and
+ * `list.close`.
+ */
+export type ViewParams = {
+  /**
+   * The view.
+   */
+  view: string,
+};
+
+/**
+ * A stretch of a view's rows: from `offset`, at most `limit` of them.
+ */
+export type Window = {
+  /**
+   * The index of the first row.
+   */
+  offset: number,
+  /**
+   * How many rows, at most the descriptor's `maxWindowRows`.
+   */
+  limit: number,
 };

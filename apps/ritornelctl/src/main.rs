@@ -15,6 +15,7 @@
 )]
 
 mod cli;
+mod identity;
 mod jobs;
 mod library;
 mod scan;

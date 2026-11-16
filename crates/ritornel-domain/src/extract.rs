@@ -1,4 +1,4 @@
-//! Extractor 1: turns one stored payload into claims. See "Scanning one
+//! Extractor 2: turns one stored payload into claims. See "Scanning one
 //! file" step 6 and decision 3 in docs/design/identity.md.
 //!
 //! The tag names are the ones MusicBrainz Picard and beets write, taken
@@ -6,7 +6,7 @@
 //! Vorbis comments (FLAC and Ogg), ID3v2 (MP3, AIFF, WAV) and MP4 atoms. A
 //! name is matched whatever its case. An ID3v2 `TXXX` frame is named
 //! `TXXX:<description>`, a `UFID` frame `UFID:<owner>`, and an MP4 freeform
-//! atom `----:<mean>:<name>`. The three-letter frames of ID3v2.2 are read
+//! atom `<mean>:<name>`, which is how the reader names a `----` atom. The three-letter frames of ID3v2.2 are read
 //! as the frames they became.
 //!
 //! One file can hold several blocks of tags that say the same thing
@@ -18,7 +18,7 @@
 use crate::payload::{Payload, Tag};
 
 /// The version of this extractor. Claims are rebuilt when it changes.
-pub const EXTRACTOR_VERSION: i64 = 1;
+pub const EXTRACTOR_VERSION: i64 = 2;
 
 /// The kind of entity a claim describes. It is never a pointer to one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,8 +110,7 @@ pub struct Claim {
 mod names {
     pub(super) const TITLE: &[&str] = &["TITLE", "TIT2", "TT2", "\u{a9}nam"];
     pub(super) const ARTIST: &[&str] = &["ARTIST", "TPE1", "TP1", "\u{a9}ART"];
-    pub(super) const ARTISTS: &[&str] =
-        &["ARTISTS", "TXXX:ARTISTS", "----:com.apple.iTunes:ARTISTS"];
+    pub(super) const ARTISTS: &[&str] = &["ARTISTS", "TXXX:ARTISTS", "com.apple.iTunes:ARTISTS"];
     pub(super) const ARTIST_SORT: &[&str] = &["ARTISTSORT", "TSOP", "TSP", "soar"];
     pub(super) const ALBUM: &[&str] = &["ALBUM", "TALB", "TAL", "\u{a9}alb"];
     pub(super) const ALBUM_ARTIST: &[&str] = &[
@@ -137,13 +136,13 @@ mod names {
     pub(super) const ORIGINAL_DATE: &[&str] = &[
         "ORIGINALDATE",
         "TDOR",
-        "----:com.apple.iTunes:ORIGINALDATE",
+        "com.apple.iTunes:ORIGINALDATE",
         "TXXX:ORIGINALDATE",
         "ORIGINALYEAR",
         "TORY",
         "TOR",
-        "----:com.apple.iTunes:ORIGINAL YEAR",
-        "----:com.apple.iTunes:ORIGINALYEAR",
+        "com.apple.iTunes:ORIGINAL YEAR",
+        "com.apple.iTunes:ORIGINALYEAR",
         "TXXX:ORIGINALYEAR",
     ];
     pub(super) const COMPILATION: &[&str] = &["COMPILATION", "TCMP", "TCP", "cpil"];
@@ -151,43 +150,43 @@ mod names {
         "RELEASETYPE",
         "MUSICBRAINZ_ALBUMTYPE",
         "TXXX:MusicBrainz Album Type",
-        "----:com.apple.iTunes:MusicBrainz Album Type",
+        "com.apple.iTunes:MusicBrainz Album Type",
     ];
     pub(super) const MB_RECORDING: &[&str] = &[
         "MUSICBRAINZ_TRACKID",
         "UFID:http://musicbrainz.org",
-        "----:com.apple.iTunes:MusicBrainz Track Id",
+        "com.apple.iTunes:MusicBrainz Track Id",
     ];
     pub(super) const MB_TRACK: &[&str] = &[
         "MUSICBRAINZ_RELEASETRACKID",
         "TXXX:MusicBrainz Release Track Id",
-        "----:com.apple.iTunes:MusicBrainz Release Track Id",
+        "com.apple.iTunes:MusicBrainz Release Track Id",
     ];
     pub(super) const MB_RELEASE: &[&str] = &[
         "MUSICBRAINZ_ALBUMID",
         "TXXX:MusicBrainz Album Id",
-        "----:com.apple.iTunes:MusicBrainz Album Id",
+        "com.apple.iTunes:MusicBrainz Album Id",
     ];
     pub(super) const MB_RELEASE_GROUP: &[&str] = &[
         "MUSICBRAINZ_RELEASEGROUPID",
         "TXXX:MusicBrainz Release Group Id",
-        "----:com.apple.iTunes:MusicBrainz Release Group Id",
+        "com.apple.iTunes:MusicBrainz Release Group Id",
     ];
     pub(super) const MB_ARTIST: &[&str] = &[
         "MUSICBRAINZ_ARTISTID",
         "TXXX:MusicBrainz Artist Id",
-        "----:com.apple.iTunes:MusicBrainz Artist Id",
+        "com.apple.iTunes:MusicBrainz Artist Id",
     ];
     pub(super) const MB_ALBUM_ARTIST: &[&str] = &[
         "MUSICBRAINZ_ALBUMARTISTID",
         "TXXX:MusicBrainz Album Artist Id",
-        "----:com.apple.iTunes:MusicBrainz Album Artist Id",
+        "com.apple.iTunes:MusicBrainz Album Artist Id",
     ];
-    pub(super) const ISRC: &[&str] = &["ISRC", "TSRC", "TRC", "----:com.apple.iTunes:ISRC"];
+    pub(super) const ISRC: &[&str] = &["ISRC", "TSRC", "TRC", "com.apple.iTunes:ISRC"];
     pub(super) const ACOUSTID: &[&str] = &[
         "ACOUSTID_ID",
         "TXXX:Acoustid Id",
-        "----:com.apple.iTunes:Acoustid Id",
+        "com.apple.iTunes:Acoustid Id",
     ];
 }
 
@@ -217,6 +216,14 @@ fn name_of(tag: &Tag) -> String {
     let key = match tag.key.as_str() {
         "TXX" => "TXXX",
         "UFI" => "UFID",
+        // A freeform atom given as `----` with its mean and name beside it
+        // is named as the reader names it, by the mean and name alone.
+        "----" => {
+            if let Some(sub) = &tag.sub {
+                return sub.clone();
+            }
+            "----"
+        }
         key => key,
     };
     match &tag.sub {
@@ -891,9 +898,12 @@ mod tests {
                 tag("disk", "1"),
                 tag("\u{a9}day", "2019-03-08"),
                 tag("cpil", "true"),
-                tag("----|com.apple.iTunes:MusicBrainz Track Id", REC),
-                tag("----|com.apple.iTunes:MusicBrainz Album Type", "single"),
-                tag("----|com.apple.iTunes:ORIGINAL YEAR", "1999"),
+                // As the reader names a freeform atom: its mean and its
+                // name, with no `----` in front. The real reader is
+                // tested on a fixture in ritornel-engine's media tests.
+                tag("com.apple.iTunes:MusicBrainz Track Id", REC),
+                tag("com.apple.iTunes:MusicBrainz Album Type", "single"),
+                tag("com.apple.iTunes:ORIGINAL YEAR", "1999"),
             ],
         )));
         assert_eq!(facts.title.as_deref(), Some("Paper Kites"));

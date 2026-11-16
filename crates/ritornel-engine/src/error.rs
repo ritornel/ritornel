@@ -114,6 +114,9 @@ pub enum Error {
     /// A job was stopped where a test asked it to be, as a crash would stop
     /// it.
     FailPoint,
+    /// The library changed between a resolution's plan and its write, so
+    /// the plan was not written. It is made again.
+    PlanStale,
 }
 
 impl fmt::Display for Error {
@@ -191,7 +194,7 @@ impl fmt::Display for Error {
             }
             Self::RootOffline { path } => write!(
                 f,
-                "the root at {} is missing or empty: it is offline, and nothing was changed",
+                "the root at {} is missing or holds no audio: it is taken to be offline, and nothing was changed",
                 path.display()
             ),
             Self::Io(error) => write!(f, "reading a root: {error}"),
@@ -200,6 +203,7 @@ impl fmt::Display for Error {
                 write!(f, "the database holds {what} this program did not write")
             }
             Self::FailPoint => f.write_str("stopped at a fail point"),
+            Self::PlanStale => f.write_str("the library changed while a resolution was planned"),
         }
     }
 }

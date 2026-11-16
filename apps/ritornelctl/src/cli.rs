@@ -6,6 +6,8 @@
 //! ritornelctl library stats [--data-dir <dir>] [--json]
 //! ritornelctl scan <folder> [--name <name>] [--no-wait] [--data-dir <dir>] [--json]
 //! ritornelctl jobs [<job>] [--cancel] [--data-dir <dir>] [--json]
+//! ritornelctl identity re-resolve --dry-run [--detail] [<policy values>] [--data-dir <dir>] [--json]
+//! ritornelctl identity review [--data-dir <dir>] [--json]
 //! ```
 //!
 //! clap parses it. The help is [`USAGE`] and the messages are the fixed
@@ -20,7 +22,7 @@ use clap::error::{ContextKind, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 use ritornel_client::contract::local::Env;
 
-use crate::{jobs, library, scan, status};
+use crate::{identity, jobs, library, scan, status};
 
 const USAGE: &str = "\
 The command-line client of a Ritornel server. It talks to the server that is
@@ -32,6 +34,9 @@ Usage:
   ritornelctl library stats [--data-dir <dir>] [--json]
   ritornelctl scan <folder> [--name <name>] [--no-wait] [--data-dir <dir>] [--json]
   ritornelctl jobs [<job>] [--cancel] [--data-dir <dir>] [--json]
+  ritornelctl identity re-resolve --dry-run [--detail] [<policy values>]
+                                  [--data-dir <dir>] [--json]
+  ritornelctl identity review [--data-dir <dir>] [--json]
 
 Commands:
   status           Show the running server's ID, name and role, the versions
@@ -50,6 +55,17 @@ Commands:
                    is the server's: it carries on if this program stops
   jobs [<job>]     List the server's jobs, newest first, or show one with
                    what its scan found and what could not be read
+  identity re-resolve --dry-run
+                   Run the resolver again over what the library has
+                   stored, and say for each file whether the result is
+                   unchanged, would change, is pinned by your own
+                   assignment or blocked by your exclusion. It writes
+                   nothing. It decides by the policy scans use, policy
+                   2, unless the values below ask what another policy or
+                   other values would change
+  identity review  List the matches marked for review, grouped by cause:
+                   each file, the one it nearly matched, the distance and
+                   what made it up
 
 Options:
   --name <name>         scan: the name the folder is added under. With none
@@ -57,6 +73,38 @@ Options:
   --no-wait             scan: start the scan and return at once
   --cancel              jobs: ask the job to stop. It stops after the files
                         it is reading, and what it has recorded stays
+  --detail              re-resolve: list every file that is not unchanged
+
+Policy values, for re-resolve --dry-run. A switch is on or off, and on
+when given alone:
+  --policy <n>          Start from policy 1 or 2 rather than the one scans
+                        use
+  --bind-max <d>        A match by tags binds at this distance or less
+  --min-gap <d>         and only this far ahead of the runner-up
+  --review-below <d>    A new recording is marked for review if a candidate
+                        was nearer than this
+  --duration-grace-ms <ms>
+                        A difference in length costs nothing up to this
+  --fold-accents [on|off]
+                        Take accents off names before comparing them
+  --discs-from-folders [on|off]
+                        Sibling folders of one album whose track numbers
+                        collide, which share no title and no year, and
+                        whose names each give a disc, are its discs
+  --disc-from-album-title [on|off]
+                        A trailing \"Disc 2\" or \"CD 2\" in an album title is
+                        the disc number
+  --tags-across-albums [on|off]
+                        A match by tags and length alone may bind a file
+                        to a recording on another album
+  --across-albums-within-ms <ms>
+                        When it may not, it still may if the lengths are
+                        this close; 0 for never
+  --tracks-of-one-release-differ [on|off]
+                        A match by tags never binds a file to the
+                        recording of another track of its own release
+  --marker-list <n>     The version markers: 1, or 2 with every spelling
+                        of \"a cappella\" and part numbers
   --data-dir <dir>      The data directory of the server to talk to
   --json                Print the answer as JSON, in the shape the server
                         sends it in
@@ -159,12 +207,61 @@ enum Command {
     Library(LibraryCommand),
     Scan(ScanArgs),
     Jobs(JobsArgs),
+    #[command(subcommand)]
+    Identity(IdentityCommand),
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum LibraryCommand {
     Create(ServerArgs),
     Stats(ServerArgs),
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+enum IdentityCommand {
+    ReResolve(Box<ReResolveArgs>),
+    Review(ServerArgs),
+}
+
+/// What `identity re-resolve` takes. The thresholds are text here and read
+/// by [`identity`], so that a wrong one is told with a fixed message.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ReResolveArgs {
+    /// Say what would change and write nothing: the only way it runs.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+    /// List every file that is not unchanged.
+    #[arg(long)]
+    pub(crate) detail: bool,
+    /// The named policy to start from: 1 or 2. The one scans use when it
+    /// is left out.
+    #[arg(long)]
+    pub(crate) policy: Option<String>,
+    #[arg(long)]
+    pub(crate) bind_max: Option<String>,
+    #[arg(long)]
+    pub(crate) min_gap: Option<String>,
+    #[arg(long)]
+    pub(crate) review_below: Option<String>,
+    #[arg(long)]
+    pub(crate) duration_grace_ms: Option<String>,
+    #[arg(long)]
+    pub(crate) across_albums_within_ms: Option<String>,
+    /// Each switch is `on` or `off`, and on when given alone.
+    #[arg(long, num_args = 0..=1, default_missing_value = "on")]
+    pub(crate) fold_accents: Option<String>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "on")]
+    pub(crate) discs_from_folders: Option<String>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "on")]
+    pub(crate) disc_from_album_title: Option<String>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "on")]
+    pub(crate) tags_across_albums: Option<String>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "on")]
+    pub(crate) tracks_of_one_release_differ: Option<String>,
+    #[arg(long)]
+    pub(crate) marker_list: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `scan` takes.
@@ -283,6 +380,10 @@ fn try_run(
         Command::Library(LibraryCommand::Stats(args)) => library::stats(&args, env, out),
         Command::Scan(args) => scan::scan(&args, env, out),
         Command::Jobs(args) => jobs::jobs(&args, env, out),
+        Command::Identity(IdentityCommand::ReResolve(args)) => {
+            identity::re_resolve(&args, env, out)
+        }
+        Command::Identity(IdentityCommand::Review(args)) => identity::review(&args, env, out),
     }
 }
 
@@ -412,6 +513,67 @@ mod tests {
         assert!(
             err.starts_with("ritornelctl: cannot scan that folder: "),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn identity_takes_its_dry_run_and_the_values_to_ask_about() {
+        assert_eq!(
+            parse(args(&[
+                "identity",
+                "re-resolve",
+                "--dry-run",
+                "--fold-accents",
+                "--duration-grace-ms",
+                "3000",
+                "--detail",
+                "--json"
+            ]))
+            .unwrap()
+            .command,
+            Command::Identity(IdentityCommand::ReResolve(Box::new(ReResolveArgs {
+                dry_run: true,
+                detail: true,
+                duration_grace_ms: Some("3000".to_owned()),
+                fold_accents: Some("on".to_owned()),
+                server: ServerArgs {
+                    data_dir: None,
+                    json: true
+                },
+                ..ReResolveArgs::default()
+            })))
+        );
+        assert_eq!(
+            parse(args(&[
+                "identity",
+                "re-resolve",
+                "--dry-run",
+                "--policy",
+                "1",
+                "--tags-across-albums",
+                "off",
+                "--disc-from-album-title",
+            ]))
+            .unwrap()
+            .command,
+            Command::Identity(IdentityCommand::ReResolve(Box::new(ReResolveArgs {
+                dry_run: true,
+                policy: Some("1".to_owned()),
+                tags_across_albums: Some("off".to_owned()),
+                disc_from_album_title: Some("on".to_owned()),
+                ..ReResolveArgs::default()
+            })))
+        );
+        assert_eq!(
+            parse(args(&["identity", "review"])).unwrap().command,
+            Command::Identity(IdentityCommand::Review(ServerArgs::default()))
+        );
+        // Without --dry-run nothing is asked of a server.
+        let (code, out, err) = program(&["identity", "re-resolve"]);
+        assert_eq!((code, out.as_str()), (EXIT_USAGE, ""));
+        assert_eq!(
+            err,
+            "ritornelctl: re-resolve only runs with --dry-run: a scan resolves the library at its end\n"
         );
     }
 

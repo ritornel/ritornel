@@ -21,7 +21,7 @@ fn read(name: &str) -> Payload {
 
 /// Each fixture that is audio: its codec, its duration in milliseconds and
 /// its audio hash.
-const PINNED: [(&str, &str, u64, &str); 15] = [
+const PINNED: [(&str, &str, u64, &str); 17] = [
     (
         "a.flac",
         "flac",
@@ -47,6 +47,12 @@ const PINNED: [(&str, &str, u64, &str); 15] = [
         "965afb3a8fd3e3aa0d08901d19024674e12a3c0b71a790183057a893e0b1f6e2",
     ),
     (
+        "b.compilation.flac",
+        "flac",
+        500,
+        "965afb3a8fd3e3aa0d08901d19024674e12a3c0b71a790183057a893e0b1f6e2",
+    ),
+    (
         "a.mp3",
         "mp3",
         500,
@@ -66,6 +72,12 @@ const PINNED: [(&str, &str, u64, &str); 15] = [
     ),
     (
         "a.retagged.m4a",
+        "aac",
+        564,
+        "033e2ae663c743c4b4341a8706371569905f3babc8f49d53aadb4f820b69fbc4",
+    ),
+    (
+        "a.musicbrainz.m4a",
         "aac",
         564,
         "033e2ae663c743c4b4341a8706371569905f3babc8f49d53aadb4f820b69fbc4",
@@ -136,7 +148,7 @@ fn every_fixture_has_the_audio_hash_scheme_1_pinned_for_it() {
     let mut audio: Vec<String> = std::fs::read_dir(fixtures())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|name| !name.ends_with(".sh") && !name.starts_with("no"))
+        .filter(|name| !name.ends_with(".sh") && !name.ends_with(".py") && !name.starts_with("no"))
         .collect();
     audio.sort();
     let mut pinned: Vec<&str> = PINNED.iter().map(|(name, ..)| *name).collect();
@@ -153,8 +165,10 @@ fn retagging_never_changes_the_hash_and_other_audio_always_does() {
         ("a.flac", "a.id3v1.flac"),
         ("a.mp3", "a.retagged.mp3"),
         ("a.m4a", "a.retagged.m4a"),
+        ("a.m4a", "a.musicbrainz.m4a"),
         ("a.ogg", "a.retagged.ogg"),
         ("a.opus", "a.retagged.opus"),
+        ("b.flac", "b.compilation.flac"),
     ] {
         assert_eq!(hash(original), hash(retagged), "{retagged}");
         assert_ne!(read(original).tags, read(retagged).tags, "{retagged}");
@@ -283,5 +297,47 @@ fn every_tag_is_read_verbatim_and_the_ones_understood_become_claims() {
     assert_eq!(
         (facts.title, facts.title_inferred.as_deref()),
         (None, Some("a"))
+    );
+}
+
+#[test]
+fn an_m4a_s_freeform_atoms_are_read_as_picard_writes_them() {
+    let payload = read("a.musicbrainz.m4a");
+    // The reader names a freeform atom by its mean and its name.
+    let named: Vec<String> = payload
+        .tags
+        .iter()
+        .filter(|tag| tag.key.contains("MusicBrainz Track Id"))
+        .map(|tag| format!("{}|{:?}", tag.key, tag.sub))
+        .collect();
+    assert_eq!(named.len(), 1, "{:?}", payload.tags);
+    let facts = Facts::from_claims(&extract(&payload));
+    assert_eq!(
+        facts.recording_mbid.as_deref(),
+        Some("11111111-2222-4333-8444-555555555555")
+    );
+    assert_eq!(
+        facts.release_mbid.as_deref(),
+        Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+    );
+    assert_eq!(
+        facts.release_group_mbid.as_deref(),
+        Some("99999999-8888-4777-8666-555555555555")
+    );
+    assert_eq!(facts.artist_mbids, ["12121212-3434-4565-8787-909090909090"]);
+    assert_eq!(
+        facts.album_artist_mbids,
+        ["12121212-3434-4565-8787-909090909090"]
+    );
+    assert_eq!(facts.artists, ["Moss Arcade"]);
+    assert_eq!(facts.original_date.as_deref(), Some("2004-10-11"));
+    assert_eq!(facts.primary_type.as_deref(), Some("album"));
+    assert_eq!(facts.isrcs, ["XXA000000001"]);
+    assert_eq!(facts.acoustids, ["56565656-7878-4909-8121-343434343434"]);
+    let claims = extract(&payload);
+    assert!(
+        claims.iter().any(|claim| claim.name == "mb_track"
+            && claim.value == "33333333-4444-4555-8666-777777777777"),
+        "{claims:?}"
     );
 }

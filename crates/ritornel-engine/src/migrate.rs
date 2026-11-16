@@ -44,11 +44,18 @@ pub(crate) const SERVER: &[Migration] = &[
 ];
 
 /// The migrations of `library.db`.
-pub(crate) const LIBRARY: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_library",
-    sql: include_str!("../migrations/library/0001_library.sql"),
-}];
+pub(crate) const LIBRARY: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_library",
+        sql: include_str!("../migrations/library/0001_library.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_list_indexes",
+        sql: include_str!("../migrations/library/0002_list_indexes.sql"),
+    },
+];
 
 /// What a run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

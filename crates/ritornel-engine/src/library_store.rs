@@ -12,7 +12,7 @@
 //! none of it.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -127,6 +127,22 @@ pub struct Written {
     pub replayed: bool,
 }
 
+/// A write that has been committed: what a [`CommitHook`] is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Committed {
+    /// The library revision it was committed at.
+    pub revision: i64,
+    /// The contract call or the internal writer it was, as its
+    /// [`WriteRequest`] names it.
+    pub method: &'static str,
+}
+
+/// Told of every write after it commits, on the writer thread and in the
+/// order of the commits. It is how the server tells clients that the
+/// library changed (decision 25 in docs/design/server.md: events are hints
+/// sent after the commit). It must be quick: the next write waits for it.
+pub type CommitHook = Arc<dyn Fn(Committed) + Send + Sync>;
+
 /// What `library_meta` says: which library this is, which server may write
 /// it, and how far it has come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +203,18 @@ pub struct LibraryStore {
     /// This server, which the hub pointer named when the library was
     /// opened. Every write checks that it still does.
     hub: Id,
+    /// Told of each write once it has committed.
+    on_commit: OnCommit,
+}
+
+/// The hook a store tells of each commit, if it has one.
+#[derive(Default)]
+struct OnCommit(RwLock<Option<CommitHook>>);
+
+impl std::fmt::Debug for OnCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnCommit")
+    }
 }
 
 impl LibraryStore {
@@ -302,6 +330,7 @@ impl LibraryStore {
             migrated,
             library_id,
             hub,
+            on_commit: OnCommit::default(),
         };
         Ok((store, written))
     }
@@ -348,6 +377,7 @@ impl LibraryStore {
             migrated,
             library_id,
             hub: server_id,
+            on_commit: OnCommit::default(),
         })
     }
 
@@ -402,16 +432,47 @@ impl LibraryStore {
         F: FnOnce(&Write<'_>) -> Result<String, Error> + Send + 'static,
     {
         let (clock, entropy, hub) = (Arc::clone(&self.clock), Arc::clone(&self.entropy), self.hub);
+        let on_commit = self
+            .on_commit
+            .0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         self.writer.call(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let written = write_in(&transaction, hub, &request, clock.now_ms(), &*entropy, work)?;
             transaction.commit()?;
+            // The one place a write is known to have committed. A replayed
+            // command wrote nothing, so there is nothing to tell.
+            if let Some(hook) = on_commit
+                && !written.replayed
+            {
+                hook(Committed {
+                    revision: written.revision,
+                    method: request.method,
+                });
+            }
             Ok(written)
         })
     }
 
-    /// Runs a short read on the read-only connection.
+    /// Tells `hook` of every write from now on, after it commits. A second
+    /// hook replaces the first.
+    pub fn on_commit(&self, hook: CommitHook) {
+        *self
+            .on_commit
+            .0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// The clock the store takes its times from.
+    pub(crate) fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
+    /// Runs a short read on the read connection.
     pub(crate) fn read<T>(
         &self,
         work: impl FnOnce(&Connection) -> Result<T, Error>,
@@ -787,7 +848,7 @@ mod tests {
         // gives the library's ID the bytes 00 to 09.
         let library_id = "019a7afd-1e00-7001-8203-040506070809";
         assert_eq!(store.library_id().to_string(), library_id);
-        assert_eq!(store.schema_version(), 1);
+        assert_eq!(store.schema_version(), 2);
         assert_eq!(
             store.meta().unwrap(),
             LibraryMeta {
@@ -1176,7 +1237,7 @@ mod tests {
         let scratch = Scratch::new();
         let path = library_db(&scratch);
         let (store, _) = create_on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 1);
+        assert_eq!(store.migrations_applied(), 2);
         let created = store.meta().unwrap();
         store
             .write(request("test.write", None), set("kept"))
@@ -1186,7 +1247,7 @@ mod tests {
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 1);
+        assert_eq!(store.schema_version(), 2);
         assert_eq!(store.library_id(), created.library_id);
         assert_eq!(
             store.meta().unwrap(),
@@ -1343,11 +1404,11 @@ mod tests {
         create_on_disk(&path).unwrap().0.close().unwrap();
         tamper_file(
             &path,
-            "INSERT INTO schema_migration VALUES (2, '0002_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (3, '0003_from_the_future', x'00', 0)",
         );
         let refused = open_on_disk(&path, id(0x11));
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 2, known: 1 })),
+            matches!(refused, Err(Error::NewerSchema { found: 3, known: 2 })),
             "{refused:?}"
         );
     }
@@ -1370,5 +1431,113 @@ mod tests {
             (claimed.role, claimed.library_id),
             (Role::Hub, Some(library.library_id()))
         );
+    }
+
+    /// A `library.db` as the first migration left it, with a scan of three
+    /// fixtures in it.
+    const SAVED_0001: &str = include_str!("../saved/library/0001.sql");
+
+    #[test]
+    fn a_library_saved_at_the_first_migration_is_taken_forward_with_what_it_holds() {
+        use ritornel_contract::{ListKind, Query, Row};
+
+        let scratch = Scratch::new();
+        let path = library_db(&scratch);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(SAVED_0001)
+            .unwrap();
+
+        let store = open_on_disk(&path, id(0x11)).unwrap();
+        assert_eq!(store.migrations_applied(), 1);
+        assert_eq!(store.schema_version(), 2);
+        // The library is the one it was, at the revision it was.
+        assert_eq!(
+            store.library_id().to_string(),
+            "019a7afd-1e00-7001-8203-040506070809"
+        );
+        assert_eq!(store.meta().unwrap().revision, 4);
+        // The indexes the second migration adds are there, and the lists
+        // read what the scan made through them.
+        assert_eq!(
+            rows(
+                &store,
+                "SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL
+                 AND name IN ('track_appearance_release', 'release_release_group',
+                   'release_display_artist_credit', 'assignment_current_appearance',
+                   'revision_picture_picture')
+                 ORDER BY name"
+            )
+            .len(),
+            5
+        );
+        let albums = store
+            .list_open(ListKind::Albums, &Query::default())
+            .unwrap();
+        let rows = store.list_rows(ListKind::Albums, &albums.ids).unwrap();
+        let [Row::Album(album)] = &rows[..] else {
+            panic!("{rows:?}");
+        };
+        assert_eq!(
+            (album.title.as_deref(), album.track_count),
+            (Some("Tin Weather"), 2)
+        );
+        assert!(album.art_id.is_some());
+        let songs = store.list_open(ListKind::Songs, &Query::default()).unwrap();
+        assert_eq!(songs.ids.len(), 3);
+
+        // It takes writes, and the next start applies nothing.
+        store
+            .write(request("test.write", None), set("after"))
+            .unwrap();
+        store.close().unwrap();
+        let store = open_on_disk(&path, id(0x11)).unwrap();
+        assert_eq!(store.migrations_applied(), 0);
+        assert_eq!(store.meta().unwrap().revision, 5);
+    }
+
+    #[test]
+    fn the_saved_library_is_one_the_first_migration_made() {
+        let mut saved = Connection::open_in_memory().unwrap();
+        saved.execute_batch(SAVED_0001).unwrap();
+        let mut made = Connection::open_in_memory().unwrap();
+        migrate::run(
+            &mut made,
+            migrate::LIBRARY.get(..1).unwrap(),
+            &FixedClock::at(T0),
+        )
+        .unwrap();
+        // The search index's own tables are left out: the dump writes them
+        // as rows, and SQLite keeps no statement for them.
+        let schema = |connection: &Connection| -> Vec<String> {
+            connection
+                .prepare(
+                    "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL
+                     AND name NOT LIKE 'search_text_%' ORDER BY name",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(schema(&saved), schema(&made));
+        let ledger = |connection: &Connection| -> (i64, String, Vec<u8>) {
+            connection
+                .query_row(
+                    "SELECT version, name, checksum FROM schema_migration",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(ledger(&saved), ledger(&made));
+        let again = migrate::run(
+            &mut saved,
+            migrate::LIBRARY.get(..1).unwrap(),
+            &FixedClock::at(T0),
+        )
+        .unwrap();
+        assert_eq!((again.applied, again.version), (0, 1));
     }
 }

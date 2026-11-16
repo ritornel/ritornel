@@ -351,3 +351,90 @@ fn a_scan_cut_off_when_the_server_dies_is_taken_up_by_the_next_run_and_finishes(
     assert_eq!(stats["libraryRevision"], 6);
     server.stop();
 }
+
+/// The bytes of the library file and of its write-ahead log, which is
+/// where a running server's writes are until a checkpoint.
+fn library_bytes(data_dir: &Path) -> (Vec<u8>, Option<Vec<u8>>) {
+    (
+        std::fs::read(data_dir.join("library.db")).unwrap(),
+        std::fs::read(data_dir.join("library.db-wal")).ok(),
+    )
+}
+
+#[test]
+fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was() {
+    let scratch = Scratch::new();
+    let (data_dir, music) = (scratch.data_dir(), scratch.music());
+    let server = Server::start(&data_dir, &[]);
+    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    let (code, _, stderr) = ritornelctl(&data_dir, &["scan", music.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let before = library_bytes(&data_dir);
+
+    let run = json(
+        &data_dir,
+        &["identity", "re-resolve", "--dry-run", "--detail"],
+    );
+    assert_eq!(run["policy"]["exact"], true);
+    assert_eq!(run["policy"]["resolverVersion"], 2);
+    assert_eq!(run["wouldWrite"], false);
+    assert_eq!(
+        (&run["items"], &run["unchanged"]),
+        (&Value::from(4), &Value::from(4))
+    );
+    assert_eq!(run["wouldChange"], 0);
+    assert_eq!(run["changes"], Value::Array(Vec::new()));
+    let (code, stdout, _) = ritornelctl(&data_dir, &["identity", "re-resolve", "--dry-run"]);
+    assert_eq!(code, Some(0));
+    for line in [
+        "Policy            policy 2\n",
+        "Would change      0 (0 to another recording)\n",
+        "Would write       no\n",
+    ] {
+        assert!(stdout.contains(line), "{line}: {stdout}");
+    }
+    // Other values are asked about, and nothing is applied.
+    let variant = json(
+        &data_dir,
+        &[
+            "identity",
+            "re-resolve",
+            "--dry-run",
+            "--fold-accents",
+            "--duration-grace-ms",
+            "3000",
+        ],
+    );
+    assert_eq!(variant["policy"]["exact"], false);
+    assert_eq!(variant["policy"]["durationGraceMs"], 3000);
+    assert_eq!(variant["wouldChange"], 0);
+    let review = json(&data_dir, &["identity", "review"]);
+    assert_eq!(review["reviews"], Value::Array(Vec::new()));
+    assert_eq!(
+        ritornelctl(&data_dir, &["identity", "review"]).1,
+        "0 marked for review.\n"
+    );
+
+    // Without --dry-run, and with a value out of range, nothing is asked.
+    for (line, message) in [
+        (
+            &["identity", "re-resolve"][..],
+            "re-resolve only runs with --dry-run: a scan resolves the library at its end",
+        ),
+        (
+            &["identity", "re-resolve", "--dry-run", "--bind-max", "2"],
+            "--bind-max needs a number from 0 to 1",
+        ),
+    ] {
+        let (code, stdout, stderr) = ritornelctl(&data_dir, line);
+        assert_eq!((code, stdout.as_str()), (Some(2), ""), "{line:?}");
+        assert_eq!(stderr, format!("ritornelctl: {message}\n"));
+    }
+
+    // The library file and its log are byte for byte what they were.
+    assert!(
+        before == library_bytes(&data_dir),
+        "the dry run changed library.db"
+    );
+    server.stop();
+}

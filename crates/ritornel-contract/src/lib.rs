@@ -42,8 +42,11 @@ mod error;
 mod event;
 mod frame;
 mod id;
+mod identity;
 mod library;
+mod list;
 pub mod local;
+mod media;
 pub mod methods;
 mod server;
 mod ticket;
@@ -53,16 +56,27 @@ mod typescript;
 pub use command::{LibraryCreateParams, LibraryCreated, Receipt, ReceiptStatus};
 pub use error::{ErrorCode, ErrorData, RpcError};
 pub use event::{
-    EVENT_METHOD, Event, JobsEvent, LibraryChange, LibraryEvent, ServersEvent, Subscriptions,
-    Topic, TopicsParams,
+    EVENT_METHOD, Event, JobsEvent, LibraryChange, LibraryEvent, ListEvent, ServersEvent,
+    Subscriptions, Topic, TopicsParams,
 };
 pub use frame::{Frame, Malformed, Notification, Request, RequestId, Response};
 pub use id::{Id, NotAnId};
+pub use identity::{
+    Binding, DryRun, DryRunParams, FileFacts, ItemChange, ItemOutcome, Nearest, Penalties,
+    PolicyOverrides, PolicyValues, Review, ReviewCause, ReviewList,
+};
 pub use library::{
     Count, Job, JobCancelParams, JobCancelled, JobDetail, JobGetParams, JobItem, JobState,
     JobTarget, JobsList, LibraryStats, ScanStartParams, ScanStarted, ScanSummary, Source,
     SourceAdded, SourceKind, SourcesAddParams, SourcesList,
 };
+pub use list::{
+    AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,
+    ListClosed, ListKind, ListLocateParams, ListLocated, ListOpenParams, ListOpened, ListSections,
+    ListSupport, ListWindow, ListWindowParams, Predicate, PredicateName, Quality, Query, Replaces,
+    Row, Section, SongRow, Sort, SortKey, TrackCopy, ViewParams, Window,
+};
+pub use media::{ART_SIZES, MEDIA_TOKEN_PARAM, MediaToken};
 pub use methods::{METHODS, Method, MethodInfo, MethodKind, MethodVisitor, visit_methods};
 pub use server::{
     ClientKind, Descriptor, FreeDisk, HelloParams, LibraryStatus, Limits, MAX_CLIENT_TEXT,
@@ -84,6 +98,19 @@ pub mod capability {
     /// The server has the `servers` topic: it sends one server's full
     /// status whenever it changes.
     pub const EVENTS_SERVERS: &str = "events.servers";
+
+    /// The server has the `library` topic: a hint after each library write.
+    pub const EVENTS_LIBRARY: &str = "events.library";
+
+    /// The server reads large lists through views: `list.open`,
+    /// `list.window`, `list.sections`, `list.locate` and `list.close`, and
+    /// the `list` topic. The descriptor's `lists` says which kinds, orders
+    /// and predicates.
+    pub const LISTS: &str = "lists";
+
+    /// The server serves covers at `GET /v1/art/{artId}/{size}`, with the
+    /// media token from `media.token`.
+    pub const MEDIA_ART: &str = "media.art";
 }
 
 /// The HTTP routes. Each is a `GET` but [`TICKET`](route::TICKET), which
@@ -106,6 +133,11 @@ pub mod route {
 
     /// Whether the server is up: a [`Health`]. It needs a credential.
     pub const HEALTH: &str = "/v1/health";
+
+    /// Covers: `GET /v1/art/{artId}/{size}` under this prefix. It takes the
+    /// credential in a header, or a [media token](crate::MediaToken) in the
+    /// query string, and nothing else takes a media token.
+    pub const ART: &str = "/v1/art";
 
     /// The body of [`HEALTH`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

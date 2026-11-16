@@ -24,11 +24,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use ritornel_client::contract::methods::{EventsSubscribe, Method, ServerHello};
+use ritornel_client::contract::methods::{
+    EventsSubscribe, IdentityDryRun, IdentityReview, Method, ServerHello,
+};
 use ritornel_client::contract::{
-    CONTRACT_VERSION, ClientKind, Descriptor, ErrorCode, Event, HelloParams, Id, JobState,
-    JobTarget, LibraryStatus, Limits, PublicDescriptor, Receipt, ReceiptStatus, ServerInfo,
-    ServerRole, SessionKind, SourceKind, Topic, capability, route,
+    ART_SIZES, CONTRACT_VERSION, ClientKind, Descriptor, ErrorCode, Event, HelloParams, Id,
+    JobState, JobTarget, LibraryStatus, Limits, ListSupport, PublicDescriptor, Receipt,
+    ReceiptStatus, ServerInfo, ServerRole, SessionKind, SourceKind, Topic, capability, route,
 };
 use ritornel_client::{Client, Credential, NotRunning, local};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -189,10 +191,22 @@ impl Running {
             name: "Ritornel server".to_owned(),
             role: ServerRole::Unassigned,
             contract_version: CONTRACT_VERSION,
-            capabilities: vec![capability::EVENTS_SERVERS.to_owned()],
+            capabilities: [
+                capability::EVENTS_SERVERS,
+                capability::EVENTS_LIBRARY,
+                capability::LISTS,
+                capability::MEDIA_ART,
+            ]
+            .map(str::to_owned)
+            .to_vec(),
             limits: Limits {
                 max_message_bytes: 1 << 20,
+                max_views: 16,
+                max_window_rows: 500,
+                view_idle_ms: 600_000,
             },
+            lists: ListSupport::all(),
+            art_sizes: ART_SIZES.to_vec(),
         }
     }
 
@@ -241,6 +255,7 @@ on_both_transports! {
     a_folder_is_added_as_a_source_once_and_only_where_there_is_one
     a_scan_runs_as_a_job_and_the_stats_say_what_came_out
     a_job_can_be_asked_to_stop_and_one_there_is_not_is_not_found
+    the_dry_run_and_the_review_read_the_library_and_check_what_they_are_asked
     a_subscriber_is_sent_a_servers_event_and_after_unsubscribing_none
     changes_a_client_has_not_read_yet_reach_it_as_one_event
     a_method_the_server_does_not_have_is_unsupported
@@ -284,9 +299,11 @@ async fn hello_answers_with_the_descriptor(via: Via) {
     assert_eq!(
         fields,
         [
+            "artSizes",
             "capabilities",
             "contractVersion",
             "limits",
+            "lists",
             "name",
             "role",
             "serverId",
@@ -334,7 +351,7 @@ async fn creating_a_library_makes_the_server_its_hub(via: Via) {
     // server's role says hub: the event, the list and the descriptor.
     let status = client.status().await.unwrap();
     assert_eq!(status.role, ServerRole::Hub);
-    assert_eq!(status.versions.library_schema, Some(1));
+    assert_eq!(status.versions.library_schema, Some(2));
     assert_eq!(
         status.library,
         Some(LibraryStatus {
@@ -640,6 +657,58 @@ async fn a_job_can_be_asked_to_stop_and_one_there_is_not_is_not_found(via: Via) 
     let (job, _) = ended(&mut client, next.job.job_id).await;
     assert_eq!(job.state, JobState::Succeeded);
     assert_eq!(client.library_stats().await.unwrap().files, 4);
+}
+
+async fn the_dry_run_and_the_review_read_the_library_and_check_what_they_are_asked(via: Via) {
+    let running = Running::start().await;
+    let mut client = running.greeted(via).await;
+    let (code, ..) = refused(client.call_raw(IdentityDryRun::NAME, json!({})).await);
+    assert_eq!(code, ErrorCode::Unavailable);
+    client.create_library(key()).await.unwrap();
+    let folder = music(&running);
+    let source = client
+        .add_source(key(), "main", folder.to_str().unwrap())
+        .await
+        .unwrap()
+        .source;
+    client.subscribe(&[Topic::Jobs]).await.unwrap();
+    let started = client.start_scan(key(), source.source_id).await.unwrap();
+    let (job, _) = ended(&mut client, started.job.job_id).await;
+    assert_eq!(job.state, JobState::Succeeded);
+
+    let run = client
+        .call_raw(IdentityDryRun::NAME, json!({ "detail": true }))
+        .await
+        .unwrap();
+    assert_eq!(
+        (&run["items"], &run["wouldChange"], &run["wouldWrite"]),
+        (&json!(4), &json!(0), &json!(false))
+    );
+    let review = client
+        .call::<IdentityReview>(&Default::default())
+        .await
+        .unwrap();
+    assert_eq!(review.reviews, []);
+    for (params, field) in [
+        (json!({ "policy": { "bindMax": 1.5 } }), "bindMax"),
+        (json!({ "policy": { "minGap": -0.1 } }), "minGap"),
+        (json!({ "policy": { "reviewBelow": 2 } }), "reviewBelow"),
+        (json!({ "policy": { "version": 3 } }), "version"),
+        (json!({ "policy": { "markerList": 0 } }), "markerList"),
+        (
+            json!({ "policy": { "acrossAlbumsWithinMs": 60_001 } }),
+            "acrossAlbumsWithinMs",
+        ),
+        (
+            json!({ "policy": { "durationGraceMs": 60_001 } }),
+            "durationGraceMs",
+        ),
+    ] {
+        let (code, retryable, details) =
+            refused(client.call_raw(IdentityDryRun::NAME, params).await);
+        assert_eq!((code, retryable), (ErrorCode::Invalid, false));
+        assert_eq!(details["field"], field);
+    }
 }
 
 async fn the_list_of_servers_is_this_server(via: Via) {
@@ -985,6 +1054,8 @@ async fn a_limited_session_may_not_ask_for_the_status_or_change_anything() {
             refused(client.jobs().await),
             refused(client.job(key()).await),
             refused(client.cancel_job(key(), key()).await),
+            refused(client.call::<IdentityDryRun>(&Default::default()).await),
+            refused(client.call::<IdentityReview>(&Default::default()).await),
         ] {
             assert_eq!((forbidden.0, forbidden.1), (ErrorCode::Forbidden, false));
         }

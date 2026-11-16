@@ -3,14 +3,13 @@
 //! frames" in docs/design/contract.md.
 //!
 //! A field that describes something a server does not have yet is left
-//! out: there are no sort keys or predicates in the descriptor until there
-//! are lists to sort. What a server says of its library is in its status.
+//! out. What a server says of its library is in its status.
 //! The descriptor carries the library revision, and the public one the
 //! library and its hub, when the first client needs them there.
 
 use serde::{Deserialize, Serialize};
 
-use crate::Id;
+use crate::{Id, ListSupport};
 
 /// A server's own record of its role. The library's hub pointer decides
 /// which server is the hub (docs/design/linking.md, decision 2).
@@ -124,6 +123,15 @@ pub struct PublicDescriptor {
     pub capabilities: Vec<String>,
     /// The limits a client must stay within.
     pub limits: Limits,
+    /// What each kind of list supports: its orders and the predicates a
+    /// filter on it may use. Empty from a server that has no lists.
+    #[serde(default)]
+    pub lists: Vec<ListSupport>,
+    /// The sizes a cover is served at, in pixels on its longer side: what
+    /// `{size}` in `GET /v1/art/{artId}/{size}` may be. Empty from a server
+    /// that serves no covers.
+    #[serde(default)]
+    pub art_sizes: Vec<u32>,
 }
 
 impl PublicDescriptor {
@@ -141,6 +149,18 @@ pub struct Limits {
     /// The largest frame the server reads, in bytes. It closes a socket
     /// that sends a larger one.
     pub max_message_bytes: u64,
+    /// How many views a session may hold. Opening one more ends the one
+    /// used least recently, and a call on it fails with `view_expired`.
+    /// 0 from a server that has no lists.
+    #[serde(default)]
+    pub max_views: u32,
+    /// The most rows one `list.window` sends.
+    #[serde(default)]
+    pub max_window_rows: u32,
+    /// How long a view lasts unused, in milliseconds, before the server
+    /// ends it.
+    #[serde(default)]
+    pub view_idle_ms: u64,
 }
 
 /// The descriptor: the result of `server.hello`. It is the public
@@ -281,7 +301,12 @@ mod tests {
             capabilities: vec![capability::EVENTS_SERVERS.to_owned()],
             limits: Limits {
                 max_message_bytes: 1_048_576,
+                max_views: 16,
+                max_window_rows: 500,
+                view_idle_ms: 600_000,
             },
+            lists: Vec::new(),
+            art_sizes: vec![64, 128],
         }
     }
 
@@ -336,7 +361,14 @@ mod tests {
             "role": "unassigned",
             "contractVersion": 0,
             "capabilities": ["events.servers"],
-            "limits": { "maxMessageBytes": 1_048_576 },
+            "limits": {
+                "maxMessageBytes": 1_048_576,
+                "maxViews": 16,
+                "maxWindowRows": 500,
+                "viewIdleMs": 600_000,
+            },
+            "lists": [],
+            "artSizes": [64, 128],
             "sessionKind": "full",
         });
         assert_eq!(serde_json::to_value(&descriptor).unwrap(), wire);
@@ -361,7 +393,15 @@ mod tests {
             "role": "unassigned",
             "contractVersion": 0,
             "capabilities": ["events.servers", "from.the.future"],
-            "limits": { "maxMessageBytes": 1_048_576, "maxViews": 8 },
+            "limits": {
+                "maxMessageBytes": 1_048_576,
+                "maxViews": 16,
+                "maxWindowRows": 500,
+                "viewIdleMs": 600_000,
+                "maxIds": 1000,
+            },
+            "lists": [],
+            "artSizes": [64, 128],
             "libraryRevision": 4711,
         });
         let read = serde_json::from_value::<PublicDescriptor>(newer).unwrap();

@@ -9,11 +9,15 @@
 //! backlog.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use ritornel_contract::{EVENT_METHOD, Event, Frame, Notification, SessionKind, Topic};
+use ritornel_engine::View;
 use tokio::sync::{Notify, watch};
 use tracing::error;
+
+use crate::views::Views;
 
 /// One client's session on one transport.
 #[derive(Debug)]
@@ -26,6 +30,8 @@ pub(crate) struct Session {
     /// Whether the session has closed, for whoever is waiting on something
     /// else and must stop when it does.
     shut: watch::Sender<bool>,
+    /// The views it holds.
+    views: Mutex<Views>,
 }
 
 #[derive(Debug, Default)]
@@ -54,15 +60,19 @@ fn key(event: &Event) -> String {
     match event {
         Event::Servers(event) => event.server.server_id.to_string(),
         Event::Jobs(event) => event.job.job_id.to_string(),
-        // The library is one resource.
+        // There is one library.
         Event::Library(_) => String::new(),
+        Event::List(event) => event.view.clone(),
     }
 }
 
-/// Merges a newer event into the unsent one for the same topic and key. A
-/// server's status and a job are full copies, so that is keeping the newer
-/// copy. A library hint keeps the highest revision and the union of what
-/// changed.
+/// Merges a newer event into the unsent one for the same topic and key.
+///
+/// A server's status and a job are full copies, so that is keeping the
+/// newer copy. A library or list event is a hint: the merged one has the
+/// highest revision, `reorder` if either had it, and every kind of change
+/// either had, so a `reorder` is never lost behind a later change that
+/// would not have reordered.
 fn merge(unsent: &mut Event, newer: Event) {
     match (&mut *unsent, newer) {
         (Event::Servers(held), Event::Servers(new)) => {
@@ -77,6 +87,10 @@ fn merge(unsent: &mut Event, newer: Event) {
             held.changed.sort_unstable();
             held.changed.dedup();
         }
+        (Event::List(held), Event::List(new)) => {
+            held.library_revision = held.library_revision.max(new.library_revision);
+            held.reorder |= new.reorder;
+        }
         // The key is per topic, so the two are always of one topic.
         _ => {}
     }
@@ -90,6 +104,7 @@ impl Session {
             state: Mutex::default(),
             wake: Notify::new(),
             shut: watch::Sender::new(false),
+            views: Mutex::default(),
         }
     }
 
@@ -139,11 +154,13 @@ impl Session {
         state.topics.iter().copied().collect()
     }
 
-    /// Queues an event, if the session is subscribed to its topic.
+    /// Queues an event, if the session is subscribed to its topic. A
+    /// session that holds a view needs no subscription for the `list`
+    /// topic: holding the view is the subscription.
     pub(crate) fn publish(&self, event: Event) {
         let mut state = self.state();
         let topic = event.topic();
-        if state.closed || !state.topics.contains(&topic) {
+        if state.closed || (topic != Topic::List && !state.topics.contains(&topic)) {
             return;
         }
         let key = key(&event);
@@ -169,9 +186,41 @@ impl Session {
         self.wake.notify_one();
     }
 
+    fn views(&self) -> MutexGuard<'_, Views> {
+        // Nothing here can leave the views half changed.
+        self.views.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Holds a view under `id`, ending one the session holds if it holds
+    /// as many as it may.
+    pub(crate) fn hold_view(&self, id: String, resolved: Arc<View>) {
+        self.views().hold(id, resolved, Instant::now());
+    }
+
+    /// The view held under `id`, if it has not ended.
+    pub(crate) fn view(&self, id: &str) -> Option<Arc<View>> {
+        self.views().get(id, Instant::now())
+    }
+
+    /// Ends the view held under `id`. Whether there was one.
+    pub(crate) fn close_view(&self, id: &str) -> bool {
+        self.views().close(id)
+    }
+
+    /// The IDs of the views the session holds.
+    pub(crate) fn view_ids(&self) -> Vec<String> {
+        self.views().ids()
+    }
+
+    /// What the session's views cost to hold, in bytes, near enough.
+    pub(crate) fn view_bytes(&self) -> usize {
+        self.views().bytes()
+    }
+
     /// Ends the session: what is unsent is dropped, and [`next`](Self::next)
     /// says so.
     pub(crate) fn close(&self) {
+        *self.views() = Views::default();
         let mut state = self.state();
         state.closed = true;
         state.queue.clear();
@@ -427,6 +476,72 @@ mod tests {
         waiting.await.unwrap();
         // Whoever asks afterwards is told at once.
         session.closed().await;
+    }
+
+    fn library(revision: u64, changed: &[ritornel_contract::LibraryChange]) -> Event {
+        Event::Library(ritornel_contract::LibraryEvent {
+            library_revision: revision,
+            changed: changed.to_vec(),
+        })
+    }
+
+    fn list(view: &str, revision: u64, reorder: bool) -> Event {
+        Event::List(ritornel_contract::ListEvent {
+            view: view.to_owned(),
+            library_revision: revision,
+            reorder,
+        })
+    }
+
+    fn params(frame: &Frame) -> Event {
+        let Frame::Notification(Notification { params, .. }) = frame else {
+            panic!("{frame:?}");
+        };
+        serde_json::from_value(params.clone().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn library_events_merge_into_the_highest_revision_and_every_kind_of_change() {
+        use ritornel_contract::LibraryChange::{Membership, Metadata, Stats};
+        let session = Session::new(1, SessionKind::Full);
+        // Not subscribed: nothing.
+        session.publish(library(2, &[Metadata]));
+        assert_eq!(drain(&session), []);
+        session.subscribe(&[Topic::Library]);
+        session.publish(library(3, &[Stats]));
+        session.publish(library(5, &[Metadata]));
+        session.publish(library(4, &[Membership]));
+        let sent = drain(&session);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(params(&sent[0]), library(5, &[Membership, Metadata, Stats]));
+    }
+
+    #[test]
+    fn a_list_event_needs_no_subscription_and_a_reorder_is_never_lost_in_a_merge() {
+        let session = Session::new(1, SessionKind::Full);
+        session.publish(list("a", 2, true));
+        session.publish(list("b", 2, false));
+        session.publish(list("a", 3, false));
+        let sent: Vec<Event> = drain(&session).iter().map(params).collect();
+        assert_eq!(sent, [list("a", 3, true), list("b", 2, false)]);
+    }
+
+    #[test]
+    fn a_session_holds_views_until_it_closes() {
+        let session = Session::new(1, SessionKind::Full);
+        let resolved = std::sync::Arc::new(ritornel_engine::View {
+            kind: ritornel_contract::ListKind::Artists,
+            sort: ritornel_contract::SortKey::Name,
+            revision: 1,
+            ids: vec![1, 2, 3],
+            sections: Vec::new(),
+        });
+        session.hold_view("v".to_owned(), resolved);
+        assert_eq!(session.view_ids(), ["v"]);
+        assert!(session.view_bytes() >= 24);
+        assert!(session.view("v").is_some());
+        session.close();
+        assert!(session.view("v").is_none());
     }
 
     #[test]

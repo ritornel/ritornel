@@ -112,19 +112,23 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
     Ok(())
 }
 
-/// Walks a root. A root that is missing, is not a folder or holds nothing
-/// at all is offline, not empty: this is what a share that failed to mount
-/// looks like, and the scan must not mark its files missing.
+/// Walks a root. A root that is missing, is not a folder, or in which a
+/// whole walk finds no audio file at all is offline, not empty: this is
+/// what a share that failed to mount looks like, often with a `.DS_Store`
+/// at its mount point, and the scan must not mark its files missing.
+/// Emptiness is decided by what the walk counts, never by whether the
+/// folder has entries.
 pub(crate) fn walk(root: &Path, stop: &AtomicBool) -> Result<Walked, Error> {
     let offline = || Error::RootOffline {
         path: root.to_owned(),
     };
-    let mut entries = std::fs::read_dir(root).map_err(|_| offline())?;
-    if entries.next().is_none() {
-        return Err(offline());
-    }
+    std::fs::read_dir(root).map_err(|_| offline())?;
     let mut walked = Walked::default();
     walk_into(root, "", &mut walked, stop)?;
+    // A walk that was asked to stop has not looked everywhere.
+    if walked.files.is_empty() && !stop.load(Ordering::Relaxed) {
+        return Err(offline());
+    }
     walked.files.sort_by(|a, b| a.path.cmp(&b.path));
     for images in walked.images.values_mut() {
         images.sort_by(|a, b| a.path.cmp(&b.path));
@@ -186,10 +190,19 @@ mod tests {
     fn a_root_that_is_missing_or_empty_is_offline() {
         let scratch = Scratch::new();
         let stop = AtomicBool::new(false);
+        let hidden = scratch.path().join("mount-point");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::write(hidden.join(".DS_Store"), b"Bud1").unwrap();
+        let no_audio = scratch.path().join("no-audio");
+        std::fs::create_dir_all(no_audio.join("a")).unwrap();
+        std::fs::write(no_audio.join("a/cover.jpg"), b"jpeg").unwrap();
         for root in [
             scratch.path().join("never-mounted"),
-            scratch.path().to_owned(),
+            scratch.path().join("empty"),
+            hidden,
+            no_audio,
         ] {
+            let _ = std::fs::create_dir(scratch.path().join("empty"));
             let refused = walk(&root, &stop);
             assert!(
                 matches!(&refused, Err(Error::RootOffline { path }) if *path == root),

@@ -11,15 +11,16 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use ritornel_contract::methods::{
-    self, EventsSubscribe, EventsUnsubscribe, JobsCancel, JobsGet, JobsList, LibraryCreate,
-    LibraryStats, Method, ScanStart, ServerHello, ServerStatus, ServersList, SourcesAdd,
-    SourcesList,
+    self, EventsSubscribe, EventsUnsubscribe, IdentityDryRun, IdentityReview, JobsCancel, JobsGet,
+    JobsList, LibraryCreate, LibraryStats, ListClose, ListLocate, ListOpen, ListSectionsCall,
+    ListWindowCall, MediaTokenCall, Method, ScanStart, ServerHello, ServerStatus, ServersList,
+    SourcesAdd, SourcesList,
 };
 use ritornel_contract::{
-    CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
-    LibraryCreateParams, LibraryCreated, LibraryStatus, Limits, MAX_CLIENT_TEXT, PublicDescriptor,
-    Receipt, ReceiptStatus, Response, RpcError, ServerInfo, ServerRole, ServersEvent, SessionKind,
-    Versions, capability,
+    ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
+    LibraryCreateParams, LibraryCreated, LibraryStatus, Limits, ListSupport, MAX_CLIENT_TEXT,
+    PublicDescriptor, Receipt, ReceiptStatus, Response, RpcError, ServerInfo, ServerRole,
+    ServersEvent, SessionKind, Versions, capability,
 };
 use ritornel_engine::{
     Client, Clock, Command, Entropy, Fingerprint, LibraryStore, Role, SQLITE_VERSION,
@@ -32,11 +33,17 @@ use tracing::{debug, error, info, warn};
 use crate::credential::Verifier;
 use crate::data_dir::DataDir;
 use crate::disk;
+use crate::media::{CoverPool, MediaTokens};
 use crate::session::Session;
 use crate::transport::{self, Wire};
+use crate::views::{MAX_VIEWS, MAX_WINDOW_ROWS, VIEW_IDLE};
 use crate::{Bounds, Error};
 
 mod calls;
+mod churn;
+mod lists;
+
+use lists::Fanout;
 
 /// The largest frame the server reads, in bytes: 1 MiB, which keeps bulk
 /// out of the control channel (docs/design/linking.md, decision 11).
@@ -91,7 +98,19 @@ pub(crate) struct Core {
     sessions: Mutex<Sessions>,
     /// What wakes the worker that runs jobs.
     jobs: crate::jobs::Wake,
+    /// Who is told after a library write.
+    fanout: Arc<Fanout>,
+    /// The media tokens sessions hold.
+    media_tokens: MediaTokens,
+    /// The cover cache.
+    covers: ritornel_engine::covers::Covers,
+    /// The threads that make covers.
+    cover_pool: CoverPool,
 }
+
+/// How many threads make covers: enough to keep a screenful coming, and
+/// few enough to leave the machine to the page that is drawing them.
+const COVER_THREADS: usize = 4;
 
 #[derive(Debug)]
 struct This {
@@ -135,8 +154,27 @@ impl Core {
         clock: Arc<dyn Clock>,
         entropy: Arc<dyn Entropy>,
         bounds: Bounds,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Error> {
+        let fanout = Arc::new(Fanout::default());
+        if let Some(library) = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            lists::hook(library, &fanout);
+        }
+        let cache = dir.cache()?;
+        let covers = ritornel_engine::covers::Covers::new(&cache).map_err(|error| Error::Io {
+            doing: "prepare",
+            path: cache.clone(),
+            source: std::io::Error::other(error.to_string()),
+        })?;
+        Ok(Self {
+            fanout,
+            media_tokens: MediaTokens::default(),
+            covers,
+            cover_pool: CoverPool::start(COVER_THREADS),
             local_credential,
             clock,
             entropy,
@@ -152,7 +190,7 @@ impl Core {
             stores: RwLock::new(Some(stores)),
             sessions: Mutex::default(),
             jobs: crate::jobs::Wake::default(),
-        }
+        })
     }
 
     pub(crate) fn server_id(&self) -> Id {
@@ -184,10 +222,22 @@ impl Core {
             name: this.name.clone(),
             role: this.role,
             contract_version: CONTRACT_VERSION,
-            capabilities: vec![capability::EVENTS_SERVERS.to_owned()],
+            capabilities: [
+                capability::EVENTS_SERVERS,
+                capability::EVENTS_LIBRARY,
+                capability::LISTS,
+                capability::MEDIA_ART,
+            ]
+            .map(str::to_owned)
+            .to_vec(),
             limits: Limits {
                 max_message_bytes: MAX_MESSAGE_BYTES as u64,
+                max_views: MAX_VIEWS as u32,
+                max_window_rows: MAX_WINDOW_ROWS as u32,
+                view_idle_ms: VIEW_IDLE.as_millis() as u64,
             },
+            lists: ListSupport::all(),
+            art_sizes: ART_SIZES.to_vec(),
         }
     }
 
@@ -218,6 +268,7 @@ impl Core {
         sessions.next_id += 1;
         let session = Arc::new(Session::new(sessions.next_id, kind));
         sessions.open.insert(session.id(), Arc::clone(&session));
+        self.fanout.add(&session);
         Some(session)
     }
 
@@ -266,6 +317,8 @@ impl Core {
     /// Ends a session whose transport has gone.
     pub(crate) fn close_session(&self, session: &Session) {
         session.close();
+        self.fanout.remove(session.id());
+        self.media_tokens.revoke(session.id());
         lock(&self.sessions).open.remove(&session.id());
     }
 
@@ -303,6 +356,8 @@ impl Core {
     /// it is unavailable. This waits for a call that is using a database to
     /// finish.
     pub(crate) fn close_store(&self) -> Result<(), Error> {
+        // The cover threads read the databases, so they stop first.
+        self.cover_pool.stop();
         let stores = self
             .stores
             .write()
@@ -483,6 +538,26 @@ impl Core {
                 run::<JobsCancel>(params, |params| self.jobs_cancel(stores, &params))
             }
             LibraryStats::NAME => run::<LibraryStats>(params, |_| self.library_stats(stores)),
+            IdentityDryRun::NAME => {
+                run::<IdentityDryRun>(params, |params| self.identity_dry_run(stores, &params))
+            }
+            IdentityReview::NAME => run::<IdentityReview>(params, |_| self.identity_review(stores)),
+            ListOpen::NAME => {
+                run::<ListOpen>(params, |params| self.list_open(stores, session, params))
+            }
+            ListWindowCall::NAME => {
+                run::<ListWindowCall>(params, |params| Self::list_window(stores, session, params))
+            }
+            ListSectionsCall::NAME => {
+                run::<ListSectionsCall>(params, |params| Self::list_sections(session, &params))
+            }
+            ListLocate::NAME => {
+                run::<ListLocate>(params, |params| Self::list_locate(stores, session, &params))
+            }
+            ListClose::NAME => {
+                run::<ListClose>(params, |params| Ok(Self::list_close(session, &params)))
+            }
+            MediaTokenCall::NAME => run::<MediaTokenCall>(params, |_| self.media_token(session)),
             _ => Err(RpcError::new(
                 ErrorCode::Internal,
                 format!("{} is in the method table and has no handler", row.name),
@@ -605,6 +680,7 @@ impl Core {
                     .new_library(stores, request, params.idempotency_key)
                     .map_err(failed)?;
                 info!(library_id = %created.library_id(), "created a library: this server is its hub");
+                lists::hook(&created, &self.fanout);
                 *library = Some(created);
                 let mut this = lock(&self.this);
                 this.role = ServerRole::Hub;
@@ -768,7 +844,8 @@ mod tests {
             Arc::new(SystemClock),
             Arc::new(OsEntropy),
             bounds,
-        );
+        )
+        .unwrap();
         (core, scratch)
     }
 
@@ -816,8 +893,15 @@ mod tests {
                 "name": "desk",
                 "role": "unassigned",
                 "contractVersion": CONTRACT_VERSION,
-                "capabilities": ["events.servers"],
-                "limits": { "maxMessageBytes": 1_048_576 },
+                "capabilities": ["events.servers", "events.library", "lists", "media.art"],
+                "limits": {
+                    "maxMessageBytes": 1_048_576,
+                    "maxViews": 16,
+                    "maxWindowRows": 500,
+                    "viewIdleMs": 600_000,
+                },
+                "lists": serde_json::to_value(ListSupport::all()).unwrap(),
+                "artSizes": ART_SIZES,
                 "sessionKind": "limited",
             })
         );
@@ -1030,7 +1114,7 @@ mod tests {
                 "contract": CONTRACT_VERSION,
                 "sqlite": "3.54.1",
                 "serverSchema": 2,
-                "librarySchema": 1,
+                "librarySchema": 2,
             })
         );
         assert_eq!(

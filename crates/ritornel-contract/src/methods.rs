@@ -193,6 +193,49 @@ methods! {
     /// it.
     LibraryStats: "library.stats", Query, needs_full: false,
     NoParams => LibraryStats;
+
+    /// `identity.dryRun`: runs the resolver again over the stored
+    /// revisions, by policy 1 or by other values put in its place, and
+    /// says what that would change. It writes nothing. It names files by
+    /// path, so it needs a `full` session.
+    IdentityDryRun: "identity.dryRun", Query, needs_full: true,
+    DryRunParams => DryRun;
+
+    /// `identity.review`: every binding marked for review, with the
+    /// candidate it nearly matched and why it did not bind. It names files
+    /// by path, so it needs a `full` session.
+    IdentityReview: "identity.review", Query, needs_full: true,
+    NoParams => ReviewList;
+
+    /// `list.open`: resolves a query into a view this session holds, and
+    /// answers with its ID, its exact total and, if asked, its first rows.
+    /// With `replaces` it closes that view and says where its anchor row
+    /// is in this one.
+    ListOpen: "list.open", Session, needs_full: false,
+    ListOpenParams => ListOpened;
+
+    /// `list.window`: rows of a view, read as the library has them now.
+    ListWindowCall: "list.window", Query, needs_full: false,
+    ListWindowParams => ListWindow;
+
+    /// `list.sections`: where each letter, year or stretch of time begins
+    /// in a view.
+    ListSectionsCall: "list.sections", Query, needs_full: false,
+    ViewParams => ListSections;
+
+    /// `list.locate`: the index of a row in a view, by its ID or by the
+    /// start of its name.
+    ListLocate: "list.locate", Query, needs_full: false,
+    ListLocateParams => ListLocated;
+
+    /// `list.close`: ends a view.
+    ListClose: "list.close", Session, needs_full: false,
+    ViewParams => ListClosed;
+
+    /// `media.token`: the token a page puts in the query string of a media
+    /// URL. It is the same for the life of the session.
+    MediaTokenCall: "media.token", Session, needs_full: false,
+    NoParams => MediaToken;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -222,7 +265,15 @@ mod tests {
                 "jobs.list",
                 "jobs.get",
                 "jobs.cancel",
-                "library.stats"
+                "library.stats",
+                "identity.dryRun",
+                "identity.review",
+                "list.open",
+                "list.window",
+                "list.sections",
+                "list.locate",
+                "list.close",
+                "media.token"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -246,7 +297,9 @@ mod tests {
                 "scan.start",
                 "jobs.list",
                 "jobs.get",
-                "jobs.cancel"
+                "jobs.cancel",
+                "identity.dryRun",
+                "identity.review"
             ]
         );
         // Everything but reading the library and controlling playback

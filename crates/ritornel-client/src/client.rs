@@ -5,13 +5,15 @@ use std::net::SocketAddr;
 
 use ritornel_contract::methods::{
     EventsSubscribe, EventsUnsubscribe, JobsCancel, JobsGet, JobsList, LibraryCreate, LibraryStats,
-    Method, ScanStart, ServerHello, ServerStatus, ServersList, SourcesAdd, SourcesList,
+    ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
+    ScanStart, ServerHello, ServerStatus, ServersList, SourcesAdd, SourcesList,
 };
 use ritornel_contract::{
     Descriptor, EVENT_METHOD, Event, Frame, HelloParams, Id, JobCancelParams, JobCancelled,
-    JobDetail, JobGetParams, LibraryCreateParams, LibraryCreated, NoParams, Request, RequestId,
-    Response, ScanStartParams, ScanStarted, SourceAdded, SourcesAddParams, Subscriptions, Topic,
-    TopicsParams,
+    JobDetail, JobGetParams, LibraryCreateParams, LibraryCreated, ListClosed, ListLocateParams,
+    ListLocated, ListOpenParams, ListOpened, ListSections, ListWindow, ListWindowParams,
+    MediaToken, NoParams, Request, RequestId, Response, ScanStartParams, ScanStarted, SourceAdded,
+    SourcesAddParams, Subscriptions, Topic, TopicsParams, ViewParams,
 };
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -222,6 +224,49 @@ impl Client {
     /// it.
     pub async fn library_stats(&self) -> Result<ritornel_contract::LibraryStats, Error> {
         self.call::<LibraryStats>(&NoParams {}).await
+    }
+
+    /// `list.open`: resolves a query into a view, and answers with its ID,
+    /// its total and the window asked for.
+    pub async fn list_open(&self, params: &ListOpenParams) -> Result<ListOpened, Error> {
+        self.call::<ListOpen>(params).await
+    }
+
+    /// `list.window`: rows of a view, read as the library has them now.
+    pub async fn list_window(
+        &self,
+        view: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<ListWindow, Error> {
+        let params = ListWindowParams {
+            view: view.to_owned(),
+            offset,
+            limit,
+        };
+        self.call::<ListWindowCall>(&params).await
+    }
+
+    /// `list.sections`: where each letter, year or stretch of time begins.
+    pub async fn list_sections(&self, view: &str) -> Result<ListSections, Error> {
+        let view = view.to_owned();
+        self.call::<ListSectionsCall>(&ViewParams { view }).await
+    }
+
+    /// `list.locate`: a row's index, by its ID or the start of its name.
+    pub async fn list_locate(&self, params: &ListLocateParams) -> Result<ListLocated, Error> {
+        self.call::<ListLocate>(params).await
+    }
+
+    /// `list.close`: ends a view.
+    pub async fn list_close(&self, view: &str) -> Result<ListClosed, Error> {
+        let view = view.to_owned();
+        self.call::<ListClose>(&ViewParams { view }).await
+    }
+
+    /// `media.token`: the token that reads covers from the query string.
+    pub async fn media_token(&self) -> Result<MediaToken, Error> {
+        self.call::<MediaTokenCall>(&NoParams {}).await
     }
 
     /// The next event, waiting until there is one. `None` once the

@@ -519,7 +519,7 @@ impl ScanRun {
                 facts: Facts::from_claims(&extract(payload)),
             });
         }
-        let kept = judge_replacements(&model, &replacements, &Policy::v1());
+        let kept = judge_replacements(&model, &replacements, &Policy::current());
         let mut ops = Vec::with_capacity(replaced.len());
         for ((item, payload), kept) in replaced.into_iter().zip(kept) {
             if kept {

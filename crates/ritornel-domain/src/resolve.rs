@@ -1,5 +1,13 @@
-//! Resolver policy 1: which recording each source item is. See "Resolver
-//! policy 1" and "Merge, split and never-link" in docs/design/identity.md.
+//! The resolver: which recording each source item is. See "Resolver policy
+//! 1" and "Merge, split and never-link" in docs/design/identity.md.
+//!
+//! One ladder serves every policy; a [`Policy`] is the numbers and switches
+//! it decides by. Policy 2, which scans resolve by, is policy 1 with four
+//! values changed after it was tuned on a real library: accents folded,
+//! both disc rules on, and a match on tags alone bound across two albums
+//! only when the lengths agree almost exactly
+//! ([`Policy::tags_bind_across_albums`],
+//! [`Policy::across_albums_within_ms`]).
 //!
 //! Items are taken in first-seen order, and each sees only what the items
 //! before it said. A recording is made by the first item that binds to
@@ -7,14 +15,21 @@
 //! the next, which is what makes a second run over the same library decide
 //! the same thing.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::extract::Facts;
-use crate::library::{Candidate, Decision, Evidence, Item, Kind, Library, Method, Penalties};
-use crate::normalize::{core, difference, normalize};
+use crate::library::{
+    AcrossAlbums, Candidate, Decision, Evidence, Item, Kind, Library, Method, Penalties, Withheld,
+    WithheldCause,
+};
+use unicode_normalization::UnicodeNormalization;
 
-/// The version of this policy: `identity_decision.resolver_version`.
-pub const RESOLVER_VERSION: i64 = 1;
+use crate::normalize::{core, difference, fold_accents, normalize};
+
+/// The version of the policy scans resolve by, [`Policy::current`]: what
+/// `identity_decision.resolver_version` records for a decision it makes.
+pub const RESOLVER_VERSION: i64 = 2;
 
 /// Words that mark a different version of a song. One that is in a title
 /// and not in the other can only stop a match. "Remaster" is not here: a
@@ -52,6 +67,19 @@ const VERSION_MARKERS: &[&str] = &[
     "stripped",
 ];
 
+/// Spellings of "a cappella". Policy 2's markers read every one as the
+/// same marker, so that two spellings never stop a match and one spelling
+/// against none does; policy 1 knows only the first two, as two markers.
+const CAPPELLA: &[&str] = &["acapella", "cappella", "capella", "acappella"];
+
+/// The words that, followed by a number, name a part: "Part II", "Pt. 2".
+const PART: &[&str] = &["part", "pt"];
+
+/// Number words a part may be written in.
+const NUMBERS: &[&str] = &[
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+];
+
 /// The markers that, in an album's title, say every track on it is a
 /// different version.
 const ALBUM_MARKERS: &[&str] = &[
@@ -71,12 +99,15 @@ const ALBUM_MARKERS: &[&str] = &[
     "sessions",
 ];
 
-/// The numbers policy 1 decides by. The thresholds are Beets' defaults
-/// applied to a different scoring function: a starting point, tuned on a
-/// real library.
+/// The numbers and switches a policy decides by. The thresholds are Beets'
+/// defaults applied to a different scoring function: a starting point,
+/// tuned on a real library. The dry run takes other values to ask what
+/// they would change; only a named policy, [`Policy::current`], is applied
+/// by a scan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
-    /// [`RESOLVER_VERSION`].
+    /// The policy's number: `identity_decision.resolver_version`. Values
+    /// changed for a dry run keep the number of the policy they vary.
     pub version: i64,
     /// A tags-and-duration match binds at this distance or less.
     pub bind_max: f64,
@@ -95,13 +126,74 @@ pub struct Policy {
     pub title_note_penalty: f64,
     /// The weights of the title, artist, duration and album penalties.
     pub weights: [f64; 4],
+    /// Whether candidate text has its accents taken off before it is
+    /// compared, so that `Élan` finds `Elan`. Stored names never change.
+    pub fold_accents: bool,
+    /// Whether sibling folders of one album whose track numbers collide,
+    /// which share no title and no year, and whose names each give a disc
+    /// of their own, are discs of one release. See the `discs` module.
+    pub discs_from_folders: bool,
+    /// Whether a trailing "Disc 2" or "CD 2" in an album title is taken
+    /// as the disc number and left out of the title. See the `discs` module.
+    pub disc_from_album_title: bool,
+    /// Whether a match on tags and duration alone may bind a file to a
+    /// recording whose only near evidence is on a different album. When it
+    /// may not, such a match is still scored and listed, the file gets a
+    /// recording of its own, and the decision is marked for review with
+    /// the match it was held back from in its evidence. The same audio and
+    /// a recording MBID bind across albums either way. What "a different
+    /// album" is: see `same_album` in this module.
+    pub tags_bind_across_albums: bool,
+    /// When tags may not bind across albums, the exception: a match on
+    /// another album still binds when the two lengths differ by this many
+    /// milliseconds or less, and the decision's evidence says so. 0 makes
+    /// no exception. Two rips of one master agree to within a CD frame
+    /// (13 ms); two different recordings of a song rarely do.
+    pub across_albums_within_ms: i64,
+    /// Whether two different tracks of one release are never one
+    /// recording by tags: a match on tags and length does not bind a file
+    /// to a recording that a file at another disc and track of the same
+    /// release is bound to. The file gets a recording of its own, marked
+    /// for review. "The same release" is the one the catalog forms: by a
+    /// release MBID, or else by album artist and title split by folder
+    /// where two folders claim one position, so two copies of an album in
+    /// two folders are two releases and still bind track to track. Two
+    /// positions differ when the track numbers do, or both files have a
+    /// disc and the discs do; a file with no track number has no position
+    /// and is never held back by this. The same audio still binds.
+    pub tracks_of_one_release_differ: bool,
+    /// Which list of version markers: 1 is policy 1's; 2 also reads every
+    /// spelling of "a cappella" as one marker, and part numbers ("Part
+    /// II", "Pt. 2") as markers.
+    pub marker_list: u8,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self::current()
+    }
 }
 
 impl Policy {
-    /// Policy 1.
+    /// The policy scans resolve by: policy 2.
+    pub fn current() -> Self {
+        Self::v2()
+    }
+
+    /// The named policy of this number, if there is one.
+    pub fn of_version(version: i64) -> Option<Self> {
+        match version {
+            1 => Some(Self::v1()),
+            2 => Some(Self::v2()),
+            _ => None,
+        }
+    }
+
+    /// Policy 1, as it was first applied. Kept unchanged so that a dry run
+    /// can still compare it with the policy in force.
     pub fn v1() -> Self {
         Self {
-            version: RESOLVER_VERSION,
+            version: 1,
             bind_max: 0.04,
             min_gap: 0.25,
             review_below: 0.25,
@@ -110,6 +202,29 @@ impl Policy {
             identifier_duration_max_ms: 10_000,
             title_note_penalty: 0.1,
             weights: [3.0, 3.0, 3.0, 0.3],
+            fold_accents: false,
+            discs_from_folders: false,
+            disc_from_album_title: false,
+            tags_bind_across_albums: true,
+            across_albums_within_ms: 0,
+            tracks_of_one_release_differ: false,
+            marker_list: 1,
+        }
+    }
+
+    /// Policy 2: policy 1 with the four choices its tuning on a real
+    /// library recommended. The free duration band stays at 2 s.
+    pub fn v2() -> Self {
+        Self {
+            version: 2,
+            fold_accents: true,
+            discs_from_folders: true,
+            disc_from_album_title: true,
+            tags_bind_across_albums: false,
+            across_albums_within_ms: 20,
+            tracks_of_one_release_differ: true,
+            marker_list: 2,
+            ..Self::v1()
         }
     }
 }
@@ -134,6 +249,11 @@ pub(crate) struct Bound {
     /// Whether the recording differs from the current assignment's.
     pub(crate) rec_changed: bool,
     pub(crate) pinned: bool,
+    /// The recording, as an index into [`Folded::recs`], that a match on
+    /// tags alone was held back from because it is on another album.
+    pub(crate) withheld: Option<usize>,
+    /// An exclusion took a candidate away from it.
+    pub(crate) blocked: bool,
     /// The item's assignment is not the resolver's to change at all.
     pub(crate) frozen: bool,
 }
@@ -154,39 +274,140 @@ struct Ev {
     artist: Option<String>,
     album_full: Option<String>,
     album_core: Option<String>,
+    /// The album artist tag, normalised. `None` when there is none.
+    album_artist: Option<String>,
+    release: Option<String>,
+    release_group: Option<String>,
     duration: Option<i64>,
-    markers: Vec<&'static str>,
-    album_markers: Vec<&'static str>,
+    markers: Vec<String>,
+    album_markers: Vec<String>,
+    /// The release the catalog puts it on, when the policy tells tracks of
+    /// one release apart.
+    on_release: Option<String>,
+    /// Its disc, where it has one, and its track, where it has a track
+    /// number.
+    position: Option<(Option<i64>, i64)>,
     mbid: Option<String>,
     ids: Vec<String>,
 }
 
-fn markers(key: Option<&str>, list: &'static [&'static str]) -> Vec<&'static str> {
-    let mut found: Vec<&'static str> = Vec::new();
-    for word in key.unwrap_or("").split(' ') {
-        if let Some(marker) = list.iter().find(|marker| **marker == word)
-            && !found.contains(marker)
-        {
+/// The number a part is written as: digits, a roman numeral up to
+/// thirty-nine, or a word up to ten.
+fn part_number(word: &str) -> Option<u32> {
+    if let Ok(number) = word.parse::<u32>() {
+        return Some(number);
+    }
+    if let Some(at) = NUMBERS.iter().position(|number| *number == word) {
+        return u32::try_from(at).ok().map(|at| at + 1);
+    }
+    let value = |c: char| match c {
+        'i' => Some(1),
+        'v' => Some(5),
+        'x' => Some(10),
+        _ => None,
+    };
+    let digits: Vec<u32> = word.chars().map(value).collect::<Option<_>>()?;
+    let mut total = 0;
+    for (at, digit) in digits.iter().enumerate() {
+        match digits.get(at + 1) {
+            Some(next) if next > digit => total -= i64::from(*digit),
+            _ => total += i64::from(*digit),
+        }
+    }
+    u32::try_from(total)
+        .ok()
+        .filter(|total| (1..40).contains(total))
+}
+
+/// The version markers in a title as it is written. The words are taken
+/// before any punctuation is stripped, so that a marker stuck to the word
+/// before it, as in `Lantern(Live)` or `Lantern-Remix`, is still a word,
+/// and also as the normaliser joins them, so that `Re-recorded` is one.
+///
+/// With policy 2's list (`list` 2), every spelling of "a cappella" is one
+/// marker, and a part number is one: "Part II", "Pt. 2" and "Part Two"
+/// are all `part 2`. Like the others, they can only stop a match.
+fn markers(text: Option<&str>, words: &'static [&'static str], list: u8) -> Vec<String> {
+    let text = text.unwrap_or("");
+    let lower: String = text.nfkc().flat_map(char::to_lowercase).collect();
+    let split: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let key = normalize(text);
+    let joined = key.split(' ');
+    let mut found: Vec<String> = Vec::new();
+    let mut add = |marker: String| {
+        if !found.contains(&marker) {
             found.push(marker);
+        }
+    };
+    for word in split.iter().copied().chain(joined) {
+        if list >= 2 && CAPPELLA.contains(&word) {
+            add("a cappella".to_owned());
+        } else if let Some(marker) = words.iter().find(|marker| **marker == word) {
+            add((*marker).to_owned());
+        }
+    }
+    if list >= 2 {
+        for pair in split.windows(2) {
+            if let [word, number] = pair
+                && PART.contains(word)
+                && let Some(number) = part_number(number)
+            {
+                add(format!("part {number}"));
+            }
         }
     }
     found.sort_unstable();
     found
 }
 
+/// Whether two positions on one release are different tracks: their track
+/// numbers differ, or both have a disc and those differ. A file with no
+/// track number has no position, and one with no disc is taken to be on
+/// whichever disc the other is, so that a copy of a disc that lost its
+/// disc tag is not parted from one that kept it.
+fn apart(a: Option<(Option<i64>, i64)>, b: Option<(Option<i64>, i64)>) -> bool {
+    match (a, b) {
+        (Some((a_disc, a_track)), Some((b_disc, b_track))) => {
+            a_track != b_track || matches!((a_disc, b_disc), (Some(a), Some(b)) if a != b)
+        }
+        _ => false,
+    }
+}
+
+/// The version markers of a title by a marker list, for tests.
+#[cfg(test)]
+pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
+    markers(Some(title), VERSION_MARKERS, list)
+}
+
 impl Ev {
-    fn of(item: i64, facts: &Facts) -> Self {
-        let full = facts.title.as_deref().map(normalize);
-        let album_full = facts.album.as_deref().map(normalize);
+    fn of(item: i64, facts: &Facts, policy: &Policy, on_release: Option<&String>) -> Self {
+        let key = |key: String| {
+            if policy.fold_accents {
+                fold_accents(&key)
+            } else {
+                key
+            }
+        };
+        let full = facts.title.as_deref().map(normalize).map(key);
+        let album_full = facts.album.as_deref().map(normalize).map(key);
         Self {
             item,
             rec: usize::MAX,
-            core: facts.title.as_deref().map(core),
-            artist: facts.artist_text().as_deref().map(normalize),
-            album_core: facts.album.as_deref().map(core),
+            core: facts.title.as_deref().map(core).map(key),
+            artist: facts.artist_text().as_deref().map(normalize).map(key),
+            album_core: facts.album.as_deref().map(core).map(key),
+            album_artist: facts.album_artist_text().as_deref().map(normalize).map(key),
+            release: facts.release_mbid.clone(),
+            release_group: facts.release_group_mbid.clone(),
             duration: facts.duration_ms,
-            markers: markers(full.as_deref(), VERSION_MARKERS),
-            album_markers: markers(album_full.as_deref(), ALBUM_MARKERS),
+            markers: markers(facts.title.as_deref(), VERSION_MARKERS, policy.marker_list),
+            album_markers: markers(facts.album.as_deref(), ALBUM_MARKERS, policy.marker_list),
+            on_release: on_release.cloned(),
+            position: facts.track.map(|track| (facts.disc, track)),
             mbid: facts.recording_mbid.clone(),
             ids: facts
                 .isrcs
@@ -224,6 +445,12 @@ struct Fold<'a> {
     title_alias: Aliases,
     artist_alias: Aliases,
     excluded: HashMap<i64, HashSet<i64>>,
+    /// Set when an exclusion takes a candidate away from the item being
+    /// decided.
+    blocked: Cell<bool>,
+    /// The release each item is on, by its row, when the policy tells two
+    /// tracks of one release apart.
+    releases: HashMap<i64, String>,
 }
 
 enum Outcome {
@@ -239,7 +466,40 @@ enum Outcome {
     },
     New {
         decision: Decision,
+        /// The recording a match on tags was held back from.
+        withheld: Option<usize>,
     },
+}
+
+/// A candidate recording: its distance, what made it up, its index in the
+/// fold, the item whose evidence it is, and whether that evidence is on
+/// another album.
+#[derive(Debug, Clone, Copy)]
+struct Weighed {
+    distance: f64,
+    penalties: Penalties,
+    rec: usize,
+    item: i64,
+    across: bool,
+    /// How far apart the two lengths are, when both are known.
+    apart_ms: Option<i64>,
+    /// An item bound to this recording that is another track of the
+    /// file's own release.
+    clash: Option<i64>,
+}
+
+impl Weighed {
+    /// Whether the policy lets tags bind to this candidate at all: one on
+    /// the same album, or on another whose length agrees closely enough.
+    fn may_bind(&self, policy: &Policy) -> bool {
+        self.clash.is_none()
+            && (policy.tags_bind_across_albums
+                || !self.across
+                || (policy.across_albums_within_ms > 0
+                    && self
+                        .apart_ms
+                        .is_some_and(|apart| apart <= policy.across_albums_within_ms)))
+    }
 }
 
 fn learn(aliases: &mut Aliases, a: &str, b: &str) {
@@ -275,9 +535,14 @@ impl<'a> Fold<'a> {
         }
         let (mut title_alias, mut artist_alias) = (Aliases::new(), Aliases::new());
         for (kind, a, b) in &library.aliases {
+            let (a, b) = if policy.fold_accents {
+                (fold_accents(a), fold_accents(b))
+            } else {
+                (a.clone(), b.clone())
+            };
             match kind {
-                Kind::Recording => learn(&mut title_alias, a, b),
-                Kind::Artist => learn(&mut artist_alias, a, b),
+                Kind::Recording => learn(&mut title_alias, &a, &b),
+                Kind::Artist => learn(&mut artist_alias, &a, &b),
                 _ => {}
             }
         }
@@ -295,6 +560,12 @@ impl<'a> Fold<'a> {
             title_alias,
             artist_alias,
             excluded,
+            blocked: Cell::new(false),
+            releases: if policy.tracks_of_one_release_differ {
+                crate::catalog::release_keys(library)
+            } else {
+                HashMap::new()
+            },
         }
     }
 
@@ -322,13 +593,51 @@ impl<'a> Fold<'a> {
     }
 
     fn is_excluded(&self, item: i64, rec: usize) -> bool {
-        match self.recs.get(rec).map(|rec| rec.key) {
+        let excluded = match self.recs.get(rec).map(|rec| rec.key) {
             Some(RecKey::Row(row)) => self
                 .excluded
                 .get(&item)
                 .is_some_and(|recordings| recordings.contains(&row)),
             _ => false,
+        };
+        if excluded {
+            self.blocked.set(true);
         }
+        excluded
+    }
+
+    /// Whether two items' claims put them on the same album, by which
+    /// [`Policy::tags_bind_across_albums`] decides. `None` when either has
+    /// no album tag: an album not known is not a different one, so the
+    /// switch leaves such a pair alone.
+    ///
+    /// - With a release-group MBID on both, the album is the same when the
+    ///   IDs are: a remaster or a deluxe edition in the original's group is
+    ///   the same album, and two self-titled albums are not.
+    /// - Otherwise, one release MBID on both is the same album.
+    /// - Otherwise it is the same when the normalised titles are, whole or
+    ///   without a bracketed note (`Long Field` and `Long Field (Deluxe)`),
+    ///   and the album artists are, when both files have an album artist
+    ///   tag. Two copies of one album in different folders are therefore
+    ///   one album, and so are two copies of a various-artists compilation
+    ///   tagged with no album artist; a compilation and an artist's own
+    ///   album, titled differently, are two.
+    fn same_album(&self, a: &Ev, b: &Ev) -> Option<bool> {
+        let (Some(a_full), Some(b_full)) = (&a.album_full, &b.album_full) else {
+            return None;
+        };
+        if let (Some(a), Some(b)) = (&a.release_group, &b.release_group) {
+            return Some(a == b);
+        }
+        if a.release.is_some() && a.release == b.release {
+            return Some(true);
+        }
+        let titles = a_full == b_full || a.album_core == b.album_core;
+        let artists = match (&a.album_artist, &b.album_artist) {
+            (Some(a), Some(b)) => a == b || aliased(&self.artist_alias, a, b),
+            _ => true,
+        };
+        Some(titles && artists)
     }
 
     /// The distance between an item and one item's evidence for a
@@ -487,10 +796,19 @@ impl<'a> Fold<'a> {
                     (Some(a), Some(b)) => difference(a, b) > 0.5,
                     _ => false,
                 };
+                // A version marker on one side and not the other is a clear
+                // disagreement: a live take does not share a studio
+                // recording's ID, whatever the tags claim.
+                let versions_disagree = probe.markers != ev.markers;
                 if apart > self.policy.identifier_duration_max_ms {
                     contradictions.push(format!(
                         "mb_recording {mbid} is carried by item {} whose duration differs by {} ms",
                         ev.item, apart
+                    ));
+                } else if versions_disagree {
+                    contradictions.push(format!(
+                        "mb_recording {mbid} is carried by item {} under another version: {:?} and {:?}",
+                        ev.item, probe.markers, ev.markers
                     ));
                 } else if titles_disagree {
                     contradictions.push(format!(
@@ -516,8 +834,9 @@ impl<'a> Fold<'a> {
 
         // Step 3: tags plus duration. It needs a title and an artist from
         // the tags, and is skipped after a contradiction.
+        let policy = self.policy;
         let mut claims = Vec::new();
-        let mut candidates: Vec<(f64, Penalties, usize, i64)> = Vec::new();
+        let mut candidates: Vec<Weighed> = Vec::new();
         if contradictions.is_empty()
             && let (Some(full), Some(core), Some(artist)) =
                 (&probe.full, &probe.core, &probe.artist)
@@ -540,7 +859,16 @@ impl<'a> Fold<'a> {
             for alias in self.title_alias.get(full).into_iter().flatten() {
                 indexes.extend(self.by_full.get(alias).into_iter().flatten().copied());
             }
-            let mut best: HashMap<usize, (f64, Penalties, i64)> = HashMap::new();
+            // Each recording is weighed by its nearest evidence. When tags
+            // may not bind across albums, evidence they may bind by that is
+            // near enough to bind comes first, so that a copy of the file's
+            // own album is what the recording is weighed by.
+            let rank = |weighed: &Weighed| -> (bool, f64) {
+                let bindable = weighed.may_bind(policy) && weighed.distance <= policy.bind_max;
+                (!bindable, weighed.distance)
+            };
+            let mut best: HashMap<usize, Weighed> = HashMap::new();
+            let mut clashes: HashMap<usize, i64> = HashMap::new();
             for index in indexes {
                 let Some(ev) = self.evs.get(index) else {
                     continue;
@@ -558,72 +886,138 @@ impl<'a> Fold<'a> {
                 if other_mbid {
                     continue;
                 }
+                // Another track of the file's own release: whatever the
+                // tags say, two positions on one release are two
+                // recordings, so tags never bind to its recording.
+                if policy.tracks_of_one_release_differ
+                    && probe.on_release.is_some()
+                    && probe.on_release == ev.on_release
+                    && apart(probe.position, ev.position)
+                {
+                    clashes.entry(ev.rec).or_insert(ev.item);
+                }
                 if let Some((distance, penalties)) = self.distance(probe, ev) {
-                    let entry = best.entry(ev.rec).or_insert((distance, penalties, ev.item));
-                    if distance < entry.0 {
-                        *entry = (distance, penalties, ev.item);
+                    let weighed = Weighed {
+                        distance,
+                        penalties,
+                        rec: ev.rec,
+                        item: ev.item,
+                        across: self.same_album(probe, ev) == Some(false),
+                        apart_ms: probe.duration.zip(ev.duration).map(|(a, b)| (a - b).abs()),
+                        clash: None,
+                    };
+                    let entry = best.entry(ev.rec).or_insert(weighed);
+                    if rank(&weighed) < rank(entry) {
+                        *entry = weighed;
                     }
                 }
             }
             candidates = best
-                .into_iter()
-                .map(|(rec, (distance, penalties, item))| (distance, penalties, rec, item))
+                .into_values()
+                .map(|weighed| Weighed {
+                    clash: clashes.get(&weighed.rec).copied(),
+                    ..weighed
+                })
                 .collect();
-            candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)));
+            candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.rec.cmp(&b.rec)));
         }
         let listed: Vec<Candidate> = candidates
             .iter()
             .take(5)
-            .map(|(distance, _, _, item)| Candidate {
-                item: *item,
-                distance: *distance,
+            .map(|weighed| Candidate {
+                item: weighed.item,
+                distance: weighed.distance,
+                penalties: Some(weighed.penalties),
             })
             .collect();
-        let gap = match (candidates.first(), candidates.get(1)) {
-            (Some(best), Some(next)) => Some(next.0 - best.0),
+        let gap_of = |list: &[&Weighed]| match (list.first(), list.get(1)) {
+            (Some(best), Some(next)) => Some(next.distance - best.distance),
             _ => None,
         };
-        if let Some((distance, penalties, rec, _)) = candidates.first().copied()
-            && distance <= self.policy.bind_max
-            && gap.is_none_or(|gap| gap >= self.policy.min_gap)
-        {
+        let binds = |list: &[&Weighed]| {
+            list.first().copied().copied().filter(|best| {
+                best.distance <= policy.bind_max
+                    && gap_of(list).is_none_or(|gap| gap >= policy.min_gap)
+            })
+        };
+        let all: Vec<&Weighed> = candidates.iter().collect();
+        // Only the candidates tags may bind to: when they may not bind
+        // across albums, one on another album, at a length that is not the
+        // same, is no binding and no runner-up to one either.
+        let bindable: Vec<&Weighed> = candidates
+            .iter()
+            .filter(|weighed| weighed.may_bind(policy))
+            .collect();
+        if let Some(best) = binds(&bindable) {
             return Outcome::Bind {
-                rec,
+                rec: best.rec,
                 decision: Decision {
                     method: Method::TagsDuration,
-                    score: distance,
-                    runner_up_gap: gap,
-                    penalties: Some(penalties),
+                    score: best.distance,
+                    runner_up_gap: gap_of(&bindable),
+                    penalties: Some(best.penalties),
                     evidence: Evidence {
                         claims,
                         candidates: listed,
                         contradictions: Vec::new(),
+                        withheld: None,
+                        // Bound across albums only by the exception for an
+                        // all but equal length, which says so.
+                        across_albums: (best.across && !policy.tags_bind_across_albums).then(
+                            || AcrossAlbums {
+                                length_difference_ms: best.apart_ms.unwrap_or_default(),
+                            },
+                        ),
                     },
                     needs_review: false,
                     aliases: Vec::new(),
                 },
             };
         }
+        // The nearest match was near enough to bind, and the policy does
+        // not let tags bind to it: it is another track of the file's own
+        // release, or on another album at another length. It is held back
+        // whatever the runner-up: when several albums carry the song, a
+        // policy that never binds across them finds each of them close.
+        let withheld = candidates
+            .first()
+            .copied()
+            .filter(|best| !best.may_bind(policy) && best.distance <= policy.bind_max);
 
-        // Step 4: nothing bound. Policy 1 never binds on a doubtful match:
-        // it makes a recording and marks the decision for review.
+        // Step 4: nothing bound. A doubtful match never binds: the item
+        // gets a recording of its own, and the decision is marked for
+        // review.
         let doubtful = candidates
             .iter()
-            .any(|(distance, ..)| *distance < self.policy.review_below);
+            .any(|weighed| weighed.distance < policy.review_below);
         Outcome::New {
             decision: Decision {
                 method: Method::New,
                 score: 0.0,
-                runner_up_gap: gap,
+                runner_up_gap: gap_of(&all),
                 penalties: None,
-                needs_review: doubtful || !contradictions.is_empty(),
+                needs_review: doubtful || !contradictions.is_empty() || withheld.is_some(),
                 evidence: Evidence {
                     claims,
                     candidates: listed,
                     contradictions,
+                    across_albums: None,
+                    withheld: withheld.map(|best| match best.clash {
+                        Some(item) => Withheld {
+                            cause: WithheldCause::SameRelease,
+                            item,
+                            recording: None,
+                        },
+                        None => Withheld {
+                            cause: WithheldCause::OtherAlbum,
+                            item: best.item,
+                            recording: None,
+                        },
+                    }),
                 },
                 aliases: Vec::new(),
             },
+            withheld: withheld.map(|best| best.rec),
         }
     }
 
@@ -657,20 +1051,40 @@ impl<'a> Fold<'a> {
         let library = self.library;
         let mut bounds = Vec::with_capacity(library.items.len());
         for (index, item) in library.items.iter().enumerate() {
-            let probe = Ev::of(item.id, &item.facts);
+            let probe = Ev::of(
+                item.id,
+                &item.facts,
+                self.policy,
+                self.releases.get(&item.id),
+            );
             let current = item.current;
-            let (rec, decision, pinned, frozen) = match self.decide(item, &probe, false) {
+            self.blocked.set(false);
+            let outcome = self.decide(item, &probe, false);
+            let blocked = self.blocked.get();
+            let mut withheld = None;
+            let (rec, decision, pinned, frozen) = match outcome {
                 Outcome::Unbound => (None, None, false, true),
                 Outcome::Keep { pinned } => {
                     let rec = current.map(|current| self.rec_for_row(current.recording));
                     (rec, None, pinned, true)
                 }
                 Outcome::Bind { rec, decision } => (Some(rec), Some(decision), false, false),
-                Outcome::New { decision } => {
-                    // An item whose recording was made for it keeps it.
+                Outcome::New {
+                    decision,
+                    withheld: held,
+                } => {
+                    withheld = held;
+                    // An item whose recording was made for it keeps it,
+                    // unless the owner has said the item is not that
+                    // recording, wherever its redirects lead.
                     let own = current
                         .filter(|current| current.method == Method::New && !current.by_user)
                         .map(|current| current.recording)
+                        .filter(|row| {
+                            !self.excluded.get(&item.id).is_some_and(|recordings| {
+                                recordings.contains(&self.canonical(*row))
+                            })
+                        })
                         .filter(|row| self.founded.insert(*row));
                     let rec = match own {
                         Some(row) => self.rec_for_row(row),
@@ -704,6 +1118,8 @@ impl<'a> Fold<'a> {
                 decision,
                 rec_changed: !same,
                 pinned,
+                withheld,
+                blocked,
                 frozen,
             });
         }
@@ -765,7 +1181,7 @@ pub fn judge_replacements(
                 facts: replacement.facts.clone(),
                 current: None,
             };
-            let probe = Ev::of(as_new.id, &as_new.facts);
+            let probe = Ev::of(as_new.id, &as_new.facts, policy, None);
             matches!(fold.decide(&as_new, &probe, true), Outcome::Bind { rec, .. } if rec == had)
         })
         .collect()

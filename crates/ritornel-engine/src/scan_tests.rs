@@ -27,18 +27,18 @@ fn id(byte: u8) -> Id {
 }
 
 /// A server with a library in memory, and one root in a temporary folder.
-struct Rig {
+pub(crate) struct Rig {
     scratch: Scratch,
     clock: Arc<FixedClock>,
-    server: ServerStore,
-    library: LibraryStore,
-    main: Source,
+    pub(crate) server: ServerStore,
+    pub(crate) library: LibraryStore,
+    pub(crate) main: Source,
     commands: u8,
     boot: u8,
 }
 
 impl Rig {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let scratch = Scratch::new();
         let clock = Arc::new(FixedClock::at(T0));
         let entropy = Arc::new(CountingEntropy::default());
@@ -119,7 +119,7 @@ impl Rig {
     /// Puts a copy of a fixture at a path under the main root, with a time
     /// of its own, so that a file replaced within a millisecond still
     /// reads as changed.
-    fn put(&mut self, path: &str, fixture: &str) {
+    pub(crate) fn put(&mut self, path: &str, fixture: &str) {
         let to = self.root().join(path);
         self.put_at(&to, fixture);
     }
@@ -142,7 +142,11 @@ impl Rig {
     }
 
     /// Runs a scan of a source as a claimed job.
-    fn try_scan(&mut self, source: &Source, settings: ScanSettings) -> Result<ScanSummary, Error> {
+    pub(crate) fn try_scan(
+        &mut self,
+        source: &Source,
+        settings: ScanSettings,
+    ) -> Result<ScanSummary, Error> {
         let new = NewJob {
             kind: "scan",
             dedupe_key: source.name.clone(),
@@ -157,7 +161,7 @@ impl Rig {
 
     /// Claims the queued job under a new run of the server and carries it
     /// on to its end.
-    fn resume(&mut self, settings: ScanSettings) -> Result<ScanSummary, Error> {
+    pub(crate) fn resume(&mut self, settings: ScanSettings) -> Result<ScanSummary, Error> {
         self.boot += 1;
         self.clock.set(self.clock_ms() + 1000);
         self.server
@@ -186,12 +190,12 @@ impl Rig {
         self.clock.now_ms()
     }
 
-    fn scan(&mut self) -> ScanSummary {
+    pub(crate) fn scan(&mut self) -> ScanSummary {
         let source = self.main.clone();
         self.try_scan(&source, ScanSettings::default()).unwrap()
     }
 
-    fn rows(&self, sql: &str) -> Vec<String> {
+    pub(crate) fn rows(&self, sql: &str) -> Vec<String> {
         self.library
             .read(|connection| {
                 let mut statement = connection.prepare(sql)?;
@@ -219,18 +223,18 @@ impl Rig {
             .unwrap()
     }
 
-    fn one(&self, sql: &str) -> String {
+    pub(crate) fn one(&self, sql: &str) -> String {
         let rows = self.rows(sql);
         assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
         rows.into_iter().next().unwrap()
     }
 
-    fn revision(&self) -> i64 {
+    pub(crate) fn revision(&self) -> i64 {
         self.library.meta().unwrap().revision
     }
 
     /// Every row of every table, as text: what a write would change.
-    fn dump(&self) -> Vec<String> {
+    pub(crate) fn dump(&self) -> Vec<String> {
         let tables = self.rows(
             "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'search_text_%' ORDER BY name",
         );
@@ -321,12 +325,12 @@ fn a_first_scan_records_every_file_and_resolves_the_ones_it_can_read() {
         ),
         ["Elsewhere/broken.m4a|malformed|-", "Elsewhere/not-audio.flac|unsupported|-"]
     );
-    // Claims are extractor 1's, and the embedded picture is the cover.
+    // Claims are this extractor's, and the embedded picture is the cover.
     assert_eq!(
         rig.one(
             "SELECT count(DISTINCT extractor_version), min(extractor_version) FROM metadata_claim"
         ),
-        "1|1"
+        format!("1|{}", ritornel_domain::EXTRACTOR_VERSION)
     );
     assert_eq!(
         rig.rows("SELECT namespace, value FROM identifier_claim WHERE scope = 'release_group'"),
@@ -346,7 +350,11 @@ fn a_first_scan_records_every_file_and_resolves_the_ones_it_can_read() {
     );
     assert_eq!(
         rig.one("SELECT value_json FROM library_setting"),
-        r#"{"extractor":1,"resolver":1,"normalizer":1}"#
+        format!(
+            r#"{{"extractor":{},"resolver":{},"normalizer":1}}"#,
+            ritornel_domain::EXTRACTOR_VERSION,
+            ritornel_domain::RESOLVER_VERSION
+        )
     );
     // Every row a scan wrote is stamped with the revision that wrote it.
     assert_eq!(
@@ -728,9 +736,14 @@ fn a_root_that_is_unreachable_or_empty_fails_the_scan_and_marks_nothing_missing(
     std::fs::rename(&root, &away).unwrap();
     let main = rig.main.clone();
 
-    for empty in [false, true] {
-        if empty {
-            std::fs::create_dir(&root).unwrap();
+    // Not there; there and empty; there with only what macOS leaves at an
+    // unmounted share's mount point; there with no audio at all.
+    for step in 0..4 {
+        match step {
+            1 => std::fs::create_dir(&root).unwrap(),
+            2 => std::fs::write(root.join(".DS_Store"), b"Bud1").unwrap(),
+            3 => std::fs::write(root.join("notes.txt"), b"not audio").unwrap(),
+            _ => {}
         }
         let refused = rig.try_scan(&main, ScanSettings::default());
         assert!(
@@ -744,7 +757,7 @@ fn a_root_that_is_unreachable_or_empty_fails_the_scan_and_marks_nothing_missing(
     assert!(failed.error.unwrap().contains("offline"));
 
     // Mounted again, everything is where it was.
-    std::fs::remove_dir(&root).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
     std::fs::rename(&away, &root).unwrap();
     assert_eq!(rig.scan().unchanged, 5);
     assert_eq!(rig.revision(), revision);

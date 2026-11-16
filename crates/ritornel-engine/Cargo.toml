@@ -31,6 +31,12 @@ sha2 = "0.11.1"
 # as what this version's demuxers deliver, and a fixture test fails if an
 # upgrade moves any hash. The decoders it brings are what the player needs.
 symphonia = { version = "=0.6.1", features = ["all"] }
+# Covers: decodes the JPEG or PNG a picture is stored as, scales it to a
+# served size and writes it as a JPEG. Only the two formats covers come in.
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
+# Decomposes text so that a list can be ordered and searched ignoring accents.
+# The version the domain's normaliser pins.
+unicode-normalization = "=0.1.25"
 
 [lints]
 workspace = true

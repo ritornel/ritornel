@@ -6,13 +6,14 @@ use std::sync::PoisonError;
 
 use ritornel_contract::methods::{JobsCancel, Method, ScanStart, SourcesAdd};
 use ritornel_contract::{
-    ErrorCode, Event, Job, JobCancelParams, JobCancelled, JobDetail, JobGetParams, JobItem,
-    JobState, JobTarget, JobsEvent, JobsList, LibraryChange, LibraryEvent, LibraryStats, Receipt,
-    ReceiptStatus, RpcError, ScanStartParams, ScanStarted, Source, SourceAdded, SourceKind,
-    SourcesAddParams, SourcesList,
+    DryRun, DryRunParams, ErrorCode, Event, Job, JobCancelParams, JobCancelled, JobDetail,
+    JobGetParams, JobItem, JobState, JobTarget, JobsEvent, JobsList, LibraryStats, Receipt,
+    ReceiptStatus, ReviewList, RpcError, ScanStartParams, ScanStarted, Source, SourceAdded,
+    SourceKind, SourcesAddParams, SourcesList,
 };
 use ritornel_engine::{
-    Client, Command, LibraryStore, NewJob, ServerStore, SubjectKind, WriteRequest, scan_summary,
+    Client, Command, LibraryStore, NewJob, ServerStore, SubjectKind, WriteRequest, is_policy,
+    scan_summary,
 };
 
 use super::{Core, Stores, failed, fingerprint, lock, revision};
@@ -23,6 +24,9 @@ const LISTED: u32 = 100;
 
 /// The longest a root's name may be, in characters.
 const MAX_ROOT_NAME: usize = 100;
+
+/// The widest free duration band a dry run may ask about: a minute.
+const MAX_DURATION_GRACE_MS: u64 = 60_000;
 
 fn unsigned(number: i64) -> u64 {
     u64::try_from(number).unwrap_or(0)
@@ -62,6 +66,7 @@ fn no_library() -> RpcError {
         ErrorCode::Unavailable,
         "this server holds no library: create one with library.create",
     )
+    .with_detail("reason", "no_library")
 }
 
 fn stored(error: ritornel_engine::Error) -> RpcError {
@@ -109,12 +114,6 @@ impl Core {
         .flatten()
     }
 
-    /// The library revision, or 0 where there is no library to ask.
-    pub(crate) fn library_revision(&self) -> u64 {
-        self.with_library(|_, library| library.meta().map_or(0, |meta| revision(meta.revision)))
-            .unwrap_or(0)
-    }
-
     fn publish(&self, event: &Event) {
         for session in lock(&self.sessions).open.values() {
             session.publish(event.clone());
@@ -126,15 +125,6 @@ impl Core {
         self.publish(&Event::Jobs(Box::new(JobsEvent { job: job(changed) })));
     }
 
-    /// Sends a hint that the library changed to every session subscribed
-    /// to the `library` topic.
-    pub(crate) fn publish_library(&self, library_revision: u64, changed: &[LibraryChange]) {
-        self.publish(&Event::Library(LibraryEvent {
-            library_revision,
-            changed: changed.to_vec(),
-        }));
-    }
-
     /// The session every command comes from: the only credential there is
     /// yet is the local one.
     fn client(&self) -> Option<Client> {
@@ -144,8 +134,8 @@ impl Core {
         })
     }
 
-    fn library<T>(
-        &self,
+    /// Runs `work` on the library, or says this server holds none.
+    pub(super) fn library<T>(
         stores: &Stores,
         work: impl FnOnce(&LibraryStore) -> Result<T, RpcError>,
     ) -> Result<T, RpcError> {
@@ -158,7 +148,7 @@ impl Core {
 
     pub(super) fn sources_list(&self, stores: &Stores) -> Result<SourcesList, RpcError> {
         let roots = stores.server.roots().map_err(stored)?;
-        let sources = self.library(stores, |library| library.sources().map_err(in_library))?;
+        let sources = Self::library(stores, |library| library.sources().map_err(in_library))?;
         Ok(SourcesList {
             sources: sources
                 .into_iter()
@@ -221,7 +211,7 @@ impl Core {
         };
         let (command_id, name, path) =
             (params.idempotency_key, name.to_owned(), params.path.clone());
-        let written = self.library(stores, |library| {
+        let written = Self::library(stores, |library| {
             stores.server.add_root(&name, &path).map_err(stored)?;
             let receipt = move |source: &ritornel_engine::Source, rev: i64| {
                 let added = SourceAdded {
@@ -245,9 +235,8 @@ impl Core {
                 .add_source(request, &name, receipt)
                 .map_err(in_library)
         })?;
-        if !written.replayed {
-            self.publish_library(revision(written.revision), &[LibraryChange::Membership]);
-        }
+        // The library tells subscribers of the write itself, after it
+        // commits (`lists::hook`).
         serde_json::from_str(&written.result_json).map_err(|error| {
             RpcError::new(
                 ErrorCode::Internal,
@@ -267,11 +256,10 @@ impl Core {
         stores: &Stores,
         params: &ScanStartParams,
     ) -> Result<ScanStarted, RpcError> {
-        let source = self
-            .library(stores, |library| {
-                library.source(params.source_id).map_err(in_library)
-            })?
-            .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "the library has no such source"))?;
+        let source = Self::library(stores, |library| {
+            library.source(params.source_id).map_err(in_library)
+        })?
+        .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "the library has no such source"))?;
         let roots = stores.server.roots().map_err(stored)?;
         if !source.on_this_server || !roots.iter().any(|(name, _)| *name == source.name) {
             return Err(RpcError::new(
@@ -374,6 +362,70 @@ impl Core {
     }
 
     pub(super) fn library_stats(&self, stores: &Stores) -> Result<LibraryStats, RpcError> {
-        self.library(stores, |library| library.stats().map_err(in_library))
+        Self::library(stores, |library| library.stats().map_err(in_library))
+    }
+
+    /// `identity.dryRun`: the resolver run again, by the policy scans use,
+    /// by another named policy, or with values the params put in its
+    /// place. It writes nothing.
+    pub(super) fn identity_dry_run(
+        &self,
+        stores: &Stores,
+        params: &DryRunParams,
+    ) -> Result<DryRun, RpcError> {
+        let policy = &params.policy;
+        for (field, value) in [
+            ("bindMax", policy.bind_max),
+            ("minGap", policy.min_gap),
+            ("reviewBelow", policy.review_below),
+        ] {
+            if value.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+                return Err(
+                    RpcError::new(ErrorCode::Invalid, format!("{field} must be 0 to 1"))
+                        .with_detail("field", field),
+                );
+            }
+        }
+        if policy.version.is_some_and(|version| !is_policy(version)) {
+            return Err(RpcError::new(ErrorCode::Invalid, "version names no policy")
+                .with_detail("field", "version"));
+        }
+        if policy
+            .marker_list
+            .is_some_and(|list| !(1..=2).contains(&list))
+        {
+            return Err(
+                RpcError::new(ErrorCode::Invalid, "markerList must be 1 or 2")
+                    .with_detail("field", "markerList"),
+            );
+        }
+        if policy
+            .across_albums_within_ms
+            .is_some_and(|ms| ms > MAX_DURATION_GRACE_MS)
+        {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                "acrossAlbumsWithinMs must be at most a minute",
+            )
+            .with_detail("field", "acrossAlbumsWithinMs"));
+        }
+        if policy
+            .duration_grace_ms
+            .is_some_and(|ms| ms > MAX_DURATION_GRACE_MS)
+        {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                "durationGraceMs must be at most a minute",
+            )
+            .with_detail("field", "durationGraceMs"));
+        }
+        Self::library(stores, |library| {
+            library.dry_run(params).map_err(in_library)
+        })
+    }
+
+    /// `identity.review`: the bindings marked for review.
+    pub(super) fn identity_review(&self, stores: &Stores) -> Result<ReviewList, RpcError> {
+        Self::library(stores, |library| library.review().map_err(in_library))
     }
 }

@@ -66,7 +66,7 @@ Exit codes:
 ";
 
 /// The command line, as clap reads it.
-#[derive(Debug, PartialEq, Eq, Parser)]
+#[derive(Debug, PartialEq, Parser)]
 #[command(name = "ritornel-server", version, propagate_version = true)]
 #[command(disable_help_subcommand = true)]
 struct Cli {
@@ -74,9 +74,13 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Debug, PartialEq, Eq, Subcommand)]
+#[derive(Debug, PartialEq, Subcommand)]
 enum Command {
     Serve(ServeArgs),
+    /// Developer-only, and not in the help: fills a library with an
+    /// invented one. See `crate::invent`.
+    #[command(hide = true)]
+    Invent(crate::invent::InventArgs),
 }
 
 /// The arguments of `ritornel-server serve`.
@@ -96,6 +100,10 @@ pub(crate) struct ServeArgs {
     pub(crate) listen: Option<String>,
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub(crate) log_level: Option<String>,
+    /// Developer-only, and not in the help: writes to an invented library
+    /// this many times a second while serving, as a scan would.
+    #[arg(long, hide = true)]
+    pub(crate) invent_churn: Option<u32>,
 }
 
 /// What a wrong command line is answered with. The messages are fixed and
@@ -166,6 +174,9 @@ fn try_run(
         Ok(Cli {
             command: Command::Serve(args),
         }) => serve::serve(&args, env, out),
+        Ok(Cli {
+            command: Command::Invent(args),
+        }) => crate::invent::run(&args, env, out),
         // Help wins wherever it is, and it is the same help.
         Err(error) if error.kind() == ErrorKind::DisplayHelp => {
             out.write_all(USAGE.as_bytes()).map_err(Error::Output)
@@ -214,6 +225,7 @@ mod tests {
             owned: true,
             listen: Some("127.0.0.1:5000".to_owned()),
             log_level: Some("debug".to_owned()),
+            invent_churn: None,
         });
         for line in [
             &[

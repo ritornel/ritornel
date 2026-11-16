@@ -327,6 +327,22 @@ impl<'a> Recorder<'a> {
 /// setting that follows the library.
 pub(crate) const VERSIONS_SETTING: &str = "identity.versions";
 
+/// The setting that says something was recorded that no resolution has
+/// seen yet. It lives in the library, beside what was recorded, so that a
+/// scan cancelled before it resolved leaves it for the next one. Only a
+/// resolution that completes removes it.
+pub(crate) const PENDING_SETTING: &str = "identity.resolution_pending";
+
+/// Says, in the write's transaction, that a resolution is owed.
+pub(crate) fn mark_pending(write: &Write<'_>) -> Result<(), Error> {
+    write.connection().execute(
+        "INSERT INTO library_setting (key, value_json, rev) VALUES (?1, 'true', ?2)
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev",
+        (PENDING_SETTING, write.rev()),
+    )?;
+    Ok(())
+}
+
 impl LibraryStore {
     /// Adds a source: a named master root on this server and the folder
     /// that is the whole of it. The root's path is not here: it is in this
@@ -490,6 +506,9 @@ impl LibraryStore {
                     }
                 }
             }
+            if !ops.is_empty() {
+                mark_pending(write)?;
+            }
             Ok(ops.len().to_string())
         })
     }
@@ -510,6 +529,8 @@ impl LibraryStore {
             for item in &items {
                 update.execute((item, write.now_ms(), write.rev()))?;
             }
+            drop(update);
+            mark_pending(write)?;
             Ok(items.len().to_string())
         })
     }
@@ -532,6 +553,7 @@ impl LibraryStore {
     pub(crate) fn rebuild_claims(&self, request: WriteRequest) -> Result<Written, Error> {
         self.write(request, |write| {
             let recorder = Recorder::new(write)?;
+            mark_pending(write)?;
             write
                 .connection()
                 .execute_batch("DELETE FROM identifier_claim; DELETE FROM metadata_claim;")?;

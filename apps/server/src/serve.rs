@@ -111,6 +111,9 @@ fn run(
         Bounds::default(),
         jobs,
     ))?;
+    if let Some(per_second) = args.invent_churn {
+        server.invent_churn(per_second)?;
+    }
     info!(server_id = %server.server_id(), name = %server.name(), "ready");
     let ready = writeln!(
         out,

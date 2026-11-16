@@ -10,9 +10,10 @@
 //!   server.db      what describes this server
 //!   library.db     the library, on the server that is its hub
 //!   logs/          JSON lines, one file a day
+//!   cache/         covers/, made on demand, and tmp/, where each is written first
 //! ```
 //!
-//! `backups/` and `cache/` arrive with what first uses them.
+//! `backups/` arrives with what first uses it.
 //!
 //! Where the directory is, and the names of `server.lock`, `server.json` and
 //! `credential`, are the contract's (`ritornel_contract::local`): a local client reads
@@ -109,6 +110,18 @@ impl DataDir {
 
     pub(crate) fn logs(&self) -> PathBuf {
         self.root.join("logs")
+    }
+
+    /// The built-in cache root, made if it is missing: `covers/` and
+    /// `tmp/` are in it. Nothing in it need be backed up.
+    pub(crate) fn cache(&self) -> Result<PathBuf, Error> {
+        let cache = self.root.join("cache");
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&cache)
+            .map_err(io_error("create", &cache))?;
+        Ok(cache)
     }
 }
 

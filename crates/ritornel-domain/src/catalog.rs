@@ -162,6 +162,9 @@ struct Active<'a> {
     /// The index of its release in `releases`.
     release: Option<usize>,
     appearance: Option<usize>,
+    /// The owner's assignment holds it where it is. Its claims are still
+    /// projected onto what it is bound to.
+    pinned: bool,
 }
 
 /// A release being formed.
@@ -277,6 +280,114 @@ fn union(parents: &mut [usize], a: usize, b: usize) {
     }
 }
 
+/// The album artist credit of each item that has an album: its album
+/// artist tag, or else the artist its folder's files of that album share,
+/// or else various.
+fn release_credits(items: &[&Item]) -> Vec<Option<CreditSpec>> {
+    let mut shared: HashMap<(&str, String), Option<String>> = HashMap::new();
+    for item in items {
+        let facts = &item.facts;
+        if let (Some(album), true) = (&facts.album, facts.album_artist.is_empty()) {
+            let artist = facts.artist_text().unwrap_or_default();
+            shared
+                .entry((item.folder.as_str(), normalize(album)))
+                .and_modify(|one| {
+                    if one
+                        .as_ref()
+                        .is_some_and(|one| normalize(one) != normalize(&artist))
+                    {
+                        *one = None;
+                    }
+                })
+                .or_insert(Some(artist));
+        }
+    }
+    items
+        .iter()
+        .map(|item| {
+            let facts = &item.facts;
+            let album = facts.album.as_ref()?;
+            credit(
+                &facts.album_artist,
+                &[],
+                &facts.album_artist_mbids,
+                facts.album_artist_sort.as_ref(),
+            )
+            .or_else(|| {
+                let artist = shared
+                    .get(&(item.folder.as_str(), normalize(album)))
+                    .cloned()
+                    .flatten()
+                    .filter(|artist| !artist.is_empty())
+                    .unwrap_or_else(|| VARIOUS.to_owned());
+                credit(&[artist], &[], &[], None)
+            })
+        })
+        .collect()
+}
+
+/// Forms releases from items and their album artist credits: a release
+/// MBID picks the release, and otherwise album artist and album title do,
+/// split by folder where two folders claim the same disc and track. Gives
+/// each release's key and the indexes of its members. An item with no
+/// album is on none.
+fn form_releases(items: &[(usize, &Item, Option<&CreditSpec>)]) -> Vec<(String, Vec<usize>)> {
+    let mut keyed: BTreeMap<String, Vec<(usize, &Item)>> = BTreeMap::new();
+    for (index, item, spec) in items {
+        let facts: &Facts = &item.facts;
+        let Some(album) = &facts.album else { continue };
+        let key = match &facts.release_mbid {
+            Some(mbid) => format!("m\u{1f}{mbid}"),
+            None => format!(
+                "t\u{1f}{}\u{1f}{}",
+                spec.map(|credit| normalize(&credit.text))
+                    .unwrap_or_default(),
+                normalize(album)
+            ),
+        };
+        keyed.entry(key).or_default().push((*index, item));
+    }
+    let mut formed = Vec::new();
+    for (key, members) in keyed {
+        if key.starts_with('m') {
+            formed.push((key, members.into_iter().map(|(index, _)| index).collect()));
+            continue;
+        }
+        for (part, members) in split_by_folder(&members).into_iter().enumerate() {
+            formed.push((format!("{key}\u{1f}{part}"), members));
+        }
+    }
+    formed
+}
+
+/// The release each item's claims put it on, as the catalog forms releases
+/// for files the resolver places, by the source item's row. The resolver
+/// reads it to tell two tracks of one release apart before anything is
+/// bound. An item with no album, or no audio, is on none.
+pub(crate) fn release_keys(library: &Library) -> HashMap<i64, String> {
+    let items: Vec<&Item> = library
+        .items
+        .iter()
+        .filter(|item| item.audio.is_some() && !item.retired)
+        .collect();
+    let credits = release_credits(&items);
+    let listed: Vec<(usize, &Item, Option<&CreditSpec>)> = items
+        .iter()
+        .zip(&credits)
+        .enumerate()
+        .map(|(index, (item, spec))| (index, *item, spec.as_ref()))
+        .collect();
+    let mut keys = HashMap::new();
+    for (key, members) in form_releases(&listed) {
+        for index in members {
+            if let Some(item) = items.get(index) {
+                keys.insert(item.id, key.clone());
+            }
+        }
+    }
+    keys
+}
+
 /// A date and its year, when the claim holds one.
 fn dated(value: Option<String>) -> (Option<String>, Option<i64>) {
     match value.as_deref().and_then(parse_date) {
@@ -285,13 +396,16 @@ fn dated(value: Option<String>) -> (Option<String>, Option<i64>) {
     }
 }
 
-/// Resolves a library: binds every item to a recording by policy 1, forms
+/// Resolves a library: binds every item to a recording by the policy, forms
 /// the catalog its claims describe, and projects what each entity shows.
 ///
 /// It is pure, and it reads the current assignments only to keep what need
 /// not change. Run on a library it has just resolved, it reports no change:
 /// that is what `re-resolve --dry-run` checks.
 pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
+    // The disc numbers the policy's release rules imply, when one is on.
+    let implied = crate::discs::apply(library, policy);
+    let library = implied.as_ref().unwrap_or(library);
     let folded = fold(library, policy);
     let edit = |kind: Kind, r: Ref, field: &str| -> Option<String> {
         match r {
@@ -318,7 +432,7 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
 
     let mut actives: Vec<Active<'_>> = Vec::new();
     for (seq, (item, bound)) in library.items.iter().zip(&folded.items).enumerate() {
-        let Some(rec) = bound.rec.filter(|_| !bound.frozen) else {
+        let Some(rec) = bound.rec.filter(|_| !bound.frozen || bound.pinned) else {
             continue;
         };
         let Some(recording) = recordings.get(rec) else {
@@ -339,86 +453,30 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             release_credit: None,
             release: None,
             appearance: None,
+            pinned: bound.pinned,
         });
     }
 
-    // The album artist of a file that has no album artist tag is the
-    // artist its folder's files of that album share, or else various.
-    let mut shared: HashMap<(&str, String), Option<String>> = HashMap::new();
-    for active in &actives {
-        let facts = &active.item.facts;
-        if let (Some(album), true) = (&facts.album, facts.album_artist.is_empty()) {
-            let artist = facts.artist_text().unwrap_or_default();
-            shared
-                .entry((active.item.folder.as_str(), normalize(album)))
-                .and_modify(|one| {
-                    if one
-                        .as_ref()
-                        .is_some_and(|one| normalize(one) != normalize(&artist))
-                    {
-                        *one = None;
-                    }
-                })
-                .or_insert(Some(artist));
-        }
+    let credits = release_credits(&actives.iter().map(|active| active.item).collect::<Vec<_>>());
+    for (active, spec) in actives.iter_mut().zip(credits) {
+        active.release_credit = spec;
     }
-    let mut keyed: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (index, active) in actives.iter_mut().enumerate() {
-        let facts: &Facts = &active.item.facts;
-        let Some(album) = &facts.album else { continue };
-        active.release_credit = credit(
-            &facts.album_artist,
-            &[],
-            &facts.album_artist_mbids,
-            facts.album_artist_sort.as_ref(),
-        )
-        .or_else(|| {
-            let artist = shared
-                .get(&(active.item.folder.as_str(), normalize(album)))
-                .cloned()
-                .flatten()
-                .filter(|artist| !artist.is_empty())
-                .unwrap_or_else(|| VARIOUS.to_owned());
-            credit(&[artist], &[], &[], None)
-        });
-        // A release MBID picks the release. Otherwise album artist and
-        // album title do.
-        let key = match &facts.release_mbid {
-            Some(mbid) => format!("m\u{1f}{mbid}"),
-            None => format!(
-                "t\u{1f}{}\u{1f}{}",
-                active
-                    .release_credit
-                    .as_ref()
-                    .map(|credit| normalize(&credit.text))
-                    .unwrap_or_default(),
-                normalize(album)
-            ),
-        };
-        keyed.entry(key).or_default().push(index);
-    }
-    let mut forming: Vec<Forming> = Vec::new();
-    for (key, members) in keyed {
-        if key.starts_with('m') {
-            forming.push(Forming {
-                key,
-                members,
-                r: Ref::New(0),
-            });
-            continue;
-        }
-        let with_items: Vec<(usize, &Item)> = members
-            .iter()
-            .filter_map(|index| actives.get(*index).map(|active| (*index, active.item)))
-            .collect();
-        for (part, members) in split_by_folder(&with_items).into_iter().enumerate() {
-            forming.push(Forming {
-                key: format!("{key}\u{1f}{part}"),
-                members,
-                r: Ref::New(0),
-            });
-        }
-    }
+    // A pinned file stays on the release it is on, which is found once the
+    // others have their rows.
+    let unpinned: Vec<(usize, &Item, Option<&CreditSpec>)> = actives
+        .iter()
+        .enumerate()
+        .filter(|(_, active)| !active.pinned)
+        .map(|(index, active)| (index, active.item, active.release_credit.as_ref()))
+        .collect();
+    let mut forming: Vec<Forming> = form_releases(&unpinned)
+        .into_iter()
+        .map(|(key, members)| Forming {
+            key,
+            members,
+            r: Ref::New(0),
+        })
+        .collect();
     let release_of = |item: &Item| -> Option<i64> {
         let appearance = item.current?.appearance?;
         let release = library.appearances.get(&appearance)?.1?;
@@ -429,6 +487,49 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 .map_or(release, |release| release.canonical),
         )
     };
+    // A merge of releases is the owner's and lasts: files on a release that
+    // a merge was made into stay one release, whatever their tags say. The
+    // formations that hold files on such a release are joined before rows
+    // are given out.
+    let merged: HashSet<i64> = library
+        .releases
+        .iter()
+        .filter(|(row, release)| **row != release.canonical)
+        .map(|(_, release)| release.canonical)
+        .collect();
+    if !merged.is_empty() {
+        let mut parents: Vec<usize> = (0..forming.len()).collect();
+        let mut holder: HashMap<i64, usize> = HashMap::new();
+        for (at, release) in forming.iter().enumerate() {
+            for member in &release.members {
+                let Some(canonical) = actives
+                    .get(*member)
+                    .and_then(|active| release_of(active.item))
+                else {
+                    continue;
+                };
+                if merged.contains(&canonical) {
+                    let first = *holder.entry(canonical).or_insert(at);
+                    union(&mut parents, first, at);
+                }
+            }
+        }
+        let mut joined: BTreeMap<usize, Forming> = BTreeMap::new();
+        for (at, release) in std::mem::take(&mut forming).into_iter().enumerate() {
+            match joined.entry(find(&mut parents, at)) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(release);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let into = entry.get_mut();
+                    into.key = into.key.clone().min(release.key);
+                    into.members.extend(release.members);
+                    into.members.sort_unstable();
+                }
+            }
+        }
+        forming = joined.into_values().collect();
+    }
     let votes = forming
         .iter()
         .map(|release| {
@@ -441,8 +542,33 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             (release.key.clone(), rows)
         })
         .collect();
-    for (index, (release, row)) in forming.iter_mut().zip(keep_rows(votes)).enumerate() {
-        release.r = row.map_or(Ref::New(index), Ref::Row);
+    for (release, row) in forming.iter_mut().zip(keep_rows(votes)) {
+        release.r = row.map_or(Ref::New(usize::MAX), Ref::Row);
+    }
+    // Each pinned file joins the release it is on, or holds it alone.
+    for (index, active) in actives.iter().enumerate() {
+        if !active.pinned {
+            continue;
+        }
+        let Some(row) = release_of(active.item) else {
+            continue;
+        };
+        match forming
+            .iter_mut()
+            .find(|release| release.r == Ref::Row(row))
+        {
+            Some(release) => release.members.push(index),
+            None => forming.push(Forming {
+                key: format!("p\u{1f}{row}"),
+                members: vec![index],
+                r: Ref::Row(row),
+            }),
+        }
+    }
+    for (index, release) in forming.iter_mut().enumerate() {
+        if release.r == Ref::New(usize::MAX) {
+            release.r = Ref::New(index);
+        }
         for member in &release.members {
             if let Some(active) = actives.get_mut(*member) {
                 active.release = Some(index);
@@ -495,6 +621,12 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                             Ref::Row(*recording) == active.assign && release == wanted_release
                         })
                 });
+            // A pinned file keeps its appearance, whatever its tags say.
+            let held = if active.pinned {
+                active.item.current.and_then(|current| current.appearance)
+            } else {
+                held
+            };
             let at = match (pass, held) {
                 (true, Some(row)) => *by_row.entry(row).or_insert_with(|| {
                     appearance_rows.push((Ref::Row(row), Vec::new()));
@@ -585,12 +717,19 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
     }
     let mut artist_keys: Vec<(&ArtistKey, &Seen)> = merged.iter().collect();
     artist_keys.sort_by(|a, b| a.1.first.cmp(&b.1.first).then(a.0.cmp(b.0)));
+    // An artist with an ID keeps the row that has its ID. One with no ID
+    // takes a row by its normalised name, among the rows with no ID: so
+    // two namesakes never swap rows, and a renamed artist keeps its own.
+    let mut id_rows: HashMap<&str, VecDeque<i64>> = HashMap::new();
     let mut free_rows: HashMap<&str, VecDeque<i64>> = HashMap::new();
     for (row, match_name) in &library.artists {
-        free_rows
-            .entry(match_name.as_str())
-            .or_default()
-            .push_back(*row);
+        match library.artist_mbids.get(row) {
+            Some(mbid) => id_rows.entry(mbid.as_str()).or_default().push_back(*row),
+            None => free_rows
+                .entry(match_name.as_str())
+                .or_default()
+                .push_back(*row),
+        }
     }
     let mut artists: Vec<ArtistOut> = Vec::new();
     let mut artist_index: HashMap<ArtistKey, usize> = HashMap::new();
@@ -599,9 +738,18 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             continue;
         };
         let match_name = normalize(&name);
-        let row = free_rows
-            .get_mut(match_name.as_str())
-            .and_then(VecDeque::pop_front);
+        let (row, mbid) = match key {
+            ArtistKey::Mbid(mbid) => (
+                id_rows.get_mut(mbid.as_str()).and_then(VecDeque::pop_front),
+                Some(mbid.clone()),
+            ),
+            ArtistKey::Name(_) => (
+                free_rows
+                    .get_mut(match_name.as_str())
+                    .and_then(VecDeque::pop_front),
+                None,
+            ),
+        };
         let r = row.map_or(Ref::New(artists.len()), Ref::Row);
         let name = edit(Kind::Artist, r, "name").unwrap_or(name);
         artist_index.insert(key.clone(), artists.len());
@@ -610,6 +758,7 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             sort_name: pick(entry.sorts.iter().cloned()).unwrap_or_else(|| name.clone()),
             name,
             match_name,
+            mbid,
         });
     }
 
@@ -996,16 +1145,35 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 current.and_then(|current| current.appearance).map(Ref::Row),
             ),
         };
+        // A decision that would mark the item for review otherwise than
+        // the one in force is written, even where the binding stays.
+        // So is one whose binding across albums by an all but equal length
+        // the one in force does not mark, or marks wrongly.
+        let review_changed = match (&bound.decision, current) {
+            (Some(decision), Some(current)) => {
+                decision.needs_review != current.needs_review
+                    || decision.evidence.across_albums.is_some() != current.across_albums
+            }
+            _ => false,
+        };
         let changed = !bound.frozen
             && (bound.rec_changed
+                || review_changed
                 || appearance != current.and_then(|current| current.appearance).map(Ref::Row));
+        let mut decision = bound.decision;
+        if let (Some(decision), Some(rec)) = (decision.as_mut(), bound.withheld)
+            && let Some(withheld) = decision.evidence.withheld.as_mut()
+        {
+            withheld.recording = recordings.get(rec).map(|out| out.r);
+        }
         items.push(ItemOut {
             item: item.id,
             recording,
             appearance,
-            decision: bound.decision,
+            decision,
             changed,
             pinned: bound.pinned,
+            blocked: bound.blocked,
         });
     }
     Resolution {

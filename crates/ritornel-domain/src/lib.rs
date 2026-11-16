@@ -3,11 +3,13 @@
 //! no SQLite.
 //!
 //! - [`payload`] is what reading one file gives, stored verbatim.
-//! - [`extract`] turns a payload into claims: extractor 1.
-//! - [`resolve`](mod@resolve) decides which recording each source item is:
-//!   resolver policy 1.
+//! - [`extract`] turns a payload into claims: extractor 2.
+//! - [`resolve`](mod@resolve) decides which recording each source item is,
+//!   by resolver policy 2 or by policy 1, which a dry run can still ask
+//!   about.
 //! - [`catalog`] forms releases, appearances, release groups and artists
-//!   from the same claims and projects what each shows.
+//!   from the same claims and projects what each shows. The disc numbers
+//!   the policy's two release rules imply are in `discs`.
 //! - [`library`] is what those are given and what they return.
 //!
 //! See docs/design/identity.md.
@@ -29,6 +31,7 @@
 use ritornel_contract as _;
 
 pub mod catalog;
+mod discs;
 pub mod extract;
 pub mod library;
 pub mod normalize;

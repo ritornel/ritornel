@@ -30,8 +30,9 @@ use ts_rs::{Config, TS, TypeVisitor};
 
 use crate::methods::{Method, MethodKind, MethodVisitor, visit_methods};
 use crate::{
-    CONTRACT_VERSION, EVENT_METHOD, Event, MAX_CLIENT_TEXT, PublicDescriptor, Receipt, RpcError,
-    SocketTicket, TICKET_PARAM, Topic, capability, route,
+    ART_SIZES, CONTRACT_VERSION, EVENT_METHOD, Event, FILTER_VERSION, MAX_CLIENT_TEXT,
+    MEDIA_TOKEN_PARAM, PublicDescriptor, Receipt, RpcError, SocketTicket, TICKET_PARAM, Topic,
+    capability, route,
 };
 
 /// The file, from the repository root.
@@ -48,11 +49,17 @@ const ROUTES: &[(&str, &str)] = &[
     ("ticket", route::TICKET),
     ("descriptor", route::DESCRIPTOR),
     ("health", route::HEALTH),
+    ("art", route::ART),
 ];
 
 /// The capability flags, by the name each has in `CAPABILITIES`. A flag
 /// added to [`capability`] is added here.
-const CAPABILITIES: &[(&str, &str)] = &[("eventsServers", capability::EVENTS_SERVERS)];
+const CAPABILITIES: &[(&str, &str)] = &[
+    ("eventsServers", capability::EVENTS_SERVERS),
+    ("eventsLibrary", capability::EVENTS_LIBRARY),
+    ("lists", capability::LISTS),
+    ("mediaArt", capability::MEDIA_ART),
+];
 
 const HEADER: &str = "\
 // The Ritornel contract as TypeScript: every call, event, error and route a
@@ -308,6 +315,21 @@ export const EVENT_METHOD = {event_method};
 export const MAX_CLIENT_TEXT = {MAX_CLIENT_TEXT};
 
 /**
+ * The name of the query parameter that carries a media token on a media
+ * route.
+ */
+export const MEDIA_TOKEN_PARAM = {media_token_param};
+
+/**
+ * The sizes a cover is served at, in pixels on its longer side. The
+ * descriptor lists the ones a server serves.
+ */
+export const ART_SIZES = [{art_sizes}] as const;
+
+/** The version of the filter language a filter is written in. */
+export const FILTER_VERSION = {FILTER_VERSION};
+
+/**
  * Every method, in the order of the contract's call list: what kind of call
  * it is, and whether it needs a `full` session.
  */
@@ -335,6 +357,12 @@ export type EventMap = {{
         capabilities = constants(CAPABILITIES),
         event_method = quoted(EVENT_METHOD),
         ticket_param = quoted(TICKET_PARAM),
+        media_token_param = quoted(MEDIA_TOKEN_PARAM),
+        art_sizes = ART_SIZES
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
         topics = topics.join(", "),
     );
     for declaration in declarations.by_name.values() {
@@ -434,9 +462,10 @@ fn the_maps_follow_the_method_table_and_the_topics() {
     assert!(text.contains("  \"library.create\": { kind: \"command\", needsFull: true },\n"));
     assert!(text.contains("  \"servers\": Extract<Event, { topic: \"servers\" }>;\n"));
     assert!(text.contains("  \"jobs\": Extract<Event, { topic: \"jobs\" }>;\n"));
-    assert!(
-        text.contains("export const TOPICS = [\"servers\", \"jobs\", \"library\"] as const;\n")
-    );
+    assert!(text.contains("  \"list\": Extract<Event, { topic: \"list\" }>;\n"));
+    assert!(text.contains(
+        "export const TOPICS = [\"servers\", \"jobs\", \"library\", \"list\"] as const;\n"
+    ));
 }
 
 #[test]

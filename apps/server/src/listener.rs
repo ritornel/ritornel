@@ -4,10 +4,11 @@
 //! docs/design/server.md.
 //!
 //! ```text
-//! GET  /v1/descriptor   the public descriptor. The one route with no credential
-//! GET  /v1/health       whether the server is up
-//! POST /v1/ticket       trades the credential for a ticket that opens one socket
-//! GET  /v1/ws           the socket that carries calls and events
+//! GET  /v1/descriptor            the public descriptor. The one route with no credential
+//! GET  /v1/health                whether the server is up
+//! POST /v1/ticket                trades the credential for a ticket that opens one socket
+//! GET  /v1/ws                    the socket that carries calls and events
+//! GET  /v1/art/{artId}/{size}    a cover, with the credential or a media token
 //! ```
 //!
 //! A connection is one of at most `Bounds::max_connections` being served,
@@ -38,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -48,7 +49,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use ritornel_contract::route::{self, Health, HealthStatus};
-use ritornel_contract::{SessionKind, TICKET_PARAM};
+use ritornel_contract::{ART_SIZES, Id, MEDIA_TOKEN_PARAM, SessionKind, TICKET_PARAM};
 use ritornel_engine::SessionToken;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
@@ -83,6 +84,8 @@ enum Presented {
     Header,
     /// A ticket, in the query string of the socket's route.
     Ticket,
+    /// A media token, in the query string of a media route.
+    MediaToken,
 }
 
 /// Binds the listener. Nobody having chosen a port, a taken default port
@@ -253,6 +256,7 @@ fn router(core: Arc<Core>, tickets: Arc<Tickets>) -> Router {
         .route(route::HEALTH, get(health))
         .route(route::TICKET, post(ticket))
         .route(route::WS, get(socket))
+        .route(&format!("{}/{{art}}/{{size}}", route::ART), get(art))
         // A path the server does not have is checked like any other, so
         // asking without a credential shows nothing of what exists.
         .fallback(|| async { StatusCode::NOT_FOUND })
@@ -287,11 +291,19 @@ async fn require_credential(
     let by_header = bearer(request.headers())
         .and_then(|token| core.authenticate(&token))
         .map(|kind| (kind, Presented::Header));
-    let admitted = by_header.or_else(|| {
-        socket_ticket(&request)
-            .and_then(|ticket| tickets.redeem(ticket))
-            .map(|kind| (kind, Presented::Ticket))
-    });
+    let admitted = by_header
+        .or_else(|| {
+            socket_ticket(&request)
+                .and_then(|ticket| tickets.redeem(ticket))
+                .map(|kind| (kind, Presented::Ticket))
+        })
+        .or_else(|| {
+            // A media token reads media, and nothing else: a session of no
+            // kind is opened with it.
+            media_token(&request)
+                .filter(|token| core.media_accepts(token))
+                .map(|_| (SessionKind::Limited, Presented::MediaToken))
+        });
     match admitted {
         Some((kind, presented)) => {
             request.extensions_mut().insert(kind);
@@ -331,6 +343,24 @@ fn socket_ticket(request: &Request) -> Option<&str> {
         .query()?
         .split('&')
         .find_map(|pair| pair.strip_prefix(TICKET_PARAM)?.strip_prefix('='))
+}
+
+/// The media token in the query string of a request for media. No other
+/// route takes one. It is handed on as it came and never printed.
+fn media_token(request: &Request) -> Option<&str> {
+    let path = request.uri().path();
+    if request.method() != Method::GET
+        || !path
+            .strip_prefix(route::ART)
+            .is_some_and(|rest| rest.starts_with('/'))
+    {
+        return None;
+    }
+    request
+        .uri()
+        .query()?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(MEDIA_TOKEN_PARAM)?.strip_prefix('='))
 }
 
 fn json<T: Serialize>(body: &T) -> Response {
@@ -380,6 +410,57 @@ async fn ticket(
             error!(error = %failed, "a ticket could not be made");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+/// A cover: `GET /v1/art/{artId}/{size}`. From the cache if it is there,
+/// or else made on a cover thread, newest request first. A client that
+/// goes before its cover is made has it dropped from the queue.
+///
+/// The answer never changes for one URL, so it may be kept for a year.
+/// A cover that cannot be found, at a size that is not a bucket or for an
+/// art ID that is not one, is 404.
+async fn art(State(core): State<Arc<Core>>, Path((art, size)): Path<(String, String)>) -> Response {
+    let (Ok(art), Ok(size)) = (art.parse::<Id>(), size.parse::<u32>()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !ART_SIZES.contains(&size) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let jpeg = |bytes: Vec<u8>| {
+        (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (
+                    header::CACHE_CONTROL,
+                    "private, max-age=31536000, immutable",
+                ),
+            ],
+            bytes,
+        )
+            .into_response()
+    };
+    // Reading a file waits on the disk, so it is not done on an async
+    // worker either.
+    let cached = core.cover_path(art, size);
+    if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || std::fs::read(cached)).await {
+        return jpeg(bytes);
+    }
+    let (send, made) = tokio::sync::oneshot::channel();
+    let worker = Arc::clone(&core);
+    // Dropped with this request, which drops the work if it has not begun.
+    let _wanted = core.submit_cover(move || {
+        let _ = send.send(worker.render_cover(art, size));
+    });
+    match made.await {
+        Ok(Ok(rendered)) => jpeg(rendered.bytes),
+        Ok(Err(
+            ritornel_engine::covers::CoverError::NotFound
+            | ritornel_engine::covers::CoverError::BadSize,
+        )) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        // The server is stopping.
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 

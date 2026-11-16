@@ -10,15 +10,17 @@
 use std::collections::HashMap;
 
 use ritornel_domain::library::{
-    Current, ExistingCredit, ExistingRelease, Item, Kind, Library, Method, Ref, Resolution,
+    Current, Evidence, ExistingCredit, ExistingRelease, Item, Kind, Library, Method, Ref,
+    Resolution,
 };
 use ritornel_domain::{
     Claim, EXTRACTOR_VERSION, Facts, NORMALIZER_VERSION, Policy, RESOLVER_VERSION, Scope, Source,
 };
 use rusqlite::{Connection, OptionalExtension};
+use serde::Serialize;
 
 use crate::library_store::Write;
-use crate::scan_store::VERSIONS_SETTING;
+use crate::scan_store::{PENDING_SETTING, VERSIONS_SETTING};
 use crate::walk::folder_of;
 use crate::{Error, LibraryStore, WriteRequest, Written};
 
@@ -49,15 +51,36 @@ pub(crate) struct Shown {
     appearances: HashMap<i64, AppearanceShown>,
     search: HashMap<i64, (String, String, String)>,
     versions: Text,
+    /// The library revision all of this was read at.
+    revision: i64,
 }
 
-fn versions() -> String {
+/// The versions a library resolved by this resolver version records: the
+/// next resolution after any of them changes is owed.
+fn versions(resolver: i64) -> String {
     format!(
-        "{{\"extractor\":{EXTRACTOR_VERSION},\"resolver\":{RESOLVER_VERSION},\"normalizer\":{NORMALIZER_VERSION}}}"
+        "{{\"extractor\":{EXTRACTOR_VERSION},\"resolver\":{resolver},\"normalizer\":{NORMALIZER_VERSION}}}"
     )
 }
 
-fn rows<T>(
+/// A decision's evidence as it is stored: what the resolver gave, and a
+/// match it held back with the recording that match names as a row.
+#[derive(Serialize)]
+struct StoredEvidence<'a> {
+    #[serde(flatten)]
+    evidence: &'a Evidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    withheld: Option<StoredWithheld>,
+}
+
+#[derive(Serialize)]
+struct StoredWithheld {
+    cause: &'static str,
+    item: i64,
+    recording: Option<i64>,
+}
+
+pub(crate) fn rows<T>(
     connection: &Connection,
     sql: &str,
     read: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
@@ -70,7 +93,11 @@ fn rows<T>(
 /// Reads the library as the resolver sees it, in one read transaction.
 pub(crate) fn load(connection: &Connection) -> Result<(Library, Shown), Error> {
     let transaction = connection.unchecked_transaction()?;
-    let connection: &Connection = &transaction;
+    load_in(&transaction)
+}
+
+/// Reads the library as the resolver sees it, in the caller's transaction.
+pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error> {
     let mut library = Library::default();
     let mut shown = Shown::default();
 
@@ -140,7 +167,8 @@ pub(crate) fn load(connection: &Connection) -> Result<(Library, Shown), Error> {
     let mut current: HashMap<i64, Current> = HashMap::new();
     let assignments = rows(
         connection,
-        "SELECT a.source_item_id, a.recording_id, a.appearance_id, d.method, d.actor_kind
+        "SELECT a.source_item_id, a.recording_id, a.appearance_id, d.method, d.actor_kind,
+                d.needs_review, json_extract(d.evidence_json, '$.across_albums') IS NOT NULL
          FROM assignment a JOIN identity_decision d ON d.id = a.decision_id
          WHERE a.superseded_at_ms IS NULL",
         |row| {
@@ -150,10 +178,12 @@ pub(crate) fn load(connection: &Connection) -> Result<(Library, Shown), Error> {
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, bool>(5)?,
+                row.get::<_, bool>(6)?,
             ))
         },
     )?;
-    for (item, recording, appearance, method, actor) in assignments {
+    for (item, recording, appearance, method, actor, needs_review, across_albums) in assignments {
         current.insert(
             item,
             Current {
@@ -161,6 +191,8 @@ pub(crate) fn load(connection: &Connection) -> Result<(Library, Shown), Error> {
                 appearance,
                 method: Method::parse(&method).ok_or(Error::Corrupt("a decision's method"))?,
                 by_user: actor != "resolver",
+                needs_review,
+                across_albums,
             },
         );
     }
@@ -338,6 +370,50 @@ pub(crate) fn load(connection: &Connection) -> Result<(Library, Shown), Error> {
     library.credits = credits.into_values().collect();
     library.credits.sort_by_key(|credit| credit.id);
 
+    // The ID each artist row is known by: the one the files whose credits
+    // name it claim at its place in the credit, counted only where a file
+    // claims as many IDs as the credit has names, which is when the credit
+    // was made from the IDs. The most claimed wins, then the least.
+    let mut votes: HashMap<i64, HashMap<String, i64>> = HashMap::new();
+    for (row, mbid, count) in rows(
+        connection,
+        "WITH placed AS (
+           SELECT a.source_item_id AS item, ta.display_artist_credit_id AS credit, 'mb_artist' AS namespace
+           FROM assignment a JOIN track_appearance ta ON ta.id = a.appearance_id
+           WHERE a.superseded_at_ms IS NULL
+           UNION ALL
+           SELECT a.source_item_id, rel.display_artist_credit_id, 'mb_album_artist'
+           FROM assignment a JOIN track_appearance ta ON ta.id = a.appearance_id
+           JOIN release rel ON rel.id = ta.release_id
+           WHERE a.superseded_at_ms IS NULL)
+         SELECT n.artist_id, c.value, count(*)
+         FROM placed p
+         JOIN artist_credit_name n ON n.artist_credit_id = p.credit
+         JOIN identifier_claim c ON c.source_item_id = p.item AND c.namespace = p.namespace
+              AND c.ordinal = n.position
+         WHERE (SELECT count(*) FROM identifier_claim o
+                WHERE o.source_item_id = p.item AND o.namespace = p.namespace)
+             = (SELECT count(*) FROM artist_credit_name o WHERE o.artist_credit_id = p.credit)
+         GROUP BY 1, 2",
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )? {
+        votes.entry(row).or_default().insert(mbid, count);
+    }
+    for (row, counted) in votes {
+        if let Some((mbid, _)) = counted
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        {
+            library.artist_mbids.insert(row, mbid);
+        }
+    }
+
     library.exclusions = rows(
         connection,
         "SELECT source_item_id, recording_id FROM identity_exclusion",
@@ -408,6 +484,10 @@ pub(crate) fn load(connection: &Connection) -> Result<(Library, Shown), Error> {
             ),
         );
     }
+    shown.revision =
+        connection.query_row("SELECT rev FROM library_meta WHERE id = 1", [], |row| {
+            row.get(0)
+        })?;
     shown.versions = connection
         .query_row(
             "SELECT value_json FROM library_setting WHERE key = ?1",
@@ -434,6 +514,12 @@ pub(crate) struct Plan {
     /// Appearances in the search index that no file is bound to any more.
     unsearchable: Vec<i64>,
     versions: bool,
+    /// The version of the policy that made the resolution, which its
+    /// decisions record.
+    resolver: i64,
+    /// The library revision the plan was made from. A write at any other
+    /// is refused, because what the plan supersedes may have changed.
+    based_on: i64,
 }
 
 /// What a resolution wrote.
@@ -457,7 +543,14 @@ fn as_row(r: Ref) -> Option<i64> {
 }
 
 impl Plan {
-    pub(crate) fn new(resolution: Resolution, library: &Library, shown: &Shown) -> Self {
+    /// The plan for a resolution that the policy of version `resolver`
+    /// made.
+    pub(crate) fn new(
+        resolution: Resolution,
+        library: &Library,
+        shown: &Shown,
+        resolver: i64,
+    ) -> Self {
         let credit = |at: Option<usize>| {
             at.and_then(|at| resolution.credits.get(at))
                 .map(|credit| credit.r)
@@ -584,6 +677,8 @@ impl Plan {
             appearances,
             search,
             versions: false,
+            resolver,
+            based_on: shown.revision,
             resolution,
         };
         // The versions are written with the first thing written, and again
@@ -591,9 +686,14 @@ impl Plan {
         let stale = shown
             .versions
             .as_ref()
-            .is_some_and(|stored| *stored != versions());
+            .is_some_and(|stored| *stored != versions(resolver));
         plan.versions = stale || (shown.versions.is_none() && !plan.is_empty());
         plan
+    }
+
+    /// The resolution the plan was made from.
+    pub(crate) fn resolution(&self) -> &Resolution {
+        &self.resolution
     }
 
     /// Whether the resolution asks for nothing: no write is made, and no
@@ -619,6 +719,11 @@ impl Plan {
 
     /// Writes what differs, in the write's transaction.
     pub(crate) fn apply(self, write: &Write<'_>) -> Result<Resolved, Error> {
+        // The write takes the revision after the one it was planned at, or
+        // something was written in between.
+        if write.rev() != self.based_on + 1 {
+            return Err(Error::PlanStale);
+        }
         let (connection, rev, now_ms) = (write.connection(), write.rev(), write.now_ms());
         let resolution = &self.resolution;
         let mut done = Resolved::default();
@@ -907,6 +1012,18 @@ impl Plan {
                 continue;
             };
             let bound = recording(bound)?;
+            let withheld = match &decision.evidence.withheld {
+                Some(withheld) => Some(StoredWithheld {
+                    cause: withheld.cause.as_str(),
+                    item: withheld.item,
+                    recording: withheld.recording.map(&recording).transpose()?,
+                }),
+                None => None,
+            };
+            let evidence = StoredEvidence {
+                evidence: &decision.evidence,
+                withheld,
+            };
             let appearance = match out.appearance {
                 Some(Ref::Row(row)) => Some(row),
                 Some(Ref::New(at)) => Some(appearance_rows.get(at).copied().ok_or_else(missing)?),
@@ -921,12 +1038,12 @@ impl Plan {
             .execute((
                 out.item,
                 decision.method.as_str(),
-                RESOLVER_VERSION,
+                self.resolver,
                 NORMALIZER_VERSION,
                 decision.score,
                 decision.runner_up_gap,
                 decision.penalties.as_ref().map(serde_json::to_string).transpose()?,
-                serde_json::to_string(&decision.evidence)?,
+                serde_json::to_string(&evidence)?,
                 decision.needs_review,
                 now_ms,
                 rev,
@@ -978,11 +1095,16 @@ impl Plan {
             done.assignments += 1;
         }
 
+        // The resolution that was owed has been made.
+        connection.execute(
+            "DELETE FROM library_setting WHERE key = ?1",
+            [PENDING_SETTING],
+        )?;
         if self.versions {
             connection.execute(
                 "INSERT INTO library_setting (key, value_json, rev) VALUES (?1, ?2, ?3)
                  ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev",
-                (VERSIONS_SETTING, versions(), rev),
+                (VERSIONS_SETTING, versions(self.resolver), rev),
             )?;
         }
         Ok(done)
@@ -996,8 +1118,10 @@ impl LibraryStore {
     }
 
     /// Whether anything is waiting on the resolver: a readable file with
-    /// no binding, or bindings made by another version of the extractor,
-    /// the resolver or the normaliser.
+    /// no binding, or a library last resolved by another version of the
+    /// extractor, the resolver or the normaliser. A new resolver version
+    /// makes the next scan resolve every item again by the policy in force,
+    /// and write a decision of that version for each whose result differs.
     pub(crate) fn needs_resolving(&self) -> Result<bool, Error> {
         self.read(|connection| {
             let stored: Text = connection
@@ -1005,7 +1129,15 @@ impl LibraryStore {
                     row.get(0)
                 })
                 .optional()?;
-            if stored.is_some_and(|stored| stored != versions()) {
+            if stored.is_some_and(|stored| stored != versions(RESOLVER_VERSION)) {
+                return Ok(true);
+            }
+            let pending: bool = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM library_setting WHERE key = ?1)",
+                [PENDING_SETTING],
+                |row| row.get(0),
+            )?;
+            if pending {
                 return Ok(true);
             }
             Ok(connection.query_row(
@@ -1019,20 +1151,74 @@ impl LibraryStore {
         })
     }
 
-    /// Resolves the whole library by policy 1 and writes what differs, in
-    /// one transaction. It returns `None`, and writes nothing, when the
+    /// Resolves the whole library by the policy scans use and writes what
+    /// differs, in one transaction. It returns `None`, and writes nothing, when the
     /// resolution asks for no change.
+    /// A plan that something else's write made stale is made again, a few
+    /// times.
     pub fn resolve(&self, request: WriteRequest) -> Result<Option<(Written, Resolved)>, Error> {
+        let mut tries = 0;
+        loop {
+            let Some(plan) = self.plan()? else {
+                return self.settle_pending(request);
+            };
+            match self.apply_plan(request, plan) {
+                Err(Error::PlanStale) if tries < 5 => tries += 1,
+                done => return done.map(Some),
+            }
+        }
+    }
+
+    /// Resolves the whole library by the policy scans use and plans what
+    /// differs. `None` when nothing does.
+    pub(crate) fn plan(&self) -> Result<Option<Plan>, Error> {
+        self.plan_by(&Policy::current())
+    }
+
+    /// Resolves the whole library by a policy and plans what differs. Only
+    /// tests apply a policy other than the current one: to make a library
+    /// as an earlier version left it.
+    pub(crate) fn plan_by(&self, policy: &Policy) -> Result<Option<Plan>, Error> {
         let (library, shown) = self.load()?;
-        let resolution = ritornel_domain::resolve(&library, &Policy::v1());
-        let plan = Plan::new(resolution, &library, &shown);
-        if plan.is_empty() {
+        let resolution = ritornel_domain::resolve(&library, policy);
+        let plan = Plan::new(resolution, &library, &shown, policy.version);
+        Ok((!plan.is_empty()).then_some(plan))
+    }
+
+    /// A resolution that asks for nothing still completes what was owed:
+    /// the pending mark is removed, which is a write. With no mark there is
+    /// nothing to write.
+    fn settle_pending(&self, request: WriteRequest) -> Result<Option<(Written, Resolved)>, Error> {
+        let pending: bool = self.read(|connection| {
+            Ok(connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM library_setting WHERE key = ?1)",
+                [PENDING_SETTING],
+                |row| row.get(0),
+            )?)
+        })?;
+        if !pending {
             return Ok(None);
         }
+        let written = self.write(request, |write| {
+            write.connection().execute(
+                "DELETE FROM library_setting WHERE key = ?1",
+                [PENDING_SETTING],
+            )?;
+            Ok(serde_json::to_string(&Resolved::default())?)
+        })?;
+        Ok(Some((written, Resolved::default())))
+    }
+
+    /// Writes what a plan asks for, in one transaction.
+    pub(crate) fn apply_plan(
+        &self,
+        request: WriteRequest,
+        plan: Plan,
+    ) -> Result<(Written, Resolved), Error> {
         let written = self.write(request, move |write| {
             Ok(serde_json::to_string(&plan.apply(write)?)?)
         })?;
         let resolved = serde_json::from_str(&written.result_json)?;
-        Ok(Some((written, resolved)))
+        Ok((written, resolved))
     }
 }

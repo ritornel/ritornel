@@ -75,6 +75,14 @@ pub struct Current {
     pub method: Method,
     /// Whether the owner made it. Only the owner supersedes such a one.
     pub by_user: bool,
+    /// Whether its decision is marked for review. A resolution that would
+    /// mark it otherwise writes a new decision, so that the review queue is
+    /// always what the policy in force says.
+    pub needs_review: bool,
+    /// Whether its evidence says it binds across albums by the exception
+    /// for an all but equal length. A resolution that would say otherwise
+    /// writes a new decision, so that every such binding is marked.
+    pub across_albums: bool,
 }
 
 /// One source item, as the resolver sees it.
@@ -157,6 +165,9 @@ pub struct Library {
     pub groups: HashMap<i64, Option<i64>>,
     /// Each artist's row and match name, in the order of their keys.
     pub artists: Vec<(i64, String)>,
+    /// The MusicBrainz ID of each artist row that has one: the ID the
+    /// claims of the files credited to it give it.
+    pub artist_mbids: HashMap<i64, String>,
     /// Each credit.
     pub credits: Vec<ExistingCredit>,
     /// Each "this item is not that recording".
@@ -190,6 +201,11 @@ pub struct Candidate {
     pub item: i64,
     /// The distance.
     pub distance: f64,
+    /// What made the distance up. It is not stored with the decision,
+    /// whose evidence keeps the shape it has always had: a review listing
+    /// asks the resolver again.
+    #[serde(skip)]
+    pub penalties: Option<Penalties>,
 }
 
 /// What a decision rested on: `identity_decision.evidence_json`.
@@ -201,6 +217,59 @@ pub struct Evidence {
     pub candidates: Vec<Candidate>,
     /// What stopped an identifier from binding.
     pub contradictions: Vec<String>,
+    /// Set on a binding by tags to a recording on another album, which
+    /// only the exception for an all but equal length allows: so that every
+    /// such binding can be found again if the exception proves wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub across_albums: Option<AcrossAlbums>,
+    /// A match the policy held back from binding. The writer stores it
+    /// with the recording it names as a row, so this field is not
+    /// serialised here.
+    #[serde(skip)]
+    pub withheld: Option<Withheld>,
+}
+
+/// A binding by tags across two albums, made because the lengths agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AcrossAlbums {
+    /// How far apart the two lengths were, in milliseconds.
+    pub length_difference_ms: i64,
+}
+
+/// Why a match that was near enough to bind was held back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithheldCause {
+    /// It was a match on tags and duration alone, to a recording on another
+    /// album, and the policy binds by tags only within one album.
+    OtherAlbum,
+    /// It was a match on tags and duration alone, to a recording that
+    /// another track of the file's own release is bound to.
+    SameRelease,
+}
+
+impl WithheldCause {
+    /// The cause as the evidence writes it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OtherAlbum => "other_album",
+            Self::SameRelease => "same_release",
+        }
+    }
+}
+
+/// A match the policy held back from binding: the decision was marked for
+/// review instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Withheld {
+    /// Why it was held back.
+    pub cause: WithheldCause,
+    /// The source item whose claims it matched: the first candidate, or
+    /// for [`WithheldCause::SameRelease`] the other track of the release.
+    pub item: i64,
+    /// The recording it nearly matched: a row, or one the resolution
+    /// makes. Filled in when the catalog is formed.
+    pub recording: Option<Ref>,
 }
 
 /// One decision, with the full score shape. See decision 8.
@@ -241,6 +310,8 @@ pub struct ItemOut {
     pub changed: bool,
     /// Whether the owner's own assignment held it where it is.
     pub pinned: bool,
+    /// Whether an exclusion of the owner's took a candidate away from it.
+    pub blocked: bool,
 }
 
 /// An artist the catalog should have.
@@ -254,6 +325,8 @@ pub struct ArtistOut {
     pub sort_name: String,
     /// The mechanically normalised name.
     pub match_name: String,
+    /// Its MusicBrainz ID, when it is known by one.
+    pub mbid: Option<String>,
 }
 
 /// A credit the catalog should have.

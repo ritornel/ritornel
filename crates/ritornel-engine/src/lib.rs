@@ -30,11 +30,17 @@
 )]
 
 mod clock;
+pub mod covers;
 mod entropy;
 mod error;
 mod id;
+mod identity_store;
+#[cfg(test)]
+mod identity_tests;
+pub mod invent;
 mod jobs;
 mod library_store;
+mod list;
 mod media;
 #[cfg(test)]
 mod media_fixtures;
@@ -58,10 +64,13 @@ pub use clock::{Clock, SystemClock};
 pub use entropy::{Entropy, OsEntropy};
 pub use error::Error;
 pub use id::new_id;
+pub use identity_store::is_policy;
 pub use jobs::{Job, JobState, NewJob, Progress, step_command};
 pub use library_store::{
-    Client, Command, Fingerprint, LibraryMeta, LibraryStore, SubjectKind, WriteRequest, Written,
+    Client, Command, CommitHook, Committed, Fingerprint, LibraryMeta, LibraryStore, SubjectKind,
+    WriteRequest, Written,
 };
+pub use list::{ListError, View};
 pub use resolve_store::Resolved;
 /// What a server, a session and every stored entity is named by. The type
 /// is the contract's.

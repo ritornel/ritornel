@@ -408,6 +408,36 @@ fn metadata(format: &mut dyn FormatReader) -> (Vec<Tag>, Vec<Picture>) {
     (tags, pictures)
 }
 
+/// The bytes of the picture embedded in the file at `path` whose hash is
+/// `hash`, if the file still has it. It is the scan's reader, so it finds
+/// what a scan recorded, in any container the scan reads.
+pub(crate) fn embedded_picture(path: &Path, hash: &[u8]) -> Option<Vec<u8>> {
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        hint.with_extension(extension);
+    }
+    let mut format = probe(Box::new(File::open(path).ok()?), &hint).ok()?;
+    let mut log = format.metadata();
+    loop {
+        if let Some(revision) = log.current() {
+            let per_track = revision.per_track.iter().map(|track| &track.metadata);
+            for container in std::iter::once(&revision.media).chain(per_track) {
+                if let Some(found) = container
+                    .visuals
+                    .iter()
+                    .find(|visual| blake3::hash(&visual.data).as_bytes() == hash)
+                {
+                    return Some(found.data.to_vec());
+                }
+            }
+        }
+        if log.is_latest() {
+            return None;
+        }
+        log.pop();
+    }
+}
+
 /// A folder's own image, read whole to hash it.
 pub(crate) fn read_folder_image(path: &Path, name: &str, mtime_ms: i64) -> Option<FolderImage> {
     let bytes = std::fs::read(path).ok()?;

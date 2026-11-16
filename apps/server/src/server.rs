@@ -21,7 +21,7 @@ use crate::{Bounds, Error, Listen, Run, library, memory};
 
 /// The name a new server gets. The owner renames it when there is a call to
 /// do that with.
-const DEFAULT_NAME: &str = "Ritornel server";
+pub(crate) const DEFAULT_NAME: &str = "Ritornel server";
 
 /// Ends a server's transports when it is dropped. After a stop there are
 /// none, and this does nothing.
@@ -131,7 +131,7 @@ impl Server {
         let stores = Stores::new(store, library);
         let core = Arc::new(Core::new(
             stores, &identity, dir, verifier, clock, entropy, bounds,
-        ));
+        )?);
         let listening = Listening::start(Arc::clone(&core), tickets, listener, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         let worker = Worker::start(Arc::clone(&core), boot_id, run.scan).map_err(Error::Runtime)?;
@@ -180,6 +180,22 @@ impl Server {
     /// the `servers` topic is tested with.
     pub fn rename(&self, name: &str) -> Result<(), Error> {
         self.core.rename(name)
+    }
+
+    /// Developer-only: writes to the invented library `per_second` times a
+    /// second until the server stops, as a scan running would. See
+    /// `ritornel_engine::invent::Churn`.
+    pub fn invent_churn(&self, per_second: u32) -> Result<(), Error> {
+        self.core.invent_churn(per_second)
+    }
+
+    /// Developer-only, and for tests: one write to the invented library, of
+    /// this kind, now.
+    pub fn invent_step(
+        &self,
+        kind: ritornel_engine::invent::ChurnKind,
+    ) -> Result<ritornel_engine::invent::Churned, Error> {
+        self.core.invent_step(kind)
     }
 
     /// Stops the server cleanly: it stops taking calls and closes its

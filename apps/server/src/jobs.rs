@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ritornel_contract::{Id, LibraryChange};
+use ritornel_contract::Id;
 use ritornel_engine::{JobState, Progress, ScanRun, ScanSettings};
 use tracing::{error, info, warn};
 
@@ -180,7 +180,8 @@ fn run(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &At
             Ok(false) => return,
             Err(failed) => return finish(JobState::Failed, Some(failed.to_string())),
         }
-        let before = core.library_revision();
+        // What the step wrote reaches subscribers from the library itself,
+        // after each commit (`dispatch::lists::hook`).
         let step = core.with_library(|server, library| {
             let finished = scan.commit(library)?;
             server.add_job_items(row, scan.take_items())?;
@@ -197,17 +198,6 @@ fn run(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &At
             Some(Err(failed)) => return finish(JobState::Failed, Some(failed.to_string())),
             None => return,
         };
-        let after = core.library_revision();
-        if after != before {
-            core.publish_library(
-                after,
-                &[
-                    LibraryChange::Membership,
-                    LibraryChange::Metadata,
-                    LibraryChange::Stats,
-                ],
-            );
-        }
         core.publish_job(&job);
         saved = Instant::now();
         if finished.is_some() {
