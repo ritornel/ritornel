@@ -6,6 +6,7 @@
 -- that changes here means a migration that has shipped was edited.
 --   0001_library  5a72aa0a6f7da030ece148d3b4669da867ca722f4c659f5600b47fd648100b45
 --   0002_list_indexes  1789bf26cc0c33c9bb95b6c24293e838237ffe0695bdcc7a1818c0b79212d0cb
+--   0003_listen_detail  826a650aaf9ac96b0cbf0365f3a06ad90c5df0af654ee21353fb4bd16220d1e0
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -496,35 +497,6 @@ CREATE TABLE history_observation (
 
 CREATE INDEX history_observation_source_item ON history_observation (source_item_id);
 
-CREATE TABLE observation_listen (
-  observation_id        INTEGER PRIMARY KEY REFERENCES history_observation(id),
-  played_on_server_id   INTEGER NOT NULL REFERENCES server(id),          -- the server whose player made the sound
-  actor_session_pid     BLOB CHECK (length(actor_session_pid) = 16),     -- the client session that queued the track
-  source_revision_no    INTEGER NOT NULL,                                -- which payload of the envelope's source item was heard
-  queued_appearance_id  INTEGER REFERENCES track_appearance(id),         -- a hint for display only; the recording always comes from the source item
-  audio_asset_id        INTEGER REFERENCES audio_asset(id),              -- the asset that played
-  copy_kind             TEXT NOT NULL CHECK (copy_kind IN ('master', 'derived', 'stream_master', 'stream_transcode')),
-  started_at_utc_ms     INTEGER NOT NULL,                                -- the playing server's wall clock; its zone is on the envelope
-  ended_at_utc_ms       INTEGER NOT NULL,
-  started_mono_ms       INTEGER NOT NULL,                                -- the playing server's monotonic clock when the track started
-  boot_id               BLOB NOT NULL CHECK (length(boot_id) = 16),      -- the boot it started in
-  start_reason          TEXT NOT NULL CHECK (start_reason IN ('user_pick', 'auto_advance', 'repeat', 'resume')),
-  continues_source_key  BLOB,                                            -- the earlier listen on this endpoint that this one resumes
-  start_position_ms     INTEGER NOT NULL,
-  end_position_ms       INTEGER NOT NULL,
-  max_position_ms       INTEGER NOT NULL,
-  track_duration_ms     INTEGER NOT NULL,
-  ms_played             INTEGER NOT NULL,                                -- audio actually rendered
-  heard_ranges_json     TEXT NOT NULL,                                   -- merged ranges of the track that were heard, with no cap on how many
-  seek_count            INTEGER NOT NULL,
-  pause_count           INTEGER NOT NULL,
-  end_reason            TEXT NOT NULL CHECK (end_reason IN ('finished', 'next', 'previous', 'jump', 'replaced', 'removed', 'stopped', 'error', 'shutdown', 'crash')),
-  context_kind          TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'playlist', 'query', 'agent')),
-  context_ref           BLOB CHECK (length(context_ref) = 16),           -- public ID of the release, playlist, definition or agent session
-  shuffle               INTEGER NOT NULL CHECK (shuffle IN (0, 1)),
-  rev                   INTEGER NOT NULL
-) STRICT;
-
 CREATE TABLE observation_correction (
   observation_id      INTEGER PRIMARY KEY REFERENCES history_observation(id),
   verb                TEXT NOT NULL CHECK (verb IN ('exclude', 'set_listener', 'split', 'join', 'set_clock_offset', 'revoke')),
@@ -553,13 +525,6 @@ CREATE TABLE correction_target (
 
 CREATE INDEX correction_target_target ON correction_target (target_observation_id);
 
-CREATE TRIGGER observation_listen_kind
-BEFORE INSERT ON observation_listen
-WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'listen'
-BEGIN
-  SELECT RAISE(ABORT, 'observation_listen holds the detail of a listen and of nothing else');
-END;
-
 CREATE TRIGGER observation_correction_kind
 BEFORE INSERT ON observation_correction
 WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'correction'
@@ -577,18 +542,6 @@ CREATE TRIGGER history_observation_no_delete
 BEFORE DELETE ON history_observation
 BEGIN
   SELECT RAISE(ABORT, 'history_observation is immutable: nothing is deleted');
-END;
-
-CREATE TRIGGER observation_listen_no_update
-BEFORE UPDATE ON observation_listen
-BEGIN
-  SELECT RAISE(ABORT, 'observation_listen is immutable: record a correction instead');
-END;
-
-CREATE TRIGGER observation_listen_no_delete
-BEFORE DELETE ON observation_listen
-BEGIN
-  SELECT RAISE(ABORT, 'observation_listen is immutable: nothing is deleted');
 END;
 
 CREATE TRIGGER observation_correction_no_update
@@ -666,52 +619,6 @@ CREATE TABLE history_ingest_conflict (
   rev                      INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE play_event (
-  id                  INTEGER PRIMARY KEY,
-  public_id           BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),   -- 16 bytes computed from the earliest observation's endpoint and source key; not a UUIDv7. A rebuild returns the same ID, and the ID changes if that observation changes
-  listener_id         INTEGER NOT NULL REFERENCES listener(id),
-  recording_id        INTEGER REFERENCES recording(id),          -- canonical; NULL while the source item is unbound
-  appearance_id       INTEGER REFERENCES track_appearance(id),   -- from the assignment, when it names one
-  source_item_id      INTEGER REFERENCES source_item(id),        -- so an unbound play can still be shown
-
-  -- Time: nullable, with separate axes.
-  event_at_utc_ms     INTEGER,                                   -- the start when it can be computed; NULL for an undated play
-  time_anchor         TEXT NOT NULL CHECK (time_anchor IN ('start', 'end', 'none')),   -- what the source reported
-  clock_basis         TEXT NOT NULL CHECK (clock_basis IN ('hub_age', 'server_wall', 'device_wall', 'device_offset', 'source_utc', 'none')),   -- which clock the instant rests on
-  time_precision_ms   INTEGER,
-  zone_name           TEXT,
-  zone_basis          TEXT NOT NULL CHECK (zone_basis IN ('captured', 'assumed', 'offset_only', 'none')),
-  utc_offset_minutes  INTEGER,
-  local_date          INTEGER,                                   -- YYYYMMDD
-  month_day           INTEGER,                                   -- MMDD, for "on this day"
-  local_hour          INTEGER,
-  local_dow           INTEGER,                                   -- 0 is Sunday
-  calendar_basis      TEXT NOT NULL CHECK (calendar_basis IN ('zone', 'device_wall', 'offset', 'none')),   -- where the local date came from
-  not_before_ms       INTEGER,                                   -- bounds of an event with no time
-  not_after_ms        INTEGER,
-
-  evidence_class      TEXT NOT NULL CHECK (evidence_class IN ('observed', 'manual')),
-  ms_played           INTEGER,
-  track_duration_ms   INTEGER,
-  outcome             TEXT NOT NULL CHECK (outcome IN ('listened', 'skipped', 'partial', 'unknown')),
-  counts              INTEGER NOT NULL CHECK (counts IN (0, 1)),
-  count_basis         TEXT NOT NULL CHECK (count_basis IN ('play_rule', 'source_verdict', 'device_position')),
-  play_rule_version   INTEGER NOT NULL,
-  grouper_version     INTEGER NOT NULL,
-  excluded            INTEGER NOT NULL DEFAULT 0 CHECK (excluded IN (0, 1)),   -- an active 'exclude' targets one of its observations
-  context_kind        TEXT CHECK (context_kind IN ('manual', 'album', 'playlist', 'query', 'agent')),
-  context_ref         BLOB CHECK (length(context_ref) = 16),
-  shuffle             INTEGER CHECK (shuffle IN (0, 1)),
-  rev                 INTEGER NOT NULL
-) STRICT;
-
-CREATE INDEX play_event_recent ON play_event (listener_id, event_at_utc_ms DESC);
-
-CREATE INDEX play_event_counted ON play_event (listener_id, recording_id, event_at_utc_ms DESC)
-  WHERE counts = 1 AND excluded = 0;
-
-CREATE INDEX play_event_on_this_day ON play_event (listener_id, month_day, local_date);
-
 CREATE TABLE play_event_observation (
   id              INTEGER PRIMARY KEY,
   play_event_id   INTEGER NOT NULL REFERENCES play_event(id),
@@ -745,3 +652,102 @@ CREATE INDEX assignment_current_appearance
   WHERE superseded_at_ms IS NULL;
 
 CREATE INDEX revision_picture_picture ON revision_picture (picture_id);
+
+CREATE TABLE observation_listen (
+  observation_id            INTEGER PRIMARY KEY REFERENCES history_observation(id),
+  played_on_server_id       INTEGER NOT NULL REFERENCES server(id),          -- the server whose player made the sound
+  actor_session_pid         BLOB CHECK (length(actor_session_pid) = 16),     -- the client session that queued the track
+  source_revision_no        INTEGER NOT NULL CHECK (source_revision_no > 0),   -- which payload of the envelope's source item was heard
+  queued_appearance_id      INTEGER REFERENCES track_appearance(id),         -- a hint for display only; the recording always comes from the source item
+  audio_asset_id            INTEGER REFERENCES audio_asset(id),              -- the asset that played
+  copy_kind                 TEXT NOT NULL CHECK (copy_kind IN ('master', 'derived', 'stream_master', 'stream_transcode')),
+  started_at_utc_ms         INTEGER NOT NULL,                                -- the playing server's wall clock; its zone is on the envelope
+  ended_at_utc_ms           INTEGER NOT NULL,                                -- the same clock, which can have been set back since the start
+  started_mono_ms           INTEGER NOT NULL,                                -- the playing server's monotonic clock when the track started
+  ended_mono_ms             INTEGER,                                         -- the same clock at the end: for a crash, at the last checkpoint. NULL only for a listen recorded before migration 0003
+  boot_id                   BLOB NOT NULL CHECK (length(boot_id) = 16),      -- the boot that clock counts from: the machine's, as its kernel names it, or the playing server's run where the machine's could not be read
+  start_reason              TEXT NOT NULL CHECK (start_reason IN ('user_pick', 'auto_advance', 'repeat', 'resume')),
+  continues_source_key      BLOB CHECK (length(continues_source_key) = 16),   -- the earlier listen on this endpoint that this one resumes
+  start_position_ms         INTEGER NOT NULL CHECK (start_position_ms >= 0),
+  end_position_ms           INTEGER NOT NULL CHECK (end_position_ms >= 0),
+  max_position_ms           INTEGER NOT NULL CHECK (max_position_ms >= 0),
+  track_duration_ms         INTEGER NOT NULL CHECK (track_duration_ms >= 0),
+  ms_played                 INTEGER NOT NULL CHECK (ms_played >= 0),         -- audio actually rendered
+  heard_ranges_json         TEXT NOT NULL CHECK (json_valid(heard_ranges_json)),   -- merged ranges of the track that were heard, with no cap on how many
+  heard_ranges_approximate  INTEGER NOT NULL CHECK (heard_ranges_approximate IN (0, 1)),   -- neighbouring ranges were joined to keep them under the player's cap
+  seek_count                INTEGER NOT NULL CHECK (seek_count >= 0),
+  pause_count               INTEGER NOT NULL CHECK (pause_count >= 0),
+  end_reason                TEXT NOT NULL CHECK (end_reason IN ('finished', 'next', 'previous', 'jump', 'replaced', 'removed', 'stopped', 'error', 'output_lost', 'shutdown', 'crash')),
+  context_kind              TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
+  context_ref               BLOB CHECK (length(context_ref) = 16),           -- public ID of the release, playlist, definition or agent session
+  shuffle                   INTEGER NOT NULL CHECK (shuffle IN (0, 1)),
+  rev                       INTEGER NOT NULL
+) STRICT;
+
+CREATE TRIGGER observation_listen_kind
+BEFORE INSERT ON observation_listen
+WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'listen'
+BEGIN
+  SELECT RAISE(ABORT, 'observation_listen holds the detail of a listen and of nothing else');
+END;
+
+CREATE TRIGGER observation_listen_no_update
+BEFORE UPDATE ON observation_listen
+BEGIN
+  SELECT RAISE(ABORT, 'observation_listen is immutable: record a correction instead');
+END;
+
+CREATE TRIGGER observation_listen_no_delete
+BEFORE DELETE ON observation_listen
+BEGIN
+  SELECT RAISE(ABORT, 'observation_listen is immutable: nothing is deleted');
+END;
+
+CREATE INDEX observation_listen_continues ON observation_listen (continues_source_key)
+  WHERE continues_source_key IS NOT NULL;
+
+CREATE TABLE play_event (
+  id                  INTEGER PRIMARY KEY,
+  public_id           BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),   -- 16 bytes computed from the earliest observation's endpoint and source key; not a UUIDv7. A rebuild returns the same ID, and the ID changes if that observation changes
+  listener_id         INTEGER NOT NULL REFERENCES listener(id),
+  recording_id        INTEGER REFERENCES recording(id),          -- canonical; NULL while the source item is unbound
+  appearance_id       INTEGER REFERENCES track_appearance(id),   -- from the assignment, when it names one
+  source_item_id      INTEGER REFERENCES source_item(id),        -- so an unbound play can still be shown
+
+  -- Time: nullable, with separate axes.
+  event_at_utc_ms     INTEGER,                                   -- the start when it can be computed; NULL for an undated play
+  time_anchor         TEXT NOT NULL CHECK (time_anchor IN ('start', 'end', 'none')),   -- what the source reported
+  clock_basis         TEXT NOT NULL CHECK (clock_basis IN ('hub_age', 'server_wall', 'device_wall', 'device_offset', 'source_utc', 'none')),   -- which clock the instant rests on
+  time_precision_ms   INTEGER,
+  zone_name           TEXT,
+  zone_basis          TEXT NOT NULL CHECK (zone_basis IN ('captured', 'assumed', 'offset_only', 'none')),
+  utc_offset_minutes  INTEGER,
+  local_date          INTEGER,                                   -- YYYYMMDD
+  month_day           INTEGER,                                   -- MMDD, for "on this day"
+  local_hour          INTEGER,
+  local_dow           INTEGER,                                   -- 0 is Sunday
+  calendar_basis      TEXT NOT NULL CHECK (calendar_basis IN ('zone', 'device_wall', 'offset', 'none')),   -- where the local date came from
+  not_before_ms       INTEGER,                                   -- bounds of an event with no time
+  not_after_ms        INTEGER,
+
+  evidence_class      TEXT NOT NULL CHECK (evidence_class IN ('observed', 'manual')),
+  ms_played           INTEGER,
+  track_duration_ms   INTEGER,
+  outcome             TEXT NOT NULL CHECK (outcome IN ('listened', 'skipped', 'partial', 'unknown')),
+  counts              INTEGER NOT NULL CHECK (counts IN (0, 1)),
+  count_basis         TEXT NOT NULL CHECK (count_basis IN ('play_rule', 'source_verdict', 'device_position')),
+  play_rule_version   INTEGER NOT NULL,
+  grouper_version     INTEGER NOT NULL,
+  excluded            INTEGER NOT NULL DEFAULT 0 CHECK (excluded IN (0, 1)),   -- an active 'exclude' targets one of its observations
+  context_kind        TEXT CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
+  context_ref         BLOB CHECK (length(context_ref) = 16),
+  shuffle             INTEGER CHECK (shuffle IN (0, 1)),
+  rev                 INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX play_event_recent ON play_event (listener_id, event_at_utc_ms DESC, public_id DESC);
+
+CREATE INDEX play_event_counted ON play_event (listener_id, recording_id, event_at_utc_ms DESC)
+  WHERE counts = 1 AND excluded = 0;
+
+CREATE INDEX play_event_on_this_day ON play_event (listener_id, month_day, local_date);

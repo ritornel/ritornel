@@ -40,6 +40,7 @@ mod lock;
 mod logs;
 mod media;
 mod memory;
+mod playback;
 mod serve;
 mod server;
 mod server_json;
@@ -56,7 +57,10 @@ pub use config::{ConfigError, Listen, Origin};
 pub use data_dir::HeldDir;
 pub use error::{EXIT_FAILED, EXIT_IN_USE, EXIT_USAGE, Error};
 pub use jobs::Run;
+pub use playback::PlaybackRun;
 /// How the program reads an environment variable. It is passed in, so that a
 /// test can say what the environment holds without changing its own.
 pub use ritornel_contract::local::Env;
+/// The outputs a player can render through.
+pub use ritornel_engine::playback::Output;
 pub use server::Server;

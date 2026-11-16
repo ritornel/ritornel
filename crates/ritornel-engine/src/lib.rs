@@ -12,6 +12,9 @@
 //! - The scan ([`ScanRun`]): it walks a root, reads what is new or changed
 //!   without writing anything there, records it, and resolves the library
 //!   with the pure resolver in `ritornel-domain`.
+//! - The [`playback`] module: the player, its queue and session, the
+//!   listen recorder and the audio pipeline, and the outbox that delivers
+//!   each listen to the history ingest call in `history_store`.
 //!
 //! Nothing reads the system clock or the system's random numbers directly.
 //! A store is given a [`Clock`] and an [`Entropy`], and every time, ID, key
@@ -33,6 +36,7 @@ mod clock;
 pub mod covers;
 mod entropy;
 mod error;
+mod history_store;
 mod id;
 mod identity_store;
 #[cfg(test)]
@@ -45,6 +49,7 @@ mod media;
 #[cfg(test)]
 mod media_fixtures;
 mod migrate;
+pub mod playback;
 mod resolve_store;
 mod scan;
 mod scan_store;
@@ -58,11 +63,16 @@ mod sqlite;
 mod stats;
 #[cfg(test)]
 mod testing;
+mod timekeeping;
 mod walk;
 
 pub use clock::{Clock, SystemClock};
 pub use entropy::{Entropy, OsEntropy};
 pub use error::Error;
+pub use history_store::{
+    Ingested, LISTEN_RECORD_VERSION, ListenRecord, ListenRow, PlayCursor, PlayRow, Rebuilt,
+    SendStamps,
+};
 pub use id::new_id;
 pub use identity_store::is_policy;
 pub use jobs::{Job, JobState, NewJob, Progress, step_command};
@@ -75,8 +85,11 @@ pub use resolve_store::Resolved;
 /// What a server, a session and every stored entity is named by. The type
 /// is the contract's.
 pub use ritornel_contract::Id;
+/// The wall clock in a zone at an instant: what a local date is read with.
+pub use ritornel_domain::history::{LocalTime, local_time};
 pub use scan::{ScanRun, ScanSettings, run_scan, scan_summary};
 pub use scan_store::Source;
 pub use secret::SessionToken;
 pub use server_store::{Role, ServerIdentity, ServerStore};
 pub use sqlite::SQLITE_VERSION;
+pub use timekeeping::{SystemTimekeeper, Timekeeper, clock_boot};

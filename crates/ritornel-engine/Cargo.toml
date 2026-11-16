@@ -12,6 +12,10 @@ ritornel-domain.workspace = true
 # The audio hash, and the hash a payload and a picture are known by. Pinned
 # exactly, as the audio-hash spike pinned it: the hash is a stored key.
 blake3 = "=1.8.7"
+# The zone this server is in, by its IANA name, captured on every listen.
+# The domain reads local dates with the same crate; this side only asks the
+# system for its zone.
+jiff = { version = "=0.2.43", default-features = false, features = ["std", "tz-system"] }
 # The Ed25519 key pair that is half of a server's identity.
 ed25519-dalek = "3.0.0"
 # The operating system's random numbers, for IDs, keys and tokens.
@@ -21,6 +25,18 @@ getrandom = "0.4.3"
 # `cache` is its prepared-statement cache: a scan runs the same few inserts
 # for every file, and without it each would be parsed again every time.
 rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled", "cache"] }
+# The ring between the decode thread and the output, which the output's
+# real-time callback reads without locking or allocating. Pinned as
+# docs/design/playback.md names it.
+rtrb = "=0.4.1"
+# Resampling a track to the output's rate, with the fixed-ratio FFT
+# resampler docs/design/playback.md names. Pinned exactly: three major
+# versions came out in four months.
+rubato = "=5.1.0"
+# The monotonic clock that keeps counting while the machine sleeps, which
+# every listen is stamped with: the standard library's does not on macOS.
+# The server builds it already.
+rustix = { version = "1.1.6", features = ["time"] }
 # A stored payload, a decision's evidence and a job's checkpoint are JSON.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -37,6 +53,20 @@ image = { version = "=0.25.10", default-features = false, features = ["jpeg", "p
 # Decomposes text so that a list can be ordered and searched ignoring accents.
 # The version the domain's normaliser pins.
 unicode-normalization = "=0.1.25"
+
+# The system's audio output. Only macOS has a player in M1: on Linux cpal
+# needs ALSA's development files, which the headless hub neither has nor
+# can use, so it is declared for macOS alone and the `audio-output` feature
+# does nothing elsewhere. See "Deferred" in docs/design/server.md.
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = { version = "=0.18.2", optional = true }
+
+[features]
+default = ["audio-output"]
+# Plays through the system's default output where the platform has one
+# built in (macOS). Without it, a server can still play into the null
+# output, which discards what it is given.
+audio-output = ["dep:cpal"]
 
 [lints]
 workspace = true

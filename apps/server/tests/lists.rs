@@ -612,7 +612,11 @@ async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_r
         match client.next_event().await.unwrap() {
             Event::Library(event) => library.push(event),
             Event::List(event) => lists.push(event),
-            Event::Servers(_) | Event::Jobs(_) => {}
+            Event::Servers(_)
+            | Event::Jobs(_)
+            | Event::Playback(_)
+            | Event::Progress(_)
+            | Event::Queue(_) => {}
         }
     }
     // One of each, at the second write's revision, saying to reorder.

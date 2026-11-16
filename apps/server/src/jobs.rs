@@ -57,6 +57,8 @@ pub struct Run {
     pub boot_id: Option<Id>,
     /// How a scan runs.
     pub scan: ScanSettings,
+    /// How this run plays.
+    pub playback: crate::playback::PlaybackRun,
 }
 
 /// The running worker.

@@ -100,4 +100,11 @@ $FF -i "$tmp/a.wav" -c:a pcm_s16be "${PLAIN[@]}" a.aiff
 # Not audio at all, under an audio file's name.
 printf 'this is not a FLAC file\n' > not-audio.flac
 
+# What ffmpeg decodes two of them to, in ../decoded, which the player's
+# decoding is held to: the FLAC's 16-bit samples exactly, and the MP3's float
+# samples within what two decoders may differ by.
+mkdir -p ../decoded
+$FF -i a.flac -map 0:a -c:a pcm_s16le -f s16le ../decoded/a.flac.s16le
+$FF -i a.mp3 -map 0:a -c:a pcm_f32le -f f32le ../decoded/a.mp3.f32le
+
 ls -l | awk 'NR > 1 { total += $5 } END { print NR - 1 " files, " total " bytes" }'

@@ -424,8 +424,8 @@ mod tests {
     #[test]
     fn a_new_database_is_at_the_newest_schema_and_has_no_identity() {
         let store = in_memory(&Arc::new(FixedClock::at(T0)));
-        assert_eq!(store.schema_version(), 2);
-        assert_eq!(store.migrations_applied(), 2);
+        assert_eq!(store.schema_version(), 4);
+        assert_eq!(store.migrations_applied(), 4);
         assert_eq!(store.identity().unwrap(), None);
         assert!(sessions(&store).is_empty());
     }
@@ -611,8 +611,8 @@ mod tests {
             .unwrap();
 
         let store = on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 1);
-        assert_eq!(store.schema_version(), 2);
+        assert_eq!(store.migrations_applied(), 3);
+        assert_eq!(store.schema_version(), 4);
         // Who the server is, and the credential it issued, are as they
         // were.
         let identity = store.identity().unwrap().unwrap();
@@ -741,7 +741,7 @@ mod tests {
         let path = scratch.path().join("server.db");
 
         let store = on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 2);
+        assert_eq!(store.migrations_applied(), 4);
         let (first, token) = store.ensure_identity("desk").unwrap();
         let token = token.unwrap();
         store.close().unwrap();
@@ -749,7 +749,7 @@ mod tests {
 
         let store = on_disk(&path).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 2);
+        assert_eq!(store.schema_version(), 4);
         let (second, none) = store.ensure_identity("desk").unwrap();
         assert_eq!(second, first);
         assert!(none.is_none());
@@ -806,11 +806,11 @@ mod tests {
         on_disk(&path).unwrap().close().unwrap();
         tamper(
             &path,
-            "INSERT INTO schema_migration VALUES (3, '0003_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (5, '0005_from_the_future', x'00', 0)",
         );
         let refused = on_disk(&path);
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 3, known: 2 })),
+            matches!(refused, Err(Error::NewerSchema { found: 5, known: 4 })),
             "{refused:?}"
         );
     }

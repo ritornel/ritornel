@@ -188,8 +188,8 @@ fn job_by_id(connection: &Connection, id: Id) -> Result<Option<Job>, Error> {
 
 /// The stored result of a server-local command, if it was carried out
 /// before. The same ID with another request is refused.
-fn receipt(transaction: &Transaction<'_>, command: &Command) -> Result<Option<String>, Error> {
-    let stored: Option<(Vec<u8>, String)> = transaction
+pub(crate) fn receipt(connection: &Connection, command: &Command) -> Result<Option<String>, Error> {
+    let stored: Option<(Vec<u8>, String)> = connection
         .query_row(
             "SELECT request_fingerprint, result_json FROM command_receipt WHERE command_id = ?1",
             [command.id.as_bytes()],
@@ -207,7 +207,7 @@ fn receipt(transaction: &Transaction<'_>, command: &Command) -> Result<Option<St
     }
 }
 
-fn record_receipt(
+pub(crate) fn record_receipt(
     transaction: &Transaction<'_>,
     command: &Command,
     method: &str,

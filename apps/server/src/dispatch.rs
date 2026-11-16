@@ -11,10 +11,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use ritornel_contract::methods::{
-    self, EventsSubscribe, EventsUnsubscribe, IdentityDryRun, IdentityReview, JobsCancel, JobsGet,
-    JobsList, LibraryCreate, LibraryStats, ListClose, ListLocate, ListOpen, ListSectionsCall,
-    ListWindowCall, MediaTokenCall, Method, ScanStart, ServerHello, ServerStatus, ServersList,
-    SourcesAdd, SourcesList,
+    self, EventsSubscribe, EventsUnsubscribe, HistoryOnThisDay, HistoryRebuild, HistoryRecent,
+    IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LibraryCreate, LibraryStats,
+    ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
+    PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSkip,
+    PlaybackStop, QueueWindow, ScanStart, ServerHello, ServerStatus, ServersList, SourcesAdd,
+    SourcesList, SourcesTracks,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -41,7 +43,9 @@ use crate::{Bounds, Error};
 
 mod calls;
 mod churn;
+mod history;
 mod lists;
+mod playback;
 
 use lists::Fanout;
 
@@ -106,6 +110,12 @@ pub(crate) struct Core {
     covers: ritornel_engine::covers::Covers,
     /// The threads that make covers.
     cover_pool: CoverPool,
+    /// The player, on a server with an audio output.
+    player: Mutex<Option<ritornel_engine::playback::Player>>,
+    /// Whether there is one, read without waiting on it.
+    has_player: std::sync::atomic::AtomicBool,
+    /// What wakes the thread that delivers finished listens.
+    deliveries: crate::playback::Wake,
 }
 
 /// How many threads make covers: enough to keep a screenful coming, and
@@ -190,6 +200,9 @@ impl Core {
             stores: RwLock::new(Some(stores)),
             sessions: Mutex::default(),
             jobs: crate::jobs::Wake::default(),
+            player: Mutex::new(None),
+            has_player: std::sync::atomic::AtomicBool::new(false),
+            deliveries: crate::playback::Wake::default(),
         })
     }
 
@@ -217,19 +230,23 @@ impl Core {
     /// What the server says about itself to anyone who asks.
     pub(crate) fn public_descriptor(&self) -> PublicDescriptor {
         let this = lock(&self.this);
+        let mut capabilities = [
+            capability::EVENTS_SERVERS,
+            capability::EVENTS_LIBRARY,
+            capability::LISTS,
+            capability::MEDIA_ART,
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        if self.has_player() {
+            capabilities.push(capability::PLAYBACK.to_owned());
+        }
         PublicDescriptor {
             server_id: self.server_id,
             name: this.name.clone(),
             role: this.role,
             contract_version: CONTRACT_VERSION,
-            capabilities: [
-                capability::EVENTS_SERVERS,
-                capability::EVENTS_LIBRARY,
-                capability::LISTS,
-                capability::MEDIA_ART,
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+            capabilities,
             limits: Limits {
                 max_message_bytes: MAX_MESSAGE_BYTES as u64,
                 max_views: MAX_VIEWS as u32,
@@ -558,6 +575,40 @@ impl Core {
                 run::<ListClose>(params, |params| Ok(Self::list_close(session, &params)))
             }
             MediaTokenCall::NAME => run::<MediaTokenCall>(params, |_| self.media_token(session)),
+            PlaybackGet::NAME => run::<PlaybackGet>(params, |_| self.playback_get(stores)),
+            PlaybackPlay::NAME => {
+                run::<PlaybackPlay>(params, |params| self.playback_play(stores, &params))
+            }
+            PlaybackPause::NAME => {
+                run::<PlaybackPause>(params, |params| self.playback_pause(stores, &params))
+            }
+            PlaybackResume::NAME => {
+                run::<PlaybackResume>(params, |params| self.playback_resume(stores, &params))
+            }
+            PlaybackStop::NAME => {
+                run::<PlaybackStop>(params, |params| self.playback_stop(stores, &params))
+            }
+            PlaybackSeek::NAME => {
+                run::<PlaybackSeek>(params, |params| self.playback_seek(stores, &params))
+            }
+            PlaybackSkip::NAME => {
+                run::<PlaybackSkip>(params, |params| self.playback_skip(stores, &params))
+            }
+            QueueWindow::NAME => {
+                run::<QueueWindow>(params, |params| self.queue_window(stores, &params))
+            }
+            SourcesTracks::NAME => {
+                run::<SourcesTracks>(params, |params| self.sources_tracks(stores, &params))
+            }
+            HistoryRecent::NAME => {
+                run::<HistoryRecent>(params, |params| self.history_recent(stores, &params))
+            }
+            HistoryOnThisDay::NAME => {
+                run::<HistoryOnThisDay>(params, |params| self.history_on_this_day(stores, &params))
+            }
+            HistoryRebuild::NAME => {
+                run::<HistoryRebuild>(params, |params| self.history_rebuild(stores, &params))
+            }
             _ => Err(RpcError::new(
                 ErrorCode::Internal,
                 format!("{} is in the method table and has no handler", row.name),
@@ -956,7 +1007,7 @@ mod tests {
             greeted(&core, SessionKind::Full),
         ] {
             assert_eq!(
-                call(&core, &session, "playback.play", None),
+                call(&core, &session, "weather.get", None),
                 Err((ErrorCode::Unsupported, json!({})))
             );
         }
@@ -1072,7 +1123,7 @@ mod tests {
                     "server": env!("CARGO_PKG_VERSION"),
                     "contract": CONTRACT_VERSION,
                     "sqlite": "3.54.1",
-                    "serverSchema": 2,
+                    "serverSchema": 4,
                 },
                 // There is no library, so nothing is said of one.
                 "freeDisk": { "dataBytes": free },
@@ -1113,8 +1164,8 @@ mod tests {
                 "server": env!("CARGO_PKG_VERSION"),
                 "contract": CONTRACT_VERSION,
                 "sqlite": "3.54.1",
-                "serverSchema": 2,
-                "librarySchema": 2,
+                "serverSchema": 4,
+                "librarySchema": 3,
             })
         );
         assert_eq!(
@@ -1247,9 +1298,63 @@ mod tests {
         );
     }
 
+    /// Gives the core a player on the null output, which opens nothing
+    /// until a track is played.
+    fn with_player(core: &Core) {
+        use ritornel_engine::playback::{OnDemand, Output, Player, PlayerSetup};
+        let player = core
+            .with_stores(|stores| {
+                let setup = PlayerSetup {
+                    server_id: core.server_id(),
+                    run: Id::from_bytes([0xb0; 16]),
+                    clock: Arc::new(SystemClock),
+                    timekeeper: Arc::new(ritornel_engine::SystemTimekeeper),
+                    entropy: Arc::new(OsEntropy),
+                    checkpoint_every_ms: ritornel_engine::playback::CHECKPOINT_EVERY_MS,
+                    fail_at_position_ms: None,
+                };
+                let renderer = Box::new(OnDemand::new(Output::Null { speed: 1 }));
+                Player::restore(setup, renderer, stores.server(), None)
+            })
+            .unwrap()
+            .unwrap()
+            .0;
+        core.set_player(player);
+    }
+
+    #[test]
+    fn a_server_with_a_player_says_so_and_one_without_refuses_the_players_calls() {
+        let (core, _scratch) = core();
+        let session = greeted(&core, SessionKind::Limited);
+        assert_eq!(
+            call(&core, &session, "playback.get", None),
+            Err((ErrorCode::Unsupported, json!({})))
+        );
+        with_player(&core);
+        assert_eq!(
+            core.public_descriptor().capabilities,
+            [
+                "events.servers",
+                "events.library",
+                "lists",
+                "media.art",
+                "playback"
+            ]
+        );
+        // Controlling playback is open to a limited session.
+        let state = call(&core, &session, "playback.get", None).unwrap();
+        assert_eq!(
+            (&state["status"], &state["output"]["name"]),
+            (&json!("stopped"), &json!("null"))
+        );
+        let paused = call(&core, &session, "playback.pause", Some(key(0xc5))).unwrap();
+        assert_eq!(paused["commandId"], key(0xc5)["idempotencyKey"]);
+    }
+
     #[test]
     fn every_method_in_the_table_has_a_handler() {
         let (core, _scratch) = core();
+        with_player(&core);
         let session = greeted(&core, SessionKind::Full);
         for method in METHODS {
             let outcome = call(&core, &session, method.name, None);

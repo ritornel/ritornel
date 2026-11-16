@@ -236,6 +236,61 @@ methods! {
     /// URL. It is the same for the life of the session.
     MediaTokenCall: "media.token", Session, needs_full: false,
     NoParams => MediaToken;
+    /// `playback.get`: the player's state, whole.
+    PlaybackGet: "playback.get", Query, needs_full: false,
+    NoParams => PlaybackState;
+
+    /// `playback.play`: replaces the queue with what it names and plays it.
+    PlaybackPlay: "playback.play", Command, needs_full: false,
+    PlaybackPlayParams => PlaybackChanged;
+
+    /// `playback.pause`: pauses. Paused already, it changes nothing.
+    PlaybackPause: "playback.pause", Command, needs_full: false,
+    PlaybackCommandParams => PlaybackChanged;
+
+    /// `playback.resume`: plays on from where the player is: after a pause,
+    /// a stop or a restart.
+    PlaybackResume: "playback.resume", Command, needs_full: false,
+    PlaybackCommandParams => PlaybackChanged;
+
+    /// `playback.stop`: stops, and the entry starts again from its
+    /// beginning.
+    PlaybackStop: "playback.stop", Command, needs_full: false,
+    PlaybackCommandParams => PlaybackChanged;
+
+    /// `playback.seek`: moves the entry it names to a position.
+    PlaybackSeek: "playback.seek", Command, needs_full: false,
+    PlaybackSeekParams => PlaybackChanged;
+
+    /// `playback.skip`: skips from the entry it names, forward or back.
+    PlaybackSkip: "playback.skip", Command, needs_full: false,
+    PlaybackSkipParams => PlaybackChanged;
+
+    /// `queue.window`: a window of the queue, with its revision.
+    QueueWindow: "queue.window", Query, needs_full: false,
+    QueueWindowParams => QueueWindow;
+
+    /// `sources.tracks`: the tracks of the files in a folder of one of this
+    /// server's roots, in the order they are played. It takes a path, so
+    /// it needs a `full` session.
+    SourcesTracks: "sources.tracks", Query, needs_full: true,
+    SourcesTracksParams => SourceTracks;
+
+    /// `history.recent`: the newest plays, newest first. Until list views
+    /// arrive, this is how history is read.
+    HistoryRecent: "history.recent", Query, needs_full: false,
+    HistoryRecentParams => RecentPlays;
+
+    /// `history.onThisDay`: the plays that count on one day of the year,
+    /// in every year.
+    HistoryOnThisDay: "history.onThisDay", Query, needs_full: false,
+    OnThisDayParams => OnThisDay;
+
+    /// `history.rebuild`: drops the plays and derives them again from what
+    /// the sources reported, in one transaction, or says what that would
+    /// change.
+    HistoryRebuild: "history.rebuild", Command, needs_full: true,
+    HistoryRebuildParams => HistoryRebuilt;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -273,7 +328,19 @@ mod tests {
                 "list.sections",
                 "list.locate",
                 "list.close",
-                "media.token"
+                "media.token",
+                "playback.get",
+                "playback.play",
+                "playback.pause",
+                "playback.resume",
+                "playback.stop",
+                "playback.seek",
+                "playback.skip",
+                "queue.window",
+                "sources.tracks",
+                "history.recent",
+                "history.onThisDay",
+                "history.rebuild"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -299,14 +366,19 @@ mod tests {
                 "jobs.get",
                 "jobs.cancel",
                 "identity.dryRun",
-                "identity.review"
+                "identity.review",
+                "sources.tracks",
+                "history.rebuild"
             ]
         );
         // Everything but reading the library and controlling playback
-        // needs one, so no command is open to a limited session.
+        // needs one, so no command is open to a limited session but the
+        // player's.
         for method in METHODS {
             assert!(
-                method.needs_full || method.kind != MethodKind::Command,
+                method.needs_full
+                    || method.kind != MethodKind::Command
+                    || method.name.starts_with("playback."),
                 "{}",
                 method.name
             );

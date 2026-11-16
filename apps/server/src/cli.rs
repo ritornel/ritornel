@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
-//!                       [--log-level <level>]
+//!                       [--log-level <level>] [--output <output>]
 //! ```
 //!
 //! clap parses it. The help is [`USAGE`] and the messages are the fixed
@@ -23,7 +23,7 @@ The Ritornel server. It owns a data directory and the databases in it.
 
 Usage:
   ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
-                        [--log-level <level>]
+                        [--log-level <level>] [--output <output>]
 
 Commands:
   serve    Run until asked to stop: by SIGINT or SIGTERM, or with --owned
@@ -43,6 +43,13 @@ Options:
                         so the server cannot outlive it
   --log-level <level>   error, warn, info, debug or trace. The default is
                         info
+  --output <output>     Where the player plays: default, the system's
+                        default output; null, which plays at real-time
+                        speed into nothing and makes no sound; or none, for
+                        a server with no player. The default is default
+                        where this build has an audio output, and none
+                        elsewhere. The device is opened when something is
+                        first played
   -h, --help            Show this help
   -V, --version         Show the version
 
@@ -104,6 +111,8 @@ pub(crate) struct ServeArgs {
     /// this many times a second while serving, as a scan would.
     #[arg(long, hide = true)]
     pub(crate) invent_churn: Option<u32>,
+    #[arg(long, value_parser = ["default", "null", "none"])]
+    pub(crate) output: Option<String>,
 }
 
 /// What a wrong command line is answered with. The messages are fixed and
@@ -134,6 +143,9 @@ fn usage(error: &clap::Error) -> Error {
             if option.starts_with("--log-level") =>
         {
             "--log-level needs a level"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation if option.starts_with("--output") => {
+            "--output is default, null or none"
         }
         _ => "the command line is wrong; try `ritornel-server --help`",
     })
@@ -226,6 +238,7 @@ mod tests {
             listen: Some("127.0.0.1:5000".to_owned()),
             log_level: Some("debug".to_owned()),
             invent_churn: None,
+            output: None,
         });
         for line in [
             &[

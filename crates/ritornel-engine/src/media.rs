@@ -150,7 +150,7 @@ fn tail(file: &mut File, end: u64, count: u64) -> std::io::Result<Option<Vec<u8>
 /// Where the audio ends: the file's length with the trailing ID3v1,
 /// Lyrics3v2 and APEv2 tags removed, repeatedly. These are the three kinds
 /// of tag that sit after the last frame of an MP3 or a FLAC.
-fn audio_end(file: &mut File) -> std::io::Result<u64> {
+pub(crate) fn audio_end(file: &mut File) -> std::io::Result<u64> {
     let mut end = file.metadata()?.len();
     loop {
         let before = end;

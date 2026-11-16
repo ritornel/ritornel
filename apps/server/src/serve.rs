@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 
+use ritornel_engine::playback::Output;
 use ritornel_engine::{Clock, Entropy, OsEntropy, ScanSettings, SystemClock, new_id};
 use tokio::runtime::Runtime;
 use tokio::signal::unix::{SignalKind, signal};
@@ -14,7 +15,7 @@ use tracing::{error, info};
 use crate::cli::ServeArgs;
 use crate::config::{self, Flags, Settings};
 use crate::data_dir::{self, HeldDir};
-use crate::{Bounds, Env, Error, Run, Server, logs};
+use crate::{Bounds, Env, Error, PlaybackRun, Run, Server, logs};
 
 /// Why a run is stopping.
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +71,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
     let jobs = Run {
         boot_id: Some(boot_id),
         scan: test_hooks(env),
+        playback: playback(args.output.as_deref(), env),
     };
     let run = run(held, args, settings, clock, entropy, jobs, out);
     match &run {
@@ -158,6 +160,35 @@ fn test_hooks(env: Env<'_>) -> ScanSettings {
     }
     scan.fail_after_step = number("RITORNEL_TEST_FAIL_AFTER_SCAN_STEP");
     scan
+}
+
+/// How this run plays: the output `--output` names, and what the crash tests
+/// ask of the player. Three environment variables are read, and they are
+/// for those tests alone: none is a setting, and none is in the help.
+///
+/// - `RITORNEL_TEST_NULL_OUTPUT_SPEED`: how many times faster than real
+///   time the null output plays.
+/// - `RITORNEL_TEST_FAIL_AT_POSITION_MS`: the server aborts once the track
+///   playing passes this position, with its listen open and its last
+///   checkpoint saved, as a crash there would.
+/// - `RITORNEL_TEST_FAIL_AFTER_INGEST`: the server aborts once the library
+///   has taken a listen in and before `server.db` lets it go.
+fn playback(output: Option<&str>, env: Env<'_>) -> PlaybackRun {
+    let number = |name: &str| env(name).and_then(|value| value.to_str()?.parse::<i64>().ok());
+    let speed = number("RITORNEL_TEST_NULL_OUTPUT_SPEED")
+        .and_then(|speed| u32::try_from(speed).ok())
+        .unwrap_or(1);
+    let output = match output {
+        Some("default") => Some(Output::Default),
+        Some("null") => Some(Output::Null { speed }),
+        Some(_) => None,
+        None => Output::has_device().then_some(Output::Default),
+    };
+    PlaybackRun {
+        output,
+        fail_at_position_ms: number("RITORNEL_TEST_FAIL_AT_POSITION_MS"),
+        fail_after_ingest: env("RITORNEL_TEST_FAIL_AFTER_INGEST").is_some(),
+    }
 }
 
 /// Sends a stop when the process gets SIGINT or SIGTERM. The handlers are in

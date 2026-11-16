@@ -289,7 +289,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             ("Server version", env!("CARGO_PKG_VERSION")),
             ("Contract version", "0"),
             ("SQLite version", "3.54.1"),
-            ("Server schema", "2"),
+            ("Server schema", "4"),
         ]
     );
     assert_eq!(facts[7], ("Library", "none"));
@@ -313,7 +313,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
                 "server": env!("CARGO_PKG_VERSION"),
                 "contract": 0,
                 "sqlite": "3.54.1",
-                "serverSchema": 2,
+                "serverSchema": 4,
             },
             "freeDisk": { "dataBytes": free },
             "logPath": logs_dir.to_str().unwrap(),
@@ -399,15 +399,15 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
     assert_eq!(
         shown[6..10],
         [
-            ("Server schema", "2"),
-            ("Library schema", "2"),
+            ("Server schema", "4"),
+            ("Library schema", "3"),
             ("Library ID", library_id),
             ("Library revision", "1"),
         ]
     );
     let json: Value = serde_json::from_str(&status(&data_dir, &["--json"]).stdout).unwrap();
     assert_eq!(json["role"], "hub");
-    assert_eq!(json["versions"]["librarySchema"], 2);
+    assert_eq!(json["versions"]["librarySchema"], 3);
     assert_eq!(
         json["library"],
         serde_json::json!({ "libraryId": library_id, "revision": 1 })

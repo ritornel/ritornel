@@ -8,7 +8,15 @@
 //! ritornelctl jobs [<job>] [--cancel] [--data-dir <dir>] [--json]
 //! ritornelctl identity re-resolve --dry-run [--detail] [<policy values>] [--data-dir <dir>] [--json]
 //! ritornelctl identity review [--data-dir <dir>] [--json]
+//! ritornelctl play <folder | track>... [--album <release>] [--start <n>] [--follow]
+//! ritornelctl pause | resume | stop | next | previous | now | queue
+//! ritornelctl seek <position>
+//! ritornelctl history [--limit <n>]
+//! ritornelctl history on-this-day [--day <MM-DD>]
+//! ritornelctl history rebuild [--dry-run]
 //! ```
+//!
+//! Every command takes `--data-dir <dir>` and `--json`.
 //!
 //! clap parses it. The help is [`USAGE`] and the messages are the fixed
 //! ones in [`usage`], so nothing a person typed is ever printed back.
@@ -20,9 +28,10 @@ use std::path::PathBuf;
 
 use clap::error::{ContextKind, ErrorKind};
 use clap::{Args, Parser, Subcommand};
+use ritornel_client::contract::SkipDirection;
 use ritornel_client::contract::local::Env;
 
-use crate::{identity, jobs, library, scan, status};
+use crate::{history, identity, jobs, library, playback, scan, status};
 
 const USAGE: &str = "\
 The command-line client of a Ritornel server. It talks to the server that is
@@ -37,6 +46,14 @@ Usage:
   ritornelctl identity re-resolve --dry-run [--detail] [<policy values>]
                                   [--data-dir <dir>] [--json]
   ritornelctl identity review [--data-dir <dir>] [--json]
+  ritornelctl play <folder | track>... [--album <release>] [--start <n>]
+                   [--follow] [--data-dir <dir>] [--json]
+  ritornelctl pause | resume | stop | next | previous [--data-dir <dir>] [--json]
+  ritornelctl seek <position> [--data-dir <dir>] [--json]
+  ritornelctl now | queue [--data-dir <dir>] [--json]
+  ritornelctl history [--limit <n>] [--data-dir <dir>] [--json]
+  ritornelctl history on-this-day [--day <MM-DD>] [--data-dir <dir>] [--json]
+  ritornelctl history rebuild [--dry-run] [--data-dir <dir>] [--json]
 
 Commands:
   status           Show the running server's ID, name and role, the versions
@@ -66,6 +83,24 @@ Commands:
   identity review  List the matches marked for review, grouped by cause:
                    each file, the one it nearly matched, the distance and
                    what made it up
+  play             Play the scanned tracks in a folder, album by album in
+                   disc and track order, or tracks by their IDs, or a
+                   release with --album. It replaces the queue. The server
+                   plays on when this program ends
+  pause, resume    Pause, and play on. After the server restarts, resume
+                   carries on where the last run stopped
+  stop             Stop. Resume plays the track from its beginning
+  next, previous   Skip forward, or back. Previous starts the track again
+                   when it is more than three seconds in
+  seek <position>  Move the playing track to a position: seconds, or m:ss
+  now              Show what is playing, where, from which copy and output
+  queue            Show the queue, the current entry marked
+  history          Show recent listening, newest first: each play, what
+                   became of it, and whether it counts
+  history on-this-day
+                   Show what you listened to on this day in every year
+  history rebuild  Drop the plays and derive them again from every listen
+                   recorded, in one transaction
 
 Options:
   --name <name>         scan: the name the folder is added under. With none
@@ -105,6 +140,14 @@ when given alone:
                         recording of another track of its own release
   --marker-list <n>     The version markers: 1, or 2 with every spelling
                         of \"a cappella\" and part numbers
+  --album <release>     play: a release, by its ID
+  --start <n>           play: the track to start at, from 1
+  --follow              play: show each track as it starts, until the
+                        queue ends
+  --limit <n>           history: how many plays. The default is 20
+  --day <MM-DD>         history on-this-day: the day. The default is today
+  --dry-run             history rebuild: say what would change, and change
+                        nothing
   --data-dir <dir>      The data directory of the server to talk to
   --json                Print the answer as JSON, in the shape the server
                         sends it in
@@ -156,8 +199,12 @@ pub(crate) enum Error {
     Output(std::io::Error),
     /// The folder to scan could not be found.
     Folder(std::io::Error),
+    /// What `play` was given is no folder there is.
+    PlayFolder(std::io::Error),
     /// The job that was waited for did not succeed. The text is its state.
     Job(&'static str),
+    /// There was nothing to do it to.
+    Nothing(&'static str),
 }
 
 impl Error {
@@ -180,7 +227,9 @@ impl fmt::Display for Error {
             Self::Runtime(error) => write!(f, "cannot start: {error}"),
             Self::Output(error) => write!(f, "cannot write to standard output: {error}"),
             Self::Folder(error) => write!(f, "cannot scan that folder: {error}"),
+            Self::PlayFolder(error) => write!(f, "cannot play that folder: {error}"),
             Self::Job(state) => write!(f, "the job {state}"),
+            Self::Nothing(what) => f.write_str(what),
         }
     }
 }
@@ -209,6 +258,81 @@ enum Command {
     Jobs(JobsArgs),
     #[command(subcommand)]
     Identity(IdentityCommand),
+    Play(PlayArgs),
+    Pause(ServerArgs),
+    Resume(ServerArgs),
+    Stop(ServerArgs),
+    Next(ServerArgs),
+    Previous(ServerArgs),
+    Seek(SeekArgs),
+    Now(ServerArgs),
+    Queue(ServerArgs),
+    History(HistoryArgs),
+}
+
+/// What `play` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct PlayArgs {
+    /// A folder, or track IDs.
+    pub(crate) what: Vec<String>,
+    /// A release, by its ID.
+    #[arg(long)]
+    pub(crate) album: Option<String>,
+    /// The track to start at, from 1.
+    #[arg(long)]
+    pub(crate) start: Option<u32>,
+    /// Show each track as it starts, until the queue ends.
+    #[arg(long)]
+    pub(crate) follow: bool,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `seek` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct SeekArgs {
+    /// Seconds, or m:ss.
+    pub(crate) position: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `history` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct HistoryArgs {
+    #[command(subcommand)]
+    pub(crate) command: Option<HistoryCommand>,
+    /// How many plays.
+    #[arg(long)]
+    pub(crate) limit: Option<u32>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum HistoryCommand {
+    OnThisDay(DayArgs),
+    Rebuild(RebuildArgs),
+}
+
+/// What `history on-this-day` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct DayArgs {
+    /// The day, as MM-DD.
+    #[arg(long)]
+    pub(crate) day: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `history rebuild` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct RebuildArgs {
+    /// Say what would change, and change nothing.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
@@ -384,6 +508,16 @@ fn try_run(
             identity::re_resolve(&args, env, out)
         }
         Command::Identity(IdentityCommand::Review(args)) => identity::review(&args, env, out),
+        Command::Play(args) => playback::play(&args, env, out),
+        Command::Pause(args) => playback::transport("pause", &args, env, out),
+        Command::Resume(args) => playback::transport("resume", &args, env, out),
+        Command::Stop(args) => playback::transport("stop", &args, env, out),
+        Command::Next(args) => playback::skip(SkipDirection::Next, &args, env, out),
+        Command::Previous(args) => playback::skip(SkipDirection::Previous, &args, env, out),
+        Command::Seek(args) => playback::seek(&args, env, out),
+        Command::Now(args) => playback::now(&args, env, out),
+        Command::Queue(args) => playback::queue(&args, env, out),
+        Command::History(args) => history::history(&args, env, out),
     }
 }
 

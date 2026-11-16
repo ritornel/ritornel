@@ -60,8 +60,10 @@ fn key(event: &Event) -> String {
     match event {
         Event::Servers(event) => event.server.server_id.to_string(),
         Event::Jobs(event) => event.job.job_id.to_string(),
-        // There is one library.
-        Event::Library(_) => String::new(),
+        // The library, the player and the queue are one resource each.
+        Event::Library(_) | Event::Playback(_) | Event::Progress(_) | Event::Queue(_) => {
+            String::new()
+        }
         Event::List(event) => event.view.clone(),
     }
 }
@@ -81,6 +83,15 @@ fn merge(unsent: &mut Event, newer: Event) {
             }
         }
         (Event::Jobs(held), Event::Jobs(new)) => *held = new,
+        (Event::Playback(held), Event::Playback(new)) => {
+            if new.state.revision >= held.state.revision {
+                *held = new;
+            }
+        }
+        (Event::Progress(held), Event::Progress(new)) => *held = new,
+        (Event::Queue(held), Event::Queue(new)) => {
+            held.queue_revision = held.queue_revision.max(new.queue_revision);
+        }
         (Event::Library(held), Event::Library(new)) => {
             held.library_revision = held.library_revision.max(new.library_revision);
             held.changed.extend(new.changed);

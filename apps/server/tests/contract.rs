@@ -322,7 +322,7 @@ async fn the_status_reports_versions_role_and_server_id(via: Via) {
     assert_eq!(status.versions.server, env!("CARGO_PKG_VERSION"));
     assert_eq!(status.versions.contract, CONTRACT_VERSION);
     assert_eq!(status.versions.sqlite, "3.54.1");
-    assert_eq!(status.versions.server_schema, 2);
+    assert_eq!(status.versions.server_schema, 4);
     // It has no library, and says nothing of one.
     assert_eq!(status.versions.library_schema, None);
     assert_eq!(status.library, None);
@@ -351,7 +351,7 @@ async fn creating_a_library_makes_the_server_its_hub(via: Via) {
     // server's role says hub: the event, the list and the descriptor.
     let status = client.status().await.unwrap();
     assert_eq!(status.role, ServerRole::Hub);
-    assert_eq!(status.versions.library_schema, Some(2));
+    assert_eq!(status.versions.library_schema, Some(3));
     assert_eq!(
         status.library,
         Some(LibraryStatus {
@@ -790,7 +790,7 @@ async fn a_method_the_server_does_not_have_is_unsupported(via: Via) {
     let running = Running::start().await;
     let client = running.greeted(via).await;
     assert_eq!(
-        refused(client.call_raw("playback.play", json!({})).await),
+        refused(client.call_raw("weather.get", json!({})).await),
         (ErrorCode::Unsupported, false, json!({}))
     );
     // The connection is as good as it was.

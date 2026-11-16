@@ -1216,7 +1216,10 @@ impl LibraryStore {
         plan: Plan,
     ) -> Result<(Written, Resolved), Error> {
         let written = self.write(request, move |write| {
-            Ok(serde_json::to_string(&plan.apply(write)?)?)
+            let resolved = plan.apply(write)?;
+            // Plays follow their source items' new bindings.
+            crate::history_store::rebind(write)?;
+            Ok(serde_json::to_string(&resolved)?)
         })?;
         let resolved = serde_json::from_str(&written.result_json)?;
         Ok((written, resolved))

@@ -15,6 +15,7 @@ use crate::data_dir::HeldDir;
 use crate::dispatch::{Core, Stores};
 use crate::jobs::Worker;
 use crate::listener::{self, Listening};
+use crate::playback;
 use crate::server_json::ServerJson;
 use crate::ticket::Tickets;
 use crate::{Bounds, Error, Listen, Run, library, memory};
@@ -40,6 +41,8 @@ pub struct Server {
     core: Arc<Core>,
     /// The thread that runs jobs.
     worker: Worker,
+    /// The player's control loop and the delivery of listens.
+    playback: playback::Workers,
     transports: Transports,
     listening: Listening,
     bounds: Bounds,
@@ -127,14 +130,32 @@ impl Server {
             info!(requeued, "jobs that an earlier run left are queued again");
         }
 
+        if let Some(library) = &library {
+            history_rule(library)?;
+        }
+        let player = playback::restore(
+            &store,
+            library.as_ref(),
+            run.playback,
+            identity.server_id,
+            boot_id,
+            &clock,
+            &entropy,
+        )?;
+
         let listener = listener::bind(listen).await?;
         let stores = Stores::new(store, library);
         let core = Arc::new(Core::new(
             stores, &identity, dir, verifier, clock, entropy, bounds,
         )?);
+        if let Some(player) = player {
+            core.set_player(player);
+        }
         let listening = Listening::start(Arc::clone(&core), tickets, listener, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         let worker = Worker::start(Arc::clone(&core), boot_id, run.scan).map_err(Error::Runtime)?;
+        let playback = playback::Workers::start(Arc::clone(&core), run.playback, boot_id)
+            .map_err(Error::Runtime)?;
 
         // The server answers, so a client may be told where it is.
         let server_json =
@@ -142,6 +163,7 @@ impl Server {
         Ok(Self {
             transports: Transports(Arc::clone(&core)),
             worker,
+            playback,
             core,
             listening,
             bounds,
@@ -217,6 +239,12 @@ impl Server {
         tokio::task::spawn_blocking(move || worker.stop())
             .await
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
+        // The player pauses, saves where it is and closes its listen as a
+        // shutdown, and what that closed is delivered.
+        let playback = self.playback;
+        tokio::task::spawn_blocking(move || playback.stop())
+            .await
+            .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
         // Closing waits for calls that are using the database, and then
         // empties its log, so it is not done on an async worker either.
         let core = Arc::clone(&self.core);
@@ -225,6 +253,26 @@ impl Server {
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))??;
         self.server_json.remove()
     }
+}
+
+/// Derives history again if any play was judged by a rule other than the
+/// one this program has: the rule changes by rebuilding (decision 7 in
+/// docs/design/history.md).
+fn history_rule(library: &ritornel_engine::LibraryStore) -> Result<(), Error> {
+    if !library.history_needs_rebuild().map_err(Error::Library)? {
+        return Ok(());
+    }
+    let request = ritornel_engine::WriteRequest {
+        method: "history.rebuild",
+        command: None,
+        client: None,
+    };
+    library
+        .rebuild_history(request, false, |rebuilt| {
+            format!("{} plays, {} changed", rebuilt.after, rebuilt.changed)
+        })
+        .map_err(Error::Library)
+        .map(|done| info!(%done, "history is derived again under the play rule in force"))
 }
 
 #[cfg(test)]

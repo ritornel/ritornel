@@ -59,6 +59,7 @@ const CAPABILITIES: &[(&str, &str)] = &[
     ("eventsLibrary", capability::EVENTS_LIBRARY),
     ("lists", capability::LISTS),
     ("mediaArt", capability::MEDIA_ART),
+    ("playback", capability::PLAYBACK),
 ];
 
 const HEADER: &str = "\
@@ -464,7 +465,7 @@ fn the_maps_follow_the_method_table_and_the_topics() {
     assert!(text.contains("  \"jobs\": Extract<Event, { topic: \"jobs\" }>;\n"));
     assert!(text.contains("  \"list\": Extract<Event, { topic: \"list\" }>;\n"));
     assert!(text.contains(
-        "export const TOPICS = [\"servers\", \"jobs\", \"library\", \"list\"] as const;\n"
+        "export const TOPICS = [\"servers\", \"jobs\", \"library\", \"list\", \"playback\", \"progress\", \"queue\"] as const;\n"
     ));
 }
 

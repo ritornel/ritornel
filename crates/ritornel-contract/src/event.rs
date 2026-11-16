@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Job, ServerInfo};
+use crate::{Job, PlaybackEvent, ProgressEvent, QueueEvent, ServerInfo};
 
 /// The method of every event notification.
 pub const EVENT_METHOD: &str = "event";
@@ -30,11 +30,25 @@ pub enum Topic {
     /// A view this session holds may be out of date. Holding a view is the
     /// subscription: no session subscribes to this topic to get it.
     List,
+    /// The player's state, whole, whenever it changes.
+    Playback,
+    /// Where the playing entry is, about once a second.
+    Progress,
+    /// A hint that the queue changed, with its revision.
+    Queue,
 }
 
 impl Topic {
     /// Every topic.
-    pub const ALL: &[Self] = &[Self::Servers, Self::Jobs, Self::Library, Self::List];
+    pub const ALL: &[Self] = &[
+        Self::Servers,
+        Self::Jobs,
+        Self::Library,
+        Self::List,
+        Self::Playback,
+        Self::Progress,
+        Self::Queue,
+    ];
 
     /// The topic as it is written on the wire.
     pub const fn as_str(self) -> &'static str {
@@ -43,12 +57,15 @@ impl Topic {
             Self::Jobs => "jobs",
             Self::Library => "library",
             Self::List => "list",
+            Self::Playback => "playback",
+            Self::Progress => "progress",
+            Self::Queue => "queue",
         }
     }
 }
 
 /// The params of an event notification: the topic, and what it carries.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "topic", rename_all = "snake_case")]
 pub enum Event {
@@ -60,6 +77,12 @@ pub enum Event {
     Library(LibraryEvent),
     /// A view may be out of date.
     List(ListEvent),
+    /// The player's state changed.
+    Playback(Box<PlaybackEvent>),
+    /// Where the playing entry is.
+    Progress(ProgressEvent),
+    /// The queue changed.
+    Queue(QueueEvent),
 }
 
 impl Event {
@@ -70,6 +93,9 @@ impl Event {
             Self::Jobs(_) => Topic::Jobs,
             Self::Library(_) => Topic::Library,
             Self::List(_) => Topic::List,
+            Self::Playback(_) => Topic::Playback,
+            Self::Progress(_) => Topic::Progress,
+            Self::Queue(_) => Topic::Queue,
         }
     }
 }

@@ -6,6 +6,8 @@
 -- that changes here means a migration that has shipped was edited.
 --   0001_identity  a9c16ff49737779be6423a76d68a42a3c76bc81d94fc8dc0ed2afcf94cdb5837
 --   0002_work  dd5cc576aed05d719357a659ce74ed214a0bea1481040599138e3bae36407174
+--   0003_playback  e094e2a143da2b95885551e53e98ed0749e975c234846f1035626cee4e5afea0
+--   0004_listen_detail  fa9a7a0cdc46d229caa74d94d5891d442015bf209da6ff153991023df2b70655
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -109,3 +111,75 @@ CREATE TABLE outbox (
   created_at_ms       INTEGER NOT NULL,
   UNIQUE (kind, dedupe_key)
 ) STRICT;
+
+CREATE TABLE playback_session (
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  queue_revision    INTEGER NOT NULL DEFAULT 0,                -- bumped by every queue edit, in the same transaction
+  state_revision    INTEGER NOT NULL DEFAULT 0,                -- stamps the playback state sent to clients
+  current_entry_id  INTEGER REFERENCES queue_entry(id),
+  position_ms       INTEGER NOT NULL DEFAULT 0,                -- saved with each listen checkpoint
+  resume_listen_pid BLOB CHECK (length(resume_listen_pid) = 16),   -- the listen a resume of this track would continue; set when a listen ends by crash or shutdown mid-track, kept after that listen is delivered, cleared when the track finishes or the entry changes
+  volume            REAL NOT NULL DEFAULT 1.0 CHECK (volume BETWEEN 0 AND 1),   -- the player's own gain
+  muted             INTEGER NOT NULL DEFAULT 0 CHECK (muted IN (0, 1)),
+  shuffle           INTEGER NOT NULL DEFAULT 0 CHECK (shuffle IN (0, 1)),
+  repeat            TEXT NOT NULL DEFAULT 'off' CHECK (repeat IN ('off', 'all', 'one')),
+  listener_pid      BLOB CHECK (length(listener_pid) = 16),    -- the listener set on the player
+  updated_at_ms     INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE queue_entry (
+  id                   INTEGER PRIMARY KEY,
+  public_id            BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),   -- the contract's entryId
+  appearance_pid       BLOB NOT NULL CHECK (length(appearance_pid) = 16),     -- public ID of a library track appearance
+  position             INTEGER NOT NULL,                                      -- queue order
+  shuffle_position     INTEGER,                                               -- the stored play order while shuffle is on
+  context_kind         TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
+  context_ref          BLOB CHECK (length(context_ref) = 16),                 -- public ID of the release, artist, playlist, definition or agent session
+  added_by_session_id  INTEGER REFERENCES session(id),
+  failed_reason        TEXT,                                                  -- 'unsupported_format', 'no_copy_reachable', 'file_changed', ...
+  added_at_ms          INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE listen_staging (
+  id                        INTEGER PRIMARY KEY,
+  listen_id                 BLOB NOT NULL UNIQUE CHECK (length(listen_id) = 16),   -- a UUIDv7; becomes the history source key
+  queue_entry_pid           BLOB CHECK (length(queue_entry_pid) = 16),     -- the queue entry it was heard from, by public ID, so the entry can go while the listen waits. NULL only for a listen staged before migration 0004 that was closed by then
+  listener_pid              BLOB NOT NULL CHECK (length(listener_pid) = 16),       -- the listener set on the player
+  actor_session_id          INTEGER REFERENCES session(id),                        -- the client session that queued the track
+  played_on_server_pid      BLOB NOT NULL CHECK (length(played_on_server_pid) = 16),   -- this server's ID
+  appearance_pid            BLOB NOT NULL CHECK (length(appearance_pid) = 16),     -- what was queued; history keeps it as a hint only
+  asset_pid                 BLOB NOT NULL CHECK (length(asset_pid) = 16),          -- the asset that played
+  copy_kind                 TEXT NOT NULL CHECK (copy_kind IN ('master', 'derived', 'stream_master', 'stream_transcode')),
+  source_item_pid           BLOB NOT NULL CHECK (length(source_item_pid) = 16),    -- the master behind the copy, written when the track starts
+  source_revision_no        INTEGER NOT NULL CHECK (source_revision_no > 0),
+  started_at_utc_ms         INTEGER NOT NULL,
+  zone_name                 TEXT,                                                  -- this server's IANA zone at the start
+  started_mono_ms           INTEGER NOT NULL,                                      -- this server's monotonic clock, one that keeps counting during sleep
+  boot_id                   BLOB NOT NULL CHECK (length(boot_id) = 16),            -- the boot that clock counts from: the machine's, or this server's run where the machine's could not be read
+  start_reason              TEXT NOT NULL CHECK (start_reason IN ('user_pick', 'auto_advance', 'repeat', 'resume')),
+  continues_listen_id       BLOB CHECK (length(continues_listen_id) = 16),         -- the listen this one resumes after a restart
+  start_position_ms         INTEGER NOT NULL CHECK (start_position_ms >= 0),
+  track_duration_ms         INTEGER NOT NULL CHECK (track_duration_ms >= 0),
+  ms_played                 INTEGER NOT NULL DEFAULT 0 CHECK (ms_played >= 0),     -- frames handed to the output, as time
+  heard_ranges_json         TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(heard_ranges_json)),   -- merged, with no cap on how many
+  heard_ranges_approximate  INTEGER NOT NULL DEFAULT 0 CHECK (heard_ranges_approximate IN (0, 1)),   -- neighbours were joined to keep them under the cap; once set, never cleared
+  max_position_ms           INTEGER NOT NULL DEFAULT 0 CHECK (max_position_ms >= 0),
+  seek_count                INTEGER NOT NULL DEFAULT 0 CHECK (seek_count >= 0),
+  pause_count               INTEGER NOT NULL DEFAULT 0 CHECK (pause_count >= 0),
+  context_kind              TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
+  context_ref               BLOB CHECK (length(context_ref) = 16),
+  shuffle                   INTEGER NOT NULL CHECK (shuffle IN (0, 1)),
+  checkpoint_position_ms    INTEGER NOT NULL CHECK (checkpoint_position_ms >= 0),   -- where the track was at the last checkpoint: where a listen a crash left open ended
+  checkpoint_at_ms          INTEGER NOT NULL,                                      -- the wall clock at the last checkpoint
+  checkpoint_mono_ms        INTEGER,                                               -- the monotonic clock then. NULL only for a listen staged before migration 0004
+  end_position_ms           INTEGER CHECK (end_position_ms >= 0),
+  end_reason                TEXT CHECK (end_reason IN ('finished', 'next', 'previous', 'jump', 'replaced', 'removed', 'stopped', 'error', 'output_lost', 'shutdown', 'crash')),
+  ended_at_utc_ms           INTEGER,                                               -- NULL while open; an open row found at start is closed as 'crash'
+  ended_mono_ms             INTEGER,                                               -- the monotonic clock at the end; for a crash, the last checkpoint's
+  CHECK ((ended_at_utc_ms IS NULL) = (end_reason IS NULL)),
+  CHECK ((ended_at_utc_ms IS NULL) = (end_position_ms IS NULL)),
+  CHECK (ended_at_utc_ms IS NOT NULL OR ended_mono_ms IS NULL)
+) STRICT;
+
+CREATE UNIQUE INDEX listen_staging_open ON listen_staging (played_on_server_pid)
+  WHERE ended_at_utc_ms IS NULL;

@@ -218,6 +218,11 @@ impl std::fmt::Debug for OnCommit {
 }
 
 impl LibraryStore {
+    /// The hub's clock now, read by the caller and not by the writer.
+    pub(crate) fn clock_now_ms(&self) -> i64 {
+        self.clock.now_ms()
+    }
+
     /// Creates the library in the file at `path`, with `server` as its hub,
     /// and opens it. The file may be missing or hold no library yet. One
     /// that holds a library is refused with [`Error::LibraryExists`] and
@@ -848,7 +853,7 @@ mod tests {
         // gives the library's ID the bytes 00 to 09.
         let library_id = "019a7afd-1e00-7001-8203-040506070809";
         assert_eq!(store.library_id().to_string(), library_id);
-        assert_eq!(store.schema_version(), 2);
+        assert_eq!(store.schema_version(), 3);
         assert_eq!(
             store.meta().unwrap(),
             LibraryMeta {
@@ -1237,7 +1242,7 @@ mod tests {
         let scratch = Scratch::new();
         let path = library_db(&scratch);
         let (store, _) = create_on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 2);
+        assert_eq!(store.migrations_applied(), 3);
         let created = store.meta().unwrap();
         store
             .write(request("test.write", None), set("kept"))
@@ -1247,7 +1252,7 @@ mod tests {
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 2);
+        assert_eq!(store.schema_version(), 3);
         assert_eq!(store.library_id(), created.library_id);
         assert_eq!(
             store.meta().unwrap(),
@@ -1404,11 +1409,11 @@ mod tests {
         create_on_disk(&path).unwrap().0.close().unwrap();
         tamper_file(
             &path,
-            "INSERT INTO schema_migration VALUES (3, '0003_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (4, '0004_from_the_future', x'00', 0)",
         );
         let refused = open_on_disk(&path, id(0x11));
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 3, known: 2 })),
+            matches!(refused, Err(Error::NewerSchema { found: 4, known: 3 })),
             "{refused:?}"
         );
     }
@@ -1449,8 +1454,8 @@ mod tests {
             .unwrap();
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
-        assert_eq!(store.migrations_applied(), 1);
-        assert_eq!(store.schema_version(), 2);
+        assert_eq!(store.migrations_applied(), 2);
+        assert_eq!(store.schema_version(), 3);
         // The library is the one it was, at the revision it was.
         assert_eq!(
             store.library_id().to_string(),

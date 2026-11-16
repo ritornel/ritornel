@@ -41,6 +41,16 @@ pub(crate) const SERVER: &[Migration] = &[
         name: "0002_work",
         sql: include_str!("../migrations/server/0002_work.sql"),
     },
+    Migration {
+        version: 3,
+        name: "0003_playback",
+        sql: include_str!("../migrations/server/0003_playback.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "0004_listen_detail",
+        sql: include_str!("../migrations/server/0004_listen_detail.sql"),
+    },
 ];
 
 /// The migrations of `library.db`.
@@ -54,6 +64,11 @@ pub(crate) const LIBRARY: &[Migration] = &[
         version: 2,
         name: "0002_list_indexes",
         sql: include_str!("../migrations/library/0002_list_indexes.sql"),
+    },
+    Migration {
+        version: 3,
+        name: "0003_listen_detail",
+        sql: include_str!("../migrations/library/0003_listen_detail.sql"),
     },
 ];
 
@@ -105,8 +120,30 @@ pub(crate) fn run(
         }
     }
 
+    // A migration that changes a table rebuilds it: a new table, the rows
+    // copied, the old one dropped. SQLite's procedure for that turns foreign
+    // keys off for the migration, which only works outside a transaction,
+    // and checks them before the commit, so a migration can never leave a
+    // dangling reference behind. They are on again whatever happens.
+    let enforced: bool = connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let applied = apply(connection, shipped, clock);
+    connection.pragma_update(None, "foreign_keys", enforced)?;
+    Ok(Migrated {
+        applied: applied?,
+        version: known,
+    })
+}
+
+/// Applies each of `migrations` in a transaction of its own with its ledger
+/// row, and returns how many it applied.
+fn apply<'a>(
+    connection: &mut Connection,
+    migrations: impl Iterator<Item = &'a Migration>,
+    clock: &dyn Clock,
+) -> Result<usize, Error> {
     let mut applied = 0;
-    for migration in shipped {
+    for migration in migrations {
         let failed = |source| Error::MigrationFailed {
             version: migration.version,
             source,
@@ -115,6 +152,18 @@ pub(crate) fn run(
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failed)?;
         transaction.execute_batch(migration.sql).map_err(failed)?;
+        let dangling: Option<String> = transaction
+            .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+            .optional()
+            .map_err(failed)?;
+        if let Some(table) = dangling {
+            return Err(failed(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                Some(format!(
+                    "the migration leaves a dangling reference in {table}"
+                )),
+            )));
+        }
         transaction
             .execute(
                 "INSERT INTO schema_migration (version, name, checksum, applied_at_ms)
@@ -130,10 +179,7 @@ pub(crate) fn run(
         transaction.commit().map_err(failed)?;
         applied += 1;
     }
-    Ok(Migrated {
-        applied,
-        version: known,
-    })
+    Ok(applied)
 }
 
 /// The ledger, oldest first: each applied migration's number and checksum.

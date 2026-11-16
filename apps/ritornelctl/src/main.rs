@@ -15,9 +15,11 @@
 )]
 
 mod cli;
+mod history;
 mod identity;
 mod jobs;
 mod library;
+mod playback;
 mod scan;
 mod server;
 mod status;

@@ -7,6 +7,11 @@ publish.workspace = true
 
 [dependencies]
 ritornel-contract.workspace = true
+# Local dates: the instant of a play read in its zone. Only the IANA
+# database it bundles is read, never the machine's, so a derivation is the
+# same everywhere and does no I/O. Pinned exactly: a new database can move
+# a local date, which is a rebuild.
+jiff = { version = "=0.2.43", default-features = false, features = ["std", "tzdb-bundle-always"] }
 # A payload is stored as JSON and a decision's evidence is written as JSON.
 # Only the derives are used here: the engine does the reading and writing.
 serde = { version = "1.0.229", features = ["derive"] }

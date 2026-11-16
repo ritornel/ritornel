@@ -117,6 +117,18 @@ pub enum Error {
     /// The library changed between a resolution's plan and its write, so
     /// the plan was not written. It is made again.
     PlanStale,
+    /// A request names something that is not there.
+    NotFound(&'static str),
+    /// A request cannot be carried out as it is.
+    Invalid(&'static str),
+    /// The output failed.
+    Playback(String),
+    /// The hub cannot take a listen: what it names does not hold together.
+    BadListen(&'static str),
+    /// A write that only worked out what it would do, and was rolled back
+    /// on purpose: the derived history before and after. It never reaches
+    /// a caller.
+    RolledBack(Vec<String>, Vec<String>),
 }
 
 impl fmt::Display for Error {
@@ -204,6 +216,10 @@ impl fmt::Display for Error {
             }
             Self::FailPoint => f.write_str("stopped at a fail point"),
             Self::PlanStale => f.write_str("the library changed while a resolution was planned"),
+            Self::NotFound(what) | Self::Invalid(what) => f.write_str(what),
+            Self::Playback(what) => write!(f, "the output: {what}"),
+            Self::BadListen(what) => write!(f, "a listen the hub cannot take: {what}"),
+            Self::RolledBack(..) => f.write_str("a dry run, rolled back"),
         }
     }
 }

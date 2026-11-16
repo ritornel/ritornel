@@ -114,7 +114,7 @@ impl Core {
         .flatten()
     }
 
-    fn publish(&self, event: &Event) {
+    pub(super) fn publish(&self, event: &Event) {
         for session in lock(&self.sessions).open.values() {
             session.publish(event.clone());
         }
@@ -127,7 +127,7 @@ impl Core {
 
     /// The session every command comes from: the only credential there is
     /// yet is the local one.
-    fn client(&self) -> Option<Client> {
+    pub(super) fn client(&self) -> Option<Client> {
         self.local_credential.session().map(|session| Client {
             session,
             kind: SubjectKind::Person,

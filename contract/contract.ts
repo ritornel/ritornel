@@ -33,6 +33,7 @@ export const CAPABILITIES = {
   eventsLibrary: "events.library",
   lists: "lists",
   mediaArt: "media.art",
+  playback: "playback",
 } as const;
 
 /** The method of every event notification. */
@@ -82,10 +83,22 @@ export const METHODS = {
   "list.locate": { kind: "query", needsFull: false },
   "list.close": { kind: "session", needsFull: false },
   "media.token": { kind: "session", needsFull: false },
+  "playback.get": { kind: "query", needsFull: false },
+  "playback.play": { kind: "command", needsFull: false },
+  "playback.pause": { kind: "command", needsFull: false },
+  "playback.resume": { kind: "command", needsFull: false },
+  "playback.stop": { kind: "command", needsFull: false },
+  "playback.seek": { kind: "command", needsFull: false },
+  "playback.skip": { kind: "command", needsFull: false },
+  "queue.window": { kind: "query", needsFull: false },
+  "sources.tracks": { kind: "query", needsFull: true },
+  "history.recent": { kind: "query", needsFull: false },
+  "history.onThisDay": { kind: "query", needsFull: false },
+  "history.rebuild": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
-export const TOPICS = ["servers", "jobs", "library", "list"] as const;
+export const TOPICS = ["servers", "jobs", "library", "list", "playback", "progress", "queue"] as const;
 
 /** The params and the result of each method. */
 export type MethodMap = {
@@ -110,6 +123,18 @@ export type MethodMap = {
   "list.locate": { params: ListLocateParams; result: ListLocated };
   "list.close": { params: ViewParams; result: ListClosed };
   "media.token": { params: NoParams; result: MediaToken };
+  "playback.get": { params: NoParams; result: PlaybackState };
+  "playback.play": { params: PlaybackPlayParams; result: PlaybackChanged };
+  "playback.pause": { params: PlaybackCommandParams; result: PlaybackChanged };
+  "playback.resume": { params: PlaybackCommandParams; result: PlaybackChanged };
+  "playback.stop": { params: PlaybackCommandParams; result: PlaybackChanged };
+  "playback.seek": { params: PlaybackSeekParams; result: PlaybackChanged };
+  "playback.skip": { params: PlaybackSkipParams; result: PlaybackChanged };
+  "queue.window": { params: QueueWindowParams; result: QueueWindow };
+  "sources.tracks": { params: SourcesTracksParams; result: SourceTracks };
+  "history.recent": { params: HistoryRecentParams; result: RecentPlays };
+  "history.onThisDay": { params: OnThisDayParams; result: OnThisDay };
+  "history.rebuild": { params: HistoryRebuildParams; result: HistoryRebuilt };
 };
 
 /** The name of a method. */
@@ -124,6 +149,9 @@ export type EventMap = {
   "jobs": Extract<Event, { topic: "jobs" }>;
   "library": Extract<Event, { topic: "library" }>;
   "list": Extract<Event, { topic: "list" }>;
+  "playback": Extract<Event, { topic: "playback" }>;
+  "progress": Extract<Event, { topic: "progress" }>;
+  "queue": Extract<Event, { topic: "queue" }>;
 };
 
 /**
@@ -297,6 +325,41 @@ export type Binding = {
  * never decides access: the session does.
  */
 export type ClientKind = "desktop" | "browser" | "phone" | "cli" | "agent";
+
+/**
+ * Why tracks were queued: a kind, and what it refers to.
+ */
+export type ContextKind = "manual" | "album" | "artist" | "playlist" | "query" | "agent";
+
+/**
+ * The copy the player has open for the current entry.
+ */
+export type CopyInUse = {
+  /**
+   * The server the copy is on.
+   */
+  serverId: string,
+  /**
+   * What it is to the track: `master` in M1.
+   */
+  role: string,
+  /**
+   * Its codec.
+   */
+  codec: string,
+  /**
+   * Its sample rate.
+   */
+  sampleRateHz: number,
+  /**
+   * Its channels.
+   */
+  channels: number,
+  /**
+   * Its bit depth, where the codec has one.
+   */
+  bitDepth?: number,
+};
 
 /**
  * Which copy of a track a copy is.
@@ -514,7 +577,7 @@ export type ErrorData = {
 /**
  * The params of an event notification: the topic, and what it carries.
  */
-export type Event = { "topic": "servers" } & ServersEvent | { "topic": "jobs" } & JobsEvent | { "topic": "library" } & LibraryEvent | { "topic": "list" } & ListEvent;
+export type Event = { "topic": "servers" } & ServersEvent | { "topic": "jobs" } & JobsEvent | { "topic": "library" } & LibraryEvent | { "topic": "list" } & ListEvent | { "topic": "playback" } & PlaybackEvent | { "topic": "progress" } & ProgressEvent | { "topic": "queue" } & QueueEvent;
 
 /**
  * A file as the owner judges it: where it is and what its tags say.
@@ -655,6 +718,70 @@ export type HelloParams = {
    * built with. A server refuses one that is not its own.
    */
   contractVersion: number,
+};
+
+/**
+ * The params of `history.rebuild`.
+ */
+export type HistoryRebuildParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * Say what would change, and change nothing.
+   */
+  dryRun: boolean,
+};
+
+/**
+ * The result of `history.rebuild`.
+ */
+export type HistoryRebuilt = {
+  /**
+   * Whether nothing was changed.
+   */
+  dryRun: boolean,
+  /**
+   * Plays before.
+   */
+  before: number,
+  /**
+   * Plays after.
+   */
+  after: number,
+  /**
+   * Plays that are new, gone or different.
+   */
+  changed: number,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * The params of `history.recent`.
+ */
+export type HistoryRecentParams = {
+  /**
+   * How many plays, at most 500. The default is 20.
+   */
+  limit?: number,
+  /**
+   * Only plays after this one, newest first: the `next` of the page
+   * before.
+   */
+  before?: PlayCursor,
 };
 
 /**
@@ -1303,6 +1430,59 @@ export type Nearest = {
 export type NoParams = Record<symbol, never>;
 
 /**
+ * The result of `history.onThisDay`: the plays that count on that day of
+ * any year, newest first.
+ */
+export type OnThisDay = {
+  /**
+   * The day, as `MM-DD`.
+   */
+  day: string,
+  /**
+   * The plays.
+   */
+  plays: Array<Play>,
+};
+
+/**
+ * The params of `history.onThisDay`.
+ */
+export type OnThisDayParams = {
+  /**
+   * The day, as `MM-DD`. The default is today, where the server is.
+   */
+  day?: string,
+};
+
+/**
+ * The output the player renders through.
+ */
+export type OutputInfo = {
+  /**
+   * Its name: the device's, or `null` for the output that makes no
+   * sound.
+   */
+  name: string,
+  /**
+   * How it runs.
+   */
+  mode: OutputMode,
+  /**
+   * Its rate.
+   */
+  sampleRateHz: number,
+  /**
+   * Its channels.
+   */
+  channels: number,
+};
+
+/**
+ * How an output runs. See decision 5 in docs/design/playback.md.
+ */
+export type OutputMode = "shared";
+
+/**
  * What made a tags-and-duration distance, each from 0 to 1.
  */
 export type Penalties = {
@@ -1326,6 +1506,378 @@ export type Penalties = {
    * Whether a shared ISRC or AcoustID halved the distance.
    */
   sharedIdentifier: boolean,
+};
+
+/**
+ * One play.
+ */
+export type Play = {
+  /**
+   * The play. Its ID is computed, and a client that meets one it does
+   * not know reads again.
+   */
+  playId: string,
+  /**
+   * When it began. Left out for a play with no date.
+   */
+  at?: number,
+  /**
+   * Its local date, as `YYYY-MM-DD`, in `zone`.
+   */
+  localDate?: string,
+  /**
+   * Its local hour.
+   */
+  localHour?: number,
+  /**
+   * The zone its local date is in.
+   */
+  zone?: string,
+  /**
+   * That zone's offset from UTC then, in minutes.
+   */
+  utcOffsetMinutes?: number,
+  /**
+   * Which clock its time rests on: `hub_age` or `server_wall` for a
+   * listen.
+   */
+  clockBasis: string,
+  /**
+   * What it was of.
+   */
+  track: PlayedTrack,
+  /**
+   * Audio rendered, over every listen of it.
+   */
+  msPlayed: number,
+  /**
+   * The track's length.
+   */
+  durationMs?: number,
+  /**
+   * What became of it.
+   */
+  outcome: PlayOutcome,
+  /**
+   * Whether it counts, by the play rule.
+   */
+  counts: boolean,
+  /**
+   * Whether it is excluded.
+   */
+  excluded: boolean,
+  /**
+   * The listens behind it, the first first.
+   */
+  listens: Array<PlayedListen>,
+};
+
+/**
+ * Why tracks were queued, which every listen of them records.
+ */
+export type PlayContext = {
+  /**
+   * The kind.
+   */
+  kind: ContextKind,
+  /**
+   * What it refers to: the release, the artist, the playlist, the stored
+   * definition or the agent's session.
+   */
+  ref?: string,
+};
+
+/**
+ * Where a page of `history.recent` ended: its last play's instant and
+ * ID. The next page is asked for with it, and begins with the play after
+ * that one, even one of the same instant.
+ */
+export type PlayCursor = {
+  /**
+   * The play's instant. Left out for a play with no date.
+   */
+  at?: number,
+  /**
+   * The play's ID.
+   */
+  playId: string,
+};
+
+/**
+ * What became of a play.
+ */
+export type PlayOutcome = "listened" | "skipped" | "partial" | "unknown";
+
+/**
+ * What `playback.play` plays.
+ */
+export type PlaySource = { "type": "tracks",
+  /**
+   * The appearances.
+   */
+  ids: Array<string>, } | { "type": "release",
+  /**
+   * The release.
+   */
+  id: string,
+};
+
+/**
+ * What a playback command returns: the receipt, and where the player is
+ * after it. The whole state is read with `playback.get` or sent on the
+ * `playback` topic.
+ */
+export type PlaybackChanged = {
+  /**
+   * The queue's revision after the command.
+   */
+  queueRevision: number,
+  /**
+   * The entry the player is on after it.
+   */
+  entryId?: string,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * The params of `playback.pause`, `playback.resume` and `playback.stop`.
+ */
+export type PlaybackCommandParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+};
+
+/**
+ * What an event on the `playback` topic carries: the state, whole.
+ */
+export type PlaybackEvent = {
+  /**
+   * The state.
+   */
+  state: PlaybackState,
+};
+
+/**
+ * The params of `playback.play`.
+ */
+export type PlaybackPlayParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * What to play. It replaces the queue.
+   */
+  source: PlaySource,
+  /**
+   * The track to start at, from 0. The default is the first.
+   */
+  start?: number,
+  /**
+   * Why it is played. With none, a release is played as an album and
+   * tracks by hand.
+   */
+  context?: PlayContext,
+};
+
+/**
+ * The params of `playback.seek`.
+ */
+export type PlaybackSeekParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The entry to seek in. If the player has left it, nothing changes.
+   */
+  entryId: string,
+  /**
+   * Where to.
+   */
+  positionMs: number,
+};
+
+/**
+ * The params of `playback.skip`.
+ */
+export type PlaybackSkipParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The entry to skip from. If the player has left it, nothing changes,
+   * so a skip sent again cannot skip twice.
+   */
+  fromEntryId: string,
+  /**
+   * Which way.
+   */
+  direction: SkipDirection,
+};
+
+/**
+ * The player's state, whole: the result of `playback.get` and what a
+ * `playback` event carries.
+ */
+export type PlaybackState = {
+  /**
+   * Counts the changes to this state. A client keeps the copy with the
+   * highest.
+   */
+  revision: number,
+  /**
+   * What the player is doing.
+   */
+  status: PlaybackStatus,
+  /**
+   * The entry it is on.
+   */
+  entryId?: string,
+  /**
+   * That entry's place in the queue, from 0.
+   */
+  index?: number,
+  /**
+   * What that entry's track shows.
+   */
+  track?: TrackSummary,
+  /**
+   * The copy open for it, while one is.
+   */
+  copy?: CopyInUse,
+  /**
+   * Where in the track.
+   */
+  positionMs: number,
+  /**
+   * How long the track is, when that is known.
+   */
+  durationMs?: number,
+  /**
+   * The player's own gain, 0 to 1. Always 1 in M1's first player.
+   */
+  volume: number,
+  /**
+   * Whether it is muted.
+   */
+  muted: boolean,
+  /**
+   * Whether the queue plays in a shuffled order.
+   */
+  shuffle: boolean,
+  /**
+   * Repeat.
+   */
+  repeat: Repeat,
+  /**
+   * The output.
+   */
+  output: OutputInfo,
+  /**
+   * The queue's revision.
+   */
+  queueRevision: number,
+  /**
+   * How many entries the queue has.
+   */
+  queueLength: number,
+};
+
+/**
+ * What the player is doing.
+ */
+export type PlaybackStatus = "stopped" | "playing" | "paused" | "buffering";
+
+/**
+ * One listen behind a play.
+ */
+export type PlayedListen = {
+  /**
+   * The listen.
+   */
+  listenId: string,
+  /**
+   * When it began, by the playing server's clock.
+   */
+  startedAt: number,
+  /**
+   * When it ended, by the same clock.
+   */
+  endedAt: number,
+  /**
+   * Why it began: `user_pick`, `auto_advance`, `repeat` or `resume`.
+   */
+  startReason: string,
+  /**
+   * Why it ended: `finished`, `next`, `previous`, `jump`, `replaced`,
+   * `removed`, `stopped`, `error`, `output_lost`, `shutdown` or `crash`.
+   */
+  endReason: string,
+  /**
+   * Where in the track it began.
+   */
+  startPositionMs: number,
+  /**
+   * Where it ended.
+   */
+  endPositionMs: number,
+  /**
+   * Audio actually rendered.
+   */
+  msPlayed: number,
+  /**
+   * The listen it continues after a restart.
+   */
+  continues?: string,
+  /**
+   * The zone the playing server was in at its start.
+   */
+  zone?: string,
+};
+
+/**
+ * What a play was of: its track as the library shows it. For a play whose
+ * file is bound to no track yet, the fields are those of the track that
+ * was queued, and the IDs are left out.
+ */
+export type PlayedTrack = {
+  /**
+   * The appearance the play is bound to. Left out while the file that
+   * was heard is bound to no track.
+   */
+  appearanceId?: string,
+  /**
+   * The recording the play is bound to.
+   */
+  recordingId?: string,
+  /**
+   * The title.
+   */
+  title?: string,
+  /**
+   * The artist credit.
+   */
+  artist?: string,
+  /**
+   * The album.
+   */
+  album?: string,
 };
 
 /**
@@ -1472,6 +2024,26 @@ export type Predicate = { "is": "by_artist",
 export type PredicateName = "by_artist";
 
 /**
+ * What an event on the `progress` topic carries: where the playing entry
+ * is, about once a second and at once on a change. The client carries
+ * the position on from when the event arrived.
+ */
+export type ProgressEvent = {
+  /**
+   * The entry.
+   */
+  entryId: string,
+  /**
+   * Where in it.
+   */
+  positionMs: number,
+  /**
+   * Whether it is playing.
+   */
+  playing: boolean,
+};
+
+/**
  * The public descriptor: what a server says about itself to anyone who
  * asks, with no credential, at [`route::DESCRIPTOR`](crate::route). A
  * client reads it to check which server answered before it sends one.
@@ -1556,6 +2128,73 @@ export type Query = {
 };
 
 /**
+ * One entry of the queue.
+ */
+export type QueueEntry = {
+  /**
+   * The entry.
+   */
+  entryId: string,
+  /**
+   * Its track. Its display fields are left out when the library no
+   * longer has the appearance.
+   */
+  track: TrackSummary,
+  /**
+   * Why it could not be played, once it could not.
+   */
+  failedReason?: string,
+};
+
+/**
+ * What an event on the `queue` topic carries: a hint to read the queue
+ * again.
+ */
+export type QueueEvent = {
+  /**
+   * The queue's revision after the change.
+   */
+  queueRevision: number,
+};
+
+/**
+ * The result of `queue.window`. A `queueRevision` other than the one a
+ * client read before means it reads again.
+ */
+export type QueueWindow = {
+  /**
+   * The queue's revision.
+   */
+  queueRevision: number,
+  /**
+   * How many entries it has.
+   */
+  total: number,
+  /**
+   * The place of the entry the player is on.
+   */
+  currentIndex?: number,
+  /**
+   * The entries asked for, in queue order.
+   */
+  entries: Array<QueueEntry>,
+};
+
+/**
+ * The params of `queue.window`.
+ */
+export type QueueWindowParams = {
+  /**
+   * The first entry, from 0.
+   */
+  offset: number,
+  /**
+   * How many entries, at most 500. The default is 100.
+   */
+  limit?: number,
+};
+
+/**
  * What a command returns: that its intent was recorded, and what is known
  * of it so far. A command's own result has these fields and whatever else
  * the command returns.
@@ -1583,6 +2222,29 @@ export type Receipt = {
  * How far a command has got.
  */
 export type ReceiptStatus = "accepted" | "done";
+
+/**
+ * The result of `history.recent`.
+ */
+export type RecentPlays = {
+  /**
+   * The plays, newest first.
+   */
+  plays: Array<Play>,
+  /**
+   * Where the next page begins, when this one was full.
+   */
+  next?: PlayCursor,
+  /**
+   * Listens this server has finished and not yet delivered to history.
+   */
+  undelivered: number,
+};
+
+/**
+ * Repeat. M1's first player has none: it is always `off`.
+ */
+export type Repeat = "off" | "all" | "one";
 
 /**
  * The view a new one replaces, and the row to keep in place.
@@ -1900,6 +2562,11 @@ export type ServersList = {
 export type SessionKind = "full" | "limited";
 
 /**
+ * Which way a skip goes.
+ */
+export type SkipDirection = "next" | "previous";
+
+/**
  * The body of [`route::TICKET`](crate::route::TICKET): a ticket that opens
  * one socket.
  */
@@ -2050,6 +2717,18 @@ export type SourceAdded = {
 export type SourceKind = "folder";
 
 /**
+ * The result of `sources.tracks`: the tracks of the files there, in the
+ * order they are played: album by album, each in disc and track order. A
+ * file the library has not bound to a track yet is left out.
+ */
+export type SourceTracks = {
+  /**
+   * The tracks.
+   */
+  tracks: Array<TrackSummary>,
+};
+
+/**
  * The params of `sources.add`.
  */
 export type SourcesAddParams = {
@@ -2079,6 +2758,17 @@ export type SourcesList = {
 };
 
 /**
+ * The params of `sources.tracks`.
+ */
+export type SourcesTracksParams = {
+  /**
+   * An absolute path on the server: a folder in one of its roots, or a
+   * file.
+   */
+  path: string,
+};
+
+/**
  * The result of `events.subscribe` and `events.unsubscribe`.
  */
 export type Subscriptions = {
@@ -2091,7 +2781,7 @@ export type Subscriptions = {
 /**
  * What a client can subscribe to.
  */
-export type Topic = "servers" | "jobs" | "library" | "list";
+export type Topic = "servers" | "jobs" | "library" | "list" | "playback" | "progress" | "queue";
 
 /**
  * The params of `events.subscribe` and `events.unsubscribe`.
@@ -2137,6 +2827,48 @@ export type TrackCopy = {
    * The bit rate, for a lossy format.
    */
   bitrateKbps: number | null,
+};
+
+/**
+ * What a track shows: one appearance's displayed fields.
+ */
+export type TrackSummary = {
+  /**
+   * The track appearance.
+   */
+  appearanceId: string,
+  /**
+   * Its recording.
+   */
+  recordingId?: string,
+  /**
+   * Its release. Left out for a loose file.
+   */
+  releaseId?: string,
+  /**
+   * The title.
+   */
+  title?: string,
+  /**
+   * The artist credit, as one string.
+   */
+  artist?: string,
+  /**
+   * The album's title.
+   */
+  album?: string,
+  /**
+   * The disc number.
+   */
+  discNumber?: number,
+  /**
+   * The track number.
+   */
+  trackNumber?: number,
+  /**
+   * The length.
+   */
+  durationMs?: number,
 };
 
 /**

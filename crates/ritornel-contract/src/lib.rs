@@ -41,6 +41,7 @@ mod command;
 mod error;
 mod event;
 mod frame;
+mod history;
 mod id;
 mod identity;
 mod library;
@@ -48,6 +49,7 @@ mod list;
 pub mod local;
 mod media;
 pub mod methods;
+mod playback;
 mod server;
 mod ticket;
 #[cfg(test)]
@@ -60,6 +62,10 @@ pub use event::{
     Subscriptions, Topic, TopicsParams,
 };
 pub use frame::{Frame, Malformed, Notification, Request, RequestId, Response};
+pub use history::{
+    HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams, OnThisDay, OnThisDayParams, Play,
+    PlayCursor, PlayOutcome, PlayedListen, PlayedTrack, RecentPlays,
+};
 pub use id::{Id, NotAnId};
 pub use identity::{
     Binding, DryRun, DryRunParams, FileFacts, ItemChange, ItemOutcome, Nearest, Penalties,
@@ -78,6 +84,13 @@ pub use list::{
 };
 pub use media::{ART_SIZES, MEDIA_TOKEN_PARAM, MediaToken};
 pub use methods::{METHODS, Method, MethodInfo, MethodKind, MethodVisitor, visit_methods};
+pub use playback::{
+    ContextKind, CopyInUse, OutputInfo, OutputMode, PlayContext, PlaySource, PlaybackChanged,
+    PlaybackCommandParams, PlaybackEvent, PlaybackPlayParams, PlaybackSeekParams,
+    PlaybackSkipParams, PlaybackState, PlaybackStatus, ProgressEvent, QueueEntry, QueueEvent,
+    QueueWindow, QueueWindowParams, Repeat, SkipDirection, SourceTracks, SourcesTracksParams,
+    TrackSummary,
+};
 pub use server::{
     ClientKind, Descriptor, FreeDisk, HelloParams, LibraryStatus, Limits, MAX_CLIENT_TEXT,
     NoParams, PublicDescriptor, ServerInfo, ServerRole, ServerStatus, ServersList, SessionKind,
@@ -111,6 +124,11 @@ pub mod capability {
     /// The server serves covers at `GET /v1/art/{artId}/{size}`, with the
     /// media token from `media.token`.
     pub const MEDIA_ART: &str = "media.art";
+    /// The server has a player: the `playback.*` and `queue.*` calls and
+    /// the `playback`, `progress` and `queue` topics. A server with no
+    /// audio output has none, and refuses those calls as `unsupported`
+    /// (docs/design/playback.md, decision 2).
+    pub const PLAYBACK: &str = "playback";
 }
 
 /// The HTTP routes. Each is a `GET` but [`TICKET`](route::TICKET), which

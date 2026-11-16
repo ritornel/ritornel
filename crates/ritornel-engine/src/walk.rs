@@ -45,7 +45,7 @@ pub(crate) fn folder_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(folder, _)| folder)
 }
 
-fn mtime_ms(metadata: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_ms(metadata: &std::fs::Metadata) -> i64 {
     metadata
         .modified()
         .ok()

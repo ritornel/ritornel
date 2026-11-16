@@ -11,6 +11,10 @@
 //!   from the same claims and projects what each shows. The disc numbers
 //!   the policy's two release rules imply are in `discs`.
 //! - [`library`] is what those are given and what they return.
+//! - [`history`] derives plays from listens and judges them by the play
+//!   rule (docs/design/history.md).
+//! - [`selection`] orders the copies of a track for the player
+//!   (docs/design/playback.md).
 //!
 //! See docs/design/identity.md.
 
@@ -33,10 +37,14 @@ use ritornel_contract as _;
 pub mod catalog;
 mod discs;
 pub mod extract;
+pub mod history;
+#[cfg(test)]
+mod history_tests;
 pub mod library;
 pub mod normalize;
 pub mod payload;
 pub mod resolve;
+pub mod selection;
 #[cfg(test)]
 mod tests;
 
