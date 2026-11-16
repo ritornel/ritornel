@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::Id;
+
 /// Why the engine refused or failed.
 ///
 /// `Display` is one line that is safe to print and to log: it never carries
@@ -58,6 +60,60 @@ pub enum Error {
     WriterSpawn(std::io::Error),
     /// The operating system gave no random bytes.
     Entropy(getrandom::Error),
+    /// There is no library where one was looked for: the file is missing,
+    /// or holds none.
+    NoLibrary,
+    /// A library was to be created where there is one already.
+    LibraryExists,
+    /// This server may not write the library: its hub pointer is empty or
+    /// names another server. See decision 15 in docs/design/server.md.
+    NotTheHub {
+        /// The library.
+        library_id: Id,
+        /// The server the pointer names. `None` is a released library.
+        hub: Option<Id>,
+        /// This server.
+        server_id: Id,
+    },
+    /// A command ID was used again with a request that is not the one it
+    /// was first used with.
+    CommandMismatch {
+        /// The command ID.
+        command: Id,
+    },
+    /// A root of this name is already at another path on this server.
+    RootTaken {
+        /// The root's name.
+        name: String,
+    },
+    /// The library already has a source of this name on this server.
+    SourceExists {
+        /// The source there is.
+        source: Id,
+    },
+    /// The library has no such source.
+    NoSuchSource,
+    /// This server has no path for the root a source names.
+    NoRootPath {
+        /// The root's name.
+        name: String,
+    },
+    /// A root's folder is missing, is not a folder or is empty: the root is
+    /// offline, not empty, and nothing in it is marked missing. See "The
+    /// data directory" in docs/design/server.md.
+    RootOffline {
+        /// Where the root should be.
+        path: std::path::PathBuf,
+    },
+    /// Reading a root failed.
+    Io(std::io::Error),
+    /// Something stored as JSON could not be written or read back.
+    Json(serde_json::Error),
+    /// A row is not what this program wrote.
+    Corrupt(&'static str),
+    /// A job was stopped where a test asked it to be, as a crash would stop
+    /// it.
+    FailPoint,
 }
 
 impl fmt::Display for Error {
@@ -100,6 +156,50 @@ impl fmt::Display for Error {
             Self::WriterStopped => f.write_str("the database writer has stopped"),
             Self::WriterSpawn(error) => write!(f, "cannot start the database writer: {error}"),
             Self::Entropy(error) => write!(f, "no random numbers from the system: {error}"),
+            Self::NoLibrary => f.write_str("there is no library here"),
+            Self::LibraryExists => f.write_str("there is a library here already"),
+            Self::NotTheHub {
+                library_id,
+                hub: Some(hub),
+                server_id,
+            } => write!(
+                f,
+                "library {library_id} belongs to server {hub}, and this server is {server_id}: \
+                 only the server its hub pointer names may write it"
+            ),
+            Self::NotTheHub {
+                library_id,
+                hub: None,
+                ..
+            } => write!(
+                f,
+                "library {library_id} has been released: no server may write it until one \
+                 adopts it"
+            ),
+            Self::CommandMismatch { command } => {
+                write!(f, "command {command} was sent before with other params")
+            }
+            Self::RootTaken { name } => {
+                write!(f, "this server has a root named {name} at another path")
+            }
+            Self::SourceExists { source } => {
+                write!(f, "the library has a source of that name already: {source}")
+            }
+            Self::NoSuchSource => f.write_str("the library has no such source"),
+            Self::NoRootPath { name } => {
+                write!(f, "this server has no path for the root {name}")
+            }
+            Self::RootOffline { path } => write!(
+                f,
+                "the root at {} is missing or empty: it is offline, and nothing was changed",
+                path.display()
+            ),
+            Self::Io(error) => write!(f, "reading a root: {error}"),
+            Self::Json(error) => write!(f, "stored JSON: {error}"),
+            Self::Corrupt(what) => {
+                write!(f, "the database holds {what} this program did not write")
+            }
+            Self::FailPoint => f.write_str("stopped at a fail point"),
         }
     }
 }
@@ -108,10 +208,17 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sqlite(error) | Self::MigrationFailed { source: error, .. } => Some(error),
-            Self::WriterSpawn(error) => Some(error),
+            Self::WriterSpawn(error) | Self::Io(error) => Some(error),
             Self::Entropy(error) => Some(error),
+            Self::Json(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
     }
 }
 

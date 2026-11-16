@@ -15,6 +15,10 @@
 )]
 
 mod cli;
+mod jobs;
+mod library;
+mod scan;
+mod server;
 mod status;
 
 use std::process::ExitCode;

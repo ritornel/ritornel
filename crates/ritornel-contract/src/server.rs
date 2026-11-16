@@ -3,8 +3,10 @@
 //! frames" in docs/design/contract.md.
 //!
 //! A field that describes something a server does not have yet is left
-//! out: there are no sort keys, predicates or library revision in the
-//! descriptor until there is a library to describe.
+//! out: there are no sort keys or predicates in the descriptor until there
+//! are lists to sort. What a server says of its library is in its status.
+//! The descriptor carries the library revision, and the public one the
+//! library and its hub, when the first client needs them there.
 
 use serde::{Deserialize, Serialize};
 
@@ -174,11 +176,29 @@ pub struct ServerStatus {
     pub role: ServerRole,
     /// What the server is built from and what its database is at.
     pub versions: Versions,
+    /// The library this server holds, as its hub. It is left out when the
+    /// server holds none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub library: Option<LibraryStatus>,
     /// The space left where the server keeps what it owns.
     pub free_disk: FreeDisk,
     /// The directory the server writes its logs in, on the server's own
     /// disk.
     pub log_path: String,
+}
+
+/// The library a server holds, as a status reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryStatus {
+    /// The library's ID: made when the library was created and never
+    /// changed.
+    pub library_id: Id,
+    /// The library revision: it counts the writes to the library, and a
+    /// client that holds what it read at this revision may keep it.
+    pub revision: u64,
 }
 
 /// The versions a status reports.
@@ -194,6 +214,11 @@ pub struct Versions {
     pub sqlite: String,
     /// The newest migration `server.db` has had applied.
     pub server_schema: i64,
+    /// The newest migration `library.db` has had applied. It is left out
+    /// when the server holds no library.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub library_schema: Option<i64>,
 }
 
 /// Free disk space, in bytes.
@@ -354,8 +379,13 @@ mod tests {
                 server: "0.1.0".to_owned(),
                 contract: 0,
                 sqlite: "3.54.1".to_owned(),
-                server_schema: 1,
+                server_schema: 2,
+                library_schema: Some(1),
             },
+            library: Some(LibraryStatus {
+                library_id: Id::from_bytes([0x1b; 16]),
+                revision: 58,
+            }),
             free_disk: FreeDisk {
                 data_bytes: Some(1_000),
             },
@@ -365,10 +395,29 @@ mod tests {
             "serverId": "11111111-1111-1111-1111-111111111111",
             "name": "desk",
             "role": "hub",
-            "versions": { "server": "0.1.0", "contract": 0, "sqlite": "3.54.1", "serverSchema": 1 },
+            "versions": {
+                "server": "0.1.0",
+                "contract": 0,
+                "sqlite": "3.54.1",
+                "serverSchema": 2,
+                "librarySchema": 1,
+            },
+            "library": { "libraryId": "1b1b1b1b-1b1b-1b1b-1b1b-1b1b1b1b1b1b", "revision": 58 },
             "freeDisk": { "dataBytes": 1_000 },
             "logPath": "/srv/ritornel/logs",
         });
+        assert_eq!(serde_json::to_value(&status).unwrap(), wire);
+
+        // A server with no library says nothing of one.
+        status.role = ServerRole::Unassigned;
+        status.versions.library_schema = None;
+        status.library = None;
+        wire["role"] = json!("unassigned");
+        wire["versions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("librarySchema");
+        wire.as_object_mut().unwrap().remove("library");
         assert_eq!(serde_json::to_value(&status).unwrap(), wire);
 
         status.free_disk.data_bytes = None;

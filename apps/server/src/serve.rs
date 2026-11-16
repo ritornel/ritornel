@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 
-use ritornel_engine::{Clock, Entropy, OsEntropy, SystemClock, new_id};
+use ritornel_engine::{Clock, Entropy, OsEntropy, ScanSettings, SystemClock, new_id};
 use tokio::runtime::Runtime;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
@@ -14,7 +14,7 @@ use tracing::{error, info};
 use crate::cli::ServeArgs;
 use crate::config::{self, Flags, Settings};
 use crate::data_dir::{self, HeldDir};
-use crate::{Env, Error, Server, logs};
+use crate::{Bounds, Env, Error, Run, Server, logs};
 
 /// Why a run is stopping.
 #[derive(Debug, Clone, Copy)]
@@ -67,7 +67,11 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         "starting"
     );
 
-    let run = run(held, args, settings, clock, entropy, out);
+    let jobs = Run {
+        boot_id: Some(boot_id),
+        scan: test_hooks(env),
+    };
+    let run = run(held, args, settings, clock, entropy, jobs, out);
     match &run {
         Ok(()) => info!("stopped"),
         Err(error) => error!(%error, "stopped on an error"),
@@ -83,6 +87,7 @@ fn run(
     settings: Settings,
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
+    jobs: Run,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -98,7 +103,14 @@ fn run(
 
     // Everything that can stop the server is being watched, so it may
     // start, and tell a client or a launcher where it is.
-    let server = runtime.block_on(Server::start(held, settings.listen, clock, entropy))?;
+    let server = runtime.block_on(Server::start_run(
+        held,
+        settings.listen,
+        clock,
+        entropy,
+        Bounds::default(),
+        jobs,
+    ))?;
     info!(server_id = %server.server_id(), name = %server.name(), "ready");
     let ready = writeln!(
         out,
@@ -122,6 +134,27 @@ fn run(
     let stopped = runtime.block_on(server.stop());
     runtime.shutdown_background();
     ready.and(stopped)
+}
+
+/// How a scan runs, with what the crash test asks of it. Two environment
+/// variables are read, and they are for that test alone: neither is a
+/// setting, and neither is in the help.
+///
+/// - `RITORNEL_TEST_SCAN_BATCH_FILES`: files to a step, so that a scan of
+///   a few fixtures has steps to be cut off between.
+/// - `RITORNEL_TEST_FAIL_AFTER_SCAN_STEP`: the fail point. The server
+///   aborts straight after the library commit of that step of a scan,
+///   before the step's checkpoint is saved, as a crash there would.
+fn test_hooks(env: Env<'_>) -> ScanSettings {
+    let number = |name: &str| env(name).and_then(|value| value.to_str()?.parse::<i64>().ok());
+    let mut scan = ScanSettings::default();
+    if let Some(files) =
+        number("RITORNEL_TEST_SCAN_BATCH_FILES").and_then(|files| usize::try_from(files).ok())
+    {
+        scan.batch_files = files;
+    }
+    scan.fail_after_step = number("RITORNEL_TEST_FAIL_AFTER_SCAN_STEP");
+    scan
 }
 
 /// Sends a stop when the process gets SIGINT or SIGTERM. The handlers are in

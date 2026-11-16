@@ -1,0 +1,769 @@
+//! Jobs and roots in `server.db`: work longer than one call, as a row with
+//! a claim, a heartbeat and a checkpoint, and where each named root is on
+//! this machine. See decisions 12 and 23 and "An effect, a job and a
+//! lease" in docs/design/server.md, and decision 17 in
+//! docs/design/contract.md.
+
+use rusqlite::{Connection, OptionalExtension, Row, Transaction};
+use sha2::{Digest, Sha256};
+
+use crate::{Command, Error, Id, ServerStore};
+
+/// Where a job is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    /// Waiting for the worker.
+    Queued,
+    /// Claimed by a worker of this run.
+    Running,
+    /// Asked to stop, and not yet stopped.
+    Cancelling,
+    /// It ended and did what it was for.
+    Succeeded,
+    /// It ended on an error.
+    Failed,
+    /// It ended because it was asked to.
+    Cancelled,
+}
+
+impl JobState {
+    /// The state as the schema writes it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Cancelling => "cancelling",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        [
+            Self::Queued,
+            Self::Running,
+            Self::Cancelling,
+            Self::Succeeded,
+            Self::Failed,
+            Self::Cancelled,
+        ]
+        .into_iter()
+        .find(|state| state.as_str() == text)
+    }
+
+    /// Whether the job has ended.
+    pub const fn ended(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// One job, as its row holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    /// The row's key, which never leaves the server.
+    pub id: i64,
+    /// The job's ID.
+    pub public_id: Id,
+    /// What kind of work it is, such as `scan`.
+    pub kind: String,
+    /// What its events invalidate: for a scan, the source.
+    pub target: Option<Id>,
+    /// What it was asked to do.
+    pub params_json: String,
+    /// Where it is in its life.
+    pub state: JobState,
+    /// The last step whose checkpoint was saved.
+    pub step: i64,
+    /// What the job needs to carry on from that step, and at its end what
+    /// came out.
+    pub checkpoint_json: Option<String>,
+    /// Whether it has been asked to stop.
+    pub cancel_requested: bool,
+    /// Items done.
+    pub done: i64,
+    /// Items in all, once that is known.
+    pub total: Option<i64>,
+    /// Bytes read.
+    pub bytes: i64,
+    /// Items that failed.
+    pub failed: i64,
+    /// Items passed over.
+    pub skipped: i64,
+    /// What it is doing now.
+    pub label: Option<String>,
+    /// Why it failed.
+    pub error: Option<String>,
+    /// When it was created, started and finished, as Unix milliseconds.
+    pub created_at_ms: i64,
+    /// See `created_at_ms`.
+    pub started_at_ms: Option<i64>,
+    /// See `created_at_ms`.
+    pub finished_at_ms: Option<i64>,
+}
+
+/// A job to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewJob {
+    /// What kind of work it is.
+    pub kind: &'static str,
+    /// One active job per kind and key: for a scan, the root's name.
+    pub dedupe_key: String,
+    /// What its events invalidate.
+    pub target: Id,
+    /// What it is asked to do.
+    pub params_json: String,
+    /// The session that asked, by its public ID.
+    pub session: Option<Id>,
+}
+
+/// A job's counters and where it has got to, saved about once a second and
+/// at every step.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// The last step committed.
+    pub step: i64,
+    /// What the job needs to carry on from there.
+    pub checkpoint_json: Option<String>,
+    /// Items done.
+    pub done: i64,
+    /// Items in all, once that is known.
+    pub total: Option<i64>,
+    /// Bytes read.
+    pub bytes: i64,
+    /// Items that failed.
+    pub failed: i64,
+    /// Items passed over.
+    pub skipped: i64,
+    /// What the job is doing now.
+    pub label: Option<String>,
+}
+
+const COLUMNS: &str = "id, public_id, kind, target_pid, params_json, state, step, checkpoint_json,
+    cancel_requested_at_ms IS NOT NULL, done, total, bytes, failed_count, skipped_count,
+    current_label, error_json, created_at_ms, started_at_ms, finished_at_ms";
+
+fn job(row: &Row<'_>) -> rusqlite::Result<Job> {
+    let state: String = row.get(5)?;
+    Ok(Job {
+        id: row.get(0)?,
+        public_id: Id::from_bytes(row.get(1)?),
+        kind: row.get(2)?,
+        target: row.get::<_, Option<[u8; 16]>>(3)?.map(Id::from_bytes),
+        params_json: row.get(4)?,
+        state: JobState::parse(&state).ok_or(rusqlite::Error::InvalidQuery)?,
+        step: row.get(6)?,
+        checkpoint_json: row.get(7)?,
+        cancel_requested: row.get(8)?,
+        done: row.get(9)?,
+        total: row.get(10)?,
+        bytes: row.get(11)?,
+        failed: row.get(12)?,
+        skipped: row.get(13)?,
+        label: row.get(14)?,
+        error: row.get(15)?,
+        created_at_ms: row.get(16)?,
+        started_at_ms: row.get(17)?,
+        finished_at_ms: row.get(18)?,
+    })
+}
+
+fn job_by_row(connection: &Connection, id: i64) -> Result<Job, Error> {
+    Ok(connection.query_row(
+        &format!("SELECT {COLUMNS} FROM job WHERE id = ?1"),
+        [id],
+        job,
+    )?)
+}
+
+fn job_by_id(connection: &Connection, id: Id) -> Result<Option<Job>, Error> {
+    Ok(connection
+        .query_row(
+            &format!("SELECT {COLUMNS} FROM job WHERE public_id = ?1"),
+            [id.as_bytes()],
+            job,
+        )
+        .optional()?)
+}
+
+/// The stored result of a server-local command, if it was carried out
+/// before. The same ID with another request is refused.
+fn receipt(transaction: &Transaction<'_>, command: &Command) -> Result<Option<String>, Error> {
+    let stored: Option<(Vec<u8>, String)> = transaction
+        .query_row(
+            "SELECT request_fingerprint, result_json FROM command_receipt WHERE command_id = ?1",
+            [command.id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match stored {
+        Some((fingerprint, result)) if fingerprint == command.fingerprint.bytes() => {
+            Ok(Some(result))
+        }
+        Some(_) => Err(Error::CommandMismatch {
+            command: command.id,
+        }),
+        None => Ok(None),
+    }
+}
+
+fn record_receipt(
+    transaction: &Transaction<'_>,
+    command: &Command,
+    method: &str,
+    result: &str,
+    now_ms: i64,
+) -> Result<(), Error> {
+    transaction.execute(
+        "INSERT INTO command_receipt (command_id, request_fingerprint, method, result_json, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (command.id.as_bytes(), command.fingerprint.bytes(), method, result, now_ms),
+    )?;
+    Ok(())
+}
+
+/// The command ID of one step of a job: 16 bytes derived from the job's ID
+/// and the step number, so that a step redone after a crash is recognised
+/// as the step it is.
+pub fn step_command(job: Id, step: i64) -> Id {
+    let mut hash = Sha256::new();
+    hash.update(b"ritornel-job-step");
+    hash.update(job.as_bytes());
+    hash.update(step.to_be_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0; 16];
+    for (byte, from) in bytes.iter_mut().zip(digest.iter()) {
+        *byte = *from;
+    }
+    Id::from_bytes(bytes)
+}
+
+impl ServerStore {
+    /// Records where a named root is on this machine. Naming the same path
+    /// again changes nothing, and a name that is at another path is
+    /// refused: a root is re-pointed by a call of its own.
+    pub fn add_root(&self, name: &str, abs_path: &str) -> Result<(), Error> {
+        let (name, abs_path) = (name.to_owned(), abs_path.to_owned());
+        self.transact(move |transaction, now_ms, _| {
+            let existing: Option<String> = transaction
+                .query_row(
+                    "SELECT abs_path FROM root WHERE name = ?1",
+                    [&name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match existing {
+                Some(path) if path == abs_path => Ok(()),
+                Some(_) => Err(Error::RootTaken { name }),
+                None => {
+                    transaction.execute(
+                        "INSERT INTO root (name, abs_path, created_at_ms) VALUES (?1, ?2, ?3)",
+                        (&name, &abs_path, now_ms),
+                    )?;
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Every root this server has a path for: its name and its path.
+    pub fn roots(&self) -> Result<Vec<(String, String)>, Error> {
+        self.read(|connection| {
+            let mut statement =
+                connection.prepare("SELECT name, abs_path FROM root ORDER BY id")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Carries out the command that starts a job, and returns the job with
+    /// whether this call created it. A job of the same kind and key that
+    /// has not ended is returned in place of a second one, and the command
+    /// sent again returns the job it returned the first time.
+    pub fn start_job(
+        &self,
+        command: Command,
+        method: &'static str,
+        new: NewJob,
+    ) -> Result<(Job, bool), Error> {
+        self.transact(move |transaction, now_ms, entropy| {
+            if let Some(result) = receipt(transaction, &command)? {
+                let id = result.parse().map_err(|_| Error::Corrupt("a receipt"))?;
+                let job =
+                    job_by_id(transaction, id)?.ok_or(Error::Corrupt("a receipt for no job"))?;
+                return Ok((job, false));
+            }
+            let running: Option<i64> = transaction
+                .query_row(
+                    "SELECT id FROM job WHERE kind = ?1 AND dedupe_key = ?2
+                       AND state IN ('queued', 'running', 'cancelling')",
+                    (new.kind, &new.dedupe_key),
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let (row, created) = match running {
+                Some(row) => (row, false),
+                None => {
+                    let public_id = crate::new_id(now_ms, entropy)?;
+                    transaction.execute(
+                        "INSERT INTO job
+                           (public_id, kind, dedupe_key, target_kind, target_pid, params_json,
+                            created_by_session_id, created_at_ms)
+                         VALUES (?1, ?2, ?3, 'source', ?4, ?5,
+                                 (SELECT id FROM session WHERE public_id = ?6), ?7)",
+                        (
+                            public_id.as_bytes(),
+                            new.kind,
+                            &new.dedupe_key,
+                            new.target.as_bytes(),
+                            &new.params_json,
+                            new.session.as_ref().map(Id::as_bytes),
+                            now_ms,
+                        ),
+                    )?;
+                    (transaction.last_insert_rowid(), true)
+                }
+            };
+            let job = job_by_row(transaction, row)?;
+            record_receipt(
+                transaction,
+                &command,
+                method,
+                &job.public_id.to_string(),
+                now_ms,
+            )?;
+            Ok((job, created))
+        })
+    }
+
+    /// Puts back in the queue every job that a run other than `boot`
+    /// claimed, and returns how many. This server holds the data
+    /// directory's lock, so that run is provably gone. A job that was
+    /// asked to stop is cancelled instead.
+    pub fn requeue_jobs_of_other_runs(&self, boot: Id) -> Result<usize, Error> {
+        self.transact(move |transaction, now_ms, _| {
+            transaction.execute(
+                "UPDATE job SET state = 'cancelled', finished_at_ms = ?2, claimed_boot_id = NULL
+                 WHERE state = 'cancelling' AND claimed_boot_id IS NOT ?1",
+                (boot.as_bytes(), now_ms),
+            )?;
+            Ok(transaction.execute(
+                "UPDATE job SET state = 'queued', claimed_boot_id = NULL
+                 WHERE state = 'running' AND claimed_boot_id IS NOT ?1",
+                [boot.as_bytes()],
+            )?)
+        })
+    }
+
+    /// Claims the oldest queued job for the run `boot`.
+    pub fn claim_job(&self, boot: Id) -> Result<Option<Job>, Error> {
+        self.transact(move |transaction, now_ms, _| {
+            let next: Option<i64> = transaction
+                .query_row(
+                    "SELECT id FROM job WHERE state = 'queued' ORDER BY id LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(row) = next else { return Ok(None) };
+            transaction.execute(
+                "UPDATE job SET state = 'running', claimed_boot_id = ?2, heartbeat_at_ms = ?3,
+                                started_at_ms = coalesce(started_at_ms, ?3)
+                 WHERE id = ?1",
+                (row, boot.as_bytes(), now_ms),
+            )?;
+            Ok(Some(job_by_row(transaction, row)?))
+        })
+    }
+
+    /// Saves a job's counters and its checkpoint, and with them its
+    /// heartbeat. It returns the job as it then is, which says whether it
+    /// has been asked to stop.
+    pub fn save_progress(&self, job: i64, progress: Progress) -> Result<Job, Error> {
+        self.transact(move |transaction, now_ms, _| {
+            transaction.execute(
+                "UPDATE job SET step = ?2, checkpoint_json = coalesce(?3, checkpoint_json), done = ?4,
+                                total = ?5, bytes = ?6, failed_count = ?7, skipped_count = ?8,
+                                current_label = ?9, heartbeat_at_ms = ?10
+                 WHERE id = ?1",
+                (
+                    job,
+                    progress.step,
+                    &progress.checkpoint_json,
+                    progress.done,
+                    progress.total,
+                    progress.bytes,
+                    progress.failed,
+                    progress.skipped,
+                    &progress.label,
+                    now_ms,
+                ),
+            )?;
+            job_by_row(transaction, job)
+        })
+    }
+
+    /// Records the outcome of items of a job: what each was, its state
+    /// (`succeeded`, `failed` or `skipped`) and the detail as JSON.
+    pub fn add_job_items(
+        &self,
+        job: i64,
+        items: Vec<(String, &'static str, String)>,
+    ) -> Result<(), Error> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.transact(move |transaction, _, _| {
+            let mut insert = transaction
+                .prepare("INSERT INTO job_item (job_id, item_ref, state, detail_json) VALUES (?1, ?2, ?3, ?4)")?;
+            for (item, state, detail) in &items {
+                insert.execute((job, item, state, detail))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Ends a job.
+    pub fn finish_job(
+        &self,
+        job: i64,
+        state: JobState,
+        error: Option<String>,
+    ) -> Result<Job, Error> {
+        self.transact(move |transaction, now_ms, _| {
+            transaction.execute(
+                "UPDATE job SET state = ?2, error_json = ?3, finished_at_ms = ?4, current_label = NULL
+                 WHERE id = ?1",
+                (job, state.as_str(), &error, now_ms),
+            )?;
+            job_by_row(transaction, job)
+        })
+    }
+
+    /// Carries out the command that asks a job to stop, and returns the
+    /// job, or `None` if there is no such job. A queued job is cancelled
+    /// at once; a running one stops after the step in flight. Asking again,
+    /// or asking a job that has ended, changes nothing.
+    pub fn cancel_job(
+        &self,
+        command: Command,
+        method: &'static str,
+        id: Id,
+    ) -> Result<Option<Job>, Error> {
+        self.transact(move |transaction, now_ms, _| {
+            let Some(found) = job_by_id(transaction, id)? else {
+                return Ok(None);
+            };
+            if receipt(transaction, &command)?.is_none() {
+                transaction.execute(
+                    "UPDATE job SET cancel_requested_at_ms = coalesce(cancel_requested_at_ms, ?2),
+                                    state = CASE state WHEN 'queued' THEN 'cancelled'
+                                                       WHEN 'running' THEN 'cancelling' ELSE state END,
+                                    finished_at_ms = CASE state WHEN 'queued' THEN ?2 ELSE finished_at_ms END
+                     WHERE id = ?1 AND state IN ('queued', 'running', 'cancelling')",
+                    (found.id, now_ms),
+                )?;
+                record_receipt(transaction, &command, method, &id.to_string(), now_ms)?;
+            }
+            Ok(Some(job_by_row(transaction, found.id)?))
+        })
+    }
+
+    /// The job with this ID.
+    pub fn job(&self, id: Id) -> Result<Option<Job>, Error> {
+        self.read(|connection| job_by_id(connection, id))
+    }
+
+    /// The newest jobs, newest first, at most `limit` of them.
+    pub fn jobs(&self, limit: u32) -> Result<Vec<Job>, Error> {
+        self.read(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {COLUMNS} FROM job ORDER BY id DESC LIMIT ?1"
+            ))?;
+            let rows = statement.query_map([limit], job)?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// The items of a job that failed: what each was and the detail, at
+    /// most `limit` of them.
+    pub fn failed_job_items(&self, job: i64, limit: u32) -> Result<Vec<(String, String)>, Error> {
+        self.read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT item_ref, coalesce(detail_json, '') FROM job_item
+                 WHERE job_id = ?1 AND state = 'failed' ORDER BY id LIMIT ?2",
+            )?;
+            let rows = statement.query_map((job, limit), |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::Fingerprint;
+    use crate::testing::{CountingEntropy, FixedClock};
+
+    const T0: i64 = 1_763_000_000_000;
+
+    fn store(clock: &Arc<FixedClock>) -> ServerStore {
+        let store =
+            ServerStore::open_in_memory(clock.clone(), Arc::new(CountingEntropy::default()))
+                .unwrap();
+        store.ensure_identity("desk").unwrap();
+        store
+    }
+
+    fn id(byte: u8) -> Id {
+        Id::from_bytes([byte; 16])
+    }
+
+    fn command(byte: u8, params: &str) -> Command {
+        Command {
+            id: id(byte),
+            fingerprint: Fingerprint::of("scan.start", params.as_bytes()),
+        }
+    }
+
+    fn scan(root: &str) -> NewJob {
+        NewJob {
+            kind: "scan",
+            dedupe_key: root.to_owned(),
+            target: id(0x50),
+            params_json: "{}".to_owned(),
+            session: None,
+        }
+    }
+
+    #[test]
+    fn a_root_is_a_name_and_a_path_and_a_name_keeps_its_path() {
+        let store = store(&Arc::new(FixedClock::at(T0)));
+        store.add_root("main", "/srv/invented").unwrap();
+        store.add_root("main", "/srv/invented").unwrap();
+        let refused = store.add_root("main", "/srv/elsewhere");
+        assert!(
+            matches!(&refused, Err(Error::RootTaken { name }) if name == "main"),
+            "{refused:?}"
+        );
+        store.add_root("other", "/srv/elsewhere").unwrap();
+        assert_eq!(
+            store.roots().unwrap(),
+            [
+                ("main".to_owned(), "/srv/invented".to_owned()),
+                ("other".to_owned(), "/srv/elsewhere".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn one_root_has_one_active_scan_and_a_command_sent_again_gets_its_job() {
+        let store = store(&Arc::new(FixedClock::at(T0)));
+        let session = store.local_session().unwrap();
+        let (first, created) = store
+            .start_job(
+                command(1, "a"),
+                "scan.start",
+                NewJob {
+                    session,
+                    ..scan("main")
+                },
+            )
+            .unwrap();
+        assert!(created);
+        assert_eq!(
+            (first.state, first.kind.as_str(), first.target),
+            (JobState::Queued, "scan", Some(id(0x50)))
+        );
+        // Sent again, the command returns its job and starts nothing.
+        assert_eq!(
+            store
+                .start_job(command(1, "a"), "scan.start", scan("main"))
+                .unwrap(),
+            (first.clone(), false)
+        );
+        let refused = store.start_job(command(1, "b"), "scan.start", scan("main"));
+        assert!(
+            matches!(refused, Err(Error::CommandMismatch { .. })),
+            "{refused:?}"
+        );
+        // Another command for the same root gets the job that is running.
+        assert_eq!(
+            store
+                .start_job(command(2, "a"), "scan.start", scan("main"))
+                .unwrap(),
+            (first.clone(), false)
+        );
+        // Another root has a scan of its own.
+        let (other, created) = store
+            .start_job(command(3, "a"), "scan.start", scan("other"))
+            .unwrap();
+        assert!(created && other.public_id != first.public_id);
+        assert_eq!(store.jobs(10).unwrap(), [other, first.clone()]);
+
+        // Once it has ended, the root can be scanned again.
+        store
+            .finish_job(first.id, JobState::Succeeded, None)
+            .unwrap();
+        let (again, created) = store
+            .start_job(command(4, "a"), "scan.start", scan("main"))
+            .unwrap();
+        assert!(created && again.public_id != first.public_id);
+    }
+
+    #[test]
+    fn a_job_is_claimed_checkpointed_and_requeued_when_its_run_is_gone() {
+        let clock = Arc::new(FixedClock::at(T0));
+        let store = store(&clock);
+        let (created, _) = store
+            .start_job(command(1, "a"), "scan.start", scan("main"))
+            .unwrap();
+        assert_eq!(store.requeue_jobs_of_other_runs(id(0xb1)).unwrap(), 0);
+
+        clock.set(T0 + 10);
+        let claimed = store.claim_job(id(0xb1)).unwrap().unwrap();
+        assert_eq!(
+            (claimed.state, claimed.started_at_ms),
+            (JobState::Running, Some(T0 + 10))
+        );
+        assert_eq!(store.claim_job(id(0xb1)).unwrap(), None);
+        let saved = store
+            .save_progress(
+                claimed.id,
+                Progress {
+                    step: 3,
+                    checkpoint_json: Some("{\"at\":3}".to_owned()),
+                    done: 1500,
+                    total: Some(14_000),
+                    bytes: 9,
+                    failed: 2,
+                    skipped: 4,
+                    label: Some("a/b.flac".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (saved.step, saved.done, saved.total),
+            (3, 1500, Some(14_000))
+        );
+        assert_eq!((saved.failed, saved.skipped, saved.bytes), (2, 4, 9));
+        // A save with no checkpoint keeps the last one.
+        let saved = store
+            .save_progress(
+                claimed.id,
+                Progress {
+                    step: 3,
+                    ..Progress::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(saved.checkpoint_json.as_deref(), Some("{\"at\":3}"));
+
+        // The run that claimed it leaves its own job alone. Another run
+        // finds the lock free, so that one is gone, and takes the job back.
+        assert_eq!(store.requeue_jobs_of_other_runs(id(0xb1)).unwrap(), 0);
+        assert_eq!(store.requeue_jobs_of_other_runs(id(0xb2)).unwrap(), 1);
+        let again = store.claim_job(id(0xb2)).unwrap().unwrap();
+        assert_eq!(
+            (again.public_id, again.step, again.started_at_ms),
+            (created.public_id, 3, Some(T0 + 10))
+        );
+        assert_eq!(again.checkpoint_json.as_deref(), Some("{\"at\":3}"));
+    }
+
+    #[test]
+    fn cancelling_stops_a_queued_job_at_once_and_asks_a_running_one() {
+        let clock = Arc::new(FixedClock::at(T0));
+        let store = store(&clock);
+        let (queued, _) = store
+            .start_job(command(1, "a"), "scan.start", scan("main"))
+            .unwrap();
+        let cancelled = store
+            .cancel_job(command(9, "x"), "jobs.cancel", queued.public_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (cancelled.state, cancelled.finished_at_ms),
+            (JobState::Cancelled, Some(T0))
+        );
+        assert_eq!(
+            store
+                .cancel_job(command(8, "x"), "jobs.cancel", id(0x77))
+                .unwrap(),
+            None
+        );
+
+        let (running, _) = store
+            .start_job(command(2, "a"), "scan.start", scan("main"))
+            .unwrap();
+        store.claim_job(id(0xb1)).unwrap().unwrap();
+        let asked = store
+            .cancel_job(command(7, "x"), "jobs.cancel", running.public_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (asked.state, asked.cancel_requested),
+            (JobState::Cancelling, true)
+        );
+        // The worker sees the request when it saves its progress.
+        assert!(
+            store
+                .save_progress(running.id, Progress::default())
+                .unwrap()
+                .cancel_requested
+        );
+        let ended = store
+            .finish_job(running.id, JobState::Cancelled, None)
+            .unwrap();
+        assert!(ended.state.ended());
+        // A job that was asked to stop, and whose run then died, is
+        // cancelled when the next run starts.
+        let (third, _) = store
+            .start_job(command(3, "a"), "scan.start", scan("main"))
+            .unwrap();
+        store.claim_job(id(0xb1)).unwrap().unwrap();
+        store
+            .cancel_job(command(6, "x"), "jobs.cancel", third.public_id)
+            .unwrap();
+        store.requeue_jobs_of_other_runs(id(0xb2)).unwrap();
+        assert_eq!(
+            store.job(third.public_id).unwrap().unwrap().state,
+            JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_steps_command_id_is_the_same_for_the_same_job_and_step_and_for_no_other() {
+        let a = step_command(id(1), 13);
+        assert_eq!(a, step_command(id(1), 13));
+        assert_ne!(a, step_command(id(1), 14));
+        assert_ne!(a, step_command(id(2), 13));
+    }
+
+    #[test]
+    fn what_failed_in_a_job_can_be_listed() {
+        let store = store(&Arc::new(FixedClock::at(T0)));
+        let (job, _) = store
+            .start_job(command(1, "a"), "scan.start", scan("main"))
+            .unwrap();
+        store
+            .add_job_items(
+                job.id,
+                vec![
+                    (
+                        "a/1.flac".to_owned(),
+                        "failed",
+                        "{\"kind\":\"io\"}".to_owned(),
+                    ),
+                    ("a/2.flac".to_owned(), "skipped", "{}".to_owned()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.failed_job_items(job.id, 10).unwrap(),
+            [("a/1.flac".to_owned(), "{\"kind\":\"io\"}".to_owned())]
+        );
+    }
+}

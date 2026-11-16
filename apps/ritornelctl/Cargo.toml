@@ -7,7 +7,12 @@ publish.workspace = true
 
 [dependencies]
 ritornel-client.workspace = true
-# `status --json` prints the status as JSON.
+# Parses the command line. The help it prints and the messages for a wrong
+# command line are this program's own, so clap's colours, suggestions and
+# usage lines are left out. `help` is what gives it a --help flag at all, and
+# `error-context` says which option an error is about.
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "error-context"] }
+# `--json` prints what the server sent as JSON.
 serde_json = "1.0.154"
 # The runtime the client's connection runs on. One thread is enough for a
 # command that makes a call and exits.

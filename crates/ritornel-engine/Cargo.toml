@@ -9,15 +9,28 @@ publish.workspace = true
 # The public ID type: an ID is what a client sees, so the contract owns it.
 ritornel-contract.workspace = true
 ritornel-domain.workspace = true
+# The audio hash, and the hash a payload and a picture are known by. Pinned
+# exactly, as the audio-hash spike pinned it: the hash is a stored key.
+blake3 = "=1.8.7"
 # The Ed25519 key pair that is half of a server's identity.
 ed25519-dalek = "3.0.0"
 # The operating system's random numbers, for IDs, keys and tokens.
 getrandom = "0.4.3"
 # Pinned exactly, because the SQLite it bundles is the one the server asserts
 # at startup. See decision 16 in docs/design/server.md.
-rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled"] }
+# `cache` is its prepared-statement cache: a scan runs the same few inserts
+# for every file, and without it each would be parsed again every time.
+rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled", "cache"] }
+# A stored payload, a decision's evidence and a job's checkpoint are JSON.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 # SHA-256, for migration checksums and for the hash kept of a session token.
 sha2 = "0.11.1"
+# Demuxes a file without decoding it and reads its tags and pictures. Pinned
+# exactly, with the features the audio-hash spike used: scheme 1 is defined
+# as what this version's demuxers deliver, and a fixture test fails if an
+# upgrade moves any hash. The decoders it brings are what the player needs.
+symphonia = { version = "=0.6.1", features = ["all"] }
 
 [lints]
 workspace = true

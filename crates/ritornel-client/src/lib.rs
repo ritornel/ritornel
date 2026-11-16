@@ -6,6 +6,7 @@
 //!   events the server sends. It runs over a real socket
 //!   ([`Client::connect`]) or over a pair of channels in memory
 //!   ([`Client::over_memory`]), and encodes every frame as JSON on both.
+//! - [`idempotency_key`] makes the ID a command is sent with.
 //! - [`local`] finds the server on this machine through `server.json`.
 //!   Starting and stopping one arrive with the desktop's launcher.
 //! - [`descriptor`], [`health`], [`ticket`] and [`get`] are the HTTP routes.
@@ -30,6 +31,7 @@
 use log as _;
 
 mod client;
+mod command;
 mod credential;
 mod error;
 mod http;
@@ -37,6 +39,7 @@ pub mod local;
 mod transport;
 
 pub use client::Client;
+pub use command::idempotency_key;
 pub use credential::Credential;
 pub use error::{Error, NotRunning};
 pub use http::{Answer, descriptor, get, health, ticket};

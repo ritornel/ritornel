@@ -4,11 +4,14 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use ritornel_contract::methods::{
-    EventsSubscribe, EventsUnsubscribe, Method, ServerHello, ServerStatus, ServersList,
+    EventsSubscribe, EventsUnsubscribe, JobsCancel, JobsGet, JobsList, LibraryCreate, LibraryStats,
+    Method, ScanStart, ServerHello, ServerStatus, ServersList, SourcesAdd, SourcesList,
 };
 use ritornel_contract::{
-    Descriptor, EVENT_METHOD, Event, Frame, HelloParams, NoParams, Request, RequestId, Response,
-    Subscriptions, Topic, TopicsParams,
+    Descriptor, EVENT_METHOD, Event, Frame, HelloParams, Id, JobCancelParams, JobCancelled,
+    JobDetail, JobGetParams, LibraryCreateParams, LibraryCreated, NoParams, Request, RequestId,
+    Response, ScanStartParams, ScanStarted, SourceAdded, SourcesAddParams, Subscriptions, Topic,
+    TopicsParams,
 };
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -150,6 +153,75 @@ impl Client {
         let topics = topics.to_vec();
         self.call::<EventsUnsubscribe>(&TopicsParams { topics })
             .await
+    }
+
+    /// `library.create`: creates a library on the server and makes the
+    /// server its hub. The key is the command's: sent again with the same
+    /// key, the call returns what it returned the first time.
+    pub async fn create_library(&self, idempotency_key: Id) -> Result<LibraryCreated, Error> {
+        self.call::<LibraryCreate>(&LibraryCreateParams { idempotency_key })
+            .await
+    }
+
+    /// `sources.list`: every source of the library, with where its root is
+    /// on the server.
+    pub async fn sources(&self) -> Result<ritornel_contract::SourcesList, Error> {
+        self.call::<SourcesList>(&NoParams {}).await
+    }
+
+    /// `sources.add`: adds a folder on the server as a named root. The
+    /// server only ever reads it.
+    pub async fn add_source(
+        &self,
+        idempotency_key: Id,
+        name: &str,
+        path: &str,
+    ) -> Result<SourceAdded, Error> {
+        self.call::<SourcesAdd>(&SourcesAddParams {
+            idempotency_key,
+            name: name.to_owned(),
+            path: path.to_owned(),
+        })
+        .await
+    }
+
+    /// `scan.start`: starts a scan of a source as a job. A source that is
+    /// being scanned answers with the job that is running.
+    pub async fn start_scan(
+        &self,
+        idempotency_key: Id,
+        source_id: Id,
+    ) -> Result<ScanStarted, Error> {
+        self.call::<ScanStart>(&ScanStartParams {
+            idempotency_key,
+            source_id,
+        })
+        .await
+    }
+
+    /// `jobs.list`: the newest jobs, newest first.
+    pub async fn jobs(&self) -> Result<ritornel_contract::JobsList, Error> {
+        self.call::<JobsList>(&NoParams {}).await
+    }
+
+    /// `jobs.get`: one job, with the first of its items that failed.
+    pub async fn job(&self, job_id: Id) -> Result<JobDetail, Error> {
+        self.call::<JobsGet>(&JobGetParams { job_id }).await
+    }
+
+    /// `jobs.cancel`: asks a job to stop.
+    pub async fn cancel_job(&self, idempotency_key: Id, job_id: Id) -> Result<JobCancelled, Error> {
+        self.call::<JobsCancel>(&JobCancelParams {
+            idempotency_key,
+            job_id,
+        })
+        .await
+    }
+
+    /// `library.stats`: what the library holds and what the scans made of
+    /// it.
+    pub async fn library_stats(&self) -> Result<ritornel_contract::LibraryStats, Error> {
+        self.call::<LibraryStats>(&NoParams {}).await
     }
 
     /// The next event, waiting until there is one. `None` once the
@@ -400,7 +472,10 @@ mod tests {
         answered.unwrap();
 
         let revisions: Vec<_> = std::iter::from_fn(|| client.try_next_event())
-            .map(|Event::Servers(event)| event.server.revision)
+            .filter_map(|event| match event {
+                Event::Servers(event) => Some(event.server.revision),
+                _ => None,
+            })
             .collect();
         assert_eq!(revisions, [2, 3]);
     }

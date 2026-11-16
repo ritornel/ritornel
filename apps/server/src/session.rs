@@ -53,16 +53,32 @@ enum Queued {
 fn key(event: &Event) -> String {
     match event {
         Event::Servers(event) => event.server.server_id.to_string(),
+        Event::Jobs(event) => event.job.job_id.to_string(),
+        // The library is one resource.
+        Event::Library(_) => String::new(),
     }
 }
 
-/// Merges a newer event into the unsent one for the same topic and key. An
-/// event is a full copy, so that is keeping the copy with the higher
-/// revision.
+/// Merges a newer event into the unsent one for the same topic and key. A
+/// server's status and a job are full copies, so that is keeping the newer
+/// copy. A library hint keeps the highest revision and the union of what
+/// changed.
 fn merge(unsent: &mut Event, newer: Event) {
-    let (Event::Servers(held), Event::Servers(new)) = (&*unsent, &newer);
-    if new.server.revision > held.server.revision {
-        *unsent = newer;
+    match (&mut *unsent, newer) {
+        (Event::Servers(held), Event::Servers(new)) => {
+            if new.server.revision > held.server.revision {
+                *held = new;
+            }
+        }
+        (Event::Jobs(held), Event::Jobs(new)) => *held = new,
+        (Event::Library(held), Event::Library(new)) => {
+            held.library_revision = held.library_revision.max(new.library_revision);
+            held.changed.extend(new.changed);
+            held.changed.sort_unstable();
+            held.changed.dedup();
+        }
+        // The key is per topic, so the two are always of one topic.
+        _ => {}
     }
 }
 
@@ -271,7 +287,9 @@ mod tests {
             panic!("{frame:?}");
         };
         assert_eq!(method, "event");
-        let Event::Servers(event) = serde_json::from_value(params.clone().unwrap()).unwrap();
+        let Event::Servers(event) = serde_json::from_value(params.clone().unwrap()).unwrap() else {
+            panic!("an event on another topic");
+        };
         (event.server.name, event.server.revision)
     }
 

@@ -1,5 +1,8 @@
 # Migrations are hashed and schema snapshots are compared, both byte for byte.
 /crates/**/migrations/**/*.sql text eol=lf
 /schema/*.sql text eol=lf
+# A saved database is compared with what its migration makes, statement by
+# statement.
+/crates/**/saved/**/*.sql text eol=lf
 # The contract's TypeScript is generated and compared byte for byte too.
 /contract/*.ts text eol=lf linguist-generated

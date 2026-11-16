@@ -279,7 +279,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
         })
         .collect();
     let logs_dir = data_dir.join("logs");
-    assert_eq!(facts.len(), 9, "{}", printed.stdout);
+    assert_eq!(facts.len(), 10, "{}", printed.stdout);
     assert_eq!(
         facts[..7],
         [
@@ -289,12 +289,13 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             ("Server version", env!("CARGO_PKG_VERSION")),
             ("Contract version", "0"),
             ("SQLite version", "3.54.1"),
-            ("Server schema", "1"),
+            ("Server schema", "2"),
         ]
     );
-    assert_eq!(facts[7].0, "Free disk, data");
-    assert_ne!(facts[7].1, "unknown");
-    assert_eq!(facts[8], ("Log path", logs_dir.to_str().unwrap()));
+    assert_eq!(facts[7], ("Library", "none"));
+    assert_eq!(facts[8].0, "Free disk, data");
+    assert_ne!(facts[8].1, "unknown");
+    assert_eq!(facts[9], ("Log path", logs_dir.to_str().unwrap()));
 
     // For a program: the status as the server sent it.
     let printed = status(&data_dir, &["--json"]);
@@ -312,7 +313,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
                 "server": env!("CARGO_PKG_VERSION"),
                 "contract": 0,
                 "sqlite": "3.54.1",
-                "serverSchema": 1,
+                "serverSchema": 2,
             },
             "freeDisk": { "dataBytes": free },
             "logPath": logs_dir.to_str().unwrap(),
@@ -357,6 +358,106 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
     assert_eq!(after.code, Some(NO_SERVER));
     assert_eq!(after.stdout, "");
     assert_eq!(after.stderr, no_server(&data_dir));
+}
+
+/// The facts a command printed for a person: each line's label and value.
+fn facts(printed: &Ended) -> Vec<(&str, &str)> {
+    assert_eq!(
+        (printed.code, printed.stderr.as_str()),
+        (Some(0), ""),
+        "{printed:?}"
+    );
+    printed
+        .stdout
+        .lines()
+        .map(|line| {
+            let (label, value) = line.split_at(18);
+            (label.trim_end(), value)
+        })
+        .collect()
+}
+
+#[test]
+fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let dir = data_dir.to_str().unwrap();
+    let server = Server::start(&data_dir);
+
+    let created = run(ritornelctl(&["library", "create", "--data-dir", dir]));
+    let created = facts(&created);
+    let [("Library ID", library_id), ("Library revision", "1")] = created[..] else {
+        panic!("{created:?}");
+    };
+    assert_eq!(library_id.len(), 36, "{library_id}");
+
+    // The status shows what now exists.
+    let printed = status(&data_dir, &[]);
+    let shown = facts(&printed);
+    assert_eq!(shown.len(), 12, "{}", printed.stdout);
+    assert_eq!(shown[2], ("Role", "hub"));
+    assert_eq!(
+        shown[6..10],
+        [
+            ("Server schema", "2"),
+            ("Library schema", "1"),
+            ("Library ID", library_id),
+            ("Library revision", "1"),
+        ]
+    );
+    let json: Value = serde_json::from_str(&status(&data_dir, &["--json"]).stdout).unwrap();
+    assert_eq!(json["role"], "hub");
+    assert_eq!(json["versions"]["librarySchema"], 1);
+    assert_eq!(
+        json["library"],
+        serde_json::json!({ "libraryId": library_id, "revision": 1 })
+    );
+
+    // A server holds one library. Asking again is another command, and it
+    // is refused.
+    let again = run(ritornelctl(&["library", "create", "--data-dir", dir]));
+    assert_eq!((again.code, again.stdout.as_str()), (Some(1), ""));
+    assert_eq!(
+        again.stderr,
+        "ritornelctl: the server answered with an error: conflict: there is a library on this \
+         server already\n"
+    );
+
+    // The server that starts next on the directory opens the same library.
+    let stopped = server.end("TERM");
+    assert_eq!(
+        (stopped.code, stopped.stderr.as_str()),
+        (Some(0), ""),
+        "{stopped:?}"
+    );
+    let server = Server::start(&data_dir);
+    let printed = status(&data_dir, &[]);
+    let shown = facts(&printed);
+    assert_eq!(shown[2], ("Role", "hub"));
+    assert_eq!(shown[8], ("Library ID", library_id));
+    assert_eq!(shown[9], ("Library revision", "1"));
+    assert_eq!(server.end("TERM").code, Some(0));
+}
+
+#[test]
+fn library_create_prints_its_receipt_as_json_when_asked() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let server = Server::start(&data_dir);
+
+    let mut command = ritornelctl(&["library", "create", "--json"]);
+    command.env("RITORNEL_DATA_DIR", &data_dir);
+    let printed = run(command);
+    assert_eq!((printed.code, printed.stderr.as_str()), (Some(0), ""));
+    let json: Value = serde_json::from_str(&printed.stdout).unwrap();
+    let mut fields: Vec<_> = json.as_object().unwrap().keys().collect();
+    fields.sort_unstable();
+    assert_eq!(fields, ["commandId", "libraryId", "revision", "status"]);
+    assert_eq!(
+        (&json["status"], &json["revision"]),
+        (&"done".into(), &1.into())
+    );
+    assert_eq!(server.end("TERM").code, Some(0));
 }
 
 #[test]

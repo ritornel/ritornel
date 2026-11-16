@@ -30,10 +30,24 @@ impl Migration {
 }
 
 /// The migrations of `server.db`.
-pub(crate) const SERVER: &[Migration] = &[Migration {
+pub(crate) const SERVER: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_identity",
+        sql: include_str!("../migrations/server/0001_identity.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_work",
+        sql: include_str!("../migrations/server/0002_work.sql"),
+    },
+];
+
+/// The migrations of `library.db`.
+pub(crate) const LIBRARY: &[Migration] = &[Migration {
     version: 1,
-    name: "0001_identity",
-    sql: include_str!("../migrations/server/0001_identity.sql"),
+    name: "0001_library",
+    sql: include_str!("../migrations/library/0001_library.sql"),
 }];
 
 /// What a run did.
@@ -359,14 +373,16 @@ mod tests {
 
     #[test]
     fn the_shipped_migrations_are_numbered_from_1_and_named_by_number() {
-        for (index, migration) in SERVER.iter().enumerate() {
-            let number = i64::try_from(index).unwrap() + 1;
-            assert_eq!(migration.version, number);
-            assert!(
-                migration.name.starts_with(&format!("{number:04}_")),
-                "{}",
-                migration.name
-            );
+        for database in [SERVER, LIBRARY] {
+            for (index, migration) in database.iter().enumerate() {
+                let number = i64::try_from(index).unwrap() + 1;
+                assert_eq!(migration.version, number);
+                assert!(
+                    migration.name.starts_with(&format!("{number:04}_")),
+                    "{}",
+                    migration.name
+                );
+            }
         }
     }
 }

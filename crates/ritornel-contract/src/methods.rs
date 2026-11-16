@@ -16,9 +16,6 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 /// What sort of call a method is.
-///
-/// The commands of M1 join as a third kind: each carries an idempotency key
-/// and returns a receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodKind {
     /// It changes only the session it is called on: who the client is, and
@@ -26,6 +23,10 @@ pub enum MethodKind {
     Session,
     /// It reads and changes nothing.
     Query,
+    /// It changes something lasting. Its params carry an `idempotencyKey`
+    /// and its result is a [`Receipt`](crate::Receipt), so sending it again
+    /// is safe.
+    Command,
 }
 
 /// One call of the contract.
@@ -152,6 +153,46 @@ methods! {
     /// No event on those topics follows the response.
     EventsUnsubscribe: "events.unsubscribe", Session, needs_full: false,
     TopicsParams => Subscriptions;
+
+    /// `library.create`: creates a library on this server and makes the
+    /// server its hub. A server that has a library already refuses with
+    /// `conflict`.
+    LibraryCreate: "library.create", Command, needs_full: true,
+    LibraryCreateParams => LibraryCreated;
+
+    /// `sources.list`: every source of the library, with where its root is
+    /// on this server. It names paths, so it needs a `full` session.
+    SourcesList: "sources.list", Query, needs_full: true,
+    NoParams => SourcesList;
+
+    /// `sources.add`: adds a folder on this server as a named root. The
+    /// server only ever reads it. A name the library has already is
+    /// refused with `conflict`.
+    SourcesAdd: "sources.add", Command, needs_full: true,
+    SourcesAddParams => SourceAdded;
+
+    /// `scan.start`: starts a scan of a source as a job, and returns the
+    /// job. A source that is being scanned returns the job that is running.
+    ScanStart: "scan.start", Command, needs_full: true,
+    ScanStartParams => ScanStarted;
+
+    /// `jobs.list`: the newest jobs, newest first.
+    JobsList: "jobs.list", Query, needs_full: true,
+    NoParams => JobsList;
+
+    /// `jobs.get`: one job, with the first of its items that failed.
+    JobsGet: "jobs.get", Query, needs_full: true,
+    JobGetParams => JobDetail;
+
+    /// `jobs.cancel`: asks a job to stop. It stops after the step in
+    /// flight, and what it has committed stays.
+    JobsCancel: "jobs.cancel", Command, needs_full: true,
+    JobCancelParams => JobCancelled;
+
+    /// `library.stats`: what the library holds and what the scans made of
+    /// it.
+    LibraryStats: "library.stats", Query, needs_full: false,
+    NoParams => LibraryStats;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -164,7 +205,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_table_is_the_m0_call_list() {
+    fn the_table_is_the_m0_call_list_and_the_calls_added_since() {
         let names: Vec<_> = METHODS.iter().map(|method| method.name).collect();
         assert_eq!(
             names,
@@ -173,7 +214,15 @@ mod tests {
                 "server.status",
                 "servers.list",
                 "events.subscribe",
-                "events.unsubscribe"
+                "events.unsubscribe",
+                "library.create",
+                "sources.list",
+                "sources.add",
+                "scan.start",
+                "jobs.list",
+                "jobs.get",
+                "jobs.cancel",
+                "library.stats"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -181,13 +230,34 @@ mod tests {
     }
 
     #[test]
-    fn only_the_status_needs_a_full_session() {
+    fn the_status_and_every_command_need_a_full_session() {
         let full: Vec<_> = METHODS
             .iter()
             .filter(|method| method.needs_full)
             .map(|method| method.name)
             .collect();
-        assert_eq!(full, ["server.status"]);
+        assert_eq!(
+            full,
+            [
+                "server.status",
+                "library.create",
+                "sources.list",
+                "sources.add",
+                "scan.start",
+                "jobs.list",
+                "jobs.get",
+                "jobs.cancel"
+            ]
+        );
+        // Everything but reading the library and controlling playback
+        // needs one, so no command is open to a limited session.
+        for method in METHODS {
+            assert!(
+                method.needs_full || method.kind != MethodKind::Command,
+                "{}",
+                method.name
+            );
+        }
     }
 
     #[test]

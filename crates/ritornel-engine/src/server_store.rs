@@ -57,6 +57,8 @@ pub struct ServerIdentity {
     pub name: String,
     /// The server's own record of its role.
     pub role: Role,
+    /// The library it holds, as a hub, or is linked to, as a satellite.
+    pub library_id: Option<Id>,
     /// When the identity was created, as Unix milliseconds.
     pub created_at_ms: i64,
 }
@@ -156,8 +158,9 @@ impl ServerStore {
                 server_id: new_id(now_ms, &*entropy)?,
                 public_key: key.public_key(),
                 name,
-                // What the column defaults to.
+                // What the two columns default to.
                 role: Role::Unassigned,
+                library_id: None,
                 created_at_ms: now_ms,
             };
             transaction.execute(
@@ -191,6 +194,45 @@ impl ServerStore {
             let identity = read_identity(&transaction)?;
             transaction.commit()?;
             Ok(identity)
+        })
+    }
+
+    /// Records that this server is the hub of the library `library_id`,
+    /// and returns the identity as it now is: `None` if the server has none
+    /// yet. This is the server's own claim. The library's hub pointer is
+    /// what decides, and it is written first, in `library.db`.
+    pub fn claim_library(&self, library_id: Id) -> Result<Option<ServerIdentity>, Error> {
+        self.writer.call(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "UPDATE server_identity SET role = 'hub', library_id = ?1 WHERE id = 1",
+                [library_id.as_bytes()],
+            )?;
+            let identity = read_identity(&transaction)?;
+            transaction.commit()?;
+            Ok(identity)
+        })
+    }
+
+    /// The public ID of the local credential's session: the actor on every
+    /// command that session sends. `None` before the server has an
+    /// identity.
+    pub fn local_session(&self) -> Result<Option<Id>, Error> {
+        self.reader.call(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT session.public_id
+                     FROM session
+                     JOIN server_setting
+                       ON server_setting.key = ?1
+                      AND session.id = CAST(server_setting.value_json AS INTEGER)
+                     WHERE session.revoked_at_ms IS NULL",
+                    [LOCAL_CREDENTIAL_SESSION],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .map(Id::from_bytes))
         })
     }
 
@@ -235,6 +277,30 @@ impl ServerStore {
         })
     }
 
+    /// Runs `work` in one write transaction, with the time it began.
+    pub(crate) fn transact<T, F>(&self, work: F) -> Result<T, Error>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Transaction<'_>, i64, &dyn Entropy) -> Result<T, Error> + Send + 'static,
+    {
+        let (clock, entropy) = (Arc::clone(&self.clock), Arc::clone(&self.entropy));
+        self.writer.call(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let done = work(&transaction, clock.now_ms(), &*entropy)?;
+            transaction.commit()?;
+            Ok(done)
+        })
+    }
+
+    /// Runs a short read on the read-only connection.
+    pub(crate) fn read<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.reader.call(work)
+    }
+
     /// Closes the database after a clean stop: moves the write-ahead log
     /// into the file and empties it.
     pub fn close(self) -> Result<(), Error> {
@@ -246,7 +312,7 @@ impl ServerStore {
 fn read_identity(connection: &Connection) -> Result<Option<ServerIdentity>, Error> {
     Ok(connection
         .query_row(
-            "SELECT server_id, public_key, name, role, created_at_ms
+            "SELECT server_id, public_key, name, role, library_id, created_at_ms
              FROM server_identity WHERE id = 1",
             [],
             |row| {
@@ -255,7 +321,8 @@ fn read_identity(connection: &Connection) -> Result<Option<ServerIdentity>, Erro
                     public_key: row.get(1)?,
                     name: row.get(2)?,
                     role: row.get(3)?,
-                    created_at_ms: row.get(4)?,
+                    library_id: row.get::<_, Option<[u8; 16]>>(4)?.map(Id::from_bytes),
+                    created_at_ms: row.get(5)?,
                 })
             },
         )
@@ -357,8 +424,8 @@ mod tests {
     #[test]
     fn a_new_database_is_at_the_newest_schema_and_has_no_identity() {
         let store = in_memory(&Arc::new(FixedClock::at(T0)));
-        assert_eq!(store.schema_version(), 1);
-        assert_eq!(store.migrations_applied(), 1);
+        assert_eq!(store.schema_version(), 2);
+        assert_eq!(store.migrations_applied(), 2);
         assert_eq!(store.identity().unwrap(), None);
         assert!(sessions(&store).is_empty());
     }
@@ -377,6 +444,7 @@ mod tests {
         );
         assert_eq!(identity.name, "desk");
         assert_eq!(identity.role, Role::Unassigned);
+        assert_eq!(identity.library_id, None);
         assert_eq!(identity.created_at_ms, T0);
         assert_eq!(store.identity().unwrap(), Some(identity));
 
@@ -493,6 +561,143 @@ mod tests {
     }
 
     #[test]
+    fn claiming_a_library_makes_the_server_its_hub_and_changes_nothing_else() {
+        let store = in_memory(&Arc::new(FixedClock::at(T0)));
+        let library = Id::from_bytes([0x1b; 16]);
+        assert_eq!(store.claim_library(library).unwrap(), None);
+
+        let (first, token) = store.ensure_identity("desk").unwrap();
+        let claimed = store.claim_library(library).unwrap().unwrap();
+        assert_eq!(
+            claimed,
+            ServerIdentity {
+                role: Role::Hub,
+                library_id: Some(library),
+                ..first
+            }
+        );
+        assert_eq!(store.identity().unwrap(), Some(claimed.clone()));
+        assert!(store.is_local_credential(&token.unwrap()).unwrap());
+        // Claiming it again is the same claim.
+        assert_eq!(store.claim_library(library).unwrap(), Some(claimed));
+    }
+
+    #[test]
+    fn the_local_session_is_the_one_the_credential_holds_now() {
+        let store = in_memory(&Arc::new(FixedClock::at(T0)));
+        assert_eq!(store.local_session().unwrap(), None);
+        store.ensure_identity("desk").unwrap();
+        // The counting source gives the key 00 to 1f, the server's ID 20
+        // to 29, the token 2a to 49 and the session's ID 4a to 53.
+        let first = store.local_session().unwrap().unwrap();
+        assert_eq!(first.to_string(), "019a7afd-1e00-7a4b-8c4d-4e4f50515253");
+
+        store.reissue_local_credential().unwrap();
+        let second = store.local_session().unwrap().unwrap();
+        assert_ne!(second, first);
+    }
+
+    /// A `server.db` as the first migration left it, with an identity and
+    /// a session in it.
+    const SAVED_0001: &str = include_str!("../saved/server/0001.sql");
+
+    #[test]
+    fn a_database_saved_at_the_first_migration_is_taken_forward_with_what_it_holds() {
+        let scratch = Scratch::new();
+        let path = scratch.path().join("server.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(SAVED_0001)
+            .unwrap();
+
+        let store = on_disk(&path).unwrap();
+        assert_eq!(store.migrations_applied(), 1);
+        assert_eq!(store.schema_version(), 2);
+        // Who the server is, and the credential it issued, are as they
+        // were.
+        let identity = store.identity().unwrap().unwrap();
+        assert_eq!(
+            identity.server_id.to_string(),
+            "019a7afd-1e00-7021-a223-242526272829"
+        );
+        assert_eq!(
+            (identity.name.as_str(), identity.role, identity.library_id),
+            ("desk", Role::Unassigned, None)
+        );
+        let token =
+            SessionToken::new("2a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40414243444546474849");
+        assert!(store.is_local_credential(&token).unwrap());
+        assert_eq!(sessions(&store).len(), 1);
+
+        // What the second migration adds is there to be used, and a job
+        // may name the session that was there before it.
+        store
+            .writer
+            .call(|connection| {
+                Ok(connection.execute_batch(
+                    "INSERT INTO root (name, abs_path, created_at_ms)
+                     VALUES ('main', '/srv/invented', 0);
+                     INSERT INTO job (public_id, kind, params_json, created_by_session_id, created_at_ms)
+                     VALUES (zeroblob(16), 'scan', '{}', 1, 0);
+                     INSERT INTO job_item (job_id, item_ref, state) VALUES (1, 'a.flac', 'succeeded');
+                     INSERT INTO command_receipt
+                       (command_id, request_fingerprint, method, result_json, created_at_ms)
+                     VALUES (zeroblob(16), x'f0', 'queue.clear', '{}', 0);
+                     INSERT INTO outbox (kind, dedupe_key, next_attempt_at_ms, created_at_ms)
+                     VALUES ('history.ingest', x'01', 0, 0);",
+                )?)
+            })
+            .unwrap();
+        store.close().unwrap();
+
+        let store = on_disk(&path).unwrap();
+        assert_eq!(store.migrations_applied(), 0);
+        assert_eq!(store.identity().unwrap(), Some(identity));
+    }
+
+    #[test]
+    fn the_saved_database_is_one_the_first_migration_made() {
+        let mut saved = Connection::open_in_memory().unwrap();
+        saved.execute_batch(SAVED_0001).unwrap();
+        let mut made = Connection::open_in_memory().unwrap();
+        migrate::run(
+            &mut made,
+            migrate::SERVER.get(..1).unwrap(),
+            &FixedClock::at(T0),
+        )
+        .unwrap();
+        let schema = |connection: &Connection| -> Vec<String> {
+            connection
+                .prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(schema(&saved), schema(&made));
+        let ledger = |connection: &Connection| -> (i64, String, Vec<u8>) {
+            connection
+                .query_row(
+                    "SELECT version, name, checksum FROM schema_migration",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(ledger(&saved), ledger(&made));
+        // Running the same first migration over it changes nothing: it is
+        // at that schema already.
+        let again = migrate::run(
+            &mut saved,
+            migrate::SERVER.get(..1).unwrap(),
+            &FixedClock::at(T0),
+        )
+        .unwrap();
+        assert_eq!((again.applied, again.version), (0, 1));
+    }
+
+    #[test]
     fn a_token_the_server_did_not_issue_is_not_the_local_credential() {
         let store = in_memory(&Arc::new(FixedClock::at(T0)));
         assert!(
@@ -536,7 +741,7 @@ mod tests {
         let path = scratch.path().join("server.db");
 
         let store = on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 1);
+        assert_eq!(store.migrations_applied(), 2);
         let (first, token) = store.ensure_identity("desk").unwrap();
         let token = token.unwrap();
         store.close().unwrap();
@@ -544,7 +749,7 @@ mod tests {
 
         let store = on_disk(&path).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 1);
+        assert_eq!(store.schema_version(), 2);
         let (second, none) = store.ensure_identity("desk").unwrap();
         assert_eq!(second, first);
         assert!(none.is_none());
@@ -601,11 +806,11 @@ mod tests {
         on_disk(&path).unwrap().close().unwrap();
         tamper(
             &path,
-            "INSERT INTO schema_migration VALUES (2, '0002_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (3, '0003_from_the_future', x'00', 0)",
         );
         let refused = on_disk(&path);
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 2, known: 1 })),
+            matches!(refused, Err(Error::NewerSchema { found: 3, known: 2 })),
             "{refused:?}"
         );
     }

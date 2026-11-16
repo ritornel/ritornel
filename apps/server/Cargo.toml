@@ -11,6 +11,11 @@ ritornel-engine.workspace = true
 # The listener: HTTP routing and the WebSocket upgrade, over hyper and
 # tungstenite. Only what a loopback HTTP/1 listener needs is switched on.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
+# Parses the command line. The help it prints and the messages for a wrong
+# command line are this program's own, so clap's colours, suggestions and
+# usage lines are left out. `help` is what gives it a --help flag at all, and
+# `error-context` says which option an error is about.
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "error-context"] }
 # Serves each connection, so that the listener can bound how many it serves
 # and how long each may take to send a request. axum is built on both, so
 # neither adds to the lock file.

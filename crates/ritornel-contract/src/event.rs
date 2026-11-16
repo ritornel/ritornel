@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ServerInfo;
+use crate::{Job, ServerInfo};
 
 /// The method of every event notification.
 pub const EVENT_METHOD: &str = "event";
@@ -21,16 +21,23 @@ pub const EVENT_METHOD: &str = "event";
 pub enum Topic {
     /// One server's full status, whenever it changes.
     Servers,
+    /// One job's full summary, whenever it changes: at most four times a
+    /// second for one job.
+    Jobs,
+    /// A hint that the library changed, with its revision.
+    Library,
 }
 
 impl Topic {
     /// Every topic.
-    pub const ALL: &[Self] = &[Self::Servers];
+    pub const ALL: &[Self] = &[Self::Servers, Self::Jobs, Self::Library];
 
     /// The topic as it is written on the wire.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Servers => "servers",
+            Self::Jobs => "jobs",
+            Self::Library => "library",
         }
     }
 }
@@ -42,6 +49,10 @@ impl Topic {
 pub enum Event {
     /// One server's status changed.
     Servers(ServersEvent),
+    /// One job changed.
+    Jobs(Box<JobsEvent>),
+    /// The library changed.
+    Library(LibraryEvent),
 }
 
 impl Event {
@@ -49,6 +60,8 @@ impl Event {
     pub const fn topic(&self) -> Topic {
         match self {
             Self::Servers(_) => Topic::Servers,
+            Self::Jobs(_) => Topic::Jobs,
+            Self::Library(_) => Topic::Library,
         }
     }
 }
@@ -61,6 +74,40 @@ pub struct ServersEvent {
     /// The server's status, whole. The client replaces its copy if this
     /// one's revision is higher.
     pub server: ServerInfo,
+}
+
+/// What an event on the `jobs` topic carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct JobsEvent {
+    /// The job, whole, with its target. The client replaces its copy.
+    pub job: Job,
+}
+
+/// What an event on the `library` topic carries: a bare hint to read
+/// again whatever is on screen and older than the revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryEvent {
+    /// The library revision after the change.
+    pub library_revision: u64,
+    /// What changed.
+    pub changed: Vec<LibraryChange>,
+}
+
+/// What about the library changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryChange {
+    /// What is in the library: files, tracks, albums or artists.
+    Membership,
+    /// What something shows.
+    Metadata,
+    /// The counts.
+    Stats,
 }
 
 /// The params of `events.subscribe` and `events.unsubscribe`.

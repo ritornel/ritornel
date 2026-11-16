@@ -4,10 +4,17 @@
 //! ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
 //!                       [--log-level <level>]
 //! ```
+//!
+//! clap parses it. The help is [`USAGE`] and the messages are the fixed
+//! ones in [`usage`], so nothing a person typed is ever printed back.
 
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
+
+use clap::builder::NonEmptyStringValueParser;
+use clap::error::{ContextKind, ErrorKind};
+use clap::{Args, Parser, Subcommand};
 
 use crate::{Env, Error, serve};
 
@@ -58,70 +65,75 @@ Exit codes:
   3    The data directory is in use by another server
 ";
 
-/// The arguments of `ritornel-server serve`.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ServeArgs {
-    pub(crate) data_dir: Option<PathBuf>,
-    pub(crate) owned: bool,
-    pub(crate) listen: Option<String>,
-    pub(crate) log_level: Option<String>,
+/// The command line, as clap reads it.
+#[derive(Debug, PartialEq, Eq, Parser)]
+#[command(name = "ritornel-server", version, propagate_version = true)]
+#[command(disable_help_subcommand = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-/// A parsed command line.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Subcommand)]
 enum Command {
-    Help,
-    Version,
     Serve(ServeArgs),
 }
 
-/// Parses the arguments after the program name. The messages are fixed and
-/// repeat no argument.
-fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, Error> {
-    let mut args = args.into_iter();
-    let (mut serve, mut parsed) = (false, ServeArgs::default());
-    while let Some(arg) = args.next() {
-        match arg.to_str() {
-            Some("-h" | "--help") => return Ok(Command::Help),
-            Some("-V" | "--version") => return Ok(Command::Version),
-            Some("serve") if !serve => serve = true,
-            Some("--data-dir") if serve => match value(&mut args) {
-                Some(dir) => parsed.data_dir = Some(PathBuf::from(dir)),
-                None => return Err(Error::Usage("--data-dir needs a directory")),
-            },
-            Some("--listen") if serve => match value(&mut args).map(OsString::into_string) {
-                Some(Ok(address)) => parsed.listen = Some(address),
-                _ => return Err(Error::Usage("--listen needs an address")),
-            },
-            Some("--log-level") if serve => match value(&mut args).map(OsString::into_string) {
-                Some(Ok(level)) => parsed.log_level = Some(level),
-                _ => return Err(Error::Usage("--log-level needs a level")),
-            },
-            Some("--owned") if serve => parsed.owned = true,
-            _ => {
-                return Err(Error::Usage(
-                    "unknown argument; try `ritornel-server --help`",
-                ));
-            }
-        }
-    }
-    if serve {
-        Ok(Command::Serve(parsed))
-    } else {
-        Err(Error::Usage(
-            "expected `ritornel-server serve`; try `ritornel-server --help`",
-        ))
-    }
+/// The arguments of `ritornel-server serve`.
+///
+/// A token that looks like an option is never the value of one: `--data-dir
+/// --owned` is a missing directory and not a directory named `--owned`,
+/// which would start a server that no longer stops with its owner. A
+/// directory whose name does begin with a hyphen is written `./-name`. An
+/// empty value is a missing one too.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ServeArgs {
+    #[arg(long)]
+    pub(crate) data_dir: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) owned: bool,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub(crate) listen: Option<String>,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub(crate) log_level: Option<String>,
 }
 
-/// The value of an option: the next argument, unless there is none, it is
-/// empty, or it looks like an option itself. `--data-dir --owned` is then a
-/// missing directory and not a directory named `--owned`, which would start
-/// a server that no longer stops with its owner. A directory whose name does
-/// begin with a hyphen is written `./-name`.
-fn value(args: &mut impl Iterator<Item = OsString>) -> Option<OsString> {
-    args.next()
-        .filter(|value| !value.is_empty() && !value.as_encoded_bytes().starts_with(b"-"))
+/// What a wrong command line is answered with. The messages are fixed and
+/// repeat no argument: clap's own would print back what was typed.
+fn usage(error: &clap::Error) -> Error {
+    // The context holds the option as this program declares it, never what
+    // was typed.
+    let option = error
+        .get(ContextKind::InvalidArg)
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    Error::Usage(match error.kind() {
+        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => {
+            "unknown argument; try `ritornel-server --help`"
+        }
+        ErrorKind::MissingSubcommand | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            "expected `ritornel-server serve`; try `ritornel-server --help`"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation
+            if option.starts_with("--data-dir") =>
+        {
+            "--data-dir needs a directory"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation if option.starts_with("--listen") => {
+            "--listen needs an address"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation
+            if option.starts_with("--log-level") =>
+        {
+            "--log-level needs a level"
+        }
+        _ => "the command line is wrong; try `ritornel-server --help`",
+    })
+}
+
+/// Parses the arguments after the program name.
+fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cli, clap::Error> {
+    Cli::try_parse_from(std::iter::once(OsString::from(env!("CARGO_PKG_NAME"))).chain(args))
 }
 
 /// Runs the program and returns its exit code. The ready line, the help and
@@ -150,16 +162,22 @@ fn try_run(
     env: Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    match parse(args)? {
-        Command::Help => out.write_all(USAGE.as_bytes()).map_err(Error::Output),
-        Command::Version => writeln!(
+    match parse(args) {
+        Ok(Cli {
+            command: Command::Serve(args),
+        }) => serve::serve(&args, env, out),
+        // Help wins wherever it is, and it is the same help.
+        Err(error) if error.kind() == ErrorKind::DisplayHelp => {
+            out.write_all(USAGE.as_bytes()).map_err(Error::Output)
+        }
+        Err(error) if error.kind() == ErrorKind::DisplayVersion => writeln!(
             out,
             "{} {}",
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION")
         )
         .map_err(Error::Output),
-        Command::Serve(args) => serve::serve(&args, env, out),
+        Err(error) => Err(usage(&error)),
     }
 }
 
@@ -188,7 +206,7 @@ mod tests {
     #[test]
     fn serve_is_parsed_with_its_options_in_any_order() {
         assert_eq!(
-            parse(args(&["serve"])).unwrap(),
+            parse(args(&["serve"])).unwrap().command,
             Command::Serve(ServeArgs::default())
         );
         let expected = Command::Serve(ServeArgs {
@@ -218,8 +236,15 @@ mod tests {
                 "--listen",
                 "127.0.0.1:5000",
             ],
+            &[
+                "serve",
+                "--log-level=debug",
+                "--owned",
+                "--data-dir=/srv/ritornel",
+                "--listen=127.0.0.1:5000",
+            ],
         ] {
-            assert_eq!(parse(args(line)).unwrap(), expected, "{line:?}");
+            assert_eq!(parse(args(line)).unwrap().command, expected, "{line:?}");
         }
     }
 
@@ -235,23 +260,75 @@ mod tests {
             &["serve", "--data-dir", "--owned"],
             &["serve", "--data-dir", "-x"],
             &["serve", "--log-level"],
+            &["serve", "--log-level", ""],
             &["serve", "--log-level", "--owned"],
             &["serve", "--listen"],
+            &["serve", "--listen", ""],
             &["serve", "--listen", "--owned"],
+            &["serve", "--owned", "--owned"],
             &["serve", "--port", "4747"],
             &["status"],
+            &["help"],
         ] {
             let (code, out, err) = program(line, &[]);
             assert_eq!(code, EXIT_USAGE, "{line:?}");
             assert_eq!(out, "", "{line:?}");
             assert!(err.starts_with("ritornel-server: "), "{line:?}: {err}");
+            assert_eq!(err.lines().count(), 1, "{line:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn each_way_of_being_wrong_has_its_own_fixed_message() {
+        for (line, message) in [
+            (
+                &["status"][..],
+                "unknown argument; try `ritornel-server --help`",
+            ),
+            (
+                &["serve", "--port", "4747"],
+                "unknown argument; try `ritornel-server --help`",
+            ),
+            (
+                &[],
+                "expected `ritornel-server serve`; try `ritornel-server --help`",
+            ),
+            (&["serve", "--data-dir"], "--data-dir needs a directory"),
+            (&["serve", "--data-dir", ""], "--data-dir needs a directory"),
+            (
+                &["serve", "--data-dir", "--owned"],
+                "--data-dir needs a directory",
+            ),
+            (&["serve", "--listen"], "--listen needs an address"),
+            (&["serve", "--listen", ""], "--listen needs an address"),
+            (
+                &["serve", "--log-level", "--owned"],
+                "--log-level needs a level",
+            ),
+            (
+                &["serve", "--owned", "--owned"],
+                "the command line is wrong; try `ritornel-server --help`",
+            ),
+        ] {
+            let (_, _, err) = program(line, &[]);
+            assert_eq!(err, format!("ritornel-server: {message}\n"), "{line:?}");
         }
     }
 
     #[test]
     fn an_error_message_repeats_no_argument() {
-        let (_, _, err) = program(&["serve", "--tokne", "SENTINEL_ARGUMENT_0001"], &[]);
-        assert!(!err.contains("SENTINEL"), "{err}");
+        for line in [
+            &["serve", "--tokne", "SENTINEL_ARGUMENT_0001"][..],
+            &["serve", "SENTINEL_ARGUMENT_0001"],
+            &["SENTINEL_ARGUMENT_0001"],
+            &["serve", "--SENTINEL_ARGUMENT_0001"],
+            &["serve", "--owned=SENTINEL_ARGUMENT_0001"],
+            &["serve", "--data-dir", "-SENTINEL_ARGUMENT_0001"],
+        ] {
+            let (code, _, err) = program(line, &[]);
+            assert_eq!(code, EXIT_USAGE, "{line:?}");
+            assert!(!err.contains("SENTINEL"), "{err}");
+        }
     }
 
     #[test]
@@ -263,12 +340,14 @@ mod tests {
         // Help wins wherever it is.
         assert_eq!(program(&["serve", "--owned", "-h"], &[]).1, out);
 
-        let (code, out, _) = program(&["--version"], &[]);
-        assert_eq!(code, 0);
-        assert_eq!(
-            out,
-            concat!("ritornel-server ", env!("CARGO_PKG_VERSION"), "\n")
-        );
+        for line in [&["--version"][..], &["-V"], &["serve", "-V"]] {
+            let (code, out, _) = program(line, &[]);
+            assert_eq!(code, 0, "{line:?}");
+            assert_eq!(
+                out,
+                concat!("ritornel-server ", env!("CARGO_PKG_VERSION"), "\n")
+            );
+        }
     }
 
     #[test]

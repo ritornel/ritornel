@@ -7,6 +7,16 @@ publish.workspace = true
 
 [dependencies]
 ritornel-contract.workspace = true
+# A payload is stored as JSON and a decision's evidence is written as JSON.
+# Only the derives are used here: the engine does the reading and writing.
+serde = { version = "1.0.229", features = ["derive"] }
+# NFKC, the first step of the mechanical normalisation of a name. Pinned
+# exactly: a changed table would change stored match names.
+unicode-normalization = "=0.1.25"
+
+[dev-dependencies]
+# The property tests the notes name: resolving twice gives the same result.
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

@@ -4,6 +4,8 @@
 //! - [`Frame`] is a JSON-RPC 2.0 request, response or notification.
 //! - [`methods`] is the method table: each call's name, params and result,
 //!   what kind of call it is, and whether it needs a `full` session.
+//! - [`Receipt`] is what a command returns: a call that changes something
+//!   lasting, and carries an idempotency key.
 //! - [`Event`] is what the server pushes, by [`Topic`].
 //! - [`RpcError`] is the error model: a code from the closed set
 //!   [`ErrorCode`], `retryable`, and `details`.
@@ -35,10 +37,12 @@
     )
 )]
 
+mod command;
 mod error;
 mod event;
 mod frame;
 mod id;
+mod library;
 pub mod local;
 pub mod methods;
 mod server;
@@ -46,14 +50,24 @@ mod ticket;
 #[cfg(test)]
 mod typescript;
 
+pub use command::{LibraryCreateParams, LibraryCreated, Receipt, ReceiptStatus};
 pub use error::{ErrorCode, ErrorData, RpcError};
-pub use event::{EVENT_METHOD, Event, ServersEvent, Subscriptions, Topic, TopicsParams};
+pub use event::{
+    EVENT_METHOD, Event, JobsEvent, LibraryChange, LibraryEvent, ServersEvent, Subscriptions,
+    Topic, TopicsParams,
+};
 pub use frame::{Frame, Malformed, Notification, Request, RequestId, Response};
 pub use id::{Id, NotAnId};
+pub use library::{
+    Count, Job, JobCancelParams, JobCancelled, JobDetail, JobGetParams, JobItem, JobState,
+    JobTarget, JobsList, LibraryStats, ScanStartParams, ScanStarted, ScanSummary, Source,
+    SourceAdded, SourceKind, SourcesAddParams, SourcesList,
+};
 pub use methods::{METHODS, Method, MethodInfo, MethodKind, MethodVisitor, visit_methods};
 pub use server::{
-    ClientKind, Descriptor, FreeDisk, HelloParams, Limits, MAX_CLIENT_TEXT, NoParams,
-    PublicDescriptor, ServerInfo, ServerRole, ServerStatus, ServersList, SessionKind, Versions,
+    ClientKind, Descriptor, FreeDisk, HelloParams, LibraryStatus, Limits, MAX_CLIENT_TEXT,
+    NoParams, PublicDescriptor, ServerInfo, ServerRole, ServerStatus, ServersList, SessionKind,
+    Versions,
 };
 pub use ticket::{SocketTicket, TICKET_PARAM};
 

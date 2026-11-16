@@ -3,23 +3,28 @@
 //! knows nothing of sockets. See decision 4 in docs/design/contract.md.
 //!
 //! [`Core`] is what every session of a running server shares: the open
-//! database, who this server is, and the list of sessions that events are
+//! databases, who this server is, and the list of sessions that events are
 //! published to.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use ritornel_contract::methods::{
-    self, EventsSubscribe, EventsUnsubscribe, Method, ServerHello, ServerStatus, ServersList,
+    self, EventsSubscribe, EventsUnsubscribe, JobsCancel, JobsGet, JobsList, LibraryCreate,
+    LibraryStats, Method, ScanStart, ServerHello, ServerStatus, ServersList, SourcesAdd,
+    SourcesList,
 };
 use ritornel_contract::{
-    CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id, Limits,
-    MAX_CLIENT_TEXT, PublicDescriptor, Response, RpcError, ServerInfo, ServerRole, ServersEvent,
-    SessionKind, Versions, capability,
+    CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
+    LibraryCreateParams, LibraryCreated, LibraryStatus, Limits, MAX_CLIENT_TEXT, PublicDescriptor,
+    Receipt, ReceiptStatus, Response, RpcError, ServerInfo, ServerRole, ServersEvent, SessionKind,
+    Versions, capability,
 };
-use ritornel_engine::{Role, SQLITE_VERSION, ServerIdentity, ServerStore, SessionToken};
+use ritornel_engine::{
+    Client, Clock, Command, Entropy, Fingerprint, LibraryStore, Role, SQLITE_VERSION,
+    ServerIdentity, ServerStore, SessionToken, SubjectKind, WriteRequest, Written,
+};
 use serde_json::{Map, Value};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
@@ -30,6 +35,8 @@ use crate::disk;
 use crate::session::Session;
 use crate::transport::{self, Wire};
 use crate::{Bounds, Error};
+
+mod calls;
 
 /// The largest frame the server reads, in bytes: 1 MiB, which keeps bulk
 /// out of the control channel (docs/design/linking.md, decision 11).
@@ -44,28 +51,52 @@ pub(crate) enum Received {
     Refused,
 }
 
+/// The databases a running server has open.
+#[derive(Debug)]
+pub(crate) struct Stores {
+    /// `server.db`.
+    server: ServerStore,
+    /// `library.db`, on a server that is a hub. Creating a library puts it
+    /// here, and holds this for writing while it does, so that of two calls
+    /// to create one the second finds the first's.
+    library: RwLock<Option<LibraryStore>>,
+}
+
+impl Stores {
+    pub(crate) fn new(server: ServerStore, library: Option<LibraryStore>) -> Self {
+        Self {
+            server,
+            library: RwLock::new(library),
+        }
+    }
+}
+
 /// What every session of a running server shares.
 #[derive(Debug)]
 pub(crate) struct Core {
     server_id: Id,
-    role: ServerRole,
     schema_version: i64,
-    data_dir: PathBuf,
-    logs: PathBuf,
+    dir: DataDir,
     /// What can change about this server while it runs.
     this: Mutex<This>,
-    /// `server.db`, until the server stops. A call that comes after that
+    /// The databases, until the server stops. A call that comes after that
     /// finds nothing here and is told the server is unavailable.
-    store: RwLock<Option<ServerStore>>,
+    stores: RwLock<Option<Stores>>,
     /// What a presented credential is checked against.
     local_credential: Verifier,
+    /// What a library created here takes its times and its IDs from.
+    clock: Arc<dyn Clock>,
+    entropy: Arc<dyn Entropy>,
     bounds: Bounds,
     sessions: Mutex<Sessions>,
+    /// What wakes the worker that runs jobs.
+    jobs: crate::jobs::Wake,
 }
 
 #[derive(Debug)]
 struct This {
     name: String,
+    role: ServerRole,
     /// Counts the changes to this server's status since it started.
     revision: u64,
 }
@@ -97,26 +128,30 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Core {
     pub(crate) fn new(
-        store: ServerStore,
+        stores: Stores,
         identity: &ServerIdentity,
         dir: &DataDir,
         local_credential: Verifier,
+        clock: Arc<dyn Clock>,
+        entropy: Arc<dyn Entropy>,
         bounds: Bounds,
     ) -> Self {
         Self {
             local_credential,
+            clock,
+            entropy,
             bounds,
             server_id: identity.server_id,
-            role: role(identity.role),
-            schema_version: store.schema_version(),
-            data_dir: dir.root().to_owned(),
-            logs: dir.logs(),
+            schema_version: stores.server.schema_version(),
+            dir: dir.clone(),
             this: Mutex::new(This {
                 name: identity.name.clone(),
+                role: role(identity.role),
                 revision: 1,
             }),
-            store: RwLock::new(Some(store)),
+            stores: RwLock::new(Some(stores)),
             sessions: Mutex::default(),
+            jobs: crate::jobs::Wake::default(),
         }
     }
 
@@ -143,10 +178,11 @@ impl Core {
 
     /// What the server says about itself to anyone who asks.
     pub(crate) fn public_descriptor(&self) -> PublicDescriptor {
+        let this = lock(&self.this);
         PublicDescriptor {
             server_id: self.server_id,
-            name: self.name(),
-            role: self.role,
+            name: this.name.clone(),
+            role: this.role,
             contract_version: CONTRACT_VERSION,
             capabilities: vec![capability::EVENTS_SERVERS.to_owned()],
             limits: Limits {
@@ -159,7 +195,7 @@ impl Core {
         ServerInfo {
             server_id: self.server_id,
             name: this.name.clone(),
-            role: self.role,
+            role: this.role,
             is_this_server: true,
             // A client that reads this has just reached it.
             reachable: true,
@@ -263,16 +299,26 @@ impl Core {
         drop(std::mem::take(&mut lock(&self.sessions).transports));
     }
 
-    /// Closes `server.db`. Whatever calls it afterwards is told the server
-    /// is unavailable. This waits for a call that is using the database to
+    /// Closes the databases. Whatever calls the server afterwards is told
+    /// it is unavailable. This waits for a call that is using a database to
     /// finish.
     pub(crate) fn close_store(&self) -> Result<(), Error> {
-        let store = self
-            .store
+        let stores = self
+            .stores
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        Ok(store.map_or(Ok(()), ServerStore::close)?)
+        let Some(stores) = stores else {
+            return Ok(());
+        };
+        // Both are closed, whatever closing the first one says.
+        let library = stores
+            .library
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map_or(Ok(()), |library| library.close().map_err(Error::Library));
+        stores.server.close()?;
+        library
     }
 
     /// Renames the server, and sends its new status to every session that
@@ -284,32 +330,38 @@ impl Core {
     pub(crate) fn rename(&self, name: &str) -> Result<(), Error> {
         // The database before the name, as a call takes them: the other
         // order could wait on a call while that call waits on this.
-        let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
-        let store = store.as_ref().ok_or(Error::Stopped)?;
+        let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
+        let stores = stores.as_ref().ok_or(Error::Stopped)?;
         // Held from the write to the last publish, so two renames reach
         // every session in the order they were stored.
         let mut this = lock(&self.this);
-        let Some(identity) = store.rename(name)? else {
+        let Some(identity) = stores.server.rename(name)? else {
             // A core is made from an identity, so there is always one.
             return Ok(());
         };
         this.name = identity.name;
+        self.changed(&mut this);
+        Ok(())
+    }
+
+    /// Counts a change to this server's status and sends the new status to
+    /// every session that subscribed to the `servers` topic. The event is a
+    /// hint sent after the commit.
+    fn changed(&self, this: &mut This) {
         this.revision += 1;
-        // The event is a hint sent after the commit.
         let event = Event::Servers(ServersEvent {
-            server: self.info(&this),
+            server: self.info(this),
         });
         for session in lock(&self.sessions).open.values() {
             session.publish(event.clone());
         }
-        Ok(())
     }
 
     /// Holds the database as something that is writing to it would, so a
     /// test can see what goes on working meanwhile.
     #[cfg(test)]
-    pub(crate) fn stall(&self) -> std::sync::RwLockWriteGuard<'_, Option<ServerStore>> {
-        self.store.write().unwrap_or_else(PoisonError::into_inner)
+    pub(crate) fn stall(&self) -> std::sync::RwLockWriteGuard<'_, Option<Stores>> {
+        self.stores.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Takes one frame as text from a session's transport, and queues what
@@ -348,15 +400,15 @@ impl Core {
                 // Held for the whole call: closing the database waits for
                 // every call that has started, and a call that starts
                 // after it finds none.
-                let store = self.store.read().unwrap_or_else(PoisonError::into_inner);
-                let outcome = match store.as_ref() {
-                    Some(_) => self.call(session, &request.method, request.params),
+                let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
+                let outcome = match stores.as_ref() {
+                    Some(stores) => self.call(stores, session, &request.method, request.params),
                     None => Err(RpcError::new(
                         ErrorCode::Unavailable,
                         "the server is stopping",
                     )),
                 };
-                drop(store);
+                drop(stores);
                 if let Err(failed) = &outcome
                     && failed.kind() == ErrorCode::Internal
                 {
@@ -376,6 +428,7 @@ impl Core {
 
     fn call(
         &self,
+        stores: &Stores,
         session: &Session,
         method: &str,
         params: Option<Value>,
@@ -400,7 +453,7 @@ impl Core {
         }
         match row.name {
             ServerHello::NAME => run::<ServerHello>(params, |hello| self.hello(session, &hello)),
-            ServerStatus::NAME => run::<ServerStatus>(params, |_| Ok(self.status())),
+            ServerStatus::NAME => run::<ServerStatus>(params, |_| self.status(stores)),
             ServersList::NAME => run::<ServersList>(params, |_| {
                 Ok(ritornel_contract::ServersList {
                     servers: vec![self.info(&lock(&self.this))],
@@ -416,6 +469,20 @@ impl Core {
                     topics: session.unsubscribe(&params.topics),
                 })
             }),
+            LibraryCreate::NAME => {
+                run::<LibraryCreate>(params, |params| self.create_library(stores, &params))
+            }
+            SourcesList::NAME => run::<SourcesList>(params, |_| self.sources_list(stores)),
+            SourcesAdd::NAME => {
+                run::<SourcesAdd>(params, |params| self.sources_add(stores, &params))
+            }
+            ScanStart::NAME => run::<ScanStart>(params, |params| self.scan_start(stores, &params)),
+            JobsList::NAME => run::<JobsList>(params, |_| self.jobs_list(stores)),
+            JobsGet::NAME => run::<JobsGet>(params, |params| self.jobs_get(stores, &params)),
+            JobsCancel::NAME => {
+                run::<JobsCancel>(params, |params| self.jobs_cancel(stores, &params))
+            }
+            LibraryStats::NAME => run::<LibraryStats>(params, |_| self.library_stats(stores)),
             _ => Err(RpcError::new(
                 ErrorCode::Internal,
                 format!("{} is in the method table and has no handler", row.name),
@@ -454,22 +521,190 @@ impl Core {
         })
     }
 
-    fn status(&self) -> ritornel_contract::ServerStatus {
-        ritornel_contract::ServerStatus {
+    fn status(&self, stores: &Stores) -> Result<ritornel_contract::ServerStatus, RpcError> {
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (library_schema, library) = match library.as_ref() {
+            Some(library) => {
+                let meta = library.meta().map_err(Error::Library).map_err(failed)?;
+                let status = LibraryStatus {
+                    library_id: meta.library_id,
+                    revision: revision(meta.revision),
+                };
+                (Some(library.schema_version()), Some(status))
+            }
+            None => (None, None),
+        };
+        let this = lock(&self.this);
+        Ok(ritornel_contract::ServerStatus {
             server_id: self.server_id,
-            name: self.name(),
-            role: self.role,
+            name: this.name.clone(),
+            role: this.role,
             versions: Versions {
                 server: env!("CARGO_PKG_VERSION").to_owned(),
                 contract: CONTRACT_VERSION,
                 sqlite: SQLITE_VERSION.to_owned(),
                 server_schema: self.schema_version,
+                library_schema,
             },
+            library,
             free_disk: FreeDisk {
-                data_bytes: disk::free_bytes(&self.data_dir),
+                data_bytes: disk::free_bytes(self.dir.root()),
             },
-            log_path: self.logs.to_string_lossy().into_owned(),
-        }
+            log_path: self.dir.logs().to_string_lossy().into_owned(),
+        })
+    }
+
+    /// `library.create`: makes this server a hub with a library of its own.
+    /// See "Identity and the hub role" in docs/design/linking.md.
+    ///
+    /// Two files are written, the library first. `library.db` gets the
+    /// library, with its hub pointer naming this server and the command's
+    /// receipt, in one transaction. Then `server.db` records that this
+    /// server is its hub. A server that stops between the two finishes the
+    /// second when it next starts: the pointer names it, so the library is
+    /// its own.
+    fn create_library(
+        &self,
+        stores: &Stores,
+        params: &LibraryCreateParams,
+    ) -> Result<LibraryCreated, RpcError> {
+        let request = WriteRequest {
+            method: LibraryCreate::NAME,
+            command: Some(Command {
+                id: params.idempotency_key,
+                fingerprint: fingerprint::<LibraryCreate>(params)?,
+            }),
+            // The only credential there is yet is the local one, so that is
+            // the session every command comes from.
+            client: self.local_credential.session().map(|session| Client {
+                session,
+                kind: SubjectKind::Person,
+            }),
+        };
+        let mut library = stores
+            .library
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let written = match library.as_ref() {
+            // The command that made this library, sent again, is answered
+            // as it was the first time. Any other is refused, and told
+            // which library is in its way.
+            Some(existing) => existing.created_by(request).map_err(|error| {
+                let refused = failed(Error::Library(error));
+                if refused.kind() == ErrorCode::Conflict {
+                    refused.with_detail("libraryId", existing.library_id().to_string())
+                } else {
+                    refused
+                }
+            })?,
+            None => {
+                let (created, written) = self
+                    .new_library(stores, request, params.idempotency_key)
+                    .map_err(failed)?;
+                info!(library_id = %created.library_id(), "created a library: this server is its hub");
+                *library = Some(created);
+                let mut this = lock(&self.this);
+                this.role = ServerRole::Hub;
+                self.changed(&mut this);
+                written
+            }
+        };
+        serde_json::from_str(&written.result_json).map_err(|error| {
+            RpcError::new(
+                ErrorCode::Internal,
+                format!(
+                    "the stored result of {} could not be read: {error}",
+                    LibraryCreate::NAME
+                ),
+            )
+        })
+    }
+
+    /// Creates the library in `library.db`, then records in `server.db`
+    /// that this server is its hub.
+    fn new_library(
+        &self,
+        stores: &Stores,
+        request: WriteRequest,
+        command_id: Id,
+    ) -> Result<(LibraryStore, Written), Error> {
+        // A core is made from an identity, so there is always one. It is
+        // read again here for the name the server has now.
+        let identity = stores.server.identity()?.ok_or(Error::Stopped)?;
+        let path = self.dir.private_library_db()?;
+        let receipt = move |library: &ritornel_engine::LibraryMeta| {
+            let created = LibraryCreated {
+                receipt: Receipt {
+                    command_id,
+                    status: ReceiptStatus::Done,
+                    revision: Some(revision(library.revision)),
+                },
+                library_id: library.library_id,
+            };
+            // Writing these few fields cannot fail. If it did, the result
+            // would not read back, and the call would say so.
+            serde_json::to_string(&created).unwrap_or_default()
+        };
+        let (library, written) = LibraryStore::create(
+            &path,
+            &identity,
+            request,
+            receipt,
+            Arc::clone(&self.clock),
+            Arc::clone(&self.entropy),
+        )
+        .map_err(Error::Library)?;
+        stores.server.claim_library(library.library_id())?;
+        Ok((library, written))
+    }
+}
+
+/// A library revision as the contract carries it. It counts up from 1.
+fn revision(revision: i64) -> u64 {
+    u64::try_from(revision).unwrap_or(0)
+}
+
+/// What tells a request from another that reuses its idempotency key: the
+/// method and the params, as this server writes them from their type. Two
+/// requests that differ only in white space or in the order of their fields
+/// are then the same request.
+fn fingerprint<M: Method>(params: &M::Params) -> Result<Fingerprint, RpcError> {
+    let written = serde_json::to_vec(params).map_err(|error| {
+        RpcError::new(
+            ErrorCode::Internal,
+            format!("the params of {} could not be written: {error}", M::NAME),
+        )
+    })?;
+    Ok(Fingerprint::of(M::NAME, &written))
+}
+
+/// What a client is told when a command failed in the server.
+fn failed(error: Error) -> RpcError {
+    use ritornel_engine::Error as Engine;
+    match &error {
+        // Its own, or one in its data directory that another server holds.
+        Error::Library(Engine::LibraryExists) => RpcError::new(
+            ErrorCode::Conflict,
+            "there is a library on this server already",
+        ),
+        Error::Library(Engine::CommandMismatch { .. })
+        | Error::Store(Engine::CommandMismatch { .. }) => RpcError::new(
+            ErrorCode::IdempotencyMismatch,
+            "this idempotency key was used before with other params",
+        ),
+        Error::Library(Engine::SourceExists { source }) => RpcError::new(
+            ErrorCode::Conflict,
+            "the library has a source of that name on this server already",
+        )
+        .with_detail("sourceId", source.to_string()),
+        Error::Store(Engine::RootTaken { .. }) => RpcError::new(
+            ErrorCode::Conflict,
+            "this server has a root of that name at another path",
+        ),
+        _ => RpcError::new(ErrorCode::Internal, error.to_string()),
     }
 }
 
@@ -525,7 +760,16 @@ mod tests {
             max_sessions: 4,
             ..Bounds::default()
         };
-        (Core::new(store, &identity, &dir, verifier, bounds), scratch)
+        let core = Core::new(
+            Stores::new(store, None),
+            &identity,
+            &dir,
+            verifier,
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+            bounds,
+        );
+        (core, scratch)
     }
 
     fn hello() -> Value {
@@ -655,6 +899,10 @@ mod tests {
             ("events.subscribe", Some(json!({ "topics": ["weather"] }))),
             ("events.subscribe", Some(json!([["servers"]]))),
             ("events.unsubscribe", Some(json!({}))),
+            ("library.create", None),
+            ("library.create", Some(json!({}))),
+            ("library.create", Some(json!({ "idempotencyKey": "again" }))),
+            ("library.create", Some(json!({ "idempotencyKey": 7 }))),
         ] {
             let refused = call(&core, &session, method, params.clone());
             assert!(
@@ -697,13 +945,22 @@ mod tests {
     }
 
     #[test]
-    fn the_status_needs_a_full_session_and_the_rest_do_not() {
-        let (core, _scratch) = core();
+    fn the_status_and_a_command_need_a_full_session_and_the_rest_do_not() {
+        let (core, scratch) = core();
         let limited = greeted(&core, SessionKind::Limited);
         assert_eq!(
             call(&core, &limited, "server.status", None),
             Err((ErrorCode::Forbidden, json!({})))
         );
+        // A limited session may change nothing, and it is refused before
+        // its params are looked at.
+        for params in [None, Some(key(0xc0))] {
+            assert_eq!(
+                call(&core, &limited, "library.create", params),
+                Err((ErrorCode::Forbidden, json!({})))
+            );
+        }
+        assert!(!scratch.path().join("data/library.db").exists());
         call(&core, &limited, "servers.list", None).unwrap();
         call(
             &core,
@@ -731,12 +988,162 @@ mod tests {
                     "server": env!("CARGO_PKG_VERSION"),
                     "contract": CONTRACT_VERSION,
                     "sqlite": "3.54.1",
-                    "serverSchema": 1,
+                    "serverSchema": 2,
                 },
+                // There is no library, so nothing is said of one.
                 "freeDisk": { "dataBytes": free },
                 "logPath": scratch.path().join("data/logs").to_str().unwrap(),
             })
         );
+    }
+
+    /// The params of a command with this byte for every byte of its key.
+    fn key(byte: u8) -> Value {
+        json!({ "idempotencyKey": Id::from_bytes([byte; 16]).to_string() })
+    }
+
+    #[test]
+    fn creating_a_library_makes_this_server_its_hub() {
+        let (core, scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        let created = call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
+        let library_id = created["libraryId"].as_str().unwrap().to_owned();
+        assert_eq!(
+            created,
+            json!({
+                "commandId": "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0c0",
+                "status": "done",
+                "revision": 1,
+                "libraryId": library_id,
+            })
+        );
+        assert_eq!(library_id.len(), 36);
+
+        // The status says what now exists, and the descriptor and the list
+        // of servers say the role.
+        let status = call(&core, &session, "server.status", None).unwrap();
+        assert_eq!(status["role"], "hub");
+        assert_eq!(
+            status["versions"],
+            json!({
+                "server": env!("CARGO_PKG_VERSION"),
+                "contract": CONTRACT_VERSION,
+                "sqlite": "3.54.1",
+                "serverSchema": 2,
+                "librarySchema": 1,
+            })
+        );
+        assert_eq!(
+            status["library"],
+            json!({ "libraryId": library_id, "revision": 1 })
+        );
+        assert_eq!(core.public_descriptor().role, ServerRole::Hub);
+        let list = call(&core, &session, "servers.list", None).unwrap();
+        assert_eq!(list["servers"][0]["role"], "hub");
+        assert_eq!(list["servers"][0]["revision"], 2);
+
+        // The library is a file only the OS user can read.
+        let library_db = scratch.path().join("data/library.db");
+        assert_eq!(crate::testing::mode(&library_db), 0o600);
+    }
+
+    #[test]
+    fn a_command_sent_again_gets_its_first_answer_and_another_is_refused() {
+        let (core, _scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        let created = call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
+
+        // The same key: the same receipt, from another session too, and
+        // nothing is created a second time.
+        let other = greeted(&core, SessionKind::Full);
+        for session in [&session, &other] {
+            assert_eq!(
+                call(&core, session, "library.create", Some(key(0xc0))).unwrap(),
+                created
+            );
+        }
+
+        // Another key is another command, and this server has its library.
+        assert_eq!(
+            call(&core, &session, "library.create", Some(key(0xc1))),
+            Err((
+                ErrorCode::Conflict,
+                json!({ "libraryId": created["libraryId"] })
+            ))
+        );
+        let status = call(&core, &session, "server.status", None).unwrap();
+        assert_eq!(status["library"]["libraryId"], created["libraryId"]);
+        assert_eq!(status["library"]["revision"], 1);
+    }
+
+    #[test]
+    fn becoming_a_hub_is_sent_to_the_sessions_that_subscribed() {
+        let (core, _scratch) = core();
+        let subscribed = greeted(&core, SessionKind::Full);
+        let subscribe = Some(json!({ "topics": ["servers"] }));
+        call(&core, &subscribed, "events.subscribe", subscribe).unwrap();
+
+        let creator = greeted(&core, SessionKind::Full);
+        call(&core, &creator, "library.create", Some(key(0xc0))).unwrap();
+        let Some(Frame::Notification(sent)) = now(subscribed.next()) else {
+            panic!("an event was queued");
+        };
+        let event = sent.params.unwrap();
+        assert_eq!(
+            (
+                &event["topic"],
+                &event["server"]["role"],
+                &event["server"]["revision"]
+            ),
+            (&json!("servers"), &json!("hub"), &json!(2))
+        );
+
+        // A command that is answered from its receipt changed nothing, so
+        // it sends nothing.
+        call(&core, &creator, "library.create", Some(key(0xc0))).unwrap();
+        subscribed.reply(marker());
+        assert_eq!(now(subscribed.next()), Some(marker()));
+    }
+
+    #[test]
+    fn a_library_file_that_is_another_servers_stops_one_being_created_over_it() {
+        let (core, scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        // A library.db that names some other server as its hub.
+        let library_db = scratch.path().join("data/library.db");
+        let other = ServerIdentity {
+            server_id: Id::from_bytes([0x22; 16]),
+            public_key: [0; 32],
+            name: "attic".to_owned(),
+            role: Role::Hub,
+            library_id: None,
+            created_at_ms: 0,
+        };
+        let request = WriteRequest {
+            method: "library.create",
+            command: None,
+            client: None,
+        };
+        let (theirs, _) = LibraryStore::create(
+            &library_db,
+            &other,
+            request,
+            |_| String::new(),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        theirs.close().unwrap();
+        let before = std::fs::read(&library_db).unwrap();
+
+        assert_eq!(
+            call(&core, &session, "library.create", Some(key(0xc0))),
+            Err((ErrorCode::Conflict, json!({})))
+        );
+        assert_eq!(std::fs::read(&library_db).unwrap(), before);
+        let status = call(&core, &session, "server.status", None).unwrap();
+        assert_eq!(status["role"], "unassigned");
+        assert_eq!(status.get("library"), None);
     }
 
     #[test]
@@ -934,6 +1341,12 @@ mod tests {
         assert_eq!(core.sessions().len(), 0);
         core.close_store().unwrap();
         assert!(matches!(core.rename("too late"), Err(Error::Stopped)));
+        assert_eq!(
+            call(&core, &session, "library.create", Some(key(0xc0)))
+                .unwrap_err()
+                .0,
+            ErrorCode::Unavailable
+        );
         // A call that comes now is told to come back, and not that it was
         // wrong.
         let (code, _) = call(&core, &session, "servers.list", None).unwrap_err();

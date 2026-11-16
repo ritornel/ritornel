@@ -26,8 +26,9 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use ritornel_client::contract::methods::{EventsSubscribe, Method, ServerHello};
 use ritornel_client::contract::{
-    CONTRACT_VERSION, ClientKind, Descriptor, ErrorCode, Event, HelloParams, Id, Limits,
-    PublicDescriptor, ServerInfo, ServerRole, SessionKind, Topic, capability, route,
+    CONTRACT_VERSION, ClientKind, Descriptor, ErrorCode, Event, HelloParams, Id, JobState,
+    JobTarget, LibraryStatus, Limits, PublicDescriptor, Receipt, ReceiptStatus, ServerInfo,
+    ServerRole, SessionKind, SourceKind, Topic, capability, route,
 };
 use ritornel_client::{Client, Credential, NotRunning, local};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -236,6 +237,10 @@ on_both_transports! {
     hello_answers_with_the_descriptor
     the_status_reports_versions_role_and_server_id
     the_list_of_servers_is_this_server
+    creating_a_library_makes_the_server_its_hub
+    a_folder_is_added_as_a_source_once_and_only_where_there_is_one
+    a_scan_runs_as_a_job_and_the_stats_say_what_came_out
+    a_job_can_be_asked_to_stop_and_one_there_is_not_is_not_found
     a_subscriber_is_sent_a_servers_event_and_after_unsubscribing_none
     changes_a_client_has_not_read_yet_reach_it_as_one_event
     a_method_the_server_does_not_have_is_unsupported
@@ -300,9 +305,341 @@ async fn the_status_reports_versions_role_and_server_id(via: Via) {
     assert_eq!(status.versions.server, env!("CARGO_PKG_VERSION"));
     assert_eq!(status.versions.contract, CONTRACT_VERSION);
     assert_eq!(status.versions.sqlite, "3.54.1");
-    assert_eq!(status.versions.server_schema, 1);
+    assert_eq!(status.versions.server_schema, 2);
+    // It has no library, and says nothing of one.
+    assert_eq!(status.versions.library_schema, None);
+    assert_eq!(status.library, None);
     assert!(status.free_disk.data_bytes.unwrap() > 0);
     assert_eq!(Path::new(&status.log_path), running.data_dir().join("logs"));
+}
+
+async fn creating_a_library_makes_the_server_its_hub(via: Via) {
+    let running = Running::start().await;
+    let mut client = running.greeted(via).await;
+    client.subscribe(&[Topic::Servers]).await.unwrap();
+
+    let key = ritornel_client::idempotency_key().unwrap();
+    let created = client.create_library(key).await.unwrap();
+    assert_eq!(
+        created.receipt,
+        Receipt {
+            command_id: key,
+            status: ReceiptStatus::Done,
+            revision: Some(1),
+        }
+    );
+    assert!(running.data_dir().join("library.db").exists());
+
+    // The status says what now exists, and everything that names the
+    // server's role says hub: the event, the list and the descriptor.
+    let status = client.status().await.unwrap();
+    assert_eq!(status.role, ServerRole::Hub);
+    assert_eq!(status.versions.library_schema, Some(1));
+    assert_eq!(
+        status.library,
+        Some(LibraryStatus {
+            library_id: created.library_id,
+            revision: 1,
+        })
+    );
+    let hub = ServerInfo {
+        role: ServerRole::Hub,
+        ..running.info("Ritornel server", 2)
+    };
+    let Some(Event::Servers(event)) = client.next_event().await else {
+        panic!("the server's new status was not sent");
+    };
+    assert_eq!(event.server, hub);
+    assert_eq!(client.servers().await.unwrap().servers, [hub]);
+    assert_eq!(
+        ritornel_client::descriptor(running.endpoint())
+            .await
+            .unwrap()
+            .role,
+        ServerRole::Hub
+    );
+
+    // The same command again is answered as it was. Another is refused: a
+    // server holds one library.
+    assert_eq!(client.create_library(key).await.unwrap(), created);
+    let another = ritornel_client::idempotency_key().unwrap();
+    assert_eq!(
+        refused(client.create_library(another).await),
+        (
+            ErrorCode::Conflict,
+            false,
+            json!({ "libraryId": created.library_id.to_string() })
+        )
+    );
+    assert_eq!(client.status().await.unwrap().library, status.library);
+    assert!(client.try_next_event().is_none());
+}
+
+/// A folder of the audio fixtures under the test's own directory: three
+/// files that are audio, and one that is not.
+fn music(running: &Running) -> PathBuf {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio");
+    let folder = running.scratch.0.join("music");
+    for (to, fixture) in [
+        ("Tin Weather/02.flac", "a.flac"),
+        ("Tin Weather/copy.mp3", "a.mp3"),
+        ("loose.ogg", "a.retagged.ogg"),
+        ("broken.flac", "not-audio.flac"),
+    ] {
+        let to = folder.join(to);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(fixtures.join(fixture), to).unwrap();
+    }
+    folder
+}
+
+fn key() -> Id {
+    ritornel_client::idempotency_key().unwrap()
+}
+
+async fn a_folder_is_added_as_a_source_once_and_only_where_there_is_one(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let folder = music(&running);
+    let path = folder.to_str().unwrap();
+
+    // With no library there is nothing to add it to, or to count.
+    let (code, ..) = refused(client.sources().await);
+    assert_eq!(code, ErrorCode::Unavailable);
+    let (code, ..) = refused(client.add_source(key(), "main", path).await);
+    assert_eq!(code, ErrorCode::Unavailable);
+    let (code, ..) = refused(client.library_stats().await);
+    assert_eq!(code, ErrorCode::Unavailable);
+    client.create_library(key()).await.unwrap();
+    assert_eq!(client.sources().await.unwrap().sources, []);
+
+    for (name, at, field) in [
+        ("", path, "name"),
+        ("a/b", path, "name"),
+        ("main", "music", "path"),
+        ("main", "/there/is/no/such/folder", "path"),
+        ("main", folder.join("loose.ogg").to_str().unwrap(), "path"),
+    ] {
+        let (code, _, details) = refused(client.add_source(key(), name, at).await);
+        assert_eq!(
+            (code, details),
+            (ErrorCode::Invalid, json!({ "field": field })),
+            "{name} {at}"
+        );
+    }
+
+    let first = key();
+    let added = client.add_source(first, "main", path).await.unwrap();
+    assert_eq!(
+        added.receipt,
+        Receipt {
+            command_id: first,
+            status: ReceiptStatus::Done,
+            revision: Some(2),
+        }
+    );
+    assert_eq!(
+        (
+            added.source.name.as_str(),
+            added.source.kind,
+            added.source.path.as_deref()
+        ),
+        ("main", SourceKind::Folder, Some(path))
+    );
+    assert_eq!(
+        client.sources().await.unwrap().sources,
+        std::slice::from_ref(&added.source)
+    );
+    // The command sent again is answered as it was, and adds nothing. With
+    // other params its key is refused, and another command for the same
+    // name is told which source is in its way.
+    assert_eq!(client.add_source(first, "main", path).await.unwrap(), added);
+    let (code, ..) = refused(client.add_source(first, "other", path).await);
+    assert_eq!(code, ErrorCode::IdempotencyMismatch);
+    let (code, _, details) = refused(client.add_source(key(), "main", path).await);
+    assert_eq!(
+        (code, details),
+        (
+            ErrorCode::Conflict,
+            json!({ "sourceId": added.source.source_id.to_string() })
+        )
+    );
+    assert_eq!(client.sources().await.unwrap().sources.len(), 1);
+    assert_eq!(client.status().await.unwrap().library.unwrap().revision, 2);
+    // Nothing was written under the folder.
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 3);
+}
+
+/// Reads events until the job has ended, and returns it as it ended with
+/// the library revisions the `library` topic named on the way.
+async fn ended(client: &mut Client, job_id: Id) -> (ritornel_client::contract::Job, Vec<u64>) {
+    let mut revisions = Vec::new();
+    loop {
+        match client.next_event().await.unwrap() {
+            Event::Jobs(event) if event.job.job_id == job_id && event.job.state.ended() => {
+                return (event.job, revisions);
+            }
+            Event::Library(event) => revisions.push(event.library_revision),
+            _ => {}
+        }
+    }
+}
+
+async fn a_scan_runs_as_a_job_and_the_stats_say_what_came_out(via: Via) {
+    let running = Running::start().await;
+    let mut client = running.greeted(via).await;
+    let folder = music(&running);
+    client.create_library(key()).await.unwrap();
+    let source = client
+        .add_source(key(), "main", folder.to_str().unwrap())
+        .await
+        .unwrap()
+        .source;
+    client
+        .subscribe(&[Topic::Jobs, Topic::Library])
+        .await
+        .unwrap();
+
+    let (code, ..) = refused(client.start_scan(key(), Id::from_bytes([9; 16])).await);
+    assert_eq!(code, ErrorCode::NotFound);
+    let first = key();
+    let started = client.start_scan(first, source.source_id).await.unwrap();
+    assert_eq!(
+        started.receipt,
+        Receipt {
+            command_id: first,
+            status: ReceiptStatus::Accepted,
+            revision: None,
+        }
+    );
+    assert_eq!(started.job.kind, "scan");
+    assert_eq!(
+        started.job.target,
+        Some(JobTarget::Source {
+            id: source.source_id
+        })
+    );
+    // The command sent again names the same job, whatever has become of it.
+    assert_eq!(
+        client
+            .start_scan(first, source.source_id)
+            .await
+            .unwrap()
+            .job
+            .job_id,
+        started.job.job_id
+    );
+
+    let (job, revisions) = ended(&mut client, started.job.job_id).await;
+    assert_eq!(job.state, JobState::Succeeded);
+    let scan = job.scan.unwrap();
+    assert_eq!((scan.files, scan.new, scan.unreadable), (4, 4, 1));
+    assert_eq!(
+        (scan.assignments, scan.recordings, scan.releases),
+        (3, 2, 1)
+    );
+    assert_eq!(
+        (job.done, job.total, job.failed, job.skipped),
+        (4, Some(4), 1, 0)
+    );
+    // The files were recorded at revision 3 and resolved at 4, and the
+    // library topic said so.
+    assert_eq!(revisions.last(), Some(&4));
+    assert_eq!(client.status().await.unwrap().library.unwrap().revision, 4);
+
+    // The job is a durable resource: it is listed and can be read after it
+    // has ended, with what could not be read.
+    let listed = client.jobs().await.unwrap().jobs;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0], job);
+    let detail = client.job(job.job_id).await.unwrap();
+    assert_eq!(detail.job, job);
+    assert_eq!(detail.failed_items.len(), 1);
+    assert_eq!(detail.failed_items[0].item, "broken.flac");
+    assert!(detail.failed_items[0].detail.contains("unsupported"));
+
+    let stats = client.library_stats().await.unwrap();
+    assert_eq!(
+        (stats.files, stats.files_unreadable, stats.library_revision),
+        (4, 1, 4)
+    );
+    assert_eq!(
+        (
+            stats.recordings,
+            stats.releases,
+            stats.release_groups,
+            stats.artists
+        ),
+        (2, 1, 1, 2)
+    );
+    assert_eq!(
+        (stats.appearances, stats.loose_tracks, stats.needs_review),
+        (3, 1, 0)
+    );
+    assert_eq!(
+        (
+            stats.groups_with_kind,
+            stats.groups_with_first_year_from_tag
+        ),
+        (1, 1)
+    );
+
+    // A second scan finds nothing changed, writes nothing, and leaves the
+    // library at the revision it was at.
+    let again = client.start_scan(key(), source.source_id).await.unwrap();
+    assert_ne!(again.job.job_id, job.job_id);
+    let (quiet, revisions) = ended(&mut client, again.job.job_id).await;
+    let scan = quiet.scan.unwrap();
+    assert_eq!(
+        (quiet.state, scan.files, scan.unchanged, scan.new),
+        (JobState::Succeeded, 4, 4, 0)
+    );
+    assert_eq!(revisions, [] as [u64; 0]);
+    assert_eq!(client.library_stats().await.unwrap(), stats);
+    assert_eq!(client.jobs().await.unwrap().jobs.len(), 2);
+}
+
+async fn a_job_can_be_asked_to_stop_and_one_there_is_not_is_not_found(via: Via) {
+    let running = Running::start().await;
+    let mut client = running.greeted(via).await;
+    let folder = music(&running);
+    client.create_library(key()).await.unwrap();
+    let source = client
+        .add_source(key(), "main", folder.to_str().unwrap())
+        .await
+        .unwrap()
+        .source;
+    client.subscribe(&[Topic::Jobs]).await.unwrap();
+
+    let (code, ..) = refused(client.job(Id::from_bytes([9; 16])).await);
+    assert_eq!(code, ErrorCode::NotFound);
+    let (code, ..) = refused(client.cancel_job(key(), Id::from_bytes([9; 16])).await);
+    assert_eq!(code, ErrorCode::NotFound);
+
+    // The scan is asked to stop the moment it is started. It may have
+    // ended by then, or stop at its next step: either way it ends, and
+    // what it committed stays.
+    let started = client.start_scan(key(), source.source_id).await.unwrap();
+    let cancel = key();
+    let asked = client.cancel_job(cancel, started.job.job_id).await.unwrap();
+    assert_eq!(asked.receipt.command_id, cancel);
+    let (job, _) = ended(&mut client, started.job.job_id).await;
+    assert!(
+        matches!(job.state, JobState::Cancelled | JobState::Succeeded),
+        "{:?}",
+        job.state
+    );
+    // Asking again changes nothing.
+    let again = client.cancel_job(cancel, job.job_id).await.unwrap();
+    assert_eq!(
+        (again.job.state, again.receipt.status),
+        (job.state, ReceiptStatus::Done)
+    );
+    // Whatever was left, the next scan finishes.
+    let next = client.start_scan(key(), source.source_id).await.unwrap();
+    let (job, _) = ended(&mut client, next.job.job_id).await;
+    assert_eq!(job.state, JobState::Succeeded);
+    assert_eq!(client.library_stats().await.unwrap().files, 4);
 }
 
 async fn the_list_of_servers_is_this_server(via: Via) {
@@ -627,7 +964,7 @@ async fn status_of(endpoint: SocketAddr, path: &str, credential: Option<&Credent
 }
 
 #[tokio::test]
-async fn a_limited_session_may_not_ask_for_the_status() {
+async fn a_limited_session_may_not_ask_for_the_status_or_change_anything() {
     bounded(async {
         let running = Running::start().await;
         let (outgoing, incoming) = running.server.connect_in_memory(SessionKind::Limited);
@@ -638,9 +975,28 @@ async fn a_limited_session_may_not_ask_for_the_status() {
         );
         let (code, retryable, _) = refused(client.status().await);
         assert_eq!((code, retryable), (ErrorCode::Forbidden, false));
-        // Everything else in this milestone is open to any session.
+        let (code, retryable, _) = refused(client.create_library(key()).await);
+        assert_eq!((code, retryable), (ErrorCode::Forbidden, false));
+        assert!(!running.data_dir().join("library.db").exists());
+        for forbidden in [
+            refused(client.sources().await),
+            refused(client.add_source(key(), "main", "/srv/invented").await),
+            refused(client.start_scan(key(), key()).await),
+            refused(client.jobs().await),
+            refused(client.job(key()).await),
+            refused(client.cancel_job(key(), key()).await),
+        ] {
+            assert_eq!((forbidden.0, forbidden.1), (ErrorCode::Forbidden, false));
+        }
+        // Everything else so far is open to any session: reading the
+        // library is, though there is none here to read.
         client.servers().await.unwrap();
-        client.subscribe(&[Topic::Servers]).await.unwrap();
+        client
+            .subscribe(&[Topic::Servers, Topic::Jobs, Topic::Library])
+            .await
+            .unwrap();
+        let (code, ..) = refused(client.library_stats().await);
+        assert_eq!(code, ErrorCode::Unavailable);
     })
     .await;
 }

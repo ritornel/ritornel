@@ -52,6 +52,18 @@ pub enum Error {
     },
     /// `server.db` could not be opened or used.
     Store(ritornel_engine::Error),
+    /// `library.db` could not be opened or used. For a server that is a
+    /// hub that includes a library it may not write: one whose hub pointer
+    /// is empty or names another server.
+    Library(ritornel_engine::Error),
+    /// The server's own record names one library and `library.db` is
+    /// another.
+    AnotherLibrary {
+        /// The library `server.db` says this server holds.
+        claimed: Option<ritornel_contract::Id>,
+        /// The library in `library.db`.
+        found: ritornel_contract::Id,
+    },
     /// The listener could not be bound.
     Listen {
         /// The address it was to listen on.
@@ -118,6 +130,23 @@ impl fmt::Display for Error {
                 source,
             } => write!(f, "cannot {doing} {}: {source}", path.display()),
             Self::Store(error) => write!(f, "server.db: {error}"),
+            Self::Library(error) => write!(f, "library.db: {error}"),
+            Self::AnotherLibrary {
+                claimed: Some(claimed),
+                found,
+            } => write!(
+                f,
+                "library.db: this is library {found}, and server.db says this server holds \
+                 library {claimed}"
+            ),
+            Self::AnotherLibrary {
+                claimed: None,
+                found,
+            } => write!(
+                f,
+                "library.db: this is library {found}, and server.db names no library for this \
+                 server to hold"
+            ),
             Self::Listen { address, source } => write!(f, "cannot listen on {address}: {source}"),
             Self::Stopped => f.write_str("the server has stopped"),
             Self::Runtime(error) => write!(f, "cannot start: {error}"),
@@ -135,7 +164,7 @@ impl std::error::Error for Error {
             | Self::Listen { source, .. }
             | Self::Runtime(source)
             | Self::Output(source) => Some(source),
-            Self::Store(error) => Some(error),
+            Self::Store(error) | Self::Library(error) => Some(error),
             _ => None,
         }
     }

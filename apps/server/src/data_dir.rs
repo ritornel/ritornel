@@ -8,10 +8,11 @@
 //!   credential     the local owner's session token; only the OS user can read it
 //!   config.toml    optional: the settings needed before a database opens
 //!   server.db      what describes this server
+//!   library.db     the library, on the server that is its hub
 //!   logs/          JSON lines, one file a day
 //! ```
 //!
-//! `library.db`, `backups/` and `cache/` arrive with what first uses them.
+//! `backups/` and `cache/` arrive with what first uses them.
 //!
 //! Where the directory is, and the names of `server.lock`, `server.json` and
 //! `credential`, are the contract's (`ritornel_contract::local`): a local client reads
@@ -65,30 +66,17 @@ impl DataDir {
                 .create(&path)
                 .map_err(io_error("create", &path))?;
         }
-        // SQLite keeps the mode of a file it finds, and gives the same mode
-        // to the write-ahead log it puts beside it. The mode asked for here
-        // applies only to a file this call creates, so one that was already
-        // there is closed as well, with any log left beside it.
-        let database = dir.server_db();
-        OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(OWNER_ONLY)
-            .open(&database)
-            .and_then(|file| file.set_permissions(Permissions::from_mode(OWNER_ONLY)))
-            .map_err(io_error("create", &database))?;
-        for suffix in ["-wal", "-shm"] {
-            let mut sidecar = database.clone().into_os_string();
-            sidecar.push(suffix);
-            let sidecar = PathBuf::from(sidecar);
-            match std::fs::set_permissions(&sidecar, Permissions::from_mode(OWNER_ONLY)) {
-                Err(error) if error.kind() != ErrorKind::NotFound => {
-                    return Err(io_error("close", &sidecar)(error));
-                }
-                _ => {}
-            }
-        }
+        close_database(&dir.server_db())?;
         Ok(dir)
+    }
+
+    /// Makes sure there is a file for a new library that only the OS user
+    /// can read, and returns where it is. A library holds what its owner
+    /// listened to, and SQLite would make the file readable by everyone.
+    pub(crate) fn private_library_db(&self) -> Result<PathBuf, Error> {
+        let database = self.library_db();
+        close_database(&database)?;
+        Ok(database)
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -115,9 +103,42 @@ impl DataDir {
         self.root.join("server.db")
     }
 
+    pub(crate) fn library_db(&self) -> PathBuf {
+        self.root.join("library.db")
+    }
+
     pub(crate) fn logs(&self) -> PathBuf {
         self.root.join("logs")
     }
+}
+
+/// Makes sure the database file at `path` exists and that only the OS user
+/// can read it.
+///
+/// SQLite keeps the mode of a file it finds, and gives the same mode to the
+/// write-ahead log it puts beside it. The mode asked for here applies only
+/// to a file this call creates, so one that was already there is closed as
+/// well, with any log left beside it.
+fn close_database(database: &Path) -> Result<(), Error> {
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(OWNER_ONLY)
+        .open(database)
+        .and_then(|file| file.set_permissions(Permissions::from_mode(OWNER_ONLY)))
+        .map_err(io_error("create", database))?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = database.to_owned().into_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        match std::fs::set_permissions(&sidecar, Permissions::from_mode(OWNER_ONLY)) {
+            Err(error) if error.kind() != ErrorKind::NotFound => {
+                return Err(io_error("close", &sidecar)(error));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// A data directory this process holds: it exists, this process has its

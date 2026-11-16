@@ -15,6 +15,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
+use ritornel_contract::Id;
 use ritornel_engine::{ServerStore, SessionToken};
 use subtle::ConstantTimeEq;
 
@@ -51,18 +52,32 @@ impl Credential {
 /// the server starts, so checking a credential reads no file and no
 /// database. The server is the only writer of sessions, so what it loaded
 /// stays true until it issues or revokes one, and that goes through here.
+///
+/// With it is the public ID of the session the credential holds: the client
+/// that a command sent with this credential is recorded as.
 #[derive(Clone)]
-pub(crate) struct Verifier([u8; 32]);
+pub(crate) struct Verifier {
+    hash: [u8; 32],
+    session: Option<Id>,
+}
 
 impl Verifier {
-    fn of(token: &SessionToken) -> Self {
-        Self(token.hash())
+    fn of(token: &SessionToken, store: &ServerStore) -> Result<Self, Error> {
+        Ok(Self {
+            hash: token.hash(),
+            session: store.local_session()?,
+        })
     }
 
     /// Whether `token` is the local credential. The two hashes are compared
     /// in the same time wherever they first differ.
     pub(crate) fn accepts(&self, token: &SessionToken) -> bool {
-        token.hash().ct_eq(&self.0).into()
+        token.hash().ct_eq(&self.hash).into()
+    }
+
+    /// The public ID of the local credential's session.
+    pub(crate) fn session(&self) -> Option<Id> {
+        self.session
     }
 }
 
@@ -82,16 +97,16 @@ pub(crate) fn ensure(
 ) -> Result<(Credential, Verifier), Error> {
     if let Some(token) = issued {
         write(path, &token)?;
-        return Ok((Credential::Issued, Verifier::of(&token)));
+        return Ok((Credential::Issued, Verifier::of(&token, store)?));
     }
     if let Some(token) = read(path)?
         && store.is_local_credential(&token)?
     {
-        return Ok((Credential::Kept, Verifier::of(&token)));
+        return Ok((Credential::Kept, Verifier::of(&token, store)?));
     }
     let token = store.reissue_local_credential()?;
     write(path, &token)?;
-    Ok((Credential::Replaced, Verifier::of(&token)))
+    Ok((Credential::Replaced, Verifier::of(&token, store)?))
 }
 
 /// The token in the file, if the file holds one that can still be trusted.

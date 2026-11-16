@@ -9,8 +9,11 @@ members = [
     "apps/ritornelctl",
 ]
 # The lab material holds Cargo workspaces of its own and is never built
-# from here.
-exclude = ["bakeoff", "prototypes", "spikes"]
+# from here. Neither is the desktop app's shell: it is built with Tauri,
+# which needs WebKit and GTK libraries that the hub's Linux build must not,
+# so it is a workspace of its own (apps/desktop/src-tauri/Cargo.toml) with
+# tasks of its own in mise.toml.
+exclude = ["bakeoff", "prototypes", "spikes", "apps/desktop"]
 
 [workspace.package]
 version = "0.1.0"

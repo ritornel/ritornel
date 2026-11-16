@@ -10,6 +10,9 @@ ritornel-contract.workspace = true
 # Sending on a socket and reading from it: tokio-tungstenite's socket is a
 # futures sink and stream.
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
+# The random half of an idempotency key. The engine makes its IDs with it,
+# so it adds nothing to the lock file.
+getrandom = "0.4.3"
 # Collects the body of an HTTP response, with a limit on its size.
 http-body-util = "0.1.5"
 # The HTTP client behind `GET /v1/descriptor`. The server's listener is built

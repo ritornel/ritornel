@@ -30,7 +30,7 @@ use ts_rs::{Config, TS, TypeVisitor};
 
 use crate::methods::{Method, MethodKind, MethodVisitor, visit_methods};
 use crate::{
-    CONTRACT_VERSION, EVENT_METHOD, Event, MAX_CLIENT_TEXT, PublicDescriptor, RpcError,
+    CONTRACT_VERSION, EVENT_METHOD, Event, MAX_CLIENT_TEXT, PublicDescriptor, Receipt, RpcError,
     SocketTicket, TICKET_PARAM, Topic, capability, route,
 };
 
@@ -220,7 +220,9 @@ fn generate() -> String {
         mut declarations,
         rows,
     } = table;
-    // What no method names: an event, an error, and the body of a route.
+    // What no method names: an event, an error, the body of a route, and
+    // the receipt, which each command's result holds as fields of its own.
+    declarations.visit::<Receipt>();
     declarations.visit::<Event>();
     declarations.visit::<Topic>();
     declarations.visit::<RpcError>();
@@ -258,6 +260,7 @@ fn generate() -> String {
     let kind = |kind| match kind {
         MethodKind::Session => "session",
         MethodKind::Query => "query",
+        MethodKind::Command => "command",
     };
     let methods: String = rows
         .iter()
@@ -375,7 +378,9 @@ fn every_integer_is_a_number() {
         "maxMessageBytes: number",
         "dataBytes?: number",
         "serverSchema: number",
+        "librarySchema?: number",
         "revision: number",
+        "revision?: number",
     ] {
         assert!(text.contains(field), "{field}");
     }
@@ -426,8 +431,12 @@ fn the_maps_follow_the_method_table_and_the_topics() {
         assert!(text.contains(&row), "{row}");
     }
     assert!(text.contains("  \"server.status\": { kind: \"query\", needsFull: true },\n"));
+    assert!(text.contains("  \"library.create\": { kind: \"command\", needsFull: true },\n"));
     assert!(text.contains("  \"servers\": Extract<Event, { topic: \"servers\" }>;\n"));
-    assert!(text.contains("export const TOPICS = [\"servers\"] as const;\n"));
+    assert!(text.contains("  \"jobs\": Extract<Event, { topic: \"jobs\" }>;\n"));
+    assert!(
+        text.contains("export const TOPICS = [\"servers\", \"jobs\", \"library\"] as const;\n")
+    );
 }
 
 #[test]

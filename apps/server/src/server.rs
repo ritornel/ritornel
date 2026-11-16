@@ -1,5 +1,5 @@
-//! A running server: `server.db` open, the listener serving, and
-//! `server.json` saying where. `ritornel-server serve` runs one, and so
+//! A running server: `server.db` open, and `library.db` on a hub, the
+//! listener serving, and `server.json` saying where. `ritornel-server serve` runs one, and so
 //! does a contract test, inside its own process.
 
 use std::net::SocketAddr;
@@ -12,11 +12,12 @@ use tracing::{info, warn};
 
 use crate::credential::{self, Credential};
 use crate::data_dir::HeldDir;
-use crate::dispatch::Core;
+use crate::dispatch::{Core, Stores};
+use crate::jobs::Worker;
 use crate::listener::{self, Listening};
 use crate::server_json::ServerJson;
 use crate::ticket::Tickets;
-use crate::{Bounds, Error, Listen, memory};
+use crate::{Bounds, Error, Listen, Run, library, memory};
 
 /// The name a new server gets. The owner renames it when there is a call to
 /// do that with.
@@ -37,6 +38,8 @@ impl Drop for Transports {
 #[derive(Debug)]
 pub struct Server {
     core: Arc<Core>,
+    /// The thread that runs jobs.
+    worker: Worker,
     transports: Transports,
     listening: Listening,
     bounds: Bounds,
@@ -49,7 +52,8 @@ pub struct Server {
 impl Server {
     /// Starts a server on a data directory this process holds: opens and
     /// migrates `server.db`, makes sure the server has its identity and the
-    /// credential file its token, binds the listener, and only then writes
+    /// credential file its token, opens `library.db` if this server is a
+    /// library's hub, binds the listener, and only then writes
     /// `server.json`.
     ///
     /// It must be called on a Tokio runtime, and the listener runs on that
@@ -72,9 +76,23 @@ impl Server {
         entropy: Arc<dyn Entropy>,
         bounds: Bounds,
     ) -> Result<Self, Error> {
+        Self::start_run(held, listen, clock, entropy, bounds, Run::default()).await
+    }
+
+    /// Starts a server as [`start_with`](Self::start_with) does, and says
+    /// how this run does its jobs: under which boot ID it claims them, and
+    /// how a scan runs.
+    pub async fn start_run(
+        held: HeldDir,
+        listen: Listen,
+        clock: Arc<dyn Clock>,
+        entropy: Arc<dyn Entropy>,
+        bounds: Bounds,
+        run: Run,
+    ) -> Result<Self, Error> {
         let dir = held.dir();
         let tickets = Tickets::new(Arc::clone(&entropy), bounds.ticket_life);
-        let store = ServerStore::open(&dir.server_db(), clock, entropy)?;
+        let store = ServerStore::open(&dir.server_db(), clock.clone(), entropy.clone())?;
         info!(
             sqlite = SQLITE_VERSION,
             schema_version = store.schema_version(),
@@ -95,16 +113,35 @@ impl Server {
             kept_or_issued => info!(credential = kept_or_issued.as_str(), "local credential"),
         }
 
+        let (identity, library) = library::open(dir, &store, identity, &clock, &entropy)?;
+
+        // This run holds the directory's lock, so whatever run claimed a
+        // job before it is gone: each such job goes back in the queue, and
+        // carries on from what it had committed.
+        let boot_id = match run.boot_id {
+            Some(boot_id) => boot_id,
+            None => ritornel_engine::new_id(clock.now_ms(), &*entropy)?,
+        };
+        let requeued = store.requeue_jobs_of_other_runs(boot_id)?;
+        if requeued > 0 {
+            info!(requeued, "jobs that an earlier run left are queued again");
+        }
+
         let listener = listener::bind(listen).await?;
-        let core = Arc::new(Core::new(store, &identity, dir, verifier, bounds));
+        let stores = Stores::new(store, library);
+        let core = Arc::new(Core::new(
+            stores, &identity, dir, verifier, clock, entropy, bounds,
+        ));
         let listening = Listening::start(Arc::clone(&core), tickets, listener, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
+        let worker = Worker::start(Arc::clone(&core), boot_id, run.scan).map_err(Error::Runtime)?;
 
         // The server answers, so a client may be told where it is.
         let server_json =
             ServerJson::publish(&dir.server_json(), listening.endpoint(), identity.server_id)?;
         Ok(Self {
             transports: Transports(Arc::clone(&core)),
+            worker,
             core,
             listening,
             bounds,
@@ -146,7 +183,7 @@ impl Server {
     }
 
     /// Stops the server cleanly: it stops taking calls and closes its
-    /// sockets, then closes `server.db`, then removes `server.json`.
+    /// sockets, then closes its databases, then removes `server.json`.
     ///
     /// When this returns nothing of the server is running. A connection or
     /// a transport that has not ended by itself within the stop grace is
@@ -158,6 +195,12 @@ impl Server {
         self.listening.stop().await;
         self.core.end_transports(self.bounds.stop_grace).await;
         drop(self.transports);
+        // The worker ends after the file it is reading or the write it is
+        // making. A job it leaves is taken up again by the next run.
+        let worker = self.worker;
+        tokio::task::spawn_blocking(move || worker.stop())
+            .await
+            .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
         // Closing waits for calls that are using the database, and then
         // empties its log, so it is not done on an async worker either.
         let core = Arc::clone(&self.core);

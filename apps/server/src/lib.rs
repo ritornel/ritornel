@@ -3,9 +3,9 @@
 //! contract tests can run a real listener inside the test process.
 //!
 //! A run takes a data directory and its lock ([`HeldDir`]), then starts a
-//! [`Server`]: it opens `server.db` through the engine, listens on loopback,
-//! says where it is in `server.json`, and answers the contract until it is
-//! asked to stop. See "Starting, finding and stopping" and "The data
+//! [`Server`]: it opens `server.db` through the engine, and `library.db` if
+//! it is a library's hub, listens on loopback, says where it is in
+//! `server.json`, and answers the contract until it is asked to stop. See "Starting, finding and stopping" and "The data
 //! directory" in docs/design/server.md, and docs/design/contract.md.
 //!
 //! The dispatcher (`dispatch`) takes a decoded frame and a session and knows
@@ -32,6 +32,8 @@ mod data_dir;
 mod disk;
 mod dispatch;
 mod error;
+mod jobs;
+mod library;
 mod listener;
 mod lock;
 mod logs;
@@ -50,6 +52,7 @@ pub use cli::run;
 pub use config::{ConfigError, Listen, Origin};
 pub use data_dir::HeldDir;
 pub use error::{EXIT_FAILED, EXIT_IN_USE, EXIT_USAGE, Error};
+pub use jobs::Run;
 /// How the program reads an environment variable. It is passed in, so that a
 /// test can say what the environment holds without changing its own.
 pub use ritornel_contract::local::Env;

@@ -1,62 +1,21 @@
 //! `ritornelctl status`: what the running server reports about itself. See
 //! "Configuration and logs" in docs/design/server.md.
-//!
-//! It does steps 1 and 2 of "Starting, finding and stopping" and no more:
-//! it finds the server through `server.json` and, with no server, says so
-//! and exits. It never starts one.
 
 use std::io::Write;
-use std::path::Path;
-use std::time::Duration;
 
-use ritornel_client::contract::{CONTRACT_VERSION, ClientKind, HelloParams, ServerStatus};
+use ritornel_client::contract::ServerStatus;
 use ritornel_client::local;
 
-use crate::cli::{Error, StatusArgs};
-
-/// How long the whole command may take. A server on this machine answers
-/// in milliseconds.
-const ANSWER_WAIT: Duration = Duration::from_secs(10);
+use crate::cli::{Error, ServerArgs};
+use crate::server;
 
 pub(crate) fn status(
-    args: &StatusArgs,
+    args: &ServerArgs,
     env: local::Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    let data_dir = local::data_dir(args.data_dir.as_deref(), env)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(Error::Runtime)?;
-    let status = runtime
-        .block_on(async { tokio::time::timeout(ANSWER_WAIT, ask(&data_dir)).await })
-        .map_err(|_| Error::TimedOut)??;
-
-    let text = if args.json {
-        let mut text =
-            serde_json::to_string_pretty(&status).map_err(|error| Error::Output(error.into()))?;
-        text.push('\n');
-        text
-    } else {
-        render(&status)
-    };
-    out.write_all(text.as_bytes())
-        .and_then(|()| out.flush())
-        .map_err(Error::Output)
-}
-
-/// Finds the server on `data_dir`, says hello and asks for its status.
-async fn ask(data_dir: &Path) -> Result<ServerStatus, ritornel_client::Error> {
-    let client = local::find(data_dir).await?.connect().await?;
-    client
-        .hello(&HelloParams {
-            name: env!("CARGO_PKG_NAME").to_owned(),
-            kind: ClientKind::Cli,
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            contract_version: CONTRACT_VERSION,
-        })
-        .await?;
-    client.status().await
+    let status = server::ask(args, env, async |client| client.status().await)?;
+    server::print(args, out, &status, serde_json::to_string_pretty, render)
 }
 
 /// The status as a person reads it: one fact a line.
@@ -65,7 +24,7 @@ fn render(status: &ServerStatus) -> String {
         .free_disk
         .data_bytes
         .map_or_else(|| "unknown".to_owned(), size);
-    let lines = [
+    let mut lines = vec![
         ("Server ID", status.server_id.to_string()),
         ("Name", status.name.clone()),
         ("Role", status.role.as_str().to_owned()),
@@ -73,17 +32,24 @@ fn render(status: &ServerStatus) -> String {
         ("Contract version", status.versions.contract.to_string()),
         ("SQLite version", status.versions.sqlite.clone()),
         ("Server schema", status.versions.server_schema.to_string()),
-        ("Free disk, data", free),
-        ("Log path", status.log_path.clone()),
     ];
-    lines
-        .iter()
-        .map(|(label, value)| format!("{label:<18}{value}\n"))
-        .collect()
+    if let Some(schema) = status.versions.library_schema {
+        lines.push(("Library schema", schema.to_string()));
+    }
+    match &status.library {
+        Some(library) => {
+            lines.push(("Library ID", library.library_id.to_string()));
+            lines.push(("Library revision", library.revision.to_string()));
+        }
+        None => lines.push(("Library", "none".to_owned())),
+    }
+    lines.push(("Free disk, data", free));
+    lines.push(("Log path", status.log_path.clone()));
+    server::facts(&lines)
 }
 
 /// A number of bytes in the largest decimal unit that keeps it above one.
-fn size(bytes: u64) -> String {
+pub(crate) fn size(bytes: u64) -> String {
     const UNITS: [(u64, &str); 4] = [
         (1_000_000_000_000, "TB"),
         (1_000_000_000, "GB"),
@@ -102,7 +68,7 @@ fn size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ritornel_client::contract::{FreeDisk, Id, ServerRole, Versions};
+    use ritornel_client::contract::{FreeDisk, Id, LibraryStatus, ServerRole, Versions};
 
     use super::*;
 
@@ -115,8 +81,10 @@ mod tests {
                 server: "0.1.0".to_owned(),
                 contract: 0,
                 sqlite: "3.54.1".to_owned(),
-                server_schema: 1,
+                server_schema: 2,
+                library_schema: None,
             },
+            library: None,
             free_disk: FreeDisk {
                 data_bytes: Some(412_345_678_901),
             },
@@ -135,7 +103,36 @@ Role              unassigned
 Server version    0.1.0
 Contract version  0
 SQLite version    3.54.1
-Server schema     1
+Server schema     2
+Library           none
+Free disk, data   412.3 GB
+Log path          /srv/ritornel/logs
+"
+        );
+    }
+
+    #[test]
+    fn a_hub_shows_the_library_it_holds() {
+        let mut status = example();
+        status.role = ServerRole::Hub;
+        status.versions.library_schema = Some(1);
+        status.library = Some(LibraryStatus {
+            library_id: Id::from_bytes([0x1b; 16]),
+            revision: 58,
+        });
+        assert_eq!(
+            render(&status),
+            "\
+Server ID         11111111-1111-1111-1111-111111111111
+Name              desk
+Role              hub
+Server version    0.1.0
+Contract version  0
+SQLite version    3.54.1
+Server schema     2
+Library schema    1
+Library ID        1b1b1b1b-1b1b-1b1b-1b1b-1b1b1b1b1b1b
+Library revision  58
 Free disk, data   412.3 GB
 Log path          /srv/ritornel/logs
 "
