@@ -232,6 +232,17 @@ methods! {
     ListClose: "list.close", Session, needs_full: false,
     ViewParams => ListClosed;
 
+    /// `album.get`: one release, with its tracks in disc and track order
+    /// and the other versions of its group. Given a release group, the
+    /// release the group is set to show.
+    AlbumGet: "album.get", Query, needs_full: false,
+    AlbumGetParams => AlbumPage;
+
+    /// `artist.get`: one artist, as the Artists list has them, and the
+    /// colour of their picture.
+    ArtistGet: "artist.get", Query, needs_full: false,
+    ArtistGetParams => ArtistPage;
+
     /// `media.token`: the token a page puts in the query string of a media
     /// URL. It is the same for the life of the session.
     MediaTokenCall: "media.token", Session, needs_full: false,
@@ -328,6 +339,8 @@ mod tests {
                 "list.sections",
                 "list.locate",
                 "list.close",
+                "album.get",
+                "artist.get",
                 "media.token",
                 "playback.get",
                 "playback.play",

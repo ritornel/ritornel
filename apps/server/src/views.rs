@@ -76,9 +76,12 @@ impl Views {
         self.held.remove(id).is_some()
     }
 
-    /// The IDs of every view held.
-    pub(crate) fn ids(&self) -> Vec<String> {
-        self.held.keys().cloned().collect()
+    /// Every view held, by its ID, without counting as a use of any.
+    pub(crate) fn all(&self) -> Vec<(String, Arc<View>)> {
+        self.held
+            .iter()
+            .map(|(id, held)| (id.clone(), Arc::clone(&held.resolved)))
+            .collect()
     }
 
     /// How many bytes the views hold, near enough.
@@ -131,7 +134,7 @@ mod tests {
         let now = start + Duration::from_secs(100);
         assert!(views.get("0", now).is_some());
         views.hold("new".to_owned(), view(1), now);
-        assert_eq!(views.ids().len(), MAX_VIEWS);
+        assert_eq!(views.all().len(), MAX_VIEWS);
         assert!(views.get("1", now).is_none());
         assert!(views.get("0", now).is_some());
         assert!(views.close("new"));

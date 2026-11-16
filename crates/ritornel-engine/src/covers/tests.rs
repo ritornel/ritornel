@@ -201,3 +201,64 @@ fn a_scanned_picture_is_read_from_its_file_while_it_is_the_same_picture() {
         Err(CoverError::NotFound)
     ));
 }
+
+#[test]
+fn a_colour_is_the_hue_a_picture_has_most_of_and_grey_has_none() {
+    use super::color_of_pixels;
+    // All one red.
+    let red = color_of_pixels(std::iter::repeat_n([200, 30, 30], 576)).unwrap();
+    assert_eq!(red.hue, 0);
+    assert!(red.saturation > 60, "{red:?}");
+    // Mostly a blue, some grey and a little orange: the blue wins, and the
+    // grey counts for nothing.
+    let pixels = std::iter::repeat_n([40, 70, 180], 300)
+        .chain(std::iter::repeat_n([128, 128, 128], 200))
+        .chain(std::iter::repeat_n([230, 140, 40], 76));
+    let blue = color_of_pixels(pixels).unwrap();
+    assert!((220..=232).contains(&blue.hue), "{blue:?}");
+    // Grey, near black and near white have no colour.
+    assert_eq!(
+        color_of_pixels(std::iter::repeat_n([90, 90, 92], 576)),
+        None
+    );
+    assert_eq!(color_of_pixels(std::iter::repeat_n([3, 2, 4], 576)), None);
+    assert_eq!(
+        color_of_pixels(std::iter::repeat_n([252, 253, 251], 576)),
+        None
+    );
+    assert_eq!(color_of_pixels(std::iter::empty()), None);
+}
+
+#[test]
+fn a_colour_is_kept_with_the_covers_whether_a_cover_was_made_first_or_not() {
+    let library = library(10);
+    let covers = covers(&library);
+    let arts = arts(&library);
+    // Asked for before any cover of it was made: from its source.
+    let first = arts[0];
+    assert_eq!(covers.cached_color(first), None);
+    let color = covers
+        .color(&library.store, &library.servers, first)
+        .unwrap();
+    assert!(color.is_some(), "a painted cover has a colour");
+    assert_eq!(covers.cached_color(first), Some(color));
+    // Made with a cover, from the picture decoded for it.
+    let second = arts[1];
+    covers
+        .render(&library.store, &library.servers, second, 64)
+        .unwrap();
+    let kept = covers
+        .cached_color(second)
+        .expect("kept when the cover was made");
+    assert_eq!(
+        covers
+            .color(&library.store, &library.servers, second)
+            .unwrap(),
+        kept
+    );
+    // A picture that is not there has none to give.
+    assert!(matches!(
+        covers.color(&library.store, &library.servers, Id::from_bytes([3; 16])),
+        Err(CoverError::NotFound)
+    ));
+}

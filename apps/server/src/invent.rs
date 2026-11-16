@@ -5,7 +5,11 @@
 //! ```text
 //! ritornel-server invent --data-dir <dir> --root <dir> --albums <n>
 //!                        [--seed <n>] [--cover-min <px>] [--cover-max <px>]
+//!                        [--showcase]
 //! ```
+//!
+//! `--showcase` adds, after the drawn records, a small library made by hand
+//! for judging an artist's page and an album's.
 //!
 //! It takes the data directory's lock, as `serve` does, so it runs while no
 //! server does. A server with no library is given one first, as
@@ -47,6 +51,10 @@ pub(crate) struct InventArgs {
     /// The largest side of a cover, in pixels.
     #[arg(long, default_value_t = 1500)]
     cover_max: u32,
+    /// Adds a small library made by hand, for judging an artist's page and
+    /// an album's: see `ritornel_engine::invent::seed_showcase`.
+    #[arg(long)]
+    showcase: bool,
 }
 
 fn failed(doing: &'static str, path: &std::path::Path, why: impl std::fmt::Display) -> Error {
@@ -101,6 +109,16 @@ pub(crate) fn run(args: &InventArgs, env: Env<'_>, out: &mut dyn Write) -> Resul
         let _ = writeln!(out, "invented {done} of {of} records");
     })
     .map_err(|error| failed("invent", &args.root, error))?;
+    if args.showcase {
+        let shown = invent::seed_showcase(&library, &servers, &args.root, plan.now_ms)
+            .map_err(|error| failed("invent", &args.root, error))?;
+        writeln!(
+            out,
+            "added a showcase of {} artists, {} records and {} tracks",
+            shown.artists, shown.groups, shown.tracks
+        )
+        .map_err(Error::Output)?;
+    }
     writeln!(
         out,
         "invented {} artists, {} records ({} releases), {} tracks and {} covers ({} MB) in {:.1} s",

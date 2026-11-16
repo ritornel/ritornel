@@ -55,6 +55,7 @@ impl ListKind {
                 SortKey::Title,
                 SortKey::Year,
                 SortKey::Added,
+                SortKey::Discography,
             ],
             Self::Songs => &[SortKey::Title, SortKey::Album],
         }
@@ -64,7 +65,16 @@ impl ListKind {
     pub const fn predicates(self) -> &'static [PredicateName] {
         match self {
             Self::Artists => &[],
-            Self::Albums | Self::Songs => &[PredicateName::ByArtist],
+            Self::Albums => &[
+                PredicateName::ByArtist,
+                PredicateName::WithArtist,
+                PredicateName::All,
+            ],
+            Self::Songs => &[
+                PredicateName::ByArtist,
+                PredicateName::NoRecord,
+                PredicateName::All,
+            ],
         }
     }
 }
@@ -93,6 +103,16 @@ pub enum SortKey {
     /// Songs: by record, as [`SortKey::Artist`] orders records, then by
     /// disc and track number.
     Album,
+    /// Records of one artist, filed as a discography the way a person who
+    /// knows the records would file them: their albums, with EPs and
+    /// records of no known kind among them, then singles, live
+    /// recordings, collections and rarities, and last the records of
+    /// others they appear on. Within each, newest first by the year each
+    /// first came out, records with no year last, then by title. Each
+    /// [`Shelf`] is a section. The list's filter names the artist, with
+    /// [`Predicate::ByArtist`] or [`Predicate::WithArtist`]; without one it
+    /// is refused as `invalid`.
+    Discography,
 }
 
 /// One key of a query's order.
@@ -134,6 +154,21 @@ pub enum Predicate {
         #[serde(rename = "artistId")]
         artist_id: Id,
     },
+    /// Records whose artist credit names this artist, or that have a song
+    /// whose credit does: everything of theirs, and the records of others
+    /// they appear on. Records only.
+    WithArtist {
+        /// The artist.
+        #[serde(rename = "artistId")]
+        artist_id: Id,
+    },
+    /// Songs on no record: files that name no album. Songs only.
+    NoRecord,
+    /// Every one of these holds. At most one of them may name an artist.
+    All {
+        /// The conditions.
+        of: Vec<Predicate>,
+    },
 }
 
 impl Predicate {
@@ -141,6 +176,9 @@ impl Predicate {
     pub const fn name(&self) -> PredicateName {
         match self {
             Self::ByArtist { .. } => PredicateName::ByArtist,
+            Self::WithArtist { .. } => PredicateName::WithArtist,
+            Self::NoRecord => PredicateName::NoRecord,
+            Self::All { .. } => PredicateName::All,
         }
     }
 }
@@ -152,6 +190,12 @@ impl Predicate {
 pub enum PredicateName {
     /// [`Predicate::ByArtist`].
     ByArtist,
+    /// [`Predicate::WithArtist`].
+    WithArtist,
+    /// [`Predicate::NoRecord`].
+    NoRecord,
+    /// [`Predicate::All`].
+    All,
 }
 
 /// What a list is of, and in what order.
@@ -291,11 +335,59 @@ pub struct ViewParams {
 #[serde(rename_all = "camelCase")]
 pub struct Section {
     /// What the section is: a letter, `#` for names that begin with no
-    /// letter, a year, or a stretch of time such as "This week" or
-    /// "October".
+    /// letter, a year, a stretch of time such as "This week" or
+    /// "October", or in a discography the kind of record, such as
+    /// "Singles".
     pub label: String,
     /// The index of its first row.
     pub index: u64,
+    /// In a discography, the kind of record the section holds. A client
+    /// chooses its own words and its layout by this, and not by `label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub shelf: Option<Shelf>,
+}
+
+/// The kinds of record an artist's discography is filed under, in the
+/// order it files them. See [`SortKey::Discography`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum Shelf {
+    /// Albums, EPs among them, and every record whose kind is not known.
+    Albums,
+    /// Singles.
+    Singles,
+    /// Live recordings, of whatever kind.
+    Live,
+    /// Collections and rarities: compilations, remixes, demos and the
+    /// like.
+    Collections,
+    /// Records of others that the artist appears on: their name is on a
+    /// song and not on the record.
+    AppearsOn,
+}
+
+impl Shelf {
+    /// Every shelf, in the order a discography files them.
+    pub const ALL: &[Self] = &[
+        Self::Albums,
+        Self::Singles,
+        Self::Live,
+        Self::Collections,
+        Self::AppearsOn,
+    ];
+
+    /// The shelf's name, as a section's label gives it.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Albums => "Albums",
+            Self::Singles => "Singles",
+            Self::Live => "Live",
+            Self::Collections => "Collections and rarities",
+            Self::AppearsOn => "Appears on",
+        }
+    }
 }
 
 /// The result of `list.sections`.
@@ -651,6 +743,52 @@ mod tests {
         assert_eq!(support.len(), 3);
         assert_eq!(support[0].sorts, [SortKey::Name]);
         assert_eq!(support[1].sorts[0], SortKey::Artist);
-        assert_eq!(support[2].predicates, [PredicateName::ByArtist]);
+        assert_eq!(
+            support[2].predicates,
+            [
+                PredicateName::ByArtist,
+                PredicateName::NoRecord,
+                PredicateName::All
+            ]
+        );
+    }
+
+    #[test]
+    fn predicates_nest_and_a_discography_section_names_its_shelf() {
+        let wire = json!({
+            "is": "all",
+            "of": [{ "is": "by_artist", "artistId": id(1) }, { "is": "no_record" }],
+        });
+        let predicate: Predicate = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            predicate,
+            Predicate::All {
+                of: vec![
+                    Predicate::ByArtist { artist_id: id(1) },
+                    Predicate::NoRecord
+                ]
+            }
+        );
+        assert_eq!(serde_json::to_value(&predicate).unwrap(), wire);
+        let section = Section {
+            label: Shelf::AppearsOn.label().to_owned(),
+            index: 7,
+            shelf: Some(Shelf::AppearsOn),
+        };
+        assert_eq!(
+            serde_json::to_value(&section).unwrap(),
+            json!({ "label": "Appears on", "index": 7, "shelf": "appears_on" })
+        );
+        // A section of letters says nothing of shelves.
+        let letter = Section {
+            label: "A".to_owned(),
+            index: 0,
+            shelf: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&letter).unwrap(),
+            json!({ "label": "A", "index": 0 })
+        );
+        assert!(Shelf::ALL.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

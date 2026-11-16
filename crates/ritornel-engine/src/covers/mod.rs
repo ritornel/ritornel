@@ -13,6 +13,13 @@
 //!
 //! Every step here waits on a disk or works the processor, so none of it
 //! runs on an async worker. The server runs it on threads of its own.
+//!
+//! A cover's colour ([`Covers::color`]) is worked out from the same decoded
+//! picture, when a cover is first made, and kept beside the covers as
+//! `{artId}.color`: the hue the picture has most of, the way the
+//! prototype's `scripts/colors.py` finds it. A page asks for it with the
+//! artist or the album it draws, before any cover of it may have been
+//! made, and then it is worked out there and kept the same way.
 
 use std::fmt;
 use std::io::Write as _;
@@ -21,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use ritornel_contract::{ART_SIZES, Id};
+use ritornel_contract::{ART_SIZES, ArtColor, Id};
 use rusqlite::Connection;
 
 use crate::{Error, LibraryStore, ServerStore};
@@ -139,6 +146,70 @@ impl Covers {
         std::fs::read(self.path(art, size)).ok()
     }
 
+    /// Where the colour of `art` is kept, whether or not it is there.
+    fn color_path(&self, art: Id) -> PathBuf {
+        self.covers.join(format!("{art}.color"))
+    }
+
+    /// The colour of `art`, if the cache has worked it out: `Some(None)`
+    /// for a picture that is close to grey.
+    pub fn cached_color(&self, art: Id) -> Option<Option<ArtColor>> {
+        let text = std::fs::read_to_string(self.color_path(art)).ok()?;
+        let mut parts = text.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some("none"), None) => Some(None),
+            (Some(hue), Some(saturation)) => Some(Some(ArtColor {
+                hue: hue.parse().ok()?,
+                saturation: saturation.parse().ok()?,
+            })),
+            _ => None,
+        }
+    }
+
+    /// The colour of `art`: from the cache, or else worked out from the
+    /// smallest cover of it the cache has, or from its source, and kept.
+    /// `Ok(None)` for a picture that is close to grey all over.
+    pub fn color(
+        &self,
+        library: &LibraryStore,
+        servers: &ServerStore,
+        art: Id,
+    ) -> Result<Option<ArtColor>, CoverError> {
+        if let Some(known) = self.cached_color(art) {
+            return Ok(known);
+        }
+        // A cover already made is a smaller picture to decode than its
+        // source. A colour is taken from a few pixels, so any will do.
+        let made = ART_SIZES.iter().find_map(|size| self.cached(art, *size));
+        let bytes = match made {
+            Some(bytes) => bytes,
+            None => {
+                let sources = library.picture_sources(art)?;
+                let roots = servers.roots()?;
+                sources
+                    .iter()
+                    .find_map(|source| read_source(&roots, source))
+                    .ok_or(CoverError::NotFound)?
+            }
+        };
+        let decoded = image::load_from_memory(&bytes).map_err(|error| {
+            CoverError::Failed(format!("the picture could not be decoded: {error}"))
+        })?;
+        let color = color_of(&decoded);
+        self.store_color(art, color);
+        Ok(color)
+    }
+
+    /// Keeps a colour worked out. A cache that cannot be written loses
+    /// nothing: the colour is worked out again next time.
+    fn store_color(&self, art: Id, color: Option<ArtColor>) {
+        let text = match color {
+            Some(color) => format!("{} {}", color.hue, color.saturation),
+            None => "none".to_owned(),
+        };
+        let _ = self.store_file(&self.color_path(art), text.as_bytes());
+    }
+
     /// Makes the cover `art` at `size` from its source, keeps it in the
     /// cache, and returns it.
     pub fn render(
@@ -172,6 +243,10 @@ impl Covers {
             CoverError::Failed(format!("the picture could not be decoded: {error}"))
         })?;
         timings.decode_us = micros(started);
+        // The colour, from the picture decoded here, the first time.
+        if self.cached_color(art).is_none() {
+            self.store_color(art, color_of(&decoded));
+        }
         let started = std::time::Instant::now();
         let bytes = scale(&decoded, size)?;
         timings.resize_us = micros(started);
@@ -183,9 +258,19 @@ impl Covers {
 
     /// Writes a cover in `tmp/`, syncs it, and renames it into place.
     fn store(&self, art: Id, size: u32, bytes: &[u8]) -> Result<(), CoverError> {
+        self.store_file(&self.path(art, size), bytes)
+    }
+
+    /// Writes a file of the cache in `tmp/`, syncs it, and renames it to
+    /// `path`.
+    fn store_file(&self, path: &Path, bytes: &[u8]) -> Result<(), CoverError> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let tmp = self.tmp.join(format!(
-            "{art}-{size}-{}-{}.part",
+            "{name}-{}-{}.part",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -195,7 +280,7 @@ impl Covers {
         file.write_all(bytes).map_err(failed)?;
         file.sync_all().map_err(failed)?;
         drop(file);
-        std::fs::rename(&tmp, self.path(art, size)).map_err(|error| {
+        std::fs::rename(&tmp, path).map_err(|error| {
             let _ = std::fs::remove_file(&tmp);
             failed(error)
         })
@@ -204,6 +289,88 @@ impl Covers {
 
 fn micros(since: std::time::Instant) -> u64 {
     u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// The side of the square a picture is shrunk to before its colour is
+/// taken: the prototype's.
+const COLOR_SIDE: u32 = 24;
+
+/// The colour a picture is mostly made of, as the prototype's
+/// `scripts/colors.py` finds it: shrunk to 24 pixels square, each pixel
+/// counts by how coloured it is (grey, near black and near white count for
+/// nothing), and the hue is the middle of the twelfth of the colour wheel
+/// that has the most, with the colour's strength there. `None` for a
+/// picture that is close to grey all over.
+pub(crate) fn color_of(decoded: &image::DynamicImage) -> Option<ArtColor> {
+    let small = decoded.thumbnail_exact(COLOR_SIDE, COLOR_SIDE).to_rgb8();
+    color_of_pixels(small.pixels().map(|pixel| pixel.0))
+}
+
+/// [`color_of`], from pixels already shrunk.
+pub(crate) fn color_of_pixels(pixels: impl Iterator<Item = [u8; 3]>) -> Option<ArtColor> {
+    // For each twelfth: its weight, and the weighted sums of the hue's sine
+    // and cosine and of the saturation.
+    let mut buckets = [[0.0_f64; 4]; 12];
+    let (mut total, mut count) = (0.0_f64, 0_u32);
+    for [r, g, b] in pixels {
+        count += 1;
+        let (hue, lightness, saturation) = hls(
+            f64::from(r) / 255.0,
+            f64::from(g) / 255.0,
+            f64::from(b) / 255.0,
+        );
+        let weight = saturation * (1.0 - (2.0 * lightness - 1.0).abs());
+        if weight < 0.04 {
+            continue;
+        }
+        let twelfth = ((hue * 12.0) as usize) % 12;
+        let angle = hue * std::f64::consts::TAU;
+        if let Some(bucket) = buckets.get_mut(twelfth) {
+            bucket[0] += weight;
+            bucket[1] += weight * angle.sin();
+            bucket[2] += weight * angle.cos();
+            bucket[3] += weight * saturation;
+        }
+        total += weight;
+    }
+    let best = buckets
+        .iter()
+        .copied()
+        .max_by(|a, b| a[0].total_cmp(&b[0]))?;
+    if count == 0 || total / f64::from(count) < 0.018 || best[0] <= 0.0 {
+        return None;
+    }
+    let hue = (best[1].atan2(best[2]).to_degrees() + 360.0) % 360.0;
+    Some(ArtColor {
+        hue: (hue.round() as u16) % 360,
+        saturation: (100.0 * best[3] / best[0]).round().clamp(0.0, 100.0) as u8,
+    })
+}
+
+/// Hue, lightness and saturation, each from 0 to 1, as Python's
+/// `colorsys.rgb_to_hls` gives them.
+fn hls(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0;
+    if max == min {
+        return (0.0, lightness, 0.0);
+    }
+    let range = max - min;
+    let saturation = if lightness <= 0.5 {
+        range / (max + min)
+    } else {
+        range / (2.0 - max - min)
+    };
+    let (rc, gc, bc) = ((max - r) / range, (max - g) / range, (max - b) / range);
+    let hue = if r == max {
+        bc - gc
+    } else if g == max {
+        2.0 + rc - bc
+    } else {
+        4.0 + gc - rc
+    };
+    ((hue / 6.0).rem_euclid(1.0), lightness, saturation)
 }
 
 /// The image scaled to fit `size` on its longer side, never up, as a JPEG.

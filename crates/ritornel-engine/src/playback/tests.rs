@@ -1236,3 +1236,42 @@ fn whether_the_heard_ranges_are_approximate_is_a_fact_kept_through_staging_and_d
         );
     }
 }
+
+#[test]
+fn an_output_that_goes_away_ends_the_listen_as_output_lost_and_play_continues_it() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(30_000);
+    rig.fake.lose_output();
+    rig.wait(1_000);
+    // The listen ended where the output went, and the player waits, paused
+    // at that place.
+    let [lost] = rig.staged().try_into().unwrap();
+    let ended = lost.ended.clone().unwrap();
+    assert_eq!(
+        (
+            ended.end_reason,
+            ended.end_position_ms,
+            lost.heard.ms_played
+        ),
+        (
+            ritornel_domain::history::EndReason::OutputLost,
+            30_000,
+            30_000
+        )
+    );
+    let state = rig.player.state();
+    assert_eq!((state.status, state.position_ms), (Status::Paused, 30_000));
+    // Play opens the output again, from there, as a listen that continues
+    // the lost one: one play.
+    rig.resume();
+    assert_eq!(rig.fake.loads().last().unwrap().1, 30_000);
+    rig.pass(120_000);
+    let staged = rig.staged();
+    assert_eq!(staged[1].started.continues, Some(lost.started.listen_id));
+    rig.skip(Direction::Next);
+    rig.deliver();
+    let plays = rig.plays();
+    assert_eq!(plays[0].ms_played, 150_000);
+    assert_eq!(plays[0].listens.len(), 2);
+}

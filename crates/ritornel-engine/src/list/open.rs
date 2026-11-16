@@ -3,10 +3,10 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use ritornel_contract::{FILTER_VERSION, Id, ListKind, Predicate, Query, Section, SortKey};
+use ritornel_contract::{FILTER_VERSION, Id, ListKind, Predicate, Query, Section, Shelf, SortKey};
 use rusqlite::{Connection, OptionalExtension};
 
-use super::{ListError, View, fold};
+use super::{ListError, View, discography, fold};
 use crate::Error;
 
 /// A query, checked against what its kind of list takes.
@@ -18,6 +18,51 @@ pub(super) struct Plan {
     text: Option<String>,
     /// The artist a filter names.
     artist: Option<Id>,
+    /// Whether the records of others that the artist is credited on a song
+    /// of are in it too ([`Predicate::WithArtist`]).
+    appears: bool,
+    /// Whether it is only songs on no record ([`Predicate::NoRecord`]).
+    no_record: bool,
+}
+
+/// What a filter's conditions come to, gathered from its tree.
+#[derive(Debug, Default)]
+struct Conditions {
+    artist: Option<Id>,
+    appears: bool,
+    no_record: bool,
+}
+
+impl Conditions {
+    fn gather(&mut self, kind: ListKind, predicate: &Predicate) -> Result<(), ListError> {
+        if !kind.predicates().contains(&predicate.name()) {
+            return Err(ListError::Invalid(format!(
+                "a list of {kind:?} takes no {:?} filter",
+                predicate.name()
+            )));
+        }
+        let mut name = |artist: Id, appears: bool| {
+            if self.artist.is_some() {
+                return Err(ListError::Invalid(
+                    "a filter names at most one artist".to_owned(),
+                ));
+            }
+            self.artist = Some(artist);
+            self.appears = appears;
+            Ok(())
+        };
+        match predicate {
+            Predicate::ByArtist { artist_id } => name(*artist_id, false)?,
+            Predicate::WithArtist { artist_id } => name(*artist_id, true)?,
+            Predicate::NoRecord => self.no_record = true,
+            Predicate::All { of } => {
+                for each in of {
+                    self.gather(kind, each)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Plan {
@@ -37,25 +82,21 @@ impl Plan {
                 "a list of {kind:?} cannot be ordered by {sort:?}"
             )));
         }
-        let artist = match &query.filter {
-            None => None,
+        let mut conditions = Conditions::default();
+        match &query.filter {
+            None => {}
             Some(filter) if filter.version != FILTER_VERSION => {
                 return Err(ListError::Unsupported(format!(
                     "this server reads filters of version {FILTER_VERSION}"
                 )));
             }
-            Some(filter) => {
-                if !kind.predicates().contains(&filter.predicate.name()) {
-                    return Err(ListError::Invalid(format!(
-                        "a list of {kind:?} takes no {:?} filter",
-                        filter.predicate.name()
-                    )));
-                }
-                match filter.predicate {
-                    Predicate::ByArtist { artist_id } => Some(artist_id),
-                }
-            }
-        };
+            Some(filter) => conditions.gather(kind, &filter.predicate)?,
+        }
+        if sort == SortKey::Discography && conditions.artist.is_none() {
+            return Err(ListError::Invalid(
+                "a discography is of one artist: its filter names them".to_owned(),
+            ));
+        }
         let text = query
             .text
             .as_deref()
@@ -65,7 +106,9 @@ impl Plan {
             kind,
             sort,
             text,
-            artist,
+            artist: conditions.artist,
+            appears: conditions.appears,
+            no_record: conditions.no_record,
         })
     }
 }
@@ -110,6 +153,7 @@ fn sections<T>(items: &[T], label: impl Fn(&T) -> String) -> Vec<Section> {
             sections.push(Section {
                 label,
                 index: index as u64,
+                shelf: None,
             });
         }
     }
@@ -173,6 +217,11 @@ pub(super) fn by_name_for_tests(a: &str, b: &str) -> Ordering {
     by_name(a, b)
 }
 
+/// Filed names in order, for the discography's order of titles.
+pub(super) fn by_name_for_order(a: &str, b: &str) -> Ordering {
+    by_name(a, b)
+}
+
 // ---------------------------------------------------------------- albums
 
 /// One live release, with what ordering and filing need.
@@ -192,6 +241,10 @@ pub(super) struct Release {
     pub(super) artist_key: String,
     /// What it is filed under by title.
     pub(super) title_key: String,
+    /// Its group's primary type, as stored.
+    pub(super) primary: Option<String>,
+    /// Its group's marks, as stored: a JSON array.
+    pub(super) marks: Option<String>,
 }
 
 /// Live releases with their group and what each is filed under. `?1` is
@@ -207,7 +260,8 @@ const RELEASES: &str = "SELECT r.id, r.release_group_id, rg.presentation, rg.dis
         ?1 IS NULL OR EXISTS (
           SELECT 1 FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
            WHERE acn.artist_credit_id = r.display_artist_credit_id
-             AND a.canonical_id = ?1)
+             AND a.canonical_id = ?1),
+        rg.display_primary_type, rg.display_secondary_types_json
  FROM release r
  JOIN release_group rg ON rg.id = r.release_group_id
  LEFT JOIN artist_credit ac ON ac.id = r.display_artist_credit_id
@@ -230,6 +284,16 @@ pub(super) fn releases(
 /// The live releases of the groups that the releases with these keys are
 /// in: every version of each, and nothing else.
 fn releases_of_groups(connection: &Connection, keys: &[i64]) -> Result<Vec<Release>, Error> {
+    releases_of_groups_by(connection, keys, None)
+}
+
+/// As [`releases_of_groups`], each saying whether its credit names the
+/// artist with the key `artist`.
+fn releases_of_groups_by(
+    connection: &Connection,
+    keys: &[i64],
+    artist: Option<i64>,
+) -> Result<Vec<Release>, Error> {
     let mut groups = Vec::new();
     super::for_each_in(
         connection,
@@ -249,9 +313,9 @@ fn releases_of_groups(connection: &Connection, keys: &[i64]) -> Result<Vec<Relea
             super::placeholders(chunk.len())
         );
         let mut statement = connection.prepare(&sql)?;
-        // No artist, then the groups.
+        // The artist, if any, then the groups.
         let mut parameters: Vec<Option<i64>> = Vec::with_capacity(chunk.len() + 1);
-        parameters.push(None);
+        parameters.push(artist);
         parameters.extend(chunk.iter().map(|group| Some(*group)));
         let mut rows = statement.query(rusqlite::params_from_iter(parameters))?;
         while let Some(row) = rows.next()? {
@@ -282,9 +346,62 @@ fn release(row: &rusqlite::Row<'_>) -> Result<Release, Error> {
         artist_key: fold::sort_text(&credit, sort_name.as_deref()),
         title_key: fold::sort_text(&title, None),
         by_artist: row.get(10)?,
+        primary: row.get(11)?,
+        marks: row.get(12)?,
         title,
         credit,
     })
+}
+
+/// The live releases whose own credit names the artist with this key: the
+/// credits that name them, from `artist_credit_name` (a small table, read
+/// whole), and the releases of those credits by
+/// `release_display_artist_credit`.
+fn releases_by(connection: &Connection, artist: i64) -> Result<Vec<i64>, Error> {
+    let mut statement = connection.prepare(
+        "SELECT r.id FROM release r
+         WHERE r.redirect_to_id IS NULL
+           AND r.display_artist_credit_id IN (
+             SELECT acn.artist_credit_id
+             FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
+             WHERE a.canonical_id = ?1)",
+    )?;
+    let mut found = Vec::new();
+    let mut rows = statement.query([artist])?;
+    while let Some(row) = rows.next()? {
+        found.push(row.get(0)?);
+    }
+    Ok(found)
+}
+
+/// The live releases that have a song whose credit names the artist with
+/// this key. There is no index on a song's credit, so this reads every
+/// song: measured at 100,000 records in the report of the pages' work.
+fn releases_crediting(connection: &Connection, artist: i64) -> Result<HashSet<i64>, Error> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT ta.release_id FROM track_appearance ta
+         WHERE ta.redirect_to_id IS NULL AND ta.release_id IS NOT NULL
+           AND ta.display_artist_credit_id IN (
+             SELECT acn.artist_credit_id
+             FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
+             WHERE a.canonical_id = ?1)",
+    )?;
+    let mut found = HashSet::new();
+    let mut rows = statement.query([artist])?;
+    while let Some(row) = rows.next()? {
+        found.insert(row.get(0)?);
+    }
+    Ok(found)
+}
+
+/// The shelf a record goes on in the discography of the artist a list is
+/// filtered by: see [`discography::shelf`].
+pub(super) fn shelf_of(release: &Release) -> Shelf {
+    discography::shelf(
+        discography::record_type(release.primary.as_deref()),
+        &discography::marks(release.marks.as_deref()),
+        release.by_artist,
+    )
 }
 
 /// One tile of the Albums list: its key, and the release it shows.
@@ -416,14 +533,37 @@ fn albums(
         },
         None => None,
     };
-    let releases = releases(connection, artist)?;
+    // An artist's records are found by their credits, and then every
+    // version of each, rather than by reading every release there is;
+    // with the records of others they are credited on a song of, the
+    // groups of the releases that credit them so.
+    let mut appears_in: HashSet<i64> = HashSet::new();
+    let releases = match artist {
+        Some(artist) => {
+            let mut keys = releases_by(connection, artist)?;
+            let crediting = if plan.appears {
+                releases_crediting(connection, artist)?
+            } else {
+                HashSet::new()
+            };
+            keys.extend(crediting.iter().copied());
+            let releases = releases_of_groups_by(connection, &keys, Some(artist))?;
+            for release in &releases {
+                if crediting.contains(&release.id) {
+                    appears_in.insert(release.group);
+                }
+            }
+            releases
+        }
+        None => releases(connection, None)?,
+    };
     let mut tiles: Vec<Tile> = tiles(&releases)
         .into_iter()
         .filter(|tile| {
             let Some(release) = releases.get(tile.shown) else {
                 return false;
             };
-            release.by_artist
+            (release.by_artist || appears_in.contains(&release.group))
                 && plan.text.as_ref().is_none_or(|needle| {
                     fold::matches(&release.title, needle) || fold::matches(&release.credit, needle)
                 })
@@ -448,11 +588,24 @@ fn albums(
             *entry = (*entry).min(*at);
         }
     }
+    // The shelf of each record, for a discography.
+    let shelves: HashMap<i64, Shelf> = if plan.sort == SortKey::Discography {
+        tiles
+            .iter()
+            .filter_map(|tile| Some((tile.key, shelf_of(shown(tile)?))))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let shelf = |tile: &Tile| shelves.get(&tile.key).copied().unwrap_or(Shelf::Albums);
     tiles.sort_by(|a, b| {
         let (Some(ra), Some(rb)) = (shown(a), shown(b)) else {
             return a.key.cmp(&b.key);
         };
         let order = match plan.sort {
+            SortKey::Discography => shelf(a).cmp(&shelf(b)).then_with(|| {
+                discography::newest_first(a.year, &ra.title_key, b.year, &rb.title_key)
+            }),
             SortKey::Title => by_name(&ra.title_key, &rb.title_key)
                 .then_with(|| by_name(&ra.artist_key, &rb.artist_key)),
             SortKey::Year => {
@@ -468,6 +621,16 @@ fn albums(
         order.then(a.key.cmp(&b.key))
     });
     let sections = match plan.sort {
+        SortKey::Discography => {
+            let mut sections = sections(&tiles, |tile| shelf(tile).label().to_owned());
+            for section in &mut sections {
+                section.shelf = Shelf::ALL
+                    .iter()
+                    .copied()
+                    .find(|shelf| shelf.label() == section.label);
+            }
+            sections
+        }
         SortKey::Title => sections(&tiles, |tile| {
             shown(tile)
                 .map_or('#', |release| fold::letter(&release.title_key))
@@ -609,14 +772,17 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
         Some(needle) => Some(matching(connection, needle)?),
         None => None,
     };
-    let columns = "SELECT ta.id, ta.release_id, rc.canonical_id, ta.display_title,
-                          ta.display_disc_number, ta.display_track_number,
-                          ?1 IS NULL OR EXISTS (
-                            SELECT 1 FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
-                             WHERE acn.artist_credit_id = ta.display_artist_credit_id
-                               AND a.canonical_id = ?1)
-                   FROM track_appearance ta JOIN recording rc ON rc.id = ta.recording_id
-                   WHERE ta.redirect_to_id IS NULL";
+    let all = "SELECT ta.id, ta.release_id, rc.canonical_id, ta.display_title,
+                      ta.display_disc_number, ta.display_track_number,
+                      ?1 IS NULL OR EXISTS (
+                        SELECT 1 FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
+                         WHERE acn.artist_credit_id = ta.display_artist_credit_id
+                           AND a.canonical_id = ?1)
+               FROM track_appearance ta JOIN recording rc ON rc.id = ta.recording_id
+               WHERE ta.redirect_to_id IS NULL";
+    // Songs on no record are found by `track_appearance_release`.
+    let loose = format!("{all} AND ta.release_id IS NULL");
+    let columns = if plan.no_record { loose.as_str() } else { all };
     let read = |row: &rusqlite::Row<'_>| -> Result<Song, rusqlite::Error> {
         let title: Option<String> = row.get(3)?;
         Ok(Song {
@@ -671,7 +837,9 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
     let mut on: Vec<i64> = songs.iter().filter_map(|song| song.release).collect();
     on.sort_unstable();
     on.dedup();
-    let releases = if (matched.is_some() || artist.is_some()) && on.len() <= LOOK_UP_AT_MOST {
+    let releases = if (matched.is_some() || artist.is_some() || plan.no_record)
+        && on.len() <= LOOK_UP_AT_MOST
+    {
         releases_of_groups(connection, &on)?
     } else {
         releases(connection, None)?

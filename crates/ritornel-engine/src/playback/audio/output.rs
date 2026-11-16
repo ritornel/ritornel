@@ -6,7 +6,7 @@
 //! that count. See "The pipeline" in docs/design/playback.md.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer};
 
@@ -42,6 +42,9 @@ pub(crate) struct Shared {
     pub(crate) callbacks: AtomicU64,
     /// Errors the output's stream reported.
     pub(crate) stream_errors: AtomicU64,
+    /// Whether the stream reported an error it cannot go on from: its
+    /// device went away or its configuration is no longer valid.
+    pub(crate) lost: AtomicBool,
 }
 
 /// The state that lives in the callback.

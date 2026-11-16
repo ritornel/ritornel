@@ -606,3 +606,43 @@ fn a_scanned_root_is_listed_as_the_scan_made_it() {
         ["Another Name Entirely"]
     );
 }
+
+#[test]
+fn an_artists_records_show_no_plays_and_their_other_songs_do() {
+    // The tape's rule (`View::shows_plays`): a change of plays alone tells
+    // only the views whose rows show plays. An artist's discography is of
+    // records, which show none; their songs on no record are songs, which
+    // do. Neither filters or sorts on plays, so neither reorders for one.
+    let library = library(40);
+    let artists = open(&library, ListKind::Artists, &Query::default());
+    let Some(Row::Artist(artist)) = rows(&library, &artists).into_iter().next() else {
+        panic!("an artist")
+    };
+    let records = Query {
+        filter: Some(Filter {
+            version: FILTER_VERSION,
+            predicate: Predicate::WithArtist {
+                artist_id: artist.artist_id,
+            },
+        }),
+        ..query(SortKey::Discography)
+    };
+    let records = open(&library, ListKind::Albums, &records);
+    assert!(!records.ids.is_empty());
+    assert!(!records.shows_plays());
+    let loose = Query {
+        filter: Some(Filter {
+            version: FILTER_VERSION,
+            predicate: Predicate::All {
+                of: vec![
+                    Predicate::ByArtist {
+                        artist_id: artist.artist_id,
+                    },
+                    Predicate::NoRecord,
+                ],
+            },
+        }),
+        ..Query::default()
+    };
+    assert!(open(&library, ListKind::Songs, &loose).shows_plays());
+}

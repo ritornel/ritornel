@@ -18,9 +18,12 @@
 //! for a scan running while someone scrolls.
 
 mod art;
+mod showcase;
 #[cfg(test)]
 pub(crate) mod testing;
 mod words;
+
+pub use showcase::seed_showcase;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -232,6 +235,13 @@ struct Album {
     added_ms: i64,
     /// The cover: its seed and side. `None` for a record with none.
     cover: Option<(u64, u32)>,
+    /// Whether its files say what kind of record it is. Most of the
+    /// owner's do not.
+    typed: bool,
+    /// The marks beside its kind, such as `live` or `compilation`.
+    marks: &'static [&'static str],
+    /// Whether its files say when it came out.
+    dated: bool,
 }
 
 /// An artist, planned.
@@ -468,6 +478,9 @@ fn plan_album(
         mixed: rng.chance(0.03),
         added_ms: plan.now_ms - back,
         cover,
+        typed: true,
+        marks: &[],
+        dated: true,
     }
 }
 
@@ -706,11 +719,21 @@ impl Rows {
         };
         let group = self.key("release_group");
         let group_id = self.public_id();
-        let primary = match album.kind {
+        let primary = album.typed.then_some(match album.kind {
             Kind::Album => "album",
             Kind::Ep => "ep",
             Kind::Single => "single",
-        };
+        });
+        let marks = format!(
+            "[{}]",
+            album
+                .marks
+                .iter()
+                .map(|mark| json_text(mark))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let first_year = album.dated.then_some(album.first_year);
         let first_release = self.next.get("release").copied().unwrap_or(1);
         // Parents go in before what points at them, so that no foreign key
         // is ever outstanding: SQLite would otherwise search every child
@@ -720,9 +743,10 @@ impl Rows {
             group_id,
             None::<i64>,
             primary,
-            album.first_year.to_string(),
-            album.first_year,
+            first_year.map(|year| year.to_string()),
+            first_year,
             rev,
+            marks,
         ))?;
 
         // The recordings, which every version shares.
@@ -747,14 +771,15 @@ impl Rows {
         for (number, version) in album.versions.iter().enumerate() {
             let release = self.key("release");
             let public_id = self.public_id();
+            let year = album.dated.then_some(version.year);
             statements.release.execute((
                 release,
                 public_id,
                 group,
                 &version.title,
                 credit,
-                version.year.to_string(),
-                version.year,
+                year.map(|year| year.to_string()),
+                year,
                 picture,
                 rev,
             ))?;
@@ -793,7 +818,7 @@ impl Rows {
                     write,
                     statements,
                     Track {
-                        release,
+                        release: Some(release),
                         recording: *recording,
                         credit: *track_credit,
                         title,
@@ -952,8 +977,9 @@ impl<'a> Statements<'a> {
             picture: connection.prepare("INSERT INTO picture (id, public_id, content_hash, mime_type, width, height, size_bytes, rev)
                  VALUES (?1, ?2, ?3, 'image/jpeg', ?4, ?4, ?5, ?6)")?,
             release_group: connection.prepare("INSERT INTO release_group (id, public_id, display_release_id, display_primary_type,
-                                            display_first_date, display_first_year, rev)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?,
+                                            display_first_date, display_first_year, rev,
+                                            display_secondary_types_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")?,
             recording: connection.prepare("INSERT INTO recording (id, public_id, canonical_id, display_title, display_artist_credit_id, rev)
                      VALUES (?1, ?2, ?1, ?3, ?4, ?5)")?,
             release: connection.prepare("INSERT INTO release (id, public_id, release_group_id, canonical_id, display_title,
@@ -991,7 +1017,8 @@ impl<'a> Statements<'a> {
 
 /// One track's file, as [`Rows::track`] writes it.
 struct Track<'a> {
-    release: i64,
+    /// Its record, or `None` for a file that names none.
+    release: Option<i64>,
     recording: i64,
     credit: i64,
     title: &'a str,

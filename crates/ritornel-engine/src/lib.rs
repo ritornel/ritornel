@@ -70,8 +70,8 @@ pub use clock::{Clock, SystemClock};
 pub use entropy::{Entropy, OsEntropy};
 pub use error::Error;
 pub use history_store::{
-    Ingested, LISTEN_RECORD_VERSION, ListenRecord, ListenRow, PlayCursor, PlayRow, Rebuilt,
-    SendStamps,
+    INGEST_METHOD, Ingested, LISTEN_RECORD_VERSION, ListenRecord, ListenRow, PlayCursor, PlayRow,
+    Rebuilt, SendStamps,
 };
 pub use id::new_id;
 pub use identity_store::is_policy;

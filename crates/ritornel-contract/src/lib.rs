@@ -49,6 +49,7 @@ mod list;
 pub mod local;
 mod media;
 pub mod methods;
+mod pages;
 mod playback;
 mod server;
 mod ticket;
@@ -80,10 +81,13 @@ pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,
     ListClosed, ListKind, ListLocateParams, ListLocated, ListOpenParams, ListOpened, ListSections,
     ListSupport, ListWindow, ListWindowParams, Predicate, PredicateName, Quality, Query, Replaces,
-    Row, Section, SongRow, Sort, SortKey, TrackCopy, ViewParams, Window,
+    Row, Section, Shelf, SongRow, Sort, SortKey, TrackCopy, ViewParams, Window,
 };
 pub use media::{ART_SIZES, MEDIA_TOKEN_PARAM, MediaToken};
 pub use methods::{METHODS, Method, MethodInfo, MethodKind, MethodVisitor, visit_methods};
+pub use pages::{
+    AlbumGetParams, AlbumPage, AlbumVersion, ArtColor, ArtistGetParams, ArtistPage, RecordType,
+};
 pub use playback::{
     ContextKind, CopyInUse, OutputInfo, OutputMode, PlayContext, PlaySource, PlaybackChanged,
     PlaybackCommandParams, PlaybackEvent, PlaybackPlayParams, PlaybackSeekParams,

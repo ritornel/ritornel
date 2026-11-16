@@ -226,7 +226,7 @@ fn artists(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
 }
 
 /// How many tracks each of these releases has, and how long they are.
-fn track_counts(
+pub(super) fn track_counts(
     connection: &Connection,
     releases: &[i64],
 ) -> Result<HashMap<i64, (u64, u64)>, Error> {
@@ -430,7 +430,7 @@ fn grade(format: &Format) -> (bool, u32, u32, u32) {
 
 /// The best copy across each release's tracks, and whether they differ,
 /// from its appearances, given as the release each is on.
-fn qualities(
+pub(super) fn qualities(
     connection: &Connection,
     release_of: &HashMap<i64, i64>,
 ) -> Result<HashMap<i64, Quality>, Error> {

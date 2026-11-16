@@ -264,6 +264,12 @@ fn no_library() -> Error {
     Error::NoLibrary
 }
 
+/// Whether a listen that ended for `reason` is what playing the entry again
+/// continues: one cut off by a shutdown or by the output going away.
+fn resumable(reason: EndReason) -> bool {
+    matches!(reason, EndReason::Shutdown | EndReason::OutputLost)
+}
+
 impl Player {
     /// The player as the last run left it: any listen left open is closed
     /// as a crash, and the queue and the place in it are back, paused.
@@ -537,7 +543,7 @@ impl Player {
             return self.finish_closing(server, events);
         }
         let Some(listen) = self.listen.take() else {
-            if reason != EndReason::Shutdown {
+            if !resumable(reason) {
                 self.resume_listen = None;
             }
             return Ok(());
@@ -564,7 +570,7 @@ impl Player {
             return Ok(());
         };
         let reason = ended.end_reason;
-        let resume = (reason == EndReason::Shutdown).then_some(listen.started.listen_id);
+        let resume = resumable(reason).then_some(listen.started.listen_id);
         let position = match reason {
             EndReason::Finished => 0,
             _ => ended.end_position_ms,
@@ -1046,6 +1052,22 @@ impl Player {
             return Err(Error::FailPoint);
         }
         let mono = self.setup.timekeeper.mono_ms();
+        if polled.output_lost {
+            // The output went away: the listen ends there, and the player
+            // waits, paused at that place. Play opens the output again and
+            // continues the listen, as a resume after a restart does.
+            self.leave(server, EndReason::OutputLost, &mut events)?;
+            self.status = Status::Paused;
+            server.save_place(self.entry_row(), self.position_ms, self.resume_listen)?;
+            if let Some(entry) = self.entry().map(|entry| entry.entry_id) {
+                events.push(PlayerEvent::Failed {
+                    entry,
+                    reason: "output_lost: the output went away".to_owned(),
+                });
+            }
+            self.changed(&mut events);
+            return Ok(events);
+        }
         if let Some(failed) = polled.failed {
             let heard = self.listen.is_some();
             self.leave(server, EndReason::Error, &mut events)?;

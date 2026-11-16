@@ -374,6 +374,7 @@ impl Renderer for AudioRenderer {
             frames: self.shared.previous_final.load(Ordering::SeqCst),
             ended: false,
             failed: None,
+            output_lost: self.shared.lost.load(Ordering::SeqCst),
         })
     }
 
@@ -392,6 +393,7 @@ impl Renderer for AudioRenderer {
             frames,
             ended: self.shared.drained.load(Ordering::SeqCst) == old.segment,
             failed: old.failed,
+            output_lost: self.shared.lost.load(Ordering::SeqCst),
         }
     }
 
@@ -419,6 +421,7 @@ impl Renderer for AudioRenderer {
             // has been heard.
             ended: drained && decoding.failed.is_none(),
             failed: decoding.failed.clone().filter(|_| drained),
+            output_lost: self.shared.lost.load(Ordering::SeqCst),
         }
     }
 }
@@ -498,9 +501,16 @@ impl Renderer for OnDemand {
     }
 
     fn unload(&mut self) -> Segment {
-        self.opened
-            .as_mut()
-            .map_or_else(Segment::default, Renderer::unload)
+        let Some(opened) = &mut self.opened else {
+            return Segment::default();
+        };
+        let last = opened.unload();
+        // An output that went away is let go, and the next load opens the
+        // system's output again.
+        if last.output_lost {
+            self.opened = None;
+        }
+        last
     }
 
     fn poll(&mut self) -> Segment {

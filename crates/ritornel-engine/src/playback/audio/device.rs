@@ -108,8 +108,16 @@ pub(super) fn start(
             let stream = device.build_output_stream::<f32, _, _>(
                 stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| callback.render(data),
-                move |_error| {
+                move |error: cpal::Error| {
                     errors.stream_errors.fetch_add(1, Ordering::Relaxed);
+                    if matches!(
+                        error.kind(),
+                        cpal::ErrorKind::DeviceNotAvailable
+                            | cpal::ErrorKind::StreamInvalidated
+                            | cpal::ErrorKind::HostUnavailable
+                    ) {
+                        errors.lost.store(true, Ordering::SeqCst);
+                    }
                 },
                 None,
             );

@@ -11,12 +11,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use ritornel_contract::methods::{
-    self, EventsSubscribe, EventsUnsubscribe, HistoryOnThisDay, HistoryRebuild, HistoryRecent,
-    IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LibraryCreate, LibraryStats,
-    ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
-    PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSkip,
-    PlaybackStop, QueueWindow, ScanStart, ServerHello, ServerStatus, ServersList, SourcesAdd,
-    SourcesList, SourcesTracks,
+    self, AlbumGet, ArtistGet, EventsSubscribe, EventsUnsubscribe, HistoryOnThisDay,
+    HistoryRebuild, HistoryRecent, IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList,
+    LibraryCreate, LibraryStats, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
+    MediaTokenCall, Method, PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek,
+    PlaybackSkip, PlaybackStop, QueueWindow, ScanStart, ServerHello, ServerStatus, ServersList,
+    SourcesAdd, SourcesList, SourcesTracks,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -45,6 +45,7 @@ mod calls;
 mod churn;
 mod history;
 mod lists;
+mod pages;
 mod playback;
 
 use lists::Fanout;
@@ -574,6 +575,8 @@ impl Core {
             ListClose::NAME => {
                 run::<ListClose>(params, |params| Ok(Self::list_close(session, &params)))
             }
+            AlbumGet::NAME => run::<AlbumGet>(params, |params| self.album_get(stores, &params)),
+            ArtistGet::NAME => run::<ArtistGet>(params, |params| self.artist_get(stores, &params)),
             MediaTokenCall::NAME => run::<MediaTokenCall>(params, |_| self.media_token(session)),
             PlaybackGet::NAME => run::<PlaybackGet>(params, |_| self.playback_get(stores)),
             PlaybackPlay::NAME => {

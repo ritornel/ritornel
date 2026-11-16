@@ -46,6 +46,10 @@ pub struct Segment {
     pub ended: bool,
     /// Why the track stopped before its end, if it did.
     pub failed: Option<String>,
+    /// Whether the output went away, a device unplugged or taken by the
+    /// system: nothing more is heard through it, and the next load opens
+    /// the output afresh.
+    pub output_lost: bool,
 }
 
 /// Why a track could not be opened or moved in.
@@ -128,6 +132,8 @@ pub(crate) mod fake {
     #[derive(Debug, Default)]
     struct State {
         lengths: HashMap<PathBuf, Result<u64, &'static str>>,
+        /// Whether the output went away.
+        lost: bool,
         /// Files that are no longer what the catalog says, by path.
         replaced: HashMap<PathBuf, FileFacts>,
         /// Whether the file loaded was written to where it is.
@@ -159,6 +165,14 @@ pub(crate) mod fake {
             self.state().replaced.insert(path.into(), facts);
         }
 
+        /// The output goes away: nothing more is heard until a track is
+        /// loaded again.
+        pub(crate) fn lose_output(&self) {
+            let mut state = self.state();
+            state.lost = true;
+            state.playing = false;
+        }
+
         /// The file loaded is written to where it is.
         pub(crate) fn rewrite_loaded(&self) {
             self.state().rewritten = true;
@@ -173,7 +187,7 @@ pub(crate) mod fake {
         /// up to its end.
         pub(crate) fn advance(&self, ms: u64) {
             let mut state = self.state();
-            if !state.playing {
+            if !state.playing || state.lost {
                 return;
             }
             let Some((_, length)) = state.loaded.clone() else {
@@ -230,6 +244,7 @@ pub(crate) mod fake {
                 return Err(RenderError::new("file_changed", "another file is there"));
             }
             state.rewritten = false;
+            state.lost = false;
             state.loaded = Some((path.to_owned(), length));
             state.at_ms = start_ms.min(length);
             state.frames = 0;
@@ -283,6 +298,7 @@ pub(crate) mod fake {
                 frames: state.frames,
                 ended,
                 failed: None,
+                output_lost: state.lost,
             }
         }
     }

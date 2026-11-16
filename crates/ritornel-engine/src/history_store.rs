@@ -25,6 +25,10 @@ use crate::{Error, Id, LibraryStore, WriteRequest};
 /// The version of a listen record's shape.
 pub const LISTEN_RECORD_VERSION: u32 = 1;
 
+/// What a write that takes in a listen is called, as its [`WriteRequest`]
+/// names it: what the library's commit hook is told.
+pub const INGEST_METHOD: &str = "history.ingest";
+
 /// One finished listen, as the playing server sends it to the hub: every
 /// field `listen_staging` holds, with public IDs. It is stored verbatim as
 /// the observation's payload. See "Recording a listen" in
@@ -937,7 +941,7 @@ impl LibraryStore {
         let record = record.clone();
         let written = self.write(
             WriteRequest {
-                method: "history.ingest",
+                method: INGEST_METHOD,
                 command: None,
                 client: None,
             },

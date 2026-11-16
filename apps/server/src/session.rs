@@ -218,9 +218,10 @@ impl Session {
         self.views().close(id)
     }
 
-    /// The IDs of the views the session holds.
-    pub(crate) fn view_ids(&self) -> Vec<String> {
-        self.views().ids()
+    /// The views the session holds, by their IDs, as they were resolved.
+    /// Asking is not a use: it keeps none of them from ending.
+    pub(crate) fn held_views(&self) -> Vec<(String, Arc<View>)> {
+        self.views().all()
     }
 
     /// What the session's views cost to hold, in bytes, near enough.
@@ -254,6 +255,13 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn unsent(&self) -> usize {
         self.state().queue.len()
+    }
+
+    /// Everything waiting to be sent, taken, for a test elsewhere in the
+    /// server.
+    #[cfg(test)]
+    pub(crate) fn drain(&self) -> Vec<Frame> {
+        std::iter::from_fn(|| self.take().ok().flatten()).collect()
     }
 
     /// Takes the next frame to send without waiting. `Err` when the session
@@ -548,7 +556,8 @@ mod tests {
             sections: Vec::new(),
         });
         session.hold_view("v".to_owned(), resolved);
-        assert_eq!(session.view_ids(), ["v"]);
+        let held: Vec<String> = session.held_views().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(held, ["v"]);
         assert!(session.view_bytes() >= 24);
         assert!(session.view("v").is_some());
         session.close();

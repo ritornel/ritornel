@@ -82,6 +82,8 @@ export const METHODS = {
   "list.sections": { kind: "query", needsFull: false },
   "list.locate": { kind: "query", needsFull: false },
   "list.close": { kind: "session", needsFull: false },
+  "album.get": { kind: "query", needsFull: false },
+  "artist.get": { kind: "query", needsFull: false },
   "media.token": { kind: "session", needsFull: false },
   "playback.get": { kind: "query", needsFull: false },
   "playback.play": { kind: "command", needsFull: false },
@@ -122,6 +124,8 @@ export type MethodMap = {
   "list.sections": { params: ViewParams; result: ListSections };
   "list.locate": { params: ListLocateParams; result: ListLocated };
   "list.close": { params: ViewParams; result: ListClosed };
+  "album.get": { params: AlbumGetParams; result: AlbumPage };
+  "artist.get": { params: ArtistGetParams; result: ArtistPage };
   "media.token": { params: NoParams; result: MediaToken };
   "playback.get": { params: NoParams; result: PlaybackState };
   "playback.play": { params: PlaybackPlayParams; result: PlaybackChanged };
@@ -187,6 +191,96 @@ export type EventFrame = { jsonrpc: "2.0"; method: typeof EVENT_METHOD; params: 
 export type ServerFrame = ResponseFrame | EventFrame;
 
 /**
+ * The params of `album.get`.
+ */
+export type AlbumGetParams = {
+  /**
+   * The album: a release group, which gives the release the group is
+   * set to show, or one release.
+   */
+  ref: AlbumRef,
+};
+
+/**
+ * The result of `album.get`: one release, with what an album's page
+ * shows of it.
+ */
+export type AlbumPage = {
+  /**
+   * The release shown: for a group, the one the group is set to show.
+   */
+  releaseId: string,
+  /**
+   * The release group it is a version of.
+   */
+  releaseGroupId: string,
+  /**
+   * What kind of record it is, where that is known.
+   */
+  recordType: RecordType | null,
+  /**
+   * The shelf its artist's discography files it on.
+   */
+  shelf: Shelf,
+  /**
+   * Its tracks, in disc and track order.
+   */
+  tracks: Array<SongRow>,
+  /**
+   * The other versions of the record: every other release of its group,
+   * oldest first.
+   */
+  versions: Array<AlbumVersion>,
+  /**
+   * The colour of its cover. `null` when it has none, or it is close to
+   * grey.
+   */
+  artColor: ArtColor | null,
+  /**
+   * The library revision this was read at.
+   */
+  libraryRevision: number,
+  /**
+   * What the tile is.
+   */
+  ref: AlbumRef,
+  /**
+   * The title of the release it shows. `null` until the library has one.
+   */
+  title: string | null,
+  /**
+   * Who it is by.
+   */
+  artistCredit: Credit | null,
+  /**
+   * The year it first came out, for a group shown as one tile, or the
+   * release's own year.
+   */
+  year: number | null,
+  /**
+   * How many tracks the release it shows has.
+   */
+  trackCount: number,
+  /**
+   * How long they are together.
+   */
+  durationMs: number,
+  /**
+   * How many versions its group has. 1 for a record with one.
+   */
+  versionCount: number,
+  /**
+   * Its cover, for `GET /v1/art/{artId}/{size}`. `null` when it has none.
+   */
+  artId: string | null,
+  /**
+   * The best copy across its tracks. `null` when none of its tracks has
+   * a copy the library has read.
+   */
+  quality: Quality | null,
+};
+
+/**
  * What an Albums tile points at.
  */
 export type AlbumRef = { "type": "release_group",
@@ -242,6 +336,110 @@ export type AlbumTile = {
    * a copy the library has read.
    */
   quality: Quality | null,
+};
+
+/**
+ * One version of a record: a release of its group.
+ */
+export type AlbumVersion = {
+  /**
+   * The release, for `album.get`.
+   */
+  releaseId: string,
+  /**
+   * Its title.
+   */
+  title: string | null,
+  /**
+   * The year it came out.
+   */
+  year: number | null,
+  /**
+   * How many tracks it has.
+   */
+  trackCount: number,
+  /**
+   * The best copy across its tracks. `null` when none has a copy the
+   * library has read.
+   */
+  quality: Quality | null,
+  /**
+   * Whether it is the one the group is set to show.
+   */
+  shown: boolean,
+};
+
+/**
+ * The colour a picture is mostly made of: the hue it has most of,
+ * counting each pixel by how coloured it is, and how strong the colour
+ * is there. It is a hue and not a colour to paint with: a client sets its
+ * lightness for its own palette, so that it reads on a dark window and a
+ * light one alike. `null` where it is given is a picture that is close to
+ * grey all over, or one that could not be read.
+ */
+export type ArtColor = {
+  /**
+   * The hue, in degrees from 0 to 359.
+   */
+  hue: number,
+  /**
+   * How strong the colour is where it is that hue, from 0 to 100.
+   */
+  saturation: number,
+};
+
+/**
+ * The params of `artist.get`.
+ */
+export type ArtistGetParams = {
+  /**
+   * The artist.
+   */
+  artistId: string,
+};
+
+/**
+ * The result of `artist.get`: one artist, as the Artists list has them,
+ * and the colour of their picture.
+ */
+export type ArtistPage = {
+  /**
+   * The colour of that picture. `null` when it has none, or it is close
+   * to grey.
+   */
+  artColor: ArtColor | null,
+  /**
+   * The library revision this was read at.
+   */
+  libraryRevision: number,
+  /**
+   * The artist.
+   */
+  artistId: string,
+  /**
+   * Their name, as displayed. `null` until the library has one.
+   */
+  name: string | null,
+  /**
+   * The name they are filed under, where it differs from how it is
+   * written, such as "Beatles, The".
+   */
+  sortName: string | null,
+  /**
+   * How many records name them in their credit, counted as the Albums
+   * list shows them.
+   */
+  albumCount: number,
+  /**
+   * How many songs on those records there are, and loose songs of
+   * theirs.
+   */
+  trackCount: number,
+  /**
+   * A picture to draw them with until there are photographs: the cover
+   * of their earliest record that has one. `null` when none has.
+   */
+  artId: string | null,
 };
 
 /**
@@ -2015,13 +2213,21 @@ export type Predicate = { "is": "by_artist",
   /**
    * The artist.
    */
-  artistId: string,
+  artistId: string, } | { "is": "with_artist",
+  /**
+   * The artist.
+   */
+  artistId: string, } | { "is": "no_record" } | { "is": "all",
+  /**
+   * The conditions.
+   */
+  of: Array<Predicate>,
 };
 
 /**
  * The name of a predicate, as the descriptor lists what a list supports.
  */
-export type PredicateName = "by_artist";
+export type PredicateName = "by_artist" | "with_artist" | "no_record" | "all";
 
 /**
  * What an event on the `progress` topic carries: where the playing entry
@@ -2242,6 +2448,12 @@ export type RecentPlays = {
 };
 
 /**
+ * What kind of record a release group is, as a release-type tag writes it
+ * (MusicBrainz's primary type).
+ */
+export type RecordType = "album" | "ep" | "single" | "broadcast" | "other";
+
+/**
  * Repeat. M1's first player has none: it is always `off`.
  */
 export type Repeat = "off" | "all" | "one";
@@ -2448,14 +2660,20 @@ export type ScanSummary = {
 export type Section = {
   /**
    * What the section is: a letter, `#` for names that begin with no
-   * letter, a year, or a stretch of time such as "This week" or
-   * "October".
+   * letter, a year, a stretch of time such as "This week" or
+   * "October", or in a discography the kind of record, such as
+   * "Singles".
    */
   label: string,
   /**
    * The index of its first row.
    */
   index: number,
+  /**
+   * In a discography, the kind of record the section holds. A client
+   * chooses its own words and its layout by this, and not by `label`.
+   */
+  shelf?: Shelf,
 };
 
 /**
@@ -2562,6 +2780,12 @@ export type ServersList = {
 export type SessionKind = "full" | "limited";
 
 /**
+ * The kinds of record an artist's discography is filed under, in the
+ * order it files them. See [`SortKey::Discography`].
+ */
+export type Shelf = "albums" | "singles" | "live" | "collections" | "appears_on";
+
+/**
  * Which way a skip goes.
  */
 export type SkipDirection = "next" | "previous";
@@ -2662,7 +2886,7 @@ export type Sort = {
  * so that it is total and a view of the same query twice has the same
  * order.
  */
-export type SortKey = "name" | "artist" | "title" | "year" | "added" | "album";
+export type SortKey = "name" | "artist" | "title" | "year" | "added" | "album" | "discography";
 
 /**
  * One place the library's items come from.

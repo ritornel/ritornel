@@ -1,0 +1,730 @@
+//! Contract tests for an artist's page and an album's: `artist.get`,
+//! `album.get`, and the lists the pages read through views (an artist's
+//! discography and their songs on no record). A real server inside the
+//! test, on an invented library with the hand-made showcase in it, talked
+//! to through `ritornel-client`.
+//!
+//! Each test runs twice, joined to the dispatcher by channels in memory
+//! and over a real socket (docs/design/contract.md, decision 4).
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use ritornel_client::contract::methods::{AlbumGet, ArtistGet};
+use ritornel_client::contract::{
+    AlbumGetParams, AlbumRef, AlbumTile, ArtistGetParams, ArtistRow, CONTRACT_VERSION, ClientKind,
+    ErrorCode, FILTER_VERSION, Filter, HelloParams, Id, ListKind, ListOpenParams, ListOpened,
+    Predicate, Query, RecordType, Row, SessionKind, Shelf, SongRow, Sort, SortKey, Window,
+};
+use ritornel_client::{Client, Credential};
+use ritornel_engine::{OsEntropy, SystemClock};
+use ritornel_server::{Bounds, HeldDir, Listen, Server};
+
+const WAIT: Duration = Duration::from_secs(60);
+
+async fn bounded(test: impl Future<Output = ()>) {
+    tokio::time::timeout(WAIT, test)
+        .await
+        .unwrap_or_else(|_| panic!("the test did not finish within {WAIT:?}"));
+}
+
+/// A directory that is removed when the test ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ritornel-server-pages-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.0.join("data")
+    }
+
+    fn root(&self) -> PathBuf {
+        self.0.join("root")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Via {
+    Memory,
+    Socket,
+}
+
+macro_rules! on_both_transports {
+    ($($test:ident)*) => {$(
+        mod $test {
+            use super::{Via, bounded};
+
+            #[tokio::test]
+            async fn in_memory() {
+                bounded(super::$test(Via::Memory)).await;
+            }
+
+            #[tokio::test]
+            async fn over_a_socket() {
+                bounded(super::$test(Via::Socket)).await;
+            }
+        }
+    )*};
+}
+
+/// Invents a library with the showcase in it, with the server's own hidden
+/// command, as a developer would.
+fn invent(data_dir: &Path, root: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
+        .arg("invent")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--root")
+        .arg(root)
+        .args(["--albums", "40", "--seed", "5", "--showcase"])
+        .args(["--cover-min", "200", "--cover-max", "300"])
+        .env_remove("RITORNEL_DATA_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+struct Running {
+    server: Server,
+    scratch: Scratch,
+}
+
+impl Running {
+    async fn start() -> Self {
+        let scratch = Scratch::new();
+        invent(&scratch.data_dir(), &scratch.root());
+        let server = Server::start_with(
+            HeldDir::take(scratch.data_dir()).unwrap(),
+            Listen::on_port(0),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+            Bounds::default(),
+        )
+        .await
+        .unwrap();
+        Self { server, scratch }
+    }
+
+    async fn greeted(&self, via: Via) -> Client {
+        let client = match via {
+            Via::Memory => {
+                let (outgoing, incoming) = self.server.connect_in_memory(SessionKind::Full);
+                Client::over_memory(outgoing, incoming)
+            }
+            Via::Socket => {
+                let token = std::fs::read_to_string(self.scratch.data_dir().join("credential"))
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                Client::connect(self.server.endpoint(), &Credential::new(token))
+                    .await
+                    .unwrap()
+            }
+        };
+        client
+            .hello(&HelloParams {
+                name: "pages-test".to_owned(),
+                kind: ClientKind::Cli,
+                version: "1".to_owned(),
+                contract_version: CONTRACT_VERSION,
+            })
+            .await
+            .unwrap();
+        client
+    }
+}
+
+fn refused<T: std::fmt::Debug>(answer: Result<T, ritornel_client::Error>) -> ErrorCode {
+    match answer {
+        Err(ritornel_client::Error::Call(error)) => error.data.code,
+        other => panic!("expected an error from the server, and got {other:?}"),
+    }
+}
+
+fn filter(predicate: Predicate) -> Option<Filter> {
+    Some(Filter {
+        version: FILTER_VERSION,
+        predicate,
+    })
+}
+
+fn open(kind: ListKind, predicate: Predicate, sort: Option<SortKey>) -> ListOpenParams {
+    ListOpenParams {
+        kind,
+        query: Query {
+            filter: filter(predicate),
+            sort: sort.map(|key| vec![Sort { key }]),
+            ..Query::default()
+        },
+        window: Some(Window {
+            offset: 0,
+            limit: 500,
+        }),
+        replaces: None,
+    }
+}
+
+/// The artist of this name.
+async fn artist(client: &Client, name: &str) -> ArtistRow {
+    let found = client
+        .list_open(&ListOpenParams {
+            kind: ListKind::Artists,
+            query: Query {
+                text: Some(name.to_owned()),
+                ..Query::default()
+            },
+            window: Some(Window {
+                offset: 0,
+                limit: 50,
+            }),
+            replaces: None,
+        })
+        .await
+        .unwrap();
+    found
+        .rows
+        .into_iter()
+        .find_map(|row| match row {
+            Row::Artist(artist) if artist.name.as_deref() == Some(name) => Some(artist),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no artist named {name}"))
+}
+
+fn tiles(opened: &ListOpened) -> Vec<AlbumTile> {
+    opened
+        .rows
+        .iter()
+        .map(|row| match row {
+            Row::Album(album) => album.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+/// An artist's discography: its rows, and where each shelf begins.
+struct Discography {
+    opened: ListOpened,
+    sections: Vec<(Shelf, usize)>,
+}
+
+impl Discography {
+    fn total(&self) -> u64 {
+        self.opened.total
+    }
+
+    fn tiles(&self) -> Vec<AlbumTile> {
+        tiles(&self.opened)
+    }
+
+    /// The records of each shelf, in order.
+    fn shelves(&self) -> Vec<(Shelf, Vec<AlbumTile>)> {
+        let tiles = self.tiles();
+        self.sections
+            .iter()
+            .enumerate()
+            .map(|(at, (shelf, start))| {
+                let end = self
+                    .sections
+                    .get(at + 1)
+                    .map_or(tiles.len(), |(_, next)| *next);
+                (*shelf, tiles[*start..end].to_vec())
+            })
+            .collect()
+    }
+}
+
+/// Opens an artist's discography and reads its sections.
+async fn discography(client: &Client, predicate: Predicate) -> Discography {
+    let opened = client
+        .list_open(&open(
+            ListKind::Albums,
+            predicate,
+            Some(SortKey::Discography),
+        ))
+        .await
+        .unwrap();
+    let sections = client.list_sections(&opened.view).await.unwrap().sections;
+    let sections = sections
+        .iter()
+        .map(|section| {
+            let shelf = section
+                .shelf
+                .expect("a discography's section names its shelf");
+            assert_eq!(section.label, shelf.label());
+            (shelf, section.index as usize)
+        })
+        .collect();
+    Discography { opened, sections }
+}
+
+fn title(tile: &AlbumTile) -> &str {
+    tile.title.as_deref().unwrap_or_default()
+}
+
+/// Newest first by year, those with none last.
+fn newest_first(tiles: &[AlbumTile]) -> bool {
+    tiles
+        .windows(2)
+        .all(|pair| match (pair[0].year, pair[1].year) {
+            (Some(a), Some(b)) => a >= b,
+            (Some(_), None) | (None, None) => true,
+            (None, Some(_)) => false,
+        })
+}
+
+async fn a_discography_files_every_kind_newest_first_and_the_records_they_appear_on_last(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let calla = artist(&client, "Calla Brandt").await;
+    let opened = discography(
+        &client,
+        Predicate::WithArtist {
+            artist_id: calla.artist_id,
+        },
+    )
+    .await;
+    let shelves = opened.shelves();
+    let order: Vec<Shelf> = shelves.iter().map(|(shelf, _)| *shelf).collect();
+    assert_eq!(order, Shelf::ALL);
+    for (shelf, tiles) in &shelves {
+        assert!(newest_first(tiles), "{shelf:?}: {tiles:?}");
+    }
+    let titles = |shelf: Shelf| -> Vec<String> {
+        shelves
+            .iter()
+            .find(|(each, _)| *each == shelf)
+            .unwrap()
+            .1
+            .iter()
+            .map(|tile| title(tile).to_owned())
+            .collect()
+    };
+    // EPs are among the albums, and a record is placed by the year it first
+    // came out: Low Country is 2017's, though a later edition is 2022's.
+    assert_eq!(
+        titles(Shelf::Albums),
+        [
+            "Weathervane",
+            "Low Country",
+            "Morning Static",
+            "The Orchard Keeper",
+            "Four Rooms",
+            "Copper Sky"
+        ]
+    );
+    assert_eq!(
+        titles(Shelf::Singles),
+        ["Static", "Halfway Bright", "Copper Sky"]
+    );
+    // A live EP is live.
+    assert_eq!(
+        titles(Shelf::Live),
+        ["Four Rooms, Live", "Live at the Granary"]
+    );
+    assert_eq!(
+        titles(Shelf::Collections),
+        ["Weathervane, Remade", "B-Sides and Lost Rooms"]
+    );
+    // The records of others they are credited on a song of.
+    assert_eq!(
+        titles(Shelf::AppearsOn),
+        [
+            "Lights Out, Volume II",
+            "Songs for the Harbour",
+            "The Glass Orchard"
+        ]
+    );
+    for tile in &shelves[4].1 {
+        let credit = tile.artist_credit.as_ref().unwrap();
+        assert!(!credit.artist_ids.contains(&calla.artist_id), "{tile:?}");
+    }
+
+    // Filtered by their credit alone, the same less the records of others.
+    let theirs = discography(
+        &client,
+        Predicate::ByArtist {
+            artist_id: calla.artist_id,
+        },
+    )
+    .await;
+    assert_eq!(theirs.total(), opened.total() - 3);
+    assert_eq!(theirs.total(), calla.album_count);
+    let order: Vec<Shelf> = theirs.shelves().iter().map(|(shelf, _)| *shelf).collect();
+    assert_eq!(order, &Shelf::ALL[..4]);
+}
+
+async fn records_of_no_known_kind_are_albums_and_those_with_no_year_come_last(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let ensemble = artist(&client, "Søren Dunmore Ensemble").await;
+    let opened = discography(
+        &client,
+        Predicate::WithArtist {
+            artist_id: ensemble.artist_id,
+        },
+    )
+    .await;
+    let shelves = opened.shelves();
+    assert_eq!(
+        shelves.iter().map(|(shelf, _)| *shelf).collect::<Vec<_>>(),
+        [Shelf::Albums, Shelf::AppearsOn]
+    );
+    let albums = &shelves[0].1;
+    assert_eq!(albums.len(), 22);
+    assert!(newest_first(albums));
+    assert_eq!(title(&albums[0]), "Afterglow, Again");
+    // The two with no year are last, by title.
+    assert_eq!(
+        albums[20..].iter().map(title).collect::<Vec<_>>(),
+        ["Rooms Without Doors", "Tapes from the Boathouse"]
+    );
+    assert!(albums[20..].iter().all(|tile| tile.year.is_none()));
+    // A record in versions is one tile, at its first year.
+    let window = albums
+        .iter()
+        .find(|tile| title(tile) == "Northern Window")
+        .unwrap();
+    assert_eq!((window.year, window.version_count), (Some(1984), 3));
+}
+
+async fn songs_on_no_record_are_found_by_artist(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let calla = artist(&client, "Calla Brandt").await;
+    let loose = client
+        .list_open(&open(
+            ListKind::Songs,
+            Predicate::All {
+                of: vec![
+                    Predicate::ByArtist {
+                        artist_id: calla.artist_id,
+                    },
+                    Predicate::NoRecord,
+                ],
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(loose.total, 3);
+    for row in &loose.rows {
+        let Row::Song(song) = row else { panic!() };
+        assert_eq!(song.release_id, None);
+        assert_eq!(song.album_title, None);
+    }
+    let all = client
+        .list_open(&open(
+            ListKind::Songs,
+            Predicate::ByArtist {
+                artist_id: calla.artist_id,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    assert!(all.total > 100, "{}", all.total);
+}
+
+async fn a_list_that_cannot_be_asked_for_is_refused(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let calla = artist(&client, "Calla Brandt").await;
+    let odile = artist(&client, "Odile Castellan").await;
+    // A discography of nobody in particular.
+    let mut nobody = open(
+        ListKind::Albums,
+        Predicate::NoRecord,
+        Some(SortKey::Discography),
+    );
+    nobody.query.filter = None;
+    assert_eq!(refused(client.list_open(&nobody).await), ErrorCode::Invalid);
+    // Two artists at once.
+    let two = open(
+        ListKind::Albums,
+        Predicate::All {
+            of: vec![
+                Predicate::ByArtist {
+                    artist_id: calla.artist_id,
+                },
+                Predicate::WithArtist {
+                    artist_id: odile.artist_id,
+                },
+            ],
+        },
+        None,
+    );
+    assert_eq!(refused(client.list_open(&two).await), ErrorCode::Invalid);
+    // Records on no record, and songs filed as a discography.
+    let records = open(ListKind::Albums, Predicate::NoRecord, None);
+    assert_eq!(
+        refused(client.list_open(&records).await),
+        ErrorCode::Invalid
+    );
+    let songs = open(
+        ListKind::Songs,
+        Predicate::ByArtist {
+            artist_id: calla.artist_id,
+        },
+        Some(SortKey::Discography),
+    );
+    assert_eq!(refused(client.list_open(&songs).await), ErrorCode::Invalid);
+}
+
+fn numbers(tracks: &[SongRow]) -> Vec<(i64, i64)> {
+    tracks
+        .iter()
+        .map(|track| (track.disc.unwrap(), track.track.unwrap()))
+        .collect()
+}
+
+async fn an_album_is_its_tracks_in_order_with_its_other_versions(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let ensemble = artist(&client, "Søren Dunmore Ensemble").await;
+    let opened = discography(
+        &client,
+        Predicate::ByArtist {
+            artist_id: ensemble.artist_id,
+        },
+    )
+    .await;
+    let records = opened.tiles();
+    let tile = |name: &str| {
+        records
+            .iter()
+            .find(|tile| title(tile) == name)
+            .unwrap()
+            .clone()
+    };
+
+    // A record in three versions shows the one its group is set to, the
+    // first, and names the other two.
+    let window = tile("Northern Window");
+    let page = client
+        .call::<AlbumGet>(&AlbumGetParams {
+            album: window.album,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.tile.album, window.album);
+    assert_eq!(page.release_group_id, window.album.id());
+    assert_eq!(page.tile.title.as_deref(), Some("Northern Window"));
+    assert_eq!((page.tile.year, page.tile.track_count), (Some(1984), 11));
+    assert_eq!(page.tracks.len(), 11);
+    assert_eq!(
+        numbers(&page.tracks),
+        (1..=11).map(|n| (1, n)).collect::<Vec<_>>()
+    );
+    assert_eq!(page.record_type, None);
+    assert_eq!(page.shelf, Shelf::Albums);
+    let versions: Vec<(String, Option<i64>, u64, bool)> = page
+        .versions
+        .iter()
+        .map(|version| {
+            (
+                version.title.clone().unwrap(),
+                version.year,
+                version.track_count,
+                version.shown,
+            )
+        })
+        .collect();
+    assert_eq!(
+        versions,
+        [
+            (
+                "Northern Window (Remastered)".to_owned(),
+                Some(2009),
+                11,
+                false
+            ),
+            (
+                "Northern Window (Deluxe Edition)".to_owned(),
+                Some(2014),
+                16,
+                false
+            ),
+        ]
+    );
+    assert!(
+        page.versions
+            .iter()
+            .all(|version| version.quality.is_some())
+    );
+    // One version by its own ID: its own year and tracks, and the first is
+    // the one the group shows.
+    let deluxe = page.versions[1].release_id;
+    let page = client
+        .call::<AlbumGet>(&AlbumGetParams {
+            album: AlbumRef::Release { id: deluxe },
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.release_id, deluxe);
+    assert_eq!(page.release_group_id, window.album.id());
+    assert_eq!(page.tile.album, AlbumRef::Release { id: deluxe });
+    assert_eq!((page.tile.year, page.tracks.len()), (Some(2014), 16));
+    assert_eq!(page.versions.len(), 2);
+    assert!(page.versions[0].shown && !page.versions[1].shown);
+
+    // Three discs, in disc and track order.
+    let rooms = client
+        .call::<AlbumGet>(&AlbumGetParams {
+            album: tile("Collected Rooms").album,
+        })
+        .await
+        .unwrap();
+    let numbers = numbers(&rooms.tracks);
+    assert_eq!(numbers.len(), 34);
+    assert_eq!(numbers.first(), Some(&(1, 1)));
+    assert_eq!(numbers.last(), Some(&(3, 10)));
+    let mut sorted = numbers.clone();
+    sorted.sort_unstable();
+    assert_eq!(numbers, sorted);
+
+    // A record of several artists names each song's own.
+    let harbour = client
+        .list_open(&ListOpenParams {
+            kind: ListKind::Albums,
+            query: Query {
+                text: Some("Songs for the Harbour".to_owned()),
+                ..Query::default()
+            },
+            window: Some(Window {
+                offset: 0,
+                limit: 5,
+            }),
+            replaces: None,
+        })
+        .await
+        .unwrap();
+    let harbour = tiles(&harbour)[0].clone();
+    let page = client
+        .call::<AlbumGet>(&AlbumGetParams {
+            album: harbour.album,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.record_type, Some(RecordType::Album));
+    assert_eq!(page.shelf, Shelf::Collections);
+    let album_artists = &page.tile.artist_credit.as_ref().unwrap().artist_ids;
+    assert!(page.tracks.iter().all(|track| {
+        let credit = track.artist_credit.as_ref().unwrap();
+        credit.artist_ids != *album_artists
+    }));
+}
+
+async fn an_artist_is_their_row_with_the_colour_of_their_picture(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let calla = artist(&client, "Calla Brandt").await;
+    let page = client
+        .call::<ArtistGet>(&ArtistGetParams {
+            artist_id: calla.artist_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.artist, calla);
+    let art = page.artist.art_id.unwrap();
+    let color = page.art_color.expect("a painted cover has a colour");
+    assert!(color.hue < 360 && color.saturation <= 100);
+    // Kept with the covers, and the same when asked again.
+    let kept = running
+        .scratch
+        .data_dir()
+        .join("cache/covers")
+        .join(format!("{art}.color"));
+    assert!(kept.exists(), "{}", kept.display());
+    let again = client
+        .call::<ArtistGet>(&ArtistGetParams {
+            artist_id: calla.artist_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(again.art_color, Some(color));
+
+    // An artist none of whose records has a cover has no colour either.
+    let trio = artist(&client, "Bram Kowal Trio").await;
+    let page = client
+        .call::<ArtistGet>(&ArtistGetParams {
+            artist_id: trio.artist_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!((page.artist.art_id, page.art_color), (None, None));
+    assert_eq!(page.artist.album_count, 2);
+
+    // Names in other scripts are found and read back as written.
+    for name in [
+        "Мира Кесслер",
+        "ナカムラ・ジュノ",
+        "Θέα Λίντκβιστ",
+        "카스텔란 사중주",
+    ] {
+        let found = artist(&client, name).await;
+        assert!(found.album_count >= 1, "{name}");
+    }
+}
+
+async fn what_the_library_does_not_have_is_not_found(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let nothing = Id::from_bytes([7; 16]);
+    assert_eq!(
+        refused(
+            client
+                .call::<ArtistGet>(&ArtistGetParams { artist_id: nothing })
+                .await
+        ),
+        ErrorCode::NotFound
+    );
+    for album in [
+        AlbumRef::ReleaseGroup { id: nothing },
+        AlbumRef::Release { id: nothing },
+    ] {
+        assert_eq!(
+            refused(client.call::<AlbumGet>(&AlbumGetParams { album }).await),
+            ErrorCode::NotFound
+        );
+    }
+}
+
+on_both_transports! {
+    a_discography_files_every_kind_newest_first_and_the_records_they_appear_on_last
+    records_of_no_known_kind_are_albums_and_those_with_no_year_come_last
+    songs_on_no_record_are_found_by_artist
+    a_list_that_cannot_be_asked_for_is_refused
+    an_album_is_its_tracks_in_order_with_its_other_versions
+    an_artist_is_their_row_with_the_colour_of_their_picture
+    what_the_library_does_not_have_is_not_found
+}

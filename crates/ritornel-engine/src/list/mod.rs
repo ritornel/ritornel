@@ -18,13 +18,17 @@
 //! a leading article set aside, accents and case ignored, names that start
 //! with no letter after Z.
 
+mod discography;
 mod fold;
 mod open;
+mod pages;
 mod rows;
 
 use std::fmt;
 
-use ritornel_contract::{ListKind, Query, Row, Section, SortKey};
+use ritornel_contract::{
+    AlbumPage, AlbumRef, ArtistRow, Id, ListKind, Query, Row, Section, SortKey,
+};
 use rusqlite::Connection;
 
 use crate::{Error, LibraryStore};
@@ -45,6 +49,13 @@ pub struct View {
 }
 
 impl View {
+    /// Whether its rows show plays: a song's play count and when it was
+    /// last played, which a play taken in changes. No view is sorted or
+    /// filtered by plays.
+    pub fn shows_plays(&self) -> bool {
+        matches!(self.kind, ListKind::Songs)
+    }
+
     /// What the view costs to hold, in bytes, near enough.
     pub fn bytes(&self) -> usize {
         self.ids.capacity() * std::mem::size_of::<i64>()
@@ -135,9 +146,10 @@ impl LibraryStore {
 
     /// The index in `resolved` of the first row whose sort text starts with
     /// `prefix`, or of the first one after where it would be. `None` for an
-    /// order by when, or a view with no rows.
+    /// order by when or by kind of record, or a view with no rows.
     pub fn list_locate_prefix(&self, resolved: &View, prefix: &str) -> Result<Option<u64>, Error> {
-        if matches!(resolved.sort, SortKey::Added) || resolved.ids.is_empty() {
+        if matches!(resolved.sort, SortKey::Added | SortKey::Discography) || resolved.ids.is_empty()
+        {
             return Ok(None);
         }
         self.read(|connection| open::locate_prefix(connection, resolved, prefix))
@@ -145,6 +157,31 @@ impl LibraryStore {
 
     fn now_ms(&self) -> i64 {
         self.clock().now_ms()
+    }
+
+    /// An album's page: the release `album` names, or the one its group is
+    /// set to show, with its tracks in disc and track order and the other
+    /// versions of its group. `None` if the library has no such record.
+    /// Its colour is the cover cache's to say, and is left `None`.
+    pub fn album_page(&self, album: AlbumRef) -> Result<Option<AlbumPage>, Error> {
+        self.read(move |connection| {
+            connection.execute_batch("BEGIN")?;
+            let page = pages::album(connection, album);
+            let _ = connection.execute_batch("COMMIT");
+            page
+        })
+    }
+
+    /// The artist with this ID, as the Artists list has them, and the
+    /// library revision they were read at. `None` if the library has no
+    /// such artist.
+    pub fn artist_row(&self, artist: Id) -> Result<Option<(ArtistRow, u64)>, Error> {
+        self.read(move |connection| {
+            connection.execute_batch("BEGIN")?;
+            let found = pages::artist(connection, artist);
+            let _ = connection.execute_batch("COMMIT");
+            found
+        })
     }
 }
 

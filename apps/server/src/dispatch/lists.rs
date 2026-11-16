@@ -5,7 +5,7 @@
 use std::sync::{Arc, PoisonError, Weak};
 use std::time::Instant;
 
-use ritornel_contract::methods::{Method, SourcesAdd};
+use ritornel_contract::methods::{HistoryRebuild, Method, SourcesAdd};
 use ritornel_contract::{
     ErrorCode, Event, Id, LibraryChange, LibraryEvent, ListClosed, ListEvent, ListLocateParams,
     ListLocated, ListOpenParams, ListOpened, ListSections, ListWindow, ListWindowParams,
@@ -39,27 +39,34 @@ impl Fanout {
     }
 
     /// Tells every session that the library changed: a `library` event to
-    /// those subscribed, and a `list` event for each view each one holds.
+    /// those subscribed, and a `list` event for each view of each one that
+    /// the change can have made out of date.
     ///
     /// The rule for `reorder` is the coarse one of "Large lists" step 5:
     /// a change of play counts reorders only views that sort or filter on
-    /// plays, and any other change reorders every view. No write changes
-    /// play counts yet, and no view sorts on them, so every view is told to
-    /// reorder.
+    /// plays, and any other change reorders every view. No view sorts or
+    /// filters on plays, so a change of plays alone reorders none: only the
+    /// views whose rows show plays are told, to read their windows again
+    /// in place. A listen delivered while others browse costs them a
+    /// window's read in a list of songs, and nothing anywhere else.
     pub(crate) fn changed(&self, committed: Committed) {
         let revision = revision(committed.revision);
         let sessions: Vec<Arc<Session>> = self.lock().values().filter_map(Weak::upgrade).collect();
         let changed = changes(committed.method);
+        let plays_only = changed == [LibraryChange::Stats];
         for session in sessions {
             session.publish(Event::Library(LibraryEvent {
                 library_revision: revision,
                 changed: changed.clone(),
             }));
-            for view in session.view_ids() {
+            for (view, held) in session.held_views() {
+                if plays_only && !held.shows_plays() {
+                    continue;
+                }
                 session.publish(Event::List(ListEvent {
                     view,
                     library_revision: revision,
-                    reorder: true,
+                    reorder: !plays_only,
                 }));
             }
         }
@@ -67,11 +74,15 @@ impl Fanout {
 }
 
 /// What kind of change a write made, by the method that made it. Adding a
-/// source adds a root and nothing in it. Any other write does not yet say,
-/// so it is taken as every kind.
+/// source adds a root and nothing in it. Taking in a listen and rebuilding
+/// history change plays and nothing else. Any other write does not yet
+/// say, so it is taken as every kind; a write of the resolver that moves a
+/// play with its file is among those.
 fn changes(method: &str) -> Vec<LibraryChange> {
     if method == SourcesAdd::NAME {
         vec![LibraryChange::Membership]
+    } else if method == ritornel_engine::INGEST_METHOD || method == HistoryRebuild::NAME {
+        vec![LibraryChange::Stats]
     } else {
         LibraryChange::ALL.to_vec()
     }
@@ -324,5 +335,98 @@ impl Core {
         work: impl FnOnce() + Send + 'static,
     ) -> crate::media::CancelOnDrop {
         self.cover_pool.submit(work)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ritornel_contract::{
+        Frame, LibraryChange, ListKind, Notification, SessionKind, SortKey, Topic,
+    };
+
+    use super::*;
+
+    fn view(kind: ListKind) -> Arc<View> {
+        Arc::new(View {
+            kind,
+            sort: SortKey::Title,
+            revision: 1,
+            ids: vec![1, 2, 3],
+            sections: Vec::new(),
+        })
+    }
+
+    /// A session told of library writes, holding a view of songs and one
+    /// of albums, and the fanout that tells it.
+    fn watching() -> (Arc<Session>, Fanout) {
+        let session = Arc::new(Session::new(1, SessionKind::Full));
+        session.subscribe(&[Topic::Library]);
+        session.hold_view("songs".to_owned(), view(ListKind::Songs));
+        session.hold_view("albums".to_owned(), view(ListKind::Albums));
+        let fanout = Fanout::default();
+        fanout.add(&session);
+        (session, fanout)
+    }
+
+    /// The events waiting for `session`, library events first, list events
+    /// by view.
+    fn told(session: &Session) -> (Vec<LibraryEvent>, Vec<ListEvent>) {
+        let (mut library, mut lists) = (Vec::new(), Vec::new());
+        for frame in session.drain() {
+            let Frame::Notification(Notification { params, .. }) = frame else {
+                continue;
+            };
+            match serde_json::from_value(params.unwrap()).unwrap() {
+                Event::Library(event) => library.push(event),
+                Event::List(event) => lists.push(event),
+                _ => {}
+            }
+        }
+        lists.sort_by(|a, b| a.view.cmp(&b.view));
+        (library, lists)
+    }
+
+    #[test]
+    fn a_listen_taken_in_tells_only_the_views_that_show_plays_to_read_again_in_place() {
+        let (session, fanout) = watching();
+        fanout.changed(Committed {
+            revision: 9,
+            method: ritornel_engine::INGEST_METHOD,
+        });
+        let (library, lists) = told(&session);
+        assert_eq!(library.len(), 1);
+        assert_eq!(library[0].changed, [LibraryChange::Stats]);
+        assert_eq!(
+            lists
+                .iter()
+                .map(|event| (event.view.as_str(), event.reorder))
+                .collect::<Vec<_>>(),
+            [("songs", false)]
+        );
+    }
+
+    #[test]
+    fn a_rebuild_of_history_is_a_change_of_plays_too_and_any_other_write_reorders_every_view() {
+        let (session, fanout) = watching();
+        fanout.changed(Committed {
+            revision: 9,
+            method: ritornel_contract::methods::HistoryRebuild::NAME,
+        });
+        let (library, lists) = told(&session);
+        assert_eq!(library[0].changed, [LibraryChange::Stats]);
+        assert_eq!(lists.len(), 1);
+        fanout.changed(Committed {
+            revision: 10,
+            method: "scan.step",
+        });
+        let (library, lists) = told(&session);
+        assert_eq!(library[0].changed, LibraryChange::ALL);
+        assert_eq!(
+            lists
+                .iter()
+                .map(|event| (event.view.as_str(), event.reorder))
+                .collect::<Vec<_>>(),
+            [("albums", true), ("songs", true)]
+        );
     }
 }
