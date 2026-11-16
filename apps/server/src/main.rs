@@ -1,0 +1,20 @@
+//! The `ritornel-server` binary. Everything it does is in the library next to
+//! it.
+//!
+//! `main` is not async, on purpose. The async runtime runs on threads of its
+//! own and the main thread only waits, so that on macOS it can later block
+//! in the platform run loop, which the media session needs
+//! (docs/design/server.md, "Workspace").
+
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let args = std::env::args_os().skip(1);
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
+    ExitCode::from(ritornel_server::run(
+        args,
+        &|name| std::env::var_os(name),
+        &mut out,
+        &mut err,
+    ))
+}

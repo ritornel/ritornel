@@ -1,0 +1,41 @@
+[package]
+name = "ritornel-client"
+description = "Rust client for the contract, plus find, start and stop of a local server."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ritornel-contract.workspace = true
+# Sending on a socket and reading from it: tokio-tungstenite's socket is a
+# futures sink and stream.
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
+# Collects the body of an HTTP response, with a limit on its size.
+http-body-util = "0.1.5"
+# The HTTP client behind `GET /v1/descriptor`. The server's listener is built
+# on it, so it adds nothing to the lock file.
+hyper = { version = "1.12.0", features = ["client", "http1"] }
+# Lets hyper read and write a Tokio stream.
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+# Not logged through here. It is named to put a ceiling on the `log` crate in
+# every program that links this client: tungstenite logs the whole WebSocket
+# upgrade request at TRACE, and that request carries the credential in its
+# `Authorization` header. With a static maximum of DEBUG the line is compiled
+# out, whatever logger and level the program sets. The release feature is set
+# too because, in a release build, a `release_max_level_*` feature turned on
+# by any other crate would otherwise decide alone. `tests/log_ceiling.rs`
+# fails if a TRACE line gets through.
+log = { version = "0.4.35", features = ["max_level_debug", "release_max_level_debug"] }
+# The bound on a type that is read from JSON.
+serde = "1.0.229"
+# The params and the result of a call, between the frame and their types.
+serde_json = "1.0.154"
+# The async runtime the client's connection runs on.
+tokio = { version = "1.54.1", features = ["macros", "net", "rt", "sync", "time"] }
+# The WebSocket client. It is the version the server's listener uses, so
+# there is one tungstenite in the build. No TLS: a route that needs it
+# arrives with pairing.
+tokio-tungstenite = "0.29.0"
+
+[lints]
+workspace = true

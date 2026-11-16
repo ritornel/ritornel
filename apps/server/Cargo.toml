@@ -1,0 +1,47 @@
+[package]
+name = "ritornel-server"
+description = "The server: config, lock, listener, and routing from contract calls to engine methods."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ritornel-contract.workspace = true
+ritornel-engine.workspace = true
+# The listener: HTTP routing and the WebSocket upgrade, over hyper and
+# tungstenite. Only what a loopback HTTP/1 listener needs is switched on.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
+# Serves each connection, so that the listener can bound how many it serves
+# and how long each may take to send a request. axum is built on both, so
+# neither adds to the lock file.
+hyper = { version = "1.12.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
+# Free disk space, for `server.status`. The standard library cannot ask
+# without unsafe code.
+rustix = { version = "1.1.6", features = ["fs"] }
+# Compares a presented credential with the server's own in constant time.
+# It is already in the lock file, under the engine's signing key.
+subtle = "2.6.1"
+# `config.toml` and `server.json` are read and written through it.
+serde = { version = "1.0.229", features = ["derive"] }
+# `server.json`, the text of each log line, and the bodies of the HTTP routes.
+serde_json = "1.0.154"
+# The async runtime the listener runs on. It also catches SIGINT and SIGTERM,
+# which the standard library cannot do without unsafe code.
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# `config.toml`.
+toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
+# What log lines are written through, here and in the libraries to come.
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The contract tests talk to a server through the client, as every program
+# does.
+ritornel-client.workspace = true
+# The contract tests that the client cannot make: a socket upgrade with no
+# credential, or with an `Origin`, and a message over the limit.
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
+tokio-tungstenite = "0.29.0"
+
+[lints]
+workspace = true

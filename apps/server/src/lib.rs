@@ -1,0 +1,56 @@
+//! `ritornel-server`: config, lock, listener, and routing from contract calls
+//! to engine methods. The binary is a thin `main` over this library, so
+//! contract tests can run a real listener inside the test process.
+//!
+//! A run takes a data directory and its lock ([`HeldDir`]), then starts a
+//! [`Server`]: it opens `server.db` through the engine, listens on loopback,
+//! says where it is in `server.json`, and answers the contract until it is
+//! asked to stop. See "Starting, finding and stopping" and "The data
+//! directory" in docs/design/server.md, and docs/design/contract.md.
+//!
+//! The dispatcher (`dispatch`) takes a decoded frame and a session and knows
+//! nothing of transports. The socket (`listener`) and the in-memory
+//! transport that tests use (`memory`) are thin codecs over it.
+
+// Tests may unwrap and index. Everything else is held to the workspace's
+// lints, which CI denies.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
+mod bounds;
+mod cli;
+mod config;
+mod credential;
+mod data_dir;
+mod disk;
+mod dispatch;
+mod error;
+mod listener;
+mod lock;
+mod logs;
+mod memory;
+mod serve;
+mod server;
+mod server_json;
+mod session;
+#[cfg(test)]
+mod testing;
+mod ticket;
+mod transport;
+
+pub use bounds::{Bounds, HEADER_WAIT, MAX_CONNECTIONS, MAX_SESSIONS, STOP_GRACE, TICKET_LIFE};
+pub use cli::run;
+pub use config::{ConfigError, Listen, Origin};
+pub use data_dir::HeldDir;
+pub use error::{EXIT_FAILED, EXIT_IN_USE, EXIT_USAGE, Error};
+/// How the program reads an environment variable. It is passed in, so that a
+/// test can say what the environment holds without changing its own.
+pub use ritornel_contract::local::Env;
+pub use server::Server;

@@ -1,0 +1,23 @@
+[package]
+name = "ritornel-engine"
+description = "Both stores, migrations, writers, jobs, outbox, scanner, playback and sync."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The public ID type: an ID is what a client sees, so the contract owns it.
+ritornel-contract.workspace = true
+ritornel-domain.workspace = true
+# The Ed25519 key pair that is half of a server's identity.
+ed25519-dalek = "3.0.0"
+# The operating system's random numbers, for IDs, keys and tokens.
+getrandom = "0.4.3"
+# Pinned exactly, because the SQLite it bundles is the one the server asserts
+# at startup. See decision 16 in docs/design/server.md.
+rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled"] }
+# SHA-256, for migration checksums and for the hash kept of a session token.
+sha2 = "0.11.1"
+
+[lints]
+workspace = true
