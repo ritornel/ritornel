@@ -8,14 +8,17 @@
 
 use std::io::Write;
 
-use ritornel_client::contract::methods::{HistoryOnThisDay, HistoryRebuild, HistoryRecent};
+use ritornel_client::contract::methods::{
+    HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones, HistoryZones,
+};
 use ritornel_client::contract::{
-    HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams, OnThisDay, OnThisDayParams, Play,
-    PlayOutcome, RecentPlays,
+    HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams, NoParams, OnThisDay,
+    OnThisDayParams, Play, PlayOutcome, RecentPlays, SetZonesParams, ZonePeriod, ZonePeriods,
+    ZonesSet,
 };
 use ritornel_client::local;
 
-use crate::cli::{Error, HistoryArgs, HistoryCommand};
+use crate::cli::{Error, HistoryArgs, HistoryCommand, ServerArgs, ZoneCommand};
 use crate::playback::clock;
 use crate::server;
 
@@ -54,13 +57,16 @@ fn render_play(play: &Play) -> String {
     } else {
         "-"
     };
+    // A play another service reported says only that it was played.
+    let heard = match play.ms_played {
+        Some(ms) => format!("{:>5} of {:<5}", clock(ms), length),
+        None => format!("{:<14}", "scrobbled"),
+    };
     let mut text = format!(
-        "{}  {:<8} {:<8} {:>5} of {:<5}  {what}\n",
+        "{}  {:<8} {:<8} {heard}  {what}\n",
         when(play),
         outcome,
         counts,
-        clock(play.ms_played),
-        length
     );
     if play.listens.len() > 1 {
         for listen in &play.listens {
@@ -122,6 +128,56 @@ fn render_rebuilt(rebuilt: &HistoryRebuilt) -> String {
     )
 }
 
+fn render_zones(zones: &ZonePeriods) -> String {
+    if zones.periods.is_empty() {
+        return "No zones: a play whose source gave no zone has no local date.\n".to_owned();
+    }
+    zones
+        .periods
+        .iter()
+        .map(|period| {
+            format!(
+                "{:<12} {:<12} {}\n",
+                period.from.as_deref().unwrap_or("always"),
+                period.until.as_deref().unwrap_or("on"),
+                period.zone
+            )
+        })
+        .collect()
+}
+
+/// Makes `periods` the zones, and prints them as they now are.
+fn set_zones(
+    args: &ServerArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+    change: impl FnOnce(Vec<ZonePeriod>) -> Vec<ZonePeriod>,
+) -> Result<(), Error> {
+    let (set, zones) = server::ask(args, env, async |client| {
+        let now = client.call::<HistoryZones>(&NoParams {}).await?;
+        let set = client
+            .call::<HistorySetZones>(&SetZonesParams {
+                idempotency_key: ritornel_client::idempotency_key()?,
+                periods: change(now.periods),
+            })
+            .await?;
+        Ok((set, client.call::<HistoryZones>(&NoParams {}).await?))
+    })?;
+    server::print(
+        args,
+        out,
+        &(set, zones),
+        |(set, _)| serde_json::to_string_pretty(set),
+        |(set, zones): &(ZonesSet, ZonePeriods)| {
+            format!(
+                "{}{} plays dated again.\n",
+                render_zones(zones),
+                set.changed
+            )
+        },
+    )
+}
+
 pub(crate) fn history(
     args: &HistoryArgs,
     env: local::Env<'_>,
@@ -158,6 +214,32 @@ pub(crate) fn history(
                 serde_json::to_string_pretty,
                 render_day,
             )
+        }
+        Some(HistoryCommand::Zones(zones)) => {
+            let found = server::ask(zones, env, async |client| {
+                client.call::<HistoryZones>(&NoParams {}).await
+            })?;
+            server::print(
+                zones,
+                out,
+                &found,
+                serde_json::to_string_pretty,
+                render_zones,
+            )
+        }
+        Some(HistoryCommand::Zone(ZoneCommand::Add(add))) => {
+            let period = ZonePeriod {
+                zone: add.zone.clone(),
+                from: add.from.clone(),
+                until: add.until.clone(),
+            };
+            set_zones(&add.server, env, out, |mut periods| {
+                periods.push(period);
+                periods
+            })
+        }
+        Some(HistoryCommand::Zone(ZoneCommand::Clear(clear))) => {
+            set_zones(clear, env, out, |_| Vec::new())
         }
         Some(HistoryCommand::Rebuild(rebuild)) => {
             let dry_run = rebuild.dry_run;

@@ -97,6 +97,16 @@ export const METHODS = {
   "history.recent": { kind: "query", needsFull: false },
   "history.onThisDay": { kind: "query", needsFull: false },
   "history.rebuild": { kind: "command", needsFull: true },
+  "history.zones": { kind: "query", needsFull: false },
+  "history.setZones": { kind: "command", needsFull: true },
+  "tracks.get": { kind: "query", needsFull: false },
+  "lastfm.status": { kind: "query", needsFull: true },
+  "lastfm.signInStart": { kind: "session", needsFull: true },
+  "lastfm.signInFinish": { kind: "command", needsFull: true },
+  "lastfm.signOut": { kind: "command", needsFull: true },
+  "lastfm.sync": { kind: "command", needsFull: true },
+  "lastfm.setScrobbling": { kind: "command", needsFull: true },
+  "lastfm.report": { kind: "query", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -139,6 +149,16 @@ export type MethodMap = {
   "history.recent": { params: HistoryRecentParams; result: RecentPlays };
   "history.onThisDay": { params: OnThisDayParams; result: OnThisDay };
   "history.rebuild": { params: HistoryRebuildParams; result: HistoryRebuilt };
+  "history.zones": { params: NoParams; result: ZonePeriods };
+  "history.setZones": { params: SetZonesParams; result: ZonesSet };
+  "tracks.get": { params: TrackGetParams; result: TrackDetail };
+  "lastfm.status": { params: NoParams; result: LastfmStatus };
+  "lastfm.signInStart": { params: NoParams; result: SignInStarted };
+  "lastfm.signInFinish": { params: SignInFinishParams; result: SignInFinished };
+  "lastfm.signOut": { params: KeyParams; result: SignedOut };
+  "lastfm.sync": { params: LastfmSyncParams; result: LastfmSyncStarted };
+  "lastfm.setScrobbling": { params: ScrobblingParams; result: ScrobblingSet };
+  "lastfm.report": { params: LastfmReportParams; result: LastfmReport };
 };
 
 /** The name of a method. */
@@ -593,6 +613,20 @@ export type Credit = {
 };
 
 /**
+ * How many scrobbles are in one state.
+ */
+export type DeliveryCount = {
+  /**
+   * The state.
+   */
+  state: string,
+  /**
+   * How many.
+   */
+  count: number,
+};
+
+/**
  * The descriptor: the result of `server.hello`. It is the public
  * descriptor, and what the server says to this session alone.
  */
@@ -639,6 +673,39 @@ export type Descriptor = {
    * that serves no covers.
    */
   artSizes: Array<number>,
+};
+
+/**
+ * A scrobbled track the matcher was not sure of.
+ */
+export type DoubtfulTrack = {
+  /**
+   * The artist, as Last.fm spells it.
+   */
+  artist: string,
+  /**
+   * The album.
+   */
+  album?: string,
+  /**
+   * The title.
+   */
+  title: string,
+  /**
+   * How often it was played.
+   */
+  plays: number,
+  /**
+   * Why it was not bound: `several`, when the artist and title name
+   * several recordings the album cannot tell apart, or `near`, when
+   * nothing matches exactly but something does without accents and
+   * bracketed notes.
+   */
+  doubt: string,
+  /**
+   * What it nearly matched.
+   */
+  candidates: Array<NearlyMatched>,
 };
 
 /**
@@ -1074,6 +1141,11 @@ export type Job = {
    * What a scan has found so far, and at its end what came out.
    */
   scan?: ScanSummary,
+  /**
+   * What a sync of an account's history has read so far, and at its end
+   * what came out.
+   */
+  sync?: SyncSummary,
 };
 
 /**
@@ -1164,6 +1236,10 @@ export type JobTarget = { "type": "source",
   /**
    * The source's ID.
    */
+  id: string, } | { "type": "account",
+  /**
+   * The account's ID.
+   */
   id: string,
 };
 
@@ -1188,6 +1264,178 @@ export type JobsList = {
 };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
+
+/**
+ * The params of a command that takes nothing but its key.
+ */
+export type KeyParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+};
+
+/**
+ * The result of `lastfm.report`: how much of the imported history matched
+ * the library.
+ */
+export type LastfmReport = {
+  /**
+   * The account.
+   */
+  account: string,
+  /**
+   * Scrobbles imported.
+   */
+  imported: number,
+  /**
+   * Plays they make, the echoes of plays scrobbled from here not
+   * counted.
+   */
+  plays: number,
+  /**
+   * Of those, the ones bound to a recording.
+   */
+  matchedPlays: number,
+  /**
+   * Scrobbles that are echoes of plays scrobbled from here.
+   */
+  echoes: number,
+  /**
+   * Distinct tracks the history names.
+   */
+  tracks: number,
+  /**
+   * Of those, the ones bound.
+   */
+  matchedTracks: number,
+  /**
+   * Tracks the matcher was not sure of.
+   */
+  doubtfulTracks: number,
+  /**
+   * Their plays.
+   */
+  doubtfulPlays: number,
+  /**
+   * Tracks nothing in the library comes close to.
+   */
+  absentTracks: number,
+  /**
+   * Their plays.
+   */
+  absentPlays: number,
+  /**
+   * The doubtful tracks, most played first.
+   */
+  doubtful: Array<DoubtfulTrack>,
+  /**
+   * Tracks loved now.
+   */
+  loved: number,
+  /**
+   * Of those, the ones bound.
+   */
+  lovedMatched: number,
+  /**
+   * The first and the last play imported.
+   */
+  first?: number,
+  /**
+   * See `first`.
+   */
+  last?: number,
+};
+
+/**
+ * The params of `lastfm.report`.
+ */
+export type LastfmReportParams = {
+  /**
+   * How many doubtful tracks to list, at most 1000. The default is 50.
+   */
+  limit?: number,
+};
+
+/**
+ * The result of `lastfm.status`.
+ */
+export type LastfmStatus = {
+  /**
+   * Whether this server was built with Last.fm.
+   */
+  available: boolean,
+  /**
+   * Whether it has an API key and secret, from its environment or its
+   * data directory. The values are never sent.
+   */
+  configured: boolean,
+  /**
+   * The account it is signed in to.
+   */
+  account?: string,
+  /**
+   * Last.fm refused the session: sign in again.
+   */
+  signInAgain: boolean,
+  /**
+   * Plays from this time on are scrobbled. Left out while scrobbling is
+   * off.
+   */
+  scrobblingSince?: number,
+  /**
+   * Scrobbles recorded, by state: `pending`, `sending`, `accepted`,
+   * `ignored`, `refused` or `unknown`.
+   */
+  deliveries: Array<DeliveryCount>,
+  /**
+   * Plays imported from the account.
+   */
+  imported: number,
+  /**
+   * Whether the listener has a zone for any date, without which an
+   * imported play has no local date. A sync is refused until they have.
+   */
+  zonesSet: boolean,
+};
+
+/**
+ * The params of `lastfm.sync`.
+ */
+export type LastfmSyncParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * Read the whole history again rather than what is new. What is
+   * stored already writes nothing.
+   */
+  full: boolean,
+};
+
+/**
+ * The result of `lastfm.sync`.
+ */
+export type LastfmSyncStarted = {
+  /**
+   * The job that syncs. A sync that is running already is returned.
+   */
+  job: Job,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
 
 /**
  * What kind of change a library write made, for a client deciding what to
@@ -1622,6 +1870,20 @@ export type Nearest = {
 };
 
 /**
+ * A track a doubtful scrobble nearly matched.
+ */
+export type NearlyMatched = {
+  /**
+   * Its title.
+   */
+  title?: string,
+  /**
+   * Its artist credit.
+   */
+  artist?: string,
+};
+
+/**
  * The params of a method that takes none: an empty object, which may also
  * be left out of the frame.
  */
@@ -1737,7 +1999,7 @@ export type Play = {
   utcOffsetMinutes?: number,
   /**
    * Which clock its time rests on: `hub_age` or `server_wall` for a
-   * listen.
+   * listen, `source_utc` for a play another service reported.
    */
   clockBasis: string,
   /**
@@ -1745,9 +2007,10 @@ export type Play = {
    */
   track: PlayedTrack,
   /**
-   * Audio rendered, over every listen of it.
+   * Audio rendered, over every listen of it. Left out for a play
+   * another service reported, whose played time is not known.
    */
-  msPlayed: number,
+  msPlayed?: number,
   /**
    * The track's length.
    */
@@ -2655,6 +2918,43 @@ export type ScanSummary = {
 };
 
 /**
+ * The params of `lastfm.setScrobbling`.
+ */
+export type ScrobblingParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * On, for plays from now on, or off.
+   */
+  on: boolean,
+};
+
+/**
+ * The result of `lastfm.setScrobbling`.
+ */
+export type ScrobblingSet = {
+  /**
+   * Plays from this time on are scrobbled. Left out when it is off.
+   */
+  scrobblingSince?: number,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
  * Where one section of a view begins.
  */
 export type Section = {
@@ -2780,10 +3080,99 @@ export type ServersList = {
 export type SessionKind = "full" | "limited";
 
 /**
+ * The params of `history.setZones`.
+ */
+export type SetZonesParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * Every period, in place of what there was.
+   */
+  periods: Array<ZonePeriod>,
+};
+
+/**
  * The kinds of record an artist's discography is filed under, in the
  * order it files them. See [`SortKey::Discography`].
  */
 export type Shelf = "albums" | "singles" | "live" | "collections" | "appears_on";
+
+/**
+ * The params of `lastfm.signInFinish`.
+ */
+export type SignInFinishParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The sign-in `lastfm.signInStart` began.
+   */
+  signIn: string,
+};
+
+/**
+ * The result of `lastfm.signInFinish`.
+ */
+export type SignInFinished = {
+  /**
+   * The account signed in to, once approved.
+   */
+  account?: string,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * The result of `lastfm.signInStart`: where to approve the sign-in.
+ */
+export type SignInStarted = {
+  /**
+   * The sign-in, for `lastfm.signInFinish`.
+   */
+  signIn: string,
+  /**
+   * The address at Last.fm where the listener approves it. It carries
+   * the API key and a one-hour token, as Last.fm's desktop flow has it.
+   */
+  approvalUrl: string,
+};
+
+/**
+ * The result of `lastfm.signOut`.
+ */
+export type SignedOut = {
+  /**
+   * Whether there was a session to forget.
+   */
+  wasSignedIn: boolean,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
 
 /**
  * Which way a skip goes.
@@ -3003,6 +3392,41 @@ export type Subscriptions = {
 };
 
 /**
+ * What a sync of an account's history read and stored.
+ */
+export type SyncSummary = {
+  /**
+   * Scrobbles read.
+   */
+  read: number,
+  /**
+   * Of those, the ones that were new.
+   */
+  new: number,
+  /**
+   * Scrobbles stored before that Last.fm no longer lists. They stay.
+   */
+  gone: number,
+  /**
+   * How many scrobbles Last.fm counts in the account's whole history.
+   */
+  sourceTotal?: number,
+  /**
+   * How many this library holds, once the sync has ended.
+   */
+  stored?: number,
+  /**
+   * Tracks loved now.
+   */
+  loved?: number,
+  /**
+   * Tracks bound to the library at the end, which the library did not
+   * have when they were first seen.
+   */
+  matchedAfter: number,
+};
+
+/**
  * What a client can subscribe to.
  */
 export type Topic = "servers" | "jobs" | "library" | "list" | "playback" | "progress" | "queue";
@@ -3051,6 +3475,68 @@ export type TrackCopy = {
    * The bit rate, for a lossy format.
    */
   bitrateKbps: number | null,
+};
+
+/**
+ * The result of `tracks.get`: one track, its plays and its loves.
+ */
+export type TrackDetail = {
+  /**
+   * The track.
+   */
+  trackId: string,
+  /**
+   * Its recording.
+   */
+  recordingId: string,
+  /**
+   * The title.
+   */
+  title?: string,
+  /**
+   * The artist credit.
+   */
+  artist?: string,
+  /**
+   * The album.
+   */
+  album?: string,
+  /**
+   * Plays of its recording that count, from every source.
+   */
+  plays: number,
+  /**
+   * The last of them.
+   */
+  lastPlayed?: number,
+  /**
+   * The loves in force.
+   */
+  loves: Array<TrackLove>,
+};
+
+/**
+ * The params of `tracks.get`.
+ */
+export type TrackGetParams = {
+  /**
+   * The track.
+   */
+  trackId: string,
+};
+
+/**
+ * A love that reaches a track.
+ */
+export type TrackLove = {
+  /**
+   * Who said it: a service and account, as `lastfm:name`, or `you`.
+   */
+  by: string,
+  /**
+   * When.
+   */
+  at: number,
 };
 
 /**
@@ -3145,4 +3631,58 @@ export type Window = {
    * How many rows, at most the descriptor's `maxWindowRows`.
    */
   limit: number,
+};
+
+/**
+ * One stretch of time the listener spent in one zone.
+ */
+export type ZonePeriod = {
+  /**
+   * The zone, by its IANA name, such as `Europe/London`.
+   */
+  zone: string,
+  /**
+   * The first day, as `YYYY-MM-DD` in that zone. Left out for every day
+   * before.
+   */
+  from?: string,
+  /**
+   * The day after the last, as `YYYY-MM-DD` in that zone. Left out for
+   * every day after.
+   */
+  until?: string,
+};
+
+/**
+ * The result of `history.zones`. Where periods overlap, the one that
+ * began last holds.
+ */
+export type ZonePeriods = {
+  /**
+   * The periods.
+   */
+  periods: Array<ZonePeriod>,
+};
+
+/**
+ * The result of `history.setZones`.
+ */
+export type ZonesSet = {
+  /**
+   * Plays whose date or zone changed.
+   */
+  changed: number,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
 };

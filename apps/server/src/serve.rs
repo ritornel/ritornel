@@ -72,6 +72,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         boot_id: Some(boot_id),
         scan: test_hooks(env),
         playback: playback(args.output.as_deref(), env),
+        lastfm: lastfm(env),
     };
     let run = run(held, args, settings, clock, entropy, jobs, out);
     match &run {
@@ -188,6 +189,43 @@ fn playback(output: Option<&str>, env: Env<'_>) -> PlaybackRun {
         output,
         fail_at_position_ms: number("RITORNEL_TEST_FAIL_AT_POSITION_MS"),
         fail_after_ingest: env("RITORNEL_TEST_FAIL_AFTER_INGEST").is_some(),
+    }
+}
+
+/// How this run reaches Last.fm. The API key and secret are read from the
+/// environment, as `scrobl`'s own tool reads its key, and failing that from
+/// a file in the data directory. Four more variables are for the tests
+/// alone: none is a setting, and none is in the help.
+///
+/// - `RITORNEL_TEST_LASTFM_URL`: a loopback address to send every request
+///   to, with no pause between them. `scrobl` refuses any other.
+/// - `RITORNEL_TEST_LASTFM_CHUNK` and `RITORNEL_TEST_LASTFM_PAGE`: the most
+///   scrobbles to a span, and rows to a page, so that a small history is
+///   read in several batches.
+/// - `RITORNEL_TEST_FAIL_AFTER_IMPORT_BATCH`: the server aborts straight
+///   after the library commits that many batches of a sync, as a crash
+///   there would.
+fn lastfm(env: Env<'_>) -> crate::LastfmRun {
+    let text = |name: &str| env(name).and_then(|value| value.into_string().ok());
+    let number = |name: &str| text(name).and_then(|value| value.parse::<u64>().ok());
+    crate::LastfmRun {
+        #[cfg(feature = "lastfm")]
+        credentials: match (
+            text(ritornel_lastfm::KEY_VARIABLE),
+            text(ritornel_lastfm::SECRET_VARIABLE),
+        ) {
+            (Some(key), Some(secret)) if !key.trim().is_empty() && !secret.trim().is_empty() => {
+                Some(ritornel_lastfm::ApiCredentials::new(
+                    key.trim(),
+                    secret.trim(),
+                ))
+            }
+            _ => None,
+        },
+        base_url: text("RITORNEL_TEST_LASTFM_URL"),
+        chunk: number("RITORNEL_TEST_LASTFM_CHUNK"),
+        page_size: number("RITORNEL_TEST_LASTFM_PAGE").and_then(|page| u32::try_from(page).ok()),
+        fail_after_batch: number("RITORNEL_TEST_FAIL_AFTER_IMPORT_BATCH"),
     }
 }
 

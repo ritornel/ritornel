@@ -355,7 +355,7 @@ fn a_listen_of_40_percent_is_stored_and_does_not_count_and_one_of_60_percent_cou
     let plays = at.library.recent_plays(at.listener, 10, None).unwrap();
     let judged: Vec<(i64, bool, &str)> = plays
         .iter()
-        .map(|play| (play.ms_played, play.counts, play.outcome.as_str()))
+        .map(|play| (play.ms_played.unwrap(), play.counts, play.outcome.as_str()))
         .collect();
     assert_eq!(
         judged,
@@ -764,7 +764,7 @@ fn a_library_saved_with_listens_is_taken_forward_with_its_listens_and_plays() {
     let library = LibraryStore::open(&path, server.server_id, clock.clone(), entropy).unwrap();
     assert_eq!(
         (library.migrations_applied(), library.schema_version()),
-        (1, 3)
+        (2, 4)
     );
 
     library
@@ -935,4 +935,457 @@ fn recent_history_pages_through_plays_that_share_an_instant() {
     }
     let ids = |plays: &[crate::PlayRow]| plays.iter().map(|play| play.play_id).collect::<Vec<_>>();
     assert_eq!(ids(&paged), ids(&all));
+}
+
+/// A `library.db` as the third migration left it: the library of
+/// [`SAVED_LIBRARY_0002`] taken forward one migration.
+const SAVED_LIBRARY_0003: &str = include_str!("../../saved/library/0003.sql");
+
+#[test]
+fn the_saved_library_at_the_third_migration_is_one_the_first_three_made() {
+    let saved = Connection::open_in_memory().unwrap();
+    saved.execute_batch(SAVED_LIBRARY_0003).unwrap();
+    let mut made = Connection::open_in_memory().unwrap();
+    crate::migrate::run(
+        &mut made,
+        crate::migrate::LIBRARY.get(..3).unwrap(),
+        &FixedClock::at(T0),
+    )
+    .unwrap();
+    assert_eq!(schema_of(&saved), schema_of(&made));
+}
+
+#[test]
+fn a_library_saved_at_the_third_migration_keeps_its_decisions_and_plays_through_the_fourth() {
+    let scratch = crate::testing::Scratch::new();
+    let path = scratch.path().join("library.db");
+    let saved = Connection::open(&path).unwrap();
+    saved.execute_batch(SAVED_LIBRARY_0003).unwrap();
+    let rows = |connection: &Connection, sql: &str| -> Vec<String> {
+        connection
+            .prepare(sql)
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    const DECISIONS: &str =
+        "SELECT id || '|' || action || '|' || ifnull(source_item_id, '') || '|' ||
+                method || '|' || evidence_json || '|' || rev FROM identity_decision ORDER BY id";
+    const ASSIGNED: &str = "SELECT id || '|' || decision_id FROM assignment ORDER BY id";
+    let decisions = rows(&saved, DECISIONS);
+    let assigned = rows(&saved, ASSIGNED);
+    assert_eq!((decisions.len(), assigned.len()), (4, 4));
+    let derived_before = derived(&saved).unwrap();
+    drop(saved);
+
+    let clock = Arc::new(FixedClock::at(T0));
+    let entropy = Arc::new(CountingEntropy::default());
+    let servers = ServerStore::open_in_memory(clock.clone(), entropy.clone()).unwrap();
+    let (server, _) = servers.ensure_identity("desk").unwrap();
+    let library = LibraryStore::open(&path, server.server_id, clock.clone(), entropy).unwrap();
+    assert_eq!(
+        (library.migrations_applied(), library.schema_version()),
+        (1, 4)
+    );
+    library
+        .read(|connection| {
+            assert_eq!(rows(connection, DECISIONS), decisions);
+            assert_eq!(rows(connection, ASSIGNED), assigned);
+            assert_eq!(derived(connection)?, derived_before);
+            // The rebuilt table keeps its triggers, and what points at it
+            // points at it.
+            let dangling: i64 = connection.query_row(
+                "SELECT count(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(dangling, 0);
+            let refused = connection.execute("DELETE FROM identity_decision", []);
+            assert!(refused.is_err());
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A Last.fm account on the rig's library, and an import of one scrobble of
+/// it.
+fn scrobble_of(at: &Library, account: Id, at_s: i64, artist: &str, title: &str) {
+    let mut key = b"echo".to_vec();
+    key.extend_from_slice(&at_s.to_be_bytes());
+    let batch = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: key,
+            played_at_ms: at_s * 1000,
+            track: ritornel_source::TrackText {
+                artist: artist.to_owned(),
+                album: Some("Tin Weather".to_owned()),
+                title: title.to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: at_s * 1000,
+            to_ms: at_s * 1000 + 1000,
+        },
+        cursor: "{}".to_owned(),
+    };
+    at.library
+        .ingest(Observations::Imports {
+            account,
+            batch: &batch,
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_counted_listen_is_recorded_before_it_is_sent_once_and_its_echo_joins_its_play() {
+    use crate::Settled;
+
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 + 10 * MINUTE;
+    // A 60% play counts; a 40% skip does not; a play from before scrobbling
+    // was turned on is not sent.
+    let counted = at.listen(1, 0, start, 144_000);
+    let skipped = at.listen(2, 1, start + 5 * MINUTE, 120_000);
+    let before = at.listen(3, 0, start - 5 * MINUTE, 200_000);
+    for listen in [&counted, &skipped, &before] {
+        at.send(listen, PlayRule::V1);
+    }
+    let from = start - MINUTE;
+    assert_eq!(at.library.plan_deliveries(account, from).unwrap(), 1);
+    let revision = at.library.meta().unwrap().revision;
+    assert_eq!(at.library.plan_deliveries(account, from).unwrap(), 0);
+    assert_eq!(at.library.meta().unwrap().revision, revision);
+
+    let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
+    assert_eq!(due.len(), 1);
+    let sent = &due[0];
+    assert_eq!(
+        (
+            sent.artist.as_str(),
+            sent.title.as_str(),
+            sent.album.as_deref()
+        ),
+        ("Moss Arcade", "Paper Kites", Some("Tin Weather"))
+    );
+    assert_eq!(sent.timestamp_s, start / 1000);
+    assert_eq!(sent.duration_ms, Some(240_000));
+    // Taken once, it is not taken again.
+    assert!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    at.library
+        .settle_deliveries(vec![(
+            sent.delivery,
+            Settled::Accepted {
+                artist: "Moss Arcade".to_owned(),
+                title: "Paper Kites".to_owned(),
+            },
+        )])
+        .unwrap();
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [("accepted".to_owned(), 1)]
+    );
+
+    // The echo comes back through the import, as Last.fm spells it.
+    let plays_before = at.count("SELECT count(*) FROM play_event");
+    scrobble_of(&at, account, start / 1000, "moss arcade", "Paper Kites");
+    assert_eq!(at.count("SELECT count(*) FROM play_event"), plays_before);
+    assert_eq!(
+        at.count(
+            "SELECT count(*) FROM play_event_observation WHERE role = 'corroborating'
+             AND observation_id IN (SELECT id FROM history_observation WHERE kind = 'import')"
+        ),
+        1
+    );
+    // A play with the account's own observation is never sent there again.
+    assert_eq!(at.library.plan_deliveries(account, from).unwrap(), 0);
+    // A scrobble of the same second naming another track is not the echo.
+    scrobble_of(&at, account, start / 1000 + 1, "Moss Arcade", "Lanternfish");
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event"),
+        plays_before + 1
+    );
+
+    let incremental = at.library.derived_history().unwrap();
+    at.rebuild(PlayRule::V1, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn a_delivery_a_run_left_sending_is_unknown_and_never_sent_again() {
+    use crate::Settled;
+
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 + 10 * MINUTE;
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    at.send(&at.listen(2, 1, start + 5 * MINUTE, 300_000), PlayRule::V1);
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 2);
+    let due = at.library.take_due_deliveries(account, 0, 1).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(at.library.abandon_sending().unwrap(), 1);
+    // The other is sent, refused for now, and due again later.
+    let later = at.library.take_due_deliveries(account, 0, 50).unwrap();
+    assert_eq!(later.len(), 1);
+    at.library
+        .settle_deliveries(vec![(
+            later[0].delivery,
+            Settled::Later {
+                detail: "offline".to_owned(),
+                at_ms: start + 60 * MINUTE,
+            },
+        )])
+        .unwrap();
+    assert!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    at.clock.set(start + 61 * MINUTE);
+    assert_eq!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [("sending".to_owned(), 1), ("unknown".to_owned(), 1)]
+    );
+    // A play older than the service takes is not eligible.
+    at.clock.set(start + crate::SEND_WITHIN_MS + 30 * MINUTE);
+    at.send(&at.listen(3, 2, start + 30 * MINUTE, 25_000), PlayRule::V1);
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 0);
+}
+
+/// Excludes the play of the listen with this key, as the correction call
+/// will, and derives again.
+fn exclude_listen(at: &Library, key: Id) {
+    let server = at.server.server_id;
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.exclude",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let connection = write.connection();
+                connection.execute(
+                    "INSERT INTO history_observation
+                       (endpoint_id, source_key, kind, listener_id, captured_at_utc_ms,
+                        received_at_utc_ms, zone_basis, payload_json, rev)
+                     VALUES ((SELECT id FROM history_endpoint WHERE kind = 'manual'), ?2,
+                             'correction', 1, 0, 0, 'none', '{}', ?1)",
+                    (write.rev(), key.as_bytes()),
+                )?;
+                let correction = connection.last_insert_rowid();
+                connection.execute(
+                    "INSERT INTO observation_correction (observation_id, verb, rev)
+                     VALUES (?1, 'exclude', ?2)",
+                    (correction, write.rev()),
+                )?;
+                connection.execute(
+                    "INSERT INTO correction_target (correction_id, target_observation_id, rev)
+                     SELECT ?1, o.id, ?3 FROM history_observation o
+                     JOIN history_endpoint e ON e.id = o.endpoint_id
+                     JOIN server s ON s.id = e.server_id
+                     WHERE s.public_id = ?2 AND o.source_key = ?4",
+                    (correction, server.as_bytes(), write.rev(), key.as_bytes()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    at.rebuild(PlayRule::V1, false);
+}
+
+#[test]
+fn a_queued_play_that_is_no_longer_eligible_is_withdrawn_and_never_sent() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 + 10 * MINUTE;
+    let excluded = at.listen(1, 0, start, 200_000);
+    let aged = at.listen(2, 1, start + 5 * MINUTE, 300_000);
+    for listen in [&excluded, &aged] {
+        at.send(listen, PlayRule::V1);
+    }
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 2);
+    // Excluded after it was queued: it is not sent.
+    exclude_listen(&at, excluded.listen_id);
+    let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
+    assert_eq!(
+        due.iter().map(|due| due.title.as_str()).collect::<Vec<_>>(),
+        ["Lanternfish"]
+    );
+    assert_eq!(
+        at.count("SELECT count(*) FROM history_delivery WHERE state = 'withdrawn'"),
+        1
+    );
+    // Too old by the time it is due: not sent.
+    at.library
+        .settle_deliveries(vec![(
+            due[0].delivery,
+            crate::Settled::Later {
+                detail: "offline".to_owned(),
+                at_ms: start + 30 * 24 * 60 * MINUTE,
+            },
+        )])
+        .unwrap();
+    at.clock.set(start + 30 * 24 * 60 * MINUTE);
+    assert!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        at.count("SELECT count(*) FROM history_delivery WHERE state = 'withdrawn'"),
+        2
+    );
+    assert_eq!(
+        at.count("SELECT count(*) FROM history_delivery WHERE state = 'sending'"),
+        0
+    );
+}
+
+#[test]
+fn a_queued_play_from_before_scrobbling_was_turned_on_again_is_withdrawn() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 + 10 * MINUTE;
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
+    // Scrobbling turned off and on again after the play: from then on.
+    let cutoff = start + 20 * MINUTE;
+    assert!(
+        at.library
+            .take_due_deliveries(account, cutoff, 50)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        at.count("SELECT count(*) FROM history_delivery WHERE state = 'withdrawn'"),
+        1
+    );
+}
+
+#[test]
+fn an_echo_imported_while_its_scrobble_was_sending_joins_its_play_once_the_answer_is_recorded() {
+    use crate::Settled;
+
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 + 10 * MINUTE;
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    at.library.plan_deliveries(account, 0).unwrap();
+    let [sent] = at
+        .library
+        .take_due_deliveries(account, 0, 50)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    // Last.fm takes it under a corrected title, and a sync running at the
+    // same time brings that echo back before the answer is recorded.
+    scrobble_of(
+        &at,
+        account,
+        start / 1000,
+        "Moss Arcade",
+        "Paper Kites (Remastered)",
+    );
+    assert_eq!(at.count("SELECT count(*) FROM play_event"), 2);
+    at.library
+        .settle_deliveries(vec![(
+            sent.delivery,
+            Settled::Accepted {
+                artist: "Moss Arcade".to_owned(),
+                title: "Paper Kites (Remastered)".to_owned(),
+            },
+        )])
+        .unwrap();
+    // The answer names the echo: it joins the play, and counts once.
+    assert_eq!(at.count("SELECT count(*) FROM play_event"), 1);
+    let incremental = at.library.derived_history().unwrap();
+    at.rebuild(PlayRule::V1, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn a_play_another_scrobbler_already_sent_to_the_account_is_not_sent_again() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 + 10 * MINUTE;
+    let first = at.listen(1, 0, start, 200_000);
+    let second = at.listen(2, 1, start + 10 * MINUTE, 300_000);
+    at.send(&first, PlayRule::V1);
+    // Another player scrobbled the first play itself, a second later.
+    scrobble_of(&at, account, start / 1000 + 1, "moss arcade", "PAPER KITES");
+    // Before it is queued: it is not.
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 0);
+    // After it is queued: it is not sent.
+    at.send(&second, PlayRule::V1);
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
+    scrobble_of(
+        &at,
+        account,
+        (start + 10 * MINUTE) / 1000,
+        "Moss Arcade",
+        "Lanternfish",
+    );
+    assert!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        at.count(
+            "SELECT count(*) FROM history_delivery WHERE state = 'withdrawn'
+             AND detail LIKE '%already%'"
+        ),
+        2
+    );
+    // A play of another track in the same second is not that play.
+    let third = at.listen(3, 2, start + 30 * MINUTE, 25_000);
+    let fourth = at.listen(4, 0, start + 40 * MINUTE, 200_000);
+    at.send(&third, PlayRule::V1);
+    at.send(&fourth, PlayRule::V1);
+    scrobble_of(
+        &at,
+        account,
+        (start + 40 * MINUTE) / 1000,
+        "Moss Arcade",
+        "Salt Road",
+    );
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
 }

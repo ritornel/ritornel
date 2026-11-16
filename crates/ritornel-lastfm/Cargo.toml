@@ -1,0 +1,29 @@
+[package]
+name = "ritornel-lastfm"
+description = "Last.fm as a history source and a place plays are scrobbled to, on the scrobl crate."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# A fake Last.fm on a loopback socket, for the tests of this crate and of
+# the server. Nothing else turns it on.
+fake = []
+
+[dependencies]
+ritornel-source.workspace = true
+# Signs in, reads a history page by page with every page checked, reads
+# the loved tracks, and scrobbles. Its client keeps credentials out of
+# every error and `Debug`.
+scrobl.workspace = true
+# The source key of a scrobble is its time and a hash of what it names.
+# The engine already builds this version.
+sha2 = "0.11.1"
+# A scrobble's row is stored as the JSON it came as.
+serde_json = "1.0.154"
+# scrobl's client is async. This crate runs it on a runtime of its own, so
+# that its callers, a job's thread and the dispatcher, stay synchronous.
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

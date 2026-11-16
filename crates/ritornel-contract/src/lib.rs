@@ -44,6 +44,7 @@ mod frame;
 mod history;
 mod id;
 mod identity;
+mod lastfm;
 mod library;
 mod list;
 pub mod local;
@@ -71,6 +72,12 @@ pub use id::{Id, NotAnId};
 pub use identity::{
     Binding, DryRun, DryRunParams, FileFacts, ItemChange, ItemOutcome, Nearest, Penalties,
     PolicyOverrides, PolicyValues, Review, ReviewCause, ReviewList,
+};
+pub use lastfm::{
+    DeliveryCount, DoubtfulTrack, KeyParams, LastfmReport, LastfmReportParams, LastfmStatus,
+    LastfmSyncParams, LastfmSyncStarted, NearlyMatched, ScrobblingParams, ScrobblingSet,
+    SetZonesParams, SignInFinishParams, SignInFinished, SignInStarted, SignedOut, SyncSummary,
+    TrackDetail, TrackGetParams, TrackLove, ZonePeriod, ZonePeriods, ZonesSet,
 };
 pub use library::{
     Count, Job, JobCancelParams, JobCancelled, JobDetail, JobGetParams, JobItem, JobState,

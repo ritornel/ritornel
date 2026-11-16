@@ -1,0 +1,13 @@
+[package]
+name = "ritornel-source"
+description = "The traits a plugin implements: a history source, and later a metadata source."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Nothing: a plugin and the engine both build on this, so it depends on
+# neither, and on no crate of theirs.
+[dependencies]
+
+[lints]
+workspace = true

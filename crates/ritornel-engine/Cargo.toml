@@ -9,6 +9,8 @@ publish.workspace = true
 # The public ID type: an ID is what a client sees, so the contract owns it.
 ritornel-contract.workspace = true
 ritornel-domain.workspace = true
+# What a history source hands over: import records, a cursor and loves.
+ritornel-source.workspace = true
 # The audio hash, and the hash a payload and a picture are known by. Pinned
 # exactly, as the audio-hash spike pinned it: the hash is a stored key.
 blake3 = "=1.8.7"

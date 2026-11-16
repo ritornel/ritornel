@@ -160,6 +160,7 @@ pub(crate) mod tests {
                 releases: 120,
                 ..ScanSummary::default()
             }),
+            sync: None,
         }
     }
 

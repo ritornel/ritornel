@@ -5,9 +5,18 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = ["lastfm"]
+# Last.fm: the import of a history, loved tracks, and scrobbling, through
+# `ritornel-lastfm`. A server built without it links no Last.fm code, and
+# CI builds it both ways. See docs/design/plugins.md.
+lastfm = ["dep:ritornel-lastfm", "dep:ritornel-source"]
+
 [dependencies]
 ritornel-contract.workspace = true
 ritornel-engine.workspace = true
+ritornel-lastfm = { workspace = true, optional = true }
+ritornel-source = { workspace = true, optional = true }
 # The listener: HTTP routing and the WebSocket upgrade, over hyper and
 # tungstenite. Only what a loopback HTTP/1 listener needs is switched on.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
@@ -40,6 +49,8 @@ toml = { version = "1.2.1", default-features = false, features = ["std", "parse"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# The fake Last.fm the Last.fm tests run against.
+ritornel-lastfm = { workspace = true, features = ["fake"] }
 # The contract tests talk to a server through the client, as every program
 # does.
 ritornel-client.workspace = true

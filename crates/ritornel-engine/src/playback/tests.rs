@@ -499,7 +499,7 @@ fn a_listen_of_40_percent_is_stored_and_does_not_count_and_one_of_60_percent_cou
             plays[0].counts,
             plays[0].outcome.as_str()
         ),
-        (96_000, false, "skipped")
+        (Some(96_000), false, "skipped")
     );
     assert_eq!(
         (
@@ -507,7 +507,7 @@ fn a_listen_of_40_percent_is_stored_and_does_not_count_and_one_of_60_percent_cou
             plays[1].counts,
             plays[1].outcome.as_str()
         ),
-        (180_000, true, "listened")
+        (Some(180_000), true, "listened")
     );
     assert_eq!(plays[0].title.as_deref(), Some("Paper Kites"));
     assert_eq!(plays[0].artist.as_deref(), Some("Moss Arcade"));
@@ -649,7 +649,7 @@ fn a_crash_at_2_40_with_a_checkpoint_at_2_35_is_closed_as_a_crash_and_resumed_as
         .iter()
         .find(|play| play.listens.len() == 2)
         .expect("one play with both listens");
-    assert_eq!(play.ms_played, 300_000);
+    assert_eq!(play.ms_played, Some(300_000));
     assert!(play.counts);
     assert_eq!(play.at_ms, Some(started_at));
     assert_eq!(play.listens[0].end_reason, "crash");
@@ -1272,6 +1272,6 @@ fn an_output_that_goes_away_ends_the_listen_as_output_lost_and_play_continues_it
     rig.skip(Direction::Next);
     rig.deliver();
     let plays = rig.plays();
-    assert_eq!(plays[0].ms_played, 150_000);
+    assert_eq!(plays[0].ms_played, Some(150_000));
     assert_eq!(plays[0].listens.len(), 2);
 }

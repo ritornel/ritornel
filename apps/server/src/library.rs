@@ -178,7 +178,7 @@ mod tests {
         let server = start(&data_dir).await.unwrap();
         let after = status(&server).await;
         assert_eq!(after.role, ServerRole::Hub);
-        assert_eq!(after.versions.library_schema, Some(3));
+        assert_eq!(after.versions.library_schema, Some(4));
         let library = after.library.unwrap();
         assert_eq!(
             (library.library_id, library.revision),

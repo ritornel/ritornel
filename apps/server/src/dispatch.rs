@@ -12,11 +12,13 @@ use std::time::Duration;
 
 use ritornel_contract::methods::{
     self, AlbumGet, ArtistGet, EventsSubscribe, EventsUnsubscribe, HistoryOnThisDay,
-    HistoryRebuild, HistoryRecent, IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList,
-    LibraryCreate, LibraryStats, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
-    MediaTokenCall, Method, PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek,
-    PlaybackSkip, PlaybackStop, QueueWindow, ScanStart, ServerHello, ServerStatus, ServersList,
-    SourcesAdd, SourcesList, SourcesTracks,
+    HistoryRebuild, HistoryRecent, HistorySetZones, HistoryZones, IdentityDryRun, IdentityReview,
+    JobsCancel, JobsGet, JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish,
+    LastfmSignInStart, LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate, LibraryStats,
+    ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
+    PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSkip,
+    PlaybackStop, QueueWindow, ScanStart, ServerHello, ServerStatus, ServersList, SourcesAdd,
+    SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -44,6 +46,7 @@ use crate::{Bounds, Error};
 mod calls;
 mod churn;
 mod history;
+mod lastfm;
 mod lists;
 mod pages;
 mod playback;
@@ -117,6 +120,8 @@ pub(crate) struct Core {
     has_player: std::sync::atomic::AtomicBool,
     /// What wakes the thread that delivers finished listens.
     deliveries: crate::playback::Wake,
+    /// Last.fm, once the server has started.
+    lastfm: std::sync::OnceLock<crate::lastfm::Lastfm>,
 }
 
 /// How many threads make covers: enough to keep a screenful coming, and
@@ -204,6 +209,7 @@ impl Core {
             player: Mutex::new(None),
             has_player: std::sync::atomic::AtomicBool::new(false),
             deliveries: crate::playback::Wake::default(),
+            lastfm: std::sync::OnceLock::new(),
         })
     }
 
@@ -611,6 +617,32 @@ impl Core {
             }
             HistoryRebuild::NAME => {
                 run::<HistoryRebuild>(params, |params| self.history_rebuild(stores, &params))
+            }
+            HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
+            HistorySetZones::NAME => {
+                run::<HistorySetZones>(params, |params| self.history_set_zones(stores, &params))
+            }
+            TracksGet::NAME => run::<TracksGet>(params, |params| self.tracks_get(stores, &params)),
+            LastfmStatusCall::NAME => {
+                run::<LastfmStatusCall>(params, |_| self.lastfm_status(stores))
+            }
+            LastfmSignInStart::NAME => {
+                run::<LastfmSignInStart>(params, |_| self.lastfm_sign_in_start())
+            }
+            LastfmSignInFinish::NAME => run::<LastfmSignInFinish>(params, |params| {
+                self.lastfm_sign_in_finish(stores, &params)
+            }),
+            LastfmSignOut::NAME => {
+                run::<LastfmSignOut>(params, |params| self.lastfm_sign_out(stores, &params))
+            }
+            LastfmSync::NAME => {
+                run::<LastfmSync>(params, |params| self.lastfm_sync(stores, &params))
+            }
+            LastfmSetScrobbling::NAME => run::<LastfmSetScrobbling>(params, |params| {
+                self.lastfm_set_scrobbling(stores, &params)
+            }),
+            LastfmReportCall::NAME => {
+                run::<LastfmReportCall>(params, |params| self.lastfm_report(stores, &params))
             }
             _ => Err(RpcError::new(
                 ErrorCode::Internal,
@@ -1126,7 +1158,7 @@ mod tests {
                     "server": env!("CARGO_PKG_VERSION"),
                     "contract": CONTRACT_VERSION,
                     "sqlite": "3.54.1",
-                    "serverSchema": 4,
+                    "serverSchema": 5,
                 },
                 // There is no library, so nothing is said of one.
                 "freeDisk": { "dataBytes": free },
@@ -1167,8 +1199,8 @@ mod tests {
                 "server": env!("CARGO_PKG_VERSION"),
                 "contract": CONTRACT_VERSION,
                 "sqlite": "3.54.1",
-                "serverSchema": 4,
-                "librarySchema": 3,
+                "serverSchema": 5,
+                "librarySchema": 4,
             })
         );
         assert_eq!(

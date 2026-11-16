@@ -63,6 +63,7 @@ fn derive_with(
 ) -> Vec<Play> {
     derive(&Inputs {
         listens,
+        imports: &[],
         bindings: &bound(),
         corrections,
         zone_periods: periods,
@@ -83,11 +84,11 @@ fn a_listen_of_40_percent_is_stored_and_does_not_count_and_one_of_60_percent_cou
     assert_eq!(derived.len(), 2);
     assert_eq!(
         (derived[0].counts, derived[0].outcome, derived[0].ms_played),
-        (false, Outcome::Skipped, 96_000)
+        (false, Outcome::Skipped, Some(96_000))
     );
     assert_eq!(
         (derived[1].counts, derived[1].outcome, derived[1].ms_played),
-        (true, Outcome::Listened, 144_000)
+        (true, Outcome::Listened, Some(144_000))
     );
     for play in &derived {
         assert_eq!(play.play_rule_version, 1);
@@ -183,7 +184,7 @@ fn the_crash_example_is_one_play_that_counts_dated_at_the_first_listens_start() 
 
     let [play] = plays(&[first.clone(), second.clone()]).try_into().unwrap();
     // The chain has 300 seconds against a threshold of 150.
-    assert_eq!(play.ms_played, 300_000);
+    assert_eq!(play.ms_played, Some(300_000));
     assert_eq!((play.counts, play.outcome), (true, Outcome::Listened));
     assert_eq!(
         play.observations,
@@ -267,7 +268,7 @@ fn a_resume_stays_one_play_when_its_senders_wall_clock_was_set_back_an_hour() {
     // not move its date, and must not split the chain either.
     on_a_wrong_wall_clock(&mut second, -60 * MINUTE);
     let [play] = plays(&[first.clone(), second.clone()]).try_into().unwrap();
-    assert_eq!(play.ms_played, 240_000);
+    assert_eq!(play.ms_played, Some(240_000));
     assert_eq!(play.time.event_at_ms, Some(first.started_at_ms));
     assert_eq!(plays(&[second, first]), [play]);
 }
@@ -593,4 +594,114 @@ proptest! {
             prop_assert_eq!(plays(&own), vec![play.clone()]);
         }
     }
+}
+
+/// A scrobble of item 9, which is not bound, at `at_ms`.
+fn import(observation: i64, at_ms: i64) -> Import {
+    Import {
+        observation,
+        listener: 1,
+        source_item: 9,
+        played_at_ms: at_ms,
+        echo_of: None,
+    }
+}
+
+fn derive_all(
+    listens: &[Listen],
+    imports: &[Import],
+    corrections: &[Correction],
+    periods: &[ZonePeriod],
+) -> Vec<Play> {
+    derive(&Inputs {
+        listens,
+        imports,
+        bindings: &bound(),
+        corrections,
+        zone_periods: periods,
+        rule: PlayRule::V1,
+    })
+}
+
+#[test]
+fn an_import_counts_by_its_sources_verdict_and_is_dated_in_the_listeners_zone_then() {
+    // 2009-06-30 23:30 UTC: already 1 July in Helsinki, still 30 June in
+    // New York.
+    let at = 1_246_404_600_000;
+    let periods = [
+        ZonePeriod {
+            listener: 1,
+            zone: "America/New_York".to_owned(),
+            from_ms: None,
+            to_ms: None,
+        },
+        ZonePeriod {
+            listener: 1,
+            zone: "Europe/Helsinki".to_owned(),
+            from_ms: Some(1_243_814_400_000),
+            to_ms: Some(1_249_084_800_000),
+        },
+    ];
+    let [play] = derive_all(&[], &[import(5, at)], &[], &periods)
+        .try_into()
+        .unwrap();
+    assert!(play.counts);
+    assert_eq!(play.count_basis, CountBasis::SourceVerdict);
+    assert_eq!((play.outcome, play.ms_played), (Outcome::Listened, None));
+    assert_eq!((play.recording, play.source_item), (None, 9));
+    assert_eq!(play.time.clock_basis, ClockBasis::SourceUtc);
+    assert_eq!(play.time.zone.as_deref(), Some("Europe/Helsinki"));
+    assert_eq!(play.time.zone_basis, ZoneBasis::Assumed);
+    assert_eq!(play.time.local.unwrap().date, 20_090_701);
+
+    // Outside the trip, the open period holds; with none, there is no date.
+    let [home] = derive_all(&[], &[import(5, at)], &[], &periods[..1])
+        .try_into()
+        .unwrap();
+    assert_eq!(home.time.local.unwrap().date, 20_090_630);
+    let [nowhere] = derive_all(&[], &[import(5, at)], &[], &[])
+        .try_into()
+        .unwrap();
+    assert_eq!(nowhere.time.event_at_ms, Some(at));
+    assert_eq!(
+        (nowhere.time.local, nowhere.time.calendar_basis),
+        (None, CalendarBasis::None)
+    );
+}
+
+#[test]
+fn our_own_scrobble_coming_back_joins_its_listen_and_counts_once() {
+    let heard = listen(1, 1, 200_000);
+    let mut echo = import(7, heard.started_at_ms);
+    echo.echo_of = Some(1);
+    let mut again = import(8, heard.started_at_ms);
+    again.echo_of = Some(1);
+    let plays = derive_all(
+        std::slice::from_ref(&heard),
+        &[again, echo.clone()],
+        &[],
+        &[],
+    );
+    assert_eq!(plays.len(), 2);
+    assert_eq!(
+        plays[0].observations,
+        vec![(1, Role::Primary), (7, Role::Corroborating)]
+    );
+    assert_eq!(plays[0].count_basis, CountBasis::PlayRule);
+    // The second echo of the same listen, which only a repeated scrobble
+    // makes, is a play of its own.
+    assert_eq!(plays[1].observations, vec![(8, Role::Primary)]);
+
+    // Without its listen the echo is a play of its own too.
+    let alone = derive_all(&[], &[echo.clone()], &[], &[]);
+    assert_eq!(alone[0].observations, vec![(7, Role::Primary)]);
+
+    // Excluding the echo excludes the play it joined.
+    let exclude = Correction {
+        observation: 20,
+        verb: Verb::Exclude,
+        targets: vec![7],
+    };
+    let plays = derive_all(&[heard], &[echo], &[exclude], &[]);
+    assert!(plays[0].excluded);
 }

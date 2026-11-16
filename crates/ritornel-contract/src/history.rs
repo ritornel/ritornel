@@ -116,12 +116,15 @@ pub struct Play {
     #[cfg_attr(test, ts(optional))]
     pub utc_offset_minutes: Option<i32>,
     /// Which clock its time rests on: `hub_age` or `server_wall` for a
-    /// listen.
+    /// listen, `source_utc` for a play another service reported.
     pub clock_basis: String,
     /// What it was of.
     pub track: PlayedTrack,
-    /// Audio rendered, over every listen of it.
-    pub ms_played: u64,
+    /// Audio rendered, over every listen of it. Left out for a play
+    /// another service reported, whose played time is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub ms_played: Option<u64>,
     /// The track's length.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]

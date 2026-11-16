@@ -322,7 +322,7 @@ async fn the_status_reports_versions_role_and_server_id(via: Via) {
     assert_eq!(status.versions.server, env!("CARGO_PKG_VERSION"));
     assert_eq!(status.versions.contract, CONTRACT_VERSION);
     assert_eq!(status.versions.sqlite, "3.54.1");
-    assert_eq!(status.versions.server_schema, 4);
+    assert_eq!(status.versions.server_schema, 5);
     // It has no library, and says nothing of one.
     assert_eq!(status.versions.library_schema, None);
     assert_eq!(status.library, None);
@@ -351,7 +351,7 @@ async fn creating_a_library_makes_the_server_its_hub(via: Via) {
     // server's role says hub: the event, the list and the descriptor.
     let status = client.status().await.unwrap();
     assert_eq!(status.role, ServerRole::Hub);
-    assert_eq!(status.versions.library_schema, Some(3));
+    assert_eq!(status.versions.library_schema, Some(4));
     assert_eq!(
         status.library,
         Some(LibraryStatus {

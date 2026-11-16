@@ -19,9 +19,14 @@
 //! 6. **Exclude.** A play with an observation an active `exclude` targets
 //!    is marked excluded.
 //!
-//! Grouping across sources (step 3) and rank (step 4) arrive with a second
-//! source of plays. The other correction verbs are not applied yet: no call
-//! records them.
+//! Plays another service reported, such as a Last.fm scrobble, are imports
+//! ([`Import`]). Each is a play of its own, which counts by the source's
+//! verdict and is dated in the listener's zone for that date, except the
+//! echo of a play this library sent there itself: it joins that play, matched
+//! exactly through the record of what was sent, with no window of time.
+//! Grouping across sources by a window (step 3) and rank (step 4) arrive with
+//! a second source that reports the same plays. The other correction verbs
+//! are not applied yet: no call records them.
 //!
 //! Local dates come from the IANA time zone database built into this crate
 //! (jiff's bundled copy), never from the machine's, so a derivation gives
@@ -47,6 +52,9 @@ pub const SKEW_TOLERANCE_MS: i64 = 5_000;
 /// How far a time dated by its age from the hub's clock may be off: the
 /// time the send took, which is not measured.
 pub const HUB_AGE_PRECISION_MS: i64 = 1_000;
+
+/// How far a time a source gives to the second may be off.
+pub const SOURCE_SECOND_PRECISION_MS: i64 = 1_000;
 
 /// How far a time dated by the sender's wall clock may be off, once a skew
 /// above [`SKEW_TOLERANCE_MS`] has been taken out: the skew that was let
@@ -265,6 +273,18 @@ text_enum! {
 }
 
 text_enum! {
+    /// What decided whether a play counts.
+    CountBasis {
+        /// The play rule, from the time played.
+        PlayRule => "play_rule",
+        /// The source's own verdict: it counted the play itself.
+        SourceVerdict => "source_verdict",
+        /// A device's position at the end.
+        DevicePosition => "device_position",
+    }
+}
+
+text_enum! {
     /// What an observation is to a play.
     Role {
         /// It supplies the time and the outcome: for a chain, its first
@@ -350,6 +370,24 @@ pub struct Listen {
     pub shuffle: bool,
 }
 
+/// One play another service reported: an import record, as derivation
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Import {
+    /// The observation's row.
+    pub observation: i64,
+    /// Whose play it is, as claimed at ingest.
+    pub listener: i64,
+    /// The text-only source item that stands for what it was of.
+    pub source_item: i64,
+    /// When the source dates it, in UTC.
+    pub played_at_ms: i64,
+    /// The listen whose play this is the echo of: a play this library sent
+    /// to the source, recorded before it was sent, and matched exactly on
+    /// its time and names. `None` for a play of the source's own.
+    pub echo_of: Option<i64>,
+}
+
 /// What a source item is bound to now: its current assignment, with the
 /// recording read through its redirects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +429,9 @@ pub struct Inputs<'a> {
     /// The listens to derive plays from. A `continues` chain is joined only
     /// if every listen of it is here.
     pub listens: &'a [Listen],
+    /// The imports to derive plays from. An echo joins its listen's play
+    /// only if that listen is here.
+    pub imports: &'a [Import],
     /// The current binding of each source item that has one.
     pub bindings: &'a HashMap<i64, Binding>,
     /// Every correction.
@@ -449,30 +490,33 @@ pub struct Play {
     pub recording: Option<i64>,
     /// The appearance, when the binding names one.
     pub appearance: Option<i64>,
-    /// The source item of the file that was heard first.
+    /// The source item of the file that was heard first, or of what an
+    /// import names.
     pub source_item: i64,
     /// When.
     pub time: PlayTime,
-    /// Audio rendered, over the whole chain.
-    pub ms_played: i64,
-    /// The track's length.
-    pub track_duration_ms: i64,
+    /// Audio rendered, over the whole chain. Unknown for an import.
+    pub ms_played: Option<i64>,
+    /// The track's length, where it is known.
+    pub track_duration_ms: Option<i64>,
     /// What became of it.
     pub outcome: Outcome,
     /// Whether it counts.
     pub counts: bool,
+    /// What decided that.
+    pub count_basis: CountBasis,
     /// The version of the rule that judged it.
     pub play_rule_version: i64,
     /// The version of the grouper that formed it.
     pub grouper_version: i64,
     /// Whether an active `exclude` targets one of its observations.
     pub excluded: bool,
-    /// Why its first listen was queued.
-    pub context_kind: ContextKind,
+    /// Why its first listen was queued. Unknown for an import.
+    pub context_kind: Option<ContextKind>,
     /// What it was queued from.
     pub context_ref: Option<[u8; 16]>,
-    /// Whether it was played in a shuffled order.
-    pub shuffle: bool,
+    /// Whether it was played in a shuffled order. Unknown for an import.
+    pub shuffle: Option<bool>,
 }
 
 /// The zone database every local date is read from.
@@ -484,6 +528,26 @@ fn database() -> &'static TimeZoneDatabase {
 /// The zone of this IANA name, if the database knows it.
 fn zone(name: &str) -> Option<TimeZone> {
     database().get(name).ok()
+}
+
+/// Whether the zone database knows this IANA name.
+pub fn known_zone(name: &str) -> bool {
+    zone(name).is_some()
+}
+
+/// The instant a day began in a zone: midnight of `date` (YYYYMMDD) there,
+/// as Unix milliseconds, or the first instant of the day where midnight was
+/// skipped. `None` for a date or a zone there is not.
+pub fn start_of_day_ms(date: i64, name: &str) -> Option<i64> {
+    let zone = zone(name)?;
+    let (year, month, day) = (
+        i16::try_from(date / 10_000).ok()?,
+        i8::try_from(date / 100 % 100).ok()?,
+        i8::try_from(date % 100).ok()?,
+    );
+    let day = jiff::civil::Date::new(year, month, day).ok()?;
+    let start = day.to_zoned(zone).ok()?.start_of_day().ok()?;
+    Some(start.timestamp().as_millisecond())
 }
 
 /// Whether a zone says nothing about where its listener was: UTC under any
@@ -564,6 +628,19 @@ pub fn date_listen(listen: &Listen) -> (i64, ClockBasis, i64) {
     )
 }
 
+/// The zone `listener` was in at `at_ms`, by their zone periods: of those
+/// that hold then, the one that began last, which is the most particular.
+pub fn assumed_zone(listener: i64, at_ms: i64, periods: &[ZonePeriod]) -> Option<&ZonePeriod> {
+    periods
+        .iter()
+        .filter(|period| {
+            period.listener == listener
+                && period.from_ms.is_none_or(|from| from <= at_ms)
+                && period.to_ms.is_none_or(|to| at_ms < to)
+        })
+        .max_by_key(|period| (period.from_ms, period.to_ms.map(|to| -to)))
+}
+
 /// The zone a play's local date is read in, and where it came from. A
 /// zone the sender captured wins, unless it says nothing (UTC); then the
 /// listener's zone for that date is assumed; then the captured UTC stands.
@@ -577,21 +654,38 @@ fn zone_of(
     {
         return (Some(captured.clone()), ZoneBasis::Captured);
     }
-    let assumed = periods
-        .iter()
-        .filter(|period| {
-            period.listener == listen.listener
-                && period.from_ms.is_none_or(|from| from <= event_at_ms)
-                && period.to_ms.is_none_or(|to| event_at_ms < to)
-        })
-        // The period that began last is the most particular.
-        .max_by_key(|period| (period.from_ms, period.to_ms.map(|to| -to)));
-    if let Some(period) = assumed {
+    if let Some(period) = assumed_zone(listen.listener, event_at_ms, periods) {
         return (Some(period.zone.clone()), ZoneBasis::Assumed);
     }
     match &listen.zone {
         Some(captured) => (Some(captured.clone()), ZoneBasis::Captured),
         None => (None, ZoneBasis::None),
+    }
+}
+
+/// When an import was: the time its source gives, in UTC, read in the zone
+/// the listener was in then. With no zone known for that date it has an
+/// instant and no local date.
+fn import_time(import: &Import, periods: &[ZonePeriod]) -> PlayTime {
+    let zone = assumed_zone(import.listener, import.played_at_ms, periods);
+    let local = zone.and_then(|period| local_time(import.played_at_ms, &period.zone));
+    PlayTime {
+        event_at_ms: Some(import.played_at_ms),
+        anchor: TimeAnchor::Start,
+        clock_basis: ClockBasis::SourceUtc,
+        precision_ms: Some(SOURCE_SECOND_PRECISION_MS),
+        zone: zone.map(|period| period.zone.clone()),
+        zone_basis: if zone.is_some() {
+            ZoneBasis::Assumed
+        } else {
+            ZoneBasis::None
+        },
+        calendar_basis: if local.is_some() {
+            CalendarBasis::Zone
+        } else {
+            CalendarBasis::None
+        },
+        local,
     }
 }
 
@@ -801,10 +895,63 @@ pub fn judge(rule: &PlayRule, ms_played: i64, track_ms: i64, ended: EndReason) -
     (counts, outcome)
 }
 
-/// Derives the plays of these listens: one play for each chain, in the
-/// order of each chain's first observation.
+/// Derives the plays of these listens and imports: one play for each chain,
+/// in the order of each chain's first observation, then one for each import
+/// that is not an echo of one of those plays, in the order of their
+/// observations. An echo joins the play of the listen it echoes as a
+/// corroborating observation; of two imports that echo one listen, which
+/// only a repeated scrobble can make, the first joins and the other stands
+/// as a play of its own.
 pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
     let excluded = excluded(inputs.corrections);
+    let mut plays = derive_listens(inputs, &excluded);
+    let by_listen: HashMap<i64, usize> = plays
+        .iter()
+        .enumerate()
+        .flat_map(|(at, play)| play.observations.iter().map(move |(obs, _)| (*obs, at)))
+        .collect();
+    let mut imports: Vec<&Import> = inputs.imports.iter().collect();
+    imports.sort_by_key(|import| import.observation);
+    let mut echoed = BTreeSet::new();
+    for import in imports {
+        let joins = import
+            .echo_of
+            .and_then(|listen| by_listen.get(&listen).map(|at| (listen, *at)))
+            .filter(|(listen, _)| echoed.insert(*listen));
+        if let Some((_, at)) = joins
+            && let Some(play) = plays.get_mut(at)
+        {
+            play.observations
+                .push((import.observation, Role::Corroborating));
+            play.excluded |= excluded.contains(&import.observation);
+            continue;
+        }
+        let binding = inputs.bindings.get(&import.source_item);
+        plays.push(Play {
+            observations: vec![(import.observation, Role::Primary)],
+            listener: import.listener,
+            recording: binding.map(|binding| binding.recording),
+            appearance: binding.and_then(|binding| binding.appearance),
+            source_item: import.source_item,
+            time: import_time(import, inputs.zone_periods),
+            ms_played: None,
+            track_duration_ms: None,
+            outcome: Outcome::Listened,
+            counts: true,
+            count_basis: CountBasis::SourceVerdict,
+            play_rule_version: inputs.rule.version,
+            grouper_version: GROUPER_VERSION,
+            excluded: excluded.contains(&import.observation),
+            context_kind: None,
+            context_ref: None,
+            shuffle: None,
+        });
+    }
+    plays
+}
+
+/// The plays of the listens: one for each chain.
+fn derive_listens(inputs: &Inputs<'_>, excluded: &BTreeSet<i64>) -> Vec<Play> {
     chains(inputs.listens)
         .into_iter()
         .filter_map(|chain| {
@@ -839,18 +986,19 @@ pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
                 appearance: binding.and_then(|binding| binding.appearance),
                 source_item: head.source_item,
                 time: play_time(head, inputs.zone_periods),
-                ms_played,
-                track_duration_ms: head.track_duration_ms,
+                ms_played: Some(ms_played),
+                track_duration_ms: Some(head.track_duration_ms),
                 outcome,
                 counts,
+                count_basis: CountBasis::PlayRule,
                 play_rule_version: inputs.rule.version,
                 grouper_version: GROUPER_VERSION,
                 excluded: listens
                     .iter()
                     .any(|listen| excluded.contains(&listen.observation)),
-                context_kind: head.context_kind,
+                context_kind: Some(head.context_kind),
                 context_ref: head.context_ref,
-                shuffle: head.shuffle,
+                shuffle: Some(head.shuffle),
             })
         })
         .collect()

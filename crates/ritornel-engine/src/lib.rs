@@ -34,13 +34,17 @@
 
 mod clock;
 pub mod covers;
+mod delivery_store;
 mod entropy;
 mod error;
+#[cfg(test)]
+mod history_size;
 mod history_store;
 mod id;
 mod identity_store;
 #[cfg(test)]
 mod identity_tests;
+mod import_store;
 pub mod invent;
 mod jobs;
 mod library_store;
@@ -59,6 +63,7 @@ mod scan_tests;
 mod schema_snapshot;
 mod secret;
 mod server_store;
+mod service_session;
 mod sqlite;
 mod stats;
 #[cfg(test)]
@@ -67,14 +72,19 @@ mod timekeeping;
 mod walk;
 
 pub use clock::{Clock, SystemClock};
+pub use delivery_store::{DELIVERY_METHOD, Due, ELIGIBILITY_VERSION, SEND_WITHIN_MS, Settled};
 pub use entropy::{Entropy, OsEntropy};
 pub use error::Error;
 pub use history_store::{
-    INGEST_METHOD, Ingested, LISTEN_RECORD_VERSION, ListenRecord, ListenRow, PlayCursor, PlayRow,
-    Rebuilt, SendStamps,
+    INGEST_METHOD, IngestOutcome, Ingested, LISTEN_RECORD_VERSION, ListenRecord, ListenRow,
+    Observations, PlayCursor, PlayRow, Rebuilt, SendStamps, ZonePeriodRow,
 };
 pub use id::new_id;
 pub use identity_store::is_policy;
+pub use import_store::{
+    Doubtful, ImportReport, LOVES_METHOD, LoveRow, MATCH_METHOD, SERVICES, ServiceAccount,
+    TrackDetail,
+};
 pub use jobs::{Job, JobState, NewJob, Progress, step_command};
 pub use library_store::{
     Client, Command, CommitHook, Committed, Fingerprint, LibraryMeta, LibraryStore, SubjectKind,
@@ -86,10 +96,11 @@ pub use resolve_store::Resolved;
 /// is the contract's.
 pub use ritornel_contract::Id;
 /// The wall clock in a zone at an instant: what a local date is read with.
-pub use ritornel_domain::history::{LocalTime, local_time};
+pub use ritornel_domain::history::{LocalTime, known_zone, local_time, start_of_day_ms};
 pub use scan::{ScanRun, ScanSettings, run_scan, scan_summary};
 pub use scan_store::Source;
 pub use secret::SessionToken;
 pub use server_store::{Role, ServerIdentity, ServerStore};
+pub use service_session::{ServiceKey, ServiceSession};
 pub use sqlite::SQLITE_VERSION;
 pub use timekeeping::{SystemTimekeeper, Timekeeper, clock_boot};

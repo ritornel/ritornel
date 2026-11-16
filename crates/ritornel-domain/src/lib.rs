@@ -13,6 +13,8 @@
 //! - [`library`] is what those are given and what they return.
 //! - [`history`] derives plays from listens and judges them by the play
 //!   rule (docs/design/history.md).
+//! - [`scrobble`] matches a play another service reported by its text to
+//!   the library, or leaves it unbound.
 //! - [`selection`] orders the copies of a track for the player
 //!   (docs/design/playback.md).
 //!
@@ -44,6 +46,7 @@ pub mod library;
 pub mod normalize;
 pub mod payload;
 pub mod resolve;
+pub mod scrobble;
 pub mod selection;
 #[cfg(test)]
 mod tests;

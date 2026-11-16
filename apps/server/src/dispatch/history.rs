@@ -5,14 +5,15 @@
 //! (docs/design/contract.md). That arrives with the list views; until then
 //! these two direct calls read it.
 
-use ritornel_contract::methods::{HistoryRebuild, Method};
+use ritornel_contract::methods::{HistoryRebuild, HistorySetZones, Method};
 use ritornel_contract::{
     ErrorCode, HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams, OnThisDay,
     OnThisDayParams, Play, PlayCursor, PlayOutcome, PlayedListen, PlayedTrack, Receipt,
-    ReceiptStatus, RecentPlays, RpcError,
+    ReceiptStatus, RecentPlays, RpcError, SetZonesParams, TrackDetail, TrackGetParams, TrackLove,
+    ZonePeriod, ZonePeriods, ZonesSet,
 };
 use ritornel_engine::{
-    Command, Id, LibraryStore, PlayRow, SystemTimekeeper, Timekeeper, WriteRequest,
+    Command, Id, LibraryStore, PlayRow, SystemTimekeeper, Timekeeper, WriteRequest, ZonePeriodRow,
 };
 
 use super::playback::refused;
@@ -54,7 +55,7 @@ fn play(row: PlayRow) -> Play {
             artist: row.artist,
             album: row.album,
         },
-        ms_played: unsigned(row.ms_played),
+        ms_played: row.ms_played.map(unsigned),
         duration_ms: row.track_duration_ms.map(unsigned),
         outcome: match row.outcome.as_str() {
             "listened" => PlayOutcome::Listened,
@@ -81,6 +82,23 @@ fn play(row: PlayRow) -> Play {
             })
             .collect(),
     }
+}
+
+/// Reads `YYYY-MM-DD` as YYYYMMDD.
+fn full_date(text: &str) -> Option<i64> {
+    let mut parts = text.splitn(3, '-');
+    let (year, month, day): (i64, i64, i64) = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    ((1..=9999).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day))
+        .then_some(year * 10_000 + month * 100 + day)
+}
+
+/// The day an instant falls on in a zone, as `YYYY-MM-DD`.
+fn day_of(at_ms: i64, zone: &str) -> Option<String> {
+    ritornel_engine::local_time(at_ms, zone).map(|local| date(local.date))
 }
 
 /// Reads `MM-DD` as MMDD.
@@ -155,6 +173,107 @@ impl Core {
         Ok(OnThisDay {
             day: format!("{:02}-{:02}", wanted / 100, wanted % 100),
             plays: plays.into_iter().map(play).collect(),
+        })
+    }
+
+    pub(super) fn history_zones(&self, stores: &Stores) -> Result<ZonePeriods, RpcError> {
+        let periods = Self::library(stores, |library| {
+            library
+                .zone_periods_of(Self::listener(library)?)
+                .map_err(refused)
+        })?;
+        Ok(ZonePeriods {
+            periods: periods
+                .into_iter()
+                .map(|period| ZonePeriod {
+                    from: period.from_ms.and_then(|at| day_of(at, &period.zone)),
+                    until: period.to_ms.and_then(|at| day_of(at, &period.zone)),
+                    zone: period.zone,
+                })
+                .collect(),
+        })
+    }
+
+    pub(super) fn history_set_zones(
+        &self,
+        stores: &Stores,
+        params: &SetZonesParams,
+    ) -> Result<ZonesSet, RpcError> {
+        let invalid = |message: &str| {
+            RpcError::new(ErrorCode::Invalid, message).with_detail("field", "periods")
+        };
+        let mut periods = Vec::with_capacity(params.periods.len());
+        for period in &params.periods {
+            if !ritornel_engine::known_zone(&period.zone) {
+                return Err(invalid(
+                    "a zone is an IANA name the zone database knows, such as Europe/London",
+                ));
+            }
+            let bound = |day: &Option<String>| -> Result<Option<i64>, RpcError> {
+                day.as_deref()
+                    .map(|day| {
+                        full_date(day)
+                            .and_then(|day| ritornel_engine::start_of_day_ms(day, &period.zone))
+                            .ok_or_else(|| invalid("a day is written YYYY-MM-DD"))
+                    })
+                    .transpose()
+            };
+            periods.push(ZonePeriodRow {
+                zone: period.zone.clone(),
+                from_ms: bound(&period.from)?,
+                to_ms: bound(&period.until)?,
+            });
+        }
+        let key = params.idempotency_key;
+        let request = WriteRequest {
+            method: HistorySetZones::NAME,
+            command: Some(Command {
+                id: key,
+                fingerprint: fingerprint::<HistorySetZones>(params)?,
+            }),
+            client: self.client(),
+        };
+        let answer = Self::library(stores, |library| {
+            let listener = Self::listener(library)?;
+            library
+                .set_zone_periods(request, listener, periods, |changed| changed.to_string())
+                .map_err(refused)
+        })?;
+        Ok(ZonesSet {
+            receipt: Receipt {
+                command_id: key,
+                status: ReceiptStatus::Done,
+                revision: None,
+            },
+            changed: answer.parse().unwrap_or(0),
+        })
+    }
+
+    pub(super) fn tracks_get(
+        &self,
+        stores: &Stores,
+        params: &TrackGetParams,
+    ) -> Result<TrackDetail, RpcError> {
+        let found = Self::library(stores, |library| {
+            library.track_detail(params.track_id).map_err(refused)
+        })?
+        .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "the library has no such track"))?;
+        Ok(TrackDetail {
+            track_id: found.appearance,
+            recording_id: found.recording,
+            title: found.title,
+            artist: found.artist,
+            album: found.album,
+            plays: unsigned(found.plays),
+            last_played: found.last_played_ms,
+            loves: found
+                .loves
+                .into_iter()
+                .map(|love| TrackLove {
+                    by: love.by,
+                    at: love.at_ms,
+                })
+                .collect(),
         })
     }
 

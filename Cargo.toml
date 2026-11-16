@@ -5,6 +5,8 @@ members = [
     "crates/ritornel-domain",
     "crates/ritornel-engine",
     "crates/ritornel-client",
+    "crates/ritornel-source",
+    "crates/ritornel-lastfm",
     "apps/server",
     "apps/ritornelctl",
 ]
@@ -21,13 +23,20 @@ edition = "2024"
 publish = false
 
 # Dependencies point one way: contract <- domain <- engine <- server, and
-# contract <- client <- each client program. `scripts/check-deps.sh` enforces
-# it. See decision 8 in docs/design/server.md.
+# contract <- client <- each client program. A plugin stands beside them:
+# source <- engine, and source <- each plugin <- server, and no plugin
+# depends on the engine. `scripts/check-deps.sh` enforces it. See decision 8 in docs/design/server.md.
 [workspace.dependencies]
 ritornel-contract = { path = "crates/ritornel-contract" }
 ritornel-domain = { path = "crates/ritornel-domain" }
 ritornel-engine = { path = "crates/ritornel-engine" }
 ritornel-client = { path = "crates/ritornel-client" }
+ritornel-source = { path = "crates/ritornel-source" }
+ritornel-lastfm = { path = "crates/ritornel-lastfm" }
+# The owner's Last.fm crate, which `ritornel-lastfm` stands on: sign-in, a
+# history read with every page checked, loved tracks and scrobbling. Pinned
+# exactly. Before 1.0 a minor release may add or break, and a patch fixes.
+scrobl = "=0.3.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

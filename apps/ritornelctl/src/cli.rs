@@ -14,6 +14,14 @@
 //! ritornelctl history [--limit <n>]
 //! ritornelctl history on-this-day [--day <MM-DD>]
 //! ritornelctl history rebuild [--dry-run]
+//! ritornelctl history zones
+//! ritornelctl history zone add <zone> [--from <YYYY-MM-DD>] [--until <YYYY-MM-DD>]
+//! ritornelctl history zone clear
+//! ritornelctl show <track>
+//! ritornelctl lastfm status | signin | signout
+//! ritornelctl lastfm sync [--full] [--no-wait]
+//! ritornelctl lastfm report [--limit <n>]
+//! ritornelctl lastfm scrobbling <on | off>
 //! ```
 //!
 //! Every command takes `--data-dir <dir>` and `--json`.
@@ -31,7 +39,7 @@ use clap::{Args, Parser, Subcommand};
 use ritornel_client::contract::SkipDirection;
 use ritornel_client::contract::local::Env;
 
-use crate::{history, identity, jobs, library, playback, scan, status};
+use crate::{history, identity, jobs, lastfm, library, playback, scan, status};
 
 const USAGE: &str = "\
 The command-line client of a Ritornel server. It talks to the server that is
@@ -54,6 +62,15 @@ Usage:
   ritornelctl history [--limit <n>] [--data-dir <dir>] [--json]
   ritornelctl history on-this-day [--day <MM-DD>] [--data-dir <dir>] [--json]
   ritornelctl history rebuild [--dry-run] [--data-dir <dir>] [--json]
+  ritornelctl history zones [--data-dir <dir>] [--json]
+  ritornelctl history zone add <zone> [--from <YYYY-MM-DD>] [--until <YYYY-MM-DD>]
+                               [--data-dir <dir>] [--json]
+  ritornelctl history zone clear [--data-dir <dir>] [--json]
+  ritornelctl show <track> [--data-dir <dir>] [--json]
+  ritornelctl lastfm status | signin | signout [--data-dir <dir>] [--json]
+  ritornelctl lastfm sync [--full] [--no-wait] [--data-dir <dir>] [--json]
+  ritornelctl lastfm report [--limit <n>] [--data-dir <dir>] [--json]
+  ritornelctl lastfm scrobbling <on | off> [--data-dir <dir>] [--json]
 
 Commands:
   status           Show the running server's ID, name and role, the versions
@@ -101,6 +118,34 @@ Commands:
                    Show what you listened to on this day in every year
   history rebuild  Drop the plays and derive them again from every listen
                    recorded, in one transaction
+  history zones    Show where you were, by date: the zone a play is dated
+                   in when its source gave none, as Last.fm does not
+  history zone add <zone>
+                   Say you were in a zone, by its IANA name such as
+                   Europe/London, from a day and until a day, or always.
+                   The plays are dated again with it
+  history zone clear
+                   Forget every zone
+  show <track>     Show a track by its ID: what it is, how often it was
+                   played, and who loved it
+  lastfm status    Show whether the server has Last.fm, the account it is
+                   signed in to, what was imported and what scrobbled
+  lastfm signin    Sign the server in to Last.fm: open the address it
+                   prints and approve it there. The session is kept on the
+                   server. It needs the server to have an API key and
+                   secret, in SCROBL_API_KEY and SCROBL_API_SECRET where it
+                   was started, or in lastfm.env in its data directory
+  lastfm signout   Forget the session. What was imported stays
+  lastfm sync      Import what is new in your Last.fm history, and your
+                   loved tracks, and show it until it ends. The first sync
+                   reads all of it; each after reads from a fortnight
+                   before the last. It is the server's job: it carries on
+                   if this program stops, and after a restart
+  lastfm report    Show how much of the imported history matched the
+                   library, and the tracks it was not sure of
+  lastfm scrobbling on | off
+                   Send the plays that count to Last.fm from now on, or
+                   stop
 
 Options:
   --name <name>         scan: the name the folder is added under. With none
@@ -148,6 +193,12 @@ when given alone:
   --day <MM-DD>         history on-this-day: the day. The default is today
   --dry-run             history rebuild: say what would change, and change
                         nothing
+  --from <YYYY-MM-DD>   history zone add: the first day
+  --until <YYYY-MM-DD>  history zone add: the day after the last
+  --full                lastfm sync: read the whole history again
+  --no-wait             lastfm sync: start it and return at once
+  --limit <n>           lastfm report: how many doubtful tracks. The
+                        default is 50
   --data-dir <dir>      The data directory of the server to talk to
   --json                Print the answer as JSON, in the shape the server
                         sends it in
@@ -268,6 +319,60 @@ enum Command {
     Now(ServerArgs),
     Queue(ServerArgs),
     History(HistoryArgs),
+    Show(ShowArgs),
+    #[command(subcommand)]
+    Lastfm(LastfmCommand),
+}
+
+/// What `show` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ShowArgs {
+    /// The track, by its ID.
+    pub(crate) track: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum LastfmCommand {
+    Status(ServerArgs),
+    Signin(ServerArgs),
+    Signout(ServerArgs),
+    Sync(SyncArgs),
+    Report(ReportArgs),
+    Scrobbling(ScrobblingArgs),
+}
+
+/// What `lastfm sync` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct SyncArgs {
+    /// Read the whole history again.
+    #[arg(long)]
+    pub(crate) full: bool,
+    /// Start it and return at once.
+    #[arg(long)]
+    pub(crate) no_wait: bool,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `lastfm report` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ReportArgs {
+    /// How many doubtful tracks.
+    #[arg(long)]
+    pub(crate) limit: Option<u32>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `lastfm scrobbling` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ScrobblingArgs {
+    /// `on` or `off`.
+    pub(crate) state: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `play` takes.
@@ -313,6 +418,30 @@ pub(crate) struct HistoryArgs {
 pub(crate) enum HistoryCommand {
     OnThisDay(DayArgs),
     Rebuild(RebuildArgs),
+    Zones(ServerArgs),
+    #[command(subcommand)]
+    Zone(ZoneCommand),
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum ZoneCommand {
+    Add(ZoneArgs),
+    Clear(ServerArgs),
+}
+
+/// What `history zone add` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ZoneArgs {
+    /// The zone, by its IANA name.
+    pub(crate) zone: String,
+    /// The first day, as YYYY-MM-DD.
+    #[arg(long)]
+    pub(crate) from: Option<String>,
+    /// The day after the last, as YYYY-MM-DD.
+    #[arg(long)]
+    pub(crate) until: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `history on-this-day` takes.
@@ -518,6 +647,8 @@ fn try_run(
         Command::Now(args) => playback::now(&args, env, out),
         Command::Queue(args) => playback::queue(&args, env, out),
         Command::History(args) => history::history(&args, env, out),
+        Command::Show(args) => lastfm::show(&args, env, out),
+        Command::Lastfm(command) => lastfm::lastfm(&command, env, out),
     }
 }
 

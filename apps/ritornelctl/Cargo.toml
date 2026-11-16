@@ -18,5 +18,10 @@ serde_json = "1.0.154"
 # command that makes a call and exits.
 tokio = { version = "1.54.1", features = ["rt", "time"] }
 
+[dev-dependencies]
+# The fake Last.fm the test of the `lastfm` commands runs the server
+# against. A dev-dependency: the program itself links nothing of Last.fm.
+ritornel-lastfm = { workspace = true, features = ["fake"] }
+
 [lints]
 workspace = true

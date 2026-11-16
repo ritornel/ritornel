@@ -57,7 +57,7 @@ impl Wake {
     }
 
     /// Waits until woken, or for `at_most`.
-    fn wait(&self, at_most: Duration) {
+    pub(crate) fn wait(&self, at_most: Duration) {
         let pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         let (mut pending, _) = self
             .woken
@@ -257,6 +257,8 @@ fn deliver(core: &Core, stop: &AtomicBool, run_id: Id, fail_after_ingest: bool) 
         let wait = match done {
             Some(Ok(done)) => {
                 if !done.delivered.is_empty() {
+                    // A play that counts may now be scrobbled.
+                    core.wake_scrobbler();
                     info!(
                         delivered = done.delivered.len(),
                         sent_again = done.duplicates,

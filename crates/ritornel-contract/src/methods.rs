@@ -302,6 +302,56 @@ methods! {
     /// change.
     HistoryRebuild: "history.rebuild", Command, needs_full: true,
     HistoryRebuildParams => HistoryRebuilt;
+
+    /// `history.zones`: the zones the listener was in, by date, which date
+    /// a play whose source gave no zone.
+    HistoryZones: "history.zones", Query, needs_full: false,
+    NoParams => ZonePeriods;
+
+    /// `history.setZones`: replaces the zones the listener was in, and
+    /// derives the plays again with them.
+    HistorySetZones: "history.setZones", Command, needs_full: true,
+    SetZonesParams => ZonesSet;
+
+    /// `tracks.get`: one track, with its plays and the loves that reach it.
+    TracksGet: "tracks.get", Query, needs_full: false,
+    TrackGetParams => TrackDetail;
+
+    /// `lastfm.status`: whether this server has Last.fm, the account it is
+    /// signed in to, and whether it scrobbles.
+    LastfmStatusCall: "lastfm.status", Query, needs_full: true,
+    NoParams => LastfmStatus;
+
+    /// `lastfm.signInStart`: asks Last.fm for a sign-in, and answers with
+    /// the address where the listener approves it. The sign-in is this
+    /// session's.
+    LastfmSignInStart: "lastfm.signInStart", Session, needs_full: true,
+    NoParams => SignInStarted;
+
+    /// `lastfm.signInFinish`: once the listener has approved the sign-in,
+    /// exchanges it for a session and keeps it. Before that it answers
+    /// `accepted`, and is called again.
+    LastfmSignInFinish: "lastfm.signInFinish", Command, needs_full: true,
+    SignInFinishParams => SignInFinished;
+
+    /// `lastfm.signOut`: forgets the session. What was imported stays.
+    LastfmSignOut: "lastfm.signOut", Command, needs_full: true,
+    KeyParams => SignedOut;
+
+    /// `lastfm.sync`: starts the import of what is new in the account's
+    /// history, and of its loved tracks, as a job.
+    LastfmSync: "lastfm.sync", Command, needs_full: true,
+    LastfmSyncParams => LastfmSyncStarted;
+
+    /// `lastfm.setScrobbling`: sends the plays that count to Last.fm from
+    /// now on, or stops.
+    LastfmSetScrobbling: "lastfm.setScrobbling", Command, needs_full: true,
+    ScrobblingParams => ScrobblingSet;
+
+    /// `lastfm.report`: how much of the imported history matched the
+    /// library, and the tracks the matcher was not sure of.
+    LastfmReportCall: "lastfm.report", Query, needs_full: true,
+    LastfmReportParams => LastfmReport;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -353,7 +403,17 @@ mod tests {
                 "sources.tracks",
                 "history.recent",
                 "history.onThisDay",
-                "history.rebuild"
+                "history.rebuild",
+                "history.zones",
+                "history.setZones",
+                "tracks.get",
+                "lastfm.status",
+                "lastfm.signInStart",
+                "lastfm.signInFinish",
+                "lastfm.signOut",
+                "lastfm.sync",
+                "lastfm.setScrobbling",
+                "lastfm.report"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -381,7 +441,15 @@ mod tests {
                 "identity.dryRun",
                 "identity.review",
                 "sources.tracks",
-                "history.rebuild"
+                "history.rebuild",
+                "history.setZones",
+                "lastfm.status",
+                "lastfm.signInStart",
+                "lastfm.signInFinish",
+                "lastfm.signOut",
+                "lastfm.sync",
+                "lastfm.setScrobbling",
+                "lastfm.report"
             ]
         );
         // Everything but reading the library and controlling playback

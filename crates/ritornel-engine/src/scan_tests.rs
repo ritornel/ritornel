@@ -996,3 +996,78 @@ fn a_job_names_its_source_and_fails_without_a_path_for_its_root() {
     assert!(matches!(twice, Err(Error::SourceExists { source }) if source == rig.main.public_id));
     assert_eq!(rig.library.source(id(0x99)).unwrap(), None);
 }
+
+#[test]
+fn a_scrobble_bound_to_a_scanned_song_leaves_every_later_scan_and_the_identity_reads_as_they_were()
+{
+    let mut rig = Rig::new();
+    rig.put("Moss Arcade/Tin Weather/a.flac", "a.flac");
+    rig.scan();
+    let text = rig.one(
+        "SELECT ac.display_text || '|' || r.display_title FROM recording r
+         JOIN artist_credit ac ON ac.id = r.display_artist_credit_id",
+    );
+    let (artist, title) = text.split_once('|').unwrap();
+    let decisions = rig.library.stats().unwrap().decisions;
+    let dry_run = |rig: &Rig| {
+        let run = rig
+            .library
+            .dry_run(&ritornel_contract::DryRunParams {
+                policy: ritornel_contract::PolicyOverrides::default(),
+                detail: false,
+            })
+            .unwrap();
+        (run.items, run.unchanged, run.would_write)
+    };
+    let before = dry_run(&rig);
+
+    // A scrobble of that song, imported, binds to it.
+    let account = rig
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let batch = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: b"one".to_vec(),
+            played_at_ms: T0 - 60_000,
+            track: ritornel_source::TrackText {
+                artist: artist.to_owned(),
+                album: None,
+                title: title.to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: T0 - 60_000,
+            to_ms: T0,
+        },
+        cursor: "{}".to_owned(),
+    };
+    rig.library
+        .ingest(crate::Observations::Imports {
+            account,
+            batch: &batch,
+        })
+        .unwrap();
+    assert_eq!(
+        rig.one("SELECT count(*) FROM identity_decision WHERE method = 'scrobble_text'"),
+        "1"
+    );
+
+    // The resolver, the dry run, the review and the stats read files, as
+    // they did before the scrobble.
+    assert_eq!(dry_run(&rig), before);
+    rig.library.review().unwrap();
+    assert_eq!(rig.library.stats().unwrap().decisions, decisions);
+    rig.put("Moss Arcade/Tin Weather/b.flac", "b.flac");
+    rig.scan();
+    rig.scan();
+    assert_eq!(
+        rig.one(
+            "SELECT count(*) FROM assignment a JOIN identity_decision d ON d.id = a.decision_id
+                 WHERE d.method = 'scrobble_text' AND a.superseded_at_ms IS NULL"
+        ),
+        "1"
+    );
+}

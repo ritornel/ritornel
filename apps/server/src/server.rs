@@ -43,6 +43,8 @@ pub struct Server {
     worker: Worker,
     /// The player's control loop and the delivery of listens.
     playback: playback::Workers,
+    /// The thread that scrobbles.
+    scrobbler: crate::lastfm::Scrobbler,
     transports: Transports,
     listening: Listening,
     bounds: Bounds,
@@ -132,6 +134,15 @@ impl Server {
 
         if let Some(library) = &library {
             history_rule(library)?;
+            // A scrobble a dead run was sending may have arrived: it is
+            // never sent again.
+            let abandoned = library.abandon_sending()?;
+            if abandoned > 0 {
+                warn!(
+                    abandoned,
+                    "scrobbles an earlier run was sending are marked unknown"
+                );
+            }
         }
         let player = playback::restore(
             &store,
@@ -151,11 +162,14 @@ impl Server {
         if let Some(player) = player {
             core.set_player(player);
         }
+        core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
         let listening = Listening::start(Arc::clone(&core), tickets, listener, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         let worker = Worker::start(Arc::clone(&core), boot_id, run.scan).map_err(Error::Runtime)?;
         let playback = playback::Workers::start(Arc::clone(&core), run.playback, boot_id)
             .map_err(Error::Runtime)?;
+        let scrobbler =
+            crate::lastfm::Scrobbler::start(Arc::clone(&core)).map_err(Error::Runtime)?;
 
         // The server answers, so a client may be told where it is.
         let server_json =
@@ -164,6 +178,7 @@ impl Server {
             transports: Transports(Arc::clone(&core)),
             worker,
             playback,
+            scrobbler,
             core,
             listening,
             bounds,
@@ -243,6 +258,11 @@ impl Server {
         // shutdown, and what that closed is delivered.
         let playback = self.playback;
         tokio::task::spawn_blocking(move || playback.stop())
+            .await
+            .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
+        // The scrobbler ends after the batch it is sending.
+        let scrobbler = self.scrobbler;
+        tokio::task::spawn_blocking(move || scrobbler.stop())
             .await
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
         // Closing waits for calls that are using the database, and then

@@ -276,7 +276,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
             tokio::task::yield_now().await;
         };
         for play in &recent.plays {
-            assert_eq!(play.ms_played, 500);
+            assert_eq!(play.ms_played, Some(500));
             assert!(!play.counts);
             assert_eq!(play.listens.len(), 1);
             assert_eq!(play.clock_basis, "hub_age");

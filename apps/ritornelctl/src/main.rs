@@ -18,6 +18,7 @@ mod cli;
 mod history;
 mod identity;
 mod jobs;
+mod lastfm;
 mod library;
 mod playback;
 mod scan;

@@ -853,7 +853,7 @@ mod tests {
         // gives the library's ID the bytes 00 to 09.
         let library_id = "019a7afd-1e00-7001-8203-040506070809";
         assert_eq!(store.library_id().to_string(), library_id);
-        assert_eq!(store.schema_version(), 3);
+        assert_eq!(store.schema_version(), 4);
         assert_eq!(
             store.meta().unwrap(),
             LibraryMeta {
@@ -1242,7 +1242,7 @@ mod tests {
         let scratch = Scratch::new();
         let path = library_db(&scratch);
         let (store, _) = create_on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 3);
+        assert_eq!(store.migrations_applied(), 4);
         let created = store.meta().unwrap();
         store
             .write(request("test.write", None), set("kept"))
@@ -1252,7 +1252,7 @@ mod tests {
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 3);
+        assert_eq!(store.schema_version(), 4);
         assert_eq!(store.library_id(), created.library_id);
         assert_eq!(
             store.meta().unwrap(),
@@ -1409,11 +1409,11 @@ mod tests {
         create_on_disk(&path).unwrap().0.close().unwrap();
         tamper_file(
             &path,
-            "INSERT INTO schema_migration VALUES (4, '0004_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (5, '0005_from_the_future', x'00', 0)",
         );
         let refused = open_on_disk(&path, id(0x11));
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 4, known: 3 })),
+            matches!(refused, Err(Error::NewerSchema { found: 5, known: 4 })),
             "{refused:?}"
         );
     }
@@ -1454,8 +1454,8 @@ mod tests {
             .unwrap();
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
-        assert_eq!(store.migrations_applied(), 2);
-        assert_eq!(store.schema_version(), 3);
+        assert_eq!(store.migrations_applied(), 3);
+        assert_eq!(store.schema_version(), 4);
         // The library is the one it was, at the revision it was.
         assert_eq!(
             store.library_id().to_string(),

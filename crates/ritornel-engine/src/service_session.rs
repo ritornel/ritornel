@@ -1,0 +1,214 @@
+//! This server's session at an outside service, in `server.db`: the
+//! account it is signed in to, the session key, and whether it scrobbles.
+//! The key is a secret that does not expire and can change the account, so
+//! it lives in the file that never leaves this machine, and its type cannot
+//! be printed.
+
+use std::fmt;
+
+use rusqlite::OptionalExtension;
+
+use crate::{Error, Id, ServerStore};
+
+/// A session key at a service. `Debug` prints a fixed redaction and there
+/// is no `Display`: it reaches the outside only through [`expose`].
+///
+/// [`expose`]: ServiceKey::expose
+#[derive(Clone, PartialEq, Eq)]
+pub struct ServiceKey(String);
+
+impl ServiceKey {
+    /// Wraps a key.
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    /// The key itself. Take care what you do with it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ServiceKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServiceKey(<redacted>)")
+    }
+}
+
+/// This server's session at one service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceSession {
+    /// The `service_account` in the library.
+    pub account: Id,
+    /// The account's name, as the service spells it.
+    pub account_name: String,
+    /// The session key.
+    pub key: ServiceKey,
+    /// Whether the account is a subscriber's.
+    pub subscriber: bool,
+    /// When it was signed in.
+    pub signed_in_at_ms: i64,
+    /// Plays from this time on are scrobbled; `None` scrobbles none.
+    pub scrobble_from_ms: Option<i64>,
+    /// The service refused the session: nothing is sent until a new
+    /// sign-in.
+    pub sign_in_again: bool,
+}
+
+impl ServerStore {
+    /// The session at `service`, if this server is signed in there.
+    pub fn service_session(&self, service: &str) -> Result<Option<ServiceSession>, Error> {
+        let service = service.to_owned();
+        self.read(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT account_pid, account_name, session_key, subscriber, signed_in_at_ms,
+                            scrobble_from_ms, sign_in_again
+                     FROM service_session WHERE service = ?1",
+                    [service],
+                    |row| {
+                        Ok(ServiceSession {
+                            account: Id::from_bytes(row.get(0)?),
+                            account_name: row.get(1)?,
+                            key: ServiceKey(row.get(2)?),
+                            subscriber: row.get(3)?,
+                            signed_in_at_ms: row.get(4)?,
+                            scrobble_from_ms: row.get(5)?,
+                            sign_in_again: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+    }
+
+    /// Keeps a new session at `service`, in place of any before it.
+    /// Scrobbling starts off.
+    pub fn save_service_session(
+        &self,
+        service: &str,
+        account: Id,
+        account_name: &str,
+        key: &ServiceKey,
+        subscriber: bool,
+    ) -> Result<(), Error> {
+        let (service, name, key) = (
+            service.to_owned(),
+            account_name.to_owned(),
+            key.expose().to_owned(),
+        );
+        self.transact(move |transaction, now_ms, _| {
+            transaction.execute(
+                "INSERT INTO service_session
+                   (service, account_pid, account_name, session_key, subscriber, signed_in_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (service) DO UPDATE SET
+                   account_pid = excluded.account_pid, account_name = excluded.account_name,
+                   session_key = excluded.session_key, subscriber = excluded.subscriber,
+                   signed_in_at_ms = excluded.signed_in_at_ms, scrobble_from_ms = NULL,
+                   sign_in_again = 0",
+                rusqlite::params![service, account.as_bytes(), name, key, subscriber, now_ms],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Forgets the session at `service`. Whether there was one.
+    pub fn remove_service_session(&self, service: &str) -> Result<bool, Error> {
+        let service = service.to_owned();
+        self.transact(move |transaction, _, _| {
+            Ok(
+                transaction.execute("DELETE FROM service_session WHERE service = ?1", [service])?
+                    > 0,
+            )
+        })
+    }
+
+    /// Turns scrobbling to `service` on, for plays from now on, or off.
+    /// Turned on while it is on, it keeps the time it was turned on.
+    /// Returns the session as it now is.
+    pub fn set_scrobbling(&self, service: &str, on: bool) -> Result<Option<ServiceSession>, Error> {
+        let owned = service.to_owned();
+        self.transact(move |transaction, now_ms, _| {
+            transaction.execute(
+                "UPDATE service_session
+                 SET scrobble_from_ms = CASE WHEN ?2 THEN coalesce(scrobble_from_ms, ?3) END
+                 WHERE service = ?1",
+                rusqlite::params![owned, on, now_ms],
+            )?;
+            Ok(())
+        })?;
+        self.service_session(service)
+    }
+
+    /// Records that the service refused the session.
+    pub fn refuse_service_session(&self, service: &str) -> Result<(), Error> {
+        let service = service.to_owned();
+        self.transact(move |transaction, _, _| {
+            transaction.execute(
+                "UPDATE service_session SET sign_in_again = 1 WHERE service = ?1",
+                [service],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::testing::{CountingEntropy, FixedClock};
+
+    #[test]
+    fn a_session_is_kept_scrobbling_is_turned_on_from_a_time_and_the_key_never_prints() {
+        let clock = Arc::new(FixedClock::at(1_000));
+        let store =
+            ServerStore::open_in_memory(clock.clone(), Arc::new(CountingEntropy::default()))
+                .unwrap();
+        assert_eq!(store.service_session("lastfm").unwrap(), None);
+        let key = ServiceKey::new("SENTINEL_SESSION_KEY");
+        let account = Id::from_bytes([7; 16]);
+        store
+            .save_service_session("lastfm", account, "someone", &key, false)
+            .unwrap();
+        let kept = store.service_session("lastfm").unwrap().unwrap();
+        assert_eq!(
+            (kept.account, kept.key.expose()),
+            (account, "SENTINEL_SESSION_KEY")
+        );
+        assert_eq!(kept.scrobble_from_ms, None);
+        assert!(!format!("{kept:?}").contains("SENTINEL"));
+
+        clock.set(5_000);
+        let on = store.set_scrobbling("lastfm", true).unwrap().unwrap();
+        assert_eq!(on.scrobble_from_ms, Some(5_000));
+        clock.set(9_000);
+        let again = store.set_scrobbling("lastfm", true).unwrap().unwrap();
+        assert_eq!(again.scrobble_from_ms, Some(5_000));
+        let off = store.set_scrobbling("lastfm", false).unwrap().unwrap();
+        assert_eq!(off.scrobble_from_ms, None);
+
+        store.refuse_service_session("lastfm").unwrap();
+        assert!(
+            store
+                .service_session("lastfm")
+                .unwrap()
+                .unwrap()
+                .sign_in_again
+        );
+        store
+            .save_service_session("lastfm", account, "someone", &key, false)
+            .unwrap();
+        assert!(
+            !store
+                .service_session("lastfm")
+                .unwrap()
+                .unwrap()
+                .sign_in_again
+        );
+        assert!(store.remove_service_session("lastfm").unwrap());
+        assert_eq!(store.service_session("lastfm").unwrap(), None);
+    }
+}

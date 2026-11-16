@@ -8,6 +8,7 @@
 --   0002_work  dd5cc576aed05d719357a659ce74ed214a0bea1481040599138e3bae36407174
 --   0003_playback  e094e2a143da2b95885551e53e98ed0749e975c234846f1035626cee4e5afea0
 --   0004_listen_detail  fa9a7a0cdc46d229caa74d94d5891d442015bf209da6ff153991023df2b70655
+--   0005_service_session  7d4660d805309cffe520c873ea18c50b2465dbf15174fa954243516a81cb62d5
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -183,3 +184,15 @@ CREATE TABLE listen_staging (
 
 CREATE UNIQUE INDEX listen_staging_open ON listen_staging (played_on_server_pid)
   WHERE ended_at_utc_ms IS NULL;
+
+CREATE TABLE service_session (
+  id                  INTEGER PRIMARY KEY,
+  service             TEXT NOT NULL UNIQUE CHECK (service IN ('lastfm')),
+  account_pid         BLOB NOT NULL CHECK (length(account_pid) = 16),   -- the service_account in library.db
+  account_name        TEXT NOT NULL,                                    -- as the service spells it
+  session_key         TEXT NOT NULL,                                    -- a secret: never logged, never sent to a client
+  subscriber          INTEGER NOT NULL CHECK (subscriber IN (0, 1)),
+  signed_in_at_ms     INTEGER NOT NULL,
+  scrobble_from_ms    INTEGER,                                          -- plays from this time on are sent; NULL sends none
+  sign_in_again       INTEGER NOT NULL DEFAULT 0 CHECK (sign_in_again IN (0, 1))   -- the service refused the session; nothing is sent until a new sign-in
+) STRICT;

@@ -50,7 +50,7 @@ impl Wake {
 }
 
 /// How this run does its jobs.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Run {
     /// What names this run of the server on every job it claims. A job
     /// claimed under another is one a dead run left.
@@ -59,6 +59,8 @@ pub struct Run {
     pub scan: ScanSettings,
     /// How this run plays.
     pub playback: crate::playback::PlaybackRun,
+    /// How this run reaches Last.fm.
+    pub lastfm: crate::lastfm::LastfmRun,
 }
 
 /// The running worker.
@@ -134,8 +136,38 @@ fn work(core: &Core, boot: Id, scan: ScanSettings, stop: &AtomicBool) {
     }
 }
 
-/// Carries one claimed scan to its end, or until the server stops.
+/// Carries one claimed job to its end, or until the server stops.
 fn run(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &AtomicBool) {
+    if job.kind == crate::lastfm::SYNC_JOB {
+        return sync(core, job, stop);
+    }
+    scan(core, job, settings, stop);
+}
+
+/// Carries a claimed sync of a Last.fm history on.
+#[cfg(feature = "lastfm")]
+fn sync(core: &Core, job: ritornel_engine::Job, stop: &AtomicBool) {
+    crate::lastfm::run_sync(core, job, stop);
+}
+
+/// A sync of a Last.fm history, on a server built without Last.fm: it
+/// fails, and says why.
+#[cfg(not(feature = "lastfm"))]
+fn sync(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
+    let ended = core.with_stores(|stores| {
+        stores.server().finish_job(
+            job.id,
+            JobState::Failed,
+            Some("this server was built without Last.fm".to_owned()),
+        )
+    });
+    if let Some(Ok(job)) = ended {
+        core.publish_job(&job);
+    }
+}
+
+/// Carries one claimed scan to its end, or until the server stops.
+fn scan(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &AtomicBool) {
     let (row, job_id) = (job.id, job.public_id);
     info!(job_id = %job_id, kind = %job.kind, step = job.step, "a job is claimed");
     let finish = |state: JobState, failure: Option<String>| {

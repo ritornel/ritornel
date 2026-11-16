@@ -17,7 +17,7 @@ WITH live AS (
   SELECT a.source_item_id AS item, a.recording_id AS recording, a.appearance_id AS appearance,
          a.decision_id AS decision
   FROM assignment a JOIN source_item si ON si.id = a.source_item_id
-  WHERE a.superseded_at_ms IS NULL AND si.retired_at_ms IS NULL),
+  WHERE a.superseded_at_ms IS NULL AND si.retired_at_ms IS NULL AND si.item_kind = 'file'),
 apps AS (
   SELECT DISTINCT ta.canonical_id AS id FROM live JOIN track_appearance ta ON ta.id = live.appearance),
 rels AS (

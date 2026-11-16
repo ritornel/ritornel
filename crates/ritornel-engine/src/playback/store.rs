@@ -800,8 +800,8 @@ mod tests {
             .unwrap();
 
         let store = ServerStore::open(&path, Arc::new(SystemClock), Arc::new(OsEntropy)).unwrap();
-        assert_eq!(store.migrations_applied(), 2);
-        assert_eq!(store.schema_version(), 4);
+        assert_eq!(store.migrations_applied(), 3);
+        assert_eq!(store.schema_version(), 5);
         // Who the server is, its credential, its root and its scan are as
         // they were.
         let identity = store.identity().unwrap().unwrap();
@@ -872,6 +872,39 @@ mod tests {
         assert_eq!(schema(&saved), schema(&made));
     }
 
+    /// A `server.db` as the fourth migration left it: [`SAVED_0003`] taken
+    /// forward one migration.
+    const SAVED_0004: &str = include_str!("../../saved/server/0004.sql");
+
+    #[test]
+    fn a_database_saved_at_the_fourth_migration_is_taken_forward_with_its_listens() {
+        let made = |count: usize| {
+            let mut made = Connection::open_in_memory().unwrap();
+            migrate::run(
+                &mut made,
+                migrate::SERVER.get(..count).unwrap(),
+                &FixedClock::at(T0),
+            )
+            .unwrap();
+            made
+        };
+        let saved = Connection::open_in_memory().unwrap();
+        saved.execute_batch(SAVED_0004).unwrap();
+        assert_eq!(schema(&saved), schema(&made(4)));
+
+        let scratch = Scratch::new();
+        let path = scratch.path().join("server.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(SAVED_0004)
+            .unwrap();
+        let clock = Arc::new(FixedClock::at(1_794_776_600_000));
+        let store = ServerStore::open(&path, clock, Arc::new(OsEntropy)).unwrap();
+        assert_eq!((store.migrations_applied(), store.schema_version()), (1, 5));
+        assert_eq!(store.queue().unwrap().len(), 4);
+        assert_eq!(store.undelivered_listens().unwrap(), 1);
+    }
+
     #[test]
     fn a_database_saved_with_listens_staged_is_taken_forward_with_every_one() {
         let scratch = Scratch::new();
@@ -883,7 +916,7 @@ mod tests {
 
         let clock = Arc::new(FixedClock::at(1_794_776_600_000));
         let store = ServerStore::open(&path, clock, Arc::new(OsEntropy)).unwrap();
-        assert_eq!((store.migrations_applied(), store.schema_version()), (1, 4));
+        assert_eq!((store.migrations_applied(), store.schema_version()), (2, 5));
         let queue = store.queue().unwrap();
         let session = store.playback_session().unwrap();
         assert_eq!(queue.len(), 4);

@@ -145,6 +145,11 @@ pub enum JobTarget {
         /// The source's ID.
         id: Id,
     },
+    /// An account at an outside service, such as Last.fm.
+    Account {
+        /// The account's ID.
+        id: Id,
+    },
 }
 
 /// One job: a durable resource, readable after clients disconnect and
@@ -197,6 +202,11 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub scan: Option<ScanSummary>,
+    /// What a sync of an account's history has read so far, and at its end
+    /// what came out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub sync: Option<crate::SyncSummary>,
 }
 
 /// What a scan found and did.
@@ -394,6 +404,7 @@ mod tests {
             started_at: Some(6),
             finished_at: None,
             scan: None,
+            sync: None,
         };
         let wire = json!({
             "jobId": "10101010-1010-1010-1010-101010101010",

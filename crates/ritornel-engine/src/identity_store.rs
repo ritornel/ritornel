@@ -118,7 +118,8 @@ fn rows_in(connection: &Connection) -> Result<Rows, Error> {
         "SELECT a.source_item_id, d.score, d.needs_review, d.runner_up_gap, d.evidence_json,
                 d.resolver_version
          FROM assignment a JOIN identity_decision d ON d.id = a.decision_id
-         WHERE a.superseded_at_ms IS NULL",
+         JOIN source_item si ON si.id = a.source_item_id
+         WHERE a.superseded_at_ms IS NULL AND si.item_kind = 'file'",
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,

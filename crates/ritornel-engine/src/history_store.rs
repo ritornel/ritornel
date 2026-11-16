@@ -12,8 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ritornel_domain::history::{
-    self as derive, Binding, ContextKind, Correction, EndReason, Inputs, Listen, Play, PlayRule,
-    Received, StartReason, Verb, ZonePeriod,
+    self as derive, Binding, ContextKind, Correction, EndReason, Import, Inputs, Listen, Play,
+    PlayRule, Received, StartReason, Verb, ZonePeriod,
 };
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::library_store::Write;
 use crate::{Error, Id, LibraryStore, WriteRequest};
+use ritornel_domain::scrobble::same_track;
 
 /// The version of a listen record's shape.
 pub const LISTEN_RECORD_VERSION: u32 = 1;
@@ -120,6 +121,37 @@ pub struct SendStamps {
     pub sent_boot: Id,
 }
 
+/// What the one ingest call takes: observations of one kind, from one
+/// endpoint. See decision 5 in docs/design/history.md.
+#[derive(Debug, Clone, Copy)]
+pub enum Observations<'a> {
+    /// One listen, as the playing server sends it, with the stamps of this
+    /// send.
+    Listen {
+        /// The listen.
+        record: &'a ListenRecord,
+        /// The send's stamps.
+        stamps: SendStamps,
+    },
+    /// Import records a history source read for an account, with the
+    /// cursor that says how far it has read.
+    Imports {
+        /// The account, a `service_account`.
+        account: Id,
+        /// What the source read.
+        batch: &'a ritornel_source::Batch,
+    },
+}
+
+/// What the one ingest call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// What became of a listen.
+    Listen(Ingested),
+    /// What became of a batch of import records.
+    Imports(ritornel_source::Stored),
+}
+
 /// What became of a listen sent to the hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ingested {
@@ -174,8 +206,9 @@ pub struct PlayRow {
     pub artist: Option<String>,
     /// See `title`.
     pub album: Option<String>,
-    /// Audio rendered.
-    pub ms_played: i64,
+    /// Audio rendered, where it is known: not for a play another service
+    /// reported.
+    pub ms_played: Option<i64>,
     /// The track's length.
     pub track_duration_ms: Option<i64>,
     /// What became of it.
@@ -186,6 +219,17 @@ pub struct PlayRow {
     pub excluded: bool,
     /// The listens behind it, first first.
     pub listens: Vec<ListenRow>,
+}
+
+/// One stretch of time a listener spent in one zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZonePeriodRow {
+    /// The zone, by its IANA name.
+    pub zone: String,
+    /// From when, as Unix milliseconds; `None` is open.
+    pub from_ms: Option<i64>,
+    /// Until when, not included; `None` is open.
+    pub to_ms: Option<i64>,
 }
 
 /// Where a page of recent plays ended: its last play's instant, when it
@@ -389,11 +433,149 @@ fn zone_periods(connection: &Connection) -> Result<Vec<ZonePeriod>, Error> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// The observations a listen's play can depend on: those joined to it by
-/// `continues` links, either way, as far as they go.
+/// The states of a delivery that can have reached its destination, and so
+/// can come back from it as an echo.
+const MAY_HAVE_ARRIVED: &str = "('sending', 'accepted', 'unknown')";
+
+/// The listen whose play an import is the echo of: a delivery of that
+/// listen to the import's own endpoint, which may have arrived, sent with
+/// the import's time to the second and naming the same track, as sent or as
+/// the service took it. Of several, the earliest listen.
+fn echo_of(
+    connection: &Connection,
+    endpoint: i64,
+    played_at_ms: i64,
+    artist: &str,
+    title: &str,
+) -> Result<Option<i64>, Error> {
+    if played_at_ms % 1000 != 0 {
+        return Ok(None);
+    }
+    let mut sent = connection.prepare_cached(&format!(
+        "SELECT observation_id, artist, title, accepted_artist, accepted_title
+         FROM history_delivery
+         WHERE endpoint_id = ?1 AND sent_timestamp_s = ?2 AND state IN {MAY_HAVE_ARRIVED}
+         ORDER BY observation_id"
+    ))?;
+    let rows = sent.query_map((endpoint, played_at_ms / 1000), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (listen, sent_artist, sent_title, took_artist, took_title) = row?;
+        let took = match (&took_artist, &took_title) {
+            (Some(a), Some(t)) => same_track(artist, title, a, t),
+            _ => false,
+        };
+        if took || same_track(artist, title, &sent_artist, &sent_title) {
+            return Ok(Some(listen));
+        }
+    }
+    Ok(None)
+}
+
+/// The imports that are echoes of this listen's deliveries.
+fn echoes_of(connection: &Connection, listen: i64) -> Result<Vec<i64>, Error> {
+    let mut deliveries = connection.prepare_cached(&format!(
+        "SELECT endpoint_id, sent_timestamp_s FROM history_delivery
+         WHERE observation_id = ?1 AND state IN {MAY_HAVE_ARRIVED}"
+    ))?;
+    let sent: Vec<(i64, i64)> = deliveries
+        .query_map([listen], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut found = Vec::new();
+    let mut at = connection.prepare_cached(
+        "SELECT o.id, i.artist, i.title FROM observation_import i
+         JOIN history_observation o ON o.id = i.observation_id
+         WHERE i.played_at_utc_ms = ?2 AND o.endpoint_id = ?1",
+    )?;
+    for (endpoint, seconds) in sent {
+        let candidates: Vec<(i64, String, String)> = at
+            .query_map((endpoint, seconds * 1000), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (import, artist, title) in candidates {
+            if echo_of(connection, endpoint, seconds * 1000, &artist, &title)? == Some(listen) {
+                found.push(import);
+            }
+        }
+    }
+    Ok(found)
+}
+
+const IMPORT_COLUMNS: &str = "o.id, o.endpoint_id, o.listener_id, o.source_item_id,
+    i.played_at_utc_ms, i.artist, i.title";
+
+/// The imports with these observation IDs, or every import, each with the
+/// listen it is the echo of.
+fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<Import>, Error> {
+    let row = |row: &Row<'_>| -> rusqlite::Result<(i64, i64, i64, i64, i64, String, String)> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+        ))
+    };
+    let found: Vec<(i64, i64, i64, i64, i64, String, String)> = match only {
+        None => {
+            let mut statement = connection.prepare_cached(&format!(
+                "SELECT {IMPORT_COLUMNS} FROM history_observation o
+                 JOIN observation_import i ON i.observation_id = o.id ORDER BY o.id"
+            ))?;
+            statement.query_map([], row)?.collect::<Result<_, _>>()?
+        }
+        Some(only) => {
+            let mut one = connection.prepare_cached(&format!(
+                "SELECT {IMPORT_COLUMNS} FROM history_observation o
+                 JOIN observation_import i ON i.observation_id = o.id WHERE o.id = ?1"
+            ))?;
+            let mut found = Vec::with_capacity(only.len());
+            for observation in only {
+                if let Some(import) = one.query_row([observation], row).optional()? {
+                    found.push(import);
+                }
+            }
+            found
+        }
+    };
+    found
+        .into_iter()
+        .map(
+            |(observation, endpoint, listener, source_item, played_at_ms, artist, title)| {
+                Ok(Import {
+                    observation,
+                    listener,
+                    source_item,
+                    played_at_ms,
+                    echo_of: echo_of(connection, endpoint, played_at_ms, &artist, &title)?,
+                })
+            },
+        )
+        .collect()
+}
+
+/// The observations a play can depend on: a listen's, those joined to it by
+/// `continues` links, either way, as far as they go, and the echoes of
+/// their deliveries; an import's, the listen it is the echo of and that
+/// listen's.
 fn neighbourhood(connection: &Connection, observation: i64) -> Result<BTreeSet<i64>, Error> {
     let mut found = BTreeSet::from([observation]);
     let mut todo = vec![observation];
+    let mut kind = connection.prepare_cached(
+        "SELECT o.kind, o.endpoint_id, i.played_at_utc_ms, i.artist, i.title
+         FROM history_observation o
+         LEFT JOIN observation_import i ON i.observation_id = o.id WHERE o.id = ?1",
+    )?;
     let mut back = connection.prepare_cached(
         "SELECT p.id FROM history_observation o
          JOIN observation_listen l ON l.observation_id = o.id
@@ -408,14 +590,38 @@ fn neighbourhood(connection: &Connection, observation: i64) -> Result<BTreeSet<i
          WHERE o.id = ?1 AND n.continues_source_key = o.source_key",
     )?;
     while let Some(at) = todo.pop() {
-        for statement in [&mut back, &mut forward] {
-            let near: Vec<i64> = statement
-                .query_map([at], |row| row.get(0))?
-                .collect::<Result<_, _>>()?;
-            for next in near {
-                if found.insert(next) {
-                    todo.push(next);
-                }
+        let (what, endpoint, played_at, artist, title): (
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = kind.query_row([at], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        let mut near = Vec::new();
+        if what == "import" {
+            if let (Some(played_at), Some(artist), Some(title)) = (played_at, artist, title) {
+                near.extend(echo_of(connection, endpoint, played_at, &artist, &title)?);
+            }
+        } else {
+            for statement in [&mut back, &mut forward] {
+                let joined: Vec<i64> = statement
+                    .query_map([at], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?;
+                near.extend(joined);
+            }
+            near.extend(echoes_of(connection, at)?);
+        }
+        for next in near {
+            if found.insert(next) {
+                todo.push(next);
             }
         }
     }
@@ -476,7 +682,7 @@ fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
                     count_basis, play_rule_version, grouper_version, excluded, context_kind,
                     context_ref, shuffle, rev)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                         ?17, 'observed', ?18, ?19, ?20, ?21, 'play_rule', ?22, ?23, ?24, ?25,
+                         ?17, 'observed', ?18, ?19, ?20, ?21, ?29, ?22, ?23, ?24, ?25,
                          ?26, ?27, ?28)",
             )?
             .execute(rusqlite::params![
@@ -504,10 +710,11 @@ fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
                 play.play_rule_version,
                 play.grouper_version,
                 play.excluded,
-                play.context_kind.as_str(),
+                play.context_kind.map(ContextKind::as_str),
                 play.context_ref,
                 play.shuffle,
                 write.rev(),
+                play.count_basis.as_str(),
             ])?;
         let event = connection.last_insert_rowid();
         for (observation, role) in &play.observations {
@@ -522,9 +729,43 @@ fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Derives again what a change to a delivery can move: whether an import
+/// is the echo of its listen depends on the delivery's state and on the
+/// names the service took it under. With no import of that second on that
+/// account there is nothing to move.
+pub(crate) fn rederive_delivery(write: &Write<'_>, delivery: i64) -> Result<(), Error> {
+    let connection = write.connection();
+    let (listen, endpoint, seconds): (i64, i64, i64) = connection
+        .prepare_cached(
+            "SELECT observation_id, endpoint_id, sent_timestamp_s FROM history_delivery
+             WHERE id = ?1",
+        )?
+        .query_row([delivery], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    let imports: Vec<i64> = connection
+        .prepare_cached(
+            "SELECT o.id FROM observation_import i
+             JOIN history_observation o ON o.id = i.observation_id
+             WHERE i.played_at_utc_ms = ?2 AND o.endpoint_id = ?1",
+        )?
+        .query_map((endpoint, seconds * 1000), |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if imports.is_empty() {
+        return Ok(());
+    }
+    let mut affected: BTreeSet<i64> = imports.into_iter().collect();
+    affected.insert(listen);
+    rederive(write, &affected, PlayRule::CURRENT)
+}
+
 /// Derives again the plays of these observations, and of everything chained
 /// to them.
-fn rederive(write: &Write<'_>, observations: &BTreeSet<i64>, rule: PlayRule) -> Result<(), Error> {
+pub(crate) fn rederive(
+    write: &Write<'_>,
+    observations: &BTreeSet<i64>,
+    rule: PlayRule,
+) -> Result<(), Error> {
     let connection = write.connection();
     let mut around = BTreeSet::new();
     for observation in observations {
@@ -534,9 +775,15 @@ fn rederive(write: &Write<'_>, observations: &BTreeSet<i64>, rule: PlayRule) -> 
     }
     drop_plays_of(connection, &around)?;
     let listens = listens(connection, Some(&around))?;
-    let items: BTreeSet<i64> = listens.iter().map(|listen| listen.source_item).collect();
+    let imports = imports(connection, Some(&around))?;
+    let items: BTreeSet<i64> = listens
+        .iter()
+        .map(|listen| listen.source_item)
+        .chain(imports.iter().map(|import| import.source_item))
+        .collect();
     let plays = derive::derive(&Inputs {
         listens: &listens,
+        imports: &imports,
         bindings: &bindings(connection, Some(&items))?,
         corrections: &corrections(connection)?,
         zone_periods: &zone_periods(connection)?,
@@ -548,8 +795,10 @@ fn rederive(write: &Write<'_>, observations: &BTreeSet<i64>, rule: PlayRule) -> 
 /// Every play, derived from scratch, as the rows a rebuild would write.
 fn derive_all(connection: &Connection, rule: PlayRule) -> Result<Vec<Play>, Error> {
     let listens = listens(connection, None)?;
+    let imports = imports(connection, None)?;
     Ok(derive::derive(&Inputs {
         listens: &listens,
+        imports: &imports,
         bindings: &bindings(connection, None)?,
         corrections: &corrections(connection)?,
         zone_periods: &zone_periods(connection)?,
@@ -806,14 +1055,18 @@ fn play_rows(
     params: &[&dyn rusqlite::ToSql],
 ) -> Result<Vec<PlayRow>, Error> {
     // A play that is not bound shows the appearance its first listen
-    // queued.
+    // queued, and one another service reported shows what it named.
     let mut statement = connection.prepare(&format!(
         "SELECT pe.id, pe.public_id, pe.event_at_utc_ms, pe.local_date, pe.local_hour,
                 pe.zone_name, pe.utc_offset_minutes, pe.clock_basis, ta.public_id, r.public_id,
-                coalesce(shown.display_title, r.display_title), ac.display_text,
-                rel.display_title, pe.ms_played, pe.track_duration_ms, pe.outcome, pe.counts,
-                pe.excluded
+                coalesce(shown.display_title, r.display_title, imp.title),
+                coalesce(ac.display_text, imp.artist),
+                coalesce(rel.display_title, imp.album), pe.ms_played, pe.track_duration_ms,
+                pe.outcome, pe.counts, pe.excluded
          FROM play_event pe
+         LEFT JOIN observation_import imp ON imp.observation_id = (
+           SELECT peo.observation_id FROM play_event_observation peo
+           WHERE peo.play_event_id = pe.id AND peo.role = 'primary')
          LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
          LEFT JOIN recording r ON r.id = pe.recording_id
          LEFT JOIN track_appearance shown ON shown.id = coalesce(
@@ -896,16 +1149,37 @@ fn play_rows(
 }
 
 impl LibraryStore {
-    /// Takes in one listen through the one ingest path: stores it as an
-    /// observation keyed on the playing server's endpoint and the listen's
-    /// ID, and derives its play, in one transaction. A listen sent again as
-    /// it was writes nothing. See decision 5 in docs/design/history.md.
+    /// The one ingest path, for every observation that comes from outside
+    /// the library: a listen from a player, or import records from a
+    /// history source. Each is stored keyed on its endpoint and its source
+    /// key, with its detail, and its play is derived, in one transaction;
+    /// a batch of imports moves its cursor in the same transaction. What is
+    /// sent again as it was writes nothing. See decision 5 in
+    /// docs/design/history.md.
+    pub fn ingest(&self, observations: Observations<'_>) -> Result<IngestOutcome, Error> {
+        match observations {
+            Observations::Listen { record, stamps } => Ok(IngestOutcome::Listen(
+                self.ingest_listen_by(record, stamps, PlayRule::CURRENT)?,
+            )),
+            Observations::Imports { account, batch } => Ok(IngestOutcome::Imports(
+                self.ingest_import_batch(account, batch, PlayRule::CURRENT)?,
+            )),
+        }
+    }
+
+    /// Takes in one listen through [`ingest`](Self::ingest): stores it as
+    /// an observation keyed on the playing server's endpoint and the
+    /// listen's ID, and derives its play, in one transaction. A listen sent
+    /// again as it was writes nothing.
     pub fn ingest_listen(
         &self,
         record: &ListenRecord,
         stamps: SendStamps,
     ) -> Result<Ingested, Error> {
-        self.ingest_listen_by(record, stamps, PlayRule::CURRENT)
+        match self.ingest(Observations::Listen { record, stamps })? {
+            IngestOutcome::Listen(ingested) => Ok(ingested),
+            IngestOutcome::Imports(_) => Err(Error::Corrupt("a listen ingested as imports")),
+        }
     }
 
     /// As [`ingest_listen`](Self::ingest_listen), judged by `rule`.
@@ -1027,6 +1301,85 @@ impl LibraryStore {
         Ok(written.result_json)
     }
 
+    /// The zones `listener` was in, by date, as the library has them.
+    pub fn zone_periods_of(&self, listener: Id) -> Result<Vec<ZonePeriodRow>, Error> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT zone_name, valid_from_ms, valid_to_ms FROM listener_zone_period
+                 WHERE listener_id = (SELECT id FROM listener WHERE public_id = ?1)
+                 ORDER BY valid_from_ms IS NOT NULL, valid_from_ms, id",
+            )?;
+            let rows = statement.query_map([listener.as_bytes()], |row| {
+                Ok(ZonePeriodRow {
+                    zone: row.get(0)?,
+                    from_ms: row.get(1)?,
+                    to_ms: row.get(2)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Makes `periods` the zones `listener` was in, in place of what was
+    /// there, and derives every play again, in one transaction: a zone that
+    /// was assumed is worked out at derive time, so a corrected one moves
+    /// the local dates of the plays it covers. `receipt` makes the result
+    /// from how many plays changed. See decision 18 and "Time" in
+    /// docs/design/history.md.
+    pub fn set_zone_periods(
+        &self,
+        request: WriteRequest,
+        listener: Id,
+        periods: Vec<ZonePeriodRow>,
+        receipt: impl FnOnce(i64) -> String + Send + 'static,
+    ) -> Result<String, Error> {
+        for period in &periods {
+            if !derive::known_zone(&period.zone) {
+                return Err(Error::Invalid("a zone the zone database does not know"));
+            }
+            if let (Some(from), Some(to)) = (period.from_ms, period.to_ms)
+                && from >= to
+            {
+                return Err(Error::Invalid("a period that ends before it begins"));
+            }
+        }
+        let written = self.write(request, move |write| {
+            let connection = write.connection();
+            let listener: i64 = connection
+                .query_row(
+                    "SELECT id FROM listener WHERE public_id = ?1",
+                    [listener.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or(Error::NotFound("no such listener"))?;
+            connection.execute(
+                "DELETE FROM listener_zone_period WHERE listener_id = ?1",
+                [listener],
+            )?;
+            for period in &periods {
+                connection.execute(
+                    "INSERT INTO listener_zone_period
+                       (listener_id, zone_name, valid_from_ms, valid_to_ms, rev)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (
+                        listener,
+                        &period.zone,
+                        period.from_ms,
+                        period.to_ms,
+                        write.rev(),
+                    ),
+                )?;
+            }
+            let before = derived(connection)?;
+            connection.execute("DELETE FROM play_event_observation", [])?;
+            connection.execute("DELETE FROM play_event", [])?;
+            insert_plays(write, &derive_all(connection, PlayRule::CURRENT)?)?;
+            Ok(receipt(changed(&before, &derived(connection)?)))
+        })?;
+        Ok(written.result_json)
+    }
+
     /// The derived tables as a rebuild compares them.
     pub fn derived_history(&self) -> Result<Vec<String>, Error> {
         self.read(derived)
@@ -1070,6 +1423,53 @@ impl LibraryStore {
                  ORDER BY pe.event_at_utc_ms DESC, pe.public_id DESC LIMIT ?4",
                 &[&listener.as_bytes().as_slice(), &id, &at, &limit],
             )
+        })
+    }
+
+    /// How often `listener` played each recording, and when last, in one
+    /// pass: what the Songs view and a wall read. Only plays that count
+    /// and are not excluded, dated or not, from every source. Read through
+    /// the partial index on counted plays; there is no rollup table
+    /// (decision 24 in docs/design/history.md).
+    pub fn play_counts(&self, listener: Id) -> Result<Vec<(Id, i64, Option<i64>)>, Error> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT r.public_id, counted.plays, counted.last FROM
+                   (SELECT recording_id, count(*) AS plays, max(event_at_utc_ms) AS last
+                    FROM play_event
+                    WHERE listener_id = (SELECT id FROM listener WHERE public_id = ?1)
+                      AND counts = 1 AND excluded = 0 AND recording_id IS NOT NULL
+                    GROUP BY recording_id) counted
+                 JOIN recording r ON r.id = counted.recording_id",
+            )?;
+            let rows = statement.query_map([listener.as_bytes()], |row| {
+                Ok((Id::from_bytes(row.get(0)?), row.get(1)?, row.get(2)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// How often `listener` played one artist's recordings in each year,
+    /// by the plays' local dates, oldest year first: the bars on an
+    /// artist's page. Only dated plays that count and are not excluded.
+    pub fn artist_plays_by_year(&self, listener: Id, artist: Id) -> Result<Vec<(i64, i64)>, Error> {
+        self.read(move |connection| {
+            let mut statement = connection.prepare_cached(
+                "SELECT pe.local_date / 10000 AS year, count(*) FROM play_event pe
+                 WHERE pe.listener_id = (SELECT id FROM listener WHERE public_id = ?1)
+                   AND pe.counts = 1 AND pe.excluded = 0 AND pe.local_date IS NOT NULL
+                   AND pe.recording_id IN (
+                     SELECT r.id FROM artist a
+                     JOIN artist_credit_name acn ON acn.artist_id = a.id
+                     JOIN recording r ON r.display_artist_credit_id = acn.artist_credit_id
+                     WHERE a.canonical_id = (SELECT canonical_id FROM artist WHERE public_id = ?2)
+                       AND r.redirect_to_id IS NULL)
+                 GROUP BY year ORDER BY year",
+            )?;
+            let rows = statement.query_map((listener.as_bytes(), artist.as_bytes()), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
         })
     }
 

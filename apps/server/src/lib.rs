@@ -34,6 +34,7 @@ mod dispatch;
 mod error;
 mod invent;
 mod jobs;
+mod lastfm;
 mod library;
 mod listener;
 mod lock;
@@ -57,6 +58,7 @@ pub use config::{ConfigError, Listen, Origin};
 pub use data_dir::HeldDir;
 pub use error::{EXIT_FAILED, EXIT_IN_USE, EXIT_USAGE, Error};
 pub use jobs::Run;
+pub use lastfm::LastfmRun;
 pub use playback::PlaybackRun;
 /// How the program reads an environment variable. It is passed in, so that a
 /// test can say what the environment holds without changing its own.

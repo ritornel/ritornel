@@ -51,6 +51,11 @@ pub(crate) const SERVER: &[Migration] = &[
         name: "0004_listen_detail",
         sql: include_str!("../migrations/server/0004_listen_detail.sql"),
     },
+    Migration {
+        version: 5,
+        name: "0005_service_session",
+        sql: include_str!("../migrations/server/0005_service_session.sql"),
+    },
 ];
 
 /// The migrations of `library.db`.
@@ -69,6 +74,11 @@ pub(crate) const LIBRARY: &[Migration] = &[
         version: 3,
         name: "0003_listen_detail",
         sql: include_str!("../migrations/library/0003_listen_detail.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "0004_lastfm",
+        sql: include_str!("../migrations/library/0004_lastfm.sql"),
     },
 ];
 

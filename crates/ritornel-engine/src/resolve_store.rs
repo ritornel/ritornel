@@ -164,13 +164,17 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
         }
     }
 
+    // The bindings of files: a scrobble's text-only item is bound by the
+    // scrobble matcher, never by this resolver, and its method is not one
+    // of the resolver's.
     let mut current: HashMap<i64, Current> = HashMap::new();
     let assignments = rows(
         connection,
         "SELECT a.source_item_id, a.recording_id, a.appearance_id, d.method, d.actor_kind,
                 d.needs_review, json_extract(d.evidence_json, '$.across_albums') IS NOT NULL
          FROM assignment a JOIN identity_decision d ON d.id = a.decision_id
-         WHERE a.superseded_at_ms IS NULL",
+         JOIN source_item si ON si.id = a.source_item_id
+         WHERE a.superseded_at_ms IS NULL AND si.item_kind = 'file'",
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,

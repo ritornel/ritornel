@@ -38,7 +38,13 @@ pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
     Job {
         job_id: job.public_id,
         kind: job.kind.clone(),
-        target: job.target.map(|id| JobTarget::Source { id }),
+        target: job.target.map(|id| {
+            if job.kind == crate::lastfm::SYNC_JOB {
+                JobTarget::Account { id }
+            } else {
+                JobTarget::Source { id }
+            }
+        }),
         state: match job.state {
             Engine::Queued => JobState::Queued,
             Engine::Running => JobState::Running,
@@ -58,6 +64,9 @@ pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
         started_at: job.started_at_ms,
         finished_at: job.finished_at_ms,
         scan: scan_summary(job),
+        sync: (job.kind == crate::lastfm::SYNC_JOB)
+            .then(|| serde_json::from_str(job.checkpoint_json.as_deref()?).ok())
+            .flatten(),
     }
 }
 
