@@ -265,13 +265,36 @@ fn run_until_it_dies(data_dir: &Path, variables: &[(&str, &str)]) -> Option<i32>
     child.wait().unwrap().code()
 }
 
+/// A whole-hour zone in which it is now between noon and one, as `TZ`
+/// names it: a server put there has eleven hours before its "today" ends.
+fn a_zone_at_noon() -> String {
+    let hour = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 3600
+        % 24;
+    // From UTC-11 to UTC+12; the Etc names count the other way.
+    match 12 - i64::try_from(hour).unwrap() {
+        0 => "Etc/UTC".to_owned(),
+        east if east > 0 => format!("Etc/GMT-{east}"),
+        west => format!("Etc/GMT+{}", -west),
+    }
+}
+
 #[test]
 fn ritornelctl_play_plays_a_folder_start_to_finish_and_every_listen_reaches_history() {
     let scratch = Scratch::new();
     let (data_dir, music) = (scratch.data_dir(), scratch.music());
     let folder = music.to_str().unwrap();
-    // Fifty times real time: the album is over in under a second.
-    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "50")]);
+    // Fifty times real time: the album is over in under a second. The
+    // server's zone is one far from midnight, so that "today" cannot turn
+    // between the plays and the question of what was played on it.
+    let zone = a_zone_at_noon();
+    let server = Server::start(
+        &data_dir,
+        &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "50"), ("TZ", &zone)],
+    );
     assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
     assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
 
@@ -289,6 +312,7 @@ fn ritornelctl_play_plays_a_folder_start_to_finish_and_every_listen_reaches_hist
         assert_eq!(play["counts"], true);
         assert_eq!(play["outcome"], "listened");
         assert_eq!(play["clockBasis"], "hub_age");
+        assert_eq!(play["zone"], zone.as_str());
         assert_eq!(play["listens"][0]["endReason"], "finished");
     }
     // Newest first: the second track began on its own when the first

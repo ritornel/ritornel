@@ -38,9 +38,12 @@ pub mod covers;
 mod delivery_store;
 mod entropy;
 mod error;
+mod history_facts;
+mod history_pages;
 #[cfg(test)]
 mod history_size;
 mod history_store;
+mod history_stream;
 mod id;
 mod identity_store;
 #[cfg(test)]
@@ -73,11 +76,16 @@ mod testing;
 mod timekeeping;
 mod walk;
 
-pub use artist_pictures::{PictureFolder, PicturesImported, check_picture_folder};
+pub use artist_pictures::{
+    KnownPictureFolder, LastPictureImport, PictureFolder, PicturesImported, check_picture_folder,
+};
 pub use clock::{Clock, SystemClock};
-pub use delivery_store::{DELIVERY_METHOD, Due, ELIGIBILITY_VERSION, SEND_WITHIN_MS, Settled};
+pub use delivery_store::{
+    DELIVERY_METHOD, Due, ELIGIBILITY_VERSION, Playing, SEND_WITHIN_MS, Settled,
+};
 pub use entropy::{Entropy, OsEntropy};
 pub use error::Error;
+pub use history_pages::Today;
 pub use history_store::{
     INGEST_METHOD, IngestOutcome, Ingested, LISTEN_RECORD_VERSION, ListenRecord, ListenRow,
     Observations, PlayCursor, PlayRow, Rebuilt, SendStamps, ZonePeriodRow,

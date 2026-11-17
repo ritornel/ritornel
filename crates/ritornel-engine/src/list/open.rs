@@ -283,7 +283,10 @@ pub(super) fn releases(
 
 /// The live releases of the groups that the releases with these keys are
 /// in: every version of each, and nothing else.
-fn releases_of_groups(connection: &Connection, keys: &[i64]) -> Result<Vec<Release>, Error> {
+pub(super) fn releases_of_groups(
+    connection: &Connection,
+    keys: &[i64],
+) -> Result<Vec<Release>, Error> {
     releases_of_groups_by(connection, keys, None)
 }
 

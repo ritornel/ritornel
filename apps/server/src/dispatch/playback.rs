@@ -205,7 +205,8 @@ impl Core {
     }
 
     /// Sends what the player says changed to the sessions that subscribed,
-    /// and wakes the delivery of a listen that closed.
+    /// wakes the delivery of a listen that closed, and hands Last.fm what
+    /// began to play.
     pub(crate) fn publish_player(&self, events: Vec<PlayerEvent>, state: Option<PlayerState>) {
         for event in events {
             match event {
@@ -216,8 +217,15 @@ impl Core {
                         })));
                         #[cfg(all(feature = "media-session", target_os = "macos"))]
                         self.show_in_media_session(state);
+                        if state.status != Status::Playing {
+                            self.nothing_playing();
+                        }
                     }
                 }
+                PlayerEvent::Began {
+                    appearance,
+                    duration_ms,
+                } => self.now_playing(appearance, duration_ms),
                 PlayerEvent::Progress {
                     entry,
                     position_ms,

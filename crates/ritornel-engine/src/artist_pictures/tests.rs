@@ -180,6 +180,44 @@ fn portraits_are_matched_by_id_and_by_name_and_drawn_in_place_of_covers() {
 }
 
 #[test]
+fn a_refresh_writes_only_what_the_folder_changed() {
+    let (rig, folder) = rig();
+    import(&rig, folder.path(), 0xa1).unwrap();
+    assert_eq!(rig.library.picture_folders().unwrap(), ["artists"]);
+    let checked = super::check_picture_folder(folder.path()).unwrap();
+    let refresh = || {
+        let request = WriteRequest {
+            method: "artists.refreshPictures",
+            command: None,
+            client: None,
+        };
+        rig.library
+            .refresh_artist_pictures(request, "artists", &checked)
+            .unwrap()
+    };
+    // Nothing changed: nothing is written, and no revision is taken.
+    let revision = rig.library.meta().unwrap().revision;
+    assert_eq!(refresh(), None);
+    assert_eq!(rig.library.meta().unwrap().revision, revision);
+
+    portrait(
+        folder.path(),
+        MOSS_ARCADE,
+        "portrait.jpg",
+        &jpeg(30, 30, [200, 40, 40]),
+    );
+    let added = refresh().unwrap();
+    assert_eq!((added.by_mbid, added.dropped), (1, 0));
+    assert_eq!(rig.library.meta().unwrap().revision, revision + 1);
+    assert!(named(&artists(&rig), "Moss Arcade").portrait);
+    assert_eq!(refresh(), None);
+
+    // A portrait no longer chosen is a change too.
+    std::fs::remove_dir_all(folder.path().join(MOSS_ARCADE)).unwrap();
+    assert_eq!(refresh().unwrap().dropped, 1);
+}
+
+#[test]
 fn an_import_again_changes_nothing_and_a_portrait_no_longer_chosen_is_dropped() {
     let (rig, folder) = rig();
     portrait(
@@ -218,6 +256,35 @@ fn an_import_again_changes_nothing_and_a_portrait_no_longer_chosen_is_dropped() 
     let moss = artists(&rig);
     let moss = named(&moss, "Moss Arcade");
     assert!(!moss.portrait && moss.art_id.is_some());
+}
+
+#[test]
+fn the_folders_are_listed_with_their_portraits_and_the_last_import() {
+    let (rig, folder) = rig();
+    assert_eq!(
+        rig.library.picture_folders_and_last_import().unwrap(),
+        (Vec::new(), None)
+    );
+    portrait(
+        folder.path(),
+        MOSS_ARCADE,
+        "portrait.jpg",
+        &jpeg(30, 30, [200, 40, 40]),
+    );
+    import(&rig, folder.path(), 0xa1).unwrap();
+    let (folders, last) = rig.library.picture_folders_and_last_import().unwrap();
+    assert_eq!(
+        folders,
+        [super::KnownPictureFolder {
+            name: "artists".to_owned(),
+            on_this_server: true,
+            portraits: 1,
+        }]
+    );
+    // The receipt this test's import stores is empty.
+    let last = last.unwrap();
+    assert!(last.at_ms > 0);
+    assert_eq!(last.result_json.as_deref(), Some(""));
 }
 
 #[test]
@@ -452,4 +519,78 @@ fn a_folder_checked_is_imported_even_if_its_index_goes_meanwhile() {
     std::fs::remove_file(folder.path().join("index.json")).unwrap();
     let counts = import_checked(&rig, &checked, 0xa1).unwrap();
     assert_eq!(counts.by_mbid, 1);
+}
+
+#[test]
+fn a_picture_disk_that_goes_away_mid_import_drops_no_portrait() {
+    let (rig, folder) = rig();
+    portrait(
+        folder.path(),
+        MOSS_ARCADE,
+        "portrait.jpg",
+        &jpeg(30, 30, [200, 40, 40]),
+    );
+    import(&rig, folder.path(), 0xa1).unwrap();
+    let rows = "SELECT artist_id, picture_id, path FROM artist_picture ORDER BY id";
+    let (held, revision) = (rig.rows(rows), rig.library.meta().unwrap().revision);
+    assert_eq!(held.len(), 1);
+    let refresh = |checked: &super::PictureFolder| {
+        let request = WriteRequest {
+            method: "artists.refreshPictures",
+            command: None,
+            client: None,
+        };
+        rig.library
+            .refresh_artist_pictures(request, "artists", checked)
+    };
+
+    // Checked, then unmounted before its artists are read: gone, or gone
+    // with an empty mount point left at its path.
+    let away = Scratch::new();
+    let moved = away.path().join("unmounted");
+    for mount_point_left in [false, true] {
+        let checked = super::check_picture_folder(folder.path()).unwrap();
+        std::fs::rename(folder.path(), &moved).unwrap();
+        if mount_point_left {
+            std::fs::create_dir(folder.path()).unwrap();
+        }
+        let refused = refresh(&checked);
+        assert!(
+            matches!(&refused, Err(Error::RootOffline { .. })),
+            "{refused:?}"
+        );
+        let refused = import_checked(&rig, &checked, 0xa2);
+        assert!(
+            matches!(&refused, Err(Error::RootOffline { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(rig.rows(rows), held);
+        assert_eq!(rig.library.meta().unwrap().revision, revision);
+        if mount_point_left {
+            std::fs::remove_dir(folder.path()).unwrap();
+        }
+        std::fs::rename(&moved, folder.path()).unwrap();
+    }
+
+    // An artist's folder the system will not read is kept as it was. A
+    // process that may read anything cannot be shown this.
+    let dir = folder.path().join(MOSS_ARCADE);
+    let mode = |bits| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(bits)).unwrap();
+    };
+    mode(0o000);
+    if std::fs::read_dir(&dir).is_err() {
+        let checked = super::check_picture_folder(folder.path()).unwrap();
+        assert_eq!(refresh(&checked).unwrap(), None);
+        let counts = import(&rig, folder.path(), 0xa3).unwrap();
+        assert_eq!((counts.unreadable, counts.dropped), (1, 0));
+        assert_eq!(rig.rows(rows), held);
+    }
+    mode(0o755);
+
+    // Read, and no longer chosen: dropped.
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(import(&rig, folder.path(), 0xa4).unwrap().dropped, 1);
+    assert!(rig.rows(rows).is_empty());
 }

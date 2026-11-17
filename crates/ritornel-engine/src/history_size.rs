@@ -25,7 +25,7 @@ use crate::invent::testing::NOW;
 use crate::invent::{Invented, Plan};
 use crate::testing::{FixedClock, Scratch};
 use crate::{
-    Id, IngestOutcome, LibraryStore, Observations, OsEntropy, ServerStore, WriteRequest,
+    Id, IngestOutcome, LibraryStore, Observations, OsEntropy, ServerStore, Today, WriteRequest,
     ZonePeriodRow,
 };
 
@@ -296,6 +296,41 @@ fn imported_size() {
                 .is_empty()
         );
     });
+    // What an artist's page and an album's read: the sentence, the years
+    // and, for the artist, the records played most.
+    let today = Today {
+        now_ms: NOW,
+        year: 2026,
+        month: 11,
+        date: 20261115,
+    };
+    let page = store
+        .artist_history(listener, artist, today)
+        .unwrap()
+        .unwrap();
+    let artist_page = slowest(5, || {
+        store
+            .artist_history(listener, artist, today)
+            .unwrap()
+            .unwrap();
+    });
+    let album = page.records.first().unwrap().tile.album;
+    let album_page = slowest(5, || {
+        store
+            .album_history(listener, album, today)
+            .unwrap()
+            .unwrap();
+    });
+    // What Lean back reads for a song of the record played most: its facts,
+    // with every play's hour of the listener's to hold the record's against.
+    let song = store.album_page(album).unwrap().unwrap().tracks[0].appearance_id;
+    let lean_back = slowest(5, || {
+        store.track_history(listener, song, today).unwrap().unwrap();
+    });
+    // What the History tab reads: every counted play, by day and artist.
+    let stream = slowest(3, || {
+        assert!(store.history_stream(listener, today).unwrap().months > 200);
+    });
     let report = slowest(1, || {
         store.import_report(account, 50).unwrap();
     });
@@ -316,11 +351,16 @@ fn imported_size() {
     eprintln!(
         "counts of every song ({} songs): {songs:?}\n\
          one artist's plays by year ({} years): {years:?}\n\
+         an artist's page ({} plays): {artist_page:?}\n\
+         an album's page: {album_page:?}\n\
+         Lean back's facts: {lean_back:?}\n\
+         the History tab's stream: {stream:?}\n\
          the import report: {report:?}\n\
          a full rebuild: {rebuild:?}\n\
          plays {}, matched {}",
         counts.len(),
         store.artist_plays_by_year(listener, artist).unwrap().len(),
+        page.plays,
         matched.plays,
         matched.matched_plays,
     );

@@ -82,6 +82,7 @@ export const METHODS = {
   "list.sections": { kind: "query", needsFull: false },
   "list.locate": { kind: "query", needsFull: false },
   "list.close": { kind: "session", needsFull: false },
+  "library.search": { kind: "query", needsFull: false },
   "album.get": { kind: "query", needsFull: false },
   "artist.get": { kind: "query", needsFull: false },
   "media.token": { kind: "session", needsFull: false },
@@ -102,6 +103,10 @@ export const METHODS = {
   "sources.tracks": { kind: "query", needsFull: true },
   "history.recent": { kind: "query", needsFull: false },
   "history.onThisDay": { kind: "query", needsFull: false },
+  "history.artist": { kind: "query", needsFull: false },
+  "history.album": { kind: "query", needsFull: false },
+  "history.track": { kind: "query", needsFull: false },
+  "history.stream": { kind: "query", needsFull: false },
   "history.rebuild": { kind: "command", needsFull: true },
   "history.zones": { kind: "query", needsFull: false },
   "history.setZones": { kind: "command", needsFull: true },
@@ -115,6 +120,8 @@ export const METHODS = {
   "lastfm.setScrobbling": { kind: "command", needsFull: true },
   "lastfm.report": { kind: "query", needsFull: true },
   "artists.importPictures": { kind: "command", needsFull: true },
+  "artists.pictureFolders": { kind: "query", needsFull: true },
+  "library.setWatching": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -142,6 +149,7 @@ export type MethodMap = {
   "list.sections": { params: ViewParams; result: ListSections };
   "list.locate": { params: ListLocateParams; result: ListLocated };
   "list.close": { params: ViewParams; result: ListClosed };
+  "library.search": { params: SearchParams; result: SearchResults };
   "album.get": { params: AlbumGetParams; result: AlbumPage };
   "artist.get": { params: ArtistGetParams; result: ArtistPage };
   "media.token": { params: NoParams; result: MediaToken };
@@ -162,6 +170,10 @@ export type MethodMap = {
   "sources.tracks": { params: SourcesTracksParams; result: SourceTracks };
   "history.recent": { params: HistoryRecentParams; result: RecentPlays };
   "history.onThisDay": { params: OnThisDayParams; result: OnThisDay };
+  "history.artist": { params: ArtistGetParams; result: HistoryOf };
+  "history.album": { params: AlbumGetParams; result: HistoryOf };
+  "history.track": { params: TrackHistoryParams; result: TrackHistory };
+  "history.stream": { params: NoParams; result: HistoryStream };
   "history.rebuild": { params: HistoryRebuildParams; result: HistoryRebuilt };
   "history.zones": { params: NoParams; result: ZonePeriods };
   "history.setZones": { params: SetZonesParams; result: ZonesSet };
@@ -175,6 +187,8 @@ export type MethodMap = {
   "lastfm.setScrobbling": { params: ScrobblingParams; result: ScrobblingSet };
   "lastfm.report": { params: LastfmReportParams; result: LastfmReport };
   "artists.importPictures": { params: ImportPicturesParams; result: PicturesImported };
+  "artists.pictureFolders": { params: NoParams; result: PictureFolders };
+  "library.setWatching": { params: WatchingParams; result: WatchingSet };
 };
 
 /** The name of a method. */
@@ -519,6 +533,37 @@ export type ArtistRow = {
    */
   portrait: boolean,
 };
+
+/**
+ * A rescan or an import the server started on its own.
+ */
+export type AutoRun = {
+  /**
+   * What started it.
+   */
+  trigger: AutoTrigger,
+  /**
+   * When it started, or was queued, as Unix milliseconds.
+   */
+  startedAt: number,
+  /**
+   * When it ended, once it has.
+   */
+  finishedAt?: number,
+  /**
+   * Where it is. An import that found nothing to change succeeded.
+   */
+  state: JobState,
+  /**
+   * The rescan's job. An import is no job, and has none.
+   */
+  jobId?: string,
+};
+
+/**
+ * What starts a rescan or an import on its own.
+ */
+export type AutoTrigger = "change" | "lost" | "returned" | "start" | "timer";
 
 /**
  * One side of a dry run's comparison: what an item is bound to, and how
@@ -869,6 +914,31 @@ export type ErrorData = {
 export type Event = { "topic": "servers" } & ServersEvent | { "topic": "jobs" } & JobsEvent | { "topic": "library" } & LibraryEvent | { "topic": "list" } & ListEvent | { "topic": "playback" } & PlaybackEvent | { "topic": "progress" } & ProgressEvent | { "topic": "queue" } & QueueEvent;
 
 /**
+ * One thing worth saying about what is playing, as Lean back sets it: a
+ * line in large type and a smaller one under it.
+ */
+export type Fact = {
+  /**
+   * What it is about.
+   */
+  kind: FactKind,
+  /**
+   * The line in large type, with what it turns on set apart.
+   */
+  head: Array<Phrase>,
+  /**
+   * The line under it. Left out when there is none.
+   */
+  more?: string,
+};
+
+/**
+ * What a fact Lean back shows is about, so that a client can tell them
+ * apart.
+ */
+export type FactKind = "song_plays" | "first_heard" | "its_year" | "time_of_day" | "on_this_day" | "played_most" | "not_since";
+
+/**
  * A file as the owner judges it: where it is and what its tags say.
  */
 export type FileFacts = {
@@ -1010,6 +1080,59 @@ export type HelloParams = {
 };
 
 /**
+ * The result of `history.artist` and `history.album`: what a page says of
+ * the listener's history with an artist or an album.
+ *
+ * It counts the plays that count and are not excluded, of songs the
+ * library has bound them to: an artist's are the plays of their songs, by
+ * each song's credit; an album's are those heard from one of its
+ * versions. A play bound to no song reaches no page (docs/design/history.md,
+ * "Last.fm"), so this is read again whenever plays change: a binding made
+ * later moves them here.
+ */
+export type HistoryOf = {
+  /**
+   * The plays, dated or not.
+   */
+  plays: number,
+  /**
+   * The local date of the first dated play, as `YYYY-MM-DD`.
+   */
+  firstPlayed?: string,
+  /**
+   * The local date of the last.
+   */
+  lastPlayed?: string,
+  /**
+   * The plays in the 365 days before now.
+   */
+  lastYear: number,
+  /**
+   * The dated plays by year, oldest first. A year with none is left out.
+   */
+  years: Array<YearPlays>,
+  /**
+   * The years the listener's whole history runs over. Left out while
+   * there is no dated play at all, of anything.
+   */
+  span?: YearSpan,
+  /**
+   * For an artist, the records played most, most first, at most six. For
+   * an album, none.
+   */
+  records: Array<RecordPlayed>,
+  /**
+   * The one sentence a page says of it, in its banner. Empty when there
+   * is nothing true to say, which is when there are no plays.
+   */
+  sentence: Array<Phrase>,
+  /**
+   * The library revision this was read at.
+   */
+  libraryRevision: number,
+};
+
+/**
  * The params of `history.rebuild`.
  */
 export type HistoryRebuildParams = {
@@ -1074,6 +1197,49 @@ export type HistoryRecentParams = {
 };
 
 /**
+ * The result of `history.stream`: the listener's whole history as the
+ * History tab draws it, a stream across the months in layers by the year
+ * each artist was first heard (docs/design/ui.md, "History in the
+ * interface").
+ *
+ * It counts every dated play that counts and is not excluded, bound to the
+ * library or not: History is the record of all of it. A play is the
+ * artist's its source named, and an artist is known by their name,
+ * whatever its case. A day of more than 300 plays is a device catching up,
+ * not listening, and is left out.
+ */
+export type HistoryStream = {
+  /**
+   * The first month, as `YYYY-MM`. Left out while there is no history.
+   */
+  from?: string,
+  /**
+   * How many months there are, from the first to this one.
+   */
+  months: number,
+  /**
+   * All the plays in each month.
+   */
+  total: Array<number>,
+  /**
+   * The layers, the oldest year first.
+   */
+  layers: Array<StreamLayer>,
+  /**
+   * The artists the layers name.
+   */
+  artists: Array<string>,
+  /**
+   * The days left out, as devices catching up.
+   */
+  daysLeftOut: number,
+  /**
+   * The library revision this was read at.
+   */
+  libraryRevision: number,
+};
+
+/**
  * The params of `artists.importPictures`.
  */
 export type ImportPicturesParams = {
@@ -1091,6 +1257,39 @@ export type ImportPicturesParams = {
    * reads it.
    */
   path: string,
+};
+
+/**
+ * When the account's history is imported. Only the library's hub imports:
+ * when it starts, when a client such as the desktop app opens and the
+ * last import ended more than an hour before, and six hours after the
+ * last import ended. A sync by hand counts as an import.
+ */
+export type ImportSchedule = {
+  /**
+   * The last sync of the history to end, started by hand or on its own.
+   */
+  last?: LastImport,
+  /**
+   * Whether a sync is queued or running now.
+   */
+  running: boolean,
+  /**
+   * When the server next starts one on its own. Left out while one runs
+   * and while none will start on its own.
+   */
+  next?: number,
+  /**
+   * From this time on, a client opening starts one. Left out as `next`
+   * is.
+   */
+  onOpenAfter?: number,
+  /**
+   * Why none starts on its own, when none will: this server is not the
+   * hub, has no API key, is not signed in, was refused its session, or
+   * the listener has no zones.
+   */
+  off?: string,
 };
 
 /**
@@ -1320,6 +1519,24 @@ export type KeyParams = {
 };
 
 /**
+ * How the last sync of a history ended.
+ */
+export type LastImport = {
+  /**
+   * When it ended.
+   */
+  ended: number,
+  /**
+   * `succeeded`, `failed` or `cancelled`.
+   */
+  state: JobState,
+  /**
+   * Why it failed.
+   */
+  failure?: string,
+};
+
+/**
  * The result of `lastfm.report`: how much of the imported history matched
  * the library.
  */
@@ -1441,6 +1658,10 @@ export type LastfmStatus = {
    * imported play has no local date. A sync is refused until they have.
    */
   zonesSet: boolean,
+  /**
+   * When the history was last imported, and when it next is.
+   */
+  import: ImportSchedule,
 };
 
 /**
@@ -2010,6 +2231,61 @@ export type Penalties = {
    * Whether a shared ISRC or AcoustID halved the distance.
    */
   sharedIdentifier: boolean,
+};
+
+/**
+ * A run of words in a sentence, set apart where it is `strong`: the facts
+ * a sentence turns on, a month or a count, are.
+ */
+export type Phrase = {
+  /**
+   * The words.
+   */
+  text: string,
+  /**
+   * Whether they are set apart.
+   */
+  strong: boolean,
+};
+
+/**
+ * One picture folder the library takes artists' portraits from.
+ */
+export type PictureFolder = {
+  /**
+   * Its name, as a root's.
+   */
+  name: string,
+  /**
+   * Where it is on the server that answered. It is left out when that
+   * server has no path for it, as for a source's root.
+   */
+  path?: string,
+  /**
+   * The portraits the library holds from it now.
+   */
+  portraits: number,
+};
+
+/**
+ * The result of `artists.pictureFolders`: the picture folders, and the
+ * last import of one.
+ */
+export type PictureFolders = {
+  /**
+   * Every picture folder, in the order they were first imported.
+   */
+  folders: Array<PictureFolder>,
+  /**
+   * When the last import that wrote something was committed, asked for
+   * or started on its own, as Unix milliseconds. Left out before any.
+   */
+  lastImportAt?: number,
+  /**
+   * What that import answered, while the library keeps its receipt. One
+   * started on its own has none.
+   */
+  lastImport?: PicturesImported,
 };
 
 /**
@@ -3007,6 +3283,58 @@ export type RecentPlays = {
 };
 
 /**
+ * One of the records of an artist that was played most.
+ */
+export type RecordPlayed = {
+  /**
+   * Its plays.
+   */
+  plays: number,
+  /**
+   * The year it was played most: the first such, when two tie.
+   */
+  peakYear: number,
+  /**
+   * What the tile is.
+   */
+  ref: AlbumRef,
+  /**
+   * The title of the release it shows. `null` until the library has one.
+   */
+  title: string | null,
+  /**
+   * Who it is by.
+   */
+  artistCredit: Credit | null,
+  /**
+   * The year it first came out, for a group shown as one tile, or the
+   * release's own year.
+   */
+  year: number | null,
+  /**
+   * How many tracks the release it shows has.
+   */
+  trackCount: number,
+  /**
+   * How long they are together.
+   */
+  durationMs: number,
+  /**
+   * How many versions its group has. 1 for a record with one.
+   */
+  versionCount: number,
+  /**
+   * Its cover, for `GET /v1/art/{artId}/{size}`. `null` when it has none.
+   */
+  artId: string | null,
+  /**
+   * The best copy across its tracks. `null` when none of its tracks has
+   * a copy the library has read.
+   */
+  quality: Quality | null,
+};
+
+/**
  * What kind of record a release group is, as a release-type tag writes it
  * (MusicBrainz's primary type).
  */
@@ -3251,6 +3579,58 @@ export type ScrobblingSet = {
 };
 
 /**
+ * The params of `library.search`.
+ */
+export type SearchParams = {
+  /**
+   * What was typed. Case and accents are ignored, as `list.open` ignores
+   * them, and so is the punctuation between words.
+   */
+  text: string,
+  /**
+   * How many of each kind, at most [`MAX_SEARCH_RESULTS`]. Left out, 5.
+   */
+  limit?: number,
+};
+
+/**
+ * The result of `library.search`: the best matches of each kind.
+ *
+ * A row matches when its own name has a word that starts with what was
+ * typed: an artist by their name or the name they are filed under, a
+ * record or a song by its title. "pine" finds Pinegrove and The Pines and
+ * not Happiness. Each kind is ranked the same way: a name that is what was
+ * typed, then one that starts with it, then one with a word that does;
+ * within each, the most played first, then as the walls file them. A song
+ * on several records is listed once.
+ */
+export type SearchResults = {
+  /**
+   * Artists who have a record in the library, as the Artists list has
+   * them.
+   */
+  artists: Array<ArtistRow>,
+  /**
+   * Records, as the Albums list has them.
+   */
+  albums: Array<AlbumTile>,
+  /**
+   * Songs, as the Songs list has them, with their record's cover.
+   */
+  songs: Array<SongFound>,
+  /**
+   * The kind whose first row is the best match of all: artists before
+   * records before songs among equals. Return opens it. `null` when
+   * nothing matched.
+   */
+  top: ListKind | null,
+  /**
+   * The library revision this was read at.
+   */
+  libraryRevision: number,
+};
+
+/**
  * Where one section of a view begins.
  */
 export type Section = {
@@ -3347,6 +3727,11 @@ export type ServerStatus = {
    * disk.
    */
   logPath: string,
+  /**
+   * Whether the server watches its folders for changes, and what it last
+   * did on its own. Left out by a server that does not say.
+   */
+  watch?: WatchStatus,
 };
 
 /**
@@ -3491,6 +3876,84 @@ export type SocketTicket = {
    * each time it connects.
    */
   expiresInMs: number,
+};
+
+/**
+ * A song that search found: its row, and the cover of the record it is
+ * on, which a Songs row does not carry.
+ */
+export type SongFound = {
+  /**
+   * Its record's cover, for `GET /v1/art/{artId}/{size}`. `null` when it
+   * has none, or the song is on no record.
+   */
+  artId: string | null,
+  /**
+   * The track appearance.
+   */
+  appearanceId: string,
+  /**
+   * The recording it is of.
+   */
+  recordingId: string,
+  /**
+   * The release it is on. `null` for a loose file.
+   */
+  releaseId: string | null,
+  /**
+   * Its title.
+   */
+  title: string | null,
+  /**
+   * Who it is by.
+   */
+  artistCredit: Credit | null,
+  /**
+   * The title of its release.
+   */
+  albumTitle: string | null,
+  /**
+   * Its disc number.
+   */
+  disc: number | null,
+  /**
+   * Its track number.
+   */
+  track: number | null,
+  /**
+   * The year of its release.
+   */
+  year: number | null,
+  /**
+   * How long it is.
+   */
+  durationMs: number | null,
+  /**
+   * How many times its recording has been played, by the current rule.
+   */
+  playCount: number,
+  /**
+   * When its recording was last played, or `null` when no dated play
+   * exists.
+   */
+  lastPlayedAt: number | null,
+  /**
+   * When it came into the library.
+   */
+  addedAt: number | null,
+  /**
+   * The copies of it that exist, and where.
+   */
+  copies: Array<TrackCopy>,
+  /**
+   * The listener's stars for its recording, 0 to 100, ten to the half
+   * star, or `null` when it has none.
+   */
+  rating: number | null,
+  /**
+   * Whether its recording is loved, here or at a service.
+   */
+  loved: boolean,
 };
 
 /**
@@ -3670,7 +4133,7 @@ export type SourcesAddParams = {
  */
 export type SourcesList = {
   /**
-   * Every source, in the order they were added.
+   * Every folder source, in the order they were added.
    */
   sources: Array<Source>,
 };
@@ -3684,6 +4147,26 @@ export type SourcesTracksParams = {
    * file.
    */
   path: string,
+};
+
+/**
+ * One layer of the picture of a listener's history: the artists first
+ * heard in one year, and how much they were played in each month after.
+ */
+export type StreamLayer = {
+  /**
+   * The year its artists were first heard.
+   */
+  year: number,
+  /**
+   * Their plays in each month of the history, the first first.
+   */
+  plays: Array<number>,
+  /**
+   * In each month, the artists of it played most, at most three, most
+   * first, by their place in [`HistoryStream::artists`].
+   */
+  most: Array<Array<number>>,
 };
 
 /**
@@ -3831,6 +4314,39 @@ export type TrackGetParams = {
 };
 
 /**
+ * The result of `history.track`: what Lean back says about the song that
+ * is playing and its record, one fact at a time (docs/design/ui.md, "Lean
+ * back"; the prototype's `leanFacts`).
+ *
+ * It counts as a page does: the plays that count and are not excluded, of
+ * songs the library has bound them to. The song's are the plays of its
+ * recording, wherever it was heard; the record's are those heard from one
+ * of its versions. A song with no such plays has no facts, and a client
+ * shows its title and artist alone.
+ */
+export type TrackHistory = {
+  /**
+   * The facts, in the order they are shown.
+   */
+  facts: Array<Fact>,
+  /**
+   * The library revision this was read at.
+   */
+  libraryRevision: number,
+};
+
+/**
+ * The params of `history.track`.
+ */
+export type TrackHistoryParams = {
+  /**
+   * The track: the appearance that is playing, which names its song and
+   * its record.
+   */
+  appearanceId: string,
+};
+
+/**
  * A love that reaches a track.
  */
 export type TrackLove = {
@@ -3938,6 +4454,111 @@ export type ViewParams = {
 };
 
 /**
+ * How changes to a watched folder are noticed.
+ */
+export type WatchState = "watching" | "polling" | "offline";
+
+/**
+ * How a hub notices changes to its folders: it watches them, rescans a
+ * music root or imports a picture folder once changes settle, and rescans
+ * on a timer as well. See "Watching" in docs/design/identity.md.
+ */
+export type WatchStatus = {
+  /**
+   * Whether this server is noticing changes on its own now.
+   */
+  on: boolean,
+  /**
+   * Whether watching is turned on for this machine, by
+   * `library.setWatching`. It is on until turned off. Watching also
+   * needs this server to be the hub, and a run that watches.
+   */
+  enabled: boolean,
+  /**
+   * Why it is not, when it is not.
+   */
+  off?: string,
+  /**
+   * Each folder it watches, or would.
+   */
+  folders: Array<WatchedFolder>,
+};
+
+/**
+ * A folder a hub watches.
+ */
+export type WatchedFolder = {
+  /**
+   * The root's name.
+   */
+  name: string,
+  /**
+   * What the folder holds.
+   */
+  kind: WatchedKind,
+  /**
+   * How changes to it are noticed.
+   */
+  state: WatchState,
+  /**
+   * Why it is rescanned on a timer alone, when it is.
+   */
+  detail?: string,
+  /**
+   * When the oldest change not yet taken in was seen, as Unix
+   * milliseconds.
+   */
+  pendingSince?: number,
+  /**
+   * The last rescan or import the server started on its own.
+   */
+  lastAuto?: AutoRun,
+};
+
+/**
+ * What a watched folder holds.
+ */
+export type WatchedKind = "music" | "pictures";
+
+/**
+ * The params of `library.setWatching`.
+ */
+export type WatchingParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * Watch the folders for changes, or stop.
+   */
+  on: boolean,
+};
+
+/**
+ * The result of `library.setWatching`: the receipt, and watching as the
+ * status now says it.
+ */
+export type WatchingSet = {
+  /**
+   * Watching, as `server.status` now says it.
+   */
+  watch: WatchStatus,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
  * A stretch of a view's rows: from `offset`, at most `limit` of them.
  */
 export type Window = {
@@ -3949,6 +4570,36 @@ export type Window = {
    * How many rows, at most the descriptor's `maxWindowRows`.
    */
   limit: number,
+};
+
+/**
+ * How many plays fell in one year, by their local dates.
+ */
+export type YearPlays = {
+  /**
+   * The year.
+   */
+  year: number,
+  /**
+   * The plays.
+   */
+  plays: number,
+};
+
+/**
+ * The years a listener's history runs over: from the year of their first
+ * dated play to this one. Every picture of years is drawn across it, so
+ * that a year stands in the same place on every page.
+ */
+export type YearSpan = {
+  /**
+   * The first year.
+   */
+  from: number,
+  /**
+   * This year.
+   */
+  to: number,
 };
 
 /**

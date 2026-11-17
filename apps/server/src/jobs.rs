@@ -61,6 +61,8 @@ pub struct Run {
     pub playback: crate::playback::PlaybackRun,
     /// How this run reaches Last.fm.
     pub lastfm: crate::lastfm::LastfmRun,
+    /// Whether and how this run watches the hub's folders.
+    pub watch: crate::watch::WatchRun,
 }
 
 /// The running worker.
@@ -176,6 +178,8 @@ fn scan(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &A
             Some(Ok(job)) => {
                 info!(job_id = %job_id, state = state.as_str(), "a job ended");
                 core.publish_job(&job);
+                // Changes that waited for this scan to end may go now.
+                core.wake_watch();
             }
             Some(Err(failed)) => {
                 error!(job_id = %job_id, error = %failed, "a job's end could not be saved")

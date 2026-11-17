@@ -38,6 +38,10 @@ pub(crate) struct Known {
     pub(crate) missing: bool,
     /// The audio hash of its current revision, as hex.
     pub(crate) audio: Option<String>,
+    /// Its current revision has no audio because reading it failed on I/O:
+    /// it is read again, whatever its size and time. A scan before
+    /// [`UNAVAILABLE`](crate::media::UNAVAILABLE) recorded such reads.
+    pub(crate) io_failed: bool,
     /// Its folder's images as last recorded: name, size and time.
     pub(crate) images: Vec<(String, u64, i64)>,
 }
@@ -439,7 +443,9 @@ impl LibraryStore {
         self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT si.provider_key, si.id, si.size_bytes, si.mtime_ms, si.missing_since_ms IS NOT NULL,
-                        lower(hex(aa.audio_hash)), json_extract(sr.payload_json, '$.folder_images')
+                        lower(hex(aa.audio_hash)), json_extract(sr.payload_json, '$.folder_images'),
+                        aa.audio_hash IS NULL
+                          AND json_extract(sr.payload_json, '$.error.kind') IN ('io', 'unavailable')
                  FROM source_item si
                  LEFT JOIN source_item_revision sr ON sr.id = si.current_revision_id
                  LEFT JOIN audio_asset aa ON aa.id = sr.audio_asset_id
@@ -457,6 +463,7 @@ impl LibraryStore {
                         mtime_ms: row.get::<_, Option<i64>>(3)?.unwrap_or(-1),
                         missing: row.get(4)?,
                         audio: row.get(5)?,
+                        io_failed: row.get::<_, Option<bool>>(7)?.unwrap_or(false),
                         images: images
                             .into_iter()
                             .map(|image| (image.name, image.picture.size, image.mtime_ms))

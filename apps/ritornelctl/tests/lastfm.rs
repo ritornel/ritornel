@@ -335,6 +335,88 @@ fn logs(data_dir: &Path) -> String {
     text
 }
 
+/// What `history artist` or `history album` prints for `name` is the
+/// sentence its page shows, `history.artist` or `history.album` as the
+/// desktop reads it, and both agree with `plays`, every play as
+/// `ritornelctl history` lists it: their count, their first and last days
+/// and their years, of the plays that count and are bound to the invented
+/// album, as only those reach a page. Every invented play here is of that
+/// album and that artist, so the two say the same.
+fn page_agrees_with_the_plays(data_dir: &Path, what: &str, name: &str, plays: &Value) {
+    let page = json(data_dir, &["history", what, name]);
+    let (code, text, stderr) = ritornelctl(data_dir, &["history", what, name]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let said: String = page["sentence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|phrase| phrase["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(text.lines().next(), Some(said.as_str()), "{text}");
+
+    // The plays a page counts, from the list of every play.
+    let mine: Vec<&Value> = plays["plays"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|play| {
+            play["counts"] == true
+                && play["excluded"] == false
+                && play["track"]["recordingId"].is_string()
+                && play["track"]["artist"] == "Invented Artist"
+        })
+        .collect();
+    let mut days: Vec<&str> = mine
+        .iter()
+        .map(|play| play["localDate"].as_str().unwrap())
+        .collect();
+    days.sort_unstable();
+    assert_eq!(page["plays"], mine.len(), "{page}");
+    assert_eq!(
+        mine.len(),
+        23,
+        "the album's two songs ten times each, the play of 2009 and the two heard here"
+    );
+    assert_eq!(page["firstPlayed"], days[0]);
+    assert_eq!(page["lastPlayed"], *days.last().unwrap());
+    let mut years = std::collections::BTreeMap::<String, u64>::new();
+    for day in &days {
+        *years.entry(day[..4].to_owned()).or_default() += 1;
+    }
+    let paged: std::collections::BTreeMap<String, u64> = page["years"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|year| (year["year"].to_string(), year["plays"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(paged, years);
+    for (year, count) in &years {
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with(year.as_str()) && line.contains(&format!(" {count} "))),
+            "{year}: {count} in {text}"
+        );
+    }
+
+    // The play of 2009 began the history, so the album was there from
+    // your first weeks; and the plays of the last day are in the last year.
+    assert!(
+        said.starts_with("With you since your first weeks, July 2009"),
+        "{said}"
+    );
+    let recent = mine
+        .iter()
+        .filter(|play| play["at"].as_i64().unwrap() > (now_s() as i64 - 365 * 86_400) * 1000)
+        .count();
+    assert_eq!(page["lastYear"], recent);
+    if said.contains("in the last year") {
+        assert!(
+            said.ends_with(&format!(" {recent} plays in the last year.")),
+            "{said}"
+        );
+    }
+}
+
 #[test]
 fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
     let scratch = Scratch::new();
@@ -499,9 +581,176 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
     }
     // Sent once: nothing more goes after the echoes are back.
     assert_eq!(fake.scrobbled().len(), 2);
+
+    // What the artist's page and the album's say agrees with the plays.
+    let plays = json(&data_dir, &["history", "--limit", "500"]);
+    for (what, name) in [("artist", "invented artist"), ("album", "Invented Album")] {
+        page_agrees_with_the_plays(&data_dir, what, name, &plays);
+    }
+    let (code, _, stderr) = ritornelctl(&data_dir, &["history", "artist", "Nobody Here"]);
+    assert_eq!(code, Some(1), "a stranger has no page: {stderr}");
     server.stop();
 
     // Nothing the server keeps secret reached a log.
+    let written = logs(&data_dir);
+    for secret in [API_KEY, API_SECRET, SESSION_KEY, TOKEN] {
+        assert!(!written.contains(secret), "a secret in the log");
+    }
+}
+
+#[test]
+fn the_hub_imports_on_its_own_when_it_starts_and_a_failure_waits_for_the_next_trigger() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let fake = FakeLastfm::start("someone", history(now_s()));
+
+    // Set up, and never imported: the next is due now.
+    let server = Server::start(&data_dir, &fake, &[]);
+    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    assert_eq!(ritornelctl(&data_dir, &["lastfm", "signin"]).0, Some(0));
+    let (_, text, _) = ritornelctl(&data_dir, &["lastfm", "status"]);
+    assert!(
+        text.contains("Next import       only by hand: no zones"),
+        "{text}"
+    );
+    let zone = ["history", "zone", "add", "America/New_York"];
+    assert_eq!(ritornelctl(&data_dir, &zone).0, Some(0));
+    let status = json(&data_dir, &["lastfm", "status"]);
+    assert!(status["import"]["next"].is_i64(), "{status}");
+    server.stop();
+
+    // Last.fm cannot be reached: the import the hub starts with fails,
+    // once, and the next waits for a trigger.
+    let dead = {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/2.0/", closed.local_addr().unwrap())
+    };
+    let server = Server::start(
+        &data_dir,
+        &fake,
+        &[("RITORNEL_TEST_LASTFM_URL", dead.as_str())],
+    );
+    until(&data_dir, &["jobs"], |jobs| {
+        jobs["jobs"][0]["state"] == "failed"
+    });
+    let status = json(&data_dir, &["lastfm", "status"]);
+    let import = &status["import"];
+    let ended = import["last"]["ended"].as_i64().unwrap();
+    assert_eq!(import["last"]["state"], "failed", "{status}");
+    assert!(import["last"]["failure"].is_string(), "{status}");
+    assert_eq!(import["next"], ended + 6 * 3_600_000, "{status}");
+    assert_eq!(import["onOpenAfter"], ended + 3_600_000, "{status}");
+    let (_, text, _) = ritornelctl(&data_dir, &["lastfm", "status"]);
+    assert!(text.contains(", failed: Last.fm: "), "{text}");
+    assert!(text.contains(", or when the app opens after "), "{text}");
+    let jobs = json(&data_dir, &["jobs"]);
+    assert_eq!(
+        jobs["jobs"][0]["state"], "failed",
+        "nothing is tried again before a trigger: {jobs}"
+    );
+    server.stop();
+
+    // Reachable again, the hub imports the history when it starts, with
+    // no command.
+    let server = Server::start(&data_dir, &fake, &[]);
+    let jobs = until(&data_dir, &["jobs"], |jobs| {
+        jobs["jobs"][0]["state"] == "succeeded"
+    });
+    assert_eq!(jobs["jobs"][0]["sync"]["stored"], 41, "{jobs}");
+    let status = json(&data_dir, &["lastfm", "status"]);
+    assert_eq!(status["imported"], 41);
+    assert_eq!(status["import"]["last"]["state"], "succeeded", "{status}");
+    let (_, text, _) = ritornelctl(&data_dir, &["lastfm", "status"]);
+    assert!(text.contains(" UTC, succeeded\n"), "{text}");
+    server.stop();
+
+    let written = logs(&data_dir);
+    assert!(written.contains("a Last.fm import starts on its own"));
+    assert!(written.contains("a Last.fm sync failed: the next import tries again"));
+    for secret in [API_KEY, API_SECRET, SESSION_KEY, TOKEN] {
+        assert!(!written.contains(secret), "a secret in the log");
+    }
+}
+
+/// Waits until the fake has been told of `count` tracks playing now, for
+/// at most [`WAIT`], and returns what each sent.
+fn shown(fake: &FakeLastfm, count: usize) -> Vec<std::collections::HashMap<String, String>> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let sent = fake.now_playing();
+        if sent.len() >= count {
+            return sent;
+        }
+        assert!(Instant::now() < deadline, "{sent:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether `ritornelctl now` has the playing track at `ms` or past it.
+fn past(ms: u64) -> impl Fn(&Value) -> bool {
+    move |now| now["positionMs"].as_u64().is_some_and(|at| at >= ms)
+}
+
+#[test]
+fn what_begins_to_play_is_shown_as_playing_now_only_while_scrobbling_is_on() {
+    let scratch = Scratch::new();
+    let (data_dir, music) = (scratch.data_dir(), scratch.music());
+    let folder = music.to_str().unwrap();
+    let fake = FakeLastfm::start("someone", Vec::new());
+    // At real time, so that a track is heard long enough to be shown.
+    let server = Server::start(
+        &data_dir,
+        &fake,
+        &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "1")],
+    );
+    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
+    assert_eq!(ritornelctl(&data_dir, &["lastfm", "signin"]).0, Some(0));
+
+    // Scrobbling off: a track heard for seconds is shown nowhere.
+    assert_eq!(ritornelctl(&data_dir, &["play", folder]).0, Some(0));
+    until(&data_dir, &["now"], past(2_500));
+    assert!(fake.now_playing().is_empty(), "{:?}", fake.now_playing());
+
+    // Turned on, the next track to begin is shown once, under the names
+    // its scrobble would carry.
+    json(&data_dir, &["lastfm", "scrobbling", "on"]);
+    json(&data_dir, &["next"]);
+    let sent = shown(&fake, 1);
+    let field = |name: &str| sent[0].get(name).map(String::as_str);
+    assert_eq!(field("artist"), Some("Invented Artist"));
+    assert_eq!(field("track"), Some("Second Wind"));
+    assert_eq!(field("album"), Some("Invented Album"));
+    assert_eq!(
+        field("albumArtist"),
+        None,
+        "the album's artist is the track's"
+    );
+    assert_eq!(field("trackNumber"), Some("2"));
+    assert_eq!(field("duration"), Some(TRACK_SECONDS.to_string().as_str()));
+    assert_eq!(field("sk"), Some(SESSION_KEY));
+    until(&data_dir, &["now"], past(3_000));
+    assert_eq!(fake.now_playing().len(), 1, "shown once while it plays");
+
+    // A pause shows nothing; playing again shows it again.
+    json(&data_dir, &["pause"]);
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(fake.now_playing().len(), 1);
+    json(&data_dir, &["resume"]);
+    let sent = shown(&fake, 2);
+    assert_eq!(
+        sent[1].get("track").map(String::as_str),
+        Some("Second Wind")
+    );
+    json(&data_dir, &["stop"]);
+    std::thread::sleep(Duration::from_millis(1_500));
+    assert_eq!(fake.now_playing().len(), 2);
+    assert!(
+        fake.scrobbled().is_empty(),
+        "nothing played long enough to count"
+    );
+    server.stop();
+
     let written = logs(&data_dir);
     for secret in [API_KEY, API_SECRET, SESSION_KEY, TOKEN] {
         assert!(!written.contains(secret), "a secret in the log");

@@ -11,15 +11,16 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use ritornel_contract::methods::{
-    self, AlbumGet, ArtistGet, ArtistsImportPictures, EventsSubscribe, EventsUnsubscribe,
-    HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones, HistoryZones, IdentityDryRun,
+    self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, EventsSubscribe,
+    EventsUnsubscribe, HistoryAlbum, HistoryArtist, HistoryOnThisDay, HistoryRebuild,
+    HistoryRecent, HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones, IdentityDryRun,
     IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall, LastfmSetScrobbling,
     LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall, LastfmSync,
-    LibraryCreate, LibraryStats, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
-    MediaTokenCall, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume,
-    PlaybackSeek, PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove,
-    QueueRemove, QueueWindow, RatingsSet, ScanStart, ServerHello, ServerStatus, ServersList,
-    SourcesAdd, SourcesList, SourcesTracks, TracksGet,
+    LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, ListClose, ListLocate,
+    ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet, PlaybackJump,
+    PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet, PlaybackSkip,
+    PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow, RatingsSet, ScanStart,
+    ServerHello, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -54,7 +55,9 @@ mod media_keys;
 mod pages;
 mod playback;
 mod ratings;
+mod watch;
 
+pub(crate) use calls::job_state;
 use lists::Fanout;
 
 /// The largest frame the server reads, in bytes: 1 MiB, which keeps bulk
@@ -126,6 +129,8 @@ pub(crate) struct Core {
     deliveries: crate::playback::Wake,
     /// Last.fm, once the server has started.
     lastfm: std::sync::OnceLock<crate::lastfm::Lastfm>,
+    /// Watching the hub's folders, once the server has started.
+    watch: std::sync::OnceLock<crate::watch::Watching>,
     /// The system's media session, once `serve` has started one.
     #[cfg(all(feature = "media-session", target_os = "macos"))]
     media_session: std::sync::OnceLock<crate::media_session::MediaSession>,
@@ -217,6 +222,7 @@ impl Core {
             has_player: std::sync::atomic::AtomicBool::new(false),
             deliveries: crate::playback::Wake::default(),
             lastfm: std::sync::OnceLock::new(),
+            watch: std::sync::OnceLock::new(),
             #[cfg(all(feature = "media-session", target_os = "macos"))]
             media_session: std::sync::OnceLock::new(),
         })
@@ -228,6 +234,13 @@ impl Core {
 
     pub(crate) fn name(&self) -> String {
         lock(&self.this).name.clone()
+    }
+
+    /// Whether this server is its library's hub, the one server that
+    /// writes it and runs Last.fm.
+    #[cfg_attr(not(feature = "lastfm"), allow(dead_code))]
+    pub(crate) fn is_hub(&self) -> bool {
+        lock(&self.this).role == ServerRole::Hub
     }
 
     /// What kind of session `token` holds, if it holds one. The only
@@ -557,16 +570,29 @@ impl Core {
                     topics: session.unsubscribe(&params.topics),
                 })
             }),
-            LibraryCreate::NAME => {
-                run::<LibraryCreate>(params, |params| self.create_library(stores, &params))
-            }
+            // Each of these may give the hub a folder to watch.
+            LibraryCreate::NAME => run::<LibraryCreate>(params, |params| {
+                let created = self.create_library(stores, &params);
+                self.wake_watch();
+                created
+            }),
             SourcesList::NAME => run::<SourcesList>(params, |_| self.sources_list(stores)),
-            SourcesAdd::NAME => {
-                run::<SourcesAdd>(params, |params| self.sources_add(stores, &params))
-            }
+            SourcesAdd::NAME => run::<SourcesAdd>(params, |params| {
+                let added = self.sources_add(stores, &params);
+                self.wake_watch();
+                added
+            }),
             ScanStart::NAME => run::<ScanStart>(params, |params| self.scan_start(stores, &params)),
+            LibrarySetWatching::NAME => run::<LibrarySetWatching>(params, |params| {
+                self.library_set_watching(stores, &params)
+            }),
+            ArtistsPictureFolders::NAME => {
+                run::<ArtistsPictureFolders>(params, |_| self.artists_picture_folders(stores))
+            }
             ArtistsImportPictures::NAME => run::<ArtistsImportPictures>(params, |params| {
-                self.artists_import_pictures(stores, &params)
+                let imported = self.artists_import_pictures(stores, &params);
+                self.wake_watch();
+                imported
             }),
             JobsList::NAME => run::<JobsList>(params, |_| self.jobs_list(stores)),
             JobsGet::NAME => run::<JobsGet>(params, |params| self.jobs_get(stores, &params)),
@@ -592,6 +618,9 @@ impl Core {
             }
             ListClose::NAME => {
                 run::<ListClose>(params, |params| Ok(Self::list_close(session, &params)))
+            }
+            LibrarySearch::NAME => {
+                run::<LibrarySearch>(params, |params| Self::library_search(stores, &params))
             }
             AlbumGet::NAME => run::<AlbumGet>(params, |params| self.album_get(stores, &params)),
             ArtistGet::NAME => run::<ArtistGet>(params, |params| self.artist_get(stores, &params)),
@@ -645,6 +674,18 @@ impl Core {
             }
             HistoryOnThisDay::NAME => {
                 run::<HistoryOnThisDay>(params, |params| self.history_on_this_day(stores, &params))
+            }
+            HistoryArtist::NAME => {
+                run::<HistoryArtist>(params, |params| self.history_artist(stores, &params))
+            }
+            HistoryAlbum::NAME => {
+                run::<HistoryAlbum>(params, |params| self.history_album(stores, &params))
+            }
+            HistoryTrack::NAME => {
+                run::<HistoryTrack>(params, |params| self.history_track(stores, &params))
+            }
+            HistoryStreamCall::NAME => {
+                run::<HistoryStreamCall>(params, |_| self.history_stream(stores))
             }
             HistoryRebuild::NAME => {
                 run::<HistoryRebuild>(params, |params| self.history_rebuild(stores, &params))
@@ -707,6 +748,15 @@ impl Core {
             client_version = %hello.version,
             "hello"
         );
+        // A person opening an app may want their latest plays: the
+        // Last.fm thread decides whether that starts an import.
+        if !matches!(
+            hello.kind,
+            ritornel_contract::ClientKind::Cli | ritornel_contract::ClientKind::Agent
+        ) && let Some(lastfm) = self.lastfm()
+        {
+            lastfm.client_opened();
+        }
         Ok(Descriptor {
             server: self.public_descriptor(),
             session_kind: session.kind(),
@@ -729,6 +779,7 @@ impl Core {
             }
             None => (None, None),
         };
+        let watch = self.watch_status(stores);
         let this = lock(&self.this);
         Ok(ritornel_contract::ServerStatus {
             server_id: self.server_id,
@@ -746,6 +797,7 @@ impl Core {
                 data_bytes: disk::free_bytes(self.dir.root()),
             },
             log_path: self.dir.logs().to_string_lossy().into_owned(),
+            watch: Some(watch),
         })
     }
 
@@ -1195,6 +1247,12 @@ mod tests {
                 // There is no library, so nothing is said of one.
                 "freeDisk": { "dataBytes": free },
                 "logPath": scratch.path().join("data/logs").to_str().unwrap(),
+                "watch": {
+                    "on": false,
+                    "enabled": true,
+                    "off": "this run of the server does not watch",
+                    "folders": [],
+                },
             })
         );
     }

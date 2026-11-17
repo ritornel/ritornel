@@ -50,3 +50,23 @@ pub(crate) fn mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
+
+/// A clock a test sets.
+#[derive(Debug)]
+pub(crate) struct SetClock(std::sync::atomic::AtomicI64);
+
+impl SetClock {
+    pub(crate) fn at(now_ms: i64) -> Self {
+        Self(std::sync::atomic::AtomicI64::new(now_ms))
+    }
+
+    pub(crate) fn set(&self, now_ms: i64) {
+        self.0.store(now_ms, Ordering::SeqCst);
+    }
+}
+
+impl ritornel_engine::Clock for SetClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}

@@ -279,7 +279,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
         })
         .collect();
     let logs_dir = data_dir.join("logs");
-    assert_eq!(facts.len(), 10, "{}", printed.stdout);
+    assert_eq!(facts.len(), 11, "{}", printed.stdout);
     assert_eq!(
         facts[..7],
         [
@@ -296,6 +296,10 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
     assert_eq!(facts[8].0, "Free disk, data");
     assert_ne!(facts[8].1, "unknown");
     assert_eq!(facts[9], ("Log path", logs_dir.to_str().unwrap()));
+    assert_eq!(
+        facts[10],
+        ("Watching", "off: this server is not the library's hub")
+    );
 
     // For a program: the status as the server sent it.
     let printed = status(&data_dir, &["--json"]);
@@ -317,6 +321,12 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             },
             "freeDisk": { "dataBytes": free },
             "logPath": logs_dir.to_str().unwrap(),
+            "watch": {
+                "on": false,
+                "enabled": true,
+                "off": "this server is not the library's hub",
+                "folders": [],
+            },
         })
     );
 
@@ -394,7 +404,8 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
     // The status shows what now exists.
     let printed = status(&data_dir, &[]);
     let shown = facts(&printed);
-    assert_eq!(shown.len(), 12, "{}", printed.stdout);
+    assert_eq!(shown.len(), 13, "{}", printed.stdout);
+    assert_eq!(shown[12], ("Watching", "on"));
     assert_eq!(shown[2], ("Role", "hub"));
     assert_eq!(
         shown[6..10],

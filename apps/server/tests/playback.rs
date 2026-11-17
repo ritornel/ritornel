@@ -153,9 +153,7 @@ async fn scanned(client: &mut Client, folder: &Path) {
 async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
     tokio::time::timeout(WAIT, async {
         let scratch = Scratch::new();
-        // Four times real time: each half-second track is current for
-        // several of the player's ticks, so each is said, as in use. Far
-        // faster, a track can begin and end between two ticks.
+        // Four times real time: the album is over in well under a second.
         let (server, mut client) = server_at(&scratch, 4).await;
         let folder = album(&scratch);
 
@@ -192,7 +190,6 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
             .await
             .unwrap();
         let first = key();
-        let started = std::time::Instant::now();
         let played = client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
                 idempotency_key: first,
@@ -218,9 +215,12 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
         assert_eq!((window.total, window.queue_revision), (3, 1));
         assert_eq!(window.entries[0].entry_id, played.entry_id.unwrap());
 
-        // The queue changed, the player played, and in well under two
-        // seconds of the test's time (a second and a half of audio at four
-        // times real time, and a few ticks) the album has ended.
+        // The queue changed, the player played, and the album ended. An
+        // event says the state as it is when sent, so a track can begin and
+        // end between two when the machine is slow: those said are in the
+        // queue's order, from the first to the last, and history below has
+        // every one.
+        let ids: Vec<Id> = window.entries.iter().map(|entry| entry.entry_id).collect();
         let (mut queue_events, mut entries) = (0, Vec::new());
         loop {
             match client.next_event().await.unwrap() {
@@ -231,18 +231,22 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
                     {
                         entries.push(entry);
                     }
-                    if event.state.status == PlaybackStatus::Stopped && entries.len() == 3 {
+                    if event.state.status == PlaybackStatus::Stopped
+                        && entries.last() == ids.last()
+                    {
                         break;
                     }
                 }
                 _ => {}
             }
         }
-        let took = started.elapsed();
-        assert!(took < Duration::from_secs(2), "the album took {took:?}");
         assert!(queue_events >= 1);
-        let ids: Vec<Id> = window.entries.iter().map(|entry| entry.entry_id).collect();
-        assert_eq!(entries, ids);
+        let places: Vec<Option<usize>> = entries
+            .iter()
+            .map(|entry| ids.iter().position(|id| id == entry))
+            .collect();
+        assert_eq!(places.first(), Some(&Some(0)), "{places:?}");
+        assert!(places.is_sorted() && !places.contains(&None), "{places:?}");
 
         // Sent again, the play command is answered from its receipt and
         // starts nothing.

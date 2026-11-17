@@ -1,6 +1,7 @@
 //! Last.fm in the server: the client and its API key and secret, the
-//! sign-ins in progress, the job that syncs an account's history, and the
-//! worker that scrobbles. See "Last.fm" in docs/design/history.md.
+//! sign-ins in progress, the job that syncs an account's history, when the
+//! hub starts that job by itself, and the worker that scrobbles and tells
+//! Last.fm what is playing. See "Last.fm" in docs/design/history.md.
 //!
 //! All of it is built with the `lastfm` feature. Without it a server has
 //! the same calls, which say Last.fm is not built in, and links nothing of
@@ -20,8 +21,17 @@ pub(crate) const SERVICE: &str = "lastfm";
 /// The kind of the job that syncs an account's history.
 pub(crate) const SYNC_JOB: &str = "lastfm.sync";
 
-/// The longest the scrobbler sleeps with nothing to do.
+/// The longest the scrobbler sleeps with nothing to do. It is also how
+/// late the six-hourly import may start.
 const IDLE: Duration = Duration::from_secs(60);
+
+/// How long after an import ends a client opening starts another.
+#[cfg(feature = "lastfm")]
+pub(crate) const IMPORT_ON_OPEN_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// How long after an import ends the hub starts another by itself.
+#[cfg(feature = "lastfm")]
+pub(crate) const IMPORT_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// How this run reaches Last.fm. Everything but the credentials is for
 /// tests alone.
@@ -50,6 +60,9 @@ pub(crate) struct Lastfm {
     run: LastfmRun,
     /// What wakes the scrobbler.
     wake: crate::playback::Wake,
+    /// Set when a client opens, until the scrobbler's thread has looked at
+    /// whether that starts an import.
+    opened: AtomicBool,
     /// The client, when the server has an API key and secret.
     #[cfg(feature = "lastfm")]
     client: Option<ritornel_lastfm::Lastfm>,
@@ -59,6 +72,9 @@ pub(crate) struct Lastfm {
     /// Sign-ins in progress, by the ID handed out for each.
     #[cfg(feature = "lastfm")]
     sign_ins: std::sync::Mutex<std::collections::HashMap<ritornel_contract::Id, SignIn>>,
+    /// The track to show as playing now, until the scrobbler takes it.
+    #[cfg(feature = "lastfm")]
+    playing: Slot,
 }
 
 /// Where a sign-in has got to.
@@ -129,20 +145,53 @@ impl Lastfm {
             Self {
                 run,
                 wake: crate::playback::Wake::default(),
+                opened: AtomicBool::new(false),
                 client,
                 problem,
                 sign_ins: std::sync::Mutex::default(),
+                playing: Slot::default(),
             }
         }
         #[cfg(not(feature = "lastfm"))]
         Self {
             wake: crate::playback::Wake::default(),
+            opened: AtomicBool::new(false),
         }
     }
 
     /// Wakes the scrobbler.
     pub(crate) fn wake(&self) {
         self.wake.wake();
+    }
+
+    /// Says a client such as the desktop app has opened, which may start
+    /// an import. The thread decides, so that a hello never waits on it.
+    pub(crate) fn client_opened(&self) {
+        self.opened.store(true, Ordering::SeqCst);
+        self.wake.wake();
+    }
+
+    /// Says a track began to be heard, or was heard again after a pause: it
+    /// replaces any not yet shown as playing, and the scrobbler is woken to
+    /// show it once it has settled.
+    #[cfg_attr(not(feature = "lastfm"), allow(unused_variables))]
+    pub(crate) fn began(&self, appearance: ritornel_contract::Id, duration_ms: i64) {
+        #[cfg(feature = "lastfm")]
+        {
+            self.playing.put(Began {
+                appearance,
+                duration_ms,
+                at: std::time::Instant::now(),
+            });
+            self.wake.wake();
+        }
+    }
+
+    /// Says the player paused or stopped: a track not yet shown as playing
+    /// is let go.
+    pub(crate) fn stopped(&self) {
+        #[cfg(feature = "lastfm")]
+        self.playing.clear();
     }
 
     /// For the crash test: how many batches of a sync are committed before
@@ -165,21 +214,217 @@ mod enabled {
         Due, Job, JobState, LibraryStore, Observations, Progress, ServerStore, ServiceKey,
         ServiceSession, Settled,
     };
-    use ritornel_lastfm::{Outcome, Sent, SessionKey, ToScrobble, Unsent};
+    use ritornel_lastfm::{NotShown, Outcome, Playing, Sent, SessionKey, ToScrobble, Unsent};
     use ritornel_source::{
         Batch, Error as SourceError, HistorySource, Love, LovesStored, Progress as Read, Sink,
         Stored,
     };
-    use tracing::{error, info, warn};
+    use tracing::{debug, error, info, warn};
 
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use super::{Lastfm, SERVICE, SignIn};
+    use super::{IMPORT_EVERY, IMPORT_ON_OPEN_AFTER, Lastfm, SERVICE, SignIn};
     use crate::dispatch::Core;
+
+    /// What may start an import on its own.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Trigger {
+        /// The hub has just started.
+        Start,
+        /// A client such as the desktop app has opened.
+        ClientOpened,
+        /// The scrobbler's thread woke, as it does at least every minute.
+        Timer,
+    }
+
+    impl Trigger {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Start => "start",
+                Self::ClientOpened => "client_opened",
+                Self::Timer => "timer",
+            }
+        }
+    }
+
+    /// What a look at whether an import is due came to.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Auto {
+        /// A sync was queued: this job.
+        Started(Id),
+        /// One is queued or running already, and that one counts.
+        Running,
+        /// The last one ended too recently.
+        NotDue,
+        /// None starts on its own, and this is why.
+        Off(String),
+        /// One was due and could not be queued.
+        Failed(String),
+    }
+
+    pub(crate) fn ms(duration: std::time::Duration) -> i64 {
+        i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+    }
+
+    /// Whether `trigger` starts an import, given when the last one ended.
+    /// A failed one counts, so a failure waits for the next trigger.
+    pub(crate) fn due(trigger: Trigger, last_ended_ms: Option<i64>, now_ms: i64) -> bool {
+        let after = match trigger {
+            Trigger::Start => return true,
+            Trigger::ClientOpened => IMPORT_ON_OPEN_AFTER,
+            Trigger::Timer => IMPORT_EVERY,
+        };
+        last_ended_ms.is_none_or(|ended| now_ms.saturating_sub(ended) >= ms(after))
+    }
+
+    /// One look at whether an import is due, as the scrobbler's thread
+    /// takes it each time it wakes. Its first look is the hub's start.
+    pub(crate) fn import_tick(core: &Core, lastfm: &Lastfm, first: bool) -> Auto {
+        let opened = lastfm.opened.swap(false, Ordering::SeqCst);
+        let trigger = if first {
+            Trigger::Start
+        } else if opened {
+            Trigger::ClientOpened
+        } else {
+            Trigger::Timer
+        };
+        let auto = core.import_if_due(trigger);
+        let (timer, trigger) = (trigger == Trigger::Timer, trigger.as_str());
+        match &auto {
+            Auto::Started(job_id) => {
+                info!(trigger, job_id = %job_id, "a Last.fm import starts on its own")
+            }
+            Auto::Running => debug!(trigger, "a Last.fm import is already queued or running"),
+            // The timer would say so every minute.
+            Auto::NotDue | Auto::Off(_) if timer => {}
+            Auto::NotDue => debug!(trigger, "the last Last.fm import ended too recently"),
+            Auto::Off(why) => debug!(trigger, why = %why, "no Last.fm import starts on its own"),
+            Auto::Failed(failure) => {
+                warn!(trigger, error = %failure, "a Last.fm import could not be started")
+            }
+        }
+        auto
+    }
 
     /// How long a play that could not be sent waits before it is sent
     /// again.
     const RETRY_MS: i64 = 5 * 60 * 1000;
+
+    /// How long a track is heard before Last.fm is told it is playing:
+    /// skipping through several tells it of the one stopped at alone.
+    const SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// The longest a track waits to be shown as playing. One older, kept
+    /// back while the scrobbler was busy, is let go.
+    const STALE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A track that began to be heard.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Began {
+        pub(crate) appearance: Id,
+        pub(crate) duration_ms: i64,
+        pub(crate) at: Instant,
+    }
+
+    /// What there is to show as playing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Taken {
+        /// Nothing.
+        Nothing,
+        /// A track that has not settled yet: look again after this long.
+        Wait(std::time::Duration),
+        /// This track.
+        Show(Began),
+    }
+
+    /// The one track to show as playing: the latest that began wins, and
+    /// it is never kept anywhere else nor sent twice.
+    #[derive(Debug, Default)]
+    pub(crate) struct Slot(std::sync::Mutex<Option<Began>>);
+
+    impl Slot {
+        pub(crate) fn put(&self, began: Began) {
+            *lock(&self.0) = Some(began);
+        }
+
+        pub(crate) fn clear(&self) {
+            *lock(&self.0) = None;
+        }
+
+        /// Takes the track waiting, once it has been heard for [`SETTLE`];
+        /// one older than [`STALE`] is let go.
+        pub(crate) fn take(&self, now: Instant) -> Taken {
+            let mut slot = lock(&self.0);
+            let Some(began) = *slot else {
+                return Taken::Nothing;
+            };
+            let age = now.saturating_duration_since(began.at);
+            if age < SETTLE {
+                return Taken::Wait(SETTLE - age);
+            }
+            *slot = None;
+            if age > STALE {
+                debug!("a track that began too long ago is not shown as playing at Last.fm");
+                return Taken::Nothing;
+            }
+            Taken::Show(began)
+        }
+    }
+
+    /// Tells Last.fm what began to play, once it has settled, when
+    /// scrobbling is on: once, never kept and never sent again. Returns
+    /// how long until a track waiting has settled.
+    pub(crate) fn now_playing_once(core: &Core, lastfm: &Lastfm) -> Option<std::time::Duration> {
+        let began = match lastfm.playing.take(Instant::now()) {
+            Taken::Nothing => return None,
+            Taken::Wait(wait) => return Some(wait),
+            Taken::Show(began) => began,
+        };
+        let client = lastfm.client().ok()?;
+        let session = core.with_stores(|stores| stores.server().service_session(SERVICE));
+        let Some(Ok(Some(session))) = session else {
+            return None;
+        };
+        if session.scrobble_from_ms.is_none() || session.sign_in_again {
+            return None;
+        }
+        let names = match core.with_library(|_, library| library.playing(began.appearance)) {
+            Some(Ok(Some(names))) => names,
+            // Not the library's hub, which alone scrobbles.
+            None => return None,
+            Some(Ok(None)) => {
+                debug!("the track playing has no artist or title to show at Last.fm");
+                return None;
+            }
+            Some(Err(failed)) => {
+                warn!(error = %failed, "the track playing could not be read for Last.fm");
+                return None;
+            }
+        };
+        let playing = Playing {
+            artist: names.artist,
+            title: names.title,
+            album: names.album,
+            album_artist: names.album_artist,
+            track_number: names.track_number.and_then(|n| u32::try_from(n).ok()),
+            duration_ms: Some(began.duration_ms).filter(|ms| *ms > 0),
+        };
+        match client.now_playing(&SessionKey::new(session.key.expose()), &playing) {
+            Ok(()) => debug!("Last.fm is told what is playing"),
+            Err(NotShown::SignInAgain(_)) => {
+                warn!("Last.fm refused the session: nothing is scrobbled until a new sign-in");
+                if let Some(Err(failed)) =
+                    core.with_stores(|stores| stores.server().refuse_service_session(SERVICE))
+                {
+                    error!(error = %failed, "a refused session could not be recorded");
+                }
+            }
+            Err(NotShown::Failed(detail)) => {
+                debug!(error = %detail, "Last.fm could not be told what is playing");
+            }
+        }
+        None
+    }
 
     /// How often a sync's counters are saved and sent to subscribers.
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -380,7 +625,14 @@ mod enabled {
             });
             match finished {
                 Some(Ok(job)) => {
-                    info!(job_id = %job_id, state = state.as_str(), "a job ended");
+                    match &job.error {
+                        Some(failure) if state == JobState::Failed => warn!(
+                            job_id = %job_id,
+                            error = %failure,
+                            "a Last.fm sync failed: the next import tries again"
+                        ),
+                        _ => info!(job_id = %job_id, state = state.as_str(), "a job ended"),
+                    }
                     core.publish_job(&job);
                 }
                 Some(Err(failed)) => {
@@ -677,7 +929,36 @@ mod enabled {
         use ritornel_engine::{Due, ServiceKey, ServiceSession};
         use ritornel_lastfm::{Outcome, Sent, SessionKey, ToScrobble, Unsent};
 
-        use super::{Sending, send_due};
+        use super::{Began, SETTLE, STALE, Sending, Slot, Taken, send_due};
+
+        #[test]
+        fn of_tracks_skipped_through_only_the_last_is_shown_once_it_settles() {
+            let t0 = std::time::Instant::now();
+            let ms = std::time::Duration::from_millis;
+            let began = |byte: u8, after: u64| Began {
+                appearance: Id::from_bytes([byte; 16]),
+                duration_ms: 200_000,
+                at: t0 + ms(after),
+            };
+            let slot = Slot::default();
+            assert_eq!(slot.take(t0), Taken::Nothing);
+            // Three in quick succession: the last wins, once it settles.
+            for (byte, after) in [(1, 0), (2, 300), (3, 600)] {
+                slot.put(began(byte, after));
+            }
+            assert_eq!(slot.take(t0 + ms(700)), Taken::Wait(SETTLE - ms(100)));
+            assert_eq!(slot.take(t0 + ms(600) + SETTLE), Taken::Show(began(3, 600)));
+            // Taken once, it is gone.
+            assert_eq!(slot.take(t0 + ms(5_000)), Taken::Nothing);
+            // A pause before it settles lets it go.
+            slot.put(began(4, 0));
+            slot.clear();
+            assert_eq!(slot.take(t0 + SETTLE), Taken::Nothing);
+            // One kept back too long is let go.
+            slot.put(began(5, 0));
+            assert_eq!(slot.take(t0 + STALE + ms(1)), Taken::Nothing);
+            assert_eq!(slot.take(t0 + STALE + ms(2)), Taken::Nothing);
+        }
 
         fn session(key: &str, on: bool) -> ServiceSession {
             ServiceSession {
@@ -778,7 +1059,9 @@ mod enabled {
 }
 
 /// The thread that scrobbles: it wakes when a listen has been delivered,
-/// or every minute, and sends what is due.
+/// when a track begins to play, when a client opens, or every minute; tells
+/// Last.fm what is playing, starts an import if one is due, and sends what
+/// is due.
 #[derive(Debug)]
 pub(crate) struct Scrobbler {
     core: Arc<Core>,
@@ -825,15 +1108,26 @@ impl Drop for Scrobbler {
     }
 }
 
-#[cfg_attr(not(feature = "lastfm"), allow(unused_variables))]
+#[cfg_attr(
+    not(feature = "lastfm"),
+    allow(unused_variables, unused_assignments, unused_mut)
+)]
 fn scrobble(core: &Core, stop: &AtomicBool) {
+    let mut first = true;
     while !stop.load(Ordering::SeqCst) {
+        let mut wait = IDLE;
         #[cfg(feature = "lastfm")]
         if let Some(lastfm) = core.lastfm() {
+            // First, as it is about now and the rest can wait.
+            if let Some(settling) = now_playing_once(core, lastfm) {
+                wait = settling;
+            }
+            import_tick(core, lastfm, first);
             scrobble_once(core, lastfm, stop);
         }
+        first = false;
         match core.lastfm() {
-            Some(lastfm) => lastfm.wake.wait(IDLE),
+            Some(lastfm) => lastfm.wake.wait(wait),
             None => return,
         }
     }

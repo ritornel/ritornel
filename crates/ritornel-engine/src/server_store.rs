@@ -18,6 +18,10 @@ use crate::{Clock, Entropy, Error, Id, SessionToken, new_id};
 /// credential's. Its value is that session's row ID.
 const LOCAL_CREDENTIAL_SESSION: &str = "local_credential_session_id";
 
+/// The `server_setting` row that says whether the hub watches its folders.
+/// Absent means it does.
+const WATCH_SETTING: &str = "library.watch";
+
 /// The label of the local credential's session. Display text only.
 const LOCAL_CREDENTIAL_LABEL: &str = "local owner";
 
@@ -212,6 +216,33 @@ impl ServerStore {
             let identity = read_identity(&transaction)?;
             transaction.commit()?;
             Ok(identity)
+        })
+    }
+
+    /// Whether the hub watches its folders for changes: on unless turned
+    /// off. See "Watching" in docs/design/identity.md.
+    pub fn watching(&self) -> Result<bool, Error> {
+        self.reader.call(|connection| {
+            let value: Option<String> = connection
+                .query_row(
+                    "SELECT value_json FROM server_setting WHERE key = ?1",
+                    [WATCH_SETTING],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(value.as_deref() != Some("false"))
+        })
+    }
+
+    /// Turns watching on or off, for this machine.
+    pub fn set_watching(&self, on: bool) -> Result<(), Error> {
+        self.writer.call(move |connection| {
+            connection.execute(
+                "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+                (WATCH_SETTING, if on { "true" } else { "false" }),
+            )?;
+            Ok(())
         })
     }
 

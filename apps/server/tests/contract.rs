@@ -25,12 +25,13 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use ritornel_client::contract::methods::{
-    EventsSubscribe, IdentityDryRun, IdentityReview, Method, ServerHello,
+    EventsSubscribe, IdentityDryRun, IdentityReview, LibrarySetWatching, Method, ServerHello,
 };
 use ritornel_client::contract::{
     ART_SIZES, CONTRACT_VERSION, ClientKind, Descriptor, ErrorCode, Event, HelloParams, Id,
     JobState, JobTarget, LibraryStatus, Limits, ListSupport, PublicDescriptor, Receipt,
-    ReceiptStatus, ServerInfo, ServerRole, SessionKind, SourceKind, Topic, capability, route,
+    ReceiptStatus, ServerInfo, ServerRole, SessionKind, SourceKind, Topic, WatchingParams,
+    capability, route,
 };
 use ritornel_client::{Client, Credential, NotRunning, local};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -265,6 +266,54 @@ on_both_transports! {
     a_batch_is_refused_and_a_notification_gets_no_answer
     stopping_the_server_closes_its_connections_and_then_its_database
     a_message_over_the_limit_closes_the_connection_and_no_other
+    watching_is_turned_off_and_on_and_the_status_says_so
+}
+
+async fn watching_is_turned_off_and_on_and_the_status_says_so(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    client
+        .create_library(Id::from_bytes([1; 16]))
+        .await
+        .unwrap();
+    // On until turned off, though this run of the server watches nothing.
+    let before = client.status().await.unwrap().watch.unwrap();
+    assert!(before.enabled && !before.on);
+    let set = |key: u8, on: bool| WatchingParams {
+        idempotency_key: Id::from_bytes([key; 16]),
+        on,
+    };
+    let off = client
+        .call::<LibrarySetWatching>(&set(2, false))
+        .await
+        .unwrap();
+    assert_eq!(
+        off.receipt,
+        Receipt {
+            command_id: Id::from_bytes([2; 16]),
+            status: ReceiptStatus::Done,
+            revision: None,
+        }
+    );
+    assert!(!off.watch.enabled && !off.watch.on);
+    assert_eq!(client.status().await.unwrap().watch.unwrap(), off.watch);
+    // Sent again, it answers the same.
+    assert_eq!(
+        client
+            .call::<LibrarySetWatching>(&set(2, false))
+            .await
+            .unwrap(),
+        off
+    );
+    let on = client
+        .call::<LibrarySetWatching>(&set(3, true))
+        .await
+        .unwrap();
+    assert!(on.watch.enabled);
+    assert_eq!(
+        on.watch.off.as_deref(),
+        Some("this run of the server does not watch")
+    );
 }
 
 async fn hello_answers_with_the_descriptor(via: Via) {
@@ -502,6 +551,18 @@ async fn ended(client: &mut Client, job_id: Id) -> (ritornel_client::contract::J
     }
 }
 
+/// Reads events until the `library` topic has said `revision`. An unsent
+/// event keeps the place of the first it was merged from, so a job's end
+/// can come before the library's last change when the session sends late.
+async fn said(client: &mut Client, mut revisions: Vec<u64>, revision: u64) -> Vec<u64> {
+    while revisions.last() < Some(&revision) {
+        if let Event::Library(event) = client.next_event().await.unwrap() {
+            revisions.push(event.library_revision);
+        }
+    }
+    revisions
+}
+
 async fn a_scan_runs_as_a_job_and_the_stats_say_what_came_out(via: Via) {
     let running = Running::start().await;
     let mut client = running.greeted(via).await;
@@ -561,7 +622,7 @@ async fn a_scan_runs_as_a_job_and_the_stats_say_what_came_out(via: Via) {
     );
     // The files were recorded at revision 3 and resolved at 4, and the
     // library topic said so.
-    assert_eq!(revisions.last(), Some(&4));
+    assert_eq!(said(&mut client, revisions, 4).await.last(), Some(&4));
     assert_eq!(client.status().await.unwrap().library.unwrap().revision, 4);
 
     // The job is a durable resource: it is listed and can be read after it
@@ -612,6 +673,7 @@ async fn a_scan_runs_as_a_job_and_the_stats_say_what_came_out(via: Via) {
         (JobState::Succeeded, 4, 4, 0)
     );
     assert_eq!(revisions, [] as [u64; 0]);
+    assert_eq!(client.status().await.unwrap().library.unwrap().revision, 4);
     assert_eq!(client.library_stats().await.unwrap(), stats);
     assert_eq!(client.jobs().await.unwrap().jobs.len(), 2);
 }

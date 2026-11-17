@@ -212,6 +212,8 @@ struct Rig {
     next_command: u8,
     /// How long the output plays on during each call to it: see [`Rig::busy`].
     busy: u64,
+    /// Each track the player said began to be heard, and its length.
+    began: Vec<(Id, i64)>,
 }
 
 fn setup(
@@ -287,7 +289,27 @@ impl Rig {
             items,
             next_command: 0,
             busy: 0,
+            began: Vec::new(),
         }
+    }
+
+    /// Keeps what the player said began.
+    fn note(&mut self, events: &[super::PlayerEvent]) {
+        for event in events {
+            if let super::PlayerEvent::Began {
+                appearance,
+                duration_ms,
+            } = event
+            {
+                self.began.push((*appearance, *duration_ms));
+            }
+        }
+    }
+
+    /// Ticks the player and keeps what it said began.
+    fn tick(&mut self) {
+        let events = self.player.tick(&self.server, Some(&self.library)).unwrap();
+        self.note(&events);
     }
 
     fn request(&mut self, method: &'static str) -> Request {
@@ -311,7 +333,7 @@ impl Rig {
             self.clock.set(self.clock.now_ms() + step);
             self.hub_clock.set(self.hub_clock.now_ms() + step);
             self.keeper.advance(step);
-            self.player.tick(&self.server, Some(&self.library)).unwrap();
+            self.tick();
             left -= step;
         }
     }
@@ -321,7 +343,7 @@ impl Rig {
         self.clock.set(self.clock.now_ms() + ms);
         self.hub_clock.set(self.hub_clock.now_ms() + ms);
         self.keeper.advance(ms);
-        self.player.tick(&self.server, Some(&self.library)).unwrap();
+        self.tick();
     }
 
     fn play(&mut self, start: usize) {
@@ -338,24 +360,29 @@ impl Rig {
             shuffle: None,
             known: false,
         };
-        self.player
+        let done = self
+            .player
             .play(request, what, &self.server, Some(&self.library))
             .unwrap();
+        self.note(&done.events);
         // The first frames are heard on the next tick.
-        self.player.tick(&self.server, Some(&self.library)).unwrap();
+        self.tick();
     }
 
     fn pause(&mut self) {
         let request = self.request("playback.pause");
-        self.player.pause(request, &self.server).unwrap();
+        let done = self.player.pause(request, &self.server).unwrap();
+        self.note(&done.events);
     }
 
     fn resume(&mut self) {
         let request = self.request("playback.resume");
-        self.player
+        let done = self
+            .player
             .resume(request, &self.server, Some(&self.library))
             .unwrap();
-        self.player.tick(&self.server, Some(&self.library)).unwrap();
+        self.note(&done.events);
+        self.tick();
     }
 
     fn entry(&self) -> Id {
@@ -365,7 +392,8 @@ impl Rig {
     fn seek(&mut self, position_ms: i64) {
         let request = self.request("playback.seek");
         let entry = self.entry();
-        self.player
+        let done = self
+            .player
             .seek(
                 request,
                 entry,
@@ -374,15 +402,18 @@ impl Rig {
                 Some(&self.library),
             )
             .unwrap();
+        self.note(&done.events);
     }
 
     fn skip(&mut self, direction: Direction) {
         let request = self.request("playback.skip");
         let entry = self.entry();
-        self.player
+        let done = self
+            .player
             .skip(request, entry, direction, &self.server, Some(&self.library))
             .unwrap();
-        self.player.tick(&self.server, Some(&self.library)).unwrap();
+        self.note(&done.events);
+        self.tick();
     }
 
     /// The listens staged now, oldest first.
@@ -1340,6 +1371,38 @@ fn an_album_plays_gaplessly_and_each_track_is_a_listen_of_its_own_with_nothing_b
     );
     assert_eq!(rig.fake.loads().len(), 1);
     assert_eq!(rig.player.state().status, Status::Stopped);
+}
+
+#[test]
+fn a_track_is_said_to_begin_when_it_is_first_heard_joined_to_and_resumed_but_not_on_a_seek() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    let first = (rig.tracks[0], ALBUM[0].length_ms);
+    let second = (rig.tracks[1], ALBUM[1].length_ms);
+    // Not when it is asked for, but when it is first heard.
+    assert_eq!(rig.began, []);
+    rig.pass(10_000);
+    assert_eq!(rig.began, [first]);
+    // A pause says nothing; a resume says it again.
+    rig.pause();
+    rig.wait(5_000);
+    assert_eq!(rig.began, [first]);
+    rig.resume();
+    assert_eq!(rig.began, [first, first]);
+    // A seek within the track is the same listen.
+    rig.seek(100_000);
+    rig.pass(1_000);
+    assert_eq!(rig.began, [first, first]);
+    // The output runs straight on into the next track.
+    rig.pass(140_000);
+    assert_eq!(rig.player.state().current.unwrap().index, 1);
+    assert_eq!(rig.began, [first, first, second]);
+    // A skip begins the one after, once it is heard.
+    rig.skip(Direction::Next);
+    rig.pass(1_000);
+    assert_eq!(rig.began.len(), 4);
+    assert_eq!(rig.began[3].0, rig.tracks[2]);
 }
 
 #[test]

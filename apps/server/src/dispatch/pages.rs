@@ -1,9 +1,11 @@
 //! `artist.get` and `album.get`: the reads of an artist's page and an
 //! album's that are one entity each. Their lists are views. See
-//! `ritornel_contract`'s `pages` module.
+//! `ritornel_contract`'s `pages` module. And `library.search`, which holds
+//! no view either.
 
 use ritornel_contract::{
-    AlbumGetParams, AlbumPage, ArtColor, ArtistGetParams, ArtistPage, ErrorCode, Id, RpcError,
+    AlbumGetParams, AlbumPage, ArtColor, ArtistGetParams, ArtistPage, ErrorCode, Id,
+    MAX_SEARCH_RESULTS, RpcError, SearchParams, SearchResults,
 };
 use ritornel_engine::LibraryStore;
 use tracing::debug;
@@ -61,6 +63,30 @@ impl Core {
                 art_color,
                 library_revision: revision,
             })
+        })
+    }
+
+    pub(super) fn library_search(
+        stores: &Stores,
+        params: &SearchParams,
+    ) -> Result<SearchResults, RpcError> {
+        let limit = params.limit.unwrap_or(5);
+        if limit > MAX_SEARCH_RESULTS {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!("a search answers with at most {MAX_SEARCH_RESULTS} of each kind"),
+            ));
+        }
+        Self::library(stores, |library| {
+            let started = std::time::Instant::now();
+            let found = library
+                .search(&params.text, limit as usize)
+                .map_err(failed)?;
+            debug!(
+                ms = started.elapsed().as_secs_f64() * 1000.0,
+                "searched the library"
+            );
+            Ok(found)
         })
     }
 

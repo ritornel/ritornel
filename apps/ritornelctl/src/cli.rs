@@ -14,6 +14,7 @@
 //! ritornelctl seek <position>
 //! ritornelctl volume [<level> | mute | unmute]
 //! ritornelctl history [--limit <n>]
+//! ritornelctl history artist | album <name or ID>
 //! ritornelctl history on-this-day [--day <MM-DD>]
 //! ritornelctl history rebuild [--dry-run]
 //! ritornelctl history zones
@@ -64,6 +65,7 @@ Usage:
   ritornelctl volume [<level> | mute | unmute] [--data-dir <dir>] [--json]
   ritornelctl now | queue [--data-dir <dir>] [--json]
   ritornelctl history [--limit <n>] [--data-dir <dir>] [--json]
+  ritornelctl history artist | album <name or ID> [--data-dir <dir>] [--json]
   ritornelctl history on-this-day [--day <MM-DD>] [--data-dir <dir>] [--json]
   ritornelctl history rebuild [--dry-run] [--data-dir <dir>] [--json]
   ritornelctl history zones [--data-dir <dir>] [--json]
@@ -126,6 +128,12 @@ Commands:
   queue            Show the queue, the current entry marked
   history          Show recent listening, newest first: each play, what
                    became of it, and whether it counts
+  history artist <artist>, history album <album>
+                   Show what an artist's page or an album's says of your
+                   history with it: its sentence, its plays by year and,
+                   for an artist, the records played most. Only plays
+                   matched to a song in the library count. Name it by its
+                   ID, or by its name when that names one
   history on-this-day
                    Show what you listened to on this day in every year
   history rebuild  Drop the plays and derive them again from every listen
@@ -440,6 +448,8 @@ pub(crate) struct HistoryArgs {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 pub(crate) enum HistoryCommand {
+    Artist(OfArgs),
+    Album(OfArgs),
     OnThisDay(DayArgs),
     Rebuild(RebuildArgs),
     Zones(ServerArgs),
@@ -464,6 +474,15 @@ pub(crate) struct ZoneArgs {
     /// The day after the last, as YYYY-MM-DD.
     #[arg(long)]
     pub(crate) until: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `history artist` and `history album` take.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct OfArgs {
+    /// The artist or the album, by its ID or by its name.
+    pub(crate) name: String,
     #[command(flatten)]
     pub(crate) server: ServerArgs,
 }

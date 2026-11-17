@@ -36,7 +36,7 @@ const ASK_EVERY: Duration = Duration::from_secs(3);
 const SIGN_IN_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// An instant as a UTC date and time.
-fn utc(at_ms: i64) -> String {
+pub(crate) fn utc(at_ms: i64) -> String {
     let days = at_ms.div_euclid(86_400_000);
     let ms = at_ms.rem_euclid(86_400_000);
     // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
@@ -106,6 +106,33 @@ fn render_status(status: &LastfmStatus) -> String {
     for count in &status.deliveries {
         lines.push(("Scrobbles", format!("{} {}", count.count, count.state)));
     }
+    let import = &status.import;
+    lines.push((
+        "Last import",
+        import.last.as_ref().map_or_else(
+            || "never".to_owned(),
+            |last| match &last.failure {
+                Some(failure) => format!("{}, failed: {failure}", utc(last.ended)),
+                None => format!("{}, {}", utc(last.ended), last.state.as_str()),
+            },
+        ),
+    ));
+    lines.push((
+        "Next import",
+        match (&import.off, import.running, import.next) {
+            (_, true, _) => "running now".to_owned(),
+            (Some(off), _, _) => format!("only by hand: {off}"),
+            (None, false, Some(next)) => {
+                let open = import
+                    .on_open_after
+                    .filter(|&after| after < next)
+                    .map(|after| format!(", or when the app opens after {}", utc(after)))
+                    .unwrap_or_default();
+                format!("{}{open}", utc(next))
+            }
+            (None, false, None) => "-".to_owned(),
+        },
+    ));
     server::facts(&lines)
 }
 

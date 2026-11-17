@@ -209,6 +209,34 @@ fn not_eligible(
     })
 }
 
+/// The names a play is sent under, of a track appearance `ta` and its
+/// recording `r`: its title, artist, album, the album's artist where it
+/// is not the track's, and its place on the album.
+const NAMES: &str = "coalesce(ta.display_title, r.display_title), ac.display_text,
+    rel.display_title, nullif(rac.display_text, ac.display_text), ta.display_track_number";
+
+/// What [`NAMES`] reads beside `ta` and `r`.
+const NAME_JOINS: &str = "LEFT JOIN artist_credit ac
+      ON ac.id = coalesce(ta.display_artist_credit_id, r.display_artist_credit_id)
+    LEFT JOIN release rel ON rel.id = ta.release_id
+    LEFT JOIN artist_credit rac ON rac.id = rel.display_artist_credit_id";
+
+/// A track as Last.fm's "now playing" shows it: the names its scrobble
+/// would carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Playing {
+    /// The artist.
+    pub artist: String,
+    /// The title.
+    pub title: String,
+    /// The album.
+    pub album: Option<String>,
+    /// The album's artist, where it is not the track's.
+    pub album_artist: Option<String>,
+    /// The track's place on the album.
+    pub track_number: Option<i64>,
+}
+
 /// One eligible play, as it would be sent.
 type Eligible = (
     i64,
@@ -229,20 +257,14 @@ fn eligible(
     listener: i64,
     from_ms: i64,
 ) -> Result<Vec<Eligible>, Error> {
-    let mut statement = connection.prepare(
-        "SELECT peo.observation_id, pe.event_at_utc_ms,
-                coalesce(ta.display_title, r.display_title), ac.display_text, rel.display_title,
-                nullif(rac.display_text, ac.display_text), ta.display_track_number,
-                pe.track_duration_ms
+    let mut statement = connection.prepare(&format!(
+        "SELECT peo.observation_id, pe.event_at_utc_ms, {NAMES}, pe.track_duration_ms
          FROM play_event pe
          JOIN play_event_observation peo ON peo.play_event_id = pe.id AND peo.role = 'primary'
          JOIN history_observation o ON o.id = peo.observation_id AND o.kind = 'listen'
          JOIN recording r ON r.id = pe.recording_id
          LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
-         LEFT JOIN artist_credit ac
-           ON ac.id = coalesce(ta.display_artist_credit_id, r.display_artist_credit_id)
-         LEFT JOIN release rel ON rel.id = ta.release_id
-         LEFT JOIN artist_credit rac ON rac.id = rel.display_artist_credit_id
+         {NAME_JOINS}
          WHERE pe.listener_id = ?1 AND pe.event_at_utc_ms >= ?3
            AND pe.counts = 1 AND pe.excluded = 0 AND pe.evidence_class = 'observed'
            AND pe.clock_basis = 'hub_age'
@@ -251,8 +273,8 @@ fn eligible(
                            WHERE x.play_event_id = pe.id AND xo.endpoint_id = ?2)
            AND NOT EXISTS (SELECT 1 FROM history_delivery d
                            WHERE d.observation_id = peo.observation_id AND d.endpoint_id = ?2)
-         ORDER BY pe.event_at_utc_ms",
-    )?;
+         ORDER BY pe.event_at_utc_ms"
+    ))?;
     let rows = statement.query_map((listener, endpoint, from_ms), |row| {
         Ok((
             row.get(0)?,
@@ -286,6 +308,46 @@ fn eligible(
 }
 
 impl LibraryStore {
+    /// The names a play of this track appearance would be scrobbled under,
+    /// followed through its redirect. `None` for one the library no longer
+    /// has, or that shows no artist or no title, which cannot be sent.
+    pub fn playing(&self, appearance: Id) -> Result<Option<Playing>, Error> {
+        self.read(move |connection| {
+            let found = connection
+                .query_row(
+                    &format!(
+                        "SELECT {NAMES} FROM track_appearance ta
+                         JOIN recording r ON r.id = ta.recording_id
+                         {NAME_JOINS}
+                         WHERE ta.id =
+                           (SELECT canonical_id FROM track_appearance WHERE public_id = ?1)"
+                    ),
+                    [appearance.as_bytes()],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(
+                found.and_then(|(title, artist, album, album_artist, track_number)| {
+                    Some(Playing {
+                        artist: artist?,
+                        title: title?,
+                        album,
+                        album_artist,
+                        track_number,
+                    })
+                }),
+            )
+        })
+    }
+
     /// Records a pending delivery to the account for every play eligible
     /// to be sent there that has none, played from `from_ms` on and within
     /// [`SEND_WITHIN_MS`] of now. Returns how many it recorded; with none

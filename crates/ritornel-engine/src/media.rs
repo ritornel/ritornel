@@ -202,9 +202,29 @@ fn probe(
     symphonia::default::get_probe().probe(hint, stream, FormatOptions::default(), metadata)
 }
 
+/// The kind of a read that failed because the file could not be reached,
+/// not because of what is in it: it was opened, or read, and the system
+/// said no, as a disk that went away does. A scan records nothing of such
+/// a read, so the file keeps what was last read of it and is read again.
+pub(crate) const UNAVAILABLE: &str = "unavailable";
+
+/// The kind of an I/O failure. One the system reports, or a file that has
+/// gone, says nothing of the file's content; a short read does.
+fn io_kind(error: &std::io::Error) -> &'static str {
+    if error.raw_os_error().is_some() || error.kind() == std::io::ErrorKind::NotFound {
+        UNAVAILABLE
+    } else {
+        "io"
+    }
+}
+
+fn io_failed(error: &std::io::Error) -> ReadError {
+    failed(io_kind(error), error.to_string())
+}
+
 fn read_error(error: &Symphonia) -> ReadError {
     let kind = match error {
-        Symphonia::IoError(_) => "io",
+        Symphonia::IoError(error) => io_kind(error),
         Symphonia::DecodeError(_) => "malformed",
         Symphonia::SeekError(_) => "seek",
         Symphonia::Unsupported(_) => "unsupported",
@@ -455,7 +475,7 @@ fn read_audio(path: &Path, payload: &mut Payload) -> Result<(), ReadError> {
     if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
         hint.with_extension(extension);
     }
-    let open = || File::open(path).map_err(|error| failed("io", error.to_string()));
+    let open = || File::open(path).map_err(|error| io_failed(&error));
     let mut format = probe(Box::new(open()?), &hint).map_err(|error| read_error(&error))?;
     payload.container = Some(format.format_info().short_name.to_owned());
     (payload.tags, payload.pictures) = metadata(format.as_mut());
@@ -467,11 +487,8 @@ fn read_audio(path: &Path, payload: &mut Payload) -> Result<(), ReadError> {
         "mp1" | "mp2" | "mp3" | "flac"
     ) {
         let mut file = open()?;
-        let total = file
-            .metadata()
-            .map_err(|error| failed("io", error.to_string()))?
-            .len();
-        let end = audio_end(&mut file).map_err(|error| failed("io", error.to_string()))?;
+        let total = file.metadata().map_err(|error| io_failed(&error))?.len();
+        let end = audio_end(&mut file).map_err(|error| io_failed(&error))?;
         if end < total {
             format = probe(Box::new(Bounded { file, len: end }), &hint)
                 .map_err(|error| read_error(&error))?;
@@ -614,6 +631,14 @@ pub(crate) fn read_file(
         error: None,
     };
     payload.error = read_audio(&root.join(rel_path), &mut payload).err();
+    if payload
+        .error
+        .as_ref()
+        .is_some_and(|error| error.kind == UNAVAILABLE)
+    {
+        // What was read before the system said no is not the file's audio.
+        payload.audio = None;
+    }
     payload
 }
 
@@ -633,6 +658,25 @@ mod tests {
         assert_eq!(image_size(b"GIF89a\x10\0\x08\0"), Some((16, 8)));
         assert_eq!(image_size(b"not an image"), None);
         assert_eq!(image_size(&[0xff, 0xd8, 0xff]), None);
+    }
+
+    #[test]
+    fn a_failure_the_system_reports_is_not_the_files_fault_and_a_short_read_is() {
+        let gone = std::io::Error::from_raw_os_error(6);
+        assert_eq!(io_kind(&gone), UNAVAILABLE);
+        assert_eq!(io_kind(&std::io::Error::from_raw_os_error(5)), UNAVAILABLE);
+        let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        assert_eq!(io_kind(&missing), UNAVAILABLE);
+        let short = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "end of stream");
+        assert_eq!(io_kind(&short), "io");
+        assert_eq!(read_error(&Symphonia::IoError(gone)).kind, UNAVAILABLE);
+        assert_eq!(read_error(&Symphonia::IoError(short)).kind, "io");
+
+        // A file that is not there when it is read is unavailable, with
+        // nothing of its audio kept.
+        let payload = read_file(Path::new("/nonexistent-root"), "a.flac", 1, 1, Vec::new());
+        assert_eq!(payload.error.unwrap().kind, UNAVAILABLE);
+        assert_eq!(payload.audio, None);
     }
 
     #[test]

@@ -5,11 +5,16 @@
 //! ```text
 //! ritornel-server invent --data-dir <dir> --root <dir> --albums <n>
 //!                        [--seed <n>] [--cover-min <px>] [--cover-max <px>]
-//!                        [--showcase]
+//!                        [--showcase] [--plays <n> [--years <n>] [--zone <zone>]]
 //! ```
 //!
 //! `--showcase` adds, after the drawn records, a small library made by hand
-//! for judging an artist's page and an album's.
+//! for judging an artist's page and an album's. `--plays` then invents a
+//! listening history of that many plays over `--years` (18 by default), of
+//! the library's music and of strangers', imported as a Last.fm account
+//! named `invented` would be: see `ritornel_engine::invent::invent_plays`.
+//! Its plays are dated in `--zone`, or in this machine's zone, unless the
+//! library has zones already.
 //!
 //! It takes the data directory's lock, as `serve` does, so it runs while no
 //! server does. A server with no library is given one first, as
@@ -23,9 +28,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clap::Args;
-use ritornel_engine::invent::{self, Plan};
+use ritornel_engine::invent::{self, Plan, PlaysPlan};
 use ritornel_engine::{
-    Clock, Entropy, LibraryStore, OsEntropy, ServerStore, SystemClock, WriteRequest,
+    Clock, Entropy, LibraryStore, OsEntropy, ServerStore, SystemClock, SystemTimekeeper,
+    Timekeeper, WriteRequest,
 };
 
 use crate::data_dir::{self, HeldDir};
@@ -55,6 +61,15 @@ pub(crate) struct InventArgs {
     /// an album's: see `ritornel_engine::invent::seed_showcase`.
     #[arg(long)]
     showcase: bool,
+    /// How many plays of invented history to add.
+    #[arg(long, default_value_t = 0)]
+    plays: usize,
+    /// How many years the invented history runs over.
+    #[arg(long, default_value_t = 18)]
+    years: u32,
+    /// The zone the invented plays are dated in.
+    #[arg(long)]
+    zone: Option<String>,
 }
 
 fn failed(doing: &'static str, path: &std::path::Path, why: impl std::fmt::Display) -> Error {
@@ -131,6 +146,32 @@ pub(crate) fn run(args: &InventArgs, env: Env<'_>, out: &mut dyn Write) -> Resul
         started.elapsed().as_secs_f64()
     )
     .map_err(Error::Output)?;
+    if args.plays > 0 {
+        let started = Instant::now();
+        let zone = args
+            .zone
+            .clone()
+            .or_else(|| SystemTimekeeper.zone())
+            .unwrap_or_else(|| "UTC".to_owned());
+        let plan = PlaysPlan {
+            plays: args.plays,
+            seed: args.seed,
+            now_ms: plan.now_ms,
+            years: args.years,
+            zone,
+        };
+        let stored = invent::invent_plays(&library, &plan, |done, of| {
+            let _ = writeln!(out, "invented {} of {of} plays", done.min(of));
+        })
+        .map_err(|error| failed("invent", &args.root, error))?;
+        writeln!(
+            out,
+            "invented a history of {stored} plays over {} years in {:.1} s",
+            args.years,
+            started.elapsed().as_secs_f64()
+        )
+        .map_err(Error::Output)?;
+    }
     library.close().map_err(Error::Library)?;
     servers.close()?;
     Ok(())

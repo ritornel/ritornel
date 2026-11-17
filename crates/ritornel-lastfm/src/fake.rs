@@ -1,6 +1,6 @@
 //! A fake Last.fm on a loopback socket, for tests: the history of one
-//! invented account, its loved tracks, the desktop sign-in and scrobbling,
-//! answered in the shapes the real service uses. A scrobble it accepts
+//! invented account, its loved tracks, the desktop sign-in, scrobbling and
+//! "now playing", answered in the shapes the real service uses. A scrobble it accepts
 //! joins the history, as on the real service, so a test can see its echo
 //! come back through an import.
 //!
@@ -139,6 +139,16 @@ impl FakeLastfm {
     /// The plays sent to `track.scrobble`, in order.
     pub fn scrobbled(&self) -> Vec<FakeScrobble> {
         lock(&self.state).scrobbled.clone()
+    }
+
+    /// What each `track.updateNowPlaying` sent, in order.
+    pub fn now_playing(&self) -> Vec<HashMap<String, String>> {
+        lock(&self.state)
+            .seen
+            .iter()
+            .filter(|seen| seen.method == "track.updateNowPlaying")
+            .map(|seen| seen.params.clone())
+            .collect()
     }
 
     /// Every request answered, in order.
@@ -289,6 +299,22 @@ fn respond(state: &Mutex<State>, params: HashMap<String, String>) -> (u16, Value
             (
                 200,
                 json!({"scrobbles": {"scrobble": rows, "@attr": {"accepted": accepted, "ignored": 0}}}),
+            )
+        }
+        "track.updatenowplaying" => {
+            if params.get("sk").map(String::as_str) != Some(SESSION_KEY) {
+                return error(9, "Invalid session key");
+            }
+            let text = |name: &str| params.get(name).cloned().unwrap_or_default();
+            (
+                200,
+                json!({"nowplaying": {
+                    "artist": {"corrected": "0", "#text": text("artist")},
+                    "track": {"corrected": "0", "#text": text("track")},
+                    "album": {"corrected": "0", "#text": text("album")},
+                    "albumArtist": {"corrected": "0", "#text": text("albumArtist")},
+                    "ignoredMessage": {"code": "0", "#text": ""},
+                }}),
             )
         }
         _ => error(3, "Invalid Method"),

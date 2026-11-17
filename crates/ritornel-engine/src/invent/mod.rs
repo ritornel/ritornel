@@ -18,11 +18,13 @@
 //! for a scan running while someone scrolls.
 
 mod art;
+mod plays;
 mod showcase;
 #[cfg(test)]
 pub(crate) mod testing;
 mod words;
 
+pub use plays::{ACCOUNT, PlaysPlan, invent_plays};
 pub use showcase::seed_showcase;
 
 use std::collections::HashMap;

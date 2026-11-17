@@ -29,6 +29,23 @@ impl Core {
             lastfm.wake();
         }
     }
+
+    /// Says a track began to be heard, or was heard again after a pause,
+    /// for Last.fm's "now playing". It only puts it where the scrobbler
+    /// takes it from, so the player never waits on Last.fm.
+    pub(crate) fn now_playing(&self, appearance: ritornel_contract::Id, duration_ms: i64) {
+        if let Some(lastfm) = self.lastfm() {
+            lastfm.began(appearance, duration_ms);
+        }
+    }
+
+    /// Says the player paused or stopped: a track not yet shown as playing
+    /// is not shown.
+    pub(crate) fn nothing_playing(&self) {
+        if let Some(lastfm) = self.lastfm() {
+            lastfm.stopped();
+        }
+    }
 }
 
 #[cfg(not(feature = "lastfm"))]
@@ -52,6 +69,7 @@ impl Core {
             deliveries: Vec::new(),
             imported: 0,
             zones_set: false,
+            import: ritornel_contract::ImportSchedule::default(),
         })
     }
 
@@ -99,14 +117,19 @@ impl Core {
 #[cfg(feature = "lastfm")]
 mod enabled {
     use ritornel_contract::methods::{LastfmSync, Method};
-    use ritornel_contract::{DeliveryCount, DoubtfulTrack, NearlyMatched, Receipt, ReceiptStatus};
-    use ritornel_engine::{Command, NewJob, ServiceSession};
+    use ritornel_contract::{
+        DeliveryCount, DoubtfulTrack, ImportSchedule, LastImport, NearlyMatched, Receipt,
+        ReceiptStatus,
+    };
+    use ritornel_engine::{Command, LibraryStore, NewJob, ServiceSession};
 
     use super::*;
     use crate::dispatch::calls::job;
     use crate::dispatch::fingerprint;
     use crate::dispatch::playback::refused;
-    use crate::lastfm::{SERVICE, SYNC_JOB, keep_session};
+    use crate::lastfm::{
+        Auto, IMPORT_EVERY, IMPORT_ON_OPEN_AFTER, SERVICE, SYNC_JOB, Trigger, due, keep_session, ms,
+    };
 
     /// The most doubtful tracks one report lists.
     const MAX_DOUBTFUL: u32 = 1000;
@@ -120,6 +143,22 @@ mod enabled {
 
     fn unsigned(number: i64) -> u64 {
         u64::try_from(number).unwrap_or(0)
+    }
+
+    /// Whether the listener has a zone for any date, which a sync needs.
+    fn zones_set(library: &LibraryStore) -> Result<bool, RpcError> {
+        Ok(match library.default_listener().map_err(refused)? {
+            Some(listener) => !library
+                .zone_periods_of(listener)
+                .map_err(refused)?
+                .is_empty(),
+            None => false,
+        })
+    }
+
+    /// One account has one sync at a time, by this key.
+    fn sync_key(session: &ServiceSession) -> String {
+        session.account_name.to_lowercase()
     }
 
     fn receipt(key: ritornel_contract::Id, status: ReceiptStatus) -> Receipt {
@@ -157,13 +196,7 @@ mod enabled {
             let lastfm = self.lastfm_or_refuse()?;
             let session = stores.server().service_session(SERVICE).map_err(refused)?;
             let (deliveries, imported, zones_set) = Self::library(stores, |library| {
-                let zones_set = match library.default_listener().map_err(refused)? {
-                    Some(listener) => !library
-                        .zone_periods_of(listener)
-                        .map_err(refused)?
-                        .is_empty(),
-                    None => false,
-                };
+                let zones_set = zones_set(library)?;
                 let Some(session) = &session else {
                     return Ok((Vec::new(), 0, zones_set));
                 };
@@ -191,7 +224,143 @@ mod enabled {
                 deliveries,
                 imported,
                 zones_set,
+                import: self.import_schedule(stores, session.as_ref()),
             })
+        }
+
+        /// The session an import would run as, or why none starts on its
+        /// own: only the hub imports, and only when a sync could run.
+        fn importable(&self, stores: &Stores) -> Result<ServiceSession, String> {
+            if !self.is_hub() {
+                return Err("this server is not the library's hub".to_owned());
+            }
+            if !self.lastfm().is_some_and(Lastfm::configured) {
+                return Err("this server has no Last.fm API key and secret".to_owned());
+            }
+            let session = match stores.server().service_session(SERVICE) {
+                Ok(Some(session)) => session,
+                Ok(None) => return Err("not signed in".to_owned()),
+                Err(failed) => return Err(failed.to_string()),
+            };
+            if session.sign_in_again {
+                return Err("Last.fm refused the session: sign in again".to_owned());
+            }
+            match Self::library(stores, zones_set) {
+                Ok(true) => Ok(session),
+                Ok(false) => {
+                    Err("no zones: add one with `ritornelctl history zone add`".to_owned())
+                }
+                Err(failed) => Err(failed.message),
+            }
+        }
+
+        /// Starts an import if `trigger` makes one due and none is queued
+        /// or running. See "Last.fm" in docs/design/history.md.
+        pub(crate) fn import_if_due(&self, trigger: Trigger) -> Auto {
+            self.with_stores(|stores| {
+                let session = match self.importable(stores) {
+                    Ok(session) => session,
+                    Err(why) => return Auto::Off(why),
+                };
+                let (key, server) = (sync_key(&session), stores.server());
+                let last = match server.active_job(SYNC_JOB, &key) {
+                    Ok(Some(_)) => return Auto::Running,
+                    Ok(None) => server.last_ended_job(SYNC_JOB, &key),
+                    Err(failed) => Err(failed),
+                };
+                let last = match last {
+                    Ok(last) => last.and_then(|job| job.finished_at_ms),
+                    Err(failed) => return Auto::Failed(failed.to_string()),
+                };
+                if !due(trigger, last, self.clock.now_ms()) {
+                    return Auto::NotDue;
+                }
+                let started = ritornel_engine::new_id(self.clock.now_ms(), &*self.entropy)
+                    .map_err(refused)
+                    .and_then(|idempotency_key| {
+                        let params = LastfmSyncParams {
+                            idempotency_key,
+                            full: false,
+                        };
+                        self.start_sync(stores, &session, &params)
+                    });
+                match started {
+                    Ok((job, true)) => Auto::Started(job.public_id),
+                    Ok((_, false)) => Auto::Running,
+                    Err(failed) => Auto::Failed(failed.message),
+                }
+            })
+            .unwrap_or_else(|| Auto::Off("the server is stopping".to_owned()))
+        }
+
+        /// When the account was last imported and when it next is.
+        fn import_schedule(
+            &self,
+            stores: &Stores,
+            session: Option<&ServiceSession>,
+        ) -> ImportSchedule {
+            let server = stores.server();
+            let (last, running) = session.map_or((None, false), |session| {
+                let key = sync_key(session);
+                (
+                    server.last_ended_job(SYNC_JOB, &key).ok().flatten(),
+                    server.active_job(SYNC_JOB, &key).ok().flatten().is_some(),
+                )
+            });
+            let off = self.importable(stores).err();
+            let (ended, now) = (
+                last.as_ref().and_then(|job| job.finished_at_ms),
+                self.clock.now_ms(),
+            );
+            // Never imported, or overdue: the thread starts one within a
+            // minute.
+            let after = |interval| {
+                (off.is_none() && !running)
+                    .then(|| ended.map_or(now, |ended| (ended + ms(interval)).max(now)))
+            };
+            ImportSchedule {
+                next: after(IMPORT_EVERY),
+                on_open_after: after(IMPORT_ON_OPEN_AFTER),
+                last: last.as_ref().and_then(|ended| {
+                    Some(LastImport {
+                        ended: ended.finished_at_ms?,
+                        state: job(ended).state,
+                        failure: ended.error.clone(),
+                    })
+                }),
+                running,
+                off,
+            }
+        }
+
+        /// Queues a sync of the account's history, or finds the one that
+        /// is queued or running.
+        fn start_sync(
+            &self,
+            stores: &Stores,
+            session: &ServiceSession,
+            params: &LastfmSyncParams,
+        ) -> Result<(ritornel_engine::Job, bool), RpcError> {
+            let command = Command {
+                id: params.idempotency_key,
+                fingerprint: fingerprint::<LastfmSync>(params)?,
+            };
+            let new = NewJob {
+                kind: SYNC_JOB,
+                dedupe_key: sync_key(session),
+                target: session.account,
+                params_json: serde_json::to_string(params).unwrap_or_default(),
+                session: self.local_credential.session(),
+            };
+            let (started, created) = stores
+                .server()
+                .start_job(command, LastfmSync::NAME, new)
+                .map_err(refused)?;
+            if created {
+                self.publish_job(&started);
+            }
+            self.jobs.wake();
+            Ok((started, created))
         }
 
         pub(in crate::dispatch) fn lastfm_sign_in_start(&self) -> Result<SignInStarted, RpcError> {
@@ -254,19 +423,7 @@ mod enabled {
             let session = Self::session(stores)?;
             // An imported play is dated in the zone the listener was in
             // that day, so the zones come first (history.md, "Last.fm").
-            let zones_set = Self::library(stores, |library| {
-                let listener = library
-                    .default_listener()
-                    .map_err(refused)?
-                    .ok_or_else(|| {
-                        RpcError::new(ErrorCode::Internal, "the library has no listener")
-                    })?;
-                Ok(!library
-                    .zone_periods_of(listener)
-                    .map_err(refused)?
-                    .is_empty())
-            })?;
-            if !zones_set {
+            if !Self::library(stores, zones_set)? {
                 return Err(RpcError::new(
                     ErrorCode::Invalid,
                     "say where you were first, so that each imported play falls on the right \
@@ -274,25 +431,7 @@ mod enabled {
                 )
                 .with_detail("reason", "no_zones"));
             }
-            let command = Command {
-                id: params.idempotency_key,
-                fingerprint: fingerprint::<LastfmSync>(params)?,
-            };
-            let new = NewJob {
-                kind: SYNC_JOB,
-                dedupe_key: session.account_name.to_lowercase(),
-                target: session.account,
-                params_json: serde_json::to_string(params).unwrap_or_default(),
-                session: self.local_credential.session(),
-            };
-            let (started, created) = stores
-                .server()
-                .start_job(command, LastfmSync::NAME, new)
-                .map_err(refused)?;
-            if created {
-                self.publish_job(&started);
-            }
-            self.jobs.wake();
+            let (started, _) = self.start_sync(stores, &session, params)?;
             Ok(LastfmSyncStarted {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Accepted),
                 job: job(&started),
@@ -362,5 +501,329 @@ mod enabled {
                 last: report.last_ms,
             })
         }
+    }
+}
+
+/// When the hub imports on its own, against a clock the test sets. No sync
+/// runs: these look at which jobs are queued, and end them by hand.
+#[cfg(all(test, feature = "lastfm"))]
+mod tests {
+    use std::sync::Arc;
+
+    use ritornel_contract::{CONTRACT_VERSION, ErrorCode, Frame, Request, RequestId, SessionKind};
+    use ritornel_engine::{JobState, OsEntropy, ServerStore, ServiceKey};
+    use ritornel_lastfm::fake::{API_KEY, API_SECRET};
+    use serde_json::{Value, json};
+
+    use super::{Core, Stores};
+    use crate::Bounds;
+    use crate::data_dir::DataDir;
+    use crate::lastfm::{Auto, Lastfm, LastfmRun, SERVICE, SYNC_JOB, import_tick};
+    use crate::session::Session;
+    use crate::testing::{Scratch, SetClock};
+
+    /// 2026-11-16 12:00 UTC.
+    const T0: i64 = 1_763_294_400_000;
+    const MINUTE: i64 = 60_000;
+    const HOUR: i64 = 60 * MINUTE;
+
+    /// A server with Last.fm set up and nothing to reach: nothing here
+    /// sends a request.
+    fn server(clock: &Arc<SetClock>) -> (Core, Scratch) {
+        let scratch = Scratch::new();
+        let dir = DataDir::prepare(scratch.path().join("data")).unwrap();
+        let store = ServerStore::open_in_memory(clock.clone(), Arc::new(OsEntropy)).unwrap();
+        let (identity, issued) = store.ensure_identity("desk").unwrap();
+        let (_, verifier) = crate::credential::ensure(&store, &dir.credential(), issued).unwrap();
+        let core = Core::new(
+            Stores::new(store, None),
+            &identity,
+            &dir,
+            verifier,
+            clock.clone(),
+            Arc::new(OsEntropy),
+            Bounds::default(),
+        )
+        .unwrap();
+        core.set_lastfm(Lastfm::new(
+            LastfmRun {
+                credentials: Some(ritornel_lastfm::ApiCredentials::new(API_KEY, API_SECRET)),
+                base_url: Some("http://127.0.0.1:9/2.0/".to_owned()),
+                ..LastfmRun::default()
+            },
+            dir.root(),
+        ));
+        (core, scratch)
+    }
+
+    fn call(
+        core: &Core,
+        session: &Session,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, ErrorCode> {
+        let request = Frame::Request(Request {
+            id: RequestId::Number(1),
+            method: method.to_owned(),
+            params: Some(params),
+        });
+        let Some(Frame::Response(response)) = core.dispatch(session, request) else {
+            panic!("a request gets a response");
+        };
+        response.outcome.map_err(|error| error.data.code)
+    }
+
+    fn hello(core: &Core, kind: &str) -> Arc<Session> {
+        let session = core.open_session(SessionKind::Full).unwrap();
+        let hello = json!({
+            "name": "test", "kind": kind, "version": "1", "contractVersion": CONTRACT_VERSION
+        });
+        call(core, &session, "server.hello", hello).unwrap();
+        session
+    }
+
+    fn key(byte: u8) -> Value {
+        json!({ "idempotencyKey": ritornel_contract::Id::from_bytes([byte; 16]).to_string() })
+    }
+
+    /// Signs in as an invented account, as a sign-in Last.fm approved
+    /// would.
+    fn sign_in(core: &Core) {
+        core.with_library(|server, library| {
+            let account = library.ensure_service_account(SERVICE, "someone").unwrap();
+            server
+                .save_service_session(SERVICE, account, "someone", &ServiceKey::new("k"), false)
+                .unwrap();
+        })
+        .unwrap();
+    }
+
+    fn set_zone(core: &Core, session: &Session) {
+        let mut zones = key(0x20);
+        zones["periods"] = json!([{ "zone": "Europe/Helsinki" }]);
+        call(core, session, "history.setZones", zones).unwrap();
+    }
+
+    /// A hub, signed in, with a zone.
+    fn hub(clock: &Arc<SetClock>) -> (Core, Scratch, Arc<Session>) {
+        let (core, scratch) = server(clock);
+        let cli = hello(&core, "cli");
+        call(&core, &cli, "library.create", key(0xc0)).unwrap();
+        sign_in(&core);
+        set_zone(&core, &cli);
+        (core, scratch, cli)
+    }
+
+    /// Looks as the Last.fm thread does when it wakes.
+    fn tick(core: &Core, first: bool) -> Auto {
+        import_tick(core, core.lastfm().unwrap(), first)
+    }
+
+    fn syncs(core: &Core) -> Vec<ritornel_engine::Job> {
+        core.with_stores(|stores| stores.server().jobs(100).unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.kind == SYNC_JOB)
+            .collect()
+    }
+
+    /// Ends the sync that is queued, at the clock's time.
+    fn end(core: &Core, state: JobState, failure: Option<&str>) {
+        core.with_stores(|stores| {
+            let job = stores
+                .server()
+                .active_job(SYNC_JOB, "someone")
+                .unwrap()
+                .unwrap();
+            stores
+                .server()
+                .finish_job(job.id, state, failure.map(str::to_owned))
+                .unwrap();
+        })
+        .unwrap();
+    }
+
+    fn schedule(core: &Core, session: &Session) -> Value {
+        call(core, session, "lastfm.status", json!({})).unwrap()["import"].clone()
+    }
+
+    #[test]
+    fn the_hub_imports_when_it_starts_and_then_every_six_hours() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch) = server(&clock);
+        let cli = hello(&core, "cli");
+        call(&core, &cli, "library.create", key(0xc0)).unwrap();
+        // Not signed in, then no zones: nothing starts.
+        assert_eq!(tick(&core, true), Auto::Off("not signed in".to_owned()));
+        sign_in(&core);
+        assert!(matches!(tick(&core, true), Auto::Off(why) if why.starts_with("no zones")));
+        let off = schedule(&core, &cli)["off"].as_str().unwrap().to_owned();
+        assert!(off.starts_with("no zones"), "{off}");
+        set_zone(&core, &cli);
+
+        // The hub starts: an import is queued, and the next look finds it.
+        let Auto::Started(started) = tick(&core, true) else {
+            panic!("an import at the start");
+        };
+        assert_eq!(tick(&core, false), Auto::Running);
+        assert_eq!(schedule(&core, &cli), json!({ "running": true }));
+        let jobs = syncs(&core);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            (jobs[0].public_id, jobs[0].state),
+            (started, JobState::Queued)
+        );
+        assert!(
+            jobs[0].params_json.contains("\"full\":false"),
+            "{}",
+            jobs[0].params_json
+        );
+
+        // It ends; the timer starts the next six hours after, and not
+        // before.
+        end(&core, JobState::Succeeded, None);
+        assert_eq!(
+            schedule(&core, &cli),
+            json!({
+                "last": { "ended": T0, "state": "succeeded" },
+                "running": false,
+                "next": T0 + 6 * HOUR,
+                "onOpenAfter": T0 + HOUR,
+            })
+        );
+        clock.set(T0 + 6 * HOUR - MINUTE);
+        assert_eq!(tick(&core, false), Auto::NotDue);
+        clock.set(T0 + 6 * HOUR);
+        assert!(matches!(tick(&core, false), Auto::Started(_)));
+        assert_eq!(syncs(&core).len(), 2);
+
+        // A hub started again imports at once, however recent the last.
+        end(&core, JobState::Succeeded, None);
+        assert_eq!(tick(&core, false), Auto::NotDue);
+        assert!(matches!(tick(&core, true), Auto::Started(_)));
+    }
+
+    #[test]
+    fn opening_a_client_imports_once_the_last_import_is_an_hour_old() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, _) = hub(&clock);
+        assert!(matches!(tick(&core, true), Auto::Started(_)));
+        end(&core, JobState::Succeeded, None);
+
+        // The app opens half an hour later: nothing.
+        clock.set(T0 + 30 * MINUTE);
+        hello(&core, "desktop");
+        assert_eq!(tick(&core, false), Auto::NotDue);
+        // `ritornelctl` is no app opening, however late.
+        clock.set(T0 + 2 * HOUR);
+        hello(&core, "cli");
+        assert_eq!(tick(&core, false), Auto::NotDue);
+        assert_eq!(syncs(&core).len(), 1);
+        // The app opens two hours later: an import.
+        hello(&core, "desktop");
+        assert!(matches!(tick(&core, false), Auto::Started(_)));
+        assert_eq!(syncs(&core).len(), 2);
+        // Opened again while it runs: the same one.
+        hello(&core, "desktop");
+        assert_eq!(tick(&core, false), Auto::Running);
+        assert_eq!(syncs(&core).len(), 2);
+    }
+
+    #[test]
+    fn a_sync_by_hand_is_joined_and_counts_as_an_import() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, cli) = hub(&clock);
+        let mut params = key(0x51);
+        params["full"] = json!(false);
+        let manual = call(&core, &cli, "lastfm.sync", params).unwrap();
+
+        // Every trigger finds it queued and starts no other.
+        assert_eq!(tick(&core, true), Auto::Running);
+        hello(&core, "desktop");
+        assert_eq!(tick(&core, false), Auto::Running);
+        let jobs = syncs(&core);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(manual["job"]["jobId"], jobs[0].public_id.to_string());
+
+        // Once it has ended, it is the last import.
+        end(&core, JobState::Succeeded, None);
+        clock.set(T0 + 10 * MINUTE);
+        hello(&core, "desktop");
+        assert_eq!(tick(&core, false), Auto::NotDue);
+        assert_eq!(schedule(&core, &cli)["last"]["ended"], T0);
+    }
+
+    #[test]
+    fn a_failure_waits_for_the_next_trigger_and_a_refused_session_stops_imports() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, cli) = hub(&clock);
+        assert!(matches!(tick(&core, true), Auto::Started(_)));
+        end(&core, JobState::Failed, Some("Last.fm: offline"));
+        assert_eq!(
+            schedule(&core, &cli)["last"],
+            json!({ "ended": T0, "state": "failed", "failure": "Last.fm: offline" })
+        );
+
+        // Not tried again straight away, nor on an app opening within the
+        // hour; tried again by the first trigger after it.
+        clock.set(T0 + MINUTE);
+        assert_eq!(tick(&core, false), Auto::NotDue);
+        clock.set(T0 + 59 * MINUTE);
+        hello(&core, "desktop");
+        assert_eq!(tick(&core, false), Auto::NotDue);
+        clock.set(T0 + 61 * MINUTE);
+        hello(&core, "desktop");
+        assert!(matches!(tick(&core, false), Auto::Started(_)));
+        end(&core, JobState::Failed, Some("Last.fm: offline"));
+
+        // Last.fm refuses the session: nothing starts by itself, whatever
+        // the trigger, until a new sign-in.
+        core.with_stores(|stores| stores.server().refuse_service_session(SERVICE).unwrap());
+        let refused = Auto::Off("Last.fm refused the session: sign in again".to_owned());
+        assert_eq!(tick(&core, true), refused);
+        clock.set(T0 + 24 * HOUR);
+        hello(&core, "desktop");
+        assert_eq!(tick(&core, false), refused);
+        assert_eq!(tick(&core, false), refused);
+        let after = schedule(&core, &cli);
+        assert_eq!(after["off"], "Last.fm refused the session: sign in again");
+        assert_eq!(after.get("next"), None);
+        assert_eq!(syncs(&core).len(), 2);
+        sign_in(&core);
+        assert!(matches!(tick(&core, false), Auto::Started(_)));
+    }
+
+    #[test]
+    fn a_server_that_is_not_the_hub_never_imports() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch) = server(&clock);
+        // A session in server.db, and no library: this server holds none.
+        core.with_stores(|stores| {
+            let account = ritornel_contract::Id::from_bytes([7; 16]);
+            stores
+                .server()
+                .save_service_session(SERVICE, account, "someone", &ServiceKey::new("k"), false)
+                .unwrap();
+        })
+        .unwrap();
+        let off = Auto::Off("this server is not the library's hub".to_owned());
+        assert_eq!(tick(&core, true), off);
+        clock.set(T0 + 24 * HOUR);
+        let desktop = hello(&core, "desktop");
+        assert_eq!(tick(&core, false), off);
+        assert_eq!(tick(&core, false), off);
+        assert!(syncs(&core).is_empty());
+        assert_eq!(
+            schedule(&core, &desktop)["off"],
+            "this server is not the library's hub"
+        );
+    }
+
+    #[test]
+    fn the_account_a_history_comes_from_is_no_music_folder() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, cli) = hub(&clock);
+        let listed = call(&core, &cli, "sources.list", json!({})).unwrap();
+        assert_eq!(listed["sources"], json!([]));
     }
 }

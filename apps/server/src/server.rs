@@ -45,6 +45,8 @@ pub struct Server {
     playback: playback::Workers,
     /// The thread that scrobbles.
     scrobbler: crate::lastfm::Scrobbler,
+    /// The thread that watches the hub's folders.
+    watcher: crate::watch::Watcher,
     transports: Transports,
     listening: Listening,
     bounds: Bounds,
@@ -163,6 +165,7 @@ impl Server {
             core.set_player(player);
         }
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
+        core.set_watch(run.watch);
         let listening = Listening::start(Arc::clone(&core), tickets, listener, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         let worker = Worker::start(Arc::clone(&core), boot_id, run.scan).map_err(Error::Runtime)?;
@@ -170,6 +173,7 @@ impl Server {
             .map_err(Error::Runtime)?;
         let scrobbler =
             crate::lastfm::Scrobbler::start(Arc::clone(&core)).map_err(Error::Runtime)?;
+        let watcher = crate::watch::Watcher::start(Arc::clone(&core)).map_err(Error::Runtime)?;
 
         // The server answers, so a client may be told where it is.
         let server_json =
@@ -179,6 +183,7 @@ impl Server {
             worker,
             playback,
             scrobbler,
+            watcher,
             core,
             listening,
             bounds,
@@ -217,6 +222,12 @@ impl Server {
     /// the `servers` topic is tested with.
     pub fn rename(&self, name: &str) -> Result<(), Error> {
         self.core.rename(name)
+    }
+
+    /// What the server shares, for a test to reach inside.
+    #[cfg(test)]
+    pub(crate) fn core(&self) -> &Arc<Core> {
+        &self.core
     }
 
     /// Starts the system's media session, for a server with a player.
@@ -268,6 +279,12 @@ impl Server {
         // jobs, so that a quit silences the music at once.
         let playback = self.playback;
         tokio::task::spawn_blocking(move || playback.stop())
+            .await
+            .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
+        // The watcher first, so that it queues no scan the worker would
+        // leave behind.
+        let watcher = self.watcher;
+        tokio::task::spawn_blocking(move || watcher.stop())
             .await
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
         // The worker ends after the file it is reading or the write it is

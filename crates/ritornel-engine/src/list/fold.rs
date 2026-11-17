@@ -28,6 +28,25 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// `text` as its folded words with one space between each: "AC/DC" is
+/// "ac dc". Empty for text with no letter or digit.
+pub(crate) fn spaced(text: &str) -> String {
+    // Search folds every title in the library, so this makes one string
+    // and not one a word.
+    let folded = fold(text);
+    let mut spaced = String::with_capacity(folded.len());
+    for word in folded
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+    {
+        if !spaced.is_empty() {
+            spaced.push(' ');
+        }
+        spaced.push_str(word);
+    }
+    spaced
+}
+
 /// What a name or a title is filed under: its folded words, with a leading
 /// "the", "a" or "an" set aside when it is a word of its own and more
 /// follows. A sort name that is given is taken as it is written, since

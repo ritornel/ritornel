@@ -135,6 +135,9 @@ pub enum Error {
     /// on purpose: the derived history before and after. It never reaches
     /// a caller.
     RolledBack(Vec<String>, Vec<String>),
+    /// A write that found nothing to change, and was rolled back so that
+    /// it takes no revision. It never reaches a caller.
+    Unchanged,
 }
 
 impl fmt::Display for Error {
@@ -230,6 +233,7 @@ impl fmt::Display for Error {
             ),
             Self::BadListen(what) => write!(f, "a listen the hub cannot take: {what}"),
             Self::RolledBack(..) => f.write_str("a dry run, rolled back"),
+            Self::Unchanged => f.write_str("nothing changed, so nothing was written"),
         }
     }
 }

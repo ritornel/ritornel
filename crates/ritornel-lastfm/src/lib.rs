@@ -1,5 +1,5 @@
 //! Last.fm: a history source, the sign-in that gives a session, and the
-//! place plays are scrobbled to. It stands on the owner's `scrobl` crate,
+//! place plays are scrobbled to and what is playing is shown. It stands on the owner's `scrobl` crate,
 //! which makes every request, checks every page of a history against the
 //! others, and keeps credentials out of every error and `Debug`. See
 //! "Last.fm" in docs/design/history.md and "The crates" in
@@ -40,7 +40,7 @@ use std::time::Duration;
 use scrobl::{ApiKey, ApiSecret, Client};
 
 pub use credentials::{ApiCredentials, CREDENTIALS_FILE, KEY_VARIABLE, SECRET_VARIABLE};
-pub use scrobble::{MAX_BATCH, Outcome, Sent, ToScrobble, Unsent};
+pub use scrobble::{MAX_BATCH, NotShown, Outcome, Playing, Sent, ToScrobble, Unsent};
 /// The session key and the sign-in token, as `scrobl` keeps them: no
 /// `Display`, and a redacted `Debug`.
 pub use scrobl::{AuthToken, SessionKey};
@@ -328,5 +328,39 @@ mod tests {
             .unwrap_err();
         assert!(matches!(refused, Unsent::SignInAgain(_)), "{refused:?}");
         assert_eq!(fake.scrobbled().len(), 2);
+    }
+
+    #[test]
+    fn now_playing_is_sent_once_with_the_names_a_scrobble_carries() {
+        let fake = FakeLastfm::start("someone", Vec::new());
+        let lastfm = lastfm(&fake);
+        let playing = Playing {
+            artist: "Invented Artist".to_owned(),
+            title: "First".to_owned(),
+            album: Some("Invented Album".to_owned()),
+            album_artist: Some("Various Invented".to_owned()),
+            track_number: Some(1),
+            duration_ms: Some(200_400),
+        };
+        lastfm
+            .now_playing(&SessionKey::new(SESSION_KEY), &playing)
+            .unwrap();
+        let sent = fake.now_playing();
+        assert_eq!(sent.len(), 1);
+        let field = |name: &str| sent[0].get(name).map(String::as_str);
+        assert_eq!(field("artist"), Some("Invented Artist"));
+        assert_eq!(field("track"), Some("First"));
+        assert_eq!(field("album"), Some("Invented Album"));
+        assert_eq!(field("albumArtist"), Some("Various Invented"));
+        assert_eq!(field("trackNumber"), Some("1"));
+        assert_eq!(field("duration"), Some("200"));
+        assert_eq!(field("timestamp"), None);
+        assert!(fake.scrobbled().is_empty(), "nothing is scrobbled");
+
+        let refused = lastfm
+            .now_playing(&SessionKey::new("WRONG"), &playing)
+            .unwrap_err();
+        assert!(matches!(refused, NotShown::SignInAgain(_)), "{refused:?}");
+        assert_eq!(fake.now_playing().len(), 2, "sent once, never again");
     }
 }

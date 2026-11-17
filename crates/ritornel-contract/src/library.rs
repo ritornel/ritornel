@@ -41,7 +41,7 @@ pub struct Source {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct SourcesList {
-    /// Every source, in the order they were added.
+    /// Every folder source, in the order they were added.
     pub sources: Vec<Source>,
 }
 
@@ -138,6 +138,42 @@ pub struct PicturesImported {
     /// another's, whose portrait's manifest names neither. They are
     /// counted in `without` too.
     pub ambiguous: u64,
+}
+
+/// One picture folder the library takes artists' portraits from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PictureFolder {
+    /// Its name, as a root's.
+    pub name: String,
+    /// Where it is on the server that answered. It is left out when that
+    /// server has no path for it, as for a source's root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub path: Option<String>,
+    /// The portraits the library holds from it now.
+    pub portraits: u64,
+}
+
+/// The result of `artists.pictureFolders`: the picture folders, and the
+/// last import of one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PictureFolders {
+    /// Every picture folder, in the order they were first imported.
+    pub folders: Vec<PictureFolder>,
+    /// When the last import that wrote something was committed, asked for
+    /// or started on its own, as Unix milliseconds. Left out before any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub last_import_at: Option<i64>,
+    /// What that import answered, while the library keeps its receipt. One
+    /// started on its own has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub last_import: Option<PicturesImported>,
 }
 
 /// Where a job is in its life.

@@ -10,8 +10,9 @@ use ritornel_contract::methods::{
 use ritornel_contract::{
     DryRun, DryRunParams, ErrorCode, Event, ImportPicturesParams, Job, JobCancelParams,
     JobCancelled, JobDetail, JobGetParams, JobItem, JobState, JobTarget, JobsEvent, JobsList,
-    LibraryStats, PicturesImported, Receipt, ReceiptStatus, ReviewList, RpcError, ScanStartParams,
-    ScanStarted, Source, SourceAdded, SourceKind, SourcesAddParams, SourcesList,
+    LibraryStats, PictureFolder, PictureFolders, PicturesImported, Receipt, ReceiptStatus,
+    ReviewList, RpcError, ScanStartParams, ScanStarted, Source, SourceAdded, SourceKind,
+    SourcesAddParams, SourcesList,
 };
 use ritornel_engine::{
     Client, Command, LibraryStore, NewJob, ServerStore, SubjectKind, WriteRequest, is_policy,
@@ -34,9 +35,21 @@ fn unsigned(number: i64) -> u64 {
     u64::try_from(number).unwrap_or(0)
 }
 
+/// A job's state as the contract carries it.
+pub(crate) fn job_state(state: ritornel_engine::JobState) -> JobState {
+    use ritornel_engine::JobState as Engine;
+    match state {
+        Engine::Queued => JobState::Queued,
+        Engine::Running => JobState::Running,
+        Engine::Cancelling => JobState::Cancelling,
+        Engine::Succeeded => JobState::Succeeded,
+        Engine::Failed => JobState::Failed,
+        Engine::Cancelled => JobState::Cancelled,
+    }
+}
+
 /// A job as the contract carries it.
 pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
-    use ritornel_engine::JobState as Engine;
     Job {
         job_id: job.public_id,
         kind: job.kind.clone(),
@@ -47,14 +60,7 @@ pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
                 JobTarget::Source { id }
             }
         }),
-        state: match job.state {
-            Engine::Queued => JobState::Queued,
-            Engine::Running => JobState::Running,
-            Engine::Cancelling => JobState::Cancelling,
-            Engine::Succeeded => JobState::Succeeded,
-            Engine::Failed => JobState::Failed,
-            Engine::Cancelled => JobState::Cancelled,
-        },
+        state: job_state(job.state),
         done: unsigned(job.done),
         total: job.total.map(unsigned),
         bytes: unsigned(job.bytes),
@@ -202,8 +208,11 @@ impl Core {
         let roots = stores.server.roots().map_err(stored)?;
         let sources = Self::library(stores, |library| library.sources().map_err(in_library))?;
         Ok(SourcesList {
+            // A folder is the one kind the contract has. The account a
+            // history is imported from is a source too, and is no folder.
             sources: sources
                 .into_iter()
+                .filter(|source| source.kind == "folder")
                 .map(|source| Source {
                     source_id: source.public_id,
                     kind: SourceKind::Folder,
@@ -274,6 +283,38 @@ impl Core {
                     SourcesAdd::NAME
                 ),
             )
+        })
+    }
+
+    /// `artists.pictureFolders`: each picture folder, with its path where
+    /// this server has one, and the last import.
+    pub(super) fn artists_picture_folders(
+        &self,
+        stores: &Stores,
+    ) -> Result<PictureFolders, RpcError> {
+        let roots = stores.server.roots().map_err(stored)?;
+        let (folders, last) = Self::library(stores, |library| {
+            library
+                .picture_folders_and_last_import()
+                .map_err(in_library)
+        })?;
+        Ok(PictureFolders {
+            folders: folders
+                .into_iter()
+                .map(|folder| PictureFolder {
+                    path: roots
+                        .iter()
+                        .find(|(name, _)| folder.on_this_server && *name == folder.name)
+                        .map(|(_, path)| path.clone()),
+                    name: folder.name,
+                    portraits: folder.portraits,
+                })
+                .collect(),
+            last_import_at: last.as_ref().map(|last| last.at_ms),
+            // A receipt that will not read is as good as one pruned.
+            last_import: last
+                .and_then(|last| last.result_json)
+                .and_then(|json| serde_json::from_str(&json).ok()),
         })
     }
 

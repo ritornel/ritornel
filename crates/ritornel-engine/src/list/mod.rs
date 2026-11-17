@@ -23,6 +23,7 @@ mod fold;
 mod open;
 mod pages;
 mod rows;
+mod search;
 
 use std::fmt;
 
@@ -216,6 +217,15 @@ impl LibraryStore {
             found
         })
     }
+}
+
+/// The Albums tiles of these release groups, in the same order, read on a
+/// connection already in a read transaction.
+pub(crate) fn album_tiles(connection: &Connection, groups: &[i64]) -> Result<Vec<Row>, Error> {
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    rows::read(connection, ListKind::Albums, groups)
 }
 
 /// `?, ?, ?` for `count` parameters.

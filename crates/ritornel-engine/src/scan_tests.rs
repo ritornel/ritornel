@@ -1071,3 +1071,161 @@ fn a_scrobble_bound_to_a_scanned_song_leaves_every_later_scan_and_the_identity_r
         "1"
     );
 }
+
+/// Starts a scan of the main root and carries it through its walk, as a
+/// worker would, and returns it with its job's row.
+fn walked(rig: &mut Rig) -> (crate::ScanRun, i64) {
+    let new = NewJob {
+        kind: "scan",
+        dedupe_key: rig.main.name.clone(),
+        target: rig.main.public_id,
+        params_json: "{}".to_owned(),
+        session: None,
+    };
+    let command = rig.command();
+    rig.server.start_job(command, "scan.start", new).unwrap();
+    rig.boot += 1;
+    let job = rig.server.claim_job(id(rig.boot)).unwrap().unwrap();
+    let row = job.id;
+    let mut run =
+        crate::ScanRun::open(job, &rig.server, &rig.library, ScanSettings::default()).unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    assert!(run.prepare(&stop, &mut |_| {}).unwrap());
+    assert_eq!(run.commit(&rig.library).unwrap(), None);
+    (run, row)
+}
+
+#[test]
+fn a_disk_that_goes_away_mid_scan_leaves_every_file_as_it_was_and_the_next_scan_reads_it() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    let title = "SELECT r.display_title FROM source_item si
+                 JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+                 JOIN recording r ON r.id = a.recording_id
+                 WHERE si.provider_key = 'Tin Weather/01.flac'";
+    assert_eq!(rig.one(title), "Paper Kites");
+    // Retagged, and the disk goes away after the walk saw it and before
+    // it is read: unmounted, or unmounted with its mount point left behind.
+    rig.put("Tin Weather/01.flac", "a.retagged.flac");
+    let (root, away) = (rig.root(), rig.scratch.path().join("unmounted"));
+    for mount_point_left in [false, true] {
+        let (revision, before) = (rig.revision(), rig.dump());
+        let (mut run, row) = walked(&mut rig);
+        std::fs::rename(&root, &away).unwrap();
+        if mount_point_left {
+            std::fs::create_dir(&root).unwrap();
+        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let refused = run.prepare(&stop, &mut |_| {});
+        assert!(
+            matches!(&refused, Err(Error::RootOffline { path }) if *path == root),
+            "{refused:?}"
+        );
+        rig.server
+            .finish_job(row, JobState::Failed, Some("offline".to_owned()))
+            .unwrap();
+        // Nothing is unreadable, missing or changed.
+        assert_eq!((rig.revision(), rig.dump()), (revision, before));
+        if mount_point_left {
+            std::fs::remove_dir(&root).unwrap();
+        }
+        std::fs::rename(&away, &root).unwrap();
+    }
+
+    // Back: the retagged file is read, with its new tags.
+    let summary = rig.scan();
+    assert_eq!(
+        (summary.changed, summary.unreadable, summary.missing),
+        (1, 0, 0)
+    );
+    assert_eq!(rig.one(title), "Another Name Entirely");
+    assert_eq!(rig.library.stats().unwrap().files_unreadable, 0);
+}
+
+#[test]
+fn a_file_that_cannot_be_reached_when_it_is_read_keeps_what_was_last_read_of_it() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    rig.put("Tin Weather/01.flac", "a.retagged.flac");
+    let revisions = "SELECT si.current_revision_id FROM source_item si
+                     WHERE si.provider_key = 'Tin Weather/01.flac'";
+    let before = rig.one(revisions);
+    // The root stays, and only this file is gone by the time it is read.
+    let (mut run, row) = walked(&mut rig);
+    let path = rig.root().join("Tin Weather/01.flac");
+    let kept = rig.scratch.path().join("kept.flac");
+    std::fs::rename(&path, &kept).unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let summary = loop {
+        assert!(run.prepare(&stop, &mut |_| {}).unwrap());
+        if let Some(summary) = run.commit(&rig.library).unwrap() {
+            break summary;
+        }
+    };
+    rig.server
+        .finish_job(row, JobState::Succeeded, None)
+        .unwrap();
+    assert_eq!((summary.changed, summary.unreadable), (0, 0));
+    assert_eq!(rig.one(revisions), before, "no revision without audio");
+    assert_eq!(rig.library.stats().unwrap().files_unreadable, 0);
+
+    // Back, it is read; gone for good, it is missing.
+    std::fs::rename(&kept, &path).unwrap();
+    assert_eq!(rig.scan().changed, 1);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(rig.scan().missing, 1);
+    assert_eq!(rig.library.stats().unwrap().files_unreadable, 0);
+}
+
+#[test]
+fn a_file_an_earlier_scan_recorded_as_unreadable_by_a_failed_read_is_read_again() {
+    use ritornel_domain::payload::ReadError;
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.scan();
+    // What a scan before the fix wrote when the disk went away mid-read:
+    // the file's size and time, no audio, and the system's error.
+    let path = "Tin Weather/01.flac";
+    let metadata = std::fs::metadata(rig.root().join(path)).unwrap();
+    let mut payload = crate::media::read_file(
+        &rig.root(),
+        path,
+        metadata.len(),
+        crate::walk::mtime_ms(&metadata),
+        Vec::new(),
+    );
+    payload.audio = None;
+    payload.error = Some(ReadError {
+        kind: "io".to_owned(),
+        message: "Device not configured (os error 6)".to_owned(),
+    });
+    let item: i64 = rig
+        .one("SELECT id FROM source_item WHERE provider_key = 'Tin Weather/01.flac'")
+        .parse()
+        .unwrap();
+    let request = WriteRequest {
+        method: "scan.step",
+        command: None,
+        client: None,
+    };
+    rig.library
+        .record(
+            request,
+            rig.main.row,
+            vec![crate::scan_store::RecordOp::Update { item, payload }],
+        )
+        .unwrap();
+    assert_eq!(rig.library.stats().unwrap().files_unreadable, 1);
+
+    // Same size and time, and read again all the same.
+    let summary = rig.scan();
+    assert_eq!((summary.changed, summary.unchanged), (1, 0));
+    assert_eq!(rig.library.stats().unwrap().files_unreadable, 0);
+    let revision = rig.revision();
+    assert_eq!(rig.scan().unchanged, 1);
+    assert_eq!(rig.revision(), revision);
+}

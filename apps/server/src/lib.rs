@@ -54,6 +54,7 @@ mod testing;
 mod ticket;
 mod transport;
 mod views;
+mod watch;
 
 pub use bounds::{Bounds, HEADER_WAIT, MAX_CONNECTIONS, MAX_SESSIONS, STOP_GRACE, TICKET_LIFE};
 pub use cli::run;
@@ -69,3 +70,4 @@ pub use ritornel_contract::local::Env;
 /// The outputs a player can render through.
 pub use ritornel_engine::playback::Output;
 pub use server::Server;
+pub use watch::WatchRun;

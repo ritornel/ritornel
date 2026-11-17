@@ -32,9 +32,9 @@ use ritornel_domain::{Facts, Policy, Replacement, extract, judge_replacements};
 use serde::{Deserialize, Serialize};
 
 use crate::jobs::{Job, Progress, step_command};
-use crate::media::{read_file, read_folder_image};
+use crate::media::{UNAVAILABLE, read_file, read_folder_image};
 use crate::scan_store::{Known, RecordOp, Source};
-use crate::walk::{Seen, Walked, folder_of, walk};
+use crate::walk::{Seen, Walked, folder_of, root_id, walk};
 use crate::{Command, Error, Fingerprint, LibraryStore, ServerStore, WriteRequest};
 
 /// How a scan runs.
@@ -277,10 +277,26 @@ impl ScanRun {
                     stop,
                     &mut read,
                 );
-                match batch {
-                    Some(batch) => self.batch = batch,
-                    None => return Ok(false),
+                let Some(batch) = batch else {
+                    return Ok(false);
+                };
+                // A file the system would not let be read, in a root that
+                // is no longer the folder that was walked: the disk went
+                // away. The scan ends, and nothing it could not read is
+                // recorded or taken for gone.
+                let unavailable = batch.iter().any(|payload| {
+                    payload
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.kind == UNAVAILABLE)
+                });
+                let walked_id = self.walked.as_ref().and_then(|walked| walked.root_id);
+                if unavailable && root_id(&self.root) != walked_id {
+                    return Err(Error::RootOffline {
+                        path: self.root.clone(),
+                    });
                 }
+                self.batch = batch;
             }
             _ => {}
         }
@@ -383,6 +399,7 @@ impl ScanRun {
             // its folder's image changed.
             let same = self.known.get(&file.path).is_some_and(|known| {
                 !known.missing
+                    && !known.io_failed
                     && unsigned(known.size) == file.size
                     && known.mtime_ms == file.mtime_ms
                     && known.images == images
@@ -428,8 +445,32 @@ impl ScanRun {
         let mut ops = Vec::with_capacity(batch.len());
         let mut counted = self.summary;
         for payload in batch {
-            counted.bytes_read += payload.size;
+            if let Some(error) = payload
+                .error
+                .as_ref()
+                .filter(|error| error.kind == UNAVAILABLE)
+            {
+                // Nothing is recorded: the file keeps what was last read of
+                // it, and its size and time, so the next scan reads it.
+                let detail = serde_json::to_string(error)?;
+                self.failed.push((payload.path.clone(), "skipped", detail));
+                continue;
+            }
             let audio = payload.audio.as_ref().map(|audio| audio.hash.clone());
+            // Read again only because its last read failed on I/O, and it
+            // still cannot be read: there is nothing new to record.
+            let still = self.known.get(&payload.path).is_some_and(|known| {
+                known.io_failed
+                    && !known.missing
+                    && audio.is_none()
+                    && unsigned(known.size) == payload.size
+                    && known.mtime_ms == payload.mtime_ms
+            });
+            if still {
+                counted.unchanged += 1;
+                continue;
+            }
+            counted.bytes_read += payload.size;
             if audio.is_none() {
                 counted.unreadable += 1;
                 let detail = payload

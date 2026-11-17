@@ -7,13 +7,15 @@
 
 use ritornel_contract::methods::{HistoryRebuild, HistorySetZones, Method};
 use ritornel_contract::{
-    ErrorCode, HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams, OnThisDay,
-    OnThisDayParams, Play, PlayCursor, PlayOutcome, PlayedListen, PlayedTrack, Receipt,
-    ReceiptStatus, RecentPlays, RpcError, SetZonesParams, TrackDetail, TrackGetParams, TrackLove,
-    ZonePeriod, ZonePeriods, ZonesSet,
+    AlbumGetParams, ArtistGetParams, ErrorCode, HistoryOf, HistoryRebuildParams, HistoryRebuilt,
+    HistoryRecentParams, HistoryStream, OnThisDay, OnThisDayParams, Play, PlayCursor, PlayOutcome,
+    PlayedListen, PlayedTrack, Receipt, ReceiptStatus, RecentPlays, RpcError, SetZonesParams,
+    TrackDetail, TrackGetParams, TrackHistory, TrackHistoryParams, TrackLove, ZonePeriod,
+    ZonePeriods, ZonesSet,
 };
 use ritornel_engine::{
-    Command, Id, LibraryStore, PlayRow, SystemTimekeeper, Timekeeper, WriteRequest, ZonePeriodRow,
+    Command, Id, LibraryStore, PlayRow, SystemTimekeeper, Timekeeper, Today, WriteRequest,
+    ZonePeriodRow,
 };
 
 use super::playback::refused;
@@ -128,6 +130,10 @@ impl Core {
             at_ms: cursor.at,
             play_id: cursor.play_id,
         });
+        // Counted before the plays are read: a delivery commits to the
+        // library before it leaves the outbox, so a closed listen not counted
+        // here is in the plays. Counted after, one could be in neither.
+        let undelivered = unsigned(stores.server().undelivered_listens().map_err(refused)?);
         let plays = Self::library(stores, |library| {
             library
                 .recent_plays(Self::listener(library)?, limit, after)
@@ -144,7 +150,7 @@ impl Core {
         Ok(RecentPlays {
             plays: plays.into_iter().map(play).collect(),
             next,
-            undelivered: unsigned(stores.server().undelivered_listens().map_err(refused)?),
+            undelivered,
         })
     }
 
@@ -173,6 +179,80 @@ impl Core {
         Ok(OnThisDay {
             day: format!("{:02}-{:02}", wanted / 100, wanted % 100),
             plays: plays.into_iter().map(play).collect(),
+        })
+    }
+
+    /// Now, and the date it is where this server is: what a page's
+    /// sentence and Lean back's facts are said against, and where History
+    /// ends.
+    fn today(&self) -> Today {
+        let now_ms = self.clock.now_ms();
+        let zone = SystemTimekeeper.zone().unwrap_or_else(|| "UTC".to_owned());
+        let date =
+            ritornel_engine::local_time(now_ms, &zone).map_or(19_700_101, |local| local.date);
+        Today {
+            now_ms,
+            year: i32::try_from(date / 10_000).unwrap_or(1970),
+            month: u32::try_from(date / 100 % 100).unwrap_or(1),
+            date,
+        }
+    }
+
+    pub(super) fn history_stream(&self, stores: &Stores) -> Result<HistoryStream, RpcError> {
+        let today = self.today();
+        let started = std::time::Instant::now();
+        let stream = Self::library(stores, |library| {
+            library
+                .history_stream(Self::listener(library)?, today)
+                .map_err(refused)
+        })?;
+        tracing::debug!(
+            ms = started.elapsed().as_secs_f64() * 1000.0,
+            months = stream.months,
+            "read the history stream"
+        );
+        Ok(stream)
+    }
+
+    pub(super) fn history_artist(
+        &self,
+        stores: &Stores,
+        params: &ArtistGetParams,
+    ) -> Result<HistoryOf, RpcError> {
+        let today = self.today();
+        Self::library(stores, |library| {
+            library
+                .artist_history(Self::listener(library)?, params.artist_id, today)
+                .map_err(refused)?
+                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "the library has no such artist"))
+        })
+    }
+
+    pub(super) fn history_album(
+        &self,
+        stores: &Stores,
+        params: &AlbumGetParams,
+    ) -> Result<HistoryOf, RpcError> {
+        let today = self.today();
+        Self::library(stores, |library| {
+            library
+                .album_history(Self::listener(library)?, params.album, today)
+                .map_err(refused)?
+                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "the library has no such album"))
+        })
+    }
+
+    pub(super) fn history_track(
+        &self,
+        stores: &Stores,
+        params: &TrackHistoryParams,
+    ) -> Result<TrackHistory, RpcError> {
+        let today = self.today();
+        Self::library(stores, |library| {
+            library
+                .track_history(Self::listener(library)?, params.appearance_id, today)
+                .map_err(refused)?
+                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "the library has no such track"))
         })
     }
 

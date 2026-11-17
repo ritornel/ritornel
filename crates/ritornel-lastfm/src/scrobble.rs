@@ -1,11 +1,12 @@
 //! Scrobbling: sending plays to Last.fm, once each, and saying what became
 //! of them. What to send and when is the core's (`history_delivery`); this
-//! sends one batch and reads the answer.
+//! sends one batch and reads the answer. And "now playing": telling Last.fm
+//! what is playing, once, with nothing kept.
 
 use std::time::Duration;
 
 use scrobl::client::Play;
-use scrobl::{Delivery, Retry, SessionKey};
+use scrobl::{ApiErrorCode, Delivery, Retry, SessionKey};
 
 use crate::Lastfm;
 
@@ -72,6 +73,34 @@ pub enum Unsent {
     Unknown(String),
 }
 
+/// A track that has begun to play, to show as playing now. Its names are
+/// those its scrobble would carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Playing {
+    /// The artist.
+    pub artist: String,
+    /// The title.
+    pub title: String,
+    /// The album.
+    pub album: Option<String>,
+    /// The album's artist, where it is not the track's.
+    pub album_artist: Option<String>,
+    /// The track's place on the album.
+    pub track_number: Option<u32>,
+    /// The track's length.
+    pub duration_ms: Option<i64>,
+}
+
+/// Why Last.fm was not told what is playing. Nothing is sent again: a
+/// later "now playing" is simply a newer one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotShown {
+    /// Last.fm refused the session: the account has to be signed in again.
+    SignInAgain(String),
+    /// Anything else.
+    Failed(String),
+}
+
 fn play(scrobble: &ToScrobble) -> Play {
     let mut play = Play::new(&scrobble.artist, &scrobble.title, scrobble.timestamp_s);
     if let Some(album) = &scrobble.album {
@@ -90,6 +119,32 @@ fn play(scrobble: &ToScrobble) -> Play {
 }
 
 impl Lastfm {
+    /// Tells Last.fm that the account whose session this is is playing
+    /// `playing` now, once.
+    pub fn now_playing(&self, session: &SessionKey, playing: &Playing) -> Result<(), NotShown> {
+        let writer = self.writer.with_session(session.clone());
+        let mut query = writer.now_playing(&playing.artist, &playing.title);
+        if let Some(album) = &playing.album {
+            query = query.album(album);
+        }
+        if let Some(artist) = &playing.album_artist {
+            query = query.album_artist(artist);
+        }
+        if let Some(number) = playing.track_number {
+            query = query.track_number(number);
+        }
+        if let Some(ms) = playing.duration_ms.and_then(|ms| u64::try_from(ms).ok()) {
+            query = query.duration(Duration::from_millis(ms));
+        }
+        match self.block(query.send()) {
+            Ok(_) => Ok(()),
+            Err(error) if error.api_code() == Some(ApiErrorCode::INVALID_SESSION_KEY) => {
+                Err(NotShown::SignInAgain(error.to_string()))
+            }
+            Err(error) => Err(NotShown::Failed(error.to_string())),
+        }
+    }
+
     /// Sends up to [`MAX_BATCH`] plays as the account whose session this
     /// is, once. Their times must differ: Last.fm's answer ties an outcome
     /// to a play by time alone.

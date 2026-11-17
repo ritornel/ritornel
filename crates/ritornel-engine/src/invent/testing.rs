@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use super::{Invented, Plan};
 use crate::testing::{CountingEntropy, FixedClock, Scratch};
-use crate::{Client, Command, Fingerprint, LibraryStore, ServerStore, SubjectKind, WriteRequest};
+use crate::{
+    Client, Command, Entropy, Fingerprint, LibraryStore, OsEntropy, ServerStore, SubjectKind,
+    WriteRequest,
+};
 
 pub(crate) const NOW: i64 = 1_794_744_000_000;
 
@@ -16,9 +19,18 @@ pub(crate) struct Library {
 }
 
 pub(crate) fn library(albums: usize) -> Library {
+    library_with(albums, Arc::new(CountingEntropy::default()))
+}
+
+/// As [`library`], its IDs from the system's random numbers: a history
+/// draws more of them than counted ones can tell apart.
+pub(crate) fn library_drawing(albums: usize) -> Library {
+    library_with(albums, Arc::new(OsEntropy))
+}
+
+fn library_with(albums: usize, entropy: Arc<dyn Entropy>) -> Library {
     let scratch = Scratch::new();
     let clock = Arc::new(FixedClock::at(NOW));
-    let entropy = Arc::new(CountingEntropy::default());
     let servers = ServerStore::open_in_memory(clock.clone(), entropy.clone()).unwrap();
     let (identity, _) = servers.ensure_identity("desk").unwrap();
     let request = WriteRequest {

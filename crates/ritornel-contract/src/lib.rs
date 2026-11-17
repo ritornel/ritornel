@@ -53,6 +53,7 @@ pub mod methods;
 mod pages;
 mod playback;
 mod rating;
+mod search;
 mod server;
 mod ticket;
 #[cfg(test)]
@@ -66,8 +67,10 @@ pub use event::{
 };
 pub use frame::{Frame, Malformed, Notification, Request, RequestId, Response};
 pub use history::{
-    HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams, OnThisDay, OnThisDayParams, Play,
-    PlayCursor, PlayOutcome, PlayedListen, PlayedTrack, RecentPlays,
+    Fact, FactKind, HistoryOf, HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams,
+    HistoryStream, OnThisDay, OnThisDayParams, Phrase, Play, PlayCursor, PlayOutcome, PlayedListen,
+    PlayedTrack, RecentPlays, RecordPlayed, StreamLayer, TrackHistory, TrackHistoryParams,
+    YearPlays, YearSpan,
 };
 pub use id::{Id, NotAnId};
 pub use identity::{
@@ -75,15 +78,17 @@ pub use identity::{
     PolicyOverrides, PolicyValues, Review, ReviewCause, ReviewList,
 };
 pub use lastfm::{
-    DeliveryCount, DoubtfulTrack, KeyParams, LastfmReport, LastfmReportParams, LastfmStatus,
-    LastfmSyncParams, LastfmSyncStarted, NearlyMatched, ScrobblingParams, ScrobblingSet,
-    SetZonesParams, SignInFinishParams, SignInFinished, SignInStarted, SignedOut, SyncSummary,
-    TrackDetail, TrackGetParams, TrackLove, ZonePeriod, ZonePeriods, ZonesSet,
+    DeliveryCount, DoubtfulTrack, ImportSchedule, KeyParams, LastImport, LastfmReport,
+    LastfmReportParams, LastfmStatus, LastfmSyncParams, LastfmSyncStarted, NearlyMatched,
+    ScrobblingParams, ScrobblingSet, SetZonesParams, SignInFinishParams, SignInFinished,
+    SignInStarted, SignedOut, SyncSummary, TrackDetail, TrackGetParams, TrackLove, ZonePeriod,
+    ZonePeriods, ZonesSet,
 };
 pub use library::{
     Count, ImportPicturesParams, Job, JobCancelParams, JobCancelled, JobDetail, JobGetParams,
-    JobItem, JobState, JobTarget, JobsList, LibraryStats, PicturesImported, ScanStartParams,
-    ScanStarted, ScanSummary, Source, SourceAdded, SourceKind, SourcesAddParams, SourcesList,
+    JobItem, JobState, JobTarget, JobsList, LibraryStats, PictureFolder, PictureFolders,
+    PicturesImported, ScanStartParams, ScanStarted, ScanSummary, Source, SourceAdded, SourceKind,
+    SourcesAddParams, SourcesList,
 };
 pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,
@@ -105,10 +110,12 @@ pub use playback::{
     SkipDirection, SourceTracks, SourcesTracksParams, TrackSummary,
 };
 pub use rating::{MAX_RATING, RatingSet, RatingSetParams};
+pub use search::{MAX_SEARCH_RESULTS, SearchParams, SearchResults, SongFound};
 pub use server::{
-    ClientKind, Descriptor, FreeDisk, HelloParams, LibraryStatus, Limits, MAX_CLIENT_TEXT,
-    NoParams, PublicDescriptor, ServerInfo, ServerRole, ServerStatus, ServersList, SessionKind,
-    Versions,
+    AutoRun, AutoTrigger, ClientKind, Descriptor, FreeDisk, HelloParams, LibraryStatus, Limits,
+    MAX_CLIENT_TEXT, NoParams, PublicDescriptor, ServerInfo, ServerRole, ServerStatus, ServersList,
+    SessionKind, Versions, WatchState, WatchStatus, WatchedFolder, WatchedKind, WatchingParams,
+    WatchingSet,
 };
 pub use ticket::{SocketTicket, TICKET_PARAM};
 

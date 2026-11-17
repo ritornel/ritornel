@@ -206,6 +206,179 @@ pub struct ServerStatus {
     /// The directory the server writes its logs in, on the server's own
     /// disk.
     pub log_path: String,
+    /// Whether the server watches its folders for changes, and what it last
+    /// did on its own. Left out by a server that does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub watch: Option<WatchStatus>,
+}
+
+/// How a hub notices changes to its folders: it watches them, rescans a
+/// music root or imports a picture folder once changes settle, and rescans
+/// on a timer as well. See "Watching" in docs/design/identity.md.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct WatchStatus {
+    /// Whether this server is noticing changes on its own now.
+    pub on: bool,
+    /// Whether watching is turned on for this machine, by
+    /// `library.setWatching`. It is on until turned off. Watching also
+    /// needs this server to be the hub, and a run that watches.
+    pub enabled: bool,
+    /// Why it is not, when it is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub off: Option<String>,
+    /// Each folder it watches, or would.
+    pub folders: Vec<WatchedFolder>,
+}
+
+/// The params of `library.setWatching`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct WatchingParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// Watch the folders for changes, or stop.
+    pub on: bool,
+}
+
+/// The result of `library.setWatching`: the receipt, and watching as the
+/// status now says it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct WatchingSet {
+    /// The receipt.
+    #[serde(flatten)]
+    pub receipt: crate::Receipt,
+    /// Watching, as `server.status` now says it.
+    pub watch: WatchStatus,
+}
+
+/// A folder a hub watches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct WatchedFolder {
+    /// The root's name.
+    pub name: String,
+    /// What the folder holds.
+    pub kind: WatchedKind,
+    /// How changes to it are noticed.
+    pub state: WatchState,
+    /// Why it is rescanned on a timer alone, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub detail: Option<String>,
+    /// When the oldest change not yet taken in was seen, as Unix
+    /// milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub pending_since: Option<i64>,
+    /// The last rescan or import the server started on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub last_auto: Option<AutoRun>,
+}
+
+/// What a watched folder holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WatchedKind {
+    /// Music: a source's root, rescanned.
+    Music,
+    /// Artist pictures, imported again.
+    Pictures,
+}
+
+impl WatchedKind {
+    /// The kind as it is written on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Music => "music",
+            Self::Pictures => "pictures",
+        }
+    }
+}
+
+/// How changes to a watched folder are noticed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WatchState {
+    /// The system tells the server of changes as they happen.
+    Watching,
+    /// The system cannot: the folder is looked at again on a timer.
+    Polling,
+    /// The folder is not there, as an unmounted disk is not. Nothing in it
+    /// is taken to be gone, and it is looked at again when it is back.
+    Offline,
+}
+
+impl WatchState {
+    /// The state as it is written on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Watching => "watching",
+            Self::Polling => "polling",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+/// A rescan or an import the server started on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AutoRun {
+    /// What started it.
+    pub trigger: AutoTrigger,
+    /// When it started, or was queued, as Unix milliseconds.
+    pub started_at: i64,
+    /// When it ended, once it has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub finished_at: Option<i64>,
+    /// Where it is. An import that found nothing to change succeeded.
+    pub state: crate::JobState,
+    /// The rescan's job. An import is no job, and has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub job_id: Option<Id>,
+}
+
+/// What starts a rescan or an import on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum AutoTrigger {
+    /// Files changed, and the changes settled.
+    Change,
+    /// The system lost track of changes, so all of them are looked at.
+    Lost,
+    /// A folder that was offline is back.
+    Returned,
+    /// The hub started, and the folder was last looked at too long ago.
+    Start,
+    /// The timer: the folder was last looked at too long ago.
+    Timer,
+}
+
+impl AutoTrigger {
+    /// The trigger as it is written on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Change => "change",
+            Self::Lost => "lost",
+            Self::Returned => "returned",
+            Self::Start => "start",
+            Self::Timer => "timer",
+        }
+    }
 }
 
 /// The library a server holds, as a status reports it.
@@ -430,6 +603,7 @@ mod tests {
                 data_bytes: Some(1_000),
             },
             log_path: "/srv/ritornel/logs".to_owned(),
+            watch: None,
         };
         let mut wire = json!({
             "serverId": "11111111-1111-1111-1111-111111111111",

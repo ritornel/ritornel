@@ -178,6 +178,15 @@ pub enum PlayerEvent {
     },
     /// The queue changed.
     Queue(i64),
+    /// A track began to be heard, a gapless join to it included, or was
+    /// heard again after a pause: what Last.fm's "now playing" is sent
+    /// for. A seek within a track says nothing.
+    Began {
+        /// The track appearance.
+        appearance: Id,
+        /// The length of the copy playing.
+        duration_ms: i64,
+    },
     /// A listen was closed and waits to be delivered.
     ListenClosed,
     /// A track could not be played, or stopped before its end.
@@ -534,11 +543,28 @@ impl Player {
         };
         for event in &said {
             let closed = self.recorder.last_closed();
+            let open = self.recorder.open().map(|listen| listen.started.listen_id);
             self.recorder.fold(event, &time);
             let heard = self.recorder.last_closed() != closed;
             self.follow(event, heard, events);
+            // A new listen, not a seek within the one open.
+            if matches!(event, Event::Began { .. })
+                && let Some(began) = self
+                    .began()
+                    .filter(|_| self.recorder.open().map(|listen| listen.started.listen_id) != open)
+            {
+                events.push(began);
+            }
         }
         self.progress = progress;
+    }
+
+    /// What the open listen is heard as, to say it began.
+    fn began(&self) -> Option<PlayerEvent> {
+        self.recorder.open().map(|listen| PlayerEvent::Began {
+            appearance: listen.started.appearance,
+            duration_ms: listen.started.track_duration_ms,
+        })
     }
 
     fn follow(&mut self, event: &Event, heard: bool, events: &mut Vec<PlayerEvent>) {
@@ -968,6 +994,7 @@ impl Player {
             (Status::Paused, Some(_)) => {
                 self.renderer.play();
                 self.status = Status::Playing;
+                events.extend(self.began());
                 self.changed(&mut events);
             }
             _ if self.current.is_some() => {

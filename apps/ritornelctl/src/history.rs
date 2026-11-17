@@ -9,16 +9,18 @@
 use std::io::Write;
 
 use ritornel_client::contract::methods::{
-    HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones, HistoryZones,
+    HistoryAlbum, HistoryArtist, HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones,
+    HistoryZones, ListClose, ListOpen,
 };
 use ritornel_client::contract::{
-    HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams, NoParams, OnThisDay,
-    OnThisDayParams, Play, PlayOutcome, RecentPlays, SetZonesParams, ZonePeriod, ZonePeriods,
-    ZonesSet,
+    AlbumGetParams, AlbumRef, ArtistGetParams, ErrorCode, HistoryOf, HistoryRebuildParams,
+    HistoryRebuilt, HistoryRecentParams, Id, ListKind, ListOpenParams, NoParams, OnThisDay,
+    OnThisDayParams, Play, PlayOutcome, Query, RecentPlays, Row, SetZonesParams, ViewParams,
+    Window, ZonePeriod, ZonePeriods, ZonesSet,
 };
-use ritornel_client::local;
+use ritornel_client::{Client, local};
 
-use crate::cli::{Error, HistoryArgs, HistoryCommand, ServerArgs, ZoneCommand};
+use crate::cli::{Error, HistoryArgs, HistoryCommand, OfArgs, ServerArgs, ZoneCommand};
 use crate::playback::clock;
 use crate::server;
 
@@ -146,6 +148,206 @@ fn render_zones(zones: &ZonePeriods) -> String {
         .collect()
 }
 
+/// What a page says of your history with an artist or an album: its
+/// sentence as the page shows it, then what the sentence rests on, then
+/// every year of the history with its plays.
+fn render_of(of: &HistoryOf) -> String {
+    if of.plays == 0 {
+        return if of.span.is_none() {
+            "No plays yet.\n".to_owned()
+        } else {
+            "No plays matched to it.\n".to_owned()
+        };
+    }
+    let mut text: String = of
+        .sentence
+        .iter()
+        .map(|phrase| phrase.text.as_str())
+        .collect();
+    text.push_str("\n\n");
+    let mut lines = vec![("Plays", of.plays.to_string())];
+    if let Some(first) = &of.first_played {
+        lines.push(("First played", first.clone()));
+    }
+    if let Some(last) = &of.last_played {
+        lines.push(("Last played", last.clone()));
+    }
+    lines.push(("In the last year", of.last_year.to_string()));
+    text.push_str(&server::facts(&lines));
+    if let Some(span) = of.span {
+        let most = of
+            .years
+            .iter()
+            .map(|year| year.plays)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        text.push('\n');
+        for year in span.from..=span.to {
+            let plays = of
+                .years
+                .iter()
+                .find(|played| played.year == year)
+                .map_or(0, |played| played.plays);
+            // A bar of up to 40, as long as the plays: a measure, where the
+            // page's picture is eased to show the quiet years.
+            let bar = "█".repeat(usize::try_from(plays * 40 / most).unwrap_or(0));
+            let bar = if plays > 0 && bar.is_empty() {
+                "▏"
+            } else {
+                &bar
+            };
+            text.push_str(&format!("{year}  {plays:>6}  {bar}\n"));
+        }
+    }
+    if !of.records.is_empty() {
+        text.push_str("\nPlayed most\n");
+        for record in &of.records {
+            text.push_str(&format!(
+                "  {:<40} {:>6}  most in {}\n",
+                record.tile.title.as_deref().unwrap_or("(untitled)"),
+                record.plays,
+                record.peak_year
+            ));
+        }
+    }
+    text
+}
+
+/// How many rows a name is looked up among.
+const LOOKUP: u64 = 50;
+
+/// What a name or an ID finds: the one it names, or the rows it may mean,
+/// one a line, each with its ID.
+enum Named {
+    One(Id),
+    Choose(String),
+}
+
+/// Finds an artist or an album by its ID, or by its name: the one whose
+/// name it is, ignoring case, or the only one whose text holds it.
+async fn named(
+    client: &Client,
+    kind: ListKind,
+    name: &str,
+) -> Result<Named, ritornel_client::Error> {
+    if let Ok(id) = name.parse::<Id>() {
+        return Ok(Named::One(id));
+    }
+    let opened = client
+        .call::<ListOpen>(&ListOpenParams {
+            kind,
+            query: Query {
+                text: Some(name.to_owned()),
+                ..Query::default()
+            },
+            window: Some(Window {
+                offset: 0,
+                limit: LOOKUP,
+            }),
+            replaces: None,
+        })
+        .await?;
+    let _ = client
+        .call::<ListClose>(&ViewParams {
+            view: opened.view.clone(),
+        })
+        .await;
+    let found: Vec<(Id, String, String)> = opened
+        .rows
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::Artist(artist) => {
+                let name = artist.name.unwrap_or_default();
+                Some((artist.artist_id, name.clone(), name))
+            }
+            Row::Album(tile) => {
+                let title = tile.title.unwrap_or_default();
+                let by = tile
+                    .artist_credit
+                    .map(|credit| format!(" — {}", credit.text))
+                    .unwrap_or_default();
+                Some((tile.album.id(), title.clone(), format!("{title}{by}")))
+            }
+            _ => None,
+        })
+        .collect();
+    let wanted = name.to_lowercase();
+    let exact: Vec<&(Id, String, String)> = found
+        .iter()
+        .filter(|(_, named, _)| named.to_lowercase() == wanted)
+        .collect();
+    Ok(match (exact.as_slice(), found.as_slice()) {
+        ([(id, ..)], _) | ([], [(id, ..)]) => Named::One(*id),
+        _ => Named::Choose(
+            found
+                .iter()
+                .map(|(id, _, line)| format!("{id}  {line}\n"))
+                .collect(),
+        ),
+    })
+}
+
+/// What a page says of an artist or an album, named by ID or by name.
+fn history_of(
+    args: &OfArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+    album: bool,
+) -> Result<(), Error> {
+    let kind = if album {
+        ListKind::Albums
+    } else {
+        ListKind::Artists
+    };
+    let answer = server::ask(&args.server, env, async |client| {
+        let id = match named(client, kind, &args.name).await? {
+            Named::One(id) => id,
+            Named::Choose(choices) => return Ok(Err(choices)),
+        };
+        if !album {
+            return client
+                .call::<HistoryArtist>(&ArtistGetParams { artist_id: id })
+                .await
+                .map(Ok);
+        }
+        // An album's ID is its record's or one release's: the record's first.
+        let record = client
+            .call::<HistoryAlbum>(&AlbumGetParams {
+                album: AlbumRef::ReleaseGroup { id },
+            })
+            .await;
+        match record {
+            Err(ritornel_client::Error::Call(error)) if error.data.code == ErrorCode::NotFound => {
+                client
+                    .call::<HistoryAlbum>(&AlbumGetParams {
+                        album: AlbumRef::Release { id },
+                    })
+                    .await
+                    .map(Ok)
+            }
+            answered => answered.map(Ok),
+        }
+    })?;
+    match answer {
+        Ok(of) => server::print(
+            &args.server,
+            out,
+            &of,
+            serde_json::to_string_pretty,
+            render_of,
+        ),
+        Err(choices) => {
+            out.write_all(choices.as_bytes()).map_err(Error::Output)?;
+            Err(Error::Nothing(if album {
+                "that names no one album: name it by one of these IDs"
+            } else {
+                "that names no one artist: name them by one of these IDs"
+            }))
+        }
+    }
+}
+
 /// Makes `periods` the zones, and prints them as they now are.
 fn set_zones(
     args: &ServerArgs,
@@ -200,6 +402,8 @@ pub(crate) fn history(
                 render_recent,
             )
         }
+        Some(HistoryCommand::Artist(of)) => history_of(of, env, out, false),
+        Some(HistoryCommand::Album(of)) => history_of(of, env, out, true),
         Some(HistoryCommand::OnThisDay(day)) => {
             let params = OnThisDayParams {
                 day: day.day.clone(),

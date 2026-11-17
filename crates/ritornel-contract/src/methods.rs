@@ -160,8 +160,9 @@ methods! {
     LibraryCreate: "library.create", Command, needs_full: true,
     LibraryCreateParams => LibraryCreated;
 
-    /// `sources.list`: every source of the library, with where its root is
-    /// on this server. It names paths, so it needs a `full` session.
+    /// `sources.list`: every folder the library scans, with where its root
+    /// is on this server. An account a history is imported from is a source
+    /// too, and is not listed. It names paths, so it needs a `full` session.
     SourcesList: "sources.list", Query, needs_full: true,
     NoParams => SourcesList;
 
@@ -231,6 +232,12 @@ methods! {
     /// `list.close`: ends a view.
     ListClose: "list.close", Session, needs_full: false,
     ViewParams => ListClosed;
+
+    /// `library.search`: the few artists, records and songs whose names
+    /// match what was typed, best first, for the results under the search
+    /// field.
+    LibrarySearch: "library.search", Query, needs_full: false,
+    SearchParams => SearchResults;
 
     /// `album.get`: one release, with its tracks in disc and track order
     /// and the other versions of its group. Given a release group, the
@@ -324,6 +331,29 @@ methods! {
     HistoryOnThisDay: "history.onThisDay", Query, needs_full: false,
     OnThisDayParams => OnThisDay;
 
+    /// `history.artist`: what an artist's page says of the listener's
+    /// history with them: the sentence, the plays by year and the records
+    /// played most.
+    HistoryArtist: "history.artist", Query, needs_full: false,
+    ArtistGetParams => HistoryOf;
+
+    /// `history.album`: what an album's page says of the listener's history
+    /// with it, across every version of it: the sentence and the plays by
+    /// year.
+    HistoryAlbum: "history.album", Query, needs_full: false,
+    AlbumGetParams => HistoryOf;
+
+    /// `history.track`: what Lean back says about a song and its record,
+    /// one fact at a time.
+    HistoryTrack: "history.track", Query, needs_full: false,
+    TrackHistoryParams => TrackHistory;
+
+    /// `history.stream`: the listener's whole history as the History tab
+    /// draws it: every month's plays, in layers by the year each artist
+    /// was first heard.
+    HistoryStreamCall: "history.stream", Query, needs_full: false,
+    NoParams => HistoryStream;
+
     /// `history.rebuild`: drops the plays and derives them again from what
     /// the sources reported, in one transaction, or says what that would
     /// change.
@@ -390,6 +420,18 @@ methods! {
     /// it.
     ArtistsImportPictures: "artists.importPictures", Command, needs_full: true,
     ImportPicturesParams => PicturesImported;
+
+    /// `artists.pictureFolders`: the picture folders, with where each is on
+    /// this server, and what the last import did. It names paths, so it
+    /// needs a `full` session.
+    ArtistsPictureFolders: "artists.pictureFolders", Query, needs_full: true,
+    NoParams => PictureFolders;
+
+    /// `library.setWatching`: turns watching the library's folders for
+    /// changes on or off for this machine, and keeps it so. It answers with
+    /// watching as the status then says it.
+    LibrarySetWatching: "library.setWatching", Command, needs_full: true,
+    WatchingParams => WatchingSet;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -427,6 +469,7 @@ mod tests {
                 "list.sections",
                 "list.locate",
                 "list.close",
+                "library.search",
                 "album.get",
                 "artist.get",
                 "media.token",
@@ -447,6 +490,10 @@ mod tests {
                 "sources.tracks",
                 "history.recent",
                 "history.onThisDay",
+                "history.artist",
+                "history.album",
+                "history.track",
+                "history.stream",
                 "history.rebuild",
                 "history.zones",
                 "history.setZones",
@@ -459,7 +506,9 @@ mod tests {
                 "lastfm.sync",
                 "lastfm.setScrobbling",
                 "lastfm.report",
-                "artists.importPictures"
+                "artists.importPictures",
+                "artists.pictureFolders",
+                "library.setWatching"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -497,7 +546,9 @@ mod tests {
                 "lastfm.sync",
                 "lastfm.setScrobbling",
                 "lastfm.report",
-                "artists.importPictures"
+                "artists.importPictures",
+                "artists.pictureFolders",
+                "library.setWatching"
             ]
         );
         // Everything but reading the library and controlling playback

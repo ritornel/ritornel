@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Id, Job, Receipt};
+use crate::{Id, Job, JobState, Receipt};
 
 /// The result of `lastfm.status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +44,57 @@ pub struct LastfmStatus {
     /// imported play has no local date. A sync is refused until they have.
     #[serde(default)]
     pub zones_set: bool,
+    /// When the history was last imported, and when it next is.
+    #[serde(default)]
+    pub import: ImportSchedule,
+}
+
+/// When the account's history is imported. Only the library's hub imports:
+/// when it starts, when a client such as the desktop app opens and the
+/// last import ended more than an hour before, and six hours after the
+/// last import ended. A sync by hand counts as an import.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSchedule {
+    /// The last sync of the history to end, started by hand or on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub last: Option<LastImport>,
+    /// Whether a sync is queued or running now.
+    #[serde(default)]
+    pub running: bool,
+    /// When the server next starts one on its own. Left out while one runs
+    /// and while none will start on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub next: Option<i64>,
+    /// From this time on, a client opening starts one. Left out as `next`
+    /// is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub on_open_after: Option<i64>,
+    /// Why none starts on its own, when none will: this server is not the
+    /// hub, has no API key, is not signed in, was refused its session, or
+    /// the listener has no zones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub off: Option<String>,
+}
+
+/// How the last sync of a history ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LastImport {
+    /// When it ended.
+    pub ended: i64,
+    /// `succeeded`, `failed` or `cancelled`.
+    pub state: JobState,
+    /// Why it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub failure: Option<String>,
 }
 
 /// How many scrobbles are in one state.

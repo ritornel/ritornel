@@ -42,6 +42,10 @@ rustix = { version = "1.1.6", features = ["fs", "process"] }
 # Compares a presented credential with the server's own in constant time.
 # It is already in the lock file, under the engine's signing key.
 subtle = "2.6.1"
+# Watches the hub's folders: FSEvents on macOS and inotify on Linux, neither
+# of which needs a library installed. Pinned exactly, as its events are what a
+# rescan waits on.
+notify = { version = "=8.2.2", default-features = false, features = ["macos_fsevent"] }
 # `config.toml` and `server.json` are read and written through it.
 serde = { version = "1.0.229", features = ["derive"] }
 # `server.json`, the text of each log line, and the bodies of the HTTP routes.

@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
@@ -98,7 +99,7 @@ pub(crate) fn read_inside(root: &Path, rel: &str, cap: u64) -> std::io::Result<V
 /// so the folder is checked once, before its root is recorded, and not
 /// again after: a folder changed between the two is not refused late.
 #[derive(Debug)]
-pub struct PictureFolder(std::path::PathBuf);
+pub struct PictureFolder(std::path::PathBuf, Option<(u64, u64)>);
 
 /// The picture folder at `folder`, if its `index.json` says format 1.
 pub fn check_picture_folder(folder: &Path) -> Result<PictureFolder, Error> {
@@ -109,7 +110,12 @@ pub fn check_picture_folder(folder: &Path) -> Result<PictureFolder, Error> {
         format: u32,
     }
     match serde_json::from_slice::<Index>(&index) {
-        Ok(Index { format: 1 }) => Ok(PictureFolder(folder.to_path_buf())),
+        // Which folder it is, so that a disk unmounted after the check is
+        // told from a folder whose portraits were taken away.
+        Ok(Index { format: 1 }) => Ok(PictureFolder(
+            folder.to_path_buf(),
+            crate::walk::root_id(folder),
+        )),
         _ => Err(Error::Invalid("that picture folder is not of format 1")),
     }
 }
@@ -206,17 +212,43 @@ fn is_mbid(text: &str) -> bool {
 
 /// The portrait an artist's folder chose, read: `Ok(None)` when it has
 /// none, `Err(())` when it chose one that cannot be read.
-fn portrait(folder: &Path, dir: &str) -> Result<Option<Read>, ()> {
+/// Why a portrait was not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unread {
+    /// What the folder holds is not a portrait that can be used: a
+    /// manifest of another format, a name out of the folder, a link.
+    Content,
+    /// The system would not let it be read, as a disk that went away does.
+    /// The portrait the library has is kept.
+    Unreachable,
+}
+
+/// Whether a failed read says something of the folder, or only of the
+/// system.
+fn unread(error: &std::io::Error) -> Unread {
+    let link = [rustix::io::Errno::LOOP, rustix::io::Errno::NOTDIR]
+        .iter()
+        .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()));
+    if error.kind() == std::io::ErrorKind::InvalidInput || link {
+        Unread::Content
+    } else {
+        Unread::Unreachable
+    }
+}
+
+fn portrait(folder: &Path, dir: &str) -> Result<Option<Read>, Unread> {
     let text = match read_inside(folder, &format!("{dir}/manifest.json"), MANIFEST_CAP) {
         Ok(text) => text,
+        // No manifest: the artist has no portrait chosen. Whether the
+        // folder itself is still there is checked once every read is done.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(()),
+        Err(error) => return Err(unread(&error)),
     };
     let Ok(manifest) = serde_json::from_slice::<Manifest>(&text) else {
-        return Err(());
+        return Err(Unread::Content);
     };
     if manifest.format != 1 {
-        return Err(());
+        return Err(Unread::Content);
     }
     let mut chosen = manifest.chosen;
     let Some(choice) = chosen.remove("portrait") else {
@@ -225,10 +257,11 @@ fn portrait(folder: &Path, dir: &str) -> Result<Option<Read>, ()> {
     // A plain name beside the manifest, never a path out of the folder.
     let file = &choice.file;
     if file.is_empty() || file.starts_with('.') || file.contains(['/', '\\']) {
-        return Err(());
+        return Err(Unread::Content);
     }
     let path = format!("{dir}/{file}");
-    let bytes = read_inside(folder, &path, PORTRAIT_CAP).map_err(|_| ())?;
+    // A chosen file that cannot be read is still chosen.
+    let bytes = read_inside(folder, &path, PORTRAIT_CAP).map_err(|error| unread(&error))?;
     let source = manifest
         .files
         .into_iter()
@@ -291,7 +324,72 @@ fn artists(connection: &Connection) -> Result<Vec<Artist>, Error> {
         .collect())
 }
 
+/// A picture folder the library knows, as `artists.pictureFolders` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownPictureFolder {
+    /// Its name, which this server's `server.db` maps to a path if it is
+    /// on this server.
+    pub name: String,
+    /// Whether it is on this server.
+    pub on_this_server: bool,
+    /// The portraits the library holds from it.
+    pub portraits: u64,
+}
+
+/// The last import of a picture folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastPictureImport {
+    /// When it was committed.
+    pub at_ms: i64,
+    /// What it answered, while the library keeps its receipt.
+    pub result_json: Option<String>,
+}
+
 impl LibraryStore {
+    /// Every picture folder, in the order they were first imported, and
+    /// the last import of any that wrote something, asked for or started
+    /// on its own. The import's time is its revision's, which is kept; its
+    /// counts are its receipt's, which may be pruned, and which an import
+    /// started on its own has none of.
+    pub fn picture_folders_and_last_import(
+        &self,
+    ) -> Result<(Vec<KnownPictureFolder>, Option<LastPictureImport>), Error> {
+        let hub = self.hub();
+        self.read(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT f.name, s.public_id,
+                        (SELECT count(*) FROM artist_picture p WHERE p.folder_id = f.id)
+                 FROM picture_folder f JOIN server s ON s.id = f.server_id
+                 ORDER BY f.id",
+            )?;
+            let folders = statement
+                .query_map([], |row| {
+                    Ok(KnownPictureFolder {
+                        name: row.get(0)?,
+                        on_this_server: crate::Id::from_bytes(row.get(1)?) == hub,
+                        portraits: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                    })
+                })?
+                .collect::<Result<_, _>>()?;
+            let last = connection
+                .query_row(
+                    "SELECT r.committed_at_ms, c.result_json FROM library_revision r
+                     LEFT JOIN library_command c ON c.command_id = r.command_id
+                     WHERE r.method IN ('artists.importPictures', 'artists.refreshPictures')
+                     ORDER BY r.rev DESC LIMIT 1",
+                    [],
+                    |row| {
+                        Ok(LastPictureImport {
+                            at_ms: row.get(0)?,
+                            result_json: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok((folders, last))
+        })
+    }
+
     /// Imports the portraits of the picture folder `name`, `folder` on
     /// this server, for the library's artists: by MusicBrainz ID, and by
     /// name for an artist with none. The folder's earlier portraits that
@@ -307,7 +405,58 @@ impl LibraryStore {
     where
         R: FnOnce(&PicturesImported, i64) -> String + Send + 'static,
     {
-        let folder = folder.0.as_path();
+        self.import_pictures(request, name, folder, false, receipt)
+    }
+
+    /// The names of this hub's picture folders: each root an import has
+    /// read.
+    pub fn picture_folders(&self) -> Result<Vec<String>, Error> {
+        let hub = self.hub();
+        self.read(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT f.name FROM picture_folder f JOIN server s ON s.id = f.server_id
+                 WHERE s.public_id = ?1 ORDER BY f.id",
+            )?;
+            let rows = statement.query_map([hub.as_bytes()], |row| row.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Imports a picture folder again, as the hub does when the folder
+    /// changes: as [`import_artist_pictures`](Self::import_artist_pictures),
+    /// except that a folder that would change nothing is not written, and
+    /// takes no revision. `None` then.
+    pub fn refresh_artist_pictures(
+        &self,
+        request: WriteRequest,
+        name: &str,
+        folder: &PictureFolder,
+    ) -> Result<Option<PicturesImported>, Error> {
+        let slot = Arc::new(Mutex::new(PicturesImported::default()));
+        let kept = Arc::clone(&slot);
+        let receipt = move |counts: &PicturesImported, _| {
+            *kept.lock().unwrap_or_else(PoisonError::into_inner) = *counts;
+            String::new()
+        };
+        match self.import_pictures(request, name, folder, true, receipt) {
+            Ok(_) => Ok(Some(*slot.lock().unwrap_or_else(PoisonError::into_inner))),
+            Err(Error::Unchanged) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn import_pictures<R>(
+        &self,
+        request: WriteRequest,
+        name: &str,
+        folder: &PictureFolder,
+        only_if_changed: bool,
+        receipt: R,
+    ) -> Result<Written, Error>
+    where
+        R: FnOnce(&PicturesImported, i64) -> String + Send + 'static,
+    {
+        let (folder, walked) = (folder.0.as_path(), folder.1);
         let artists = self.read(artists)?;
         // Names with no ID that the folder makes the same: a portrait there
         // is only an artist's whose name its manifest gives exactly.
@@ -325,6 +474,9 @@ impl LibraryStore {
             ..PicturesImported::default()
         };
         let mut found = Vec::new();
+        // Artists whose portrait could not be reached: what the library has
+        // of them is kept.
+        let mut held = HashSet::new();
         for artist in artists {
             let (dir, by_mbid) = match (&artist.mbid, &artist.name) {
                 (Some(mbid), _) if is_mbid(mbid) => (mbid.clone(), true),
@@ -382,16 +534,27 @@ impl LibraryStore {
                     });
                 }
                 Ok(None) => counts.without += 1,
-                Err(()) => {
+                Err(why) => {
+                    if why == Unread::Unreachable {
+                        held.insert(artist.id);
+                    }
                     counts.unreadable += 1;
                     counts.without += 1;
                 }
             }
         }
+        // The folder went away while it was read: what it seemed to say is
+        // not written, and nothing is dropped.
+        if walked.is_none() || crate::walk::root_id(folder) != walked {
+            return Err(Error::RootOffline {
+                path: folder.to_owned(),
+            });
+        }
 
         let (name, hub) = (name.to_owned(), self.hub());
         self.write(request, move |write| {
             let (connection, rev) = (write.connection(), write.rev());
+            let mut changed = false;
             let folder_id: i64 = match connection
                 .query_row(
                     "SELECT f.id FROM picture_folder f JOIN server s ON s.id = f.server_id
@@ -408,10 +571,11 @@ impl LibraryStore {
                          VALUES (?1, (SELECT id FROM server WHERE public_id = ?2), ?3, ?4, ?5)",
                         (write.new_id()?.as_bytes(), hub.as_bytes(), &name, write.now_ms(), rev),
                     )?;
+                    changed = true;
                     connection.last_insert_rowid()
                 }
             };
-            let mut kept = HashSet::new();
+            let mut kept = held;
             for portrait in &found {
                 // An artist merged away since the read is left for next time.
                 let live: bool = connection.query_row(
@@ -426,7 +590,7 @@ impl LibraryStore {
                 let picture = picture_row(write, portrait)?;
                 let matched_by = if portrait.by_mbid { "mbid" } else { "name" };
                 // Only a portrait that changed takes this revision.
-                connection.execute(
+                changed |= 0 < connection.execute(
                     "INSERT INTO artist_picture
                        (artist_id, kind, picture_id, folder_id, path, matched_by, source, chosen_by, rev)
                      VALUES (?1, 'portrait', ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -461,6 +625,9 @@ impl LibraryStore {
                 )?;
             }
             counts.dropped = dropped as u64;
+            if only_if_changed && !changed && dropped == 0 {
+                return Err(Error::Unchanged);
+            }
             Ok(receipt(&counts, rev))
         })
     }

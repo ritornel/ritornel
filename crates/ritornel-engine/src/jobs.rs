@@ -485,6 +485,58 @@ impl ServerStore {
         })
     }
 
+    /// The job of this kind and key that is queued, running or stopping,
+    /// if there is one: there is at most one.
+    pub fn active_job(&self, kind: &str, dedupe_key: &str) -> Result<Option<Job>, Error> {
+        self.read(|connection| {
+            Ok(connection
+                .query_row(
+                    &format!(
+                        "SELECT {COLUMNS} FROM job WHERE kind = ?1 AND dedupe_key = ?2
+                           AND state IN ('queued', 'running', 'cancelling')"
+                    ),
+                    (kind, dedupe_key),
+                    job,
+                )
+                .optional()?)
+        })
+    }
+
+    /// The job of this kind and key that ended last, however it ended.
+    pub fn last_ended_job(&self, kind: &str, dedupe_key: &str) -> Result<Option<Job>, Error> {
+        self.read(|connection| {
+            Ok(connection
+                .query_row(
+                    &format!(
+                        "SELECT {COLUMNS} FROM job WHERE kind = ?1 AND dedupe_key = ?2
+                           AND finished_at_ms IS NOT NULL
+                         ORDER BY finished_at_ms DESC, id DESC LIMIT 1"
+                    ),
+                    (kind, dedupe_key),
+                    job,
+                )
+                .optional()?)
+        })
+    }
+
+    /// The newest job of this kind and key that the server started on its
+    /// own, however far it has got: one whose params name its `trigger`.
+    pub fn last_automatic_job(&self, kind: &str, dedupe_key: &str) -> Result<Option<Job>, Error> {
+        self.read(|connection| {
+            Ok(connection
+                .query_row(
+                    &format!(
+                        "SELECT {COLUMNS} FROM job WHERE kind = ?1 AND dedupe_key = ?2
+                           AND json_extract(params_json, '$.trigger') IS NOT NULL
+                         ORDER BY id DESC LIMIT 1"
+                    ),
+                    (kind, dedupe_key),
+                    job,
+                )
+                .optional()?)
+        })
+    }
+
     /// The items of a job that failed: what each was and the detail, at
     /// most `limit` of them.
     pub fn failed_job_items(&self, job: i64, limit: u32) -> Result<Vec<(String, String)>, Error> {
@@ -611,6 +663,82 @@ mod tests {
             .start_job(command(4, "a"), "scan.start", scan("main"))
             .unwrap();
         assert!(created && again.public_id != first.public_id);
+    }
+
+    #[test]
+    fn the_last_automatic_job_is_the_newest_whose_params_name_a_trigger() {
+        let store = store(&Arc::new(FixedClock::at(T0)));
+        assert_eq!(store.last_automatic_job("scan", "main").unwrap(), None);
+        let (manual, _) = store
+            .start_job(command(1, "a"), "scan.start", scan("main"))
+            .unwrap();
+        assert_eq!(store.last_automatic_job("scan", "main").unwrap(), None);
+        store
+            .finish_job(manual.id, JobState::Succeeded, None)
+            .unwrap();
+        let automatic = NewJob {
+            params_json: r#"{"trigger":"watch"}"#.to_owned(),
+            ..scan("main")
+        };
+        let (started, _) = store
+            .start_job(command(2, "b"), "scan.start", automatic)
+            .unwrap();
+        assert_eq!(
+            store.last_automatic_job("scan", "main").unwrap(),
+            Some(started)
+        );
+        assert_eq!(store.last_automatic_job("scan", "other").unwrap(), None);
+    }
+
+    #[test]
+    fn watching_is_on_until_it_is_turned_off() {
+        let store = store(&Arc::new(FixedClock::at(T0)));
+        assert!(store.watching().unwrap());
+        store.set_watching(false).unwrap();
+        assert!(!store.watching().unwrap());
+        store.set_watching(true).unwrap();
+        assert!(store.watching().unwrap());
+    }
+
+    #[test]
+    fn the_active_job_and_the_last_to_end_are_found_by_kind_and_key() {
+        let clock = Arc::new(FixedClock::at(T0));
+        let store = store(&clock);
+        assert_eq!(store.active_job("scan", "main").unwrap(), None);
+        assert_eq!(store.last_ended_job("scan", "main").unwrap(), None);
+        let (first, _) = store
+            .start_job(command(1, "a"), "scan.start", scan("main"))
+            .unwrap();
+        store
+            .start_job(command(2, "a"), "scan.start", scan("other"))
+            .unwrap();
+        assert_eq!(
+            store.active_job("scan", "main").unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(store.last_ended_job("scan", "main").unwrap(), None);
+
+        clock.set(T0 + 50);
+        let failed = store
+            .finish_job(first.id, JobState::Failed, Some("offline".to_owned()))
+            .unwrap();
+        assert_eq!(store.active_job("scan", "main").unwrap(), None);
+        assert_eq!(store.last_ended_job("scan", "main").unwrap(), Some(failed));
+
+        let (second, _) = store
+            .start_job(command(3, "a"), "scan.start", scan("main"))
+            .unwrap();
+        clock.set(T0 + 90);
+        let succeeded = store
+            .finish_job(second.id, JobState::Succeeded, None)
+            .unwrap();
+        let last = store.last_ended_job("scan", "main").unwrap().unwrap();
+        assert_eq!(
+            (last.finished_at_ms, last.state),
+            (Some(T0 + 90), JobState::Succeeded)
+        );
+        assert_eq!(last, succeeded);
+        assert_eq!(store.last_ended_job("scan", "other").unwrap(), None);
     }
 
     #[test]

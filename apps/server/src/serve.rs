@@ -73,6 +73,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         scan: test_hooks(env),
         playback: playback(args.output.as_deref(), env),
         lastfm: lastfm(env),
+        watch: crate::WatchRun::on(),
     };
     let run = run(held, args, settings, clock, entropy, jobs, out);
     match &run {

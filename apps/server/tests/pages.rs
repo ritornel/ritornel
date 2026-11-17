@@ -1,6 +1,7 @@
 //! Contract tests for an artist's page and an album's: `artist.get`,
 //! `album.get`, and the lists the pages read through views (an artist's
-//! discography and their songs on no record). A real server inside the
+//! discography and their songs on no record); and `history.track`, what
+//! Lean back says of a song. A real server inside the
 //! test, on an invented library with the hand-made showcase in it, talked
 //! to through `ritornel-client`.
 //!
@@ -20,12 +21,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ritornel_client::contract::methods::{AlbumGet, ArtistGet, ArtistsImportPictures};
+use ritornel_client::contract::methods::{
+    AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, HistoryTrack, LibrarySearch,
+};
 use ritornel_client::contract::{
     AlbumGetParams, AlbumRef, AlbumTile, ArtistGetParams, ArtistRow, CONTRACT_VERSION, ClientKind,
     ErrorCode, FILTER_VERSION, Filter, HelloParams, Id, ImportPicturesParams, ListKind,
-    ListOpenParams, ListOpened, Predicate, Query, RecordType, Row, SessionKind, Shelf, SongRow,
-    Sort, SortKey, Window,
+    ListOpenParams, ListOpened, MAX_SEARCH_RESULTS, NoParams, PictureFolder, Predicate, Query,
+    RecordType, Row, SearchParams, SearchResults, SessionKind, Shelf, SongRow, Sort, SortKey,
+    TrackHistoryParams, Window,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -717,6 +721,11 @@ async fn an_artist_takes_their_portrait_from_a_picture_folder(via: Via) {
     let client = running.greeted(via).await;
     let trio = artist(&client, "Bram Kowal Trio").await;
     assert_eq!((trio.art_id, trio.portrait), (None, false));
+    let none = client
+        .call::<ArtistsPictureFolders>(&NoParams {})
+        .await
+        .unwrap();
+    assert!(none.folders.is_empty() && none.last_import_at.is_none());
 
     // A picture folder whose one portrait is an invented cover.
     let folder = running.scratch.0.join("artists");
@@ -747,6 +756,21 @@ async fn an_artist_takes_their_portrait_from_a_picture_folder(via: Via) {
         client.call::<ArtistsImportPictures>(&params).await.unwrap(),
         imported
     );
+    // The folder is listed with where it is, and the import with its counts.
+    let listed = client
+        .call::<ArtistsPictureFolders>(&NoParams {})
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.folders,
+        [PictureFolder {
+            name: "artists".to_owned(),
+            path: Some(params.path.clone()),
+            portraits: 1,
+        }]
+    );
+    assert!(listed.last_import_at.is_some());
+    assert_eq!(listed.last_import, Some(imported.clone()));
 
     // Their row and their page draw them with it, in its colour.
     let trio = artist(&client, "Bram Kowal Trio").await;
@@ -825,9 +849,139 @@ async fn what_the_library_does_not_have_is_not_found(via: Via) {
             ErrorCode::NotFound
         );
     }
+    assert_eq!(
+        refused(
+            client
+                .call::<HistoryTrack>(&TrackHistoryParams {
+                    appearance_id: nothing
+                })
+                .await
+        ),
+        ErrorCode::NotFound
+    );
+}
+
+/// Lean back's facts about a song nobody has played: none, so that the
+/// window shows its title and artist alone.
+async fn a_song_nobody_has_played_has_no_facts(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let ensemble = artist(&client, "Søren Dunmore Ensemble").await;
+    let records = discography(
+        &client,
+        Predicate::ByArtist {
+            artist_id: ensemble.artist_id,
+        },
+    )
+    .await
+    .tiles();
+    let page = client
+        .call::<AlbumGet>(&AlbumGetParams {
+            album: records[0].album,
+        })
+        .await
+        .unwrap();
+    let history = client
+        .call::<HistoryTrack>(&TrackHistoryParams {
+            appearance_id: page.tracks[0].appearance_id,
+        })
+        .await
+        .unwrap();
+    assert!(history.facts.is_empty(), "{history:?}");
+    assert_eq!(history.library_revision, page.library_revision);
+}
+
+async fn search(client: &Client, text: &str) -> SearchResults {
+    client
+        .call::<LibrarySearch>(&SearchParams {
+            text: text.to_owned(),
+            limit: None,
+        })
+        .await
+        .unwrap()
+}
+
+async fn search_finds_names_as_they_are_typed_best_first(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let names = |found: &SearchResults| -> Vec<String> {
+        found
+            .artists
+            .iter()
+            .map(|artist| artist.name.clone().unwrap_or_default())
+            .collect()
+    };
+
+    // Case and accents are ignored, and the artist whose name it is comes
+    // first.
+    for typed in ["SØREN", "soren", "søren dunmore ensemble"] {
+        let found = search(&client, typed).await;
+        assert_eq!(found.top, Some(ListKind::Artists), "{typed}");
+        assert_eq!(
+            names(&found).first().map(String::as_str),
+            Some("Søren Dunmore Ensemble"),
+            "{typed}"
+        );
+    }
+    // By the name they are filed under, and in another script.
+    let found = search(&client, "castellan").await;
+    assert_eq!(
+        names(&found).first().map(String::as_str),
+        Some("Odile Castellan")
+    );
+    let found = search(&client, "мира").await;
+    assert_eq!(names(&found), ["Мира Кесслер"]);
+
+    // A record by its title, shown once however many versions it has, and
+    // a song by its title.
+    let found = search(&client, "northern window").await;
+    assert_eq!(found.top, Some(ListKind::Albums));
+    let titles: Vec<_> = found.albums.iter().map(|tile| tile.title.clone()).collect();
+    assert_eq!(titles, [Some("Northern Window".to_owned())]);
+    let page = client
+        .call::<AlbumGet>(&AlbumGetParams {
+            album: found.albums[0].album,
+        })
+        .await
+        .unwrap();
+    let track = page.tracks[0].clone();
+    let found = search(&client, track.title.as_deref().unwrap()).await;
+    assert!(
+        found
+            .songs
+            .iter()
+            .any(|found| found.song.recording_id == track.recording_id),
+        "{:?}",
+        track.title
+    );
+
+    // Each kind at most as many as asked, and nothing for nothing typed.
+    let found = client
+        .call::<LibrarySearch>(&SearchParams {
+            text: "a".to_owned(),
+            limit: Some(2),
+        })
+        .await
+        .unwrap();
+    assert!(found.artists.len() <= 2 && found.albums.len() <= 2 && found.songs.len() <= 2);
+    assert!(!found.albums.is_empty());
+    let found = search(&client, "  ").await;
+    assert!(found.artists.is_empty() && found.albums.is_empty() && found.songs.is_empty());
+    assert_eq!(
+        refused(
+            client
+                .call::<LibrarySearch>(&SearchParams {
+                    text: "a".to_owned(),
+                    limit: Some(MAX_SEARCH_RESULTS + 1),
+                })
+                .await
+        ),
+        ErrorCode::Invalid
+    );
 }
 
 on_both_transports! {
+    search_finds_names_as_they_are_typed_best_first
     a_discography_files_every_kind_newest_first_and_the_records_they_appear_on_last
     records_of_no_known_kind_are_albums_and_those_with_no_year_come_last
     songs_on_no_record_are_found_by_artist
@@ -836,4 +990,5 @@ on_both_transports! {
     an_artist_is_their_row_with_the_colour_of_their_picture
     an_artist_takes_their_portrait_from_a_picture_folder
     what_the_library_does_not_have_is_not_found
+    a_song_nobody_has_played_has_no_facts
 }

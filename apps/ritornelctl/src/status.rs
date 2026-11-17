@@ -3,7 +3,7 @@
 
 use std::io::Write;
 
-use ritornel_client::contract::ServerStatus;
+use ritornel_client::contract::{ServerStatus, WatchStatus, WatchedFolder, WatchedKind};
 use ritornel_client::local;
 
 use crate::cli::{Error, ServerArgs};
@@ -45,7 +45,59 @@ fn render(status: &ServerStatus) -> String {
     }
     lines.push(("Free disk, data", free));
     lines.push(("Log path", status.log_path.clone()));
+    if let Some(watch) = &status.watch {
+        watching(watch, &mut lines);
+    }
     server::facts(&lines)
+}
+
+/// Whether the server notices changes to its folders, and each folder's
+/// line.
+fn watching(watch: &WatchStatus, lines: &mut Vec<(&str, String)>) {
+    lines.push((
+        "Watching",
+        match &watch.off {
+            Some(off) => format!("off: {off}"),
+            None => "on".to_owned(),
+        },
+    ));
+    for (n, folder) in watch.folders.iter().enumerate() {
+        lines.push((if n == 0 { "Watched folders" } else { "" }, watched(folder)));
+    }
+}
+
+/// A folder: how it is watched, what is waiting, and what was last done on
+/// its own.
+fn watched(folder: &WatchedFolder) -> String {
+    let mut line = format!(
+        "{} ({}): {}",
+        folder.name,
+        folder.kind.as_str(),
+        folder.state.as_str()
+    );
+    if let Some(detail) = &folder.detail {
+        line.push_str(&format!(" ({detail})"));
+    }
+    if let Some(since) = folder.pending_since {
+        line.push_str(&format!(
+            ", changes waiting since {}",
+            crate::lastfm::utc(since)
+        ));
+    }
+    let what = match folder.kind {
+        WatchedKind::Music => "rescan",
+        WatchedKind::Pictures => "import",
+    };
+    match &folder.last_auto {
+        Some(last) => line.push_str(&format!(
+            ", last {what} on its own {} after {}, {}",
+            crate::lastfm::utc(last.started_at),
+            last.trigger.as_str(),
+            last.state.as_str()
+        )),
+        None => line.push_str(&format!(", no {what} on its own yet")),
+    }
+    line
 }
 
 /// A number of bytes in the largest decimal unit that keeps it above one.
@@ -89,6 +141,7 @@ mod tests {
                 data_bytes: Some(412_345_678_901),
             },
             log_path: "/srv/ritornel/logs".to_owned(),
+            watch: None,
         }
     }
 
@@ -136,6 +189,60 @@ Library revision  58
 Free disk, data   412.3 GB
 Log path          /srv/ritornel/logs
 "
+        );
+    }
+
+    #[test]
+    fn watching_shows_each_folder_and_what_was_last_done_on_its_own() {
+        use ritornel_client::contract::{
+            AutoRun, AutoTrigger, JobState, WatchState, WatchedFolder,
+        };
+        let mut status = example();
+        status.watch = Some(WatchStatus {
+            on: true,
+            enabled: true,
+            off: None,
+            folders: vec![
+                WatchedFolder {
+                    name: "music".to_owned(),
+                    kind: WatchedKind::Music,
+                    state: WatchState::Watching,
+                    detail: None,
+                    pending_since: Some(1_763_294_410_000),
+                    last_auto: Some(AutoRun {
+                        trigger: AutoTrigger::Change,
+                        started_at: 1_763_294_400_000,
+                        finished_at: Some(1_763_294_401_000),
+                        state: JobState::Succeeded,
+                        job_id: None,
+                    }),
+                },
+                WatchedFolder {
+                    name: "share".to_owned(),
+                    kind: WatchedKind::Music,
+                    state: WatchState::Polling,
+                    detail: Some("no events".to_owned()),
+                    pending_since: None,
+                    last_auto: None,
+                },
+            ],
+        });
+        assert!(render(&status).ends_with(
+            "\
+Watching          on
+Watched folders   music (music): watching, changes waiting since 2025-11-16 12:00 UTC, last rescan on its own 2025-11-16 12:00 UTC after change, succeeded
+                  share (music): polling (no events), no rescan on its own yet
+"
+        ));
+        status.watch = Some(WatchStatus {
+            on: false,
+            enabled: true,
+            off: Some("this server is not the library's hub".to_owned()),
+            folders: Vec::new(),
+        });
+        assert!(
+            render(&status)
+                .ends_with("Watching          off: this server is not the library's hub\n")
         );
     }
 

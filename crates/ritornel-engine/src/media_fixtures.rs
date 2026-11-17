@@ -253,9 +253,11 @@ fn a_file_with_no_packets_is_refused_and_has_no_hash() {
     assert_eq!((payload.audio, payload.container), (None, None));
     assert_eq!(payload.error.unwrap().kind, "unsupported");
 
+    // A file that is not there says nothing of its content: a scan records
+    // nothing of it.
     let payload = read("there-is-no-such-file.flac");
     assert_eq!(payload.audio, None);
-    assert_eq!(payload.error.unwrap().kind, "io");
+    assert_eq!(payload.error.unwrap().kind, crate::media::UNAVAILABLE);
 }
 
 #[test]

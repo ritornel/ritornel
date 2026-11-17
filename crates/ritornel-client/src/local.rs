@@ -302,13 +302,28 @@ mod tests {
         assert!(matches!(data_dir(None, &no_env), Err(Error::NoDataDir)));
     }
 
+    /// Whether `done` comes true within a few seconds. A lock let go is not
+    /// free at once while another test spawns a process: the child carries
+    /// this process's open files, and their locks, until its exec closes
+    /// them.
+    fn soon(done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
     /// Holds a data directory's lock as a server does, with this pid in
     /// the lock file.
     fn hold(dir: &Path, pid: &str) -> File {
         let path = dir.join(local::SERVER_LOCK);
         std::fs::write(&path, pid).unwrap();
         let file = File::open(&path).unwrap();
-        file.try_lock().unwrap();
+        assert!(soon(|| file.try_lock().is_ok()), "the lock stays held");
         file
     }
 
@@ -350,7 +365,7 @@ mod tests {
         // Asking took nothing from the holder, however often.
         assert_eq!(probe(&scratch.0).unwrap(), Lock::Held { pid: Some(4312) });
         drop(held);
-        assert_eq!(probe(&scratch.0).unwrap(), Lock::Free);
+        assert!(soon(|| probe(&scratch.0).unwrap() == Lock::Free));
 
         // A server that has the lock and has not written its pid yet.
         let _held = hold(&scratch.0, "");

@@ -38,6 +38,16 @@ pub(crate) struct Walked {
     pub(crate) images: BTreeMap<String, Vec<Seen>>,
     /// Files passed over, with why: a name that is not UTF-8.
     pub(crate) skipped: Vec<(String, &'static str)>,
+    /// Which folder the root was when it was walked: its device and inode.
+    /// An unmounted disk leaves another folder at the same path.
+    pub(crate) root_id: Option<(u64, u64)>,
+}
+
+/// Which folder is at `root` now, if one is.
+pub(crate) fn root_id(root: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(root).ok()?;
+    metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
 }
 
 /// The folder a file is in, relative to the root: empty at the root.
@@ -91,9 +101,13 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
             continue;
         }
         // A link to a file is followed. A link to a folder is not: it
-        // could lead back to where the walk came from.
-        let Ok(metadata) = std::fs::metadata(entry.path()) else {
-            continue;
+        // could lead back to where the walk came from. A link that leads
+        // nowhere is passed over; a file the system will not describe
+        // fails the walk, rather than being taken for gone.
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(_) if kind.is_symlink() => continue,
+            Err(error) => return Err(Error::Io(error)),
         };
         if !metadata.is_file() {
             continue;
@@ -123,7 +137,10 @@ pub(crate) fn walk(root: &Path, stop: &AtomicBool) -> Result<Walked, Error> {
         path: root.to_owned(),
     };
     std::fs::read_dir(root).map_err(|_| offline())?;
-    let mut walked = Walked::default();
+    let mut walked = Walked {
+        root_id: root_id(root),
+        ..Walked::default()
+    };
     walk_into(root, "", &mut walked, stop)?;
     // A walk that was asked to stop has not looked everywhere.
     if walked.files.is_empty() && !stop.load(Ordering::Relaxed) {
