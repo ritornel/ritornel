@@ -112,11 +112,13 @@ pub enum LibraryChange {
     Metadata,
     /// Counts changed, such as plays.
     Stats,
+    /// What the listener says of a song changed: its stars.
+    Ratings,
 }
 
 impl LibraryChange {
     /// Every kind of change, in order.
-    pub const ALL: &[Self] = &[Self::Membership, Self::Metadata, Self::Stats];
+    pub const ALL: &[Self] = &[Self::Membership, Self::Metadata, Self::Stats, Self::Ratings];
 }
 
 /// What an event on the `library` topic carries. Events that were not yet

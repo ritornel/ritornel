@@ -37,8 +37,9 @@ rtrb = "=0.4.1"
 rubato = "=5.1.0"
 # The monotonic clock that keeps counting while the machine sleeps, which
 # every listen is stamped with: the standard library's does not on macOS.
-# The server builds it already.
-rustix = { version = "1.1.6", features = ["time"] }
+# The server builds it already. `fs` opens a picture folder's files one
+# component at a time, following no link and waiting on no pipe.
+rustix = { version = "1.1.6", features = ["fs", "time"] }
 # A stored payload, a decision's evidence and a job's checkpoint are JSON.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

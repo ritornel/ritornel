@@ -626,7 +626,10 @@ async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_r
     assert!(lists[0].reorder);
     assert_eq!(lists[0].library_revision, library[0].library_revision);
     assert!(library[0].library_revision >= opened.library_revision + 2);
-    assert_eq!(library[0].changed.len(), 3);
+    assert_eq!(
+        library[0].changed,
+        ritornel_client::contract::LibraryChange::ALL
+    );
     // Nothing else is waiting.
     client.servers().await.unwrap();
     assert!(client.try_next_event().is_none());

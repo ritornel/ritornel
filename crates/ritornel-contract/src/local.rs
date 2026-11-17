@@ -46,6 +46,16 @@ pub const SERVER_JSON: &str = "server.json";
 /// holds a `full` session.
 pub const CREDENTIAL: &str = "credential";
 
+/// The first word of the one line `ritornel-server serve` prints on standard
+/// output, once it can be found and stopped: `ready pid=<pid>
+/// server_id=<id>`. A launcher waits for it.
+pub const READY: &str = "ready";
+
+/// The exit code `ritornel-server serve` reserves for one case: another
+/// server holds the data directory. A launcher that lost the race to start
+/// one goes back to finding the one that won.
+pub const EXIT_IN_USE: u8 = 3;
+
 /// How a program reads an environment variable. It is passed in, so that a
 /// test can say what the environment holds without changing its own.
 pub type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;

@@ -34,12 +34,17 @@ impl Drop for NullOutput {
     }
 }
 
+/// What a test reads the frames handed to the null output from.
+pub(super) type Tap = Arc<std::sync::Mutex<Vec<f32>>>;
+
 /// Starts the null output, which drives `callback` at `speed` times real
-/// time.
+/// time. With a tap, every frame the callback hands over is kept there, for
+/// a test to hold to what was decoded.
 pub(super) fn start(
     mut callback: Callback,
     spec: OutputSpec,
     speed: u32,
+    tap: Option<Tap>,
 ) -> Result<NullOutput, RenderError> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
@@ -53,7 +58,14 @@ pub(super) fn start(
                 let mut rendered: u64 = 0;
                 let per_second = f64::from(spec.rate) * f64::from(speed);
                 while !stop.load(Ordering::SeqCst) {
-                    callback.render(&mut buffer);
+                    let written = callback.render(&mut buffer);
+                    if let Some(tap) = &tap
+                        && let Some(frames) = buffer.get(..written * spec.channels)
+                    {
+                        tap.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .extend_from_slice(frames);
+                    }
                     rendered += frames as u64;
                     // Paced against the start, so that the rate holds
                     // however long each pass takes.

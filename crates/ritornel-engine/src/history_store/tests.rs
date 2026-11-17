@@ -764,7 +764,7 @@ fn a_library_saved_with_listens_is_taken_forward_with_its_listens_and_plays() {
     let library = LibraryStore::open(&path, server.server_id, clock.clone(), entropy).unwrap();
     assert_eq!(
         (library.migrations_applied(), library.schema_version()),
-        (2, 4)
+        (3, 5)
     );
 
     library
@@ -987,7 +987,7 @@ fn a_library_saved_at_the_third_migration_keeps_its_decisions_and_plays_through_
     let library = LibraryStore::open(&path, server.server_id, clock.clone(), entropy).unwrap();
     assert_eq!(
         (library.migrations_applied(), library.schema_version()),
-        (1, 4)
+        (2, 5)
     );
     library
         .read(|connection| {
@@ -1007,6 +1007,60 @@ fn a_library_saved_at_the_third_migration_keeps_its_decisions_and_plays_through_
             Ok(())
         })
         .unwrap();
+}
+
+/// A `library.db` as the fourth migration left it: the library of
+/// [`SAVED_LIBRARY_0003`] taken forward one migration.
+const SAVED_LIBRARY_0004: &str = include_str!("../../saved/library/0004.sql");
+
+#[test]
+fn the_saved_library_at_the_fourth_migration_is_one_the_first_four_made() {
+    let saved = Connection::open_in_memory().unwrap();
+    saved.execute_batch(SAVED_LIBRARY_0004).unwrap();
+    let mut made = Connection::open_in_memory().unwrap();
+    crate::migrate::run(
+        &mut made,
+        crate::migrate::LIBRARY.get(..4).unwrap(),
+        &FixedClock::at(T0),
+    )
+    .unwrap();
+    assert_eq!(schema_of(&saved), schema_of(&made));
+}
+
+#[test]
+fn a_library_saved_at_the_fourth_migration_keeps_what_it_holds_through_the_fifth() {
+    let scratch = crate::testing::Scratch::new();
+    let path = scratch.path().join("library.db");
+    let saved = Connection::open(&path).unwrap();
+    saved.execute_batch(SAVED_LIBRARY_0004).unwrap();
+    let derived_before = derived(&saved).unwrap();
+    drop(saved);
+
+    let clock = Arc::new(FixedClock::at(T0));
+    let entropy = Arc::new(CountingEntropy::default());
+    let servers = ServerStore::open_in_memory(clock.clone(), entropy.clone()).unwrap();
+    let (server, _) = servers.ensure_identity("desk").unwrap();
+    let library = LibraryStore::open(&path, server.server_id, clock, entropy).unwrap();
+    assert_eq!(
+        (library.migrations_applied(), library.schema_version()),
+        (1, 5)
+    );
+    library
+        .read(|connection| {
+            assert_eq!(derived(connection)?, derived_before);
+            let pictures: i64 = connection.query_row(
+                "SELECT (SELECT count(*) FROM picture_folder) + (SELECT count(*) FROM artist_picture)",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(pictures, 0);
+            Ok(())
+        })
+        .unwrap();
+    let albums = library
+        .list_open(ritornel_contract::ListKind::Albums, &Default::default())
+        .unwrap();
+    assert_eq!(albums.ids.len(), 1);
 }
 
 /// A Last.fm account on the rig's library, and an import of one scrobble of

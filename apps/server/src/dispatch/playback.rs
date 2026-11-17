@@ -1,5 +1,5 @@
-//! The player's calls: `playback.*`, `queue.window` and `sources.tracks`,
-//! and the events the player sends. See "Playback and jobs" in
+//! The player's calls: `playback.*`, `queue.*` and `sources.tracks`, and
+//! the events the player sends. See "Playback and jobs" in
 //! docs/design/contract.md and docs/design/playback.md.
 //!
 //! A server with no output has no player, and answers the player's calls
@@ -10,23 +10,28 @@ use std::sync::PoisonError;
 use std::sync::atomic::Ordering;
 
 use ritornel_contract::methods::{
-    Method, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSkip, PlaybackStop,
+    Method, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
+    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove,
 };
 use ritornel_contract::{
-    ContextKind, CopyInUse, ErrorCode, Event, Id, OutputInfo, OutputMode, PlaySource,
-    PlaybackChanged, PlaybackCommandParams, PlaybackEvent, PlaybackPlayParams, PlaybackSeekParams,
-    PlaybackSkipParams, PlaybackState, PlaybackStatus, ProgressEvent, QueueEntry, QueueEvent,
-    QueueWindow, QueueWindowParams, Receipt, ReceiptStatus, Repeat, RpcError, SkipDirection,
-    SourceTracks, SourcesTracksParams, TrackSummary,
+    ContextKind, CopyInUse, ErrorCode, Event, Id, ListKind, OutputInfo, OutputMode, PlaySource,
+    PlaybackChanged, PlaybackCommandParams, PlaybackEvent, PlaybackJumpParams, PlaybackPlayParams,
+    PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState, PlaybackStatus,
+    ProgressEvent, QueueAddParams, QueueClearParams, QueueEntry, QueueEvent, QueueMoveParams,
+    QueueOrder, QueuePlace, QueueRemoveParams, QueueWindow, QueueWindowParams, Receipt,
+    ReceiptStatus, Repeat, RpcError, SkipDirection, SourceTracks, SourcesTracksParams,
+    TrackSummary,
 };
 use ritornel_engine::playback::{
-    self as engine, Direction, Done, PlayTracks, Player, PlayerEvent, PlayerState, Request, Status,
-    TrackDisplay,
+    self as engine, AddTracks, Direction, Done, Order, Place, PlayTracks, Player, PlayerEvent,
+    PlayerState, Request, Settings, Status, TrackDisplay,
 };
 use ritornel_engine::{Command, LibraryStore, ServerStore};
 use tracing::{error, warn};
 
+use super::lists::expired;
 use super::{Core, Stores, fingerprint, lock};
+use crate::session::Session;
 
 /// The most queue entries one `queue.window` returns.
 const MAX_WINDOW: u32 = 500;
@@ -34,6 +39,33 @@ const MAX_WINDOW: u32 = 500;
 fn unsigned(number: i64) -> u64 {
     u64::try_from(number).unwrap_or(0)
 }
+
+fn signed(number: u64) -> i64 {
+    i64::try_from(number).unwrap_or(i64::MAX)
+}
+
+/// Repeat, as the engine has it.
+fn repeat_of(repeat: Repeat) -> engine::Repeat {
+    match repeat {
+        Repeat::Off => engine::Repeat::Off,
+        Repeat::All => engine::Repeat::All,
+        Repeat::One => engine::Repeat::One,
+    }
+}
+
+/// Repeat, as the contract writes it.
+fn repeat_to(repeat: engine::Repeat) -> Repeat {
+    match repeat {
+        engine::Repeat::Off => Repeat::Off,
+        engine::Repeat::All => Repeat::All,
+        engine::Repeat::One => Repeat::One,
+    }
+}
+
+/// The tracks a source names, in order, why they are played when the
+/// caller does not say, and where the start the caller named is among
+/// them.
+type Resolved = (Vec<Id>, (ContextKind, Option<Id>), Option<usize>);
 
 /// Why tracks were queued, as the engine writes it.
 fn context_kind(kind: ContextKind) -> engine::ContextKind {
@@ -62,6 +94,11 @@ pub(super) fn refused(error: ritornel_engine::Error) -> RpcError {
             "this idempotency key was used before with other params",
         ),
         Engine::Playback(what) => RpcError::new(ErrorCode::Unavailable, what),
+        Engine::StaleQueue { current } => RpcError::new(
+            ErrorCode::Conflict,
+            "the queue has changed since that edit was decided: read it again",
+        )
+        .with_detail("currentRevision", unsigned(current)),
         other => RpcError::new(ErrorCode::Internal, other.to_string()),
     }
 }
@@ -86,6 +123,9 @@ pub(super) fn track(display: &TrackDisplay) -> TrackSummary {
         disc_number: number(display.disc),
         track_number: number(display.track),
         duration_ms: display.duration_ms.and_then(|ms| u64::try_from(ms).ok()),
+        art_id: display.art,
+        rating: display.rating.and_then(|value| u32::try_from(value).ok()),
+        loved: display.loved,
     }
 }
 
@@ -101,6 +141,9 @@ fn bare(appearance: Id) -> TrackSummary {
         disc_number: None,
         track_number: None,
         duration_ms: None,
+        art_id: None,
+        rating: None,
+        loved: false,
     }
 }
 
@@ -146,10 +189,10 @@ impl Core {
                 }),
             position_ms: unsigned(state.position_ms),
             duration_ms: state.duration_ms.map(unsigned),
-            volume: 1.0,
-            muted: false,
-            shuffle: false,
-            repeat: Repeat::Off,
+            volume: state.volume,
+            muted: state.muted,
+            shuffle: state.shuffle,
+            repeat: repeat_to(state.repeat),
             output: OutputInfo {
                 name: state.output.0.clone(),
                 mode: OutputMode::Shared,
@@ -171,6 +214,8 @@ impl Core {
                         self.publish(&Event::Playback(Box::new(PlaybackEvent {
                             state: self.playback_state(state),
                         })));
+                        #[cfg(all(feature = "media-session", target_os = "macos"))]
+                        self.show_in_media_session(state);
                     }
                 }
                 PlayerEvent::Progress {
@@ -299,16 +344,43 @@ impl Core {
         Ok(self.playback_state(&player.state()))
     }
 
-    pub(super) fn playback_play(
-        &self,
+    /// What a command carried out before answered, read before anything it
+    /// names is resolved, as the view it played from may have ended since.
+    /// The write checks again, for one sent twice at once.
+    fn answered_before<M: Method>(
         stores: &Stores,
-        params: &PlaybackPlayParams,
-    ) -> Result<PlaybackChanged, RpcError> {
-        if !self.has_player() {
-            return Err(no_player());
-        }
-        let (tracks, default_context) = match &params.source {
-            PlaySource::Tracks { ids } => (ids.clone(), (ContextKind::Manual, None)),
+        key: Id,
+        params: &M::Params,
+    ) -> Result<Option<PlaybackChanged>, RpcError> {
+        let command = Command {
+            id: key,
+            fingerprint: fingerprint::<M>(params)?,
+        };
+        let Some(stored) = stores.server.stored_result(command).map_err(refused)? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&stored).map(Some).map_err(|error| {
+            RpcError::new(
+                ErrorCode::Internal,
+                format!(
+                    "the stored result of {} could not be read: {error}",
+                    M::NAME
+                ),
+            )
+        })
+    }
+
+    /// The tracks a source names. A view's rows the library no longer has
+    /// are left out, and the start moves with them.
+    fn source_tracks(
+        stores: &Stores,
+        session: &Session,
+        source: &PlaySource,
+        start: Option<u32>,
+    ) -> Result<Resolved, RpcError> {
+        let start = start.map(|start| usize::try_from(start).unwrap_or(usize::MAX));
+        match source {
+            PlaySource::Tracks { ids } => Ok((ids.clone(), (ContextKind::Manual, None), start)),
             PlaySource::Release { id } => {
                 let tracks = Self::library(stores, |library| {
                     library
@@ -316,20 +388,66 @@ impl Core {
                         .map_err(refused)?
                         .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no such release"))
                 })?;
-                (
+                Ok((
                     tracks.iter().map(|track| track.appearance).collect(),
                     (ContextKind::Album, Some(*id)),
-                )
+                    start,
+                ))
             }
-        };
+            PlaySource::View { view } => {
+                let resolved = session.view(view).ok_or_else(|| expired(view))?;
+                if resolved.kind != ListKind::Songs {
+                    return Err(RpcError::new(
+                        ErrorCode::Invalid,
+                        "only a list of songs can be played",
+                    ));
+                }
+                let ids = Self::library(stores, |library| {
+                    library.song_ids(&resolved.ids).map_err(refused)
+                })?;
+                if let Some(start) = start
+                    && ids.get(start).is_some_and(Option::is_none)
+                {
+                    return Err(RpcError::new(ErrorCode::NotFound, "that song is gone"));
+                }
+                let moved = start.map(|start| {
+                    ids.iter()
+                        .take(start)
+                        .filter(|found| found.is_some())
+                        .count()
+                });
+                let tracks = ids.into_iter().flatten().collect();
+                Ok((tracks, (ContextKind::Query, None), moved))
+            }
+        }
+    }
+
+    pub(super) fn playback_play(
+        &self,
+        stores: &Stores,
+        session: &Session,
+        params: &PlaybackPlayParams,
+    ) -> Result<PlaybackChanged, RpcError> {
+        if !self.has_player() {
+            return Err(no_player());
+        }
+        if let Some(answer) =
+            Self::answered_before::<PlaybackPlay>(stores, params.idempotency_key, params)?
+        {
+            return Ok(answer);
+        }
+        let (tracks, default_context, start) =
+            Self::source_tracks(stores, session, &params.source, params.start)?;
         let context = params
             .context
             .map_or(default_context, |context| (context.kind, context.reference));
         let what = PlayTracks {
             tracks,
-            start: usize::try_from(params.start.unwrap_or(0)).unwrap_or(usize::MAX),
+            start,
             context: (context_kind(context.0), context.1),
             actor: self.local_credential.session(),
+            shuffle: params.shuffle,
+            known: matches!(params.source, PlaySource::View { .. }),
         };
         let request = self.request::<PlaybackPlay>(params.idempotency_key, params)?;
         let done = self.with_player(stores, |player, server, library| {
@@ -433,38 +551,223 @@ impl Core {
         stores: &Stores,
         params: &QueueWindowParams,
     ) -> Result<QueueWindow, RpcError> {
-        let (queue, state) = {
+        let order = match params.order.unwrap_or(QueueOrder::Queue) {
+            QueueOrder::Queue => Order::Queue,
+            QueueOrder::Play => Order::Play,
+            QueueOrder::UpNext => Order::UpNext,
+        };
+        let limit = usize::try_from(params.limit.unwrap_or(100).min(MAX_WINDOW)).unwrap_or(0);
+        let offset = usize::try_from(params.offset).unwrap_or(usize::MAX);
+        let (page, revision) = {
             let player = lock(&self.player);
             let player = player.as_ref().ok_or_else(no_player)?;
-            (player.queue(), player.state())
+            (
+                player.window(order, offset, limit),
+                player.state().queue_revision,
+            )
         };
-        let limit = params.limit.unwrap_or(100).min(MAX_WINDOW);
-        let offset = usize::try_from(params.offset).unwrap_or(usize::MAX);
+        let appearances: Vec<Id> = page
+            .entries
+            .iter()
+            .map(|(_, appearance, _)| *appearance)
+            .collect();
         let library = stores
             .library
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        let entries = queue
-            .iter()
-            .skip(offset)
-            .take(usize::try_from(limit).unwrap_or(0))
-            .map(|(entry_id, appearance, failed)| {
-                let shown = library
-                    .as_ref()
-                    .and_then(|library| library.track(*appearance).ok().flatten());
-                QueueEntry {
-                    entry_id: *entry_id,
-                    track: shown.as_ref().map_or_else(|| bare(*appearance), track),
-                    failed_reason: failed.clone(),
-                }
+        let shown = match library.as_ref() {
+            Some(library) => library.tracks(&appearances).map_err(refused)?,
+            None => Vec::new(),
+        };
+        let entries = page
+            .entries
+            .into_iter()
+            .enumerate()
+            .map(|(at, (entry_id, appearance, failed))| QueueEntry {
+                entry_id,
+                track: shown
+                    .get(at)
+                    .and_then(Option::as_ref)
+                    .map_or_else(|| bare(appearance), track),
+                failed_reason: failed,
             })
             .collect();
         Ok(QueueWindow {
-            queue_revision: unsigned(state.queue_revision),
-            total: queue.len() as u64,
-            current_index: state.current.and_then(|now| u32::try_from(now.index).ok()),
+            queue_revision: unsigned(revision),
+            total: page.total as u64,
+            current_index: page.current.and_then(|index| u32::try_from(index).ok()),
             entries,
         })
+    }
+
+    /// Runs a command of the player's and answers with where it is after.
+    fn command<M: Method>(
+        &self,
+        stores: &Stores,
+        key: Id,
+        params: &M::Params,
+        act: impl FnOnce(
+            &mut Player,
+            Request,
+            &ServerStore,
+            Option<&LibraryStore>,
+        ) -> Result<Done, ritornel_engine::Error>,
+    ) -> Result<PlaybackChanged, RpcError> {
+        if !self.has_player() {
+            return Err(no_player());
+        }
+        let request = self.request::<M>(key, params)?;
+        let done = self.with_player(stores, |player, server, library| {
+            let done = act(player, request, server, library)?;
+            let events = done.events.clone();
+            Ok((done, events))
+        })?;
+        Self::answer_of::<M>(&done)
+    }
+
+    pub(super) fn playback_set(
+        &self,
+        stores: &Stores,
+        params: &PlaybackSetParams,
+    ) -> Result<PlaybackChanged, RpcError> {
+        let settings = Settings {
+            volume: params.volume,
+            muted: params.muted,
+            shuffle: params.shuffle,
+            repeat: params.repeat.map(repeat_of),
+        };
+        self.command::<PlaybackSet>(
+            stores,
+            params.idempotency_key,
+            params,
+            |player, request, server, _| player.set(request, settings, server),
+        )
+    }
+
+    pub(super) fn playback_jump(
+        &self,
+        stores: &Stores,
+        params: &PlaybackJumpParams,
+    ) -> Result<PlaybackChanged, RpcError> {
+        let entry = params.entry_id;
+        self.command::<PlaybackJump>(
+            stores,
+            params.idempotency_key,
+            params,
+            |player, request, server, library| player.jump(request, entry, server, library),
+        )
+    }
+
+    pub(super) fn queue_add(
+        &self,
+        stores: &Stores,
+        session: &Session,
+        params: &QueueAddParams,
+    ) -> Result<PlaybackChanged, RpcError> {
+        if !self.has_player() {
+            return Err(no_player());
+        }
+        if let Some(answer) =
+            Self::answered_before::<QueueAdd>(stores, params.idempotency_key, params)?
+        {
+            return Ok(answer);
+        }
+        let (tracks, default_context, _) =
+            Self::source_tracks(stores, session, &params.source, None)?;
+        let context = params
+            .context
+            .map_or(default_context, |context| (context.kind, context.reference));
+        let what = AddTracks {
+            tracks,
+            place: match params.place {
+                QueuePlace::Next => Place::Next,
+                QueuePlace::End => Place::End,
+                QueuePlace::After { entry_id } => Place::After(entry_id),
+            },
+            context: (context_kind(context.0), context.1),
+            actor: self.local_credential.session(),
+        };
+        let expected = params.expected_revision.map(signed);
+        self.command::<QueueAdd>(
+            stores,
+            params.idempotency_key,
+            params,
+            |player, request, server, library| player.add(request, expected, what, server, library),
+        )
+    }
+
+    pub(super) fn queue_remove(
+        &self,
+        stores: &Stores,
+        params: &QueueRemoveParams,
+    ) -> Result<PlaybackChanged, RpcError> {
+        let expected = params.expected_revision.map(signed);
+        let entries = params.entry_ids.clone();
+        self.command::<QueueRemove>(
+            stores,
+            params.idempotency_key,
+            params,
+            |player, request, server, library| {
+                player.remove(request, expected, &entries, server, library)
+            },
+        )
+    }
+
+    pub(super) fn queue_move(
+        &self,
+        stores: &Stores,
+        params: &QueueMoveParams,
+    ) -> Result<PlaybackChanged, RpcError> {
+        let expected = params.expected_revision.map(signed);
+        let entries = params.entry_ids.clone();
+        let place = match params.place {
+            QueuePlace::Next => Place::Next,
+            QueuePlace::End => Place::End,
+            QueuePlace::After { entry_id } => Place::After(entry_id),
+        };
+        self.command::<QueueMove>(
+            stores,
+            params.idempotency_key,
+            params,
+            |player, request, server, _| {
+                player.move_entries(request, expected, &entries, place, server)
+            },
+        )
+    }
+
+    pub(super) fn queue_clear(
+        &self,
+        stores: &Stores,
+        params: &QueueClearParams,
+    ) -> Result<PlaybackChanged, RpcError> {
+        let expected = params.expected_revision.map(signed);
+        self.command::<QueueClear>(
+            stores,
+            params.idempotency_key,
+            params,
+            |player, request, server, _| player.clear(request, expected, server),
+        )
+    }
+
+    /// Reads again what the listener said of the playing song, after a
+    /// rating was set, and tells the clients if it changed.
+    pub(super) fn said_again(&self, stores: &Stores) {
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(library) = library.as_ref() else {
+            return;
+        };
+        let mut player = lock(&self.player);
+        let Some(player) = player.as_mut() else {
+            return;
+        };
+        match player.said_again(library) {
+            Ok(true) => self.publish_player(vec![PlayerEvent::State], Some(player.state())),
+            Ok(false) => {}
+            Err(failed) => warn!(error = %failed, "the playing song's rating could not be read"),
+        }
     }
 
     /// `sources.tracks`: the tracks of the files under a path in one of

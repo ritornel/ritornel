@@ -20,11 +20,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ritornel_client::contract::methods::{AlbumGet, ArtistGet};
+use ritornel_client::contract::methods::{AlbumGet, ArtistGet, ArtistsImportPictures};
 use ritornel_client::contract::{
     AlbumGetParams, AlbumRef, AlbumTile, ArtistGetParams, ArtistRow, CONTRACT_VERSION, ClientKind,
-    ErrorCode, FILTER_VERSION, Filter, HelloParams, Id, ListKind, ListOpenParams, ListOpened,
-    Predicate, Query, RecordType, Row, SessionKind, Shelf, SongRow, Sort, SortKey, Window,
+    ErrorCode, FILTER_VERSION, Filter, HelloParams, Id, ImportPicturesParams, ListKind,
+    ListOpenParams, ListOpened, Predicate, Query, RecordType, Row, SessionKind, Shelf, SongRow,
+    Sort, SortKey, Window,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -696,6 +697,113 @@ async fn an_artist_is_their_row_with_the_colour_of_their_picture(via: Via) {
     }
 }
 
+/// The first invented cover under `dir`.
+fn a_cover(dir: &Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = a_cover(&path) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|name| name == "cover.jpg") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+async fn an_artist_takes_their_portrait_from_a_picture_folder(via: Via) {
+    let running = Running::start().await;
+    let client = running.greeted(via).await;
+    let trio = artist(&client, "Bram Kowal Trio").await;
+    assert_eq!((trio.art_id, trio.portrait), (None, false));
+
+    // A picture folder whose one portrait is an invented cover.
+    let folder = running.scratch.0.join("artists");
+    let dir = folder.join("by-name/Bram Kowal Trio");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(folder.join("index.json"), r#"{"format": 1, "artists": []}"#).unwrap();
+    std::fs::copy(
+        a_cover(&running.scratch.root()).unwrap(),
+        dir.join("portrait.jpg"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("manifest.json"),
+        r#"{"format": 1, "chosen": {"portrait": {"file": "portrait.jpg", "by": "owner"}}}"#,
+    )
+    .unwrap();
+    let params = ImportPicturesParams {
+        idempotency_key: Id::from_bytes([9; 16]),
+        name: "artists".to_owned(),
+        path: folder.to_str().unwrap().to_owned(),
+    };
+    let imported = client.call::<ArtistsImportPictures>(&params).await.unwrap();
+    assert_eq!(
+        (imported.by_name, imported.by_mbid, imported.dropped),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        client.call::<ArtistsImportPictures>(&params).await.unwrap(),
+        imported
+    );
+
+    // Their row and their page draw them with it, in its colour.
+    let trio = artist(&client, "Bram Kowal Trio").await;
+    assert!(trio.portrait && trio.art_id.is_some());
+    let page = client
+        .call::<ArtistGet>(&ArtistGetParams {
+            artist_id: trio.artist_id,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.artist, trio);
+    assert!(page.art_color.is_some());
+
+    // A folder that is not a picture folder is refused.
+    let elsewhere = ImportPicturesParams {
+        idempotency_key: Id::from_bytes([10; 16]),
+        name: "music".to_owned(),
+        path: running.scratch.root().to_str().unwrap().to_owned(),
+    };
+    assert_eq!(
+        refused(client.call::<ArtistsImportPictures>(&elsewhere).await),
+        ErrorCode::Invalid
+    );
+
+    // The import sent again answers from its receipt, even with the folder
+    // no longer a picture folder.
+    std::fs::remove_file(folder.join("index.json")).unwrap();
+    assert_eq!(
+        client.call::<ArtistsImportPictures>(&params).await.unwrap(),
+        imported
+    );
+
+    // A folder refused does not keep the name: it is free for the next.
+    let wrong = running.scratch.0.join("wrong");
+    std::fs::create_dir_all(&wrong).unwrap();
+    std::fs::write(wrong.join("index.json"), r#"{"format": 2}"#).unwrap();
+    let named = |key: u8, path: &Path| ImportPicturesParams {
+        idempotency_key: Id::from_bytes([key; 16]),
+        name: "faces".to_owned(),
+        path: path.to_str().unwrap().to_owned(),
+    };
+    assert_eq!(
+        refused(
+            client
+                .call::<ArtistsImportPictures>(&named(11, &wrong))
+                .await
+        ),
+        ErrorCode::Invalid
+    );
+    std::fs::write(folder.join("index.json"), r#"{"format": 1, "artists": []}"#).unwrap();
+    let elsewhere = client
+        .call::<ArtistsImportPictures>(&named(12, &folder))
+        .await
+        .unwrap();
+    assert_eq!(elsewhere.by_name, 1);
+}
+
 async fn what_the_library_does_not_have_is_not_found(via: Via) {
     let running = Running::start().await;
     let client = running.greeted(via).await;
@@ -726,5 +834,6 @@ on_both_transports! {
     a_list_that_cannot_be_asked_for_is_refused
     an_album_is_its_tracks_in_order_with_its_other_versions
     an_artist_is_their_row_with_the_colour_of_their_picture
+    an_artist_takes_their_portrait_from_a_picture_folder
     what_the_library_does_not_have_is_not_found
 }

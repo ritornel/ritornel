@@ -40,11 +40,14 @@ mod listener;
 mod lock;
 mod logs;
 mod media;
+#[cfg(all(feature = "media-session", target_os = "macos"))]
+mod media_session;
 mod memory;
 mod playback;
 mod serve;
 mod server;
 mod server_json;
+mod service;
 mod session;
 #[cfg(test)]
 mod testing;

@@ -90,6 +90,54 @@ pub(crate) fn rows<T>(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// The ID each artist row is known by: the one the files whose credits
+/// name it claim at its place in the credit, counted only where a file
+/// claims as many IDs as the credit has names, which is when the credit
+/// was made from the IDs. The most claimed wins, then the least.
+pub(crate) fn artist_mbids(connection: &Connection) -> Result<HashMap<i64, String>, Error> {
+    let mut votes: HashMap<i64, HashMap<String, i64>> = HashMap::new();
+    for (row, mbid, count) in rows(
+        connection,
+        "WITH placed AS (
+           SELECT a.source_item_id AS item, ta.display_artist_credit_id AS credit, 'mb_artist' AS namespace
+           FROM assignment a JOIN track_appearance ta ON ta.id = a.appearance_id
+           WHERE a.superseded_at_ms IS NULL
+           UNION ALL
+           SELECT a.source_item_id, rel.display_artist_credit_id, 'mb_album_artist'
+           FROM assignment a JOIN track_appearance ta ON ta.id = a.appearance_id
+           JOIN release rel ON rel.id = ta.release_id
+           WHERE a.superseded_at_ms IS NULL)
+         SELECT n.artist_id, c.value, count(*)
+         FROM placed p
+         JOIN artist_credit_name n ON n.artist_credit_id = p.credit
+         JOIN identifier_claim c ON c.source_item_id = p.item AND c.namespace = p.namespace
+              AND c.ordinal = n.position
+         WHERE (SELECT count(*) FROM identifier_claim o
+                WHERE o.source_item_id = p.item AND o.namespace = p.namespace)
+             = (SELECT count(*) FROM artist_credit_name o WHERE o.artist_credit_id = p.credit)
+         GROUP BY 1, 2",
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )? {
+        votes.entry(row).or_default().insert(mbid, count);
+    }
+    let mut mbids = HashMap::new();
+    for (row, counted) in votes {
+        if let Some((mbid, _)) = counted
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        {
+            mbids.insert(row, mbid);
+        }
+    }
+    Ok(mbids)
+}
+
 /// Reads the library as the resolver sees it, in one read transaction.
 pub(crate) fn load(connection: &Connection) -> Result<(Library, Shown), Error> {
     let transaction = connection.unchecked_transaction()?;
@@ -374,49 +422,7 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
     library.credits = credits.into_values().collect();
     library.credits.sort_by_key(|credit| credit.id);
 
-    // The ID each artist row is known by: the one the files whose credits
-    // name it claim at its place in the credit, counted only where a file
-    // claims as many IDs as the credit has names, which is when the credit
-    // was made from the IDs. The most claimed wins, then the least.
-    let mut votes: HashMap<i64, HashMap<String, i64>> = HashMap::new();
-    for (row, mbid, count) in rows(
-        connection,
-        "WITH placed AS (
-           SELECT a.source_item_id AS item, ta.display_artist_credit_id AS credit, 'mb_artist' AS namespace
-           FROM assignment a JOIN track_appearance ta ON ta.id = a.appearance_id
-           WHERE a.superseded_at_ms IS NULL
-           UNION ALL
-           SELECT a.source_item_id, rel.display_artist_credit_id, 'mb_album_artist'
-           FROM assignment a JOIN track_appearance ta ON ta.id = a.appearance_id
-           JOIN release rel ON rel.id = ta.release_id
-           WHERE a.superseded_at_ms IS NULL)
-         SELECT n.artist_id, c.value, count(*)
-         FROM placed p
-         JOIN artist_credit_name n ON n.artist_credit_id = p.credit
-         JOIN identifier_claim c ON c.source_item_id = p.item AND c.namespace = p.namespace
-              AND c.ordinal = n.position
-         WHERE (SELECT count(*) FROM identifier_claim o
-                WHERE o.source_item_id = p.item AND o.namespace = p.namespace)
-             = (SELECT count(*) FROM artist_credit_name o WHERE o.artist_credit_id = p.credit)
-         GROUP BY 1, 2",
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        },
-    )? {
-        votes.entry(row).or_default().insert(mbid, count);
-    }
-    for (row, counted) in votes {
-        if let Some((mbid, _)) = counted
-            .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-        {
-            library.artist_mbids.insert(row, mbid);
-        }
-    }
+    library.artist_mbids = artist_mbids(connection)?;
 
     library.exclusions = rows(
         connection,

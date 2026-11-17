@@ -4,13 +4,27 @@
 //!
 //! This is the control side, and it owns all state. It does nothing on its
 //! own: a command changes it, and a tick, which the server gives it a few
-//! times a second, reads what the renderer has played, opens, checkpoints
-//! and closes listens, and moves on at the end of a track. A test drives
+//! times a second, takes in what the output did, saves the listens when a
+//! save is due, and moves on when a track's audio runs out. A test drives
 //! both with a fake renderer and clocks it sets.
 //!
-//! This first player plays simply on purpose: a plain queue in the order it
-//! was given, no gapless joins, no shuffle or repeat, no ReplayGain, no
-//! volume (build-order.md, decision 2).
+//! Every command and every tick first takes in what the output said, so
+//! nothing is decided on a track the output has left: one that ran into
+//! the next has made the next current by then. Each span handed down is
+//! registered with the listen it opens or carries on, as it is decided, and
+//! the listens are folded from the output's events alone ([`Recorder`]).
+//! Saving them is a step of its own, and one that fails only puts off the
+//! next.
+//!
+//! The entry that follows is prepared as soon as a track starts, and again
+//! whenever an edit lets it go, and the renderer joins it with no gap
+//! (decisions 6 and 10). An entry queued from an album plays at its
+//! album's ReplayGain, any other at its track's (decision 7). The volume
+//! is the player's own.
+//!
+//! The queue keeps its two orders in [`Queue`]; what edits it is in
+//! `edits`. Shuffle is a stored play order, and repeat is off, all or one;
+//! [`Player::following`] is where both decide what comes next.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,13 +33,19 @@ use std::sync::Arc;
 use ritornel_domain::history::{ContextKind, EndReason, StartReason};
 
 use crate::playback::catalog::{Copy, TrackDisplay};
-use crate::playback::listen::OpenListen;
-use crate::playback::renderer::{Format, RenderError, Renderer, Segment};
-use crate::playback::store::{Ended, Entry, Mark, NewEntry, Replaced, Started};
+use crate::playback::listen::{Recorder, Span};
+use crate::playback::queue::{Queue, Random, Repeat};
+use crate::playback::renderer::{End, Event, Format, Progress, RenderError, Renderer, ReplayGain};
+use crate::playback::store::{Change, Entry, Started, Wrote};
 use crate::timekeeping::Timekeeper;
 use crate::{Clock, Command, Entropy, Error, Id, LibraryStore, ServerStore, new_id};
 
-/// How often an open listen is saved while it plays.
+mod edits;
+
+pub use edits::{AddTracks, Order, Place, QueuePage, Settings};
+
+/// How often an open listen is saved while it plays: every this much
+/// heard.
 pub const CHECKPOINT_EVERY_MS: i64 = 5_000;
 
 /// How often a progress event goes out while playing.
@@ -105,7 +125,7 @@ pub struct NowPlaying {
 }
 
 /// The player's state, whole: what a client is sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlayerState {
     /// Counts the changes to this state.
     pub revision: u64,
@@ -121,8 +141,16 @@ pub struct PlayerState {
     pub queue_revision: i64,
     /// How many entries the queue has.
     pub queue_length: usize,
+    /// Whether the queue plays in its stored shuffled order.
+    pub shuffle: bool,
+    /// Repeat.
+    pub repeat: Repeat,
     /// The output: its name, rate and channels.
     pub output: (String, u32, u32),
+    /// The player's own volume, 0 to 1.
+    pub volume: f64,
+    /// Whether it is muted.
+    pub muted: bool,
 }
 
 /// What a command answers with once it has been carried out.
@@ -164,14 +192,20 @@ pub enum PlayerEvent {
 /// What to play.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayTracks {
-    /// The track appearances, in the order they are played.
+    /// The track appearances, in queue order.
     pub tracks: Vec<Id>,
-    /// The one to start at, from 0.
-    pub start: usize,
+    /// The one to start at, from 0. `None` is the first, or with shuffle
+    /// on, any.
+    pub start: Option<usize>,
     /// Why they were queued, and what from.
     pub context: (ContextKind, Option<Id>),
     /// The session that queued them.
     pub actor: Option<Id>,
+    /// Shuffle on or off from now; `None` leaves it as it is.
+    pub shuffle: Option<bool>,
+    /// Whether the tracks were read from the library just now, as a view's
+    /// are, and need not be looked up again.
+    pub known: bool,
 }
 
 /// A command for the player, with its receipt.
@@ -208,20 +242,27 @@ pub struct Done {
 /// A track that is loaded in the renderer.
 #[derive(Debug, Clone)]
 struct Loaded {
-    copy: Copy,
+    /// The span playing it, and the output's rate it is counted at, kept
+    /// for when the output has gone.
+    span: u64,
+    rate: u32,
     format: Format,
     duration_ms: i64,
-    /// Where the current segment began.
+    /// Where the span began.
     from_ms: i64,
-    /// The current segment's frames that have been counted.
-    frames: u64,
+    /// What a listen of it records, decided as it was loaded or prepared.
+    listen: Started,
+    /// The span's count, once it has ended.
+    ended: Option<u64>,
 }
 
-/// A listen that has ended and whose close has not committed yet.
-#[derive(Debug)]
-struct Closing {
-    listen: OpenListen,
-    ended: Ended,
+/// The entry that follows the current one, opened to be joined to it:
+/// `None` where it could not be, and it is then loaded when its turn comes.
+#[derive(Debug, Clone)]
+struct Prepared {
+    entry_id: Id,
+    loaded: Option<Loaded>,
+    display: Option<TrackDisplay>,
 }
 
 /// The player.
@@ -230,38 +271,72 @@ pub struct Player {
     setup: PlayerSetup,
     renderer: Box<dyn Renderer>,
     status: Status,
-    queue: Vec<Entry>,
+    queue: Queue,
+    repeat: Repeat,
     current: Option<usize>,
     /// Where the current entry is while nothing is loaded.
     position_ms: i64,
     loaded: Option<Loaded>,
+    /// The entry after it, opened to follow it with no gap.
+    prepared: Option<Prepared>,
     display: Option<TrackDisplay>,
-    listen: Option<OpenListen>,
-    /// A listen whose first frames were heard and whose row could not be
-    /// written yet: its start, and every frame heard since, held until the
-    /// write commits and the recorder has them.
-    starting: Option<(Started, u64)>,
-    /// A listen that ended and is not closed yet, because the write that
-    /// closes it failed: kept whole, with how and when it ended, until a
-    /// retry commits it. Nothing moves on from it until then.
-    closing: Option<Closing>,
+    /// Every listen, folded from what the output said.
+    recorder: Recorder,
+    /// How far the span in hand had played when the output was last asked.
+    progress: Progress,
+    /// How the loaded track's audio ran out, and whether any of it was
+    /// heard: the tick moves on from it.
+    ran_out: Option<(End, bool)>,
+    /// The last span handed down, by its number.
+    span: u64,
+    /// Why the last save failed, for the tick to say. The next tries again.
+    unsaved: Option<Error>,
     /// The listen a resume of the current entry continues.
     resume_listen: Option<Id>,
-    /// Why the next listen to open began.
+    /// Why the next track loaded starts.
     start_reason: StartReason,
     listener: Option<Id>,
     queue_revision: i64,
     revision: u64,
     failures_in_a_row: u32,
-    last_write_mono: i64,
     last_progress_mono: i64,
-    /// When the renderer was last told to play: no frame can have been
-    /// heard before it.
-    played_since_mono: i64,
+    volume: f64,
+    muted: bool,
 }
 
 fn no_library() -> Error {
     Error::NoLibrary
+}
+
+/// This server's roots, by name.
+fn roots(server: &ServerStore) -> Result<HashMap<String, PathBuf>, Error> {
+    Ok(server
+        .roots()?
+        .into_iter()
+        .map(|(name, path)| (name, PathBuf::from(path)))
+        .collect())
+}
+
+/// The ReplayGain an entry plays at: its album's when it was queued as an
+/// album, so the album keeps its own dynamics, and its track's otherwise.
+fn gain_for(entry: &Entry) -> ReplayGain {
+    match entry.context_kind {
+        ContextKind::Album => ReplayGain::Album,
+        _ => ReplayGain::Track,
+    }
+}
+
+/// How long the copy opened is: as the library knows it, or failing that
+/// as its container says.
+fn duration_of(copy: &Copy, format: &Format) -> i64 {
+    if copy.duration_ms > 0 {
+        copy.duration_ms
+    } else {
+        format
+            .duration_ms
+            .and_then(|ms| i64::try_from(ms).ok())
+            .unwrap_or(0)
+    }
 }
 
 /// Whether a listen that ended for `reason` is what playing the entry again
@@ -277,13 +352,15 @@ impl Player {
     /// docs/design/playback.md.
     pub fn restore(
         setup: PlayerSetup,
-        renderer: Box<dyn Renderer>,
+        mut renderer: Box<dyn Renderer>,
         server: &ServerStore,
         library: Option<&LibraryStore>,
     ) -> Result<(Self, Vec<Id>), Error> {
         let crashed = server.close_crashed_listens()?;
         let session = server.playback_session()?;
-        let queue = server.queue()?;
+        let (volume, muted) = server.volume()?;
+        renderer.set_volume(if muted { 0.0 } else { volume as f32 });
+        let queue = Queue::new(server.queue()?, session.shuffle);
         let listener = match (session.listener, library) {
             (Some(listener), _) => Some(listener),
             (None, Some(library)) => {
@@ -308,22 +385,26 @@ impl Player {
                 Status::Stopped
             },
             queue,
+            repeat: session.repeat,
             current,
             position_ms: session.position_ms,
             loaded: None,
+            prepared: None,
             display: None,
-            listen: None,
-            starting: None,
-            closing: None,
+            recorder: Recorder::default(),
+            progress: Progress::default(),
+            ran_out: None,
+            span: 0,
+            unsaved: None,
             resume_listen: session.resume_listen,
             start_reason: StartReason::UserPick,
             listener,
             queue_revision: session.queue_revision,
             revision: u64::try_from(session.state_revision).unwrap_or(0),
             failures_in_a_row: 0,
-            last_write_mono: mono,
             last_progress_mono: mono,
-            played_since_mono: mono,
+            volume,
+            muted,
         };
         player.display = player.read_display(library);
         Ok((player, crashed))
@@ -342,18 +423,23 @@ impl Player {
         self.entry().map(|entry| entry.row)
     }
 
-    /// Where the current entry is.
+    /// Where the current entry is, as far as the output had played when
+    /// last asked.
     fn position(&self) -> i64 {
-        match &self.loaded {
-            Some(loaded) => {
-                let heard = i64::try_from(
-                    loaded.frames.saturating_mul(1000) / u64::from(self.renderer.rate().max(1)),
-                )
-                .unwrap_or(i64::MAX);
-                (loaded.from_ms + heard).min(loaded.duration_ms.max(loaded.from_ms))
-            }
-            None => self.position_ms,
-        }
+        let Some(loaded) = &self.loaded else {
+            return self.position_ms;
+        };
+        let frames = match loaded.ended {
+            Some(frames) => frames,
+            None if self.progress.span == loaded.span => self.progress.frames,
+            None => 0,
+        };
+        let heard = frames.saturating_mul(1000) / u64::from(loaded.rate);
+        let heard = i64::try_from(heard).unwrap_or(i64::MAX);
+        loaded
+            .from_ms
+            .saturating_add(heard)
+            .min(loaded.duration_ms.max(loaded.from_ms))
     }
 
     /// The state, whole.
@@ -378,31 +464,28 @@ impl Player {
             },
             queue_revision: self.queue_revision,
             queue_length: self.queue.len(),
+            shuffle: self.queue.shuffled(),
+            repeat: self.repeat,
             output: (
                 self.renderer.name(),
                 self.renderer.rate(),
                 self.renderer.channels(),
             ),
+            volume: self.volume,
+            muted: self.muted,
         }
-    }
-
-    /// The queue, in order.
-    pub fn queue(&self) -> Vec<(Id, Id, Option<String>)> {
-        self.queue
-            .iter()
-            .map(|entry| {
-                (
-                    entry.entry_id,
-                    entry.appearance,
-                    entry.failed_reason.clone(),
-                )
-            })
-            .collect()
     }
 
     /// The listen that is open, by its ID.
     pub fn open_listen(&self) -> Option<Id> {
-        self.listen.as_ref().map(|listen| listen.started.listen_id)
+        self.recorder.open().map(|listen| listen.started.listen_id)
+    }
+
+    /// Whether the loaded track's audio has run out, and the next tick
+    /// moves on from it.
+    #[cfg(test)]
+    pub(crate) fn moving_on(&self) -> bool {
+        self.ran_out.is_some()
     }
 
     fn summary(&self) -> Summary {
@@ -426,183 +509,178 @@ impl Player {
         }
     }
 
-    /// Counts what the renderer has played since it was last asked, and
-    /// opens the listen when the first frame of the track has been heard.
-    /// The renderer's count is taken in here even when the listen cannot be
-    /// written: its frames are then held with the listen's start, and given
-    /// to the recorder once the write commits, so none is lost and the
-    /// start does not move.
-    fn account(
-        &mut self,
-        server: &ServerStore,
-        segment: &Segment,
-        events: &mut Vec<PlayerEvent>,
-    ) -> Result<(), Error> {
-        let Some(loaded) = &mut self.loaded else {
-            return Ok(());
-        };
-        let fresh = segment.frames.saturating_sub(loaded.frames);
-        loaded.frames = segment.frames.max(loaded.frames);
-        if fresh == 0 && self.starting.is_none() {
-            return Ok(());
-        }
-        let position = self.position();
-        if let Some(listen) = &mut self.listen {
-            listen.heard(fresh, position);
-            return Ok(());
-        }
-        let (started, frames) = match self.starting.take() {
-            Some((started, held)) => (started, held + fresh),
-            None => match self.start_of(fresh)? {
-                Some(started) => (started, fresh),
-                None => return Ok(()),
-            },
-        };
-        let mark = Mark {
-            position_ms: started.start_position_ms,
-            mono_ms: self.setup.timekeeper.mono_ms(),
-        };
-        if let Err(error) = server.open_listen(started.clone(), self.entry_row(), mark) {
-            self.starting = Some((started, frames));
-            return Err(error);
-        }
-        // Checkpoints run every few seconds from the first frame heard.
-        self.last_write_mono = started.started_mono_ms;
-        let mut listen = OpenListen::new(started, self.renderer.rate().max(1));
-        listen.heard(frames, position);
-        self.listen = Some(listen);
-        events.push(PlayerEvent::State);
-        Ok(())
+    /// Takes in what the output did since it was last asked, then saves the
+    /// listens if a save is due. Every command and tick does this first.
+    pub(super) fn sync(&mut self, server: &ServerStore, events: &mut Vec<PlayerEvent>) {
+        self.take_in(events);
+        self.save(server, events);
     }
 
-    /// The start of the listen whose first `frames` were just heard.
-    fn start_of(&self, frames: u64) -> Result<Option<Started>, Error> {
-        let (Some(loaded), Some(entry)) = (&self.loaded, self.entry()) else {
-            return Ok(None);
+    /// Folds what the output said into the listens, in order, and follows
+    /// the loaded track: one that ran into the track prepared after it
+    /// makes that the current entry, and one whose audio ran out is moved
+    /// on from by the tick.
+    fn take_in(&mut self, events: &mut Vec<PlayerEvent>) {
+        let progress = self.renderer.progress();
+        let said = self.renderer.drain();
+        // One reading of each clock dates all that was said. A stamp can
+        // be later than now: the output stamps a buffer as it will play.
+        let now = i128::from(self.renderer.now());
+        let (mono, wall) = (self.setup.timekeeper.mono_ms(), self.setup.clock.now_ms());
+        let time = |at: u64| {
+            let ago = (now - i128::from(at)).div_euclid(1_000_000);
+            let ago = i64::try_from(ago).unwrap_or(i64::MAX);
+            (wall.saturating_sub(ago), mono.saturating_sub(ago))
         };
-        let rate = self.renderer.rate().max(1);
+        for event in &said {
+            let closed = self.recorder.last_closed();
+            self.recorder.fold(event, &time);
+            let heard = self.recorder.last_closed() != closed;
+            self.follow(event, heard, events);
+        }
+        self.progress = progress;
+    }
+
+    fn follow(&mut self, event: &Event, heard: bool, events: &mut Vec<PlayerEvent>) {
+        let Event::Ended {
+            span, frames, end, ..
+        } = event
+        else {
+            return;
+        };
+        let Some(loaded) = self.loaded.as_mut().filter(|loaded| loaded.span == *span) else {
+            return;
+        };
+        loaded.ended = Some(*frames);
+        match end {
+            End::Joined { next } => self.joined(*next, events),
+            End::Drained | End::Failed(_) => self.ran_out = Some((end.clone(), heard)),
+            End::Replaced => {}
+        }
+    }
+
+    /// The track in hand ran into the one prepared after it, which plays
+    /// now. The entry is found by its ID wherever an edit has put it since;
+    /// one taken out of the queue meanwhile is let go by the next tick.
+    fn joined(&mut self, next: u64, events: &mut Vec<PlayerEvent>) {
+        let prepared = self.prepared.take();
+        let index = prepared
+            .as_ref()
+            .and_then(|prepared| self.queue.index_of(prepared.entry_id));
+        match (prepared, index) {
+            (
+                Some(Prepared {
+                    loaded: Some(loaded),
+                    display,
+                    ..
+                }),
+                Some(index),
+            ) if loaded.span == next => {
+                self.loaded = Some(loaded);
+                self.display = display;
+                self.current = Some(index);
+                self.position_ms = 0;
+                self.resume_listen = None;
+                self.failures_in_a_row = 0;
+                self.changed(events);
+            }
+            _ => self.ran_out = Some((End::Joined { next }, false)),
+        }
+    }
+
+    /// Saves the listens and the player's place, if a save is due: a listen
+    /// opened or closed, was sought or paused, or has played five seconds
+    /// since. One that fails is tried again at the next.
+    fn save(&mut self, server: &ServerStore, events: &mut Vec<PlayerEvent>) {
+        let live = self.recorder.live(self.progress);
+        if !self.recorder.due(live, self.setup.checkpoint_every_ms) {
+            return;
+        }
+        let place = (self.entry_row(), self.position(), self.resume_listen);
         let mono = self.setup.timekeeper.mono_ms();
-        // The first frame was heard this long ago: what has been heard
-        // since, but never before the renderer was told to play, which an
-        // output faster than real time would otherwise put it before.
-        let heard_ms = i64::try_from(frames.saturating_mul(1000) / u64::from(rate))
-            .unwrap_or(i64::MAX)
-            .min(mono.saturating_sub(self.played_since_mono).max(0));
-        let now = self.setup.clock.now_ms();
-        let resumes = self.start_reason == StartReason::Resume;
-        let started = Started {
-            listen_id: new_id(now, &*self.setup.entropy)?,
+        match server.save_listens(self.recorder.unsaved(live), place, mono) {
+            Ok(()) => {
+                self.unsaved = None;
+                if self.recorder.saved(live) {
+                    events.push(PlayerEvent::ListenClosed);
+                }
+            }
+            Err(error) => self.unsaved = Some(error),
+        }
+    }
+
+    /// What a listen of `copy` for `entry` records, all but when it starts:
+    /// decided now, as the track is loaded or prepared.
+    fn facts(&self, entry: &Entry, copy: &Copy, reason: StartReason) -> Result<Started, Error> {
+        Ok(Started {
+            listen_id: new_id(self.setup.clock.now_ms(), &*self.setup.entropy)?,
             entry: Some(entry.entry_id),
             listener: self.listener.ok_or(no_library())?,
             actor_session: entry.added_by,
             played_on_server: self.setup.server_id,
             appearance: entry.appearance,
-            asset: loaded.copy.asset,
-            source_item: loaded.copy.source_item,
-            source_revision: loaded.copy.revision_no,
-            started_at_ms: now.saturating_sub(heard_ms),
+            asset: copy.asset,
+            source_item: copy.source_item,
+            source_revision: copy.revision_no,
+            started_at_ms: 0,
             zone: self.setup.timekeeper.zone(),
-            started_mono_ms: mono.saturating_sub(heard_ms),
+            started_mono_ms: 0,
             boot: crate::timekeeping::clock_boot(&*self.setup.timekeeper, self.setup.run),
-            start_reason: self.start_reason,
-            continues: if resumes { self.resume_listen } else { None },
-            start_position_ms: loaded.from_ms,
-            track_duration_ms: loaded.duration_ms,
+            start_reason: reason,
+            continues: self.resume_listen.filter(|_| reason == StartReason::Resume),
+            start_position_ms: 0,
+            track_duration_ms: copy.duration_ms,
             context_kind: entry.context_kind,
             context_ref: entry.context_ref,
-            shuffle: false,
-        };
-        Ok(Some(started))
+            shuffle: self.queue.shuffled(),
+        })
     }
 
-    /// Saves what the open listen has heard, and the position with it.
-    fn checkpoint(&mut self, server: &ServerStore) -> Result<(), Error> {
-        if let Some(listen) = &self.listen {
-            let mono = self.setup.timekeeper.mono_ms();
-            let mark = Mark {
-                position_ms: listen.position_ms(),
-                mono_ms: mono,
-            };
-            server.checkpoint_listen(listen.started.listen_id, listen.snapshot(), mark)?;
-            self.last_write_mono = mono;
-        }
-        Ok(())
+    /// The number of a span about to be handed down.
+    fn next_span(&mut self) -> u64 {
+        self.span += 1;
+        self.span
     }
 
-    /// Closes the open listen, if there is one, for `reason`, and saves the
-    /// place: a listen cut off by a shutdown is what a resume continues,
-    /// and any other end leaves nothing to continue. A listen whose close
-    /// failed before is closed first, as it ended then.
-    fn end_listen(
-        &mut self,
-        server: &ServerStore,
-        reason: EndReason,
-        events: &mut Vec<PlayerEvent>,
-    ) -> Result<(), Error> {
-        if self.closing.is_some() {
-            return self.finish_closing(server, events);
-        }
-        let Some(listen) = self.listen.take() else {
-            if !resumable(reason) {
-                self.resume_listen = None;
-            }
-            return Ok(());
+    /// Says what a span handed down is, before the output can say anything
+    /// of it.
+    fn register(&mut self, span: u64, listen: &Started, from_ms: i64, continues: Option<Id>) {
+        let spec = Span {
+            listen: listen.clone(),
+            continues,
+            from_ms,
+            rate: self.renderer.rate().max(1),
+            end: None,
         };
-        let ended = Ended {
-            end_position_ms: listen.position_ms(),
-            end_reason: reason,
-            ended_at_ms: self.setup.clock.now_ms(),
-            ended_mono_ms: Some(self.setup.timekeeper.mono_ms()),
-        };
-        self.closing = Some(Closing { listen, ended });
-        self.finish_closing(server, events)
+        self.recorder.register(span, spec);
     }
 
-    /// Commits the close of the listen that has ended, if there is one.
-    /// Until it commits the listen is kept whole, and every command and
-    /// tick tries again before it does anything else.
-    fn finish_closing(
-        &mut self,
-        server: &ServerStore,
-        events: &mut Vec<PlayerEvent>,
-    ) -> Result<(), Error> {
-        let Some(Closing { listen, ended }) = &self.closing else {
-            return Ok(());
-        };
-        let reason = ended.end_reason;
-        let resume = resumable(reason).then_some(listen.started.listen_id);
-        let position = match reason {
-            EndReason::Finished => 0,
-            _ => ended.end_position_ms,
-        };
-        server.close_listen(
-            listen.started.listen_id,
-            listen.snapshot(),
-            ended.clone(),
-            (self.entry_row(), position, resume),
-        )?;
-        self.closing = None;
-        self.resume_listen = resume;
-        self.last_write_mono = self.setup.timekeeper.mono_ms();
-        events.push(PlayerEvent::ListenClosed);
-        Ok(())
-    }
-
-    /// Leaves the current entry's track for `reason`: lets the renderer go
-    /// of it, counts what it played last, and closes the listen.
-    fn leave(
-        &mut self,
-        server: &ServerStore,
-        reason: EndReason,
-        events: &mut Vec<PlayerEvent>,
-    ) -> Result<(), Error> {
+    /// Leaves the current entry's track for `reason`: notes it as why the
+    /// listen ends, lets the renderer go of the track and of one prepared
+    /// after it, and takes in what the output said of both. A listen cut
+    /// off by a shutdown or the output going away is what playing the
+    /// entry again continues; any other end leaves nothing to continue.
+    fn leave(&mut self, server: &ServerStore, reason: EndReason, events: &mut Vec<PlayerEvent>) {
+        let before = self.recorder.last_closed();
+        self.recorder.note(reason);
+        self.prepared = None;
         if self.loaded.is_some() {
-            let last = self.renderer.unload();
-            self.account(server, &last, events)?;
+            self.renderer.unload();
+            self.take_in(events);
             self.position_ms = self.position();
             self.loaded = None;
         }
-        self.end_listen(server, reason, events)
+        self.ran_out = None;
+        match self
+            .recorder
+            .last_closed()
+            .filter(|_| self.recorder.last_closed() != before)
+        {
+            Some((listen, ended)) => self.resume_listen = resumable(ended).then_some(listen),
+            None if !resumable(reason) => self.resume_listen = None,
+            None => {}
+        }
+        self.save(server, events);
     }
 
     /// Opens the current entry at the current position and plays it. An
@@ -614,23 +692,21 @@ impl Player {
         library: &LibraryStore,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
-        let roots: HashMap<String, PathBuf> = server
-            .roots()?
-            .into_iter()
-            .map(|(name, path)| (name, PathBuf::from(path)))
-            .collect();
+        let roots = roots(server)?;
         loop {
             let Some(entry) = self.entry().cloned() else {
                 self.status = Status::Stopped;
                 return Ok(());
             };
-            let opened = self.open(&entry, library, &roots);
+            let opened = self.open(&entry, library, &roots)?;
             self.display = library.track(entry.appearance)?;
             match opened {
                 Ok(loaded) => {
                     self.loaded = Some(loaded);
+                    // Before it plays, so that its decoder has the next
+                    // before it can reach its end, however short it is.
+                    self.prepare_next(server, Some(library))?;
                     self.renderer.play();
-                    self.played_since_mono = self.setup.timekeeper.mono_ms();
                     self.status = Status::Playing;
                     self.failures_in_a_row = 0;
                     self.last_progress_mono = self.setup.timekeeper.mono_ms();
@@ -647,13 +723,23 @@ impl Player {
                     }
                     events.push(PlayerEvent::Queue(self.queue_revision));
                     self.failures_in_a_row += 1;
-                    let next = self.current.map(|index| index + 1);
-                    let has_next = next.is_some_and(|next| next < self.queue.len());
-                    if self.failures_in_a_row >= FAILURES_BEFORE_STOP || !has_next {
+                    let next = self.current.and_then(|index| self.queue.after(index));
+                    // With repeat all the last goes round to the first, as at
+                    // the end of a track, but never to itself.
+                    let round =
+                        next.is_none() && self.repeat == Repeat::All && self.queue.len() > 1;
+                    if self.failures_in_a_row >= FAILURES_BEFORE_STOP || (next.is_none() && !round)
+                    {
                         self.status = Status::Stopped;
                         self.position_ms = 0;
                         server.save_place(self.entry_row(), 0, None)?;
                         return Ok(());
+                    }
+                    if round {
+                        self.status = Status::Playing;
+                        self.position_ms = 0;
+                        self.resume_listen = None;
+                        return self.wrap(StartReason::AutoAdvance, server, library, events);
                     }
                     self.current = next;
                     self.position_ms = 0;
@@ -664,45 +750,52 @@ impl Player {
         }
     }
 
-    /// Opens the first copy of an entry that works.
+    /// Opens the first copy of an entry that works, as a span of its own.
     fn open(
         &mut self,
         entry: &Entry,
         library: &LibraryStore,
         roots: &HashMap<String, PathBuf>,
-    ) -> Result<Loaded, RenderError> {
-        let copies = library
-            .copies(entry.appearance, self.setup.server_id)
-            .map_err(|error| RenderError::new("unreadable", error.to_string()))?;
+    ) -> Result<Result<Loaded, RenderError>, Error> {
+        let copies = match library.copies(entry.appearance, self.setup.server_id) {
+            Ok(copies) => copies,
+            Err(error) => return Ok(Err(RenderError::new("unreadable", error.to_string()))),
+        };
+        self.renderer.set_replay_gain(gain_for(entry));
         let mut failure = RenderError::new("no_copy_reachable", "no file of this track is here");
+        let from_ms = self.position_ms.max(0);
         for copy in copies {
             let Some(root) = roots.get(&copy.root) else {
                 continue;
             };
-            let path = root.join(&copy.rel_path);
-            let start = u64::try_from(self.position_ms.max(0)).unwrap_or(0);
-            match self.renderer.load(&path, copy.facts, start) {
+            let listen = self.facts(entry, &copy, self.start_reason)?;
+            let span = self.next_span();
+            let start = u64::try_from(from_ms).unwrap_or(0);
+            match self
+                .renderer
+                .load(&root.join(&copy.rel_path), copy.facts, start, span)
+            {
                 Ok(format) => {
-                    let duration_ms = if copy.duration_ms > 0 {
-                        copy.duration_ms
-                    } else {
-                        format
-                            .duration_ms
-                            .and_then(|ms| i64::try_from(ms).ok())
-                            .unwrap_or(0)
+                    let duration_ms = duration_of(&copy, &format);
+                    let listen = Started {
+                        track_duration_ms: duration_ms,
+                        ..listen
                     };
-                    return Ok(Loaded {
-                        copy,
+                    self.register(span, &listen, from_ms, None);
+                    return Ok(Ok(Loaded {
+                        span,
                         format,
                         duration_ms,
-                        from_ms: self.position_ms.max(0),
-                        frames: 0,
-                    });
+                        from_ms,
+                        listen,
+                        ended: None,
+                        rate: self.renderer.rate().max(1),
+                    }));
                 }
                 Err(error) => failure = error,
             }
         }
-        Err(failure)
+        Ok(Err(failure))
     }
 
     /// Moves to the entry at `index` from its beginning, playing it if the
@@ -769,6 +862,8 @@ impl Player {
             start,
             context,
             actor,
+            shuffle,
+            known,
         } = what;
         if let Some(done) = Self::replayed(server, &request)? {
             return Ok(done);
@@ -778,14 +873,12 @@ impl Player {
             return Err(Error::Invalid("there is nothing to play"));
         }
         let mut events = Vec::new();
-        self.finish_closing(server, &mut events)?;
-        if start >= tracks.len() {
+        self.sync(server, &mut events);
+        if start.is_some_and(|start| start >= tracks.len()) {
             return Err(Error::Invalid("start is past the end of the tracks"));
         }
-        for track in &tracks {
-            if library.track(*track)?.is_none() {
-                return Err(Error::NotFound("no such track"));
-            }
+        if !known && library.unknown_appearance(&tracks)?.is_some() {
+            return Err(Error::NotFound("no such track"));
         }
         if self.listener.is_none() {
             self.listener = library.first_listener()?;
@@ -793,32 +886,31 @@ impl Player {
                 server.set_listener(listener)?;
             }
         }
-        self.leave(server, EndReason::Replaced, &mut events)?;
-        let entries = tracks
-            .into_iter()
-            .map(|appearance| NewEntry {
-                appearance,
-                context_kind: context.0,
-                context_ref: context.1,
-                added_by: actor,
-            })
-            .collect();
-        let answer = request.answer;
-        let replaced = server.replace_queue(
-            request.command,
-            request.method,
-            entries,
-            start,
-            move |queue, revision| {
-                answer(Summary {
-                    queue_revision: revision,
-                    entry: queue.get(start).map(|entry| entry.entry_id),
-                })
-            },
-        )?;
-        let (queue, answer) = match replaced {
-            Replaced::Done(queue, answer) => (queue, answer),
-            Replaced::Replayed(answer) => {
+        let shuffled = shuffle.unwrap_or(self.queue.shuffled());
+        let mut random = Random::new(&*self.setup.entropy);
+        let start = match start {
+            Some(start) => start,
+            None if shuffled => random.below(tracks.len())?,
+            None => 0,
+        };
+        let entries = self.fresh(server, tracks, context, actor)?;
+        let first = entries.get(start).map(|entry| (entry.row, entry.entry_id));
+        let write = self
+            .queue
+            .replace(entries, Some(start), shuffled, &mut random)?;
+        self.leave(server, EndReason::Replaced, &mut events);
+        let change = Change {
+            command: None,
+            expected: None,
+            queue: write,
+            bump: true,
+            repeat: None,
+            volume: None,
+            place: (first.map(|(row, _)| row), 0, None),
+        };
+        let answer = match self.commit(server, Some(request), change, first.map(|(_, id)| id))? {
+            Wrote::Done { answer, .. } => answer,
+            Wrote::Replayed(answer) => {
                 return Ok(Done {
                     answer,
                     replayed: true,
@@ -826,9 +918,6 @@ impl Player {
                 });
             }
         };
-        self.queue = queue;
-        self.queue_revision += 1;
-        self.current = Some(start);
         self.position_ms = 0;
         self.resume_listen = None;
         self.start_reason = StartReason::UserPick;
@@ -849,16 +938,12 @@ impl Player {
             return Ok(done);
         }
         let mut events = Vec::new();
-        self.finish_closing(server, &mut events)?;
+        self.sync(server, &mut events);
         if self.status == Status::Playing {
             self.renderer.pause();
-            let polled = self.renderer.poll();
-            self.account(server, &polled, &mut events)?;
-            if let Some(listen) = &mut self.listen {
-                listen.pause();
-            }
-            self.checkpoint(server)?;
+            self.recorder.paused();
             self.status = Status::Paused;
+            self.sync(server, &mut events);
             self.changed(&mut events);
         }
         self.receipt(server, request, events)
@@ -877,12 +962,11 @@ impl Player {
             return Ok(done);
         }
         let mut events = Vec::new();
-        self.finish_closing(server, &mut events)?;
+        self.sync(server, &mut events);
         match (self.status, &self.loaded) {
             (Status::Playing, _) => {}
             (Status::Paused, Some(_)) => {
                 self.renderer.play();
-                self.played_since_mono = self.setup.timekeeper.mono_ms();
                 self.status = Status::Playing;
                 self.changed(&mut events);
             }
@@ -909,9 +993,9 @@ impl Player {
             return Ok(done);
         }
         let mut events = Vec::new();
-        self.finish_closing(server, &mut events)?;
+        self.sync(server, &mut events);
         if self.status != Status::Stopped {
-            self.leave(server, EndReason::Stopped, &mut events)?;
+            self.leave(server, EndReason::Stopped, &mut events);
             self.status = Status::Stopped;
             self.position_ms = 0;
             self.resume_listen = None;
@@ -937,42 +1021,59 @@ impl Player {
             return Ok(done);
         }
         let mut events = Vec::new();
-        self.finish_closing(server, &mut events)?;
+        self.sync(server, &mut events);
         if self
             .entry()
             .is_some_and(|current| current.entry_id == entry)
         {
-            self.seek_to(position_ms, server, library, &mut events)?;
+            self.seek_to(position_ms, EndReason::Jump, server, library, &mut events)?;
             self.changed(&mut events);
         }
         self.receipt(server, request, events)
     }
 
+    /// Plays the loaded track from `position_ms`, as a span that carries on
+    /// its listen. A track the output ran on into just before is cut off
+    /// for `cut`.
     fn seek_to(
         &mut self,
         position_ms: i64,
+        cut: EndReason,
         server: &ServerStore,
         library: Option<&LibraryStore>,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
-        let Some(duration) = self.loaded.as_ref().map(|loaded| loaded.duration_ms) else {
+        let Some(loaded) = self.loaded.clone() else {
             self.position_ms = position_ms.max(0);
             return Ok(());
         };
-        let target = position_ms.clamp(0, duration);
-        let ended = match self.renderer.seek(u64::try_from(target).unwrap_or(0)) {
-            Ok(ended) => ended,
-            Err(failure) => return self.fail_track(server, library, &failure, events),
+        let target = position_ms.clamp(0, loaded.duration_ms);
+        // Should the listen have ended by the time it begins, it opens
+        // one of its own.
+        let listen = Started {
+            listen_id: new_id(self.setup.clock.now_ms(), &*self.setup.entropy)?,
+            ..loaded.listen.clone()
         };
-        self.account(server, &ended, events)?;
-        if let Some(listen) = &mut self.listen {
-            listen.seek(target);
+        let span = self.next_span();
+        self.recorder.note(cut);
+        let to = u64::try_from(target).unwrap_or(0);
+        if let Err(failure) = self.renderer.seek(loaded.span, to, span) {
+            return self.fail_track(server, library, &failure, events);
         }
-        if let Some(loaded) = &mut self.loaded {
-            loaded.from_ms = target;
-            loaded.frames = 0;
-        }
-        self.checkpoint(server)
+        let continues = self.recorder.open().map(|open| open.started.listen_id);
+        self.register(span, &listen, target, continues);
+        self.loaded = Some(Loaded {
+            span,
+            from_ms: target,
+            ended: None,
+            ..loaded
+        });
+        // The renderer let a track queued after this one go: it is
+        // prepared again at once.
+        self.prepared = None;
+        self.ran_out = None;
+        self.sync(server, events);
+        self.prepare_next(server, library)
     }
 
     /// Skips from the entry named. A skip that names another entry than
@@ -991,38 +1092,37 @@ impl Player {
             return Ok(done);
         }
         let mut events = Vec::new();
-        self.finish_closing(server, &mut events)?;
+        self.sync(server, &mut events);
         let on_it = self.entry().is_some_and(|current| current.entry_id == from);
         if let (true, Some(index)) = (on_it, self.current) {
             let library = library.ok_or(no_library())?;
-            match direction {
-                Direction::Next => {
-                    self.leave(server, EndReason::Next, &mut events)?;
-                    if index + 1 < self.queue.len() {
-                        self.go_to(
-                            index + 1,
-                            StartReason::UserPick,
-                            server,
-                            library,
-                            &mut events,
-                        )?;
-                    } else {
-                        self.status = Status::Stopped;
-                        self.position_ms = 0;
+            let before = match self.repeat {
+                Repeat::All => self.queue.before(index).or_else(|| self.queue.last()),
+                Repeat::Off | Repeat::One => self.queue.before(index),
+            };
+            match (direction, before) {
+                (Direction::Next, _) => {
+                    self.leave(server, EndReason::Next, &mut events);
+                    match self.queue.after(index) {
+                        Some(next) => {
+                            self.go_to(next, StartReason::UserPick, server, library, &mut events)?;
+                        }
+                        None if self.repeat == Repeat::All => {
+                            self.wrap(StartReason::UserPick, server, library, &mut events)?;
+                        }
+                        None => {
+                            self.status = Status::Stopped;
+                            self.position_ms = 0;
+                        }
                     }
                 }
-                Direction::Previous if self.position() > RESTART_AFTER_MS || index == 0 => {
-                    self.seek_to(0, server, Some(library), &mut events)?;
+                (Direction::Previous, Some(before)) if self.position() <= RESTART_AFTER_MS => {
+                    self.leave(server, EndReason::Previous, &mut events);
+                    self.go_to(before, StartReason::UserPick, server, library, &mut events)?;
                 }
-                Direction::Previous => {
-                    self.leave(server, EndReason::Previous, &mut events)?;
-                    self.go_to(
-                        index - 1,
-                        StartReason::UserPick,
-                        server,
-                        library,
-                        &mut events,
-                    )?;
+                (Direction::Previous, _) => {
+                    let cut = EndReason::Previous;
+                    self.seek_to(0, cut, server, Some(library), &mut events)?;
                 }
             }
             self.changed(&mut events);
@@ -1030,33 +1130,28 @@ impl Player {
         self.receipt(server, request, events)
     }
 
-    /// Reads what the renderer has played: opens the listen at the first
-    /// frame heard, checkpoints it every few seconds, and at the end of a
-    /// track closes it and moves on.
+    /// Takes in what the output did and saves the listens when a save is
+    /// due; moves on from a track whose audio ran out, or that went with
+    /// the output; and prepares what follows. A save that failed is said
+    /// here, once all else is done.
     pub fn tick(
         &mut self,
         server: &ServerStore,
         library: Option<&LibraryStore>,
     ) -> Result<Vec<PlayerEvent>, Error> {
         let mut events = Vec::new();
-        self.finish_closing(server, &mut events)?;
-        if self.loaded.is_none() {
-            return Ok(events);
-        }
-        let polled = self.renderer.poll();
-        self.account(server, &polled, &mut events)?;
+        self.sync(server, &mut events);
         if let Some(limit) = self.setup.fail_at_position_ms
             && self.status == Status::Playing
             && self.position() >= limit
         {
             return Err(Error::FailPoint);
         }
-        let mono = self.setup.timekeeper.mono_ms();
-        if polled.output_lost {
+        if self.progress.lost && self.loaded.is_some() {
             // The output went away: the listen ends there, and the player
             // waits, paused at that place. Play opens the output again and
             // continues the listen, as a resume after a restart does.
-            self.leave(server, EndReason::OutputLost, &mut events)?;
+            self.leave(server, EndReason::OutputLost, &mut events);
             self.status = Status::Paused;
             server.save_place(self.entry_row(), self.position_ms, self.resume_listen)?;
             if let Some(entry) = self.entry().map(|entry| entry.entry_id) {
@@ -1066,29 +1161,35 @@ impl Player {
                 });
             }
             self.changed(&mut events);
-            return Ok(events);
+            return self.ticked(events);
         }
-        if let Some(failed) = polled.failed {
-            let heard = self.listen.is_some();
-            self.leave(server, EndReason::Error, &mut events)?;
-            if let Some(entry) = self.entry().cloned() {
-                if !heard {
-                    server.mark_failed(entry.row, "unreadable".to_owned())?;
+        match self.ran_out.take() {
+            Some((End::Failed(failed), heard)) => {
+                self.leave(server, EndReason::Error, &mut events);
+                if let Some(entry) = self.entry().cloned() {
+                    if !heard {
+                        server.mark_failed(entry.row, "unreadable".to_owned())?;
+                    }
+                    events.push(PlayerEvent::Failed {
+                        entry: entry.entry_id,
+                        reason: failed,
+                    });
                 }
-                events.push(PlayerEvent::Failed {
-                    entry: entry.entry_id,
-                    reason: failed,
-                });
+                self.advance(false, server, library, &mut events)?;
             }
-            self.advance(server, library, &mut events)?;
-        } else if polled.ended {
-            self.leave(server, EndReason::Finished, &mut events)?;
-            self.advance(server, library, &mut events)?;
-        } else if self.listen.is_some()
-            && mono - self.last_write_mono >= self.setup.checkpoint_every_ms
-        {
-            self.checkpoint(server)?;
+            Some((End::Joined { .. }, _)) => {
+                // It ran into a track taken out of the queue, which stops.
+                self.leave(server, EndReason::Removed, &mut events);
+                self.advance(true, server, library, &mut events)?;
+            }
+            Some(_) => {
+                self.leave(server, EndReason::Finished, &mut events);
+                self.advance(true, server, library, &mut events)?;
+            }
+            None => {}
         }
+        self.prepare_next(server, library)?;
+        let mono = self.setup.timekeeper.mono_ms();
         if self.status == Status::Playing
             && mono - self.last_progress_mono >= PROGRESS_EVERY_MS
             && let Some(entry) = self.entry().map(|entry| entry.entry_id)
@@ -1100,7 +1201,15 @@ impl Player {
                 playing: true,
             });
         }
-        Ok(events)
+        self.ticked(events)
+    }
+
+    /// The tick's events, or why the last save failed.
+    fn ticked(&mut self, events: Vec<PlayerEvent>) -> Result<Vec<PlayerEvent>, Error> {
+        match self.unsaved.take() {
+            Some(failed) => Err(failed),
+            None => Ok(events),
+        }
     }
 
     /// The track in hand cannot be played on: what it played is counted
@@ -1113,7 +1222,7 @@ impl Player {
         failure: &RenderError,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
-        self.leave(server, EndReason::Error, events)?;
+        self.leave(server, EndReason::Error, events);
         if let Some(entry) = self.entry().cloned() {
             server.mark_failed(entry.row, failure.reason.to_owned())?;
             if let Some(failed) = self.current.and_then(|index| self.queue.get_mut(index)) {
@@ -1125,21 +1234,37 @@ impl Player {
             });
             events.push(PlayerEvent::Queue(self.queue_revision));
         }
-        self.advance(server, library, events)
+        self.advance(false, server, library, events)
     }
 
-    /// Moves on from a track that ended: to the next entry, or to a stop at
-    /// the end of the queue.
+    /// Moves on from a track that ended, played to its end (`finished`)
+    /// or not: to the same entry again with repeat one, to the next in play
+    /// order, round to the first with repeat all, or to a stop at the end.
     fn advance(
         &mut self,
+        finished: bool,
         server: &ServerStore,
         library: Option<&LibraryStore>,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
-        let next = self.current.map(|index| index + 1);
+        // A track that failed is not played again, whatever repeat says.
+        let next = if finished {
+            self.following()
+        } else {
+            self.current.and_then(|index| self.queue.after(index))
+        };
         match (next, library) {
-            (Some(next), Some(library)) if next < self.queue.len() => {
-                self.go_to(next, StartReason::AutoAdvance, server, library, events)?;
+            (Some(next), Some(library)) => {
+                let reason = self.follows_by(next);
+                self.go_to(next, reason, server, library, events)?;
+            }
+            // A failed entry goes round only to another, never to itself.
+            (None, Some(library))
+                if self.current.is_some()
+                    && self.repeat == Repeat::All
+                    && (finished || self.queue.len() > 1) =>
+            {
+                self.wrap(StartReason::AutoAdvance, server, library, events)?;
             }
             _ => {
                 self.status = Status::Stopped;
@@ -1152,17 +1277,157 @@ impl Player {
         Ok(())
     }
 
+    /// The entry that plays when the current one ends by itself: the same
+    /// again with repeat one, the next in play order, or with repeat all
+    /// the first again. At the end of a shuffled queue repeat all needs a
+    /// new order first, so nothing follows yet, and `advance` writes one.
+    fn following(&self) -> Option<usize> {
+        let index = self.current?;
+        match self.repeat {
+            Repeat::One => Some(index),
+            Repeat::All => self.queue.after(index).or_else(|| {
+                (!self.queue.shuffled())
+                    .then(|| self.queue.first())
+                    .flatten()
+            }),
+            Repeat::Off => self.queue.after(index),
+        }
+    }
+
+    /// Why the entry at `next` starts when the current one ends into it:
+    /// again, with repeat one.
+    fn follows_by(&self, next: usize) -> StartReason {
+        if self.repeat == Repeat::One && self.current == Some(next) {
+            StartReason::Repeat
+        } else {
+            StartReason::AutoAdvance
+        }
+    }
+
+    /// Lets the entry prepared to follow the current one go, if an edit has
+    /// changed what follows: the next tick prepares what follows now. It is
+    /// kept while the same entry still follows for the same reason, so that
+    /// an edit elsewhere costs no join, and where the output has run into it
+    /// already, when the join takes it wherever it is.
+    fn forget_prepared(&mut self) {
+        let Some(prepared) = &self.prepared else {
+            return;
+        };
+        let decided = prepared
+            .loaded
+            .as_ref()
+            .map(|loaded| loaded.listen.start_reason);
+        let follows = self.following().and_then(|index| {
+            let entry = self.queue.get(index)?.entry_id;
+            Some((entry, Some(self.follows_by(index))))
+        });
+        if follows == Some((prepared.entry_id, decided)) {
+            return;
+        }
+        if self.renderer.cancel_next() {
+            self.prepared = None;
+        }
+    }
+
+    /// Opens the entry that follows, to be joined to the current one, as
+    /// soon as there is a current one and nothing is prepared. Opened means
+    /// its copy is chosen and held from now to its end (decision 10), and
+    /// what its listen records, its start reason and the shuffle among it,
+    /// is decided now.
+    fn prepare_next(
+        &mut self,
+        server: &ServerStore,
+        library: Option<&LibraryStore>,
+    ) -> Result<(), Error> {
+        let (Some(_), Some(library)) = (&self.loaded, library) else {
+            return Ok(());
+        };
+        if self.prepared.is_some() || self.ran_out.is_some() {
+            return Ok(());
+        }
+        let Some((entry, reason)) = self.following().and_then(|index| {
+            let entry = self.queue.get(index)?.clone();
+            Some((entry, self.follows_by(index)))
+        }) else {
+            return Ok(());
+        };
+        let roots = roots(server)?;
+        let copies = library.copies(entry.appearance, self.setup.server_id)?;
+        let display = library.track(entry.appearance)?;
+        self.renderer.set_replay_gain(gain_for(&entry));
+        let mut opened = None;
+        for copy in copies {
+            let Some(root) = roots.get(&copy.root) else {
+                continue;
+            };
+            let listen = self.facts(&entry, &copy, reason)?;
+            let span = self.next_span();
+            match self
+                .renderer
+                .queue_next(&root.join(&copy.rel_path), copy.facts, span)
+            {
+                Ok(Some(format)) => {
+                    let duration_ms = duration_of(&copy, &format);
+                    let listen = Started {
+                        track_duration_ms: duration_ms,
+                        ..listen
+                    };
+                    self.register(span, &listen, 0, None);
+                    opened = Some(Loaded {
+                        span,
+                        format,
+                        duration_ms,
+                        from_ms: 0,
+                        listen,
+                        ended: None,
+                        rate: self.renderer.rate().max(1),
+                    });
+                    break;
+                }
+                // It cannot be joined: it loads when its turn comes.
+                Ok(None) => break,
+                // Its turn tries every copy again and marks the entry.
+                Err(_) => {}
+            }
+        }
+        self.prepared = Some(Prepared {
+            entry_id: entry.entry_id,
+            loaded: opened,
+            display,
+        });
+        Ok(())
+    }
+
+    /// Sets the player's own volume, 0 to 1, and whether it is muted; either
+    /// left out stays as it is. See "The pipeline" in
+    /// docs/design/playback.md.
+    pub fn set_volume(
+        &mut self,
+        request: Request,
+        volume: Option<f64>,
+        muted: Option<bool>,
+        server: &ServerStore,
+    ) -> Result<Done, Error> {
+        let settings = Settings {
+            volume,
+            muted,
+            ..Settings::default()
+        };
+        self.set(request, settings, server)
+    }
+
     /// Stops for a clean shutdown: the open listen ends as `shutdown` and is
     /// what a resume after the restart continues, and the position is
     /// saved. The output is let go.
     pub fn shutdown(&mut self, server: &ServerStore) -> Result<Vec<PlayerEvent>, Error> {
         let mut events = Vec::new();
+        self.sync(server, &mut events);
         self.renderer.pause();
-        self.leave(server, EndReason::Shutdown, &mut events)?;
+        self.leave(server, EndReason::Shutdown, &mut events);
         if self.current.is_some() {
             self.status = Status::Paused;
             server.save_place(self.entry_row(), self.position_ms, self.resume_listen)?;
         }
-        Ok(events)
+        self.ticked(events)
     }
 }

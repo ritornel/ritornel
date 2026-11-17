@@ -12,6 +12,22 @@ pub fn new_id(now_ms: i64, entropy: &dyn Entropy) -> Result<Id, Error> {
     Ok(Id::new_v7(now_ms, random))
 }
 
+/// `count` new UUIDv7s for the time `now_ms`, from one draw of the source,
+/// in the order of their bytes: what a long run of new rows is keyed by,
+/// so that an index on them is written at its end.
+pub(crate) fn new_ids(now_ms: i64, count: usize, entropy: &dyn Entropy) -> Result<Vec<Id>, Error> {
+    let mut random = vec![0; count.saturating_mul(10)];
+    entropy.fill(&mut random)?;
+    let mut ids: Vec<Id> = random
+        .as_chunks::<10>()
+        .0
+        .iter()
+        .map(|ten| Id::new_v7(now_ms, *ten))
+        .collect();
+    ids.sort_unstable_by_key(|id| *id.as_bytes());
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

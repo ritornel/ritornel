@@ -40,6 +40,9 @@ pub struct PlaybackRun {
     /// For the crash test alone: the server aborts once the library has
     /// taken a listen in and before `server.db` lets it go.
     pub fail_after_ingest: bool,
+    /// Whether the player is shown in the system's media session, where
+    /// the build has one. Only `serve` asks for it.
+    pub media_session: bool,
 }
 
 /// What wakes a worker, with a deadline.

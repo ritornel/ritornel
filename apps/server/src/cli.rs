@@ -3,6 +3,8 @@
 //! ```text
 //! ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
 //!                       [--log-level <level>] [--output <output>]
+//! ritornel-server service install [--data-dir <dir>]
+//! ritornel-server service uninstall | status
 //! ```
 //!
 //! clap parses it. The help is [`USAGE`] and the messages are the fixed
@@ -24,10 +26,19 @@ The Ritornel server. It owns a data directory and the databases in it.
 Usage:
   ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
                         [--log-level <level>] [--output <output>]
+  ritornel-server service install [--data-dir <dir>]
+  ritornel-server service uninstall | status
 
 Commands:
-  serve    Run until asked to stop: by SIGINT or SIGTERM, or with --owned
-           by the end of standard input
+  serve              Run until asked to stop: by SIGINT or SIGTERM, or
+                     with --owned by the end of standard input
+  service install    Run serve on the data directory in the background,
+                     now and at each login, as a launchd user agent
+                     (macOS). The desktop app then uses it and starts no
+                     server of its own, and quitting the app leaves it
+                     playing. It replaces one installed before
+  service uninstall  Stop the background service and remove it
+  service status     Say whether it is installed and running
 
 Options:
   --data-dir <dir>      Where the server keeps everything it owns, created
@@ -84,6 +95,7 @@ struct Cli {
 #[derive(Debug, PartialEq, Subcommand)]
 enum Command {
     Serve(ServeArgs),
+    Service(crate::service::ServiceArgs),
     /// Developer-only, and not in the help: fills a library with an
     /// invented one. See `crate::invent`.
     #[command(hide = true)]
@@ -129,7 +141,7 @@ fn usage(error: &clap::Error) -> Error {
             "unknown argument; try `ritornel-server --help`"
         }
         ErrorKind::MissingSubcommand | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-            "expected `ritornel-server serve`; try `ritornel-server --help`"
+            "expected `ritornel-server serve` or `service`; try `ritornel-server --help`"
         }
         ErrorKind::InvalidValue | ErrorKind::ValueValidation
             if option.starts_with("--data-dir") =>
@@ -186,6 +198,9 @@ fn try_run(
         Ok(Cli {
             command: Command::Serve(args),
         }) => serve::serve(&args, env, out),
+        Ok(Cli {
+            command: Command::Service(args),
+        }) => crate::service::run(&args, env, out),
         Ok(Cli {
             command: Command::Invent(args),
         }) => crate::invent::run(&args, env, out),
@@ -316,7 +331,7 @@ mod tests {
             ),
             (
                 &[],
-                "expected `ritornel-server serve`; try `ritornel-server --help`",
+                "expected `ritornel-server serve` or `service`; try `ritornel-server --help`",
             ),
             (&["serve", "--data-dir"], "--data-dir needs a directory"),
             (&["serve", "--data-dir", ""], "--data-dir needs a directory"),

@@ -97,6 +97,49 @@ pub struct ScanStarted {
     pub job: Job,
 }
 
+/// The params of `artists.importPictures`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPicturesParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// The picture folder's name, as a root's: 1 to 100 characters, with
+    /// no `/`.
+    pub name: String,
+    /// The folder's absolute path on the server. The server only ever
+    /// reads it.
+    pub path: String,
+}
+
+/// The result of `artists.importPictures`: the receipt, and what the
+/// import found among the artists with a record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PicturesImported {
+    /// The receipt.
+    #[serde(flatten)]
+    pub receipt: Receipt,
+    /// The artists with a record.
+    pub artists: u64,
+    /// Those whose portrait was found by their MusicBrainz ID.
+    pub by_mbid: u64,
+    /// Those with no ID whose portrait was found by their name.
+    pub by_name: u64,
+    /// Those the folder has no portrait for.
+    pub without: u64,
+    /// Portraits the folder chose that could not be read.
+    pub unreadable: u64,
+    /// Portraits from this folder the library had, and the folder no
+    /// longer chooses.
+    pub dropped: u64,
+    /// Artists with no ID whose names the folder makes the same as
+    /// another's, whose portrait's manifest names neither. They are
+    /// counted in `without` too.
+    pub ambiguous: u64,
+}
+
 /// Where a job is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]

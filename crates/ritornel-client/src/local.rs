@@ -18,7 +18,7 @@
 //! hold the lock: only the data directory's owner can open the lock file.
 //!
 //! Starting a server when none answers, and stopping one, belong to the
-//! desktop's launcher and are not here yet.
+//! desktop's launcher, in [`crate::launch`].
 
 use std::fs::{File, TryLockError};
 use std::io::{ErrorKind, Read};

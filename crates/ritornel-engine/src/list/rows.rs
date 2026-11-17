@@ -175,6 +175,20 @@ fn artists(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
         },
     )?;
 
+    // Their portraits, by `artist_picture`'s own key.
+    let mut portraits: HashMap<i64, Id> = HashMap::new();
+    for_each_in(
+        connection,
+        "SELECT ap.artist_id, p.public_id FROM artist_picture ap
+         JOIN picture p ON p.id = ap.picture_id
+         WHERE ap.kind = 'portrait' AND ap.artist_id IN ({})",
+        &live,
+        |row| {
+            portraits.insert(row.get(0)?, id(row.get(1)?));
+            Ok(())
+        },
+    )?;
+
     // How many tracks the records they show have, by
     // `track_appearance_release`.
     let shown: Vec<i64> = records
@@ -197,29 +211,33 @@ fn artists(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
                     .map(|tile| tracks.get(&tile.release).map_or(0, |(count, _)| *count))
                     .sum()
             });
-            // Their earliest record that has a cover: by the year it first
-            // came out, then by title, then by which came into the library
-            // first.
-            let art_id = tiles.and_then(|tiles| {
-                tiles
-                    .values()
-                    .filter(|tile| tile.art.is_some())
-                    .min_by(|a, b| {
-                        a.year
-                            .unwrap_or(i64::MAX)
-                            .cmp(&b.year.unwrap_or(i64::MAX))
-                            .then_with(|| a.title_key.cmp(&b.title_key))
-                            .then(a.release.cmp(&b.release))
-                    })
-                    .and_then(|tile| tile.art.map(id))
-            });
+            // Their portrait, else their earliest record that has a cover:
+            // by the year it first came out, then by title, then by which
+            // came into the library first.
+            let portrait = portraits.get(key).copied();
+            let cover = || {
+                tiles.and_then(|tiles| {
+                    tiles
+                        .values()
+                        .filter(|tile| tile.art.is_some())
+                        .min_by(|a, b| {
+                            a.year
+                                .unwrap_or(i64::MAX)
+                                .cmp(&b.year.unwrap_or(i64::MAX))
+                                .then_with(|| a.title_key.cmp(&b.title_key))
+                                .then(a.release.cmp(&b.release))
+                        })
+                        .and_then(|tile| tile.art.map(id))
+                })
+            };
             Ok(Row::Artist(ArtistRow {
                 artist_id: *artist_id,
                 name: name.clone(),
                 sort_name: sort_name.clone(),
                 album_count,
                 track_count,
-                art_id,
+                art_id: portrait.or_else(cover),
+                portrait: portrait.is_some(),
             }))
         })
         .collect()
@@ -575,6 +593,8 @@ fn songs(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
         }
     }
 
+    let said = crate::ratings::said(connection, &recordings)?;
+
     let live: Vec<i64> = keys
         .iter()
         .copied()
@@ -596,6 +616,7 @@ fn songs(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
             };
             let (play_count, last_played_at) =
                 plays.get(&song.recording).copied().unwrap_or((0, None));
+            let said = said.get(&song.recording).copied().unwrap_or_default();
             Ok(Row::Song(SongRow {
                 appearance_id: song.public_id,
                 recording_id: song.recording_id,
@@ -611,6 +632,8 @@ fn songs(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
                 last_played_at,
                 added_at: song.added_at,
                 copies: copies.remove(key).unwrap_or_default(),
+                rating: said.rating.and_then(|value| u32::try_from(value).ok()),
+                loved: said.loved,
             }))
         })
         .collect()

@@ -92,7 +92,13 @@ export const METHODS = {
   "playback.stop": { kind: "command", needsFull: false },
   "playback.seek": { kind: "command", needsFull: false },
   "playback.skip": { kind: "command", needsFull: false },
+  "playback.jump": { kind: "command", needsFull: false },
+  "playback.set": { kind: "command", needsFull: false },
   "queue.window": { kind: "query", needsFull: false },
+  "queue.add": { kind: "command", needsFull: false },
+  "queue.remove": { kind: "command", needsFull: false },
+  "queue.move": { kind: "command", needsFull: false },
+  "queue.clear": { kind: "command", needsFull: false },
   "sources.tracks": { kind: "query", needsFull: true },
   "history.recent": { kind: "query", needsFull: false },
   "history.onThisDay": { kind: "query", needsFull: false },
@@ -100,6 +106,7 @@ export const METHODS = {
   "history.zones": { kind: "query", needsFull: false },
   "history.setZones": { kind: "command", needsFull: true },
   "tracks.get": { kind: "query", needsFull: false },
+  "ratings.set": { kind: "command", needsFull: true },
   "lastfm.status": { kind: "query", needsFull: true },
   "lastfm.signInStart": { kind: "session", needsFull: true },
   "lastfm.signInFinish": { kind: "command", needsFull: true },
@@ -107,6 +114,7 @@ export const METHODS = {
   "lastfm.sync": { kind: "command", needsFull: true },
   "lastfm.setScrobbling": { kind: "command", needsFull: true },
   "lastfm.report": { kind: "query", needsFull: true },
+  "artists.importPictures": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -144,7 +152,13 @@ export type MethodMap = {
   "playback.stop": { params: PlaybackCommandParams; result: PlaybackChanged };
   "playback.seek": { params: PlaybackSeekParams; result: PlaybackChanged };
   "playback.skip": { params: PlaybackSkipParams; result: PlaybackChanged };
+  "playback.jump": { params: PlaybackJumpParams; result: PlaybackChanged };
+  "playback.set": { params: PlaybackSetParams; result: PlaybackChanged };
   "queue.window": { params: QueueWindowParams; result: QueueWindow };
+  "queue.add": { params: QueueAddParams; result: PlaybackChanged };
+  "queue.remove": { params: QueueRemoveParams; result: PlaybackChanged };
+  "queue.move": { params: QueueMoveParams; result: PlaybackChanged };
+  "queue.clear": { params: QueueClearParams; result: PlaybackChanged };
   "sources.tracks": { params: SourcesTracksParams; result: SourceTracks };
   "history.recent": { params: HistoryRecentParams; result: RecentPlays };
   "history.onThisDay": { params: OnThisDayParams; result: OnThisDay };
@@ -152,6 +166,7 @@ export type MethodMap = {
   "history.zones": { params: NoParams; result: ZonePeriods };
   "history.setZones": { params: SetZonesParams; result: ZonesSet };
   "tracks.get": { params: TrackGetParams; result: TrackDetail };
+  "ratings.set": { params: RatingSetParams; result: RatingSet };
   "lastfm.status": { params: NoParams; result: LastfmStatus };
   "lastfm.signInStart": { params: NoParams; result: SignInStarted };
   "lastfm.signInFinish": { params: SignInFinishParams; result: SignInFinished };
@@ -159,6 +174,7 @@ export type MethodMap = {
   "lastfm.sync": { params: LastfmSyncParams; result: LastfmSyncStarted };
   "lastfm.setScrobbling": { params: ScrobblingParams; result: ScrobblingSet };
   "lastfm.report": { params: LastfmReportParams; result: LastfmReport };
+  "artists.importPictures": { params: ImportPicturesParams; result: PicturesImported };
 };
 
 /** The name of a method. */
@@ -456,10 +472,14 @@ export type ArtistPage = {
    */
   trackCount: number,
   /**
-   * A picture to draw them with until there are photographs: the cover
-   * of their earliest record that has one. `null` when none has.
+   * Their picture: their portrait where the library has one, else the
+   * cover of their earliest record that has one. `null` when neither.
    */
   artId: string | null,
+  /**
+   * Whether `artId` is their portrait, not a cover.
+   */
+  portrait: boolean,
 };
 
 /**
@@ -490,10 +510,14 @@ export type ArtistRow = {
    */
   trackCount: number,
   /**
-   * A picture to draw them with until there are photographs: the cover
-   * of their earliest record that has one. `null` when none has.
+   * Their picture: their portrait where the library has one, else the
+   * cover of their earliest record that has one. `null` when neither.
    */
   artId: string | null,
+  /**
+   * Whether `artId` is their portrait, not a cover.
+   */
+  portrait: boolean,
 };
 
 /**
@@ -1050,6 +1074,26 @@ export type HistoryRecentParams = {
 };
 
 /**
+ * The params of `artists.importPictures`.
+ */
+export type ImportPicturesParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The picture folder's name, as a root's: 1 to 100 characters, with
+   * no `/`.
+   */
+  name: string,
+  /**
+   * The folder's absolute path on the server. The server only ever
+   * reads it.
+   */
+  path: string,
+};
+
+/**
  * One item that the dry run does not find unchanged.
  */
 export type ItemChange = {
@@ -1441,7 +1485,7 @@ export type LastfmSyncStarted = {
  * What kind of change a library write made, for a client deciding what to
  * read again.
  */
-export type LibraryChange = "membership" | "metadata" | "stats";
+export type LibraryChange = "membership" | "metadata" | "stats" | "ratings";
 
 /**
  * The params of `library.create`.
@@ -1969,6 +2013,57 @@ export type Penalties = {
 };
 
 /**
+ * The result of `artists.importPictures`: the receipt, and what the
+ * import found among the artists with a record.
+ */
+export type PicturesImported = {
+  /**
+   * The artists with a record.
+   */
+  artists: number,
+  /**
+   * Those whose portrait was found by their MusicBrainz ID.
+   */
+  byMbid: number,
+  /**
+   * Those with no ID whose portrait was found by their name.
+   */
+  byName: number,
+  /**
+   * Those the folder has no portrait for.
+   */
+  without: number,
+  /**
+   * Portraits the folder chose that could not be read.
+   */
+  unreadable: number,
+  /**
+   * Portraits from this folder the library had, and the folder no
+   * longer chooses.
+   */
+  dropped: number,
+  /**
+   * Artists with no ID whose names the folder makes the same as
+   * another's, whose portrait's manifest names neither. They are
+   * counted in `without` too.
+   */
+  ambiguous: number,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
  * One play.
  */
 export type Play = {
@@ -2080,7 +2175,11 @@ export type PlaySource = { "type": "tracks",
   /**
    * The release.
    */
-  id: string,
+  id: string, } | { "type": "view",
+  /**
+   * The view.
+   */
+  view: string,
 };
 
 /**
@@ -2133,6 +2232,20 @@ export type PlaybackEvent = {
 };
 
 /**
+ * The params of `playback.jump`.
+ */
+export type PlaybackJumpParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The entry to play now, from its beginning.
+   */
+  entryId: string,
+};
+
+/**
  * The params of `playback.play`.
  */
 export type PlaybackPlayParams = {
@@ -2145,7 +2258,8 @@ export type PlaybackPlayParams = {
    */
   source: PlaySource,
   /**
-   * The track to start at, from 0. The default is the first.
+   * The track to start at, from 0. The default is the first, or with
+   * shuffle on, any.
    */
   start?: number,
   /**
@@ -2153,6 +2267,11 @@ export type PlaybackPlayParams = {
    * tracks by hand.
    */
   context?: PlayContext,
+  /**
+   * Shuffle on or off from now: on plays the start first and the rest
+   * in a new random order. Left out, the player's setting stays.
+   */
+  shuffle?: boolean,
 };
 
 /**
@@ -2171,6 +2290,34 @@ export type PlaybackSeekParams = {
    * Where to.
    */
   positionMs: number,
+};
+
+/**
+ * The params of `playback.set`: the player's settings, as absolute values.
+ * One left out stays as it is.
+ */
+export type PlaybackSetParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The player's own gain, 0 to 1. It is not the system's volume.
+   */
+  volume?: number,
+  /**
+   * Whether it is muted. The volume is kept while it is.
+   */
+  muted?: boolean,
+  /**
+   * Shuffle. On writes a new random order with the current entry first;
+   * off goes back to queue order at the current entry.
+   */
+  shuffle?: boolean,
+  /**
+   * Repeat.
+   */
+  repeat?: Repeat,
 };
 
 /**
@@ -2231,7 +2378,7 @@ export type PlaybackState = {
    */
   durationMs?: number,
   /**
-   * The player's own gain, 0 to 1. Always 1 in M1's first player.
+   * The player's own gain, 0 to 1.
    */
   volume: number,
   /**
@@ -2239,7 +2386,7 @@ export type PlaybackState = {
    */
   muted: boolean,
   /**
-   * Whether the queue plays in a shuffled order.
+   * Whether the queue plays in its stored shuffled order.
    */
   shuffle: boolean,
   /**
@@ -2597,6 +2744,48 @@ export type Query = {
 };
 
 /**
+ * The params of `queue.add`.
+ */
+export type QueueAddParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * What to add.
+   */
+  source: PlaySource,
+  /**
+   * Where.
+   */
+  place: QueuePlace,
+  /**
+   * Why it is queued. With none, a release is queued as an album and
+   * tracks by hand.
+   */
+  context?: PlayContext,
+  /**
+   * The queue revision the edit was decided on. If the queue has moved
+   * past it, the edit is refused with `conflict` and changes nothing.
+   */
+  expectedRevision?: number,
+};
+
+/**
+ * The params of `queue.clear`.
+ */
+export type QueueClearParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * As for `queue.add`.
+   */
+  expectedRevision?: number,
+};
+
+/**
  * One entry of the queue.
  */
 export type QueueEntry = {
@@ -2627,6 +2816,63 @@ export type QueueEvent = {
 };
 
 /**
+ * The params of `queue.move`.
+ */
+export type QueueMoveParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The entries, in the order they are to have.
+   */
+  entryIds: Array<string>,
+  /**
+   * Where they go: straight after the current entry, straight after
+   * another, or last, in both orders.
+   */
+  place: QueuePlace,
+  /**
+   * As for `queue.add`.
+   */
+  expectedRevision?: number,
+};
+
+/**
+ * Which order `queue.window` reads the queue in.
+ */
+export type QueueOrder = "queue" | "play" | "up_next";
+
+/**
+ * Where `queue.add` puts what it adds.
+ */
+export type QueuePlace = { "type": "next" } | { "type": "end" } | { "type": "after",
+  /**
+   * The entry.
+   */
+  entryId: string,
+};
+
+/**
+ * The params of `queue.remove`.
+ */
+export type QueueRemoveParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The entries. One the queue no longer has is passed over. Taking out
+   * the current entry moves the player to the next.
+   */
+  entryIds: Array<string>,
+  /**
+   * As for `queue.add`.
+   */
+  expectedRevision?: number,
+};
+
+/**
  * The result of `queue.window`. A `queueRevision` other than the one a
  * client read before means it reads again.
  */
@@ -2636,11 +2882,11 @@ export type QueueWindow = {
    */
   queueRevision: number,
   /**
-   * How many entries it has.
+   * How many entries there are in the order asked for.
    */
   total: number,
   /**
-   * The place of the entry the player is on.
+   * The place of the entry the player is on, in the order asked for.
    */
   currentIndex?: number,
   /**
@@ -2661,6 +2907,56 @@ export type QueueWindowParams = {
    * How many entries, at most 500. The default is 100.
    */
   limit?: number,
+  /**
+   * The order. The default is queue order.
+   */
+  order?: QueueOrder,
+};
+
+/**
+ * The result of `ratings.set`.
+ */
+export type RatingSet = {
+  /**
+   * The recording, as it is now: one merged since is named by the one
+   * it was merged into.
+   */
+  recordingId: string,
+  /**
+   * Its stars now.
+   */
+  rating: number | null,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * The params of `ratings.set`.
+ */
+export type RatingSetParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The recording.
+   */
+  recordingId: string,
+  /**
+   * Its stars, 0 to 100, ten to the half star; `null` takes them away.
+   */
+  rating: number | null,
 };
 
 /**
@@ -2717,7 +3013,7 @@ export type RecentPlays = {
 export type RecordType = "album" | "ep" | "single" | "broadcast" | "other";
 
 /**
- * Repeat. M1's first player has none: it is always `off`.
+ * Repeat. See "The queue" in docs/design/playback.md.
  */
 export type Repeat = "off" | "all" | "one";
 
@@ -3258,6 +3554,15 @@ export type SongRow = {
    * The copies of it that exist, and where.
    */
   copies: Array<TrackCopy>,
+  /**
+   * The listener's stars for its recording, 0 to 100, ten to the half
+   * star, or `null` when it has none.
+   */
+  rating: number | null,
+  /**
+   * Whether its recording is loved, here or at a service.
+   */
+  loved: boolean,
 };
 
 /**
@@ -3579,6 +3884,19 @@ export type TrackSummary = {
    * The length.
    */
   durationMs?: number,
+  /**
+   * The cover of its release.
+   */
+  artId?: string,
+  /**
+   * The listener's stars for its recording, 0 to 100, ten to the half
+   * star. Left out when it has none.
+   */
+  rating?: number,
+  /**
+   * Whether its recording is loved, here or at a service.
+   */
+  loved: boolean,
 };
 
 /**

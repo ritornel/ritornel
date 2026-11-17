@@ -64,6 +64,18 @@ pub struct TrackSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub duration_ms: Option<u64>,
+    /// The cover of its release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub art_id: Option<Id>,
+    /// The listener's stars for its recording, 0 to 100, ten to the half
+    /// star. Left out when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub rating: Option<u32>,
+    /// Whether its recording is loved, here or at a service.
+    #[serde(default)]
+    pub loved: bool,
 }
 
 /// The copy the player has open for the current entry.
@@ -113,16 +125,17 @@ pub struct OutputInfo {
     pub channels: u32,
 }
 
-/// Repeat. M1's first player has none: it is always `off`.
+/// Repeat. See "The queue" in docs/design/playback.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Repeat {
     /// The queue plays once.
     Off,
-    /// The queue starts again at its end.
+    /// The queue starts again at its end, in a new order when shuffled.
     All,
-    /// The entry starts again at its end.
+    /// The entry starts again at its end, as a new listen. Next still
+    /// moves on.
     One,
 }
 
@@ -159,11 +172,11 @@ pub struct PlaybackState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub duration_ms: Option<u64>,
-    /// The player's own gain, 0 to 1. Always 1 in M1's first player.
+    /// The player's own gain, 0 to 1.
     pub volume: f64,
     /// Whether it is muted.
     pub muted: bool,
-    /// Whether the queue plays in a shuffled order.
+    /// Whether the queue plays in its stored shuffled order.
     pub shuffle: bool,
     /// Repeat.
     pub repeat: Repeat,
@@ -223,6 +236,12 @@ pub enum PlaySource {
         /// The release.
         id: Id,
     },
+    /// Every row of a list of songs this session holds a view of, in the
+    /// view's order: play from here, over a list of any length.
+    View {
+        /// The view.
+        view: String,
+    },
 }
 
 /// The params of `playback.play`.
@@ -234,7 +253,8 @@ pub struct PlaybackPlayParams {
     pub idempotency_key: Id,
     /// What to play. It replaces the queue.
     pub source: PlaySource,
-    /// The track to start at, from 0. The default is the first.
+    /// The track to start at, from 0. The default is the first, or with
+    /// shuffle on, any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub start: Option<u32>,
@@ -243,6 +263,22 @@ pub struct PlaybackPlayParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub context: Option<PlayContext>,
+    /// Shuffle on or off from now: on plays the start first and the rest
+    /// in a new random order. Left out, the player's setting stays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub shuffle: Option<bool>,
+}
+
+/// The params of `playback.jump`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackJumpParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// The entry to play now, from its beginning.
+    pub entry_id: Id,
 }
 
 /// The params of `playback.pause`, `playback.resume` and `playback.stop`.
@@ -293,6 +329,33 @@ pub struct PlaybackSkipParams {
     pub direction: SkipDirection,
 }
 
+/// The params of `playback.set`: the player's settings, as absolute values.
+/// One left out stays as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackSetParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// The player's own gain, 0 to 1. It is not the system's volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub volume: Option<f64>,
+    /// Whether it is muted. The volume is kept while it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub muted: Option<bool>,
+    /// Shuffle. On writes a new random order with the current entry first;
+    /// off goes back to queue order at the current entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub shuffle: Option<bool>,
+    /// Repeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub repeat: Option<Repeat>,
+}
+
 /// What a playback command returns: the receipt, and where the player is
 /// after it. The whole state is read with `playback.get` or sent on the
 /// `playback` topic.
@@ -311,6 +374,21 @@ pub struct PlaybackChanged {
     pub entry_id: Option<Id>,
 }
 
+/// Which order `queue.window` reads the queue in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum QueueOrder {
+    /// The order the entries were put in.
+    Queue,
+    /// The order they play in: the stored shuffled order while shuffle is
+    /// on, queue order otherwise.
+    Play,
+    /// What plays after the current entry, in play order: Up next. The
+    /// current entry is not among them.
+    UpNext,
+}
+
 /// The params of `queue.window`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -323,6 +401,98 @@ pub struct QueueWindowParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub limit: Option<u32>,
+    /// The order. The default is queue order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub order: Option<QueueOrder>,
+}
+
+/// Where `queue.add` puts what it adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum QueuePlace {
+    /// Straight after the current entry, in queue order and in play order.
+    Next,
+    /// At the end of the queue, and while shuffled at a random place among
+    /// the entries still to play.
+    End,
+    /// Straight after this entry, in both orders.
+    After {
+        /// The entry.
+        #[serde(rename = "entryId")]
+        entry_id: Id,
+    },
+}
+
+/// The params of `queue.add`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct QueueAddParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// What to add.
+    pub source: PlaySource,
+    /// Where.
+    pub place: QueuePlace,
+    /// Why it is queued. With none, a release is queued as an album and
+    /// tracks by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub context: Option<PlayContext>,
+    /// The queue revision the edit was decided on. If the queue has moved
+    /// past it, the edit is refused with `conflict` and changes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub expected_revision: Option<u64>,
+}
+
+/// The params of `queue.remove`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct QueueRemoveParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// The entries. One the queue no longer has is passed over. Taking out
+    /// the current entry moves the player to the next.
+    pub entry_ids: Vec<Id>,
+    /// As for `queue.add`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub expected_revision: Option<u64>,
+}
+
+/// The params of `queue.move`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct QueueMoveParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// The entries, in the order they are to have.
+    pub entry_ids: Vec<Id>,
+    /// Where they go: straight after the current entry, straight after
+    /// another, or last, in both orders.
+    pub place: QueuePlace,
+    /// As for `queue.add`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub expected_revision: Option<u64>,
+}
+
+/// The params of `queue.clear`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct QueueClearParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// As for `queue.add`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub expected_revision: Option<u64>,
 }
 
 /// One entry of the queue.
@@ -349,9 +519,9 @@ pub struct QueueEntry {
 pub struct QueueWindow {
     /// The queue's revision.
     pub queue_revision: u64,
-    /// How many entries it has.
+    /// How many entries there are in the order asked for.
     pub total: u64,
-    /// The place of the entry the player is on.
+    /// The place of the entry the player is on, in the order asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub current_index: Option<u32>,
@@ -433,6 +603,7 @@ mod tests {
                 kind: ContextKind::Agent,
                 reference: Some(Id::from_bytes([0x5e; 16])),
             }),
+            shuffle: None,
         };
         let wire = json!({
             "idempotencyKey": "c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0c0",

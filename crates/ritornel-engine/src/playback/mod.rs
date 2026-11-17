@@ -15,6 +15,7 @@ pub(crate) mod catalog;
 pub(crate) mod listen;
 mod outbox;
 pub(crate) mod player;
+pub(crate) mod queue;
 pub(crate) mod renderer;
 pub(crate) mod store;
 #[cfg(test)]
@@ -24,9 +25,10 @@ pub use audio::{AudioRenderer, OnDemand, Output};
 pub use catalog::TrackDisplay;
 pub use outbox::{Delivered, SendStamps, deliver_listens};
 pub use player::{
-    CHECKPOINT_EVERY_MS, Direction, Done, NowPlaying, PlayTracks, Player, PlayerEvent, PlayerSetup,
-    PlayerState, Request, Status, Summary,
+    AddTracks, CHECKPOINT_EVERY_MS, Direction, Done, NowPlaying, Order, Place, PlayTracks, Player,
+    PlayerEvent, PlayerSetup, PlayerState, QueuePage, Request, Settings, Status, Summary,
 };
-pub use renderer::{Format, RenderError, Renderer, Segment};
+pub use queue::Repeat;
+pub use renderer::{End, Event, Format, Progress, RenderError, Renderer};
 /// Why a track was queued, which every listen of it records.
 pub use ritornel_domain::history::ContextKind;

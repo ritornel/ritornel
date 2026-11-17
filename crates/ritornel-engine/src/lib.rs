@@ -32,6 +32,7 @@
     )
 )]
 
+mod artist_pictures;
 mod clock;
 pub mod covers;
 mod delivery_store;
@@ -54,6 +55,7 @@ mod media;
 mod media_fixtures;
 mod migrate;
 pub mod playback;
+mod ratings;
 mod resolve_store;
 mod scan;
 mod scan_store;
@@ -71,6 +73,7 @@ mod testing;
 mod timekeeping;
 mod walk;
 
+pub use artist_pictures::{PictureFolder, PicturesImported, check_picture_folder};
 pub use clock::{Clock, SystemClock};
 pub use delivery_store::{DELIVERY_METHOD, Due, ELIGIBILITY_VERSION, SEND_WITHIN_MS, Settled};
 pub use entropy::{Entropy, OsEntropy};
@@ -91,6 +94,7 @@ pub use library_store::{
     WriteRequest, Written,
 };
 pub use list::{ListError, View};
+pub use ratings::Said;
 pub use resolve_store::Resolved;
 /// What a server, a session and every stored entity is named by. The type
 /// is the contract's.

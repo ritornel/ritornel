@@ -351,7 +351,7 @@ async fn creating_a_library_makes_the_server_its_hub(via: Via) {
     // server's role says hub: the event, the list and the descriptor.
     let status = client.status().await.unwrap();
     assert_eq!(status.role, ServerRole::Hub);
-    assert_eq!(status.versions.library_schema, Some(4));
+    assert_eq!(status.versions.library_schema, Some(5));
     assert_eq!(
         status.library,
         Some(LibraryStatus {

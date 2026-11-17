@@ -123,6 +123,12 @@ pub enum Error {
     Invalid(&'static str),
     /// The output failed.
     Playback(String),
+    /// A queue edit was decided on a revision of the queue it has moved
+    /// past, so it changed nothing.
+    StaleQueue {
+        /// The queue's revision now.
+        current: i64,
+    },
     /// The hub cannot take a listen: what it names does not hold together.
     BadListen(&'static str),
     /// A write that only worked out what it would do, and was rolled back
@@ -218,6 +224,10 @@ impl fmt::Display for Error {
             Self::PlanStale => f.write_str("the library changed while a resolution was planned"),
             Self::NotFound(what) | Self::Invalid(what) => f.write_str(what),
             Self::Playback(what) => write!(f, "the output: {what}"),
+            Self::StaleQueue { current } => write!(
+                f,
+                "the queue has changed since that edit was decided: it is at revision {current}"
+            ),
             Self::BadListen(what) => write!(f, "a listen the hub cannot take: {what}"),
             Self::RolledBack(..) => f.write_str("a dry run, rolled back"),
         }

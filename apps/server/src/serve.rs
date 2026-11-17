@@ -104,6 +104,8 @@ fn run(
         watch_stdin(stop.clone()).map_err(Error::Runtime)?;
     }
 
+    #[cfg(all(feature = "media-session", target_os = "macos"))]
+    let media_session = jobs.playback.media_session;
     // Everything that can stop the server is being watched, so it may
     // start, and tell a client or a launcher where it is.
     let server = runtime.block_on(Server::start_run(
@@ -117,24 +119,33 @@ fn run(
     if let Some(per_second) = args.invent_churn {
         server.invent_churn(per_second)?;
     }
+    #[cfg(all(feature = "media-session", target_os = "macos"))]
+    if media_session {
+        server.start_media_session()?;
+    }
     info!(server_id = %server.server_id(), name = %server.name(), "ready");
     let ready = writeln!(
         out,
-        "ready pid={} server_id={}",
+        "{} pid={} server_id={}",
+        ritornel_contract::local::READY,
         std::process::id(),
         server.server_id()
     )
     .and_then(|()| out.flush())
     .map_err(Error::Output);
 
-    // The main thread waits here. On macOS this is where it will block in
-    // the platform run loop, and stopping will mean stopping that loop.
-    // `stop` is still in scope, so the channel cannot close under the wait.
+    // The main thread waits here. On macOS it blocks in the platform run
+    // loop, which the media keys need, and stopping stops that loop. `stop`
+    // is still in scope, so the channel cannot close under the wait.
     if ready.is_ok() {
-        let reason = stopped
-            .recv()
-            .map_or("nothing left to wait for", Stop::as_str);
-        info!(reason, "stopping");
+        #[cfg(all(feature = "media-session", target_os = "macos"))]
+        let reason = crate::media_session::wait(stopped);
+        #[cfg(not(all(feature = "media-session", target_os = "macos")))]
+        let reason = stopped.recv().ok();
+        info!(
+            reason = reason.map_or("nothing left to wait for", Stop::as_str),
+            "stopping"
+        );
     }
 
     let stopped = runtime.block_on(server.stop());
@@ -164,8 +175,8 @@ fn test_hooks(env: Env<'_>) -> ScanSettings {
 }
 
 /// How this run plays: the output `--output` names, and what the crash tests
-/// ask of the player. Three environment variables are read, and they are
-/// for those tests alone: none is a setting, and none is in the help.
+/// ask of the player. Four environment variables are read, and they are
+/// for the tests alone: none is a setting, and none is in the help.
 ///
 /// - `RITORNEL_TEST_NULL_OUTPUT_SPEED`: how many times faster than real
 ///   time the null output plays.
@@ -174,6 +185,9 @@ fn test_hooks(env: Env<'_>) -> ScanSettings {
 ///   checkpoint saved, as a crash there would.
 /// - `RITORNEL_TEST_FAIL_AFTER_INGEST`: the server aborts once the library
 ///   has taken a listen in and before `server.db` lets it go.
+/// - `RITORNEL_TEST_NO_MEDIA_SESSION`: the player is not shown in the
+///   system's media session, so a test that plays leaves the media keys
+///   where they were.
 fn playback(output: Option<&str>, env: Env<'_>) -> PlaybackRun {
     let number = |name: &str| env(name).and_then(|value| value.to_str()?.parse::<i64>().ok());
     let speed = number("RITORNEL_TEST_NULL_OUTPUT_SPEED")
@@ -189,6 +203,7 @@ fn playback(output: Option<&str>, env: Env<'_>) -> PlaybackRun {
         output,
         fail_at_position_ms: number("RITORNEL_TEST_FAIL_AT_POSITION_MS"),
         fail_after_ingest: env("RITORNEL_TEST_FAIL_AFTER_INGEST").is_some(),
+        media_session: env("RITORNEL_TEST_NO_MEDIA_SESSION").is_none(),
     }
 }
 

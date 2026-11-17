@@ -494,9 +494,11 @@ pub struct ArtistRow {
     /// How many songs on those records there are, and loose songs of
     /// theirs.
     pub track_count: u64,
-    /// A picture to draw them with until there are photographs: the cover
-    /// of their earliest record that has one. `null` when none has.
+    /// Their picture: their portrait where the library has one, else the
+    /// cover of their earliest record that has one. `null` when neither.
     pub art_id: Option<Id>,
+    /// Whether `artId` is their portrait, not a cover.
+    pub portrait: bool,
 }
 
 /// What an Albums tile points at.
@@ -643,6 +645,11 @@ pub struct SongRow {
     pub added_at: Option<i64>,
     /// The copies of it that exist, and where.
     pub copies: Vec<TrackCopy>,
+    /// The listener's stars for its recording, 0 to 100, ten to the half
+    /// star, or `null` when it has none.
+    pub rating: Option<u32>,
+    /// Whether its recording is loved, here or at a service.
+    pub loved: bool,
 }
 
 /// What a list of each kind supports, as the descriptor says.

@@ -9,17 +9,17 @@ use std::time::Duration;
 
 use ritornel_client::Client;
 use ritornel_client::contract::methods::{
-    PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSkip,
-    PlaybackStop, QueueWindow as QueueWindowMethod, SourcesTracks,
+    PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
+    PlaybackSkip, PlaybackStop, QueueWindow as QueueWindowMethod, SourcesTracks,
 };
 use ritornel_client::contract::{
     ContextKind, Id, NoParams, PlayContext, PlaySource, PlaybackCommandParams, PlaybackPlayParams,
-    PlaybackSeekParams, PlaybackSkipParams, PlaybackState, PlaybackStatus, QueueWindow,
-    QueueWindowParams, SkipDirection, SourcesTracksParams, TrackSummary,
+    PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState, PlaybackStatus,
+    QueueWindow, QueueWindowParams, Repeat, SkipDirection, SourcesTracksParams, TrackSummary,
 };
 use ritornel_client::local;
 
-use crate::cli::{Error, PlayArgs, SeekArgs, ServerArgs};
+use crate::cli::{Error, PlayArgs, SeekArgs, ServerArgs, VolumeArgs};
 use crate::server;
 
 /// How often `play --follow` looks at the player.
@@ -96,12 +96,31 @@ fn render(state: &PlaybackState) -> String {
         },
     ));
     lines.push((
+        "Volume",
+        format!(
+            "{}%{}",
+            (state.volume * 100.0).round(),
+            if state.muted { ", muted" } else { "" }
+        ),
+    ));
+    lines.push((
         "Queue",
         match state.index {
             Some(index) => format!("{} of {}", index + 1, state.queue_length),
             None => format!("{} entries", state.queue_length),
         },
     ));
+    let repeat = match state.repeat {
+        Repeat::Off => "repeat off",
+        Repeat::All => "repeat all",
+        Repeat::One => "repeat one",
+    };
+    let shuffle = if state.shuffle {
+        "shuffled"
+    } else {
+        "in order"
+    };
+    lines.push(("Order", format!("{shuffle}, {repeat}")));
     server::facts(&lines)
 }
 
@@ -219,6 +238,7 @@ pub(crate) fn play(args: &PlayArgs, env: local::Env<'_>, out: &mut dyn Write) ->
                 source,
                 start,
                 context,
+                shuffle: None,
             })
             .await?;
         let mut now = state(client).await?;
@@ -333,6 +353,52 @@ pub(crate) fn seek(args: &SeekArgs, env: local::Env<'_>, out: &mut dyn Write) ->
     )
 }
 
+/// What `volume` asks for: a level as a fraction, or muted or not.
+fn volume_change(level: &str) -> Option<(Option<f64>, Option<bool>)> {
+    match level {
+        "mute" => Some((None, Some(true))),
+        "unmute" => Some((None, Some(false))),
+        _ => {
+            let percent: u32 = level.trim_end_matches('%').parse().ok()?;
+            (percent <= 100).then_some((Some(f64::from(percent) / 100.0), None))
+        }
+    }
+}
+
+pub(crate) fn volume(
+    args: &VolumeArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let change = match &args.level {
+        Some(level) => {
+            Some(volume_change(level).ok_or(Error::Usage("a volume is 0 to 100, mute or unmute"))?)
+        }
+        None => None,
+    };
+    let state = server::ask(&args.server, env, async |client| {
+        if let Some((volume, muted)) = change {
+            client
+                .call::<PlaybackSet>(&PlaybackSetParams {
+                    idempotency_key: key()?,
+                    volume,
+                    muted,
+                    shuffle: None,
+                    repeat: None,
+                })
+                .await?;
+        }
+        state(client).await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &state,
+        serde_json::to_string_pretty,
+        render,
+    )
+}
+
 pub(crate) fn now(
     args: &ServerArgs,
     env: local::Env<'_>,
@@ -352,6 +418,7 @@ pub(crate) fn queue(
             .call::<QueueWindowMethod>(&QueueWindowParams {
                 offset: 0,
                 limit: Some(500),
+                order: None,
             })
             .await
     })?;
@@ -367,6 +434,16 @@ pub(crate) fn queue(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_volume_is_a_percentage_or_mute_or_unmute() {
+        assert_eq!(volume_change("40"), Some((Some(0.4), None)));
+        assert_eq!(volume_change("100%"), Some((Some(1.0), None)));
+        assert_eq!(volume_change("mute"), Some((None, Some(true))));
+        assert_eq!(volume_change("unmute"), Some((None, Some(false))));
+        assert_eq!(volume_change("101"), None);
+        assert_eq!(volume_change("loud"), None);
+    }
 
     #[test]
     fn a_position_is_seconds_or_minutes_and_seconds() {

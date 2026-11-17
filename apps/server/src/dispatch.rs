@@ -11,14 +11,15 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use ritornel_contract::methods::{
-    self, AlbumGet, ArtistGet, EventsSubscribe, EventsUnsubscribe, HistoryOnThisDay,
-    HistoryRebuild, HistoryRecent, HistorySetZones, HistoryZones, IdentityDryRun, IdentityReview,
-    JobsCancel, JobsGet, JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish,
-    LastfmSignInStart, LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate, LibraryStats,
-    ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
-    PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSkip,
-    PlaybackStop, QueueWindow, ScanStart, ServerHello, ServerStatus, ServersList, SourcesAdd,
-    SourcesList, SourcesTracks, TracksGet,
+    self, AlbumGet, ArtistGet, ArtistsImportPictures, EventsSubscribe, EventsUnsubscribe,
+    HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones, HistoryZones, IdentityDryRun,
+    IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall, LastfmSetScrobbling,
+    LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall, LastfmSync,
+    LibraryCreate, LibraryStats, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
+    MediaTokenCall, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume,
+    PlaybackSeek, PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove,
+    QueueRemove, QueueWindow, RatingsSet, ScanStart, ServerHello, ServerStatus, ServersList,
+    SourcesAdd, SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -48,8 +49,11 @@ mod churn;
 mod history;
 mod lastfm;
 mod lists;
+#[cfg(all(feature = "media-session", target_os = "macos"))]
+mod media_keys;
 mod pages;
 mod playback;
+mod ratings;
 
 use lists::Fanout;
 
@@ -122,6 +126,9 @@ pub(crate) struct Core {
     deliveries: crate::playback::Wake,
     /// Last.fm, once the server has started.
     lastfm: std::sync::OnceLock<crate::lastfm::Lastfm>,
+    /// The system's media session, once `serve` has started one.
+    #[cfg(all(feature = "media-session", target_os = "macos"))]
+    media_session: std::sync::OnceLock<crate::media_session::MediaSession>,
 }
 
 /// How many threads make covers: enough to keep a screenful coming, and
@@ -210,6 +217,8 @@ impl Core {
             has_player: std::sync::atomic::AtomicBool::new(false),
             deliveries: crate::playback::Wake::default(),
             lastfm: std::sync::OnceLock::new(),
+            #[cfg(all(feature = "media-session", target_os = "macos"))]
+            media_session: std::sync::OnceLock::new(),
         })
     }
 
@@ -556,6 +565,9 @@ impl Core {
                 run::<SourcesAdd>(params, |params| self.sources_add(stores, &params))
             }
             ScanStart::NAME => run::<ScanStart>(params, |params| self.scan_start(stores, &params)),
+            ArtistsImportPictures::NAME => run::<ArtistsImportPictures>(params, |params| {
+                self.artists_import_pictures(stores, &params)
+            }),
             JobsList::NAME => run::<JobsList>(params, |_| self.jobs_list(stores)),
             JobsGet::NAME => run::<JobsGet>(params, |params| self.jobs_get(stores, &params)),
             JobsCancel::NAME => {
@@ -585,9 +597,9 @@ impl Core {
             ArtistGet::NAME => run::<ArtistGet>(params, |params| self.artist_get(stores, &params)),
             MediaTokenCall::NAME => run::<MediaTokenCall>(params, |_| self.media_token(session)),
             PlaybackGet::NAME => run::<PlaybackGet>(params, |_| self.playback_get(stores)),
-            PlaybackPlay::NAME => {
-                run::<PlaybackPlay>(params, |params| self.playback_play(stores, &params))
-            }
+            PlaybackPlay::NAME => run::<PlaybackPlay>(params, |params| {
+                self.playback_play(stores, session, &params)
+            }),
             PlaybackPause::NAME => {
                 run::<PlaybackPause>(params, |params| self.playback_pause(stores, &params))
             }
@@ -603,8 +615,27 @@ impl Core {
             PlaybackSkip::NAME => {
                 run::<PlaybackSkip>(params, |params| self.playback_skip(stores, &params))
             }
+            PlaybackJump::NAME => {
+                run::<PlaybackJump>(params, |params| self.playback_jump(stores, &params))
+            }
+            PlaybackSet::NAME => {
+                run::<PlaybackSet>(params, |params| self.playback_set(stores, &params))
+            }
             QueueWindow::NAME => {
                 run::<QueueWindow>(params, |params| self.queue_window(stores, &params))
+            }
+            QueueAdd::NAME => {
+                run::<QueueAdd>(params, |params| self.queue_add(stores, session, &params))
+            }
+            QueueRemove::NAME => {
+                run::<QueueRemove>(params, |params| self.queue_remove(stores, &params))
+            }
+            QueueMove::NAME => run::<QueueMove>(params, |params| self.queue_move(stores, &params)),
+            QueueClear::NAME => {
+                run::<QueueClear>(params, |params| self.queue_clear(stores, &params))
+            }
+            RatingsSet::NAME => {
+                run::<RatingsSet>(params, |params| self.ratings_set(stores, &params))
             }
             SourcesTracks::NAME => {
                 run::<SourcesTracks>(params, |params| self.sources_tracks(stores, &params))
@@ -866,6 +897,7 @@ fn failed(error: Error) -> RpcError {
             ErrorCode::Conflict,
             "this server has a root of that name at another path",
         ),
+        Error::Library(Engine::Invalid(why)) => RpcError::new(ErrorCode::Invalid, *why),
         _ => RpcError::new(ErrorCode::Internal, error.to_string()),
     }
 }
@@ -1200,7 +1232,7 @@ mod tests {
                 "contract": CONTRACT_VERSION,
                 "sqlite": "3.54.1",
                 "serverSchema": 5,
-                "librarySchema": 4,
+                "librarySchema": 5,
             })
         );
         assert_eq!(

@@ -5,7 +5,7 @@
 use std::sync::{Arc, PoisonError, Weak};
 use std::time::Instant;
 
-use ritornel_contract::methods::{HistoryRebuild, Method, SourcesAdd};
+use ritornel_contract::methods::{HistoryRebuild, Method, RatingsSet, SourcesAdd};
 use ritornel_contract::{
     ErrorCode, Event, Id, LibraryChange, LibraryEvent, ListClosed, ListEvent, ListLocateParams,
     ListLocated, ListOpenParams, ListOpened, ListSections, ListWindow, ListWindowParams,
@@ -53,7 +53,11 @@ impl Fanout {
         let revision = revision(committed.revision);
         let sessions: Vec<Arc<Session>> = self.lock().values().filter_map(Weak::upgrade).collect();
         let changed = changes(committed.method);
-        let plays_only = changed == [LibraryChange::Stats];
+        // Plays and ratings show only on songs, and order no list.
+        let plays_only = matches!(
+            changed.as_slice(),
+            [LibraryChange::Stats] | [LibraryChange::Ratings]
+        );
         for session in sessions {
             session.publish(Event::Library(LibraryEvent {
                 library_revision: revision,
@@ -83,6 +87,8 @@ fn changes(method: &str) -> Vec<LibraryChange> {
         vec![LibraryChange::Membership]
     } else if method == ritornel_engine::INGEST_METHOD || method == HistoryRebuild::NAME {
         vec![LibraryChange::Stats]
+    } else if method == RatingsSet::NAME {
+        vec![LibraryChange::Ratings]
     } else {
         LibraryChange::ALL.to_vec()
     }
@@ -94,7 +100,7 @@ pub(crate) fn hook(library: &LibraryStore, fanout: &Arc<Fanout>) {
     library.on_commit(Arc::new(move |committed| fanout.changed(committed)));
 }
 
-fn expired(view: &str) -> RpcError {
+pub(super) fn expired(view: &str) -> RpcError {
     RpcError::new(ErrorCode::ViewExpired, "the view has ended: open it again")
         .with_detail("view", view.to_owned())
 }

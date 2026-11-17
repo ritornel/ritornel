@@ -210,6 +210,8 @@ struct Rig {
     tracks: Vec<Id>,
     items: Vec<i64>,
     next_command: u8,
+    /// How long the output plays on during each call to it: see [`Rig::busy`].
+    busy: u64,
 }
 
 fn setup(
@@ -254,6 +256,7 @@ impl Rig {
         server.add_root("music", ROOT).unwrap();
         let (tracks, items) = catalog(&library, identity.server_id, &ALBUM);
         let fake = Fake::default();
+        fake.clocked(keeper.clone());
         for track in &ALBUM {
             fake.track(
                 format!("{ROOT}/{}", track.file),
@@ -283,6 +286,7 @@ impl Rig {
             tracks,
             items,
             next_command: 0,
+            busy: 0,
         }
     }
 
@@ -321,12 +325,18 @@ impl Rig {
     }
 
     fn play(&mut self, start: usize) {
+        self.play_as(start, (ContextKind::Album, Some(id(0xa1))));
+    }
+
+    fn play_as(&mut self, start: usize, context: (ContextKind, Option<Id>)) {
         let request = self.request("playback.play");
         let what = PlayTracks {
             tracks: self.tracks.clone(),
-            start,
-            context: (ContextKind::Album, Some(id(0xa1))),
+            start: Some(start),
+            context,
             actor: self.server.local_session().unwrap(),
+            shuffle: None,
+            known: false,
         };
         self.player
             .play(request, what, &self.server, Some(&self.library))
@@ -400,6 +410,13 @@ impl Rig {
         self.server.playback_session().unwrap().position_ms
     }
 
+    /// The queue in queue order: each entry, its track and why it failed.
+    fn queue(&self) -> Vec<(Id, Id, Option<String>)> {
+        self.player
+            .window(super::Order::Queue, 0, usize::MAX)
+            .entries
+    }
+
     fn stamps(&self) -> SendStamps {
         SendStamps {
             sent_at_ms: self.clock.now_ms(),
@@ -454,6 +471,7 @@ impl Rig {
     fn restart(&mut self, run: u8) -> Vec<Id> {
         self.run = id(run);
         self.fake = Fake::default();
+        self.fake.clocked(self.keeper.clone());
         for track in &ALBUM {
             self.fake.track(
                 format!("{ROOT}/{}", track.file),
@@ -544,10 +562,11 @@ fn the_recording_example_pause_seek_and_next_with_its_checkpoints_and_its_crash(
     // album. The table's times are minutes after 21:00:00.
     let mut rig = Rig::new();
     rig.play(0);
-    // Written when the first frame is heard, with nothing played yet.
+    // Written once its first frame is heard, dated then, with what was
+    // heard by the time the player took it in.
     rig.pass(1_000);
     let [first] = rig.staged().try_into().unwrap();
-    assert_eq!(first.heard.ms_played, 0);
+    assert_eq!(first.heard.ms_played, 1_000);
     assert_eq!(first.started.started_at_ms, T0);
     assert_eq!(first.started.context_kind.as_str(), "album");
     assert_eq!(first.started.context_ref, Some(id(0xa1)));
@@ -798,7 +817,7 @@ fn an_entry_none_of_whose_copies_opens_is_marked_failed_and_three_in_a_row_stop_
             .broken(format!("{ROOT}/{}", track.file), "unsupported_format");
     }
     rig.play(0);
-    let queue = rig.player.queue();
+    let queue = rig.queue();
     let failed: Vec<Option<String>> = queue.iter().map(|(_, _, failed)| failed.clone()).collect();
     assert_eq!(
         failed,
@@ -1032,7 +1051,7 @@ fn a_file_replaced_since_the_scan_is_not_played_and_its_entry_says_why() {
     rig.play(0);
     // The first entry is marked, nothing was staged for it, and the second
     // plays.
-    let queue = rig.player.queue();
+    let queue = rig.queue();
     assert_eq!(queue[0].2.as_deref(), Some("file_changed"));
     assert_eq!(rig.player.state().current.unwrap().index, 1);
     rig.pass(10_000);
@@ -1060,24 +1079,24 @@ fn a_file_written_to_while_it_plays_ends_its_listen_at_the_next_seek_and_the_pla
         ),
         (ritornel_domain::history::EndReason::Error, 20_000, 20_000)
     );
-    assert_eq!(rig.player.queue()[0].2.as_deref(), Some("file_changed"));
+    assert_eq!(rig.queue()[0].2.as_deref(), Some("file_changed"));
     assert_eq!(rig.player.state().current.unwrap().index, 1);
     assert_eq!(rig.player.state().status, Status::Playing);
 }
 
 #[test]
-fn a_close_that_fails_keeps_the_listen_whole_and_the_retry_closes_it_as_it_ended() {
+fn a_close_that_cannot_be_saved_is_kept_whole_and_the_next_save_closes_it_as_it_ended() {
     let mut rig = Rig::new();
     rig.play(0);
     rig.pass(20_000);
     let stopped_at = rig.clock.now_ms();
     rig.break_writes("BEFORE UPDATE OF end_reason ON listen_staging");
-    let request = rig.request("playback.stop");
-    assert!(rig.player.stop(request, &rig.server).is_err());
-    rig.heal();
-    rig.wait(3_000);
+    // The stop is carried out; only the save of its listen waits.
     let request = rig.request("playback.stop");
     rig.player.stop(request, &rig.server).unwrap();
+    assert!(rig.staged()[0].ended.is_none());
+    rig.heal();
+    rig.wait(3_000);
 
     // Closed as it ended, when it ended, and on its way to the hub.
     let [first] = rig.staged().try_into().unwrap();
@@ -1140,13 +1159,13 @@ fn a_track_left_while_its_listen_cannot_be_written_keeps_what_it_played() {
     rig.break_writes("BEFORE INSERT ON listen_staging");
     rig.play(0);
     assert!(second(&mut rig).is_err());
-    // Stopped before the write could be made: the stop fails, and what was
-    // heard is still there for the retry.
-    let request = rig.request("playback.stop");
-    assert!(rig.player.stop(request, &rig.server).is_err());
-    rig.heal();
+    // Stopped before the listen could be written: what was heard is kept
+    // for the next save.
     let request = rig.request("playback.stop");
     rig.player.stop(request, &rig.server).unwrap();
+    assert!(rig.staged().is_empty());
+    rig.heal();
+    rig.wait(50);
     let [listen] = rig.staged().try_into().unwrap();
     assert_eq!(
         (listen.started.started_at_ms, listen.heard.ms_played),
@@ -1181,8 +1200,8 @@ fn a_crash_after_a_seek_back_closes_the_listen_where_its_last_checkpoint_was() {
 
 #[test]
 fn whether_the_heard_ranges_are_approximate_is_a_fact_kept_through_staging_and_delivery() {
-    use super::listen::{MAX_RANGES, OpenListen};
-    use super::store::{Ended, Mark};
+    use super::listen::{Listen, MAX_RANGES};
+    use super::store::{Ended, Saved};
     let cap = i64::try_from(MAX_RANGES).unwrap();
     // One range past the cap, then all of them heard again as one; and
     // exactly as many ranges as the cap, none joined.
@@ -1191,30 +1210,29 @@ fn whether_the_heard_ranges_are_approximate_is_a_fact_kept_through_staging_and_d
         rig.play(0);
         rig.pass(1_000);
         let started = rig.staged()[0].started.clone();
-        let mut listen = OpenListen::new(started.clone(), super::renderer::fake::RATE);
+        let mut listen = Listen::new(started.clone(), super::renderer::fake::RATE);
         for at in 0..ranges {
             listen.seek(at * 30);
-            listen.heard(10, at * 30 + 10);
+            listen.heard(10);
         }
         if heard_whole {
             listen.seek(0);
-            listen.heard(200_000, 200_000);
+            listen.heard(200_000);
         }
-        let mark = Mark {
-            position_ms: listen.position_ms(),
-            mono_ms: 2_000_000,
-        };
-        rig.server
-            .checkpoint_listen(started.listen_id, listen.snapshot(), mark)
-            .unwrap();
         let ended = Ended {
-            end_position_ms: listen.position_ms(),
+            end_position_ms: listen.position_ms(0),
             end_reason: ritornel_domain::history::EndReason::Stopped,
             ended_at_ms: rig.clock.now_ms(),
             ended_mono_ms: Some(2_000_000),
         };
+        let saved = Saved {
+            started,
+            heard: listen.snapshot(0),
+            position_ms: listen.position_ms(0),
+            ended: Some(ended),
+        };
         rig.server
-            .close_listen(started.listen_id, listen.snapshot(), ended, (None, 0, None))
+            .save_listens(vec![saved], (None, 0, None), 2_000_000)
             .unwrap();
         assert_eq!(rig.deliver().delivered.len(), 1);
         let (flag, count): (bool, i64) = rig
@@ -1260,8 +1278,11 @@ fn an_output_that_goes_away_ends_the_listen_as_output_lost_and_play_continues_it
             30_000
         )
     );
+    // The output is let go, and with it its rate: the place is saved where
+    // the track was heard to, not at its end.
     let state = rig.player.state();
     assert_eq!((state.status, state.position_ms), (Status::Paused, 30_000));
+    assert_eq!(rig.session_position(), 30_000);
     // Play opens the output again, from there, as a listen that continues
     // the lost one: one play.
     rig.resume();
@@ -1274,4 +1295,1306 @@ fn an_output_that_goes_away_ends_the_listen_as_output_lost_and_play_continues_it
     let plays = rig.plays();
     assert_eq!(plays[0].ms_played, Some(150_000));
     assert_eq!(plays[0].listens.len(), 2);
+}
+
+fn file(track: usize) -> std::path::PathBuf {
+    format!("{ROOT}/{}", ALBUM[track].file).into()
+}
+
+#[test]
+fn an_album_plays_gaplessly_and_each_track_is_a_listen_of_its_own_with_nothing_between() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    // The second track is opened as the first starts.
+    assert_eq!(rig.fake.queued(), Some(file(1)));
+    // The first ends half way through a step: the output goes straight on
+    // into the second, which was never loaded on its own.
+    rig.pass(239_500);
+    rig.pass(1_000);
+    assert_eq!(rig.fake.loads(), [(file(0), 0)]);
+    let state = rig.player.state();
+    assert_eq!(state.current.as_ref().unwrap().index, 1);
+    assert_eq!((state.status, state.position_ms), (Status::Playing, 500));
+    let [first, second] = rig.staged().try_into().unwrap();
+    let ended = first.ended.as_ref().unwrap();
+    assert_eq!(
+        (ended.end_reason.as_str(), first.heard.ms_played),
+        ("finished", 240_000)
+    );
+    // The second began the instant the first ended.
+    assert_eq!(ended.ended_at_ms, T0 + 240_000);
+    assert_eq!(second.started.started_at_ms, T0 + 240_000);
+    assert_eq!(second.started.start_reason.as_str(), "auto_advance");
+    assert_eq!(second.started.start_position_ms, 0);
+    // And so on to the end of the album, which stops the player.
+    rig.pass(300_000 + 25_000 + 200_000);
+    let staged = rig.staged();
+    assert_eq!(staged.len(), 4);
+    assert_eq!(
+        staged
+            .iter()
+            .map(|staged| staged.heard.ms_played)
+            .collect::<Vec<_>>(),
+        [240_000, 300_000, 25_000, 200_000]
+    );
+    assert_eq!(rig.fake.loads().len(), 1);
+    assert_eq!(rig.player.state().status, Status::Stopped);
+}
+
+#[test]
+fn an_album_plays_at_its_album_gain_and_a_mix_at_each_tracks_own() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(2);
+    rig.pass(5_000);
+    let album = gain_names(&rig.fake.gains());
+    assert_eq!(album, [(file(2), "album"), (file(3), "album")]);
+    // The same tracks shuffled into a mix, or queued by hand.
+    for context in [ContextKind::Query, ContextKind::Manual] {
+        let mut rig = Rig::new();
+        rig.fake.gapless();
+        rig.play_as(2, (context, None));
+        rig.pass(5_000);
+        let mix = gain_names(&rig.fake.gains());
+        assert_eq!(mix, [(file(2), "track"), (file(3), "track")]);
+    }
+}
+
+fn gain_names(
+    gains: &[(std::path::PathBuf, super::renderer::ReplayGain)],
+) -> Vec<(std::path::PathBuf, &'static str)> {
+    use super::renderer::ReplayGain;
+    gains
+        .iter()
+        .map(|(path, gain)| {
+            let gain = match gain {
+                ReplayGain::Off => "off",
+                ReplayGain::Track => "track",
+                ReplayGain::Album => "album",
+            };
+            (path.clone(), gain)
+        })
+        .collect()
+}
+
+#[test]
+fn a_short_track_has_the_next_prepared_as_it_starts_and_not_a_tick_later() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    let request = rig.request("playback.play");
+    let what = PlayTracks {
+        tracks: rig.tracks.clone(),
+        start: Some(2),
+        context: (ContextKind::Album, None),
+        actor: None,
+        shuffle: None,
+        known: false,
+    };
+    rig.player
+        .play(request, what, &rig.server, Some(&rig.library))
+        .unwrap();
+    assert_eq!(rig.fake.queued(), Some(file(3)));
+}
+
+#[test]
+fn the_last_track_has_nothing_queued_after_it_and_ends_the_queue() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(3);
+    assert_eq!(rig.fake.queued(), None);
+    rig.pass(200_000);
+    rig.pass(1_000);
+    assert_eq!(rig.player.state().status, Status::Stopped);
+    assert_eq!(rig.staged().len(), 1);
+}
+
+#[test]
+fn a_seek_lets_the_prepared_track_go_and_it_is_prepared_again_at_once() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.pass(215_000);
+    assert_eq!(rig.fake.queued(), Some(file(1)));
+    rig.seek(10_000);
+    assert_eq!(rig.fake.queued(), Some(file(1)));
+    let opened = |rig: &Rig| {
+        let gains = rig.fake.gains();
+        gains.iter().filter(|(path, _)| *path == file(1)).count()
+    };
+    assert_eq!(opened(&rig), 2);
+    // A skip lets it go too, loads the next entry, and prepares the one
+    // after it.
+    rig.skip(Direction::Next);
+    assert_eq!(rig.fake.loads().last(), Some(&(file(1), 0)));
+    assert_eq!(rig.fake.queued(), Some(file(2)));
+}
+
+#[test]
+fn a_track_the_output_cannot_join_plays_after_the_one_before_as_it_always_did() {
+    // The fake joins nothing unless asked, as an output that cannot.
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(240_000);
+    rig.pass(1_000);
+    assert_eq!(rig.fake.loads(), [(file(0), 0), (file(1), 0)]);
+    assert_eq!(rig.staged().len(), 2);
+}
+
+#[test]
+fn the_volume_is_set_kept_and_given_to_the_output_again_after_a_restart() {
+    let mut rig = Rig::new();
+    let request = rig.request("playback.set");
+    rig.player
+        .set_volume(request, Some(0.4), None, &rig.server)
+        .unwrap();
+    assert_eq!(rig.fake.volume(), Some(0.4));
+    let state = rig.player.state();
+    assert_eq!((state.volume, state.muted), (0.4, false));
+    // Muted, the output is given nothing, and the volume is kept.
+    let request = rig.request("playback.set");
+    rig.player
+        .set_volume(request, None, Some(true), &rig.server)
+        .unwrap();
+    assert_eq!(rig.fake.volume(), Some(0.0));
+    assert_eq!(rig.player.state().volume, 0.4);
+    // Out of range is refused, and changes nothing.
+    let request = rig.request("playback.set");
+    assert!(matches!(
+        rig.player.set_volume(request, Some(1.5), None, &rig.server),
+        Err(crate::Error::Invalid(_))
+    ));
+    // A restart gives the output the volume it had.
+    let fake = Fake::default();
+    let (player, _) = Player::restore(
+        setup(
+            &rig.identity,
+            rig.run,
+            &rig.clock,
+            &rig.keeper,
+            &rig.entropy,
+        ),
+        fake.renderer(),
+        &rig.server,
+        Some(&rig.library),
+    )
+    .unwrap();
+    let state = player.state();
+    assert_eq!((state.volume, state.muted), (0.4, true));
+    assert_eq!(fake.volume(), Some(0.0));
+}
+
+#[test]
+fn a_join_taken_late_saves_what_the_next_track_has_played_so_a_crash_loses_no_more_than_five_seconds()
+ {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.pass(239_500);
+    // The control thread stalls but the output keeps playing, crossing the
+    // boundary and handing out eight seconds of the next track.
+    rig.fake.advance(8_500);
+    rig.clock.set(rig.clock.now_ms() + 8_500);
+    rig.keeper.advance(8_500);
+    rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    assert_eq!(rig.player.state().position_ms, 8_000);
+    let [first, next] = rig.staged().try_into().unwrap();
+    assert_eq!(first.ended.unwrap().ended_at_ms, T0 + 240_000);
+    assert_eq!(next.started.started_at_ms, T0 + 240_000);
+    rig.restart(0xb1);
+    let [_, next] = rig.staged().try_into().unwrap();
+    assert_eq!(next.ended.unwrap().end_reason.as_str(), "crash");
+    assert!(
+        8_000 - next.heard.ms_played <= 5_000,
+        "heard 8000 ms but crash preserved only {} ms",
+        next.heard.ms_played
+    );
+}
+
+#[test]
+fn pauses_and_seeks_after_a_join_checkpoint_what_was_heard() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.pass(240_500);
+    rig.pass(2_000);
+    rig.pause();
+    let [_, next] = rig.staged().try_into().unwrap();
+    assert_eq!(next.heard.ms_played, 2_500);
+    rig.wait(60_000);
+    rig.resume();
+    rig.pass(2_000);
+    rig.seek(100_000);
+    let [_, next] = rig.staged().try_into().unwrap();
+    assert_eq!(next.heard.ms_played, 4_500);
+    assert_eq!(next.heard.seek_count, 1);
+    rig.pass(4_900);
+    rig.restart(0xb1);
+    let [_, next] = rig.staged().try_into().unwrap();
+    assert!(9_400 - next.heard.ms_played <= 5_000);
+}
+
+#[test]
+fn a_pause_and_resume_before_the_join_is_taken_lose_no_more_than_five_seconds_to_a_crash() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.pass(239_500);
+    rig.fake.advance(1_000);
+    rig.clock.set(rig.clock.now_ms() + 1_000);
+    rig.keeper.advance(1_000);
+    rig.pause();
+    rig.resume();
+    rig.pass(4_600);
+    assert_eq!(rig.player.state().position_ms, 5_100);
+    rig.restart(0xb1);
+    let [_, next] = rig.staged().try_into().unwrap();
+    assert!(
+        5_100 - next.heard.ms_played <= 5_000,
+        "heard 5100 ms around pause/resume but crash preserved only {} ms",
+        next.heard.ms_played
+    );
+}
+
+#[test]
+fn a_pause_at_the_very_end_of_a_track_starts_the_next_listen_when_it_is_heard() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.pass(239_000);
+    // The first ends exactly as this step does, and nothing of the next
+    // is heard before the pause.
+    rig.fake.advance(1_000);
+    rig.clock.set(rig.clock.now_ms() + 1_000);
+    rig.keeper.advance(1_000);
+    rig.pause();
+    rig.wait(2_000);
+    rig.resume();
+    rig.pass(1_000);
+    let [first, next] = rig.staged().try_into().unwrap();
+    assert_eq!(first.ended.unwrap().ended_at_ms, T0 + 240_000);
+    assert_eq!(next.started.started_at_ms, T0 + 242_000);
+    assert_eq!(rig.player.state().position_ms, 1_000);
+}
+
+// ---------------------------------------------------------------- the queue's orders and edits
+
+impl Rig {
+    fn set(&mut self, shuffle: Option<bool>, repeat: Option<super::Repeat>) {
+        let request = self.request("playback.set");
+        let settings = super::Settings {
+            shuffle,
+            repeat,
+            ..super::Settings::default()
+        };
+        self.player.set(request, settings, &self.server).unwrap();
+    }
+
+    /// The entries in play order.
+    fn play_order(&self) -> Vec<Id> {
+        self.player
+            .window(super::Order::Play, 0, usize::MAX)
+            .entries
+            .into_iter()
+            .map(|(entry, ..)| entry)
+            .collect()
+    }
+
+    fn add(
+        &mut self,
+        track: usize,
+        place: super::Place,
+        expected: Option<i64>,
+    ) -> Result<super::Done, crate::Error> {
+        let request = self.request("queue.add");
+        let what = super::AddTracks {
+            tracks: vec![self.tracks[track]],
+            place,
+            context: (ContextKind::Manual, None),
+            actor: None,
+        };
+        self.player
+            .add(request, expected, what, &self.server, Some(&self.library))
+    }
+
+    fn appearance(&self) -> Id {
+        self.player
+            .state()
+            .current
+            .unwrap()
+            .track
+            .unwrap()
+            .appearance
+    }
+}
+
+#[test]
+fn shuffle_is_a_stored_order_that_a_restart_keeps_and_previous_walks_back_through() {
+    let mut rig = Rig::new();
+    rig.play(1);
+    let playing = rig.entry();
+    rig.set(Some(true), None);
+    let order = rig.play_order();
+    assert_eq!(order.len(), 4);
+    assert_eq!(order[0], playing, "the entry on plays first");
+    assert!(rig.player.state().shuffle);
+    // It plays on in that order.
+    rig.pass(300_000);
+    assert_eq!(rig.entry(), order[1]);
+    rig.pass(2_000);
+    // A restart keeps the order, paused.
+    rig.player.shutdown(&rig.server).unwrap();
+    rig.restart(0xb1);
+    assert_eq!(rig.play_order(), order);
+    let state = rig.player.state();
+    assert!(state.shuffle);
+    assert_eq!((state.status, rig.entry()), (Status::Paused, order[1]));
+    // Previous goes back through what was heard.
+    rig.resume();
+    rig.skip(Direction::Previous);
+    assert_eq!(rig.entry(), order[0]);
+    // Each listen says whether shuffle chose it: the first was chosen by
+    // hand before shuffle was on, and every one after by the order.
+    let shuffled: Vec<bool> = rig.staged().iter().map(|l| l.started.shuffle).collect();
+    assert!(!shuffled[0]);
+    assert!(
+        shuffled[1..].iter().all(|shuffled| *shuffled),
+        "{shuffled:?}"
+    );
+    // Off goes back to queue order at the entry on.
+    rig.set(Some(false), None);
+    let state = rig.player.state();
+    assert!(!state.shuffle);
+    assert_eq!(rig.entry(), playing);
+    assert_eq!(state.current.unwrap().index, 1);
+}
+
+#[test]
+fn repeat_one_plays_the_entry_again_as_a_new_listen_and_next_still_moves_on() {
+    let mut rig = Rig::new();
+    rig.play(2);
+    rig.set(None, Some(super::Repeat::One));
+    assert_eq!(rig.player.state().repeat, super::Repeat::One);
+    rig.pass(26_000);
+    assert_eq!(rig.player.state().current.unwrap().index, 2);
+    let staged = rig.staged();
+    assert_eq!(staged.len(), 2);
+    assert_eq!(
+        staged[0].ended.as_ref().unwrap().end_reason.as_str(),
+        "finished"
+    );
+    assert_eq!(staged[1].started.start_reason.as_str(), "repeat");
+    rig.skip(Direction::Next);
+    assert_eq!(rig.player.state().current.unwrap().index, 3);
+}
+
+#[test]
+fn repeat_all_starts_again_at_the_end_and_with_shuffle_in_a_new_order() {
+    let mut rig = Rig::new();
+    rig.play(3);
+    rig.set(None, Some(super::Repeat::All));
+    rig.pass(201_000);
+    let state = rig.player.state();
+    assert_eq!(
+        (state.status, state.current.unwrap().index),
+        (Status::Playing, 0)
+    );
+    // Previous from the first goes round to the last.
+    rig.skip(Direction::Previous);
+    assert_eq!(rig.player.state().current.unwrap().index, 3);
+
+    rig.set(Some(true), None);
+    let before = rig.player.state().queue_revision;
+    let last = *rig.play_order().last().unwrap();
+    for _ in 0..3 {
+        rig.skip(Direction::Next);
+    }
+    assert_eq!(rig.entry(), last);
+    rig.skip(Direction::Next);
+    let state = rig.player.state();
+    assert_eq!(state.status, Status::Playing);
+    assert_eq!(state.queue_revision, before + 1, "a new order was written");
+    let order = rig.play_order();
+    assert_eq!(rig.entry(), order[0]);
+    assert_ne!(
+        order[0], last,
+        "what just ended does not open the new order"
+    );
+}
+
+#[test]
+fn a_song_added_to_play_next_plays_next_in_queue_order_and_shuffled() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.add(3, super::Place::Next, None).unwrap();
+    let up = rig.player.window(super::Order::UpNext, 0, 10);
+    assert_eq!(up.total, 4);
+    rig.pass(241_000);
+    assert_eq!(rig.appearance(), rig.tracks[3]);
+
+    rig.set(Some(true), None);
+    rig.add(2, super::Place::Next, None).unwrap();
+    rig.skip(Direction::Next);
+    assert_eq!(rig.appearance(), rig.tracks[2]);
+    // At the end while shuffled, it is among what is still to play.
+    let played = rig.entry();
+    let added = rig.add(1, super::Place::End, None).unwrap();
+    assert!(!added.replayed);
+    let order = rig.play_order();
+    let at = order.iter().position(|entry| *entry == played).unwrap();
+    let up: Vec<Id> = rig
+        .player
+        .window(super::Order::UpNext, 0, 10)
+        .entries
+        .into_iter()
+        .map(|(entry, ..)| entry)
+        .collect();
+    assert_eq!(up, order[at + 1..]);
+    assert_eq!(rig.queue().len(), 7);
+}
+
+#[test]
+fn a_stale_queue_edit_is_refused_with_a_conflict_and_changes_nothing() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    let seen = rig.player.state().queue_revision;
+    rig.add(3, super::Place::End, Some(seen)).unwrap();
+    let now = rig.player.state().queue_revision;
+    assert_eq!(now, seen + 1);
+    let queue = rig.queue();
+
+    let stale = rig.add(2, super::Place::Next, Some(seen));
+    assert!(matches!(stale, Err(crate::Error::StaleQueue { current }) if current == now));
+    let request = rig.request("queue.remove");
+    let entries = [queue[1].0];
+    let stale = rig.player.remove(
+        request,
+        Some(seen),
+        &entries,
+        &rig.server,
+        Some(&rig.library),
+    );
+    assert!(matches!(stale, Err(crate::Error::StaleQueue { .. })));
+    let request = rig.request("queue.move");
+    let stale = rig.player.move_entries(
+        request,
+        Some(seen),
+        &entries,
+        super::Place::Next,
+        &rig.server,
+    );
+    assert!(matches!(stale, Err(crate::Error::StaleQueue { .. })));
+    let request = rig.request("queue.clear");
+    let stale = rig.player.clear(request, Some(seen), &rig.server);
+    assert!(matches!(stale, Err(crate::Error::StaleQueue { .. })));
+    // Nothing changed, in memory or in the file.
+    assert_eq!(rig.queue(), queue);
+    assert_eq!(rig.player.state().queue_revision, now);
+    assert_eq!(rig.server.playback_session().unwrap().queue_revision, now);
+    assert_eq!(rig.server.queue().unwrap().len(), queue.len());
+    // An edit on the revision there is goes through.
+    let request = rig.request("queue.remove");
+    rig.player
+        .remove(
+            request,
+            Some(now),
+            &entries,
+            &rig.server,
+            Some(&rig.library),
+        )
+        .unwrap();
+    assert_eq!(rig.queue().len(), 4);
+}
+
+#[test]
+fn taking_out_the_playing_entry_ends_its_listen_as_removed_and_plays_the_next() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(10_000);
+    let request = rig.request("queue.remove");
+    let playing = [rig.entry()];
+    rig.player
+        .remove(request, None, &playing, &rig.server, Some(&rig.library))
+        .unwrap();
+    rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    let state = rig.player.state();
+    assert_eq!(state.status, Status::Playing);
+    assert_eq!(state.queue_length, 3);
+    assert_eq!(rig.appearance(), rig.tracks[1]);
+    let staged = rig.staged();
+    assert_eq!(
+        staged[0].ended.as_ref().unwrap().end_reason.as_str(),
+        "removed"
+    );
+    // The place saved is the new entry's.
+    let session = rig.server.playback_session().unwrap();
+    let rows = rig.server.queue().unwrap();
+    assert_eq!(
+        session.current,
+        rows.iter()
+            .find(|entry| entry.entry_id == rig.entry())
+            .map(|entry| entry.row)
+    );
+}
+
+#[test]
+fn moved_entries_play_in_their_new_place_and_jump_plays_one_now() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    let queue = rig.queue();
+    // The last to straight after the one playing.
+    let request = rig.request("queue.move");
+    rig.player
+        .move_entries(
+            request,
+            None,
+            &[queue[3].0],
+            super::Place::Next,
+            &rig.server,
+        )
+        .unwrap();
+    rig.pass(5_000);
+    rig.skip(Direction::Next);
+    assert_eq!(rig.entry(), queue[3].0);
+    rig.pass(5_000);
+    // After itself is refused.
+    let request = rig.request("queue.move");
+    let refused = rig.player.move_entries(
+        request,
+        None,
+        &[queue[1].0],
+        super::Place::After(queue[1].0),
+        &rig.server,
+    );
+    assert!(matches!(refused, Err(crate::Error::Invalid(_))));
+    // Jump plays the one named now, and the listen it left ends as jump.
+    let request = rig.request("playback.jump");
+    rig.player
+        .jump(request, queue[2].0, &rig.server, Some(&rig.library))
+        .unwrap();
+    rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    assert_eq!(rig.entry(), queue[2].0);
+    let reasons: Vec<&str> = rig
+        .staged()
+        .iter()
+        .filter_map(|listen| listen.ended.as_ref())
+        .map(|ended| ended.end_reason.as_str())
+        .collect();
+    assert_eq!(reasons, ["next", "jump"]);
+}
+
+#[test]
+fn clearing_the_queue_stops_the_player_and_adding_to_none_waits_on_the_first() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(5_000);
+    let request = rig.request("queue.clear");
+    rig.player.clear(request, None, &rig.server).unwrap();
+    let state = rig.player.state();
+    assert_eq!((state.status, state.queue_length), (Status::Stopped, 0));
+    assert!(state.current.is_none());
+    assert_eq!(rig.server.queue().unwrap().len(), 0);
+    rig.add(2, super::Place::Next, None).unwrap();
+    let state = rig.player.state();
+    assert_eq!(state.status, Status::Stopped);
+    assert_eq!(rig.appearance(), rig.tracks[2]);
+    rig.resume();
+    assert_eq!(rig.player.state().status, Status::Playing);
+}
+
+#[test]
+fn a_replayed_edit_is_answered_from_its_receipt_and_adds_nothing_twice() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    let request = rig.request("queue.add");
+    let command = request.command;
+    let what = super::AddTracks {
+        tracks: vec![rig.tracks[2]],
+        place: super::Place::Next,
+        context: (ContextKind::Manual, None),
+        actor: None,
+    };
+    let first = rig
+        .player
+        .add(request, None, what.clone(), &rig.server, Some(&rig.library))
+        .unwrap();
+    let again = Request {
+        command,
+        method: "queue.add",
+        answer: Box::new(|_| String::from("never")),
+    };
+    let second = rig
+        .player
+        .add(again, None, what, &rig.server, Some(&rig.library))
+        .unwrap();
+    assert!(second.replayed);
+    assert_eq!(second.answer, first.answer);
+    assert_eq!(rig.queue().len(), 5);
+}
+
+#[test]
+fn the_track_prepared_for_a_join_is_the_one_shuffle_and_repeat_say_follows_and_an_edit_lets_it_go()
+{
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.set(Some(true), None);
+    let order = rig.play_order();
+    let second = rig
+        .queue()
+        .iter()
+        .position(|entry| entry.0 == order[1])
+        .unwrap();
+    // Thirty seconds from the end, what is prepared is what plays next in
+    // the shuffled order.
+    rig.pass(215_000);
+    assert_eq!(rig.fake.queued(), Some(file(second)));
+    // Adding a song to play next changes what follows: the one prepared
+    // goes, and the added one is prepared in its place.
+    rig.add(2, super::Place::Next, None).unwrap();
+    assert_eq!(rig.fake.queued(), None);
+    rig.pass(1_000);
+    assert_eq!(rig.fake.queued(), Some(file(2)));
+    // Repeat one: the same track follows, and joins as a repeat.
+    rig.set(None, Some(super::Repeat::One));
+    assert_eq!(rig.fake.queued(), None);
+    rig.pass(1_000);
+    assert_eq!(rig.fake.queued(), Some(file(0)));
+    rig.pass(30_000);
+    let state = rig.player.state();
+    assert_eq!(state.current.unwrap().index, 0);
+    let staged = rig.staged();
+    assert_eq!(staged.len(), 2);
+    assert_eq!(staged[1].started.start_reason.as_str(), "repeat");
+}
+
+impl Rig {
+    /// Plays these tracks of the album, in this order, from the first.
+    fn play_tracks(&mut self, tracks: &[usize]) {
+        let request = self.request("playback.play");
+        let what = PlayTracks {
+            tracks: tracks.iter().map(|track| self.tracks[*track]).collect(),
+            start: Some(0),
+            context: (ContextKind::Album, Some(id(0xa1))),
+            actor: None,
+            shuffle: None,
+            known: false,
+        };
+        self.player
+            .play(request, what, &self.server, Some(&self.library))
+            .unwrap();
+        self.player.tick(&self.server, Some(&self.library)).unwrap();
+    }
+}
+
+#[test]
+fn with_repeat_all_an_entry_that_fails_never_comes_round_to_itself() {
+    let mut rig = Rig::new();
+    rig.play_tracks(&[0]);
+    rig.set(None, Some(super::Repeat::All));
+    rig.pass(20_000);
+    rig.fake.rewrite_loaded();
+    rig.seek(100_000);
+    rig.pass(2_000);
+    // Its only entry failed: the player stops rather than open it again.
+    assert_eq!(rig.player.state().status, Status::Stopped);
+    assert_eq!(rig.fake.loads(), [(file(0), 0)]);
+    let [failed] = rig.staged().try_into().unwrap();
+    assert_eq!(
+        failed.ended.unwrap().end_reason,
+        ritornel_domain::history::EndReason::Error
+    );
+
+    // With another entry, the failed last one goes round to it.
+    let mut rig = Rig::new();
+    rig.play_tracks(&[0, 1]);
+    rig.set(None, Some(super::Repeat::All));
+    rig.skip(Direction::Next);
+    rig.pass(20_000);
+    rig.fake.rewrite_loaded();
+    rig.seek(100_000);
+    rig.pass(1_000);
+    let state = rig.player.state();
+    assert_eq!(
+        (state.status, state.current.unwrap().index),
+        (Status::Playing, 0)
+    );
+}
+
+#[test]
+fn adding_to_an_empty_queue_selects_the_first_entry_in_the_same_write_as_its_receipt() {
+    let mut rig = Rig::new();
+    let command = Command {
+        id: id(0x77),
+        fingerprint: Fingerprint::of("queue.add", &[0x77]),
+    };
+    let request = || Request {
+        command,
+        method: "queue.add",
+        answer: Box::new(|summary| summary.queue_revision.to_string()),
+    };
+    let what = super::AddTracks {
+        tracks: vec![rig.tracks[2]],
+        place: super::Place::Next,
+        context: (ContextKind::Manual, None),
+        actor: None,
+    };
+    // Choosing the entry fails, as a crash there would leave it.
+    rig.break_writes(
+        "BEFORE UPDATE OF current_entry_id ON playback_session \
+         WHEN NEW.current_entry_id IS NOT NULL",
+    );
+    let failed = rig.player.add(
+        request(),
+        None,
+        what.clone(),
+        &rig.server,
+        Some(&rig.library),
+    );
+    assert!(failed.is_err());
+    rig.heal();
+    // Sent again, the add leaves the player waiting on its entry, and the
+    // file says so too.
+    rig.player
+        .add(request(), None, what, &rig.server, Some(&rig.library))
+        .unwrap();
+    assert_eq!(rig.appearance(), rig.tracks[2]);
+    let session = rig.server.playback_session().unwrap();
+    let rows = rig.server.queue().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(session.current, Some(rows[0].row));
+}
+
+#[test]
+fn a_new_order_at_the_wrap_is_saved_with_the_entry_that_opens_it() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.set(Some(true), Some(super::Repeat::All));
+    for _ in 0..3 {
+        rig.skip(Direction::Next);
+    }
+    let before = rig.play_order();
+    assert_eq!(rig.entry(), before[3]);
+    // Choosing the entry that opens the new order fails, as a crash just
+    // after the order was written would leave it.
+    rig.break_writes(
+        "BEFORE UPDATE OF current_entry_id ON playback_session \
+         WHEN NEW.current_entry_id IS NOT OLD.current_entry_id",
+    );
+    for _ in 0..400 {
+        rig.fake.advance(1_000);
+        rig.clock.set(rig.clock.now_ms() + 1_000);
+        rig.hub_clock.set(rig.hub_clock.now_ms() + 1_000);
+        rig.keeper.advance(1_000);
+        let _ = rig.player.tick(&rig.server, Some(&rig.library));
+    }
+    rig.heal();
+    rig.restart(0xb3);
+    // Either the queue is as it was before the wrap, on its last entry, or
+    // the new order and the entry that opens it were saved together.
+    let after = rig.play_order();
+    let on = rig.entry();
+    assert!(
+        (after == before && on == before[3]) || (after[0] == on && rig.session_position() == 0),
+        "restored on {on} in {after:?}, where the order was {before:?}"
+    );
+}
+
+#[test]
+fn entries_moved_to_the_end_go_last_in_queue_order_and_in_play_order() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.set(Some(true), None);
+    let order = rig.play_order();
+    let request = rig.request("queue.move");
+    rig.player
+        .move_entries(request, None, &[order[1]], super::Place::End, &rig.server)
+        .unwrap();
+    assert_eq!(rig.play_order().last(), Some(&order[1]));
+    assert_eq!(rig.queue().last().map(|entry| entry.0), Some(order[1]));
+    let up = rig.player.window(super::Order::UpNext, 0, 10);
+    assert_eq!(up.entries.last().map(|entry| entry.0), Some(order[1]));
+}
+
+#[test]
+fn an_edit_after_a_join_has_happened_keeps_the_join_and_the_next_listen_starts_at_its_boundary() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.pass(239_000);
+    assert_eq!(rig.fake.queued(), Some(file(1)));
+    // The first track ends into the second, which plays 100 ms before the
+    // player next looks.
+    rig.fake.advance(1_100);
+    rig.clock.set(rig.clock.now_ms() + 1_100);
+    rig.hub_clock.set(rig.hub_clock.now_ms() + 1_100);
+    rig.keeper.advance(1_100);
+    // Meanwhile a song is added at the end: too late to undo the join.
+    rig.add(3, super::Place::End, None).unwrap();
+    rig.pass(1_000);
+    // The second plays on from the join: it was not opened again.
+    assert_eq!(rig.fake.loads(), [(file(0), 0)]);
+    let state = rig.player.state();
+    assert_eq!(state.current.unwrap().index, 1);
+    assert_eq!(state.position_ms, 1_100);
+    // One listen each, the second from the boundary.
+    let [first, second] = rig.staged().try_into().unwrap();
+    assert_eq!(
+        first.ended.as_ref().unwrap().end_reason.as_str(),
+        "finished"
+    );
+    assert_eq!(first.heard.ms_played, 240_000);
+    assert_eq!(second.started.start_position_ms, 0);
+    assert_eq!(second.started.started_at_ms, T0 + 240_000);
+    assert_eq!(second.ended, None);
+}
+
+#[test]
+fn with_repeat_all_a_last_entry_that_cannot_open_goes_round_to_the_first() {
+    let mut rig = Rig::new();
+    rig.fake.broken(file(1), "unreadable");
+    rig.set(None, Some(super::Repeat::All));
+    rig.play_tracks(&[0, 1]);
+    rig.pass(241_000);
+    // The second could not open: the first plays again, and the second
+    // says why.
+    let state = rig.player.state();
+    assert_eq!(
+        (state.status, state.current.unwrap().index),
+        (Status::Playing, 0)
+    );
+    assert_eq!(rig.queue()[1].2.as_deref(), Some("unreadable"));
+
+    // A queue of one that cannot open does not come round to itself.
+    let mut rig = Rig::new();
+    rig.fake.broken(file(1), "unreadable");
+    rig.set(None, Some(super::Repeat::All));
+    rig.play_tracks(&[1]);
+    assert_eq!(rig.player.state().status, Status::Stopped);
+}
+
+#[test]
+fn a_repeat_already_joined_keeps_its_reason_when_repeat_is_turned_off_before_the_tick() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.set(None, Some(super::Repeat::One));
+    rig.pass(239_000);
+    // The track ends into itself, and is heard 100 ms before repeat is
+    // turned off and the player next looks.
+    rig.fake.advance(1_100);
+    rig.clock.set(rig.clock.now_ms() + 1_100);
+    rig.hub_clock.set(rig.hub_clock.now_ms() + 1_100);
+    rig.keeper.advance(1_100);
+    rig.set(None, Some(super::Repeat::Off));
+    rig.pass(1_000);
+    let staged = rig.staged();
+    assert_eq!(staged.len(), 2);
+    assert_eq!(staged[1].started.start_reason.as_str(), "repeat");
+    assert_eq!(rig.player.state().current.unwrap().index, 0);
+}
+
+// ---------------------------------------------------------------- schedules held to the fake's own timeline
+
+/// One step of a schedule.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// The output plays on and the player does not look: a command may
+    /// come in the meantime.
+    Play(i64),
+    /// As `Play`, to this many milliseconds before the end of the track in
+    /// hand: a command next comes as it ends.
+    Near(i64),
+    /// Time passes with the player ticking, a second at a time.
+    Tick(i64),
+    Pause,
+    Resume,
+    Seek(i64),
+    Skip(Direction),
+    /// A song of the album added to play next, or last.
+    Add(usize, bool),
+    /// The entry this many places on in play order taken out, or jumped to.
+    Remove(usize),
+    Jump(usize),
+    Shuffle(bool),
+    Repeat(super::Repeat),
+    Stop,
+}
+
+/// What a schedule did that its listens are held to: when shuffle was
+/// turned on or off, by how many spans had been given; the entries it
+/// took out, with when each removal returned; and when each command
+/// ran, by the monotonic clock.
+#[derive(Debug, Default)]
+struct Ran {
+    shuffles: Vec<(usize, bool)>,
+    removed: Vec<(Id, i64)>,
+    commands: Vec<(i64, i64)>,
+}
+
+impl Ran {
+    fn and(mut self, then: Self) -> Self {
+        self.shuffles.extend(then.shuffles.into_iter().skip(1));
+        self.removed.extend(then.removed);
+        self.commands.extend(then.commands);
+        self
+    }
+}
+
+impl Rig {
+    /// While the player is busy with each call to the renderer, the output
+    /// plays on for `ms`, and the clocks move on with it, as a callback
+    /// runs during a command.
+    fn busy(&mut self, ms: u64) {
+        self.busy = ms;
+        let (clock, hub, keeper) = (
+            self.clock.clone(),
+            self.hub_clock.clone(),
+            self.keeper.clone(),
+        );
+        self.fake.meanwhile(ms, move |ms| {
+            clock.set(clock.now_ms() + ms);
+            hub.set(hub.now_ms() + ms);
+            keeper.advance(ms);
+        });
+    }
+
+    /// Runs `steps`, and after every command holds the player to the fake:
+    /// the entry it is on is the one whose track the output plays. With the
+    /// output busy during commands, the player may have been left behind
+    /// by the time one returns, and only its listens are held.
+    fn run(&mut self, steps: &[Step]) -> Ran {
+        let mut ran = Ran {
+            shuffles: vec![(0, self.player.state().shuffle)],
+            ..Ran::default()
+        };
+        let mono = |rig: &Self| crate::timekeeping::Timekeeper::mono_ms(&*rig.keeper);
+        for step in steps {
+            let from = mono(self);
+            let on = self.player.state().current.map(|current| current.entry_id);
+            let left = self.fake.left().map(|left| i64::try_from(left).unwrap());
+            match *step {
+                Step::Play(ms) | Step::Near(ms) => {
+                    let ms = match step {
+                        Step::Near(_) => left.map_or(0, |left| (left - ms).max(0)),
+                        _ => ms,
+                    };
+                    self.fake.advance(u64::try_from(ms).unwrap());
+                    for clock in [&self.clock, &self.hub_clock] {
+                        clock.set(clock.now_ms() + ms);
+                    }
+                    self.keeper.advance(ms);
+                    continue;
+                }
+                Step::Tick(ms) => {
+                    self.pass(ms);
+                    continue;
+                }
+                Step::Pause => self.pause(),
+                Step::Resume => {
+                    let request = self.request("playback.resume");
+                    self.player
+                        .resume(request, &self.server, Some(&self.library))
+                        .unwrap();
+                }
+                Step::Seek(ms) if on.is_some() => self.seek(ms),
+                Step::Skip(direction) => {
+                    let (Some(entry), request) = (on, self.request("playback.skip")) else {
+                        continue;
+                    };
+                    let (server, library) = (&self.server, Some(&self.library));
+                    self.player
+                        .skip(request, entry, direction, server, library)
+                        .unwrap();
+                }
+                Step::Add(track, next) => {
+                    let place = if next {
+                        super::Place::Next
+                    } else {
+                        super::Place::End
+                    };
+                    self.add(track, place, None).unwrap();
+                }
+                Step::Remove(ahead) | Step::Jump(ahead) => {
+                    let order = self.play_order();
+                    let slot = self.player.window(super::Order::Play, 0, 0).current;
+                    let Some(entry) = order.get((slot.unwrap_or(0) + ahead) % order.len().max(1))
+                    else {
+                        continue;
+                    };
+                    let request = self.request("queue.edit");
+                    let (server, library) = (&self.server, Some(&self.library));
+                    if matches!(step, Step::Jump(_)) {
+                        self.player.jump(request, *entry, server, library).unwrap();
+                    } else {
+                        self.player
+                            .remove(request, None, &[*entry], server, library)
+                            .unwrap();
+                        ran.removed.push((*entry, mono(self)));
+                    }
+                }
+                Step::Shuffle(on) => {
+                    self.set(Some(on), None);
+                    let decided = self.fake.timeline().1.len();
+                    ran.shuffles.push((decided, on));
+                }
+                Step::Repeat(repeat) => self.set(None, Some(repeat)),
+                Step::Stop => {
+                    let request = self.request("playback.stop");
+                    self.player.stop(request, &self.server).unwrap();
+                }
+                Step::Seek(_) => continue,
+            }
+            ran.commands.push((from, mono(self)));
+            let state = self.player.state();
+            let Some(playing) = self.fake.in_hand() else {
+                continue;
+            };
+            if self.busy > 0 || self.player.moving_on() || state.status == Status::Stopped {
+                continue;
+            }
+            let track = state
+                .current
+                .as_ref()
+                .and_then(|current| current.track.as_ref());
+            let index =
+                track.and_then(|track| self.tracks.iter().position(|t| *t == track.appearance));
+            assert_eq!(
+                index.map(file),
+                Some(playing),
+                "after {step:?} the player is on another track than the output: {state:?}"
+            );
+        }
+        ran
+    }
+
+    /// Holds every listen to what the fake says it played: no frame lost
+    /// or counted twice, each listen dated by its own first frame and its
+    /// last, of the track that span played, recording shuffle as it was
+    /// when its span was decided, and ended as removed only if its entry
+    /// was, or if all of it was heard while one command ran. A removed
+    /// entry never begins after its removal has returned.
+    fn listens_hold(&self, ran: &Ran) {
+        let (said, given) = self.fake.timeline();
+        let staged = self.staged();
+        let heard: u64 = said
+            .iter()
+            .map(|event| match event {
+                super::Event::Ended { frames, .. } => *frames,
+                super::Event::Began { .. } => 0,
+            })
+            .sum();
+        let kept: i64 = staged.iter().map(|listen| listen.heard.ms_played).sum();
+        assert_eq!(
+            kept,
+            i64::try_from(heard).unwrap(),
+            "frames heard and kept differ"
+        );
+        let mono = |at: &u64| i64::try_from(at / 1_000_000).unwrap();
+        let mut before = i64::MIN;
+        for listen in &staged {
+            let ended = listen.ended.as_ref().expect("a listen was left open");
+            let (start, end) = (listen.started.started_mono_ms, ended.ended_mono_ms.unwrap());
+            assert!(before <= start && start <= end, "{listen:?} after {before}");
+            before = end;
+            let span = said.iter().find_map(|event| match event {
+                super::Event::Began { span, at } if mono(at) == start => Some(*span),
+                _ => None,
+            });
+            let span = span.unwrap_or_else(|| panic!("no span began as {listen:?} did"));
+            assert!(
+                said.iter().any(|event| matches!(event,
+                    super::Event::Ended { at, .. } if mono(at) == end)),
+                "no span ended as {listen:?} did"
+            );
+            let removed = ran
+                .removed
+                .iter()
+                .find(|(entry, _)| Some(*entry) == listen.started.entry);
+            if let Some((_, at)) = removed {
+                assert!(start <= *at, "{listen:?} began after its removal at {at}");
+            } else if ended.end_reason.as_str() == "removed" {
+                assert!(
+                    ran.commands
+                        .iter()
+                        .any(|(from, to)| *from <= start && end <= *to),
+                    "{listen:?} ended as removed, its entry in the queue"
+                );
+            }
+            // Its span, and the one it was decided with: a seek's track's.
+            let index = |span: u64| given.iter().position(|given| given.span == span).unwrap();
+            let mut decided = index(span);
+            let track = self
+                .tracks
+                .iter()
+                .position(|t| *t == listen.started.appearance);
+            assert_eq!(
+                track.map(file).as_ref(),
+                Some(&given[decided].path),
+                "{listen:?}"
+            );
+            while let Some(of) = given[decided].seek_of {
+                decided = index(of);
+            }
+            let (_, shuffled) = ran
+                .shuffles
+                .iter()
+                .rev()
+                .find(|(spans, _)| *spans <= decided)
+                .unwrap();
+            assert_eq!(
+                listen.started.shuffle, *shuffled,
+                "{listen:?} decided as span {decided}"
+            );
+        }
+    }
+}
+
+/// Plays the album gaplessly to a second before the end of its first
+/// track, and on into the second for 100 ms with nothing looking.
+fn just_after_a_join() -> (Rig, Vec<Step>) {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    (rig, vec![Step::Tick(239_000), Step::Play(1_100)])
+}
+
+#[test]
+fn shuffle_turned_on_just_after_a_join_reorders_around_the_track_playing_and_not_its_listen() {
+    let (mut rig, mut steps) = just_after_a_join();
+    steps.extend([Step::Shuffle(true), Step::Tick(1_000)]);
+    let ran = rig.run(&steps);
+    // The new order opens with the entry the output is playing.
+    assert_eq!(rig.play_order()[0], rig.queue()[1].0);
+    // Its listen was decided with shuffle off.
+    let [first, second] = rig.staged().try_into().unwrap();
+    assert!(!first.started.shuffle && !second.started.shuffle);
+    rig.run(&[Step::Stop, Step::Tick(1)]);
+    rig.listens_hold(&ran);
+}
+
+#[test]
+fn a_song_added_to_play_next_just_after_a_join_plays_after_the_track_playing() {
+    let (mut rig, mut steps) = just_after_a_join();
+    steps.extend([Step::Add(3, true), Step::Tick(300_000)]);
+    let ran = rig.run(&steps);
+    // The second track played out, and the song added is what followed.
+    assert_eq!(rig.appearance(), rig.tracks[3]);
+    let played: Vec<Id> = rig.staged().iter().map(|l| l.started.appearance).collect();
+    assert_eq!(played, [rig.tracks[0], rig.tracks[1], rig.tracks[3]]);
+    rig.run(&[Step::Stop, Step::Tick(1)]);
+    rig.listens_hold(&ran);
+}
+
+#[test]
+fn a_join_made_while_an_edit_lets_the_next_go_keeps_the_track_it_ran_into() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.run(&[Step::Tick(239_000), Step::Play(998)]);
+    // The output runs into the second track while the edit is written,
+    // after the player last looked.
+    rig.busy(2);
+    let ran = rig.run(&[Step::Add(3, false), Step::Tick(1_000)]);
+    // The second plays on from the join: never let go, never loaded again.
+    assert_eq!(rig.fake.loads(), [(file(0), 0)]);
+    let [first, second] = rig.staged().try_into().unwrap();
+    assert_eq!(first.ended.unwrap().end_reason.as_str(), "finished");
+    assert_eq!(second.ended, None);
+    assert_eq!(rig.player.state().current.unwrap().index, 1);
+    rig.run(&[Step::Stop, Step::Tick(1)]);
+    rig.listens_hold(&ran);
+}
+
+#[test]
+fn a_song_taken_out_of_up_next_in_the_last_half_second_is_never_heard() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    // 400 ms from the end of the first: its decoder has the second.
+    let ran = rig.run(&[Step::Tick(239_000), Step::Play(600), Step::Remove(1)]);
+    let ran = ran.and(rig.run(&[Step::Tick(2_000), Step::Stop, Step::Tick(1)]));
+    // The first ended where it would have, the second was never heard, and
+    // the third started as any track does.
+    let (said, given) = rig.fake.timeline();
+    let second: Vec<u64> = given
+        .iter()
+        .filter(|given| given.path == file(1))
+        .map(|given| given.span)
+        .collect();
+    assert!(!second.is_empty());
+    let began = |span: &u64| {
+        said.iter()
+            .any(|event| matches!(event, super::Event::Began { span: s, .. } if s == span))
+    };
+    assert!(!second.iter().any(began), "{said:?}");
+    assert_eq!(rig.fake.loads(), [(file(0), 0), (file(2), 0)]);
+    let [first, third] = rig.staged().try_into().unwrap();
+    let ended = first.ended.as_ref().unwrap();
+    assert_eq!(
+        (ended.end_reason.as_str(), first.heard.ms_played),
+        ("finished", 240_000)
+    );
+    assert_eq!(ended.ended_at_ms, T0 + 240_000);
+    assert_eq!(third.started.appearance, rig.tracks[2]);
+    assert_eq!(third.started.start_reason.as_str(), "auto_advance");
+    rig.listens_hold(&ran);
+}
+
+#[test]
+fn no_schedule_of_play_commands_and_ticks_parts_the_player_from_the_output_or_a_listen_from_it() {
+    use crate::testing::Draws;
+    for seed in 1..=150 {
+        let mut draws = Draws::seeded(seed);
+        let mut rig = Rig::new();
+        rig.fake.gapless();
+        // A few seconds each: joins in time are the rule, as in use.
+        for track in 0..ALBUM.len() {
+            rig.fake.track(file(track), 2_000 + draws.below(6_000));
+        }
+        let cut = |draws: &mut Draws| usize::try_from(draws.below(4)).unwrap();
+        // Now and then a file that cannot be read to its end.
+        if draws.below(3) == 0 {
+            rig.fake
+                .cut(file(cut(&mut draws)), 300 + draws.below(4_000));
+        }
+        // In half the schedules the output plays on while a command is
+        // busy, so that joins and ends fall inside commands.
+        if draws.below(2) == 0 {
+            rig.busy(draws.below(3) + 1);
+        }
+        let steps: Vec<Step> = (0..60)
+            .map(|_| match draws.below(29) {
+                0..=7 => Step::Play(i64::try_from(draws.below(1_500)).unwrap() + 1),
+                8..=10 => Step::Tick(i64::try_from(draws.below(1_200)).unwrap() + 1),
+                11 => Step::Pause,
+                12 | 13 => Step::Resume,
+                14 => Step::Seek(i64::try_from(draws.below(8_000)).unwrap()),
+                15 => Step::Skip(Direction::Next),
+                16 => Step::Skip(Direction::Previous),
+                17 => Step::Add(cut(&mut draws), draws.below(2) == 0),
+                18 => Step::Remove(cut(&mut draws)),
+                19 => Step::Jump(cut(&mut draws)),
+                20 => Step::Shuffle(draws.below(2) == 0),
+                21 => Step::Repeat(match draws.below(3) {
+                    0 => super::Repeat::Off,
+                    1 => super::Repeat::All,
+                    _ => super::Repeat::One,
+                }),
+                22 => Step::Stop,
+                23..=25 => Step::Near(i64::try_from(draws.below(4)).unwrap()),
+                // The song after the one playing, taken out of Up next,
+                // often just before the one playing ends.
+                26 | 27 => Step::Remove(1),
+                _ => Step::Tick(50),
+            })
+            .collect();
+        rig.play(usize::try_from(draws.below(4)).unwrap());
+        let ran = rig.run(&steps).and(rig.run(&[Step::Stop, Step::Tick(1)]));
+        assert_eq!(rig.player.open_listen(), None, "seed {seed}");
+        let held = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rig.listens_hold(&ran);
+        }));
+        assert!(held.is_ok(), "seed {seed}: {steps:?}");
+    }
 }

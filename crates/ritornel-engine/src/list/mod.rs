@@ -159,6 +159,39 @@ impl LibraryStore {
         self.clock().now_ms()
     }
 
+    /// The public IDs of the songs a view of songs holds, by their keys,
+    /// in the order given: `None` for one the library no longer has.
+    pub fn song_ids(&self, keys: &[i64]) -> Result<Vec<Option<Id>>, Error> {
+        self.read(|connection| {
+            let mut found: std::collections::HashMap<i64, Id> =
+                std::collections::HashMap::with_capacity(keys.len());
+            let mut each = |row: &rusqlite::Row<'_>| {
+                found.insert(row.get(0)?, Id::from_bytes(row.get(1)?));
+                Ok(())
+            };
+            // A long view is most of the table, which one scan reads faster
+            // than a lookup a row.
+            if keys.len() > 4 * CHUNK {
+                let mut statement = connection.prepare(
+                    "SELECT id, public_id FROM track_appearance WHERE redirect_to_id IS NULL",
+                )?;
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    each(row)?;
+                }
+            } else {
+                for_each_in(
+                    connection,
+                    "SELECT id, public_id FROM track_appearance
+                     WHERE id IN ({}) AND redirect_to_id IS NULL",
+                    keys,
+                    each,
+                )?;
+            }
+            Ok(keys.iter().map(|key| found.get(key).copied()).collect())
+        })
+    }
+
     /// An album's page: the release `album` names, or the one its group is
     /// set to show, with its tracks in disc and track order and the other
     /// versions of its group. `None` if the library has no such record.

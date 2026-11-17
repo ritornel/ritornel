@@ -21,7 +21,7 @@ fn read(name: &str) -> Payload {
 
 /// Each fixture that is audio: its codec, its duration in milliseconds and
 /// its audio hash.
-const PINNED: [(&str, &str, u64, &str); 17] = [
+const PINNED: [(&str, &str, u64, &str); 26] = [
     (
         "a.flac",
         "flac",
@@ -124,6 +124,60 @@ const PINNED: [(&str, &str, u64, &str); 17] = [
         500,
         "14aa57b94440a35446e0db483c1aa8c11c724ccbf37cf519a84b6c6c1cd0951e",
     ),
+    (
+        "g1.flac",
+        "flac",
+        437,
+        "b76d2c7568b98baf6046daafed6b7d32f2ff0a7e3f6ab607272c9e6cdea52eb2",
+    ),
+    (
+        "g2.flac",
+        "flac",
+        562,
+        "3117845329f912e10c729539f865b7fca5f9629f04aaa02f62f9ad96e199644d",
+    ),
+    (
+        "g1.mp3",
+        "mp3",
+        437,
+        "504b8d4b300d4d7c710ab8aba053fcd63f08842dfc480332ce05c18e14323406",
+    ),
+    (
+        "g2.mp3",
+        "mp3",
+        562,
+        "605dcc6a0f9f0fa14ff424d98bbde0e604e98f5623ed25a412f87e67f969367c",
+    ),
+    (
+        "g1.ogg",
+        "vorbis",
+        427,
+        "bfbb8913eb07c441b053a66c9f2b6e6812d5a75b6775142fbb2eef68a850fd02",
+    ),
+    (
+        "g2.ogg",
+        "vorbis",
+        548,
+        "27a595b9584b4db1cbbbe627aa8fc35ea6af585e9edaeef935ea9f20c32e18ab",
+    ),
+    (
+        "rg.flac",
+        "flac",
+        500,
+        "9bc10212a894e26f8a4861671767910516f571472def328d116d24a0290c10da",
+    ),
+    (
+        "square.flac",
+        "flac",
+        500,
+        "09f3797997930b97937be2be706a10615417cbcc84a11abc1481fe27ae70ed19",
+    ),
+    (
+        "rg.mp3",
+        "mp3",
+        500,
+        "1459d102a13cf68edec2de615d73cb254511c468e6f365f49ebb3c7c54d586c2",
+    ),
 ];
 
 #[test]
@@ -169,13 +223,18 @@ fn retagging_never_changes_the_hash_and_other_audio_always_does() {
         ("a.ogg", "a.retagged.ogg"),
         ("a.opus", "a.retagged.opus"),
         ("b.flac", "b.compilation.flac"),
+        // ReplayGain tags are tags.
+        ("a.flac", "rg.flac"),
+        ("a.mp3", "rg.mp3"),
     ] {
         assert_eq!(hash(original), hash(retagged), "{retagged}");
         assert_ne!(read(original).tags, read(retagged).tags, "{retagged}");
     }
     let all: std::collections::HashSet<&str> = PINNED.iter().map(|(.., hash)| *hash).collect();
-    // Eight encodings of one tone and one of another: nine pieces of audio.
-    assert_eq!(all.len(), 9);
+    // Eight encodings of one tone, one of another, the two halves of a
+    // third in three encodings each, and a square wave: sixteen pieces of
+    // audio.
+    assert_eq!(all.len(), 16);
 }
 
 #[test]

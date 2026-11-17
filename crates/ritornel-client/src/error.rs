@@ -60,6 +60,9 @@ pub enum Error {
     Call(RpcError),
     /// The system gave no random numbers to make an idempotency key from.
     NoRandom(String),
+    /// A server could not be started on the data directory: what it or
+    /// the system said.
+    Start(String),
 }
 
 /// How a client knows that there is no server to talk to on a data
@@ -137,6 +140,7 @@ impl fmt::Display for Error {
             Self::Protocol(why) => write!(f, "the server did not speak the contract: {why}"),
             Self::Call(error) => write!(f, "the server answered with an error: {error}"),
             Self::NoRandom(why) => write!(f, "no random numbers from the system: {why}"),
+            Self::Start(why) => write!(f, "the server could not start: {why}"),
         }
     }
 }

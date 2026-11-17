@@ -13,11 +13,10 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rtrb::{Consumer, Producer};
 
-use super::Running;
 use super::decode::OutputSpec;
-use super::output::{Callback, Message, Shared};
+use super::output::{Callback, Shared};
+use super::{Ends, Running};
 use crate::playback::renderer::RenderError;
 
 /// The running device. Dropping it stops the stream.
@@ -50,15 +49,10 @@ fn output_error(error: impl std::fmt::Display) -> RenderError {
     RenderError::new("output", error.to_string())
 }
 
-type Queues = (Producer<Message>, Consumer<Consumer<f32>>, Callback);
+type Queues = (Ends, Callback);
 
-/// The device running, what it takes, and the control side's two queues.
-type Started = (
-    DeviceOutput,
-    OutputSpec,
-    Producer<Message>,
-    Consumer<Consumer<f32>>,
-);
+/// The device running, what it takes, and the control side's queues.
+type Started = (DeviceOutput, OutputSpec, Ends);
 
 /// Opens the default output device and starts its stream. `queues` makes
 /// the callback for the device's rate and channels once they are known.
@@ -107,7 +101,9 @@ pub(super) fn start(
             };
             let stream = device.build_output_stream::<f32, _, _>(
                 stream_config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| callback.render(data),
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    callback.render(data);
+                },
                 move |error: cpal::Error| {
                     errors.stream_errors.fetch_add(1, Ordering::Relaxed);
                     if matches!(
@@ -142,7 +138,7 @@ pub(super) fn start(
     let (spec, name) = found
         .recv()
         .map_err(|_| output_error("the output thread stopped"))??;
-    let (control, retired, callback) = queues(spec, shared);
+    let (ends, callback) = queues(spec, shared);
     let output = output(name);
     callback_tx
         .send(callback)
@@ -150,5 +146,5 @@ pub(super) fn start(
     started
         .recv()
         .map_err(|_| output_error("the output thread stopped"))??;
-    Ok((output, spec, control, retired))
+    Ok((output, spec, ends))
 }

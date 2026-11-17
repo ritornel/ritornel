@@ -8,7 +8,8 @@
 //!   ([`Client::over_memory`]), and encodes every frame as JSON on both.
 //! - [`idempotency_key`] makes the ID a command is sent with.
 //! - [`local`] finds the server on this machine through `server.json`.
-//!   Starting and stopping one arrive with the desktop's launcher.
+//! - [`launch`] starts one when none is running, and stops it again: the
+//!   desktop's launcher.
 //! - [`descriptor`], [`health`], [`ticket`] and [`get`] are the HTTP routes.
 //!
 //! The client never opens a database: it does not contain the code to
@@ -35,6 +36,7 @@ mod command;
 mod credential;
 mod error;
 mod http;
+pub mod launch;
 pub mod local;
 mod transport;
 

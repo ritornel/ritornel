@@ -2,10 +2,15 @@
 //! output's channels, then through rubato to the output's rate. See "The
 //! pipeline" in docs/design/playback.md.
 //!
-//! Each step is one the pipeline can leave out: a track whose channels are
-//! the output's is copied, and one at the output's rate is not resampled,
-//! so the samples come out as the decoder made them. Samples are 32-bit
-//! float, which holds 16 and 24-bit samples exactly.
+//! Each step is one the pipeline can leave out: a track with no ReplayGain
+//! to apply is not scaled, one whose channels are the output's is copied,
+//! and one at the output's rate is not resampled, so the samples come out
+//! as the decoder made them. Samples are 32-bit float, which holds 16 and
+//! 24-bit samples exactly.
+//!
+//! One decode thread plays a track and every track joined after it, into
+//! one stream: tracks at one rate in the same channels share a resampler,
+//! so a join is as smooth as the music across it.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -20,11 +25,11 @@ use symphonia::core::errors::Error as Symphonia;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
-use symphonia::core::meta::MetadataOptions;
+use symphonia::core::meta::{MetadataOptions, StandardTag};
 use symphonia::core::units::{Time, TimeBase, Timestamp};
 
 use crate::media::audio_end;
-use crate::playback::renderer::{FileFacts, Format, RenderError};
+use crate::playback::renderer::{FileFacts, Format, RenderError, ReplayGain};
 
 /// What the output takes: its rate and its channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +58,104 @@ pub(crate) struct Source {
     samples: Vec<f32>,
     /// Where in `samples` the frames to hand on begin.
     skip: usize,
+    /// The file's ReplayGain tags.
+    pub(crate) tags: GainTags,
+    /// What every sample is multiplied by; 1 leaves the step out.
+    pub(crate) gain: f32,
+    /// For a test: a file named `unreadable-…` fails at its first packet.
+    #[cfg(test)]
+    fails: bool,
+}
+
+/// How far under full scale a gain held by its peak takes that peak: a
+/// decibel, the usual allowance for the peaks resampling makes between the
+/// samples.
+const PEAK_HEADROOM: f32 = 0.891;
+
+/// A ReplayGain tag pair: the gain in decibels and the peak it was
+/// measured with, as a fraction of full scale.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct GainTag {
+    pub(crate) gain_db: Option<f32>,
+    pub(crate) peak: Option<f32>,
+}
+
+/// A file's ReplayGain tags.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct GainTags {
+    pub(crate) track: GainTag,
+    pub(crate) album: GainTag,
+}
+
+impl GainTags {
+    /// The factor a track plays at for `mode`. Limited by the peak, less a
+    /// decibel for what resampling adds between the samples, and with no
+    /// peak tag never above unity, since then nothing says how far it may
+    /// go. An untagged file plays unchanged.
+    pub(crate) fn factor(&self, mode: ReplayGain) -> f32 {
+        let tag = match mode {
+            ReplayGain::Off => return 1.0,
+            ReplayGain::Track => self.track,
+            ReplayGain::Album if self.album.gain_db.is_some() => self.album,
+            ReplayGain::Album => self.track,
+        };
+        let Some(db) = tag.gain_db.filter(|db| db.is_finite()) else {
+            return 1.0;
+        };
+        let gain = 10_f32.powf(db / 20.0);
+        let ceiling = match tag.peak {
+            Some(peak) if peak > 0.0 && peak.is_finite() => PEAK_HEADROOM / peak,
+            _ => 1.0,
+        };
+        gain.min(ceiling)
+    }
+}
+
+/// A ReplayGain value as taggers write it: "-6.02 dB", "+3.1", "0.988".
+fn gain_number(text: &str) -> Option<f32> {
+    let text = text.trim();
+    let text = text
+        .strip_suffix("dB")
+        .or_else(|| text.strip_suffix("db"))
+        .unwrap_or(text)
+        .trim();
+    text.strip_prefix('+').unwrap_or(text).parse().ok()
+}
+
+/// The ReplayGain tags the reader found, in any block of metadata.
+fn gain_tags(format: &mut dyn FormatReader) -> GainTags {
+    let mut tags = GainTags::default();
+    let mut log = format.metadata();
+    loop {
+        if let Some(revision) = log.current() {
+            let per_track = revision.per_track.iter().map(|track| &track.metadata);
+            for container in std::iter::once(&revision.media).chain(per_track) {
+                for tag in &container.tags {
+                    let (slot, value) = match &tag.std {
+                        Some(StandardTag::ReplayGainTrackGain(value)) => {
+                            (&mut tags.track.gain_db, value)
+                        }
+                        Some(StandardTag::ReplayGainTrackPeak(value)) => {
+                            (&mut tags.track.peak, value)
+                        }
+                        Some(StandardTag::ReplayGainAlbumGain(value)) => {
+                            (&mut tags.album.gain_db, value)
+                        }
+                        Some(StandardTag::ReplayGainAlbumPeak(value)) => {
+                            (&mut tags.album.peak, value)
+                        }
+                        _ => continue,
+                    };
+                    *slot = slot.or_else(|| gain_number(value));
+                }
+            }
+        }
+        if log.is_latest() {
+            break;
+        }
+        log.pop();
+    }
+    tags
 }
 
 impl std::fmt::Debug for Source {
@@ -279,6 +382,7 @@ impl Source {
                 || "unknown".to_owned(),
                 |codec| codec.codec.info.short_name.to_owned(),
             );
+        let tags = gain_tags(format.as_mut());
         let mut source = Self {
             format,
             decoder,
@@ -295,13 +399,25 @@ impl Source {
                 duration_ms,
             },
             bad_packets: 0,
+            #[cfg(test)]
+            fails: opened
+                .path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("unreadable-")),
             samples: Vec::new(),
             skip: 0,
+            tags,
+            gain: 1.0,
         };
         if start_ms > 0 {
             source.seek(start_ms)?;
         }
         Ok(source)
+    }
+
+    /// Plays the track at the ReplayGain `mode` asks for.
+    pub(crate) fn set_replay_gain(&mut self, mode: ReplayGain) {
+        self.gain = self.tags.factor(mode);
     }
 
     fn seek(&mut self, start_ms: u64) -> Result<(), RenderError> {
@@ -351,6 +467,10 @@ impl Source {
     /// Decodes the next frames. `false` at the end. A packet that will not
     /// decode is passed over.
     pub(crate) fn next(&mut self) -> Result<bool, RenderError> {
+        #[cfg(test)]
+        if self.fails {
+            return Err(RenderError::new("unreadable", "the test made it so"));
+        }
         loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(packet)) => packet,
@@ -471,6 +591,18 @@ impl Convert {
             from_rate,
             mapped: Vec::new(),
         })
+    }
+
+    /// Whether a track at this rate and in these channels can go on through
+    /// these steps, joined to the one before it.
+    fn takes(&self, rate: u32, channels: usize) -> bool {
+        rate == self.from_rate && channels == self.from_channels
+    }
+
+    /// Where the input taken so far ends in the output, in frames from the
+    /// first: where a track that ends here ends, once all of it is out.
+    fn boundary(&self) -> u64 {
+        self.taken * u64::from(self.to.rate) / u64::from(self.from_rate.max(1))
     }
 
     /// Puts interleaved frames in the output's channels: a mono track goes
@@ -609,39 +741,116 @@ impl Convert {
     }
 }
 
-/// Decodes the file at `path` from `start_ms`, converts it for the output,
-/// and hands every frame to `sink`, until the track ends, `sink` returns
-/// false, or `stop` is set. The file is opened by the caller, so that an
-/// error in opening it is the caller's to report.
+/// Where the decode thread puts what it decodes.
+pub(crate) trait Stream {
+    /// Hands frames on, in the output's rate and channels. `false` stops
+    /// the decoding.
+    fn write(&mut self, frames: &[f32]) -> bool;
+
+    /// The track to join after the one that has just ended, with the
+    /// segment it plays as, if one has been handed over by now. It never
+    /// waits for one: with none, the stream is finished.
+    fn next(&mut self) -> Option<(u64, Source)> {
+        None
+    }
+
+    /// The joined track `segment` begins at frame `at` of the stream,
+    /// counted from its first.
+    fn mark(&mut self, _at: u64, _segment: u64) {}
+}
+
+/// A stream that is a sink and nothing more.
+#[cfg(test)]
+struct Sink<'a>(&'a mut dyn FnMut(&[f32]) -> bool);
+
+#[cfg(test)]
+impl Stream for Sink<'_> {
+    fn write(&mut self, frames: &[f32]) -> bool {
+        (self.0)(frames)
+    }
+}
+
+/// Decodes a track, converts it for the output, and hands every frame to
+/// `sink`, until the track ends, `sink` returns false, or `stop` is set.
+/// The file is opened by the caller, so that an error in opening it is the
+/// caller's to report.
+#[cfg(test)]
 pub(crate) fn run(
-    mut source: Source,
+    source: Source,
     to: OutputSpec,
     stop: &AtomicBool,
     sink: &mut dyn FnMut(&[f32]) -> bool,
-) -> Result<Source, RenderError> {
-    let (rate, channels) = source.spec();
-    let mut convert: Option<Convert> = if channels > 0 {
-        Some(Convert::new(rate, channels, to)?)
-    } else {
-        None
-    };
+) -> Result<(), RenderError> {
+    run_joined(source, to, stop, &mut Sink(sink))
+}
+
+/// As [`run`], and each time a track ends the stream may give the track
+/// that follows it: it is decoded into the same stream with nothing
+/// between them, and the stream is told the frame where it begins.
+pub(crate) fn run_joined(
+    mut source: Source,
+    to: OutputSpec,
+    stop: &AtomicBool,
+    stream: &mut dyn Stream,
+) -> Result<(), RenderError> {
+    let mut convert: Option<Convert> = None;
+    // Frames of the stream from steps already finished, at a change of
+    // rate or channels.
+    let mut base: u64 = 0;
+    let mut scaled = Vec::new();
     loop {
-        if stop.load(Ordering::SeqCst) {
-            return Ok(source);
+        loop {
+            if stop.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            let more = match source.next() {
+                Ok(more) => more,
+                Err(error) => {
+                    // What was decoded is heard before the error ends the
+                    // stream: past a join it reaches the marker, so the
+                    // track before ends and the failing one fails.
+                    if let Some(convert) = &mut convert {
+                        convert.finish(&mut |frames| stream.write(frames))?;
+                    }
+                    return Err(error);
+                }
+            };
+            if !more {
+                break;
+            }
+            let (rate, channels) = source.spec();
+            let convert = match &mut convert {
+                Some(convert) => convert,
+                None => convert.insert(Convert::new(rate, channels, to)?),
+            };
+            let frames = if source.gain == 1.0 {
+                source.frames()
+            } else {
+                let gain = source.gain;
+                scaled.clear();
+                scaled.extend(source.frames().iter().map(|sample| sample * gain));
+                &scaled
+            };
+            if !convert.push(frames, &mut |frames| stream.write(frames))? {
+                return Ok(());
+            }
         }
-        if !source.next()? {
+        let Some((segment, following)) = stream.next() else {
             break;
-        }
-        let convert = match &mut convert {
-            Some(convert) => convert,
-            None => convert.insert(Convert::new(rate, source.spec().1, to)?),
         };
-        if !convert.push(source.frames(), sink)? {
-            return Ok(source);
+        let (rate, channels) = following.spec();
+        if let Some(mut ended) = convert.take_if(|convert| !convert.takes(rate, channels)) {
+            ended.finish(&mut |frames| stream.write(frames))?;
+            base += ended.boundary();
         }
+        stream.mark(
+            base + convert.as_ref().map_or(0, Convert::boundary),
+            segment,
+        );
+        source = following;
     }
     if let Some(convert) = &mut convert {
-        convert.finish(sink)?;
+        convert.finish(&mut |frames| stream.write(frames))?;
     }
-    Ok(source)
+    Ok(())
 }

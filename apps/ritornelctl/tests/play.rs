@@ -59,10 +59,16 @@ impl Scratch {
     /// 16-bit WAV at 8 kHz, written here so that no fixture has to be that
     /// long.
     fn music(&self) -> PathBuf {
+        self.album([TRACK_SECONDS, TRACK_SECONDS])
+    }
+
+    /// Two invented tracks of these lengths in seconds.
+    fn album(&self, seconds: [u32; 2]) -> PathBuf {
         let folder = self.0.canonicalize().unwrap().join("music/Invented Album");
         std::fs::create_dir_all(&folder).unwrap();
-        for (name, hz) in [("01 First.wav", 440.0), ("02 Second.wav", 660.0)] {
-            write_wav(&folder.join(name), TRACK_SECONDS, hz);
+        let names = [("01 First.wav", 440.0), ("02 Second.wav", 660.0)];
+        for ((name, hz), seconds) in names.into_iter().zip(seconds) {
+            write_wav(&folder.join(name), seconds, hz);
         }
         folder
     }
@@ -193,6 +199,8 @@ fn spawn(data_dir: &Path, variables: &[(&str, &str)]) -> (Child, Receiver<String
         .env_remove("RITORNEL_DATA_DIR")
         .env_remove("RITORNEL_LISTEN")
         .env_remove("RITORNEL_LOG_LEVEL")
+        // A test that plays leaves the media keys where they were.
+        .env("RITORNEL_TEST_NO_MEDIA_SESSION", "1")
         .envs(variables.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -402,6 +410,59 @@ fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_on
     assert_ne!(
         json(&data_dir, &["status"])["library"]["revision"],
         revision
+    );
+    server.stop();
+}
+
+#[test]
+fn a_server_killed_just_after_a_join_keeps_both_listens_and_the_boundary_between_them() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    // A three-second track joined to a forty-second one, at real time. The
+    // server dies four seconds into the second, which the first never
+    // reaches, before the second's first five-second save.
+    let music = scratch.album([3, TRACK_SECONDS]);
+    let folder = music.to_str().unwrap();
+    let dying = Server::start(&data_dir, &[("RITORNEL_TEST_FAIL_AT_POSITION_MS", "4000")]);
+    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
+    assert_eq!(ritornelctl(&data_dir, &["play", folder]).0, Some(0));
+    assert_eq!(dying.ended(), None);
+
+    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
+    let now = json(&data_dir, &["now"]);
+    assert_eq!(
+        (now["status"].as_str(), now["index"].as_u64()),
+        (Some("paused"), Some(1))
+    );
+    // Each listen reaches history once: the first whole, the second closed
+    // as a crash with what was saved as it began, beginning where the first
+    // ended.
+    let recent = until(&data_dir, &["history"], |recent| recent["undelivered"] == 0);
+    let [second, first] = recent["plays"].as_array().unwrap().as_slice() else {
+        panic!("two plays: {recent}");
+    };
+    let ([first], [second]) = (
+        first["listens"].as_array().unwrap().as_slice(),
+        second["listens"].as_array().unwrap().as_slice(),
+    ) else {
+        panic!("a listen each: {recent}");
+    };
+    assert_eq!(
+        (first["endReason"].as_str(), first["msPlayed"].as_u64()),
+        (Some("finished"), Some(3_000))
+    );
+    assert_eq!(second["endReason"], "crash");
+    assert_eq!(second["startReason"], "auto_advance");
+    let saved = second["msPlayed"].as_u64().unwrap();
+    assert!(
+        saved + CHECKPOINT_MS >= 4_000,
+        "at most five seconds lost: {saved}"
+    );
+    let gap = second["startedAt"].as_i64().unwrap() - first["endedAt"].as_i64().unwrap();
+    assert!(
+        gap.abs() <= 1,
+        "the second began {gap} ms after the first ended"
     );
     server.stop();
 }

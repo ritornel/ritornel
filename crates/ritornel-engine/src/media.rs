@@ -276,7 +276,7 @@ pub(crate) fn image_size(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-fn mime_of(bytes: &[u8]) -> &'static str {
+pub(crate) fn mime_of(bytes: &[u8]) -> &'static str {
     if bytes.starts_with(b"\x89PNG") {
         "image/png"
     } else if bytes.starts_with(&[0xff, 0xd8]) {

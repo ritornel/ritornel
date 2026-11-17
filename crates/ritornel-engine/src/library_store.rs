@@ -490,6 +490,15 @@ impl LibraryStore {
         self.hub
     }
 
+    /// The stored result of a command carried out before, read without
+    /// taking the writer: a call that checks the disk first answers a
+    /// replay before it looks. The write still checks again.
+    pub fn replay(&self, command: &Command) -> Result<Option<Written>, Error> {
+        let command = *command;
+        self.reader
+            .call(move |connection| stored_receipt(connection, &command))
+    }
+
     /// Whether the command with this ID has been carried out. A job asks
     /// before it redoes a step that a crash may have cut off after its
     /// commit.
@@ -513,6 +522,32 @@ impl LibraryStore {
 
 /// One write, inside a transaction the caller commits. See
 /// [`LibraryStore::write`].
+/// The stored result of `command`, if it was carried out before: the same
+/// ID with another fingerprint is [`Error::CommandMismatch`].
+fn stored_receipt(connection: &Connection, command: &Command) -> Result<Option<Written>, Error> {
+    let stored: Option<(Vec<u8>, String, i64)> = connection
+        .query_row(
+            "SELECT request_fingerprint, result_json, rev
+             FROM library_command WHERE command_id = ?1",
+            [command.id.as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    match stored {
+        None => Ok(None),
+        Some((fingerprint, result_json, revision)) if fingerprint == command.fingerprint.0 => {
+            Ok(Some(Written {
+                revision,
+                result_json,
+                replayed: true,
+            }))
+        }
+        Some(_) => Err(Error::CommandMismatch {
+            command: command.id,
+        }),
+    }
+}
+
 fn write_in(
     transaction: &Transaction<'_>,
     hub: Id,
@@ -521,28 +556,10 @@ fn write_in(
     entropy: &dyn Entropy,
     work: impl FnOnce(&Write<'_>) -> Result<String, Error>,
 ) -> Result<Written, Error> {
-    if let Some(command) = &request.command {
-        let stored: Option<(Vec<u8>, String, i64)> = transaction
-            .query_row(
-                "SELECT request_fingerprint, result_json, rev
-                 FROM library_command WHERE command_id = ?1",
-                [command.id.as_bytes()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        if let Some((fingerprint, result_json, revision)) = stored {
-            return if fingerprint == command.fingerprint.0 {
-                Ok(Written {
-                    revision,
-                    result_json,
-                    replayed: true,
-                })
-            } else {
-                Err(Error::CommandMismatch {
-                    command: command.id,
-                })
-            };
-        }
+    if let Some(command) = &request.command
+        && let Some(written) = stored_receipt(transaction, command)?
+    {
+        return Ok(written);
     }
 
     // The counter moves only while the pointer names this server, so no
@@ -853,7 +870,7 @@ mod tests {
         // gives the library's ID the bytes 00 to 09.
         let library_id = "019a7afd-1e00-7001-8203-040506070809";
         assert_eq!(store.library_id().to_string(), library_id);
-        assert_eq!(store.schema_version(), 4);
+        assert_eq!(store.schema_version(), 5);
         assert_eq!(
             store.meta().unwrap(),
             LibraryMeta {
@@ -1242,7 +1259,7 @@ mod tests {
         let scratch = Scratch::new();
         let path = library_db(&scratch);
         let (store, _) = create_on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 4);
+        assert_eq!(store.migrations_applied(), 5);
         let created = store.meta().unwrap();
         store
             .write(request("test.write", None), set("kept"))
@@ -1252,7 +1269,7 @@ mod tests {
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 4);
+        assert_eq!(store.schema_version(), 5);
         assert_eq!(store.library_id(), created.library_id);
         assert_eq!(
             store.meta().unwrap(),
@@ -1409,11 +1426,11 @@ mod tests {
         create_on_disk(&path).unwrap().0.close().unwrap();
         tamper_file(
             &path,
-            "INSERT INTO schema_migration VALUES (5, '0005_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (6, '0006_from_the_future', x'00', 0)",
         );
         let refused = open_on_disk(&path, id(0x11));
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 5, known: 4 })),
+            matches!(refused, Err(Error::NewerSchema { found: 6, known: 5 })),
             "{refused:?}"
         );
     }
@@ -1454,8 +1471,8 @@ mod tests {
             .unwrap();
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
-        assert_eq!(store.migrations_applied(), 3);
-        assert_eq!(store.schema_version(), 4);
+        assert_eq!(store.migrations_applied(), 4);
+        assert_eq!(store.schema_version(), 5);
         // The library is the one it was, at the revision it was.
         assert_eq!(
             store.library_id().to_string(),

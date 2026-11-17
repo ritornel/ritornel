@@ -4,12 +4,14 @@
 use std::path::Path;
 use std::sync::PoisonError;
 
-use ritornel_contract::methods::{JobsCancel, Method, ScanStart, SourcesAdd};
+use ritornel_contract::methods::{
+    ArtistsImportPictures, JobsCancel, Method, ScanStart, SourcesAdd,
+};
 use ritornel_contract::{
-    DryRun, DryRunParams, ErrorCode, Event, Job, JobCancelParams, JobCancelled, JobDetail,
-    JobGetParams, JobItem, JobState, JobTarget, JobsEvent, JobsList, LibraryStats, Receipt,
-    ReceiptStatus, ReviewList, RpcError, ScanStartParams, ScanStarted, Source, SourceAdded,
-    SourceKind, SourcesAddParams, SourcesList,
+    DryRun, DryRunParams, ErrorCode, Event, ImportPicturesParams, Job, JobCancelParams,
+    JobCancelled, JobDetail, JobGetParams, JobItem, JobState, JobTarget, JobsEvent, JobsList,
+    LibraryStats, PicturesImported, Receipt, ReceiptStatus, ReviewList, RpcError, ScanStartParams,
+    ScanStarted, Source, SourceAdded, SourceKind, SourcesAddParams, SourcesList,
 };
 use ritornel_engine::{
     Client, Command, LibraryStore, NewJob, ServerStore, SubjectKind, WriteRequest, is_policy,
@@ -76,6 +78,47 @@ fn no_library() -> RpcError {
         "this server holds no library: create one with library.create",
     )
     .with_detail("reason", "no_library")
+}
+
+/// What an import stored as its result, read back.
+fn stored_result(written: &ritornel_engine::Written) -> Result<PicturesImported, RpcError> {
+    serde_json::from_str(&written.result_json).map_err(|error| {
+        RpcError::new(
+            ErrorCode::Internal,
+            format!(
+                "the stored result of {} could not be read: {error}",
+                ArtistsImportPictures::NAME
+            ),
+        )
+    })
+}
+
+/// A root's name, trimmed, after checking it and the folder's path.
+fn root(name: &str, path: &str) -> Result<String, RpcError> {
+    let invalid = |field: &str, message: &str| {
+        RpcError::new(ErrorCode::Invalid, message).with_detail("field", field)
+    };
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().count() > MAX_ROOT_NAME
+        || name.chars().any(|c| c == '/' || c.is_control())
+    {
+        return Err(invalid(
+            "name",
+            "a root's name is 1 to 100 characters with no slash",
+        ));
+    }
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(invalid("path", "a root's path is absolute"));
+    }
+    if !path.is_dir() {
+        return Err(invalid(
+            "path",
+            "there is no folder at that path on this server",
+        ));
+    }
+    Ok(name.to_owned())
 }
 
 fn stored(error: ritornel_engine::Error) -> RpcError {
@@ -187,29 +230,7 @@ impl Core {
         stores: &Stores,
         params: &SourcesAddParams,
     ) -> Result<SourceAdded, RpcError> {
-        let invalid = |field: &str, message: &str| {
-            RpcError::new(ErrorCode::Invalid, message).with_detail("field", field)
-        };
-        let name = params.name.trim();
-        if name.is_empty()
-            || name.chars().count() > MAX_ROOT_NAME
-            || name.chars().any(|c| c == '/' || c.is_control())
-        {
-            return Err(invalid(
-                "name",
-                "a root's name is 1 to 100 characters with no slash",
-            ));
-        }
-        let path = Path::new(&params.path);
-        if !path.is_absolute() {
-            return Err(invalid("path", "a root's path is absolute"));
-        }
-        if !path.is_dir() {
-            return Err(invalid(
-                "path",
-                "there is no folder at that path on this server",
-            ));
-        }
+        let name = root(&params.name, &params.path)?;
         let request = WriteRequest {
             method: SourcesAdd::NAME,
             command: Some(Command {
@@ -218,8 +239,7 @@ impl Core {
             }),
             client: self.client(),
         };
-        let (command_id, name, path) =
-            (params.idempotency_key, name.to_owned(), params.path.clone());
+        let (command_id, name, path) = (params.idempotency_key, name, params.path.clone());
         let written = Self::library(stores, |library| {
             stores.server.add_root(&name, &path).map_err(stored)?;
             let receipt = move |source: &ritornel_engine::Source, rev: i64| {
@@ -255,6 +275,69 @@ impl Core {
                 ),
             )
         })
+    }
+
+    /// `artists.importPictures`: a picture folder as a named root on this
+    /// server, and the portraits it chooses, as `sources.add` writes a
+    /// root: `server.db` first, then the library with the receipt.
+    pub(super) fn artists_import_pictures(
+        &self,
+        stores: &Stores,
+        params: &ImportPicturesParams,
+    ) -> Result<PicturesImported, RpcError> {
+        let command = Command {
+            id: params.idempotency_key,
+            fingerprint: fingerprint::<ArtistsImportPictures>(params)?,
+        };
+        // An import sent again answers from its receipt before the folder
+        // is looked at, as it may have changed since. The write checks
+        // again, for one sent twice at once.
+        let replayed = Self::library(stores, |library| {
+            library.replay(&command).map_err(in_library)
+        })?;
+        if let Some(written) = replayed {
+            return stored_result(&written);
+        }
+        let name = root(&params.name, &params.path)?;
+        // Checked once, before the root is recorded, so a folder refused
+        // leaves its name free and none is refused after.
+        let folder =
+            ritornel_engine::check_picture_folder(Path::new(&params.path)).map_err(|error| {
+                RpcError::new(ErrorCode::Invalid, error.to_string()).with_detail("field", "path")
+            })?;
+        let request = WriteRequest {
+            method: ArtistsImportPictures::NAME,
+            command: Some(command),
+            client: self.client(),
+        };
+        let command_id = params.idempotency_key;
+        let written = Self::library(stores, |library| {
+            stores
+                .server
+                .add_root(&name, &params.path)
+                .map_err(stored)?;
+            let receipt = move |counts: &ritornel_engine::PicturesImported, rev: i64| {
+                let imported = PicturesImported {
+                    receipt: Receipt {
+                        command_id,
+                        status: ReceiptStatus::Done,
+                        revision: Some(revision(rev)),
+                    },
+                    artists: counts.artists,
+                    by_mbid: counts.by_mbid,
+                    by_name: counts.by_name,
+                    without: counts.without,
+                    unreadable: counts.unreadable,
+                    dropped: counts.dropped,
+                    ambiguous: counts.ambiguous,
+                };
+                serde_json::to_string(&imported).unwrap_or_default()
+            };
+            library
+                .import_artist_pictures(request, &name, &folder, receipt)
+                .map_err(in_library)
+        })?;
+        stored_result(&written)
     }
 
     /// `scan.start`: queues a scan of a source as a job, and wakes the

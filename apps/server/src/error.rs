@@ -17,7 +17,7 @@ pub const EXIT_USAGE: u8 = 2;
 /// The exit code reserved for one case: another server holds the data
 /// directory. A launcher that lost the race to start a server sees it and
 /// goes back to looking for the one that won.
-pub const EXIT_IN_USE: u8 = 3;
+pub const EXIT_IN_USE: u8 = ritornel_contract::local::EXIT_IN_USE;
 
 /// Why the server did not start, or stopped.
 ///
@@ -81,6 +81,8 @@ pub enum Error {
     /// The process already has a logger, so this run cannot install its
     /// own.
     LoggerSet,
+    /// The background service could not be installed, removed or read.
+    Service(String),
 }
 
 impl Error {
@@ -152,6 +154,7 @@ impl fmt::Display for Error {
             Self::Runtime(error) => write!(f, "cannot start: {error}"),
             Self::Output(error) => write!(f, "cannot write to standard output: {error}"),
             Self::LoggerSet => f.write_str("this process already has a logger"),
+            Self::Service(why) => write!(f, "the background service: {why}"),
         }
     }
 }

@@ -219,6 +219,19 @@ impl Server {
         self.core.rename(name)
     }
 
+    /// Starts the system's media session, for a server with a player.
+    /// Only `serve` does, on the main thread that then runs the loop the
+    /// session needs; a server in a test has none.
+    #[cfg(all(feature = "media-session", target_os = "macos"))]
+    pub(crate) fn start_media_session(&self) -> Result<(), Error> {
+        if self.core.has_player() {
+            let session = crate::media_session::MediaSession::start(Arc::downgrade(&self.core))
+                .map_err(Error::Runtime)?;
+            self.core.attach_media_session(session);
+        }
+        Ok(())
+    }
+
     /// Developer-only: writes to the invented library `per_second` times a
     /// second until the server stops, as a scan running would. See
     /// `ritornel_engine::invent::Churn`.
@@ -236,7 +249,9 @@ impl Server {
     }
 
     /// Stops the server cleanly: it stops taking calls and closes its
-    /// sockets, then closes its databases, then removes `server.json`.
+    /// sockets, pauses the player, lets each job finish its step, then
+    /// closes its databases, which empties their logs, then removes
+    /// `server.json`.
     ///
     /// When this returns nothing of the server is running. A connection or
     /// a transport that has not ended by itself within the stop grace is
@@ -248,16 +263,17 @@ impl Server {
         self.listening.stop().await;
         self.core.end_transports(self.bounds.stop_grace).await;
         drop(self.transports);
+        // The player pauses, saves where it is and closes its listen as a
+        // shutdown, and what that closed is delivered. It goes before the
+        // jobs, so that a quit silences the music at once.
+        let playback = self.playback;
+        tokio::task::spawn_blocking(move || playback.stop())
+            .await
+            .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
         // The worker ends after the file it is reading or the write it is
         // making. A job it leaves is taken up again by the next run.
         let worker = self.worker;
         tokio::task::spawn_blocking(move || worker.stop())
-            .await
-            .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
-        // The player pauses, saves where it is and closes its listen as a
-        // shutdown, and what that closed is delivered.
-        let playback = self.playback;
-        tokio::task::spawn_blocking(move || playback.stop())
             .await
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
         // The scrobbler ends after the batch it is sending.

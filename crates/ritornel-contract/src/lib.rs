@@ -52,6 +52,7 @@ mod media;
 pub mod methods;
 mod pages;
 mod playback;
+mod rating;
 mod server;
 mod ticket;
 #[cfg(test)]
@@ -80,9 +81,9 @@ pub use lastfm::{
     TrackDetail, TrackGetParams, TrackLove, ZonePeriod, ZonePeriods, ZonesSet,
 };
 pub use library::{
-    Count, Job, JobCancelParams, JobCancelled, JobDetail, JobGetParams, JobItem, JobState,
-    JobTarget, JobsList, LibraryStats, ScanStartParams, ScanStarted, ScanSummary, Source,
-    SourceAdded, SourceKind, SourcesAddParams, SourcesList,
+    Count, ImportPicturesParams, Job, JobCancelParams, JobCancelled, JobDetail, JobGetParams,
+    JobItem, JobState, JobTarget, JobsList, LibraryStats, PicturesImported, ScanStartParams,
+    ScanStarted, ScanSummary, Source, SourceAdded, SourceKind, SourcesAddParams, SourcesList,
 };
 pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,
@@ -97,11 +98,13 @@ pub use pages::{
 };
 pub use playback::{
     ContextKind, CopyInUse, OutputInfo, OutputMode, PlayContext, PlaySource, PlaybackChanged,
-    PlaybackCommandParams, PlaybackEvent, PlaybackPlayParams, PlaybackSeekParams,
-    PlaybackSkipParams, PlaybackState, PlaybackStatus, ProgressEvent, QueueEntry, QueueEvent,
-    QueueWindow, QueueWindowParams, Repeat, SkipDirection, SourceTracks, SourcesTracksParams,
-    TrackSummary,
+    PlaybackCommandParams, PlaybackEvent, PlaybackJumpParams, PlaybackPlayParams,
+    PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState, PlaybackStatus,
+    ProgressEvent, QueueAddParams, QueueClearParams, QueueEntry, QueueEvent, QueueMoveParams,
+    QueueOrder, QueuePlace, QueueRemoveParams, QueueWindow, QueueWindowParams, Repeat,
+    SkipDirection, SourceTracks, SourcesTracksParams, TrackSummary,
 };
+pub use rating::{MAX_RATING, RatingSet, RatingSetParams};
 pub use server::{
     ClientKind, Descriptor, FreeDisk, HelloParams, LibraryStatus, Limits, MAX_CLIENT_TEXT,
     NoParams, PublicDescriptor, ServerInfo, ServerRole, ServerStatus, ServersList, SessionKind,

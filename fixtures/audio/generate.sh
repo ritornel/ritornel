@@ -100,11 +100,43 @@ $FF -i "$tmp/a.wav" -c:a pcm_s16be "${PLAIN[@]}" a.aiff
 # Not audio at all, under an audio file's name.
 printf 'this is not a FLAC file\n' > not-audio.flac
 
+# A gapless pair: one second of a tone cut in two at sample 7001, which is
+# no encoder's block boundary. Played one after the other, the halves are
+# the whole tone again, with nothing between them.
+$FF -f lavfi -i "sine=f=440:r=16000:d=1" -ac 1 -c:a pcm_s16le "$tmp/g.wav"
+$FF -i "$tmp/g.wav" -af "atrim=end_sample=7001" -c:a pcm_s16le "$tmp/g1.wav"
+$FF -i "$tmp/g.wav" -af "atrim=start_sample=7001,asetpts=N/SR/TB" -c:a pcm_s16le "$tmp/g2.wav"
+for half in g1 g2; do
+    $FF -i "$tmp/$half.wav" -c:a flac "${PLAIN[@]}" "$half.flac"
+    $FF -i "$tmp/$half.wav" -c:a libmp3lame -b:a 32k "${PLAIN[@]}" "$half.mp3"
+    $FF -i "$tmp/$half.wav" -c:a libvorbis -q:a 0 "${PLAIN[@]}" "$half.ogg"
+done
+
+# ReplayGain tags on the tone of a.wav, whose peak is 1/8: the track gain
+# halves it, and the album gain would clip it but for the peak.
+RG=(
+    -metadata "REPLAYGAIN_TRACK_GAIN=-6.02 dB" -metadata "REPLAYGAIN_TRACK_PEAK=0.125"
+    -metadata "REPLAYGAIN_ALBUM_GAIN=+20.00 dB" -metadata "REPLAYGAIN_ALBUM_PEAK=0.125"
+)
+$FF -i "$tmp/a.wav" -c:a flac "${PLAIN[@]}" "${RG[@]}" rg.flac
+$FF -i "$tmp/a.wav" -c:a libmp3lame -b:a 32k -id3v2_version 4 "${PLAIN[@]}" "${RG[@]}" rg.mp3
+# A square wave at the same peak and tags: resampled, its corners overshoot
+# the peak the tag gives, which a gain held only by the tag would clip.
+$FF -f lavfi -i "aevalsrc=0.125*sgn(sin(2*PI*440*t)):s=16000:d=0.5" -ac 1 -c:a flac \
+    -sample_fmt s16 "${PLAIN[@]}" "${RG[@]}" square.flac
+
 # What ffmpeg decodes two of them to, in ../decoded, which the player's
 # decoding is held to: the FLAC's 16-bit samples exactly, and the MP3's float
 # samples within what two decoders may differ by.
 mkdir -p ../decoded
 $FF -i a.flac -map 0:a -c:a pcm_s16le -f s16le ../decoded/a.flac.s16le
 $FF -i a.mp3 -map 0:a -c:a pcm_f32le -f f32le ../decoded/a.mp3.f32le
+# The gapless pair: the whole tone, which the FLAC halves joined must be bit
+# for bit, and each MP3 half as ffmpeg decodes it, delay and padding gone.
+# ffmpeg leaves a Vorbis file's padding in, so the Ogg halves have none.
+$FF -i "$tmp/g.wav" -c:a pcm_s16le -f s16le ../decoded/g.s16le
+for half in g1 g2; do
+    $FF -i "$half.mp3" -map 0:a -c:a pcm_f32le -f f32le "../decoded/$half.mp3.f32le"
+done
 
 ls -l | awk 'NR > 1 { total += $5 } END { print NR - 1 " files, " total " bytes" }'

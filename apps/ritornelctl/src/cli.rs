@@ -5,12 +5,14 @@
 //! ritornelctl library create [--data-dir <dir>] [--json]
 //! ritornelctl library stats [--data-dir <dir>] [--json]
 //! ritornelctl scan <folder> [--name <name>] [--no-wait] [--data-dir <dir>] [--json]
+//! ritornelctl artists pictures <folder> [--name <name>] [--data-dir <dir>] [--json]
 //! ritornelctl jobs [<job>] [--cancel] [--data-dir <dir>] [--json]
 //! ritornelctl identity re-resolve --dry-run [--detail] [<policy values>] [--data-dir <dir>] [--json]
 //! ritornelctl identity review [--data-dir <dir>] [--json]
 //! ritornelctl play <folder | track>... [--album <release>] [--start <n>] [--follow]
 //! ritornelctl pause | resume | stop | next | previous | now | queue
 //! ritornelctl seek <position>
+//! ritornelctl volume [<level> | mute | unmute]
 //! ritornelctl history [--limit <n>]
 //! ritornelctl history on-this-day [--day <MM-DD>]
 //! ritornelctl history rebuild [--dry-run]
@@ -39,7 +41,7 @@ use clap::{Args, Parser, Subcommand};
 use ritornel_client::contract::SkipDirection;
 use ritornel_client::contract::local::Env;
 
-use crate::{history, identity, jobs, lastfm, library, playback, scan, status};
+use crate::{artists, history, identity, jobs, lastfm, library, playback, scan, status};
 
 const USAGE: &str = "\
 The command-line client of a Ritornel server. It talks to the server that is
@@ -50,6 +52,7 @@ Usage:
   ritornelctl library create [--data-dir <dir>] [--json]
   ritornelctl library stats [--data-dir <dir>] [--json]
   ritornelctl scan <folder> [--name <name>] [--no-wait] [--data-dir <dir>] [--json]
+  ritornelctl artists pictures <folder> [--name <name>] [--data-dir <dir>] [--json]
   ritornelctl jobs [<job>] [--cancel] [--data-dir <dir>] [--json]
   ritornelctl identity re-resolve --dry-run [--detail] [<policy values>]
                                   [--data-dir <dir>] [--json]
@@ -58,6 +61,7 @@ Usage:
                    [--follow] [--data-dir <dir>] [--json]
   ritornelctl pause | resume | stop | next | previous [--data-dir <dir>] [--json]
   ritornelctl seek <position> [--data-dir <dir>] [--json]
+  ritornelctl volume [<level> | mute | unmute] [--data-dir <dir>] [--json]
   ritornelctl now | queue [--data-dir <dir>] [--json]
   ritornelctl history [--limit <n>] [--data-dir <dir>] [--json]
   ritornelctl history on-this-day [--day <MM-DD>] [--data-dir <dir>] [--json]
@@ -87,6 +91,12 @@ Commands:
                    scan until it ends. The folder is added as a source if
                    it is not one. The server only ever reads it. The scan
                    is the server's: it carries on if this program stops
+  artists pictures <folder>
+                   Take each artist's portrait from a picture folder, by
+                   MusicBrainz ID, or by name for an artist with none. The
+                   folder is added as a root, and the server only ever
+                   reads it. Run it again after the folder changes: what it
+                   no longer chooses is dropped
   jobs [<job>]     List the server's jobs, newest first, or show one with
                    what its scan found and what could not be read
   identity re-resolve --dry-run
@@ -110,6 +120,8 @@ Commands:
   next, previous   Skip forward, or back. Previous starts the track again
                    when it is more than three seconds in
   seek <position>  Move the playing track to a position: seconds, or m:ss
+  volume [<level>] Show the player's own volume, or set it from 0 to 100,
+                   or mute or unmute it. It is not the system's volume
   now              Show what is playing, where, from which copy and output
   queue            Show the queue, the current entry marked
   history          Show recent listening, newest first: each play, what
@@ -148,8 +160,8 @@ Commands:
                    stop
 
 Options:
-  --name <name>         scan: the name the folder is added under. With none
-                        it is the folder's own name
+  --name <name>         scan, artists pictures: the name the folder is
+                        added under. With none it is the folder's own name
   --no-wait             scan: start the scan and return at once
   --cancel              jobs: ask the job to stop. It stops after the files
                         it is reading, and what it has recorded stays
@@ -306,6 +318,8 @@ enum Command {
     #[command(subcommand)]
     Library(LibraryCommand),
     Scan(ScanArgs),
+    #[command(subcommand)]
+    Artists(ArtistsCommand),
     Jobs(JobsArgs),
     #[command(subcommand)]
     Identity(IdentityCommand),
@@ -316,6 +330,7 @@ enum Command {
     Next(ServerArgs),
     Previous(ServerArgs),
     Seek(SeekArgs),
+    Volume(VolumeArgs),
     Now(ServerArgs),
     Queue(ServerArgs),
     History(HistoryArgs),
@@ -398,6 +413,15 @@ pub(crate) struct PlayArgs {
 pub(crate) struct SeekArgs {
     /// Seconds, or m:ss.
     pub(crate) position: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `volume` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct VolumeArgs {
+    /// 0 to 100, `mute` or `unmute`. With none, the volume is shown.
+    pub(crate) level: Option<String>,
     #[command(flatten)]
     pub(crate) server: ServerArgs,
 }
@@ -532,6 +556,23 @@ pub(crate) struct ScanArgs {
     pub(crate) server: ServerArgs,
 }
 
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum ArtistsCommand {
+    Pictures(PicturesArgs),
+}
+
+/// What `artists pictures` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct PicturesArgs {
+    /// The picture folder.
+    pub(crate) folder: PathBuf,
+    /// The name the folder is added under.
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
 /// What `jobs` takes.
 #[derive(Debug, Default, PartialEq, Eq, Args)]
 pub(crate) struct JobsArgs {
@@ -632,6 +673,7 @@ fn try_run(
         Command::Library(LibraryCommand::Create(args)) => library::create(&args, env, out),
         Command::Library(LibraryCommand::Stats(args)) => library::stats(&args, env, out),
         Command::Scan(args) => scan::scan(&args, env, out),
+        Command::Artists(ArtistsCommand::Pictures(args)) => artists::pictures(&args, env, out),
         Command::Jobs(args) => jobs::jobs(&args, env, out),
         Command::Identity(IdentityCommand::ReResolve(args)) => {
             identity::re_resolve(&args, env, out)
@@ -644,6 +686,7 @@ fn try_run(
         Command::Next(args) => playback::skip(SkipDirection::Next, &args, env, out),
         Command::Previous(args) => playback::skip(SkipDirection::Previous, &args, env, out),
         Command::Seek(args) => playback::seek(&args, env, out),
+        Command::Volume(args) => playback::volume(&args, env, out),
         Command::Now(args) => playback::now(&args, env, out),
         Command::Queue(args) => playback::queue(&args, env, out),
         Command::History(args) => history::history(&args, env, out),
@@ -733,6 +776,22 @@ mod tests {
                     json: true
                 },
             })
+        );
+        assert_eq!(
+            parse(args(&[
+                "artists",
+                "pictures",
+                "/pictures",
+                "--name",
+                "faces"
+            ]))
+            .unwrap()
+            .command,
+            Command::Artists(ArtistsCommand::Pictures(PicturesArgs {
+                folder: PathBuf::from("/pictures"),
+                name: Some("faces".to_owned()),
+                server: ServerArgs::default(),
+            }))
         );
         assert_eq!(
             parse(args(&["jobs"])).unwrap().command,

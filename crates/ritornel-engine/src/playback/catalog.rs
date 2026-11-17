@@ -30,6 +30,14 @@ pub struct TrackDisplay {
     pub track: Option<i64>,
     /// The length.
     pub duration_ms: Option<i64>,
+    /// The cover of its release.
+    pub art: Option<Id>,
+    /// The listener's stars for its recording, 0 to 100.
+    pub rating: Option<i64>,
+    /// Whether its recording is loved.
+    pub loved: bool,
+    /// Its recording's canonical key, which what is said of it is read by.
+    recording_key: Option<i64>,
 }
 
 /// One copy of a track on this server: a master file, where it is and
@@ -51,13 +59,16 @@ pub(crate) struct Copy {
 
 const DISPLAY_COLUMNS: &str = "ta.public_id, r.public_id, rel.public_id, ta.display_title,
     ac.display_text, rel.display_title, ta.display_disc_number, ta.display_track_number,
-    ta.display_duration_ms";
+    ta.display_duration_ms, pic.public_id, r.id";
 
 const DISPLAY_JOINS: &str = "FROM track_appearance ta
     JOIN recording r ON r.id = (SELECT canonical_id FROM recording WHERE id = ta.recording_id)
     LEFT JOIN release rel ON rel.id = ta.release_id
+    LEFT JOIN picture pic ON pic.id = rel.display_picture_id
     LEFT JOIN artist_credit ac ON ac.id = ta.display_artist_credit_id";
 
+/// A track as [`DISPLAY_COLUMNS`] reads it. What is said of it is read
+/// after, by [`with_said`].
 fn display(row: &Row<'_>) -> rusqlite::Result<TrackDisplay> {
     let id = |column: usize| -> rusqlite::Result<Option<Id>> {
         Ok(row.get::<_, Option<[u8; 16]>>(column)?.map(Id::from_bytes))
@@ -72,12 +83,36 @@ fn display(row: &Row<'_>) -> rusqlite::Result<TrackDisplay> {
         disc: row.get(6)?,
         track: row.get(7)?,
         duration_ms: row.get(8)?,
+        art: id(9)?,
+        rating: None,
+        loved: false,
+        recording_key: row.get(10)?,
     })
+}
+
+/// Fills in what the listener has said of each track's recording.
+fn with_said<'a>(
+    connection: &Connection,
+    tracks: impl IntoIterator<Item = &'a mut TrackDisplay>,
+) -> Result<(), Error> {
+    let tracks: Vec<&mut TrackDisplay> = tracks.into_iter().collect();
+    let keys: Vec<i64> = tracks
+        .iter()
+        .filter_map(|track| track.recording_key)
+        .collect();
+    let said = crate::ratings::said(connection, &keys)?;
+    for track in tracks {
+        if let Some(found) = track.recording_key.and_then(|key| said.get(&key)) {
+            track.rating = found.rating;
+            track.loved = found.loved;
+        }
+    }
+    Ok(())
 }
 
 /// What an appearance shows, followed through its redirect.
 fn track(connection: &Connection, appearance: Id) -> Result<Option<TrackDisplay>, Error> {
-    Ok(connection
+    let mut found = connection
         .query_row(
             &format!(
                 "SELECT {DISPLAY_COLUMNS} {DISPLAY_JOINS}
@@ -86,7 +121,9 @@ fn track(connection: &Connection, appearance: Id) -> Result<Option<TrackDisplay>
             [appearance.as_bytes()],
             display,
         )
-        .optional()?)
+        .optional()?;
+    with_said(connection, found.iter_mut())?;
+    Ok(found)
 }
 
 /// Sorts tracks the way a person reads an album: by disc and track, with
@@ -110,6 +147,64 @@ impl LibraryStore {
     /// there is no such appearance.
     pub fn track(&self, appearance: Id) -> Result<Option<TrackDisplay>, Error> {
         self.read(|connection| track(connection, appearance))
+    }
+
+    /// The picture an appearance's release shows, by its art ID, followed
+    /// through the appearance's redirect.
+    pub fn track_art(&self, appearance: Id) -> Result<Option<Id>, Error> {
+        self.read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT p.public_id FROM track_appearance ta
+                     JOIN release r ON r.id = ta.release_id
+                     JOIN picture p ON p.id = r.display_picture_id
+                     WHERE ta.id = (SELECT canonical_id FROM track_appearance WHERE public_id = ?1)",
+                    [appearance.as_bytes()],
+                    |row| row.get::<_, [u8; 16]>(0),
+                )
+                .optional()?
+                .map(Id::from_bytes))
+        })
+    }
+
+    /// What each appearance shows, in the order given: `None` for one the
+    /// library does not have.
+    pub fn tracks(&self, appearances: &[Id]) -> Result<Vec<Option<TrackDisplay>>, Error> {
+        self.read(|connection| {
+            let mut statement = connection.prepare_cached(&format!(
+                "SELECT {DISPLAY_COLUMNS} {DISPLAY_JOINS}
+                 WHERE ta.id = (SELECT canonical_id FROM track_appearance WHERE public_id = ?1)"
+            ))?;
+            let mut found = appearances
+                .iter()
+                .map(|appearance| {
+                    statement
+                        .query_row([appearance.as_bytes()], display)
+                        .optional()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            with_said(connection, found.iter_mut().flatten())?;
+            Ok(found)
+        })
+    }
+
+    /// Which of `appearances` the library does not have, if any.
+    pub(crate) fn unknown_appearance(&self, appearances: &[Id]) -> Result<Option<Id>, Error> {
+        self.read(|connection| {
+            let mut statement =
+                connection.prepare_cached("SELECT 1 FROM track_appearance WHERE public_id = ?1")?;
+            for appearance in appearances {
+                if !statement.exists([appearance.as_bytes()])? {
+                    return Ok(Some(*appearance));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    /// Reads again what is said of a track: after a rating is set.
+    pub fn said_again(&self, track: &mut TrackDisplay) -> Result<(), Error> {
+        self.read(|connection| with_said(connection, std::iter::once(track)))
     }
 
     /// The listener a new player plays for: the library's first.
@@ -216,6 +311,7 @@ impl LibraryStore {
                 .query_map([canonical], display)?
                 .map(|row| row.map(|track| (track, String::new())))
                 .collect::<Result<_, _>>()?;
+            with_said(connection, tracks.iter_mut().map(|(track, _)| track))?;
             album_order(&mut tracks);
             Ok(Some(tracks.into_iter().map(|(track, _)| track).collect()))
         })
@@ -245,7 +341,8 @@ impl LibraryStore {
             let mut statement = connection.prepare(
                 "SELECT ta.public_id, r.public_id, rel.public_id, ta.display_title,
                         ac.display_text, rel.display_title, ta.display_disc_number,
-                        ta.display_track_number, ta.display_duration_ms, si.provider_key
+                        ta.display_track_number, ta.display_duration_ms, pic.public_id, r.id,
+                        si.provider_key
                  FROM server s
                  JOIN library_root lr ON lr.server_id = s.id AND lr.name = ?1
                  JOIN source_instance src ON src.root_id = lr.id
@@ -257,15 +354,17 @@ impl LibraryStore {
                  JOIN track_appearance ta ON ta.id = queued.canonical_id
                  JOIN recording r ON r.id = (SELECT canonical_id FROM recording WHERE id = ta.recording_id)
                  LEFT JOIN release rel ON rel.id = ta.release_id
+                 LEFT JOIN picture pic ON pic.id = rel.display_picture_id
                  LEFT JOIN artist_credit ac ON ac.id = ta.display_artist_credit_id
                  WHERE s.public_id = ?2
                    AND (si.provider_key = ?3 OR (si.provider_key >= ?4 AND si.provider_key < ?5))",
             )?;
-            let rows: Vec<(TrackDisplay, String)> = statement
+            let mut rows: Vec<(TrackDisplay, String)> = statement
                 .query_map((&root, server.as_bytes(), &prefix, &from, &to), |row| {
-                    Ok((display(row)?, row.get(9)?))
+                    Ok((display(row)?, row.get(11)?))
                 })?
                 .collect::<Result<_, _>>()?;
+            with_said(connection, rows.iter_mut().map(|(track, _)| track))?;
             // Each release is placed where its first file is.
             let mut first_path: std::collections::HashMap<Option<Id>, String> =
                 std::collections::HashMap::new();

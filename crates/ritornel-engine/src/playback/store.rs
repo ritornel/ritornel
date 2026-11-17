@@ -8,6 +8,7 @@ use ritornel_domain::history::{ContextKind, EndReason, StartReason};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
 use crate::jobs::{receipt, record_receipt};
+use crate::playback::queue::{QueueWrite, Repeat};
 use crate::{Command, Error, Id, ServerStore};
 
 /// The kind of outbox row that delivers a listen to the hub.
@@ -22,6 +23,10 @@ pub(crate) struct Entry {
     pub(crate) entry_id: Id,
     /// The track appearance it plays.
     pub(crate) appearance: Id,
+    /// Its place in queue order.
+    pub(crate) position: i64,
+    /// Its place in the stored play order, while shuffle is on.
+    pub(crate) shuffle_position: Option<i64>,
     /// Why it was queued.
     pub(crate) context_kind: ContextKind,
     /// What it was queued from.
@@ -30,16 +35,6 @@ pub(crate) struct Entry {
     pub(crate) added_by: Option<i64>,
     /// Why it could not be played, once it could not.
     pub(crate) failed_reason: Option<String>,
-}
-
-/// An entry to put in the queue.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NewEntry {
-    pub(crate) appearance: Id,
-    pub(crate) context_kind: ContextKind,
-    pub(crate) context_ref: Option<Id>,
-    /// The session that queued it, by its public ID.
-    pub(crate) added_by: Option<Id>,
 }
 
 /// The one row of the player.
@@ -55,6 +50,10 @@ pub(crate) struct Session {
     pub(crate) resume_listen: Option<Id>,
     /// The listener set on the player.
     pub(crate) listener: Option<Id>,
+    /// Whether the queue plays in its stored shuffled order.
+    pub(crate) shuffle: bool,
+    /// Repeat.
+    pub(crate) repeat: Repeat,
 }
 
 /// Everything a staged listen holds that does not change while it is
@@ -110,12 +109,15 @@ pub(crate) struct Ended {
     pub(crate) ended_mono_ms: Option<i64>,
 }
 
-/// Where a listen's track is, by both clocks: what a checkpoint saves
-/// besides what was heard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Mark {
+/// A listen as a save writes it: open, or closed and on its way to the
+/// hub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Saved {
+    pub(crate) started: Started,
+    pub(crate) heard: Heard,
+    /// Where its track is now: where it ended, if a crash closes it.
     pub(crate) position_ms: i64,
-    pub(crate) mono_ms: i64,
+    pub(crate) ended: Option<Ended>,
 }
 
 /// A listen as it is staged, whole.
@@ -133,14 +135,47 @@ pub(crate) struct Staged {
     pub(crate) checkpoint_mono_ms: Option<i64>,
 }
 
-/// What became of a command that replaces the queue.
+/// What became of a command that changes the queue or the player's
+/// settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Replaced {
-    /// The queue is the new one, with the answer the command stored.
-    Done(Vec<Entry>, String),
+pub(crate) enum Wrote {
+    /// It was written, with the answer stored. The queue's change is
+    /// handed back, for memory to apply.
+    Done {
+        /// The queue's revision after it.
+        revision: i64,
+        /// What the command answers.
+        answer: String,
+        /// What changed in the queue.
+        queue: QueueWrite,
+    },
     /// The command was carried out before: its stored answer, and nothing
     /// was changed.
     Replayed(String),
+}
+
+/// A change to the queue and the player's settings, with the command it
+/// is and where the player is after it: what [`ServerStore::write_queue`]
+/// writes in one transaction.
+#[derive(Debug)]
+pub(crate) struct Change {
+    /// The command and its method, or `None` for the player's own change,
+    /// such as a new order when the queue starts again.
+    pub(crate) command: Option<(Command, &'static str)>,
+    /// The queue revision the edit was decided on, if it names one.
+    pub(crate) expected: Option<i64>,
+    /// What changes in the queue.
+    pub(crate) queue: QueueWrite,
+    /// Whether the queue's revision moves: its entries or their order
+    /// changed.
+    pub(crate) bump: bool,
+    /// Repeat, where it changes.
+    pub(crate) repeat: Option<Repeat>,
+    /// The volume and whether it is muted, where they change.
+    pub(crate) volume: Option<(f64, bool)>,
+    /// The entry, by row, and the position the player is at after it, and
+    /// the listen a resume would continue.
+    pub(crate) place: (Option<i64>, i64, Option<Id>),
 }
 
 /// One delivery waiting in the outbox.
@@ -163,14 +198,16 @@ fn parsed<T>(text: String, parse: impl FnOnce(&str) -> Option<T>) -> rusqlite::R
     parse(&text).ok_or(rusqlite::Error::InvalidQuery)
 }
 
-const ENTRY_COLUMNS: &str =
-    "id, public_id, appearance_pid, context_kind, context_ref, added_by_session_id, failed_reason";
+const ENTRY_COLUMNS: &str = "id, public_id, appearance_pid, context_kind, context_ref,
+    added_by_session_id, failed_reason, position, shuffle_position";
 
 fn entry(row: &Row<'_>) -> rusqlite::Result<Entry> {
     Ok(Entry {
         row: row.get(0)?,
         entry_id: id(row, 1)?,
         appearance: id(row, 2)?,
+        position: row.get(7)?,
+        shuffle_position: row.get(8)?,
         context_kind: parsed(row.get(3)?, ContextKind::parse)?,
         context_ref: optional_id(row, 4)?,
         added_by: row.get(5)?,
@@ -182,7 +219,7 @@ fn session(connection: &Connection) -> Result<Option<Session>, Error> {
     Ok(connection
         .query_row(
             "SELECT queue_revision, state_revision, current_entry_id, position_ms,
-                    resume_listen_pid, listener_pid
+                    resume_listen_pid, listener_pid, shuffle, repeat
              FROM playback_session WHERE id = 1",
             [],
             |row| {
@@ -193,6 +230,8 @@ fn session(connection: &Connection) -> Result<Option<Session>, Error> {
                     position_ms: row.get(3)?,
                     resume_listen: optional_id(row, 4)?,
                     listener: optional_id(row, 5)?,
+                    shuffle: row.get(6)?,
+                    repeat: parsed(row.get(7)?, Repeat::parse)?,
                 })
             },
         )
@@ -280,6 +319,43 @@ fn save_place(
     Ok(())
 }
 
+/// How many entries one statement inserts: a long queue goes in far faster
+/// this way than a row at a time.
+const INSERT_ROWS: usize = 100;
+
+/// Inserts entries, with their rows and positions.
+fn insert_entries(
+    transaction: &Transaction<'_>,
+    entries: &[Entry],
+    now_ms: i64,
+) -> Result<(), Error> {
+    for batch in entries.chunks(INSERT_ROWS) {
+        let rows = vec!["(?, ?, ?, ?, ?, ?, ?, ?, ?)"; batch.len()].join(", ");
+        let mut insert = transaction.prepare_cached(&format!(
+            "INSERT INTO queue_entry
+               (id, public_id, appearance_pid, position, shuffle_position, context_kind,
+                context_ref, added_by_session_id, added_at_ms)
+             VALUES {rows}"
+        ))?;
+        let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(batch.len() * 9);
+        for entry in batch {
+            values.extend([
+                entry.row.into(),
+                entry.entry_id.as_bytes().to_vec().into(),
+                entry.appearance.as_bytes().to_vec().into(),
+                entry.position.into(),
+                entry.shuffle_position.into(),
+                entry.context_kind.as_str().to_owned().into(),
+                entry.context_ref.map(|id| id.as_bytes().to_vec()).into(),
+                entry.added_by.into(),
+                now_ms.into(),
+            ]);
+        }
+        insert.execute(rusqlite::params_from_iter(values))?;
+    }
+    Ok(())
+}
+
 /// Closes a listen, and queues its delivery, in the transaction given.
 fn close(
     transaction: &Transaction<'_>,
@@ -314,6 +390,11 @@ fn close(
     if closed == 0 {
         return Err(Error::Corrupt("a listen to close that is not open"));
     }
+    deliver(transaction, listen_id, now_ms)
+}
+
+/// Queues a closed listen's delivery to the hub.
+fn deliver(transaction: &Transaction<'_>, listen_id: Id, now_ms: i64) -> Result<(), Error> {
     transaction.execute(
         "INSERT INTO outbox (kind, dedupe_key, next_attempt_at_ms, created_at_ms)
          VALUES (?1, ?2, ?3, ?3)
@@ -321,6 +402,84 @@ fn close(
         (DELIVER_LISTEN, listen_id.as_bytes(), now_ms),
     )?;
     Ok(())
+}
+
+/// Writes a listen as it is now, whether its row is there yet or not. A
+/// row once closed is never written again.
+fn upsert(
+    transaction: &Transaction<'_>,
+    listen: &Saved,
+    mono_ms: i64,
+    now_ms: i64,
+) -> Result<(), Error> {
+    let (started, heard, ended) = (&listen.started, &listen.heard, listen.ended.as_ref());
+    let written = transaction
+        .prepare_cached(
+            "INSERT INTO listen_staging
+               (listen_id, listener_pid, actor_session_id, played_on_server_pid, appearance_pid,
+                asset_pid, copy_kind, source_item_pid, source_revision_no, started_at_utc_ms,
+                zone_name, started_mono_ms, boot_id, start_reason, continues_listen_id,
+                start_position_ms, track_duration_ms, context_kind, context_ref, shuffle,
+                queue_entry_pid, ms_played, heard_ranges_json, heard_ranges_approximate,
+                max_position_ms, seek_count, pause_count, checkpoint_at_ms,
+                checkpoint_position_ms, checkpoint_mono_ms, end_position_ms, end_reason,
+                ended_at_utc_ms, ended_mono_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'master', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
+                     ?31, ?32, ?33)
+             ON CONFLICT (listen_id) DO UPDATE SET
+               ms_played = excluded.ms_played, heard_ranges_json = excluded.heard_ranges_json,
+               heard_ranges_approximate =
+                 max(heard_ranges_approximate, excluded.heard_ranges_approximate),
+               max_position_ms = excluded.max_position_ms, seek_count = excluded.seek_count,
+               pause_count = excluded.pause_count, checkpoint_at_ms = excluded.checkpoint_at_ms,
+               checkpoint_position_ms = excluded.checkpoint_position_ms,
+               checkpoint_mono_ms = excluded.checkpoint_mono_ms,
+               end_position_ms = excluded.end_position_ms, end_reason = excluded.end_reason,
+               ended_at_utc_ms = excluded.ended_at_utc_ms, ended_mono_ms = excluded.ended_mono_ms
+             WHERE listen_staging.ended_at_utc_ms IS NULL",
+        )?
+        .execute(rusqlite::params![
+            started.listen_id.as_bytes(),
+            started.listener.as_bytes(),
+            started.actor_session,
+            started.played_on_server.as_bytes(),
+            started.appearance.as_bytes(),
+            started.asset.as_bytes(),
+            started.source_item.as_bytes(),
+            started.source_revision,
+            started.started_at_ms,
+            started.zone,
+            started.started_mono_ms,
+            started.boot.as_bytes(),
+            started.start_reason.as_str(),
+            started.continues.as_ref().map(Id::as_bytes),
+            started.start_position_ms,
+            started.track_duration_ms,
+            started.context_kind.as_str(),
+            started.context_ref.as_ref().map(Id::as_bytes),
+            started.shuffle,
+            started.entry.as_ref().map(Id::as_bytes),
+            heard.ms_played,
+            &heard.ranges_json,
+            heard.ranges_approximate,
+            heard.max_position_ms,
+            heard.seek_count,
+            heard.pause_count,
+            now_ms,
+            listen.position_ms,
+            ended
+                .and_then(|ended| ended.ended_mono_ms)
+                .unwrap_or(mono_ms),
+            ended.map(|ended| ended.end_position_ms),
+            ended.map(|ended| ended.end_reason.as_str()),
+            ended.map(|ended| ended.ended_at_ms),
+            ended.and_then(|ended| ended.ended_mono_ms),
+        ])?;
+    match ended {
+        Some(_) if written > 0 => deliver(transaction, started.listen_id, now_ms),
+        _ => Ok(()),
+    }
 }
 
 impl ServerStore {
@@ -352,7 +511,7 @@ impl ServerStore {
 
     /// The stored result of a server-local command that was carried out
     /// before. The same ID with another request is refused.
-    pub(crate) fn stored_result(&self, command: Command) -> Result<Option<String>, Error> {
+    pub fn stored_result(&self, command: Command) -> Result<Option<String>, Error> {
         self.read(|connection| receipt(connection, &command))
     }
 
@@ -376,67 +535,106 @@ impl ServerStore {
         })
     }
 
-    /// Replaces the queue with `entries` and puts the player on the one at
-    /// `start`, at its beginning, with the command's receipt: one
-    /// transaction. `result` is given the new queue and returns what the
+    /// The row of a session, by its public ID.
+    pub(crate) fn session_row(&self, session: Id) -> Result<Option<i64>, Error> {
+        self.read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT id FROM session WHERE public_id = ?1",
+                    [session.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
+    /// Writes a change to the queue and the player's settings, with the
+    /// place the player is at after it and the command's receipt, in one
+    /// transaction. An edit decided on a queue revision that is not the
+    /// queue's now changes nothing and fails with [`Error::StaleQueue`].
+    /// `answer` is given the queue's revision after it and returns what the
     /// command answers.
-    pub(crate) fn replace_queue(
+    pub(crate) fn write_queue(
         &self,
-        command: Command,
-        method: &'static str,
-        entries: Vec<NewEntry>,
-        start: usize,
-        result: impl FnOnce(&[Entry], i64) -> String + Send + 'static,
-    ) -> Result<Replaced, Error> {
-        self.transact(move |transaction, now_ms, entropy| {
-            if let Some(stored) = receipt(transaction, &command)? {
-                return Ok(Replaced::Replayed(stored));
+        change: Change,
+        answer: impl FnOnce(i64) -> String + Send + 'static,
+    ) -> Result<Wrote, Error> {
+        self.transact(move |transaction, now_ms, _| {
+            if let Some((command, _)) = &change.command
+                && let Some(stored) = receipt(transaction, command)?
+            {
+                return Ok(Wrote::Replayed(stored));
             }
-            transaction.execute(
-                "UPDATE playback_session SET current_entry_id = NULL WHERE id = 1",
-                [],
-            )?;
-            transaction.execute("DELETE FROM queue_entry", [])?;
-            let mut insert = transaction.prepare(
-                "INSERT INTO queue_entry
-                   (public_id, appearance_pid, position, context_kind, context_ref,
-                    added_by_session_id, added_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, (SELECT id FROM session WHERE public_id = ?6), ?7)",
-            )?;
-            for (position, new) in entries.iter().enumerate() {
-                insert.execute((
-                    crate::new_id(now_ms, entropy)?.as_bytes(),
-                    new.appearance.as_bytes(),
-                    i64::try_from(position).unwrap_or(i64::MAX),
-                    new.context_kind.as_str(),
-                    new.context_ref.as_ref().map(Id::as_bytes),
-                    new.added_by.as_ref().map(Id::as_bytes),
-                    now_ms,
-                ))?;
-            }
-            drop(insert);
-            let mut statement = transaction.prepare(&format!(
-                "SELECT {ENTRY_COLUMNS} FROM queue_entry ORDER BY position, id"
-            ))?;
-            let queue: Vec<Entry> = statement.query_map([], entry)?.collect::<Result<_, _>>()?;
-            drop(statement);
-            let current = queue.get(start).map(|entry| entry.row);
-            transaction.execute(
-                "UPDATE playback_session
-                 SET queue_revision = queue_revision + 1, current_entry_id = ?1, position_ms = 0,
-                     resume_listen_pid = NULL, state_revision = state_revision + 1,
-                     updated_at_ms = ?2
-                 WHERE id = 1",
-                (current, now_ms),
-            )?;
-            let revision: i64 = transaction.query_row(
+            let current: i64 = transaction.query_row(
                 "SELECT queue_revision FROM playback_session WHERE id = 1",
                 [],
                 |row| row.get(0),
             )?;
-            let answer = result(&queue, revision);
-            record_receipt(transaction, &command, method, &answer, now_ms)?;
-            Ok(Replaced::Done(queue, answer))
+            if change.expected.is_some_and(|expected| expected != current) {
+                return Err(Error::StaleQueue { current });
+            }
+            let write = &change.queue;
+            if write.clear || !write.remove.is_empty() {
+                // The session's entry may be among those that go; its
+                // place is saved again below.
+                transaction.execute(
+                    "UPDATE playback_session SET current_entry_id = NULL WHERE id = 1",
+                    [],
+                )?;
+            }
+            if write.clear {
+                transaction.execute("DELETE FROM queue_entry", [])?;
+            }
+            let mut remove = transaction.prepare("DELETE FROM queue_entry WHERE id = ?1")?;
+            for row in &write.remove {
+                remove.execute([row])?;
+            }
+            drop(remove);
+            if write.shuffle == Some(false) {
+                transaction.execute("UPDATE queue_entry SET shuffle_position = NULL", [])?;
+            }
+            let mut moved = transaction.prepare(
+                "UPDATE queue_entry SET position = ?2, shuffle_position = ?3 WHERE id = ?1",
+            )?;
+            for (row, position, place) in &write.moved {
+                moved.execute((row, position, place))?;
+            }
+            drop(moved);
+            insert_entries(transaction, &write.insert, now_ms)?;
+            if let Some(shuffle) = write.shuffle {
+                transaction.execute(
+                    "UPDATE playback_session SET shuffle = ?1 WHERE id = 1",
+                    [shuffle],
+                )?;
+            }
+            if let Some(repeat) = change.repeat {
+                transaction.execute(
+                    "UPDATE playback_session SET repeat = ?1 WHERE id = 1",
+                    [repeat.as_str()],
+                )?;
+            }
+            if let Some((volume, muted)) = change.volume {
+                transaction.execute(
+                    "UPDATE playback_session SET volume = ?1, muted = ?2 WHERE id = 1",
+                    (volume, muted),
+                )?;
+            }
+            let revision = if change.bump { current + 1 } else { current };
+            transaction.execute(
+                "UPDATE playback_session SET queue_revision = ?1 WHERE id = 1",
+                [revision],
+            )?;
+            let (entry, position_ms, resume) = change.place;
+            save_place(transaction, entry, position_ms, resume, now_ms)?;
+            let answer = answer(revision);
+            if let Some((command, method)) = &change.command {
+                record_receipt(transaction, command, method, &answer, now_ms)?;
+            }
+            Ok(Wrote::Done {
+                revision,
+                answer,
+                queue: change.queue,
+            })
         })
     }
 
@@ -450,6 +648,18 @@ impl ServerStore {
     ) -> Result<(), Error> {
         self.transact(move |transaction, now_ms, _| {
             save_place(transaction, current, position_ms, resume_listen, now_ms)
+        })
+    }
+
+    /// The player's volume, 0 to 1, and whether it is muted.
+    pub(crate) fn volume(&self) -> Result<(f64, bool), Error> {
+        self.playback_session()?;
+        self.read(|connection| {
+            Ok(connection.query_row(
+                "SELECT volume, muted FROM playback_session WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
         })
     }
 
@@ -475,107 +685,20 @@ impl ServerStore {
         })
     }
 
-    /// Writes a listen when its first frame is heard, with the player's
-    /// place. `mark` is where the track is now.
-    pub(crate) fn open_listen(
+    /// Saves listens as they are now, oldest first, each closed one queued
+    /// for delivery, with the player's place: one transaction, which says
+    /// the same however often it is written. `mono_ms` is the monotonic
+    /// clock as the open listen was read.
+    pub(crate) fn save_listens(
         &self,
-        started: Started,
-        current: Option<i64>,
-        mark: Mark,
-    ) -> Result<(), Error> {
-        self.transact(move |transaction, now_ms, _| {
-            transaction.execute(
-                "INSERT INTO listen_staging
-                   (listen_id, listener_pid, actor_session_id, played_on_server_pid,
-                    appearance_pid, asset_pid, copy_kind, source_item_pid, source_revision_no,
-                    started_at_utc_ms, zone_name, started_mono_ms, boot_id, start_reason,
-                    continues_listen_id, start_position_ms, track_duration_ms, max_position_ms,
-                    context_kind, context_ref, shuffle, checkpoint_at_ms, queue_entry_pid,
-                    checkpoint_position_ms, checkpoint_mono_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'master', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                         ?15, ?16, ?15, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
-                rusqlite::params![
-                    started.listen_id.as_bytes(),
-                    started.listener.as_bytes(),
-                    started.actor_session,
-                    started.played_on_server.as_bytes(),
-                    started.appearance.as_bytes(),
-                    started.asset.as_bytes(),
-                    started.source_item.as_bytes(),
-                    started.source_revision,
-                    started.started_at_ms,
-                    started.zone,
-                    started.started_mono_ms,
-                    started.boot.as_bytes(),
-                    started.start_reason.as_str(),
-                    started.continues.as_ref().map(Id::as_bytes),
-                    started.start_position_ms,
-                    started.track_duration_ms,
-                    started.context_kind.as_str(),
-                    started.context_ref.as_ref().map(Id::as_bytes),
-                    started.shuffle,
-                    now_ms,
-                    started.entry.as_ref().map(Id::as_bytes),
-                    mark.position_ms,
-                    mark.mono_ms,
-                ],
-            )?;
-            transaction.execute(
-                "UPDATE playback_session SET current_entry_id = ?1, position_ms = ?2 WHERE id = 1",
-                (current, mark.position_ms),
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Saves what an open listen has heard so far and where its track is,
-    /// and with it the player's position: a checkpoint.
-    pub(crate) fn checkpoint_listen(
-        &self,
-        listen_id: Id,
-        heard: Heard,
-        mark: Mark,
-    ) -> Result<(), Error> {
-        self.transact(move |transaction, now_ms, _| {
-            transaction.execute(
-                "UPDATE listen_staging
-                 SET ms_played = ?2, heard_ranges_json = ?3, max_position_ms = ?4,
-                     seek_count = ?5, pause_count = ?6, checkpoint_at_ms = ?7,
-                     checkpoint_position_ms = ?8, checkpoint_mono_ms = ?9,
-                     heard_ranges_approximate = max(heard_ranges_approximate, ?10)
-                 WHERE listen_id = ?1 AND ended_at_utc_ms IS NULL",
-                rusqlite::params![
-                    listen_id.as_bytes(),
-                    heard.ms_played,
-                    &heard.ranges_json,
-                    heard.max_position_ms,
-                    heard.seek_count,
-                    heard.pause_count,
-                    now_ms,
-                    mark.position_ms,
-                    mark.mono_ms,
-                    heard.ranges_approximate,
-                ],
-            )?;
-            transaction.execute(
-                "UPDATE playback_session SET position_ms = ?1 WHERE id = 1",
-                [mark.position_ms],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Closes a listen and queues its delivery, and saves the player's
-    /// place: one transaction.
-    pub(crate) fn close_listen(
-        &self,
-        listen_id: Id,
-        heard: Heard,
-        ended: Ended,
+        listens: Vec<Saved>,
         place: (Option<i64>, i64, Option<Id>),
+        mono_ms: i64,
     ) -> Result<(), Error> {
         self.transact(move |transaction, now_ms, _| {
-            close(transaction, listen_id, &heard, &ended, now_ms)?;
+            for listen in &listens {
+                upsert(transaction, listen, mono_ms, now_ms)?;
+            }
             let (current, position_ms, resume) = place;
             save_place(transaction, current, position_ms, resume, now_ms)
         })
@@ -746,6 +869,7 @@ mod tests {
 
     use super::*;
     use crate::migrate;
+    use crate::playback::queue::{Queue, Random};
     use crate::testing::{FixedClock, Scratch};
     use crate::{OsEntropy, SessionToken, SystemClock};
 
@@ -758,6 +882,64 @@ mod tests {
     const SAVED_0003: &str = include_str!("../../saved/server/0003.sql");
 
     const T0: i64 = 1_763_000_000_000;
+
+    /// Puts `count` entries in place of the queue, as `playback.play` does,
+    /// queued by the session in row `added_by`, and returns them with the
+    /// command's answer.
+    fn replace(
+        store: &ServerStore,
+        key: u8,
+        count: u8,
+        kind: ContextKind,
+        added_by: Option<i64>,
+    ) -> (Vec<Entry>, String) {
+        let queue = Queue::default();
+        let template = Entry {
+            row: 0,
+            entry_id: Id::from_bytes([0; 16]),
+            appearance: Id::from_bytes([0xa0; 16]),
+            position: 0,
+            shuffle_position: None,
+            context_kind: kind,
+            context_ref: None,
+            added_by,
+            failed_reason: None,
+        };
+        let tracks = (0..count)
+            .map(|at| (Id::from_bytes([0xe0 + at; 16]), Id::from_bytes([0xa0; 16])))
+            .collect();
+        let write = queue
+            .replace(
+                queue.fresh(tracks, &template),
+                Some(0),
+                false,
+                &mut Random::new(&OsEntropy),
+            )
+            .unwrap();
+        let first = write.insert.first().map(|entry| entry.row);
+        let change = Change {
+            command: Some((
+                Command {
+                    id: Id::from_bytes([key; 16]),
+                    fingerprint: crate::Fingerprint::of("playback.play", b"{}"),
+                },
+                "playback.play",
+            )),
+            expected: None,
+            queue: write,
+            bump: true,
+            repeat: None,
+            volume: None,
+            place: (first, 0, None),
+        };
+        match store
+            .write_queue(change, |revision| revision.to_string())
+            .unwrap()
+        {
+            Wrote::Done { answer, queue, .. } => (queue.insert, answer),
+            Wrote::Replayed(_) => panic!("a new command is carried out"),
+        }
+    }
 
     fn schema(connection: &Connection) -> Vec<String> {
         connection
@@ -825,26 +1007,8 @@ mod tests {
         let session = store.local_session().unwrap();
         let fresh = store.playback_session().unwrap();
         assert_eq!((fresh.queue_revision, fresh.current), (0, None));
-        let replaced = store
-            .replace_queue(
-                Command {
-                    id: Id::from_bytes([0xc3; 16]),
-                    fingerprint: crate::Fingerprint::of("playback.play", b"{}"),
-                },
-                "playback.play",
-                vec![NewEntry {
-                    appearance: Id::from_bytes([0xa0; 16]),
-                    context_kind: ContextKind::Manual,
-                    context_ref: None,
-                    added_by: session,
-                }],
-                0,
-                |_, revision| revision.to_string(),
-            )
-            .unwrap();
-        let Replaced::Done(queue, answer) = replaced else {
-            panic!("a new command is carried out");
-        };
+        let added_by = store.session_row(session.unwrap()).unwrap();
+        let (queue, answer) = replace(&store, 0xc3, 1, ContextKind::Manual, added_by);
         assert_eq!((queue.len(), answer.as_str()), (1, "1"));
         assert_eq!(queue[0].added_by, Some(1));
         store.close().unwrap();
@@ -978,15 +1142,21 @@ mod tests {
             .unwrap();
 
         // One listen is open at most: a second is refused while it is.
-        let second = Started {
+        let second = |started: Started| Saved {
+            started,
+            heard: Heard {
+                ranges_json: "[]".to_owned(),
+                ..Heard::default()
+            },
+            position_ms: 0,
+            ended: None,
+        };
+        let opened = Started {
             listen_id: Id::from_bytes([0xd2; 16]),
             ..open.started.clone()
         };
-        let mark = Mark {
-            position_ms: 0,
-            mono_ms: 5_000_000,
-        };
-        assert!(store.open_listen(second.clone(), None, mark).is_err());
+        let save = |started: Started| store.save_listens(vec![second(started)], (None, 0, None), 5);
+        assert!(save(opened.clone()).is_err());
 
         // The next run closes the open one as a crash, and then the second
         // can open, queued from an artist's page.
@@ -1005,9 +1175,9 @@ mod tests {
         );
         let artist = Started {
             context_kind: ContextKind::Artist,
-            ..second
+            ..opened
         };
-        store.open_listen(artist, None, mark).unwrap();
+        save(artist).unwrap();
         assert_eq!(store.undelivered_listens().unwrap(), 2);
     }
 
@@ -1019,27 +1189,7 @@ mod tests {
         )
         .unwrap();
         store.playback_session().unwrap();
-        let entries = |kind| NewEntry {
-            appearance: Id::from_bytes([0xa0; 16]),
-            context_kind: kind,
-            context_ref: None,
-            added_by: None,
-        };
-        let Replaced::Done(queue, _) = store
-            .replace_queue(
-                Command {
-                    id: Id::from_bytes([0xc4; 16]),
-                    fingerprint: crate::Fingerprint::of("playback.play", b"{}"),
-                },
-                "playback.play",
-                vec![entries(ContextKind::Album), entries(ContextKind::Album)],
-                0,
-                |_, revision| revision.to_string(),
-            )
-            .unwrap()
-        else {
-            panic!("a new command is carried out");
-        };
+        let (queue, _) = replace(&store, 0xc4, 2, ContextKind::Album, None);
         let started = Started {
             listen_id: Id::from_bytes([0xd1; 16]),
             entry: Some(queue[0].entry_id),
@@ -1062,30 +1212,29 @@ mod tests {
             context_ref: None,
             shuffle: false,
         };
-        let mark = |position_ms| Mark {
-            position_ms,
-            mono_ms: 1_000 + position_ms,
-        };
-        store
-            .open_listen(started.clone(), Some(queue[0].row), mark(0))
-            .unwrap();
-        store
-            .checkpoint_listen(
-                started.listen_id,
-                Heard {
-                    ms_played: 5_000,
-                    ranges_json: "[[0,5000]]".to_owned(),
-                    max_position_ms: 5_000,
+        // Saved as it opened, and again five seconds in: the second save
+        // says what the first did, and more.
+        for (ms, ranges) in [(0, "[]"), (5_000, "[[0,5000]]")] {
+            let saved = Saved {
+                started: started.clone(),
+                heard: Heard {
+                    ms_played: ms,
+                    ranges_json: ranges.to_owned(),
+                    max_position_ms: ms,
                     ..Heard::default()
                 },
-                mark(5_000),
-            )
-            .unwrap();
+                position_ms: ms,
+                ended: None,
+            };
+            let place = (Some(queue[0].row), ms, None);
+            store.save_listens(vec![saved], place, 1_000 + ms).unwrap();
+        }
         // The session moved on to the second entry, and saved a place there,
         // before the run died with the first entry's listen open.
         store.save_place(Some(queue[1].row), 42_000, None).unwrap();
         assert_eq!(store.close_crashed_listens().unwrap(), [started.listen_id]);
         let closed = store.staged_listen(started.listen_id).unwrap().unwrap();
+        assert_eq!(closed.heard.ms_played, 5_000);
         assert_eq!(closed.ended.unwrap().end_position_ms, 5_000);
         assert_eq!(store.playback_session().unwrap().resume_listen, None);
     }

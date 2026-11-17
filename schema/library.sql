@@ -8,6 +8,7 @@
 --   0002_list_indexes  1789bf26cc0c33c9bb95b6c24293e838237ffe0695bdcc7a1818c0b79212d0cb
 --   0003_listen_detail  826a650aaf9ac96b0cbf0365f3a06ad90c5df0af654ee21353fb4bd16220d1e0
 --   0004_lastfm  bb5ed63f0f6797c6130d974d315612dfa8f1d4acaba1f32a2154d3af185c4397
+--   0005_artist_pictures  37d0ab48d29602121e99cac1d33785c26f979be24cc3141233f15e323ce9757a
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -837,3 +838,31 @@ CREATE INDEX history_delivery_echo ON history_delivery (endpoint_id, sent_timest
 
 CREATE INDEX history_delivery_due ON history_delivery (endpoint_id, next_attempt_at_ms)
   WHERE state = 'pending';
+
+CREATE TABLE picture_folder (
+  id                INTEGER PRIMARY KEY,
+  public_id         BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
+  server_id         INTEGER NOT NULL REFERENCES server(id),
+  name              TEXT NOT NULL,
+  created_at_ms     INTEGER NOT NULL,
+  rev               INTEGER NOT NULL,
+  UNIQUE (server_id, name)
+) STRICT;
+
+CREATE TABLE artist_picture (
+  id                INTEGER PRIMARY KEY,
+  artist_id         INTEGER NOT NULL REFERENCES artist(id),
+  kind              TEXT NOT NULL CHECK (kind IN ('portrait')),   -- the square picture for the circle and the banner
+  picture_id        INTEGER NOT NULL REFERENCES picture(id),
+  folder_id         INTEGER NOT NULL REFERENCES picture_folder(id),
+  path              TEXT NOT NULL,                                -- relative to the folder, such as '<mbid>/portrait.deezer.0a1b2c.jpg'
+  matched_by        TEXT NOT NULL CHECK (matched_by IN ('mbid', 'name')),   -- the artist's MusicBrainz ID, or their name where they have none
+  source            TEXT,                                         -- who supplied it, as the manifest says: 'theaudiodb', 'deezer', 'owner'
+  chosen_by         TEXT,                                         -- who chose it, as the manifest says: 'rule:v1', 'owner'
+  rev               INTEGER NOT NULL,
+  UNIQUE (artist_id, kind)
+) STRICT;
+
+CREATE INDEX artist_picture_picture ON artist_picture (picture_id);
+
+CREATE INDEX identifier_claim_item ON identifier_claim (source_item_id, namespace);

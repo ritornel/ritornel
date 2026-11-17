@@ -20,13 +20,17 @@ use std::time::Duration;
 
 use ritornel_client::Client;
 use ritornel_client::contract::methods::{
-    HistoryRecent, PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackSkip, QueueWindow,
+    AlbumGet, HistoryRecent, ListClose, ListOpen, PlaybackGet, PlaybackPause, PlaybackPlay,
+    PlaybackSet, PlaybackSkip, QueueAdd, QueueClear, QueueRemove, QueueWindow, RatingsSet,
     SourcesTracks,
 };
 use ritornel_client::contract::{
-    CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, HistoryRecentParams, Id, NoParams,
-    PlaySource, PlaybackCommandParams, PlaybackPlayParams, PlaybackSkipParams, PlaybackStatus,
-    QueueWindowParams, SessionKind, SkipDirection, SourcesTracksParams, Topic, capability,
+    AlbumGetParams, AlbumRef, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams,
+    HistoryRecentParams, Id, ListKind, ListOpenParams, NoParams, PlaySource, PlaybackCommandParams,
+    PlaybackPlayParams, PlaybackSetParams, PlaybackSkipParams, PlaybackStatus, Query,
+    QueueAddParams, QueueClearParams, QueueOrder, QueuePlace, QueueRemoveParams, QueueWindowParams,
+    RatingSetParams, Repeat, Row, SessionKind, SkipDirection, SongRow, SourcesTracksParams, Topic,
+    ViewParams, Window, capability,
 };
 use ritornel_engine::{OsEntropy, SystemClock};
 use ritornel_server::{Bounds, HeldDir, Listen, Output, PlaybackRun, Run, Server};
@@ -57,9 +61,14 @@ impl Drop for Scratch {
 /// Starts a server with a player on the null output, a hundred times real
 /// time, and returns a client with a full session that has said hello.
 async fn server(scratch: &Scratch) -> (Server, Client) {
+    server_at(scratch, 100).await
+}
+
+/// As [`server`], at `speed` times real time.
+async fn server_at(scratch: &Scratch, speed: u32) -> (Server, Client) {
     let run = Run {
         playback: PlaybackRun {
-            output: Some(Output::Null { speed: 100 }),
+            output: Some(Output::Null { speed }),
             ..PlaybackRun::default()
         },
         ..Run::default()
@@ -144,7 +153,10 @@ async fn scanned(client: &mut Client, folder: &Path) {
 async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
     tokio::time::timeout(WAIT, async {
         let scratch = Scratch::new();
-        let (server, mut client) = server(&scratch).await;
+        // Four times real time: each half-second track is current for
+        // several of the player's ticks, so each is said, as in use. Far
+        // faster, a track can begin and end between two ticks.
+        let (server, mut client) = server_at(&scratch, 4).await;
         let folder = album(&scratch);
 
         // Nothing to play before there is a library.
@@ -180,6 +192,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
             .await
             .unwrap();
         let first = key();
+        let started = std::time::Instant::now();
         let played = client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
                 idempotency_key: first,
@@ -188,6 +201,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
                 },
                 start: None,
                 context: None,
+                shuffle: None,
             })
             .await
             .unwrap();
@@ -197,14 +211,16 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
             .call::<QueueWindow>(&QueueWindowParams {
                 offset: 0,
                 limit: None,
+                order: None,
             })
             .await
             .unwrap();
         assert_eq!((window.total, window.queue_revision), (3, 1));
         assert_eq!(window.entries[0].entry_id, played.entry_id.unwrap());
 
-        // The queue changed, the player played, and in under a second of
-        // the test's time the album has ended.
+        // The queue changed, the player played, and in well under two
+        // seconds of the test's time (a second and a half of audio at four
+        // times real time, and a few ticks) the album has ended.
         let (mut queue_events, mut entries) = (0, Vec::new());
         loop {
             match client.next_event().await.unwrap() {
@@ -222,6 +238,8 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
                 _ => {}
             }
         }
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(2), "the album took {took:?}");
         assert!(queue_events >= 1);
         let ids: Vec<Id> = window.entries.iter().map(|entry| entry.entry_id).collect();
         assert_eq!(entries, ids);
@@ -236,6 +254,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
                 },
                 start: None,
                 context: None,
+                shuffle: None,
             })
             .await
             .unwrap();
@@ -339,6 +358,7 @@ async fn a_file_replaced_after_the_scan_is_not_played_under_the_identity_the_sca
                 },
                 start: None,
                 context: None,
+                shuffle: None,
             })
             .await
             .unwrap();
@@ -370,6 +390,7 @@ async fn a_file_replaced_after_the_scan_is_not_played_under_the_identity_the_sca
             .call::<QueueWindow>(&QueueWindowParams {
                 offset: 0,
                 limit: None,
+                order: None,
             })
             .await
             .unwrap();
@@ -386,6 +407,356 @@ async fn a_file_replaced_after_the_scan_is_not_played_under_the_identity_the_sca
             .collect();
         assert_eq!(heard.len(), 2, "{heard:?}");
         assert!(!heard.contains(&Some(tracks[0].appearance_id)), "{heard:?}");
+        server.stop().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_volume_is_set_absolutely_kept_across_a_restart_and_refused_out_of_range() {
+    tokio::time::timeout(WAIT, async {
+        let scratch = Scratch::new();
+        let (first, client) = server(&scratch).await;
+        assert_eq!(
+            client.call::<PlaybackGet>(&NoParams {}).await.unwrap().volume,
+            1.0
+        );
+        let set = PlaybackSetParams {
+            idempotency_key: key(),
+            volume: Some(0.25),
+            muted: None,
+            shuffle: None,
+            repeat: None,
+        };
+        client.call::<PlaybackSet>(&set).await.unwrap();
+        // Sent again, it is answered from its receipt.
+        client.call::<PlaybackSet>(&set).await.unwrap();
+        client
+            .call::<PlaybackSet>(&PlaybackSetParams {
+                idempotency_key: key(),
+                volume: None,
+                muted: Some(true),
+                shuffle: None,
+                repeat: None,
+            })
+            .await
+            .unwrap();
+        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        assert_eq!((state.volume, state.muted), (0.25, true));
+        let refused = client
+            .call::<PlaybackSet>(&PlaybackSetParams {
+                idempotency_key: key(),
+                volume: Some(1.5),
+                muted: None,
+                shuffle: None,
+                repeat: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, ritornel_client::Error::Call(ref error) if error.data.code == ErrorCode::Invalid),
+            "{refused:?}"
+        );
+        first.stop().await.unwrap();
+
+        let (server, client) = server(&scratch).await;
+        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        assert_eq!((state.volume, state.muted), (0.25, true));
+        server.stop().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// What a call refused with: its code and its details.
+fn refusal<T: std::fmt::Debug>(
+    answer: Result<T, ritornel_client::Error>,
+) -> (ErrorCode, serde_json::Value) {
+    match answer {
+        Err(ritornel_client::Error::Call(error)) => (
+            error.data.code,
+            serde_json::to_value(&error.data.details).unwrap(),
+        ),
+        other => panic!("expected an error from the server, and got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
+    tokio::time::timeout(WAIT, async {
+        let scratch = Scratch::new();
+        let (server, mut client) = server(&scratch).await;
+        let folder = album(&scratch);
+        scanned(&mut client, &folder).await;
+
+        // Play from here: the second row of a view of every song.
+        let opened = client
+            .call::<ListOpen>(&ListOpenParams {
+                kind: ListKind::Songs,
+                query: Query::default(),
+                window: Some(Window {
+                    offset: 0,
+                    limit: 10,
+                }),
+                replaces: None,
+            })
+            .await
+            .unwrap();
+        let songs: Vec<SongRow> = opened
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Song(song) => Some(song.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!songs.is_empty());
+        let last = songs.len() - 1;
+        let played = client
+            .call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::View {
+                    view: opened.view.clone(),
+                },
+                start: Some(u32::try_from(last).unwrap()),
+                context: None,
+                shuffle: None,
+            })
+            .await
+            .unwrap();
+        let in_order = client
+            .call::<QueueWindow>(&QueueWindowParams {
+                offset: 0,
+                limit: None,
+                order: None,
+            })
+            .await
+            .unwrap();
+        // The view's rows, in its order, from the row asked for.
+        assert_eq!(played.entry_id, Some(in_order.entries[last].entry_id));
+        let queued: Vec<Id> = in_order
+            .entries
+            .iter()
+            .map(|entry| entry.track.appearance_id)
+            .collect();
+        let listed: Vec<Id> = songs.iter().map(|song| song.appearance_id).collect();
+        assert_eq!(queued, listed);
+
+        // The album's three tracks, paused, for the rest.
+        let songs = client
+            .call::<SourcesTracks>(&SourcesTracksParams {
+                path: folder.join("Tin Weather").to_str().unwrap().to_owned(),
+            })
+            .await
+            .unwrap()
+            .tracks;
+        let played = client
+            .call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::Tracks {
+                    ids: songs.iter().map(|song| song.appearance_id).collect(),
+                },
+                start: Some(1),
+                context: None,
+                shuffle: None,
+            })
+            .await
+            .unwrap();
+        client
+            .call::<PlaybackPause>(&PlaybackCommandParams {
+                idempotency_key: key(),
+            })
+            .await
+            .unwrap();
+        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        assert_eq!(state.queue_length, 3);
+
+        // Shuffle on and repeat all, said back in the state.
+        let set = client
+            .call::<PlaybackSet>(&PlaybackSetParams {
+                idempotency_key: key(),
+                volume: None,
+                muted: None,
+                shuffle: Some(true),
+                repeat: Some(Repeat::All),
+            })
+            .await
+            .unwrap();
+        assert_eq!(set.queue_revision, played.queue_revision + 1);
+        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        assert!(state.shuffle);
+        assert_eq!(state.repeat, Repeat::All);
+        let window = |order| QueueWindowParams {
+            offset: 0,
+            limit: None,
+            order: Some(order),
+        };
+        let play_order = client
+            .call::<QueueWindow>(&window(QueueOrder::Play))
+            .await
+            .unwrap();
+        assert_eq!(play_order.entries[0].entry_id, state.entry_id.unwrap());
+        assert_eq!(play_order.current_index, Some(0));
+        let up_next = client
+            .call::<QueueWindow>(&window(QueueOrder::UpNext))
+            .await
+            .unwrap();
+        assert_eq!(up_next.total, 2);
+        assert_eq!(up_next.entries, play_order.entries[1..]);
+
+        // An edit decided on an old revision is refused, and says the
+        // revision there is.
+        let stale = client
+            .call::<QueueAdd>(&QueueAddParams {
+                idempotency_key: key(),
+                source: PlaySource::Tracks {
+                    ids: vec![songs[0].appearance_id],
+                },
+                place: QueuePlace::Next,
+                context: None,
+                expected_revision: Some(played.queue_revision),
+            })
+            .await;
+        let (code, details) = refusal(stale);
+        assert_eq!(code, ErrorCode::Conflict);
+        assert_eq!(details["currentRevision"], set.queue_revision);
+        // On the revision there is, it goes straight after the one on.
+        let added = client
+            .call::<QueueAdd>(&QueueAddParams {
+                idempotency_key: key(),
+                source: PlaySource::Tracks {
+                    ids: vec![songs[0].appearance_id],
+                },
+                place: QueuePlace::Next,
+                context: None,
+                expected_revision: Some(set.queue_revision),
+            })
+            .await
+            .unwrap();
+        assert_eq!(added.queue_revision, set.queue_revision + 1);
+        let up_next = client
+            .call::<QueueWindow>(&window(QueueOrder::UpNext))
+            .await
+            .unwrap();
+        assert_eq!(up_next.total, 3);
+        assert_eq!(
+            up_next.entries[0].track.appearance_id,
+            songs[0].appearance_id
+        );
+        let removed = client
+            .call::<QueueRemove>(&QueueRemoveParams {
+                idempotency_key: key(),
+                entry_ids: vec![up_next.entries[0].entry_id],
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(removed.queue_revision, added.queue_revision + 1);
+
+        // Stars on the song on show in the state, and on its row.
+        let recording = state.track.as_ref().unwrap().recording_id.unwrap();
+        let rated = client
+            .call::<RatingsSet>(&RatingSetParams {
+                idempotency_key: key(),
+                recording_id: recording,
+                rating: Some(80),
+            })
+            .await
+            .unwrap();
+        assert_eq!(rated.rating, Some(80));
+        assert!(rated.receipt.revision.is_some());
+        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        assert_eq!(state.track.as_ref().unwrap().rating, Some(80));
+        let page = client
+            .call::<AlbumGet>(&AlbumGetParams {
+                album: AlbumRef::Release {
+                    id: state.track.as_ref().unwrap().release_id.unwrap(),
+                },
+            })
+            .await
+            .unwrap();
+        let stars: Vec<Option<u32>> = page
+            .tracks
+            .iter()
+            .filter(|track| track.recording_id == recording)
+            .map(|track| track.rating)
+            .collect();
+        // Every appearance of the recording shows its stars.
+        assert!(!stars.is_empty());
+        assert!(stars.iter().all(|stars| *stars == Some(80)), "{stars:?}");
+        let refused = client
+            .call::<RatingsSet>(&RatingSetParams {
+                idempotency_key: key(),
+                recording_id: recording,
+                rating: Some(120),
+            })
+            .await;
+        assert_eq!(refusal(refused).0, ErrorCode::Invalid);
+
+        // Clearing stops the player and empties the queue.
+        client
+            .call::<QueueClear>(&QueueClearParams {
+                idempotency_key: key(),
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        assert_eq!(
+            (state.status, state.queue_length),
+            (PlaybackStatus::Stopped, 0)
+        );
+        server.stop().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_command_from_a_view_sent_again_after_the_view_ended_is_answered_from_its_receipt() {
+    tokio::time::timeout(WAIT, async {
+        let scratch = Scratch::new();
+        let (server, mut client) = server(&scratch).await;
+        let folder = album(&scratch);
+        scanned(&mut client, &folder).await;
+        let opened = client
+            .call::<ListOpen>(&ListOpenParams {
+                kind: ListKind::Songs,
+                query: Query::default(),
+                window: None,
+                replaces: None,
+            })
+            .await
+            .unwrap();
+        let view = || PlaySource::View {
+            view: opened.view.clone(),
+        };
+        let play = PlaybackPlayParams {
+            idempotency_key: key(),
+            source: view(),
+            start: Some(0),
+            context: None,
+            shuffle: None,
+        };
+        let played = client.call::<PlaybackPlay>(&play).await.unwrap();
+        let add = QueueAddParams {
+            idempotency_key: key(),
+            source: view(),
+            place: QueuePlace::End,
+            context: None,
+            expected_revision: None,
+        };
+        let added = client.call::<QueueAdd>(&add).await.unwrap();
+        client
+            .call::<ListClose>(&ViewParams {
+                view: opened.view.clone(),
+            })
+            .await
+            .unwrap();
+        // The view has ended: what was done with it is still answered.
+        assert_eq!(client.call::<PlaybackPlay>(&play).await.unwrap(), played);
+        assert_eq!(client.call::<QueueAdd>(&add).await.unwrap(), added);
         server.stop().await.unwrap();
     })
     .await

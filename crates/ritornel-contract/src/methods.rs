@@ -277,9 +277,36 @@ methods! {
     PlaybackSkip: "playback.skip", Command, needs_full: false,
     PlaybackSkipParams => PlaybackChanged;
 
-    /// `queue.window`: a window of the queue, with its revision.
+    /// `playback.jump`: plays the entry it names now, from its beginning.
+    PlaybackJump: "playback.jump", Command, needs_full: false,
+    PlaybackJumpParams => PlaybackChanged;
+
+    /// `playback.set`: the player's settings, as absolute values: the
+    /// volume, whether it is muted, shuffle and repeat.
+    PlaybackSet: "playback.set", Command, needs_full: false,
+    PlaybackSetParams => PlaybackChanged;
+
+    /// `queue.window`: a window of the queue, in queue order, in play
+    /// order or from the entry after the current one, with its revision.
     QueueWindow: "queue.window", Query, needs_full: false,
     QueueWindowParams => QueueWindow;
+
+    /// `queue.add`: adds tracks after the current entry, at the end, or
+    /// after an entry it names.
+    QueueAdd: "queue.add", Command, needs_full: false,
+    QueueAddParams => PlaybackChanged;
+
+    /// `queue.remove`: takes entries out of the queue, by their IDs.
+    QueueRemove: "queue.remove", Command, needs_full: false,
+    QueueRemoveParams => PlaybackChanged;
+
+    /// `queue.move`: puts entries straight after another, by their IDs.
+    QueueMove: "queue.move", Command, needs_full: false,
+    QueueMoveParams => PlaybackChanged;
+
+    /// `queue.clear`: empties the queue and stops the player.
+    QueueClear: "queue.clear", Command, needs_full: false,
+    QueueClearParams => PlaybackChanged;
 
     /// `sources.tracks`: the tracks of the files in a folder of one of this
     /// server's roots, in the order they are played. It takes a path, so
@@ -317,6 +344,10 @@ methods! {
     TracksGet: "tracks.get", Query, needs_full: false,
     TrackGetParams => TrackDetail;
 
+    /// `ratings.set`: the listener's stars for a recording, or none.
+    RatingsSet: "ratings.set", Command, needs_full: true,
+    RatingSetParams => RatingSet;
+
     /// `lastfm.status`: whether this server has Last.fm, the account it is
     /// signed in to, and whether it scrobbles.
     LastfmStatusCall: "lastfm.status", Query, needs_full: true,
@@ -352,6 +383,13 @@ methods! {
     /// library, and the tracks the matcher was not sure of.
     LastfmReportCall: "lastfm.report", Query, needs_full: true,
     LastfmReportParams => LastfmReport;
+
+    /// `artists.importPictures`: adds a picture folder on this server as a
+    /// named root, if it is not one, and takes each artist's portrait from
+    /// it, dropping those it no longer chooses. The server only ever reads
+    /// it.
+    ArtistsImportPictures: "artists.importPictures", Command, needs_full: true,
+    ImportPicturesParams => PicturesImported;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -399,7 +437,13 @@ mod tests {
                 "playback.stop",
                 "playback.seek",
                 "playback.skip",
+                "playback.jump",
+                "playback.set",
                 "queue.window",
+                "queue.add",
+                "queue.remove",
+                "queue.move",
+                "queue.clear",
                 "sources.tracks",
                 "history.recent",
                 "history.onThisDay",
@@ -407,13 +451,15 @@ mod tests {
                 "history.zones",
                 "history.setZones",
                 "tracks.get",
+                "ratings.set",
                 "lastfm.status",
                 "lastfm.signInStart",
                 "lastfm.signInFinish",
                 "lastfm.signOut",
                 "lastfm.sync",
                 "lastfm.setScrobbling",
-                "lastfm.report"
+                "lastfm.report",
+                "artists.importPictures"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -443,23 +489,26 @@ mod tests {
                 "sources.tracks",
                 "history.rebuild",
                 "history.setZones",
+                "ratings.set",
                 "lastfm.status",
                 "lastfm.signInStart",
                 "lastfm.signInFinish",
                 "lastfm.signOut",
                 "lastfm.sync",
                 "lastfm.setScrobbling",
-                "lastfm.report"
+                "lastfm.report",
+                "artists.importPictures"
             ]
         );
         // Everything but reading the library and controlling playback
         // needs one, so no command is open to a limited session but the
-        // player's.
+        // player's and its queue's.
         for method in METHODS {
             assert!(
                 method.needs_full
                     || method.kind != MethodKind::Command
-                    || method.name.starts_with("playback."),
+                    || method.name.starts_with("playback.")
+                    || method.name.starts_with("queue."),
                 "{}",
                 method.name
             );

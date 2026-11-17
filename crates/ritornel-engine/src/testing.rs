@@ -63,3 +63,21 @@ impl Drop for Scratch {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Numbers drawn from a seed, the same on every run, for the stress tests.
+#[derive(Debug)]
+pub(crate) struct Draws(u64);
+
+impl Draws {
+    pub(crate) fn seeded(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+    }
+
+    /// A number from 0 up to, not including, `n`.
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n.max(1)
+    }
+}

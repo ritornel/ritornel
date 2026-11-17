@@ -50,8 +50,7 @@ pub struct ArtistGetParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ArtistPage {
-    /// The artist's row. Their `artId` is what their page is drawn from
-    /// until there are pictures of artists.
+    /// The artist's row. Their `artId` is what their page is drawn from.
     #[serde(flatten)]
     pub artist: ArtistRow,
     /// The colour of that picture. `null` when it has none, or it is close

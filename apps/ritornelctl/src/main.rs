@@ -14,6 +14,7 @@
     )
 )]
 
+mod artists;
 mod cli;
 mod history;
 mod identity;

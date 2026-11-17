@@ -4,8 +4,9 @@
 //! docs/design/server.md.
 //!
 //! `library.db` keeps a picture as the hash of its bytes, and where it came
-//! with: embedded in a file, or a folder image beside one. The bytes stay
-//! there, and are read with the scan's own reader. [`Covers::render`] finds a source that still has
+//! with: embedded in a file, a folder image beside one, or a file of a
+//! picture folder (an artist's portrait). The bytes stay there, and are
+//! read with the scan's own reader. [`Covers::render`] finds a source that still has
 //! them, decodes them, scales them to fit the size asked for, writes the
 //! result as a JPEG in `cache/tmp/`, syncs it and renames it into
 //! `cache/covers/`, where [`Covers::cached`] finds it next time. A cover
@@ -70,17 +71,27 @@ impl From<Error> for CoverError {
     }
 }
 
+/// Where in a file a picture is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Place {
+    /// Embedded in the audio file.
+    Embedded,
+    /// A folder image of this name beside the audio file.
+    FolderImage(String),
+    /// The file is the picture: a portrait in a picture folder.
+    Whole,
+}
+
 /// Where a picture's bytes may be read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     /// The file the picture came with: its root, by name, and its path
-    /// in it.
+    /// in it. A picture folder is a root of its own.
     pub root: String,
-    /// The path of the audio file, relative to the root.
+    /// The path of the file, relative to the root.
     pub path: String,
-    /// A folder image's name beside the file, or `None` for a picture
-    /// embedded in it.
-    pub folder_image: Option<String>,
+    /// Where in the file the picture is.
+    pub place: Place,
     /// The hash the scan recorded the picture by: what was read must
     /// have it.
     pub hash: Vec<u8>,
@@ -396,23 +407,48 @@ fn scale(decoded: &image::DynamicImage, size: u32) -> Result<Vec<u8>, CoverError
 fn read_source(roots: &[(String, String)], source: &Source) -> Option<Vec<u8>> {
     let (_, root) = roots.iter().find(|(name, _)| *name == source.root)?;
     let file = Path::new(root).join(&source.path);
-    match &source.folder_image {
-        Some(name) => {
-            let folder = file.parent()?;
-            std::fs::read(folder.join(name))
-                .ok()
-                .filter(|bytes| blake3::hash(bytes).as_bytes().as_slice() == source.hash)
-        }
-        None => crate::media::embedded_picture(&file, &source.hash),
+    let same = |bytes: &Vec<u8>| blake3::hash(bytes).as_bytes().as_slice() == source.hash;
+    match &source.place {
+        Place::FolderImage(name) => std::fs::read(file.parent()?.join(name)).ok().filter(same),
+        // A portrait is read as it was imported: inside its folder, a
+        // regular file of bounded size.
+        Place::Whole => crate::artist_pictures::read_inside(
+            Path::new(root),
+            &source.path,
+            crate::artist_pictures::PORTRAIT_CAP,
+        )
+        .ok()
+        .filter(same),
+        Place::Embedded => crate::media::embedded_picture(&file, &source.hash),
     }
 }
 
 impl LibraryStore {
-    /// Where the picture `art` may be read from, best first: the files it
-    /// came with that are still there, folder images before embedded ones,
-    /// by `revision_picture_picture`.
+    /// Where the picture `art` may be read from, best first: an artist's
+    /// portrait in a picture folder, by `artist_picture_picture`, then the
+    /// files it came with that are still there, folder images before
+    /// embedded ones, by `revision_picture_picture`.
     pub fn picture_sources(&self, art: Id) -> Result<Vec<Source>, Error> {
         self.read(move |connection: &Connection| {
+            let mut sources = Vec::new();
+            let mut statement = connection.prepare(
+                "SELECT f.name, ap.path, p.content_hash
+                 FROM picture p
+                 JOIN artist_picture ap ON ap.picture_id = p.id
+                 JOIN picture_folder f ON f.id = ap.folder_id
+                 WHERE p.public_id = ?1
+                 ORDER BY ap.id
+                 LIMIT 8",
+            )?;
+            let mut rows = statement.query([art.as_bytes()])?;
+            while let Some(row) = rows.next()? {
+                sources.push(Source {
+                    root: row.get(0)?,
+                    path: row.get(1)?,
+                    place: Place::Whole,
+                    hash: row.get(2)?,
+                });
+            }
             let mut statement = connection.prepare(
                 "SELECT lr.name, si.provider_key, rp.file_name, p.content_hash
                  FROM picture p
@@ -428,12 +464,12 @@ impl LibraryStore {
                  LIMIT 8",
             )?;
             let mut rows = statement.query([art.as_bytes()])?;
-            let mut sources = Vec::new();
             while let Some(row) = rows.next()? {
+                let folder_image: Option<String> = row.get(2)?;
                 sources.push(Source {
                     root: row.get(0)?,
                     path: row.get(1)?,
-                    folder_image: row.get(2)?,
+                    place: folder_image.map_or(Place::Embedded, Place::FolderImage),
                     hash: row.get(3)?,
                 });
             }
