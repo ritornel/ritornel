@@ -105,7 +105,10 @@ fn run(
         watch_stdin(stop.clone()).map_err(Error::Runtime)?;
     }
 
-    #[cfg(all(feature = "media-session", target_os = "macos"))]
+    #[cfg(all(
+        feature = "media-session",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     let media_session = jobs.playback.media_session;
     // Everything that can stop the server is being watched, so it may
     // start, and tell a client or a launcher where it is.
@@ -120,9 +123,12 @@ fn run(
     if let Some(per_second) = args.invent_churn {
         server.invent_churn(per_second)?;
     }
-    #[cfg(all(feature = "media-session", target_os = "macos"))]
+    #[cfg(all(
+        feature = "media-session",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     if media_session {
-        server.start_media_session()?;
+        server.start_media_session(runtime.handle())?;
     }
     info!(server_id = %server.server_id(), name = %server.name(), "ready");
     let ready = writeln!(
@@ -139,9 +145,15 @@ fn run(
     // loop, which the media keys need, and stopping stops that loop. `stop`
     // is still in scope, so the channel cannot close under the wait.
     if ready.is_ok() {
-        #[cfg(all(feature = "media-session", target_os = "macos"))]
+        #[cfg(all(
+            feature = "media-session",
+            any(target_os = "macos", target_os = "linux")
+        ))]
         let reason = crate::media_session::wait(stopped);
-        #[cfg(not(all(feature = "media-session", target_os = "macos")))]
+        #[cfg(not(all(
+            feature = "media-session",
+            any(target_os = "macos", target_os = "linux")
+        )))]
         let reason = stopped.recv().ok();
         info!(
             reason = reason.map_or("nothing left to wait for", Stop::as_str),

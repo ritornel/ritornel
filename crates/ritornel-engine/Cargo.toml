@@ -58,17 +58,18 @@ image = { version = "=0.25.10", default-features = false, features = ["jpeg", "p
 # The version the domain's normaliser pins.
 unicode-normalization = "=0.1.25"
 
-# The system's audio output. Only macOS has a player in M1: on Linux cpal
-# needs ALSA's development files, which the headless hub neither has nor
-# can use, so it is declared for macOS alone and the `audio-output` feature
-# does nothing elsewhere. See "Deferred" in docs/design/server.md.
-[target.'cfg(target_os = "macos")'.dependencies]
+# The system's audio output: CoreAudio on macOS, and ALSA on Linux, which
+# reaches PipeWire and PulseAudio through their ALSA plugins. On Linux cpal
+# links libasound, so a build with the feature needs ALSA's development
+# files (alsa-lib, or libasound2-dev). The headless hub is built without it
+# and links no audio library. See docs/design/platforms.md.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 cpal = { version = "=0.18.2", optional = true }
 
 [features]
 default = ["audio-output"]
 # Plays through the system's default output where the platform has one
-# built in (macOS). Without it, a server can still play into the null
+# (macOS and Linux). Without it, a server can still play into the null
 # output, which discards what it is given.
 audio-output = ["dep:cpal"]
 

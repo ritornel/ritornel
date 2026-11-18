@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use ritornel_contract::{
-    Id, PlaybackCommandParams, PlaybackSeekParams, PlaybackSkipParams, PlaybackStatus,
-    SkipDirection,
+    Id, PlaybackCommandParams, PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams,
+    PlaybackStatus, SkipDirection,
 };
 use tracing::warn;
 
@@ -20,6 +20,14 @@ impl Core {
     /// Shows the player's state in `session` from now on.
     pub(crate) fn attach_media_session(&self, session: MediaSession) {
         let _ = self.media_session.set(session);
+    }
+
+    /// Takes the media session off the system, if the server has one.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stop_media_session(&self) {
+        if let Some(session) = self.media_session.get() {
+            session.stop();
+        }
     }
 
     /// Shows the player's state, if the server has a media session.
@@ -43,6 +51,16 @@ impl Core {
                 (Key::Toggle, _) if playing => self.playback_pause(stores, &command),
                 (Key::Toggle | Key::Play, _) => self.playback_resume(stores, &command),
                 (Key::Pause, _) => self.playback_pause(stores, &command),
+                (Key::Volume(volume), _) => self.playback_set(
+                    stores,
+                    &PlaybackSetParams {
+                        idempotency_key,
+                        volume: Some(volume),
+                        muted: Some(false),
+                        shuffle: None,
+                        repeat: None,
+                    },
+                ),
                 (Key::Next | Key::Previous, Some(from_entry_id)) => self.playback_skip(
                     stores,
                     &PlaybackSkipParams {

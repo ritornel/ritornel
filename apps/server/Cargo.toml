@@ -7,20 +7,25 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["lastfm", "media-session"]
+default = ["audio-output", "lastfm", "media-session"]
+# The system's audio output, through the engine: CoreAudio on macOS and
+# ALSA on Linux, where it needs ALSA's development files to build. The
+# headless hub is built without it, links no audio library, and has no
+# player unless `--output null` asks for one. See docs/design/platforms.md.
+audio-output = ["ritornel-engine/audio-output"]
 # Last.fm: the import of a history, loved tracks, and scrobbling, through
 # `ritornel-lastfm`. A server built without it links no Last.fm code, and
 # CI builds it both ways. See docs/design/plugins.md.
 lastfm = ["dep:ritornel-lastfm", "dep:ritornel-source"]
-# The system's media session: Now Playing and the media keys, with `main`
-# blocking in the platform run loop. Only macOS has one in M1, so it does
-# nothing elsewhere, and the hub is built without it. See "OS integration"
-# in docs/design/playback.md.
-media-session = ["dep:souvlaki", "dep:objc2-core-foundation"]
+# The system's media session: Now Playing and the media keys on macOS,
+# with `main` blocking in the platform run loop, and MPRIS on the session
+# bus on Linux. The hub is built without it. See "OS integration" in
+# docs/design/playback.md.
+media-session = ["dep:souvlaki", "dep:objc2-core-foundation", "dep:zbus"]
 
 [dependencies]
 ritornel-contract.workspace = true
-ritornel-engine.workspace = true
+ritornel-engine = { workspace = true, default-features = false }
 ritornel-lastfm = { workspace = true, optional = true }
 ritornel-source = { workspace = true, optional = true }
 # The listener: HTTP routing and the WebSocket upgrade, over hyper and
@@ -65,6 +70,12 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 souvlaki = { version = "=0.9.3", default-features = false, optional = true }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFRunLoop"], optional = true }
+
+# MPRIS on Linux: the player as `org.mpris.MediaPlayer2.ritornel` on the
+# session bus, served from the server's own async runtime. zbus is pure
+# Rust, so it needs no libdbus. Pinned exactly: it is the whole adapter.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "=6.3.0", default-features = false, features = ["tokio", "service"], optional = true }
 
 [dev-dependencies]
 # The fake Last.fm the Last.fm tests run against.
