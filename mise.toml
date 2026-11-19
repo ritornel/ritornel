@@ -1,0 +1,88 @@
+# The Rust pin is rust-toolchain.toml. This file lists no Rust, because an
+# entry here would override that file, and the setting below is what makes
+# mise read it. See decision 28 in docs/design/server.md.
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+# For making the audio fixtures again, and the tones `scripts/desktop.sh
+# tones` plays. No aqua package provides ffmpeg; conda-forge builds it for
+# macOS and Linux.
+"conda:ffmpeg" = "9.0.2"
+# Checks every dependency's licence against deny.toml.
+"aqua:EmbarkStudios/cargo-deny" = "0.21.0"
+
+[tasks.build]
+description = "Build every crate and both programs, and on a Mac the desktop app"
+run = ["cargo build --locked --workspace --all-targets", { task = "desktop:app" }]
+
+[tasks.install]
+description = "Build in release and install it: the programs in ~/.local/bin, and on a Mac Ritornel.app, with its own server, in /Applications"
+run = [
+    "cargo build --locked --release --package ritornel-server --package ritornelctl",
+    { task = "desktop:app" },
+    "scripts/install.sh",
+]
+
+[tasks.check]
+description = "Run everything CI runs"
+run = [
+    { task = "fmt" },
+    { task = "deps" },
+    { task = "licenses" },
+    { task = "lint" },
+    { task = "test" },
+    { task = "desktop:check" },
+]
+
+[tasks.fmt]
+description = "Check formatting"
+run = "cargo fmt --all --check"
+
+[tasks.deps]
+description = "Check that dependencies point one way"
+run = "scripts/check-deps.sh"
+
+[tasks.licenses]
+description = "Check that every dependency's licence allows the app's, in the main workspace and the desktop app's"
+run = [
+    "cargo deny --manifest-path Cargo.toml --config deny.toml check licenses",
+    "cargo deny --manifest-path apps/desktop/Cargo.toml --config deny.toml check licenses",
+]
+
+[tasks.lint]
+description = "Run clippy with warnings denied, on the server with and without Last.fm"
+run = [
+    "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+    # The server as the headless hub may be built: without the plugin.
+    "cargo clippy --locked --package ritornel-server --no-default-features --all-targets -- -D warnings",
+]
+
+[tasks.test]
+description = "Run the tests"
+run = "cargo test --locked --workspace --all-features"
+
+[tasks.schema]
+description = "Write the schema snapshots in schema/ again from the migrations"
+run = "cargo test --locked --package ritornel-engine schema_snapshot"
+env = { RITORNEL_BLESS = "1" }
+
+[tasks.contract]
+description = "Write contract/contract.ts again from the Rust contract"
+run = "cargo test --locked --package ritornel-contract typescript"
+env = { RITORNEL_BLESS = "1" }
+
+# The desktop app, in GPUI, is a Cargo workspace of its own in apps/desktop,
+# checked and built on macOS only: anywhere else these say so and do
+# nothing. See scripts/desktop.sh.
+[tasks."desktop:check"]
+description = "Check, lint and test the desktop app, and build it"
+run = "scripts/desktop.sh check"
+
+[tasks."desktop:run"]
+description = "Run the desktop app against an invented library, never a real one"
+run = "scripts/desktop.sh run"
+
+[tasks."desktop:app"]
+description = "Build Ritornel.app, with its own server"
+run = "scripts/desktop.sh app"
