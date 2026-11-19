@@ -4,11 +4,7 @@
 --
 -- Migrations, each with the SHA-256 recorded when it is applied. A checksum
 -- that changes here means a migration that has shipped was edited.
---   0001_library  5a72aa0a6f7da030ece148d3b4669da867ca722f4c659f5600b47fd648100b45
---   0002_list_indexes  1789bf26cc0c33c9bb95b6c24293e838237ffe0695bdcc7a1818c0b79212d0cb
---   0003_listen_detail  826a650aaf9ac96b0cbf0365f3a06ad90c5df0af654ee21353fb4bd16220d1e0
---   0004_lastfm  bb5ed63f0f6797c6130d974d315612dfa8f1d4acaba1f32a2154d3af185c4397
---   0005_artist_pictures  37d0ab48d29602121e99cac1d33785c26f979be24cc3141233f15e323ce9757a
+--   0001_library  62cec2a19a590384d34a42a3b8b3bb1c4cabdcc21f7f7371bcd49f848bebee56
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -129,6 +125,10 @@ CREATE TABLE release (
   CHECK ((redirect_to_id IS NULL) = (canonical_id = id))
 ) STRICT;
 
+CREATE INDEX release_release_group ON release (release_group_id);
+
+CREATE INDEX release_display_artist_credit ON release (display_artist_credit_id);
+
 CREATE TABLE track_appearance (
   id                        INTEGER PRIMARY KEY,
   public_id                 BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
@@ -146,6 +146,34 @@ CREATE TABLE track_appearance (
   UNIQUE (id, recording_id),                                             -- the target of assignment's composite foreign key
   CHECK ((redirect_to_id IS NULL) = (canonical_id = id))
 ) STRICT;
+
+CREATE INDEX track_appearance_release ON track_appearance (release_id);
+
+CREATE TABLE picture_folder (
+  id                INTEGER PRIMARY KEY,
+  public_id         BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
+  server_id         INTEGER NOT NULL REFERENCES server(id),
+  name              TEXT NOT NULL,
+  created_at_ms     INTEGER NOT NULL,
+  rev               INTEGER NOT NULL,
+  UNIQUE (server_id, name)
+) STRICT;
+
+CREATE TABLE artist_picture (
+  id                INTEGER PRIMARY KEY,
+  artist_id         INTEGER NOT NULL REFERENCES artist(id),
+  kind              TEXT NOT NULL CHECK (kind IN ('portrait')),   -- the square picture for the circle and the banner
+  picture_id        INTEGER NOT NULL REFERENCES picture(id),
+  folder_id         INTEGER NOT NULL REFERENCES picture_folder(id),
+  path              TEXT NOT NULL,                                -- relative to the folder, such as '<mbid>/portrait.deezer.0a1b2c.jpg'
+  matched_by        TEXT NOT NULL CHECK (matched_by IN ('mbid', 'name')),   -- the artist's MusicBrainz ID, or their name where they have none
+  source            TEXT,                                         -- who supplied it, as the manifest says: 'theaudiodb', 'deezer', 'owner'
+  chosen_by         TEXT,                                         -- who chose it, as the manifest says: 'rule:v1', 'owner'
+  rev               INTEGER NOT NULL,
+  UNIQUE (artist_id, kind)
+) STRICT;
+
+CREATE INDEX artist_picture_picture ON artist_picture (picture_id);
 
 CREATE TABLE metadata_source (
   id                INTEGER PRIMARY KEY,
@@ -171,7 +199,7 @@ CREATE TABLE library_root (
 CREATE TABLE source_instance (
   id                INTEGER PRIMARY KEY,
   public_id         BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),   -- the contract's sourceId
-  kind              TEXT NOT NULL,                                         -- 'folder' in M1; later 'beets', 'device', 'lastfm', 'musicbrainz'
+  kind              TEXT NOT NULL,                                         -- 'folder' and 'lastfm' in M1; later 'beets', 'device', 'musicbrainz'
   name              TEXT NOT NULL,
   root_id           INTEGER UNIQUE REFERENCES library_root(id),            -- a folder's root, of kind 'master'; one folder per root
   created_at_ms     INTEGER NOT NULL,
@@ -183,7 +211,7 @@ CREATE TABLE source_item (
   id                    INTEGER PRIMARY KEY,
   public_id             BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
   source_instance_id    INTEGER NOT NULL REFERENCES source_instance(id),   -- for a file, the folder, which names the root
-  item_kind             TEXT NOT NULL,                              -- 'file' in M1; later 'device_object', 'scrobble_subject'
+  item_kind             TEXT NOT NULL,                              -- 'file' and 'scrobble_subject' in M1; later 'device_object'
   provider_key          TEXT NOT NULL,                              -- for a file, the path relative to the root; re-keyed when the file moves
   current_revision_id   INTEGER,                                    -- one of this item's own revisions, by the composite key below
   current_recording_id  INTEGER REFERENCES recording(id),           -- derived cache of the current assignment, for reads
@@ -241,6 +269,8 @@ CREATE TABLE identifier_claim (
   FOREIGN KEY (source_item_id, revision_id) REFERENCES source_item_revision (source_item_id, id)
 ) STRICT;
 
+CREATE INDEX identifier_claim_item ON identifier_claim (source_item_id, namespace);
+
 CREATE TABLE metadata_claim (
   id                  INTEGER PRIMARY KEY,
   source_item_id      INTEGER NOT NULL REFERENCES source_item(id),
@@ -273,6 +303,43 @@ CREATE UNIQUE INDEX metadata_edit_in_force
   ON metadata_edit (entity_kind, entity_id, field, ordinal)
   WHERE withdrawn_at_ms IS NULL;
 
+CREATE TABLE identity_decision (
+  id                   INTEGER PRIMARY KEY,
+  action               TEXT NOT NULL CHECK (action IN ('bind', 'merge', 'unmerge')),
+  source_item_id       INTEGER REFERENCES source_item(id),   -- bind: the item decided
+  entity_kind          TEXT CHECK (entity_kind IN ('recording', 'artist', 'release', 'track_appearance')),   -- merge and unmerge: what was redirected
+  entity_id            INTEGER,                              -- the row whose redirect was set or cleared
+  target_entity_id     INTEGER,                              -- merge: where it now points
+  method               TEXT NOT NULL CHECK (method IN ('user', 'same_audio', 'identifier', 'tags_duration', 'new', 'scrobble_text')),   -- scrobble_text: a text-only item bound by its artist and title
+  resolver_version     INTEGER NOT NULL,
+  normalizer_version   INTEGER NOT NULL,
+  score                REAL CHECK (score BETWEEN 0 AND 1),   -- a distance; 0 for exact methods, NULL for a user decision
+  runner_up_gap        REAL,                                 -- NULL with no runner-up
+  penalty_vector_json  TEXT,
+  evidence_json        TEXT NOT NULL,                        -- claims used (by namespace or field and value, never by row ID), candidates with distances, contradictions
+  needs_review         INTEGER NOT NULL DEFAULT 0 CHECK (needs_review IN (0, 1)),
+  actor_kind           TEXT NOT NULL CHECK (actor_kind IN ('resolver', 'person', 'agent')),
+  actor_session_pid    BLOB CHECK (length(actor_session_pid) = 16),
+  rationale            TEXT,
+  decided_at_ms        INTEGER NOT NULL,
+  rev                  INTEGER NOT NULL,
+  CHECK ((action = 'bind') = (source_item_id IS NOT NULL)),
+  CHECK ((action = 'bind') = (entity_kind IS NULL AND entity_id IS NULL)),
+  CHECK ((action = 'merge') = (target_entity_id IS NOT NULL))
+) STRICT;
+
+CREATE TRIGGER identity_decision_no_update
+BEFORE UPDATE ON identity_decision
+BEGIN
+  SELECT RAISE(ABORT, 'identity_decision is immutable');
+END;
+
+CREATE TRIGGER identity_decision_no_delete
+BEFORE DELETE ON identity_decision
+BEGIN
+  SELECT RAISE(ABORT, 'identity_decision is immutable');
+END;
+
 CREATE TABLE assignment (
   id                INTEGER PRIMARY KEY,
   source_item_id    INTEGER NOT NULL REFERENCES source_item(id),
@@ -288,6 +355,10 @@ CREATE TABLE assignment (
 
 CREATE UNIQUE INDEX assignment_current
   ON assignment (source_item_id)
+  WHERE superseded_at_ms IS NULL;
+
+CREATE INDEX assignment_current_appearance
+  ON assignment (appearance_id)
   WHERE superseded_at_ms IS NULL;
 
 CREATE TRIGGER assignment_no_rebind
@@ -390,6 +461,8 @@ CREATE TABLE revision_picture (
   CHECK ((source_kind = 'folder_image') = (file_name IS NOT NULL))
 ) STRICT;
 
+CREATE INDEX revision_picture_picture ON revision_picture (picture_id);
+
 CREATE VIRTUAL TABLE search_text USING fts5(
   title,
   artist,
@@ -417,7 +490,7 @@ CREATE TABLE listener (
 CREATE TABLE history_endpoint (
   id                INTEGER PRIMARY KEY,
   public_id         BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
-  kind              TEXT NOT NULL CHECK (kind IN ('player', 'device_log', 'service', 'import', 'manual')),   -- 'player' and 'manual' in M1
+  kind              TEXT NOT NULL CHECK (kind IN ('player', 'device_log', 'service', 'import', 'manual')),   -- 'player', 'manual' and 'service' in M1
   server_id         INTEGER REFERENCES server(id),   -- a player's server
   name              TEXT NOT NULL,
   rev               INTEGER NOT NULL,
@@ -427,6 +500,19 @@ CREATE TABLE history_endpoint (
 CREATE UNIQUE INDEX history_endpoint_player ON history_endpoint (server_id) WHERE kind = 'player';
 
 CREATE UNIQUE INDEX history_endpoint_manual ON history_endpoint (kind) WHERE kind = 'manual';
+
+CREATE TABLE service_account (
+  id                  INTEGER PRIMARY KEY,
+  public_id           BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
+  service             TEXT NOT NULL CHECK (service IN ('lastfm')),
+  account_name        TEXT NOT NULL,                                          -- as the service spells it; untrusted display text
+  listener_id         INTEGER NOT NULL REFERENCES listener(id),               -- whose plays and loves these are
+  endpoint_id         INTEGER NOT NULL UNIQUE REFERENCES history_endpoint(id),   -- of kind 'service': the account's plays are its observations
+  source_instance_id  INTEGER NOT NULL UNIQUE REFERENCES source_instance(id),    -- of the service's kind: what a play was of is one of its items
+  created_at_ms       INTEGER NOT NULL,
+  rev                 INTEGER NOT NULL,
+  UNIQUE (service, account_name COLLATE NOCASE)
+) STRICT;
 
 CREATE TABLE history_observation (
   id                  INTEGER PRIMARY KEY,
@@ -462,6 +548,54 @@ CREATE TABLE history_observation (
 
 CREATE INDEX history_observation_source_item ON history_observation (source_item_id);
 
+CREATE TABLE observation_listen (
+  observation_id            INTEGER PRIMARY KEY REFERENCES history_observation(id),
+  played_on_server_id       INTEGER NOT NULL REFERENCES server(id),          -- the server whose player made the sound
+  actor_session_pid         BLOB CHECK (length(actor_session_pid) = 16),     -- the client session that queued the track
+  source_revision_no        INTEGER NOT NULL CHECK (source_revision_no > 0),   -- which payload of the envelope's source item was heard
+  queued_appearance_id      INTEGER REFERENCES track_appearance(id),         -- a hint for display only; the recording always comes from the source item
+  audio_asset_id            INTEGER REFERENCES audio_asset(id),              -- the asset that played
+  copy_kind                 TEXT NOT NULL CHECK (copy_kind IN ('master', 'derived', 'stream_master', 'stream_transcode')),
+  started_at_utc_ms         INTEGER NOT NULL,                                -- the playing server's wall clock; its zone is on the envelope
+  ended_at_utc_ms           INTEGER NOT NULL,                                -- the same clock, which can have been set back since the start
+  started_mono_ms           INTEGER NOT NULL,                                -- the playing server's monotonic clock when the track started
+  ended_mono_ms             INTEGER,                                         -- the same clock at the end: for a crash, at the last checkpoint. NULL only for a listen recorded before the clock was kept
+  boot_id                   BLOB NOT NULL CHECK (length(boot_id) = 16),      -- the boot that clock counts from: the machine's, as its kernel names it, or the playing server's run where the machine's could not be read
+  start_reason              TEXT NOT NULL CHECK (start_reason IN ('user_pick', 'auto_advance', 'repeat', 'resume')),
+  continues_source_key      BLOB CHECK (length(continues_source_key) = 16),   -- the earlier listen on this endpoint that this one resumes
+  start_position_ms         INTEGER NOT NULL CHECK (start_position_ms >= 0),
+  end_position_ms           INTEGER NOT NULL CHECK (end_position_ms >= 0),
+  max_position_ms           INTEGER NOT NULL CHECK (max_position_ms >= 0),
+  track_duration_ms         INTEGER NOT NULL CHECK (track_duration_ms >= 0),
+  ms_played                 INTEGER NOT NULL CHECK (ms_played >= 0),         -- audio actually rendered
+  heard_ranges_json         TEXT NOT NULL CHECK (json_valid(heard_ranges_json)),   -- merged ranges of the track that were heard, with no cap on how many
+  heard_ranges_approximate  INTEGER NOT NULL CHECK (heard_ranges_approximate IN (0, 1)),   -- neighbouring ranges were joined to keep them under the player's cap
+  seek_count                INTEGER NOT NULL CHECK (seek_count >= 0),
+  pause_count               INTEGER NOT NULL CHECK (pause_count >= 0),
+  end_reason                TEXT NOT NULL CHECK (end_reason IN ('finished', 'next', 'previous', 'jump', 'replaced', 'removed', 'stopped', 'error', 'output_lost', 'shutdown', 'crash')),
+  context_kind              TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
+  context_ref               BLOB CHECK (length(context_ref) = 16),           -- public ID of the release, playlist, definition or agent session
+  shuffle                   INTEGER NOT NULL CHECK (shuffle IN (0, 1)),
+  rev                       INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX observation_listen_continues ON observation_listen (continues_source_key)
+  WHERE continues_source_key IS NOT NULL;
+
+CREATE TABLE observation_import (
+  observation_id    INTEGER PRIMARY KEY REFERENCES history_observation(id),
+  played_at_utc_ms  INTEGER NOT NULL,   -- when the service dates the play; for Last.fm its start, to the second
+  artist            TEXT NOT NULL,      -- what it was of, as the service spells it; the envelope's source item stands for the three
+  album             TEXT,
+  title             TEXT NOT NULL,
+  artist_mbid       TEXT,               -- the identifiers the service attached. They support a match and never make one alone
+  album_mbid        TEXT,
+  track_mbid        TEXT,
+  rev               INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX observation_import_played_at ON observation_import (played_at_utc_ms);
+
 CREATE TABLE observation_correction (
   observation_id      INTEGER PRIMARY KEY REFERENCES history_observation(id),
   verb                TEXT NOT NULL CHECK (verb IN ('exclude', 'set_listener', 'split', 'join', 'set_clock_offset', 'revoke')),
@@ -490,6 +624,20 @@ CREATE TABLE correction_target (
 
 CREATE INDEX correction_target_target ON correction_target (target_observation_id);
 
+CREATE TRIGGER observation_listen_kind
+BEFORE INSERT ON observation_listen
+WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'listen'
+BEGIN
+  SELECT RAISE(ABORT, 'observation_listen holds the detail of a listen and of nothing else');
+END;
+
+CREATE TRIGGER observation_import_kind
+BEFORE INSERT ON observation_import
+WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'import'
+BEGIN
+  SELECT RAISE(ABORT, 'observation_import holds the detail of an import record and of nothing else');
+END;
+
 CREATE TRIGGER observation_correction_kind
 BEFORE INSERT ON observation_correction
 WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'correction'
@@ -507,6 +655,30 @@ CREATE TRIGGER history_observation_no_delete
 BEFORE DELETE ON history_observation
 BEGIN
   SELECT RAISE(ABORT, 'history_observation is immutable: nothing is deleted');
+END;
+
+CREATE TRIGGER observation_listen_no_update
+BEFORE UPDATE ON observation_listen
+BEGIN
+  SELECT RAISE(ABORT, 'observation_listen is immutable: record a correction instead');
+END;
+
+CREATE TRIGGER observation_listen_no_delete
+BEFORE DELETE ON observation_listen
+BEGIN
+  SELECT RAISE(ABORT, 'observation_listen is immutable: nothing is deleted');
+END;
+
+CREATE TRIGGER observation_import_no_update
+BEFORE UPDATE ON observation_import
+BEGIN
+  SELECT RAISE(ABORT, 'observation_import is immutable: record a correction instead');
+END;
+
+CREATE TRIGGER observation_import_no_delete
+BEFORE DELETE ON observation_import
+BEGIN
+  SELECT RAISE(ABORT, 'observation_import is immutable: nothing is deleted');
 END;
 
 CREATE TRIGGER observation_correction_no_update
@@ -584,92 +756,44 @@ CREATE TABLE history_ingest_conflict (
   rev                      INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE play_event_observation (
-  id              INTEGER PRIMARY KEY,
-  play_event_id   INTEGER NOT NULL REFERENCES play_event(id),
-  observation_id  INTEGER NOT NULL REFERENCES history_observation(id),
-  role            TEXT NOT NULL CHECK (role IN ('primary', 'corroborating')),   -- the primary supplies time, played time and outcome
-  rev             INTEGER NOT NULL,
-  UNIQUE (play_event_id, observation_id)
+CREATE TABLE history_cursor (
+  id             INTEGER PRIMARY KEY,
+  endpoint_id    INTEGER NOT NULL UNIQUE REFERENCES history_endpoint(id),
+  cursor_json    TEXT NOT NULL CHECK (json_valid(cursor_json)),
+  updated_at_ms  INTEGER NOT NULL,
+  rev            INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX play_event_observation_observation ON play_event_observation (observation_id);
-
-CREATE VIEW play_effective AS
-SELECT
-  listener_id,
-  recording_id,
-  event_at_utc_ms,
-  NULL AS not_before_ms,
-  NULL AS not_after_ms,
-  id   AS play_event_id
-FROM play_event
-WHERE counts = 1 AND excluded = 0 AND event_at_utc_ms IS NOT NULL;
-
-CREATE INDEX track_appearance_release ON track_appearance (release_id);
-
-CREATE INDEX release_release_group ON release (release_group_id);
-
-CREATE INDEX release_display_artist_credit ON release (display_artist_credit_id);
-
-CREATE INDEX assignment_current_appearance
-  ON assignment (appearance_id)
-  WHERE superseded_at_ms IS NULL;
-
-CREATE INDEX revision_picture_picture ON revision_picture (picture_id);
-
-CREATE TABLE observation_listen (
-  observation_id            INTEGER PRIMARY KEY REFERENCES history_observation(id),
-  played_on_server_id       INTEGER NOT NULL REFERENCES server(id),          -- the server whose player made the sound
-  actor_session_pid         BLOB CHECK (length(actor_session_pid) = 16),     -- the client session that queued the track
-  source_revision_no        INTEGER NOT NULL CHECK (source_revision_no > 0),   -- which payload of the envelope's source item was heard
-  queued_appearance_id      INTEGER REFERENCES track_appearance(id),         -- a hint for display only; the recording always comes from the source item
-  audio_asset_id            INTEGER REFERENCES audio_asset(id),              -- the asset that played
-  copy_kind                 TEXT NOT NULL CHECK (copy_kind IN ('master', 'derived', 'stream_master', 'stream_transcode')),
-  started_at_utc_ms         INTEGER NOT NULL,                                -- the playing server's wall clock; its zone is on the envelope
-  ended_at_utc_ms           INTEGER NOT NULL,                                -- the same clock, which can have been set back since the start
-  started_mono_ms           INTEGER NOT NULL,                                -- the playing server's monotonic clock when the track started
-  ended_mono_ms             INTEGER,                                         -- the same clock at the end: for a crash, at the last checkpoint. NULL only for a listen recorded before migration 0003
-  boot_id                   BLOB NOT NULL CHECK (length(boot_id) = 16),      -- the boot that clock counts from: the machine's, as its kernel names it, or the playing server's run where the machine's could not be read
-  start_reason              TEXT NOT NULL CHECK (start_reason IN ('user_pick', 'auto_advance', 'repeat', 'resume')),
-  continues_source_key      BLOB CHECK (length(continues_source_key) = 16),   -- the earlier listen on this endpoint that this one resumes
-  start_position_ms         INTEGER NOT NULL CHECK (start_position_ms >= 0),
-  end_position_ms           INTEGER NOT NULL CHECK (end_position_ms >= 0),
-  max_position_ms           INTEGER NOT NULL CHECK (max_position_ms >= 0),
-  track_duration_ms         INTEGER NOT NULL CHECK (track_duration_ms >= 0),
-  ms_played                 INTEGER NOT NULL CHECK (ms_played >= 0),         -- audio actually rendered
-  heard_ranges_json         TEXT NOT NULL CHECK (json_valid(heard_ranges_json)),   -- merged ranges of the track that were heard, with no cap on how many
-  heard_ranges_approximate  INTEGER NOT NULL CHECK (heard_ranges_approximate IN (0, 1)),   -- neighbouring ranges were joined to keep them under the player's cap
-  seek_count                INTEGER NOT NULL CHECK (seek_count >= 0),
-  pause_count               INTEGER NOT NULL CHECK (pause_count >= 0),
-  end_reason                TEXT NOT NULL CHECK (end_reason IN ('finished', 'next', 'previous', 'jump', 'replaced', 'removed', 'stopped', 'error', 'output_lost', 'shutdown', 'crash')),
-  context_kind              TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
-  context_ref               BLOB CHECK (length(context_ref) = 16),           -- public ID of the release, playlist, definition or agent session
-  shuffle                   INTEGER NOT NULL CHECK (shuffle IN (0, 1)),
-  rev                       INTEGER NOT NULL
+CREATE TABLE history_delivery (
+  id                  INTEGER PRIMARY KEY,
+  observation_id      INTEGER NOT NULL REFERENCES history_observation(id),   -- the play's primary observation: a listen
+  endpoint_id         INTEGER NOT NULL REFERENCES history_endpoint(id),      -- the destination, a service account's endpoint
+  state               TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'accepted', 'ignored', 'refused', 'unknown', 'withdrawn')),   -- 'sending' is written before the request leaves; 'accepted' and 'ignored' are the service's answers, final and apart; 'withdrawn' was never sent, because its play was no longer eligible when its turn came
+  sent_timestamp_s    INTEGER NOT NULL,   -- the time it is sent with, in seconds: what its echo is matched on
+  artist              TEXT NOT NULL,      -- what it is sent as
+  title               TEXT NOT NULL,
+  album               TEXT,
+  album_artist        TEXT,
+  track_number        INTEGER,
+  duration_ms         INTEGER,
+  accepted_artist     TEXT,               -- the names the service took it under, which it may have corrected
+  accepted_title      TEXT,
+  ignored_code        INTEGER,            -- the service's reason, as it sent it
+  detail              TEXT,               -- the service's message, or why it was not sent or was withdrawn
+  attempts            INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at_ms  INTEGER,            -- when a pending row is next due
+  created_at_ms       INTEGER NOT NULL,
+  updated_at_ms       INTEGER NOT NULL,
+  rev                 INTEGER NOT NULL,
+  UNIQUE (observation_id, endpoint_id),
+  CHECK ((state = 'accepted') = (accepted_artist IS NOT NULL AND accepted_title IS NOT NULL)),
+  CHECK ((state = 'ignored') = (ignored_code IS NOT NULL))
 ) STRICT;
 
-CREATE TRIGGER observation_listen_kind
-BEFORE INSERT ON observation_listen
-WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'listen'
-BEGIN
-  SELECT RAISE(ABORT, 'observation_listen holds the detail of a listen and of nothing else');
-END;
+CREATE INDEX history_delivery_echo ON history_delivery (endpoint_id, sent_timestamp_s);
 
-CREATE TRIGGER observation_listen_no_update
-BEFORE UPDATE ON observation_listen
-BEGIN
-  SELECT RAISE(ABORT, 'observation_listen is immutable: record a correction instead');
-END;
-
-CREATE TRIGGER observation_listen_no_delete
-BEFORE DELETE ON observation_listen
-BEGIN
-  SELECT RAISE(ABORT, 'observation_listen is immutable: nothing is deleted');
-END;
-
-CREATE INDEX observation_listen_continues ON observation_listen (continues_source_key)
-  WHERE continues_source_key IS NOT NULL;
+CREATE INDEX history_delivery_due ON history_delivery (endpoint_id, next_attempt_at_ms)
+  WHERE state = 'pending';
 
 CREATE TABLE play_event (
   id                  INTEGER PRIMARY KEY,
@@ -717,152 +841,24 @@ CREATE INDEX play_event_counted ON play_event (listener_id, recording_id, event_
 
 CREATE INDEX play_event_on_this_day ON play_event (listener_id, month_day, local_date);
 
-CREATE TABLE identity_decision (
-  id                   INTEGER PRIMARY KEY,
-  action               TEXT NOT NULL CHECK (action IN ('bind', 'merge', 'unmerge')),
-  source_item_id       INTEGER REFERENCES source_item(id),   -- bind: the item decided
-  entity_kind          TEXT CHECK (entity_kind IN ('recording', 'artist', 'release', 'track_appearance')),   -- merge and unmerge: what was redirected
-  entity_id            INTEGER,                              -- the row whose redirect was set or cleared
-  target_entity_id     INTEGER,                              -- merge: where it now points
-  method               TEXT NOT NULL CHECK (method IN ('user', 'same_audio', 'identifier', 'tags_duration', 'new', 'scrobble_text')),   -- scrobble_text: a text-only item bound by its artist and title
-  resolver_version     INTEGER NOT NULL,
-  normalizer_version   INTEGER NOT NULL,
-  score                REAL CHECK (score BETWEEN 0 AND 1),   -- a distance; 0 for exact methods, NULL for a user decision
-  runner_up_gap        REAL,                                 -- NULL with no runner-up
-  penalty_vector_json  TEXT,
-  evidence_json        TEXT NOT NULL,                        -- claims used (by namespace or field and value, never by row ID), candidates with distances, contradictions
-  needs_review         INTEGER NOT NULL DEFAULT 0 CHECK (needs_review IN (0, 1)),
-  actor_kind           TEXT NOT NULL CHECK (actor_kind IN ('resolver', 'person', 'agent')),
-  actor_session_pid    BLOB CHECK (length(actor_session_pid) = 16),
-  rationale            TEXT,
-  decided_at_ms        INTEGER NOT NULL,
-  rev                  INTEGER NOT NULL,
-  CHECK ((action = 'bind') = (source_item_id IS NOT NULL)),
-  CHECK ((action = 'bind') = (entity_kind IS NULL AND entity_id IS NULL)),
-  CHECK ((action = 'merge') = (target_entity_id IS NOT NULL))
+CREATE TABLE play_event_observation (
+  id              INTEGER PRIMARY KEY,
+  play_event_id   INTEGER NOT NULL REFERENCES play_event(id),
+  observation_id  INTEGER NOT NULL REFERENCES history_observation(id),
+  role            TEXT NOT NULL CHECK (role IN ('primary', 'corroborating')),   -- the primary supplies time, played time and outcome
+  rev             INTEGER NOT NULL,
+  UNIQUE (play_event_id, observation_id)
 ) STRICT;
 
-CREATE TRIGGER identity_decision_no_update
-BEFORE UPDATE ON identity_decision
-BEGIN
-  SELECT RAISE(ABORT, 'identity_decision is immutable');
-END;
+CREATE INDEX play_event_observation_observation ON play_event_observation (observation_id);
 
-CREATE TRIGGER identity_decision_no_delete
-BEFORE DELETE ON identity_decision
-BEGIN
-  SELECT RAISE(ABORT, 'identity_decision is immutable');
-END;
-
-CREATE TABLE service_account (
-  id                  INTEGER PRIMARY KEY,
-  public_id           BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
-  service             TEXT NOT NULL CHECK (service IN ('lastfm')),
-  account_name        TEXT NOT NULL,                                          -- as the service spells it; untrusted display text
-  listener_id         INTEGER NOT NULL REFERENCES listener(id),               -- whose plays and loves these are
-  endpoint_id         INTEGER NOT NULL UNIQUE REFERENCES history_endpoint(id),   -- of kind 'service': the account's plays are its observations
-  source_instance_id  INTEGER NOT NULL UNIQUE REFERENCES source_instance(id),    -- of the service's kind: what a play was of is one of its items
-  created_at_ms       INTEGER NOT NULL,
-  rev                 INTEGER NOT NULL,
-  UNIQUE (service, account_name COLLATE NOCASE)
-) STRICT;
-
-CREATE TABLE observation_import (
-  observation_id    INTEGER PRIMARY KEY REFERENCES history_observation(id),
-  played_at_utc_ms  INTEGER NOT NULL,   -- when the service dates the play; for Last.fm its start, to the second
-  artist            TEXT NOT NULL,      -- what it was of, as the service spells it; the envelope's source item stands for the three
-  album             TEXT,
-  title             TEXT NOT NULL,
-  artist_mbid       TEXT,               -- the identifiers the service attached. They support a match and never make one alone
-  album_mbid        TEXT,
-  track_mbid        TEXT,
-  rev               INTEGER NOT NULL
-) STRICT;
-
-CREATE INDEX observation_import_played_at ON observation_import (played_at_utc_ms);
-
-CREATE TRIGGER observation_import_kind
-BEFORE INSERT ON observation_import
-WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'import'
-BEGIN
-  SELECT RAISE(ABORT, 'observation_import holds the detail of an import record and of nothing else');
-END;
-
-CREATE TRIGGER observation_import_no_update
-BEFORE UPDATE ON observation_import
-BEGIN
-  SELECT RAISE(ABORT, 'observation_import is immutable: record a correction instead');
-END;
-
-CREATE TRIGGER observation_import_no_delete
-BEFORE DELETE ON observation_import
-BEGIN
-  SELECT RAISE(ABORT, 'observation_import is immutable: nothing is deleted');
-END;
-
-CREATE TABLE history_cursor (
-  id             INTEGER PRIMARY KEY,
-  endpoint_id    INTEGER NOT NULL UNIQUE REFERENCES history_endpoint(id),
-  cursor_json    TEXT NOT NULL CHECK (json_valid(cursor_json)),
-  updated_at_ms  INTEGER NOT NULL,
-  rev            INTEGER NOT NULL
-) STRICT;
-
-CREATE TABLE history_delivery (
-  id                  INTEGER PRIMARY KEY,
-  observation_id      INTEGER NOT NULL REFERENCES history_observation(id),   -- the play's primary observation: a listen
-  endpoint_id         INTEGER NOT NULL REFERENCES history_endpoint(id),      -- the destination, a service account's endpoint
-  state               TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'accepted', 'ignored', 'refused', 'unknown', 'withdrawn')),   -- 'sending' is written before the request leaves; 'accepted' and 'ignored' are the service's answers, final and apart; 'withdrawn' was never sent, because its play was no longer eligible when its turn came
-  sent_timestamp_s    INTEGER NOT NULL,   -- the time it is sent with, in seconds: what its echo is matched on
-  artist              TEXT NOT NULL,      -- what it is sent as
-  title               TEXT NOT NULL,
-  album               TEXT,
-  album_artist        TEXT,
-  track_number        INTEGER,
-  duration_ms         INTEGER,
-  accepted_artist     TEXT,               -- the names the service took it under, which it may have corrected
-  accepted_title      TEXT,
-  ignored_code        INTEGER,            -- the service's reason, as it sent it
-  detail              TEXT,               -- the service's message, or why it was not sent or was withdrawn
-  attempts            INTEGER NOT NULL DEFAULT 0,
-  next_attempt_at_ms  INTEGER,            -- when a pending row is next due
-  created_at_ms       INTEGER NOT NULL,
-  updated_at_ms       INTEGER NOT NULL,
-  rev                 INTEGER NOT NULL,
-  UNIQUE (observation_id, endpoint_id),
-  CHECK ((state = 'accepted') = (accepted_artist IS NOT NULL AND accepted_title IS NOT NULL)),
-  CHECK ((state = 'ignored') = (ignored_code IS NOT NULL))
-) STRICT;
-
-CREATE INDEX history_delivery_echo ON history_delivery (endpoint_id, sent_timestamp_s);
-
-CREATE INDEX history_delivery_due ON history_delivery (endpoint_id, next_attempt_at_ms)
-  WHERE state = 'pending';
-
-CREATE TABLE picture_folder (
-  id                INTEGER PRIMARY KEY,
-  public_id         BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
-  server_id         INTEGER NOT NULL REFERENCES server(id),
-  name              TEXT NOT NULL,
-  created_at_ms     INTEGER NOT NULL,
-  rev               INTEGER NOT NULL,
-  UNIQUE (server_id, name)
-) STRICT;
-
-CREATE TABLE artist_picture (
-  id                INTEGER PRIMARY KEY,
-  artist_id         INTEGER NOT NULL REFERENCES artist(id),
-  kind              TEXT NOT NULL CHECK (kind IN ('portrait')),   -- the square picture for the circle and the banner
-  picture_id        INTEGER NOT NULL REFERENCES picture(id),
-  folder_id         INTEGER NOT NULL REFERENCES picture_folder(id),
-  path              TEXT NOT NULL,                                -- relative to the folder, such as '<mbid>/portrait.deezer.0a1b2c.jpg'
-  matched_by        TEXT NOT NULL CHECK (matched_by IN ('mbid', 'name')),   -- the artist's MusicBrainz ID, or their name where they have none
-  source            TEXT,                                         -- who supplied it, as the manifest says: 'theaudiodb', 'deezer', 'owner'
-  chosen_by         TEXT,                                         -- who chose it, as the manifest says: 'rule:v1', 'owner'
-  rev               INTEGER NOT NULL,
-  UNIQUE (artist_id, kind)
-) STRICT;
-
-CREATE INDEX artist_picture_picture ON artist_picture (picture_id);
-
-CREATE INDEX identifier_claim_item ON identifier_claim (source_item_id, namespace);
+CREATE VIEW play_effective AS
+SELECT
+  listener_id,
+  recording_id,
+  event_at_utc_ms,
+  NULL AS not_before_ms,
+  NULL AS not_after_ms,
+  id   AS play_event_id
+FROM play_event
+WHERE counts = 1 AND excluded = 0 AND event_at_utc_ms IS NOT NULL;

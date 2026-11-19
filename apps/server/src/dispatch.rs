@@ -1242,7 +1242,7 @@ mod tests {
                     "server": env!("CARGO_PKG_VERSION"),
                     "contract": CONTRACT_VERSION,
                     "sqlite": "3.54.1",
-                    "serverSchema": 5,
+                    "serverSchema": 1,
                 },
                 // There is no library, so nothing is said of one.
                 "freeDisk": { "dataBytes": free },
@@ -1289,8 +1289,8 @@ mod tests {
                 "server": env!("CARGO_PKG_VERSION"),
                 "contract": CONTRACT_VERSION,
                 "sqlite": "3.54.1",
-                "serverSchema": 5,
-                "librarySchema": 5,
+                "serverSchema": 1,
+                "librarySchema": 1,
             })
         );
         assert_eq!(

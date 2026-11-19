@@ -692,192 +692,6 @@ fn a_play_follows_its_file_when_a_rescan_binds_the_file_elsewhere() {
     assert_eq!(rig.library.derived_history().unwrap(), incremental);
 }
 
-/// A `library.db` as the second migration left it, with nine listens of the
-/// invented album and the eight plays derived from them.
-const SAVED_LIBRARY_0002: &str = include_str!("../../saved/library/0002.sql");
-
-fn schema_of(connection: &Connection) -> Vec<String> {
-    connection
-        .prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap()
-}
-
-#[test]
-fn the_saved_library_with_listens_is_one_the_first_two_migrations_made() {
-    let saved = Connection::open_in_memory().unwrap();
-    saved.execute_batch(SAVED_LIBRARY_0002).unwrap();
-    let mut made = Connection::open_in_memory().unwrap();
-    crate::migrate::run(
-        &mut made,
-        crate::migrate::LIBRARY.get(..2).unwrap(),
-        &FixedClock::at(T0),
-    )
-    .unwrap();
-    assert_eq!(schema_of(&saved), schema_of(&made));
-}
-
-#[test]
-fn a_library_saved_with_listens_is_taken_forward_with_its_listens_and_plays() {
-    let scratch = crate::testing::Scratch::new();
-    let path = scratch.path().join("library.db");
-    let saved = Connection::open(&path).unwrap();
-    saved.execute_batch(SAVED_LIBRARY_0002).unwrap();
-    let count = |connection: &Connection, table: &str| -> i64 {
-        connection
-            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                row.get(0)
-            })
-            .unwrap()
-    };
-    let tables = [
-        "history_observation",
-        "observation_listen",
-        "play_event",
-        "play_event_observation",
-    ];
-    let before: Vec<i64> = tables.iter().map(|table| count(&saved, table)).collect();
-    assert_eq!(before, [9, 9, 8, 9]);
-    let derived_before = derived(&saved).unwrap();
-    let listens_before: Vec<String> = saved
-        .prepare(
-            "SELECT observation_id || '|' || ms_played || '|' || end_reason || '|' ||
-                    heard_ranges_json || '|' || ifnull(hex(continues_source_key), '')
-             FROM observation_listen ORDER BY observation_id",
-        )
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    drop(saved);
-
-    // The server that made it, made again the same way, a month on.
-    let clock = Arc::new(FixedClock::at(T0));
-    let entropy = Arc::new(CountingEntropy::default());
-    let servers = ServerStore::open_in_memory(clock.clone(), entropy.clone()).unwrap();
-    let (server, _) = servers.ensure_identity("desk").unwrap();
-    clock.set(T0 + 30 * 24 * 60 * MINUTE);
-    let library = LibraryStore::open(&path, server.server_id, clock.clone(), entropy).unwrap();
-    assert_eq!(
-        (library.migrations_applied(), library.schema_version()),
-        (3, 5)
-    );
-
-    library
-        .read(|connection| {
-            // Every row is there, as it was.
-            let after: Vec<i64> = tables
-                .iter()
-                .map(|table| count(connection, table))
-                .collect();
-            assert_eq!(after, before);
-            assert_eq!(derived(connection)?, derived_before);
-            let listens_after: Vec<String> = connection
-                .prepare(
-                    "SELECT observation_id || '|' || ms_played || '|' || end_reason || '|' ||
-                            heard_ranges_json || '|' || ifnull(hex(continues_source_key), '')
-                     FROM observation_listen ORDER BY observation_id",
-                )?
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<_, _>>()?;
-            assert_eq!(listens_after, listens_before);
-            // No listen then kept its end clock, and none was approximate,
-            // as each stored record says.
-            let (no_end_clock, approximate): (i64, i64) = connection.query_row(
-                "SELECT count(*) FILTER (WHERE ended_mono_ms IS NULL),
-                        count(*) FILTER (WHERE heard_ranges_approximate = 1)
-                 FROM observation_listen",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            assert_eq!((no_end_clock, approximate), (9, 0));
-            // Nothing points nowhere, and the file is whole.
-            let dangling: i64 = connection.query_row(
-                "SELECT count(*) FROM pragma_foreign_key_check",
-                [],
-                |row| row.get(0),
-            )?;
-            let whole: String =
-                connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-            assert_eq!((dangling, whole.as_str()), (0, "ok"));
-            // A listen is still immutable.
-            assert!(
-                connection
-                    .execute("UPDATE observation_listen SET ms_played = 1", [])
-                    .is_err()
-            );
-            assert!(
-                connection
-                    .execute("DELETE FROM observation_listen", [])
-                    .is_err()
-            );
-            // The listen a resume continues is found by the new index.
-            let plan: Vec<String> = connection
-                .prepare(
-                    "EXPLAIN QUERY PLAN SELECT observation_id FROM observation_listen
-                     WHERE continues_source_key = x'00'",
-                )?
-                .query_map([], |row| row.get(3))?
-                .collect::<Result<_, _>>()?;
-            assert!(
-                plan.iter()
-                    .any(|step| step.contains("observation_listen_continues")),
-                "{plan:?}"
-            );
-            // The tables are the ones a new library is made with.
-            let fresh = Connection::open_in_memory()?;
-            let mut fresh = fresh;
-            crate::migrate::run(&mut fresh, crate::migrate::LIBRARY, &FixedClock::at(T0))?;
-            assert_eq!(schema_of(connection), schema_of(&fresh));
-            Ok(())
-        })
-        .unwrap();
-
-    // The plays carried across are the plays the listens derive.
-    let rebuilt = library
-        .rebuild_history(
-            WriteRequest {
-                method: "history.rebuild",
-                command: None,
-                client: None,
-            },
-            true,
-            |rebuilt| format!("{}|{}|{}", rebuilt.before, rebuilt.after, rebuilt.changed),
-        )
-        .unwrap();
-    assert_eq!(rebuilt, "8|8|0");
-
-    // A listen begun from an artist's page that lost its output is taken.
-    let stored: String = library
-        .read(|connection| {
-            Ok(connection.query_row(
-                "SELECT payload_json FROM history_observation ORDER BY id LIMIT 1",
-                [],
-                |row| row.get(0),
-            )?)
-        })
-        .unwrap();
-    let mut record: ListenRecord = serde_json::from_str(&stored).unwrap();
-    record.listen_id = Id::from_bytes([0xe1; 16]);
-    record.continues = None;
-    record.context_kind = "artist".to_owned();
-    record.end_reason = "output_lost".to_owned();
-    record.ended_mono_ms = Some(record.started_mono_ms + record.ms_played);
-    let stamps = SendStamps {
-        sent_at_ms: T0 + 30 * 24 * 60 * MINUTE,
-        sent_mono_ms: record.started_mono_ms + 60 * MINUTE,
-        sent_boot: record.boot,
-    };
-    assert!(matches!(
-        library.ingest_listen(&record, stamps).unwrap(),
-        Ingested::Stored(_)
-    ));
-}
-
 #[test]
 fn a_wait_for_the_writer_is_added_neither_to_a_plays_date_nor_to_the_senders_skew() {
     let at = library();
@@ -937,130 +751,239 @@ fn recent_history_pages_through_plays_that_share_an_instant() {
     assert_eq!(ids(&paged), ids(&all));
 }
 
-/// A `library.db` as the third migration left it: the library of
-/// [`SAVED_LIBRARY_0002`] taken forward one migration.
-const SAVED_LIBRARY_0003: &str = include_str!("../../saved/library/0003.sql");
-
+/// Listens a build that kept no monotonic clock at a checkpoint or an end
+/// staged, as a database from then still holds them: a crash it left open,
+/// with no clock reading at its last checkpoint, its resume in the next
+/// boot and a listen of its own, both closed and waiting for the hub with
+/// no end clock. The next run closes the open one as a crash, and all three
+/// are delivered. They reach the library with no end clock, as every listen
+/// it took from such a build has, and make the plays they made then.
 #[test]
-fn the_saved_library_at_the_third_migration_is_one_the_first_three_made() {
-    let saved = Connection::open_in_memory().unwrap();
-    saved.execute_batch(SAVED_LIBRARY_0003).unwrap();
-    let mut made = Connection::open_in_memory().unwrap();
-    crate::migrate::run(
-        &mut made,
-        crate::migrate::LIBRARY.get(..3).unwrap(),
-        &FixedClock::at(T0),
-    )
-    .unwrap();
-    assert_eq!(schema_of(&saved), schema_of(&made));
-}
-
-#[test]
-fn a_library_saved_at_the_third_migration_keeps_its_decisions_and_plays_through_the_fourth() {
-    let scratch = crate::testing::Scratch::new();
-    let path = scratch.path().join("library.db");
-    let saved = Connection::open(&path).unwrap();
-    saved.execute_batch(SAVED_LIBRARY_0003).unwrap();
-    let rows = |connection: &Connection, sql: &str| -> Vec<String> {
-        connection
-            .prepare(sql)
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
-    const DECISIONS: &str =
-        "SELECT id || '|' || action || '|' || ifnull(source_item_id, '') || '|' ||
-                method || '|' || evidence_json || '|' || rev FROM identity_decision ORDER BY id";
-    const ASSIGNED: &str = "SELECT id || '|' || decision_id FROM assignment ORDER BY id";
-    let decisions = rows(&saved, DECISIONS);
-    let assigned = rows(&saved, ASSIGNED);
-    assert_eq!((decisions.len(), assigned.len()), (4, 4));
-    let derived_before = derived(&saved).unwrap();
-    drop(saved);
-
-    let clock = Arc::new(FixedClock::at(T0));
-    let entropy = Arc::new(CountingEntropy::default());
-    let servers = ServerStore::open_in_memory(clock.clone(), entropy.clone()).unwrap();
-    let (server, _) = servers.ensure_identity("desk").unwrap();
-    let library = LibraryStore::open(&path, server.server_id, clock.clone(), entropy).unwrap();
-    assert_eq!(
-        (library.migrations_applied(), library.schema_version()),
-        (2, 5)
+fn listens_staged_with_no_clock_readings_are_closed_delivered_and_make_the_plays_they_did() {
+    let at = library();
+    let servers =
+        ServerStore::open_in_memory(at.clock.clone(), Arc::new(CountingEntropy::default()))
+            .unwrap();
+    let (crash, resume, whole) = (
+        Id::from_bytes([0xe3; 16]),
+        Id::from_bytes([0xe4; 16]),
+        Id::from_bytes([0xe5; 16]),
     );
-    library
-        .read(|connection| {
-            assert_eq!(rows(connection, DECISIONS), decisions);
-            assert_eq!(rows(connection, ASSIGNED), assigned);
-            assert_eq!(derived(connection)?, derived_before);
-            // The rebuilt table keeps its triggers, and what points at it
-            // points at it.
-            let dangling: i64 = connection.query_row(
-                "SELECT count(*) FROM pragma_foreign_key_check",
-                [],
-                |row| row.get(0),
-            )?;
-            assert_eq!(dangling, 0);
-            let refused = connection.execute("DELETE FROM identity_decision", []);
-            assert!(refused.is_err());
+    let (second, first) = (at.tracks[1], at.tracks[0]);
+    let (listener, server) = (at.listener, at.server.server_id);
+    let (boot, next_boot) = (BOOT, Id::from_bytes([0xb1; 16]));
+    struct Old {
+        listen: Id,
+        track: (Id, Id, Id),
+        length: i64,
+        boot: Id,
+        continues: Option<Id>,
+        start: i64,
+        mono: i64,
+        from: i64,
+        heard: i64,
+        /// None for the one left open.
+        end_reason: Option<&'static str>,
+    }
+    let listens = [
+        Old {
+            listen: crash,
+            track: second,
+            length: 300_000,
+            boot,
+            continues: None,
+            start: T0,
+            mono: 1_600_000,
+            from: 0,
+            heard: 155_000,
+            end_reason: None,
+        },
+        Old {
+            listen: resume,
+            track: second,
+            length: 300_000,
+            boot: next_boot,
+            continues: Some(crash),
+            start: T0 + 240_000,
+            mono: 50,
+            from: 155_000,
+            heard: 145_000,
+            end_reason: Some("finished"),
+        },
+        Old {
+            listen: whole,
+            track: first,
+            length: 240_000,
+            boot,
+            continues: None,
+            start: T0 + 600_000,
+            mono: 2_200_000,
+            from: 0,
+            heard: 240_000,
+            end_reason: Some("finished"),
+        },
+    ];
+    servers
+        .transact(move |transaction, _, _| {
+            for old in listens {
+                let (appearance, item, asset) = old.track;
+                let (to, last) = (old.from + old.heard, old.start + old.heard);
+                // Closed: its last checkpoint its end. Open: its last
+                // checkpoint where it was when the run died.
+                let ended = old.end_reason.map(|_| (to, last));
+                transaction.execute(
+                    "INSERT INTO listen_staging (
+                       listen_id, queue_entry_pid, listener_pid, played_on_server_pid,
+                       appearance_pid, asset_pid, copy_kind, source_item_pid,
+                       source_revision_no, started_at_utc_ms, zone_name, started_mono_ms,
+                       boot_id, start_reason, continues_listen_id, start_position_ms,
+                       track_duration_ms, ms_played, heard_ranges_json, max_position_ms,
+                       context_kind, shuffle, checkpoint_position_ms, checkpoint_at_ms,
+                       checkpoint_mono_ms, end_position_ms, end_reason, ended_at_utc_ms,
+                       ended_mono_ms)
+                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, 'master', ?6, 1, ?7, 'America/New_York',
+                       ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'album', 0, ?16, ?17, NULL,
+                       ?18, ?19, ?20, NULL)",
+                    rusqlite::params![
+                        old.listen.as_bytes(),
+                        listener.as_bytes(),
+                        server.as_bytes(),
+                        appearance.as_bytes(),
+                        asset.as_bytes(),
+                        item.as_bytes(),
+                        old.start,
+                        old.mono,
+                        old.boot.as_bytes(),
+                        if old.continues.is_some() {
+                            "resume"
+                        } else {
+                            "user_pick"
+                        },
+                        old.continues.map(|id| id.as_bytes().to_vec()),
+                        old.from,
+                        old.length,
+                        old.heard,
+                        format!("[[{},{to}]]", old.from),
+                        to,
+                        last,
+                        ended.map(|(position, _)| position),
+                        old.end_reason,
+                        ended.map(|(_, at)| at),
+                    ],
+                )?;
+                if ended.is_some() {
+                    transaction.execute(
+                        "INSERT INTO outbox (kind, dedupe_key, next_attempt_at_ms, created_at_ms)
+                         VALUES ('history.ingest', ?1, ?2, ?2)",
+                        (old.listen.as_bytes(), last),
+                    )?;
+                }
+            }
             Ok(())
         })
         .unwrap();
-}
 
-/// A `library.db` as the fourth migration left it: the library of
-/// [`SAVED_LIBRARY_0003`] taken forward one migration.
-const SAVED_LIBRARY_0004: &str = include_str!("../../saved/library/0004.sql");
+    // The next run closes the open one as a crash, where and when its last
+    // checkpoint was, with no clock reading to give.
+    at.clock.set(T0 + 800_000);
+    assert_eq!(servers.close_crashed_listens().unwrap(), [crash]);
+    let closed = servers.staged_listen(crash).unwrap().unwrap();
+    let ended = closed.ended.unwrap();
+    assert_eq!(
+        (
+            ended.end_reason,
+            ended.end_position_ms,
+            ended.ended_at_ms,
+            ended.ended_mono_ms
+        ),
+        (
+            ritornel_domain::history::EndReason::Crash,
+            155_000,
+            T0 + 155_000,
+            None
+        )
+    );
+    assert_eq!(
+        (closed.heard.ms_played, closed.checkpoint_mono_ms),
+        (155_000, None)
+    );
+    assert_eq!(servers.undelivered_listens().unwrap(), 3);
 
-#[test]
-fn the_saved_library_at_the_fourth_migration_is_one_the_first_four_made() {
-    let saved = Connection::open_in_memory().unwrap();
-    saved.execute_batch(SAVED_LIBRARY_0004).unwrap();
-    let mut made = Connection::open_in_memory().unwrap();
-    crate::migrate::run(
-        &mut made,
-        crate::migrate::LIBRARY.get(..4).unwrap(),
-        &FixedClock::at(T0),
+    let sent_at = T0 + 900_000;
+    at.clock.set(sent_at);
+    let delivered = crate::playback::deliver_listens(
+        &servers,
+        &at.library,
+        &*at.clock,
+        &|| SendStamps {
+            sent_at_ms: sent_at,
+            sent_mono_ms: 50 + (sent_at - (T0 + 240_000)),
+            sent_boot: next_boot,
+        },
+        &|| Ok(()),
     )
     .unwrap();
-    assert_eq!(schema_of(&saved), schema_of(&made));
+    assert_eq!(
+        (delivered.delivered.len(), delivered.failed),
+        (3, Vec::new())
+    );
+    assert_eq!(servers.undelivered_listens().unwrap(), 0);
+
+    // Stored as such a build's listens were: no end clock, nothing
+    // approximate, and records that say neither.
+    let stored: (i64, i64, i64) = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT (SELECT count(*) FROM observation_listen
+                         WHERE ended_mono_ms IS NULL AND heard_ranges_approximate = 0),
+                        (SELECT count(*) FROM history_observation
+                         WHERE payload_json LIKE '%endedMonoMs%'
+                            OR payload_json LIKE '%heardRangesApproximate%'),
+                        (SELECT count(*) FROM play_event)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(stored, (3, 0, 2));
+
+    // The crash and its resume, in two boots with no end clock between
+    // them, are one play, joined by their dates; the other is its own.
+    let plays = at.library.recent_plays(at.listener, 10, None).unwrap();
+    let shape: Vec<(Option<i64>, usize)> = plays
+        .iter()
+        .map(|play| (play.ms_played, play.listens.len()))
+        .collect();
+    assert_eq!(shape, [(Some(240_000), 1), (Some(300_000), 2)]);
+
+    // And a rebuild derives exactly what ingest did.
+    let incremental = at.library.derived_history().unwrap();
+    at.library
+        .rebuild_history(
+            WriteRequest {
+                method: "history.rebuild",
+                command: None,
+                client: None,
+            },
+            false,
+            |rebuilt| rebuilt.changed.to_string(),
+        )
+        .map(|changed| assert_eq!(changed, "0"))
+        .unwrap();
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
 }
 
 #[test]
-fn a_library_saved_at_the_fourth_migration_keeps_what_it_holds_through_the_fifth() {
-    let scratch = crate::testing::Scratch::new();
-    let path = scratch.path().join("library.db");
-    let saved = Connection::open(&path).unwrap();
-    saved.execute_batch(SAVED_LIBRARY_0004).unwrap();
-    let derived_before = derived(&saved).unwrap();
-    drop(saved);
-
-    let clock = Arc::new(FixedClock::at(T0));
-    let entropy = Arc::new(CountingEntropy::default());
-    let servers = ServerStore::open_in_memory(clock.clone(), entropy.clone()).unwrap();
-    let (server, _) = servers.ensure_identity("desk").unwrap();
-    let library = LibraryStore::open(&path, server.server_id, clock, entropy).unwrap();
-    assert_eq!(
-        (library.migrations_applied(), library.schema_version()),
-        (1, 5)
-    );
-    library
-        .read(|connection| {
-            assert_eq!(derived(connection)?, derived_before);
-            let pictures: i64 = connection.query_row(
-                "SELECT (SELECT count(*) FROM picture_folder) + (SELECT count(*) FROM artist_picture)",
-                [],
-                |row| row.get(0),
-            )?;
-            assert_eq!(pictures, 0);
-            Ok(())
-        })
-        .unwrap();
-    let albums = library
-        .list_open(ritornel_contract::ListKind::Albums, &Default::default())
-        .unwrap();
-    assert_eq!(albums.ids.len(), 1);
+fn a_listen_begun_from_an_artists_page_that_lost_its_output_is_taken() {
+    let at = library();
+    let mut record = at.listen(1, 0, T0, 200_000);
+    record.context_kind = "artist".to_owned();
+    record.end_reason = "output_lost".to_owned();
+    assert!(matches!(
+        at.send(&record, PlayRule::CURRENT),
+        Ingested::Stored(_)
+    ));
 }
 
 /// A Last.fm account on the rig's library, and an import of one scrobble of

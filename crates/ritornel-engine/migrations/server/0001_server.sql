@@ -1,24 +1,45 @@
--- A server.db as migration 0004 left it: the database of saved/server/0003.sql
--- (an invented album queued, a listen closed and waiting for the hub, and one
--- left open by a crash) with migration 0004's file run on it and its ledger
--- row, as the runner does. This is what `sqlite3 server.db .dump` printed. A
--- test loads it and migrates it forward (docs/design/server.md, "Testing and
--- CI").
+-- =============================================================================
+-- Ritornel server.db, migration 0001: every table this server keeps of its
+-- own. The migration ledger, this server's identity, its settings and its
+-- sessions; where its named roots are; durable work: receipts of server-local
+-- commands, jobs with their per-item results, and the outbox; its player: the
+-- queue, its one session, and each listen while it is open and until the hub
+-- acknowledges it; and its sessions at outside services.
+-- Every server has one server.db. It describes this machine and never follows
+-- the library. The tables are drafted in docs/design/schema/server.sql.
 --
--- Nothing here is real. The clock was fixed and the random bytes counted up
--- from 00; the root is an invented path.
-PRAGMA foreign_keys=OFF;
-BEGIN TRANSACTION;
+-- This file is never edited once it has shipped: the runner keeps a checksum
+-- of every migration it applied and refuses to start if one has changed. A
+-- change to the schema is a new numbered file.
+--
+-- Conventions
+--   * Every table is STRICT with one integer primary key. Anything addressed
+--     from outside has a 16-byte UUIDv7 `public_id`.
+--   * A column named `*_pid` refers to a library row by its public ID. No foreign
+--     key can reach it: the two files cannot commit together (server.md
+--     decision 14), and a satellite has no library.db at all. A reference to a
+--     row in this file is an integer `*_id` with a foreign key.
+--   * The tag line above each table is `-- [area|class]`. Everything here is
+--     durable server-local state; nothing is derived.
+--   * `*_ms` is Unix milliseconds in UTC, or a duration. Flags are INTEGER 0 or 1.
+--   * Closed value lists are CHECK constraints, written out once in schema.md
+--     "Value lists".
+-- =============================================================================
+
+
+-- -----------------------------------------------------------------------------
+-- Identity and settings
+-- -----------------------------------------------------------------------------
+
+-- [meta|bookkeeping] One applied migration, written by the migration runner. server.md decision 19.
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
   name           TEXT NOT NULL,
   checksum       BLOB NOT NULL,
   applied_at_ms  INTEGER NOT NULL
 ) STRICT;
-INSERT INTO schema_migration VALUES(1,'0001_identity',X'a9c16ff49737779be6423a76d68a42a3c76bc81d94fc8dc0ed2afcf94cdb5837',1794776400000);
-INSERT INTO schema_migration VALUES(2,'0002_work',X'dd5cc576aed05d719357a659ce74ed214a0bea1481040599138e3bae36407174',1794776400000);
-INSERT INTO schema_migration VALUES(3,'0003_playback',X'e094e2a143da2b95885551e53e98ed0749e975c234846f1035626cee4e5afea0',1794776400000);
-INSERT INTO schema_migration VALUES(4,'0004_listen_detail',X'fa9a7a0cdc46d229caa74d94d5891d442015bf209da6ff153991023df2b70655',1794776400000);
+
+-- [identity|durable] The single row that is this server: its ID and signing key, created together on first start and never changed. linking.md decision 1.
 CREATE TABLE server_identity (
   id             INTEGER PRIMARY KEY CHECK (id = 1),
   server_id      BLOB NOT NULL CHECK (length(server_id) = 16),
@@ -29,13 +50,15 @@ CREATE TABLE server_identity (
   library_id     BLOB CHECK (length(library_id) = 16),             -- the library it claims or is linked to
   created_at_ms  INTEGER NOT NULL
 ) STRICT;
-INSERT INTO server_identity VALUES(1,X'01a1e10280807021a223242526272829',X'000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',X'03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8','desk','hub',X'01a1e10280807e7f8081828384858687',1794776400000);
+
+-- [identity|durable] One setting about this machine, such as the cache size limit. server.md decision 26.
 CREATE TABLE server_setting (
   id          INTEGER PRIMARY KEY,
   key         TEXT NOT NULL UNIQUE,
   value_json  TEXT NOT NULL
 ) STRICT;
-INSERT INTO server_setting VALUES(1,'local_credential_session_id','2');
+
+-- [identity|durable] One credential the server issued: the local owner's, the desktop's, or an agent's. Only hashes are kept. It lands in M0, with the local bootstrap credential. linking.md decisions 4, 5, 6; README "Sessions".
 CREATE TABLE session (
   id                  INTEGER PRIMARY KEY,
   public_id           BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),   -- the actor on every command this session sends
@@ -48,15 +71,21 @@ CREATE TABLE session (
   created_at_ms       INTEGER NOT NULL,
   revoked_at_ms       INTEGER                                                -- sessions end by revocation, not by time
 ) STRICT;
-INSERT INTO session VALUES(1,X'01a1e10280807a4b8c4d4e4f50515253','person','local owner',NULL,'full',X'bdd44d520c6f39dfecdcd2122a900e0c18dc125d688b0f26379d574e8f9c533f',NULL,1794776400000,1794776400000);
-INSERT INTO session VALUES(2,X'01a1e10280807475b67778797a7b7c7d','person','local owner',NULL,'full',X'dc6046356202634846682a2a86901efb725c9ef427e83a7f798019708db75802',NULL,1794776400000,NULL);
+
+
+-- -----------------------------------------------------------------------------
+-- Roots and durable work
+-- -----------------------------------------------------------------------------
+
+-- [files|durable] One named root and where it is on this machine. The library stores only the name. server.md decision 12.
 CREATE TABLE root (
   id             INTEGER PRIMARY KEY,
   name           TEXT NOT NULL UNIQUE,   -- matches library_root.name for this server in library.db
   abs_path       TEXT NOT NULL,
   created_at_ms  INTEGER NOT NULL
 ) STRICT;
-INSERT INTO root VALUES(1,'music','/invented/music',1794776400000);
+
+-- [work|durable] The receipt of one server-local command, such as a queue edit, committed with its change. Library commands keep theirs in library.db. server.md decision 21, flag 2 and "A command, end to end".
 CREATE TABLE command_receipt (
   id                   INTEGER PRIMARY KEY,
   command_id           BLOB NOT NULL UNIQUE CHECK (length(command_id) = 16),
@@ -65,8 +94,8 @@ CREATE TABLE command_receipt (
   result_json          TEXT NOT NULL,
   created_at_ms        INTEGER NOT NULL
 ) STRICT;
-INSERT INTO command_receipt VALUES(1,X'01010101010101010101010101010101',X'44f10b63897f4383b47fc38bb0733859c82b9a44100ba3f10eb76e5d0365a88f','playback.play','1',1794776400000);
-INSERT INTO command_receipt VALUES(2,X'02020202020202020202020202020202',X'452c7f44d7a06ae9ec4edea470e4330b5e46267364e95529b9d92fee39bdf5b5','playback.skip','1',1794776500000);
+
+-- [work|durable] One piece of work longer than a call, with a claim, a heartbeat and a checkpoint. It stays readable after it ends. server.md decision 23; contract.md decision 17.
 CREATE TABLE job (
   id                      INTEGER PRIMARY KEY,
   public_id               BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
@@ -93,6 +122,13 @@ CREATE TABLE job (
   started_at_ms           INTEGER,
   finished_at_ms          INTEGER
 ) STRICT;
+
+-- One active job per dedupe key.
+CREATE UNIQUE INDEX job_active_dedupe
+  ON job (kind, dedupe_key)
+  WHERE dedupe_key IS NOT NULL AND state IN ('queued', 'running', 'cancelling');
+
+-- [work|durable] The outcome of one item of a job, such as one file a scan failed to read. contract.md decision 17 and "Playback and jobs" (server.md names no table for it).
 CREATE TABLE job_item (
   id          INTEGER PRIMARY KEY,
   job_id      INTEGER NOT NULL REFERENCES job(id),
@@ -100,6 +136,8 @@ CREATE TABLE job_item (
   state       TEXT NOT NULL CHECK (state IN ('succeeded', 'failed', 'skipped')),
   detail_json TEXT
 ) STRICT;
+
+-- [work|durable] One side effect waiting to run after the commit that recorded its intent. It names what to send by key and holds only retry state; the data stays in its own table. Deleted when the effect succeeds. server.md decision 25; playback.md decision 21.
 CREATE TABLE outbox (
   id                  INTEGER PRIMARY KEY,
   kind                TEXT NOT NULL,   -- 'history.ingest' in M1
@@ -110,7 +148,27 @@ CREATE TABLE outbox (
   created_at_ms       INTEGER NOT NULL,
   UNIQUE (kind, dedupe_key)
 ) STRICT;
-INSERT INTO outbox VALUES(1,'history.ingest',X'01a1e102846876e7a8e9eaebecedeeef',0,1794776500000,NULL,1794776500000);
+
+
+-- -----------------------------------------------------------------------------
+-- Playback: this server's player
+-- -----------------------------------------------------------------------------
+
+-- [playback|durable] One entry in this server's queue: a track appearance and why it was queued. It never names a file. playback.md decisions 9, 15, 16, 17, 22.
+CREATE TABLE queue_entry (
+  id                   INTEGER PRIMARY KEY,
+  public_id            BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),   -- the contract's entryId
+  appearance_pid       BLOB NOT NULL CHECK (length(appearance_pid) = 16),     -- public ID of a library track appearance
+  position             INTEGER NOT NULL,                                      -- queue order
+  shuffle_position     INTEGER,                                               -- the stored play order while shuffle is on
+  context_kind         TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
+  context_ref          BLOB CHECK (length(context_ref) = 16),                 -- public ID of the release, artist, playlist, definition or agent session
+  added_by_session_id  INTEGER REFERENCES session(id),
+  failed_reason        TEXT,                                                  -- 'unsupported_format', 'no_copy_reachable', 'file_changed', ...
+  added_at_ms          INTEGER NOT NULL
+) STRICT;
+
+-- [playback|durable] The single row of this server's player, saved so a restart restores it paused. playback.md decisions 1 and 18.
 CREATE TABLE playback_session (
   id                INTEGER PRIMARY KEY CHECK (id = 1),
   queue_revision    INTEGER NOT NULL DEFAULT 0,                -- bumped by every queue edit, in the same transaction
@@ -125,27 +183,14 @@ CREATE TABLE playback_session (
   listener_pid      BLOB CHECK (length(listener_pid) = 16),    -- the listener set on the player
   updated_at_ms     INTEGER NOT NULL
 ) STRICT;
-INSERT INTO playback_session VALUES(1,1,4,2,10000,NULL,1.0,0,0,'off',X'01a1e102808078898a8b8c8d8e8f9091',1794776500000);
-CREATE TABLE queue_entry (
-  id                   INTEGER PRIMARY KEY,
-  public_id            BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),   -- the contract's entryId
-  appearance_pid       BLOB NOT NULL CHECK (length(appearance_pid) = 16),     -- public ID of a library track appearance
-  position             INTEGER NOT NULL,                                      -- queue order
-  shuffle_position     INTEGER,                                               -- the stored play order while shuffle is on
-  context_kind         TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
-  context_ref          BLOB CHECK (length(context_ref) = 16),                 -- public ID of the release, artist, playlist, definition or agent session
-  added_by_session_id  INTEGER REFERENCES session(id),
-  failed_reason        TEXT,                                                  -- 'unsupported_format', 'no_copy_reachable', 'file_changed', ...
-  added_at_ms          INTEGER NOT NULL
-) STRICT;
-INSERT INTO queue_entry VALUES(1,X'01a1e10280807ebf80c1c2c3c4c5c6c7',X'01a1e102808078d99adbdcdddedfe0e1',0,NULL,'album',X'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',2,NULL,1794776400000);
-INSERT INTO queue_entry VALUES(2,X'01a1e102808078c98acbcccdcecfd0d1',X'01a1e10280807415961718191a1b1c1d',1,NULL,'album',X'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',2,NULL,1794776400000);
-INSERT INTO queue_entry VALUES(3,X'01a1e102808072d394d5d6d7d8d9dadb',X'01a1e102808070519253545556575859',2,NULL,'album',X'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',2,NULL,1794776400000);
-INSERT INTO queue_entry VALUES(4,X'01a1e10280807cdd9edfe0e1e2e3e4e5',X'01a1e10280807c8d8e8f909192939495',3,NULL,'album',X'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',2,NULL,1794776400000);
+
+-- [playback|durable] One listen while it is open and until the hub acknowledges it: written at the first frame heard, checkpointed every 5 seconds, then delivered once. It mirrors observation_listen in library.db, field for field, with public IDs where that table has keys. playback.md decisions 19, 20, 21 and "Recording a listen".
+-- The envelope's send stamps (wall clock, monotonic clock, boot ID) are not columns: every send, retries included, takes them afresh.
+-- A listen keeps its own place, the queue entry it belongs to and where the track was at its last checkpoint, so closing one a crash left open needs nothing from the session. The monotonic clock is kept at each checkpoint and at the end, beside the wall clock: an end clock cannot be backfilled, and played time cannot stand in for it across a pause. A wall clock's end is not required to follow its start, since that clock can be set back in between.
 CREATE TABLE listen_staging (
   id                        INTEGER PRIMARY KEY,
   listen_id                 BLOB NOT NULL UNIQUE CHECK (length(listen_id) = 16),   -- a UUIDv7; becomes the history source key
-  queue_entry_pid           BLOB CHECK (length(queue_entry_pid) = 16),     -- the queue entry it was heard from, by public ID, so the entry can go while the listen waits. NULL only for a listen staged before migration 0004 that was closed by then
+  queue_entry_pid           BLOB CHECK (length(queue_entry_pid) = 16),     -- the queue entry it was heard from, by public ID, so the entry can go while the listen waits. NULL only for a listen staged, and closed, before the entry was kept
   listener_pid              BLOB NOT NULL CHECK (length(listener_pid) = 16),       -- the listener set on the player
   actor_session_id          INTEGER REFERENCES session(id),                        -- the client session that queued the track
   played_on_server_pid      BLOB NOT NULL CHECK (length(played_on_server_pid) = 16),   -- this server's ID
@@ -173,7 +218,7 @@ CREATE TABLE listen_staging (
   shuffle                   INTEGER NOT NULL CHECK (shuffle IN (0, 1)),
   checkpoint_position_ms    INTEGER NOT NULL CHECK (checkpoint_position_ms >= 0),   -- where the track was at the last checkpoint: where a listen a crash left open ended
   checkpoint_at_ms          INTEGER NOT NULL,                                      -- the wall clock at the last checkpoint
-  checkpoint_mono_ms        INTEGER,                                               -- the monotonic clock then. NULL only for a listen staged before migration 0004
+  checkpoint_mono_ms        INTEGER,                                               -- the monotonic clock then. NULL only for a listen staged before the clock was kept
   end_position_ms           INTEGER CHECK (end_position_ms >= 0),
   end_reason                TEXT CHECK (end_reason IN ('finished', 'next', 'previous', 'jump', 'replaced', 'removed', 'stopped', 'error', 'output_lost', 'shutdown', 'crash')),
   ended_at_utc_ms           INTEGER,                                               -- NULL while open; an open row found at start is closed as 'crash'
@@ -182,11 +227,26 @@ CREATE TABLE listen_staging (
   CHECK ((ended_at_utc_ms IS NULL) = (end_position_ms IS NULL)),
   CHECK (ended_at_utc_ms IS NOT NULL OR ended_mono_ms IS NULL)
 ) STRICT;
-INSERT INTO listen_staging VALUES(1,X'01a1e102846876e7a8e9eaebecedeeef',NULL,X'01a1e102808078898a8b8c8d8e8f9091',2,X'01a1e10280807021a223242526272829',X'01a1e102808078d99adbdcdddedfe0e1',X'01a1e102808072e3a4e5e6e7e8e9eaeb','master',X'01a1e102808076f7b8f9fafbfcfdfeff',1,1794776400000,'America/New_York',1000000,X'babababababababababababababababa','user_pick',NULL,0,240000,100000,'[[0,100000]]',0,100000,0,0,'album',X'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',0,100000,1794776500000,NULL,100000,'next',1794776500000,NULL);
-INSERT INTO listen_staging VALUES(2,X'01a1e1040b0870f1b2f3f4f5f6f7f8f9',X'01a1e102808078c98acbcccdcecfd0d1',X'01a1e102808078898a8b8c8d8e8f9091',2,X'01a1e10280807021a223242526272829',X'01a1e10280807415961718191a1b1c1d',X'01a1e10280807e1fa021222324252627','master',X'01a1e10280807233b435363738393a3b',1,1794776500000,'America/New_York',1100000,X'babababababababababababababababa','user_pick',NULL,0,300000,10000,'[[0,10000]]',0,10000,0,0,'album',X'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',0,10000,1794776510000,NULL,NULL,NULL,NULL,NULL);
-CREATE UNIQUE INDEX job_active_dedupe
-  ON job (kind, dedupe_key)
-  WHERE dedupe_key IS NOT NULL AND state IN ('queued', 'running', 'cancelling');
+
+-- This player has one listen open at most.
 CREATE UNIQUE INDEX listen_staging_open ON listen_staging (played_on_server_pid)
   WHERE ended_at_utc_ms IS NULL;
-COMMIT;
+
+
+-- -----------------------------------------------------------------------------
+-- Outside services
+-- -----------------------------------------------------------------------------
+
+-- [service|durable] This server's session at an outside service: one per service. A row is written when the account is signed in and removed when it is signed out.
+-- The session key is a secret that does not expire and can change the account, so it lives here, in the file that never leaves this machine, and nowhere in library.db. The account it belongs to is a `service_account` in library.db, named by its public ID. The API key and secret are not here: they are the server's own, from its environment or a file in its data directory (docs/design/history.md, "Last.fm").
+CREATE TABLE service_session (
+  id                  INTEGER PRIMARY KEY,
+  service             TEXT NOT NULL UNIQUE CHECK (service IN ('lastfm')),
+  account_pid         BLOB NOT NULL CHECK (length(account_pid) = 16),   -- the service_account in library.db
+  account_name        TEXT NOT NULL,                                    -- as the service spells it
+  session_key         TEXT NOT NULL,                                    -- a secret: never logged, never sent to a client
+  subscriber          INTEGER NOT NULL CHECK (subscriber IN (0, 1)),
+  signed_in_at_ms     INTEGER NOT NULL,
+  scrobble_from_ms    INTEGER,                                          -- plays from this time on are sent; NULL sends none
+  sign_in_again       INTEGER NOT NULL DEFAULT 0 CHECK (sign_in_again IN (0, 1))   -- the service refused the session; nothing is sent until a new sign-in
+) STRICT;

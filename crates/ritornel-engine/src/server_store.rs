@@ -455,8 +455,8 @@ mod tests {
     #[test]
     fn a_new_database_is_at_the_newest_schema_and_has_no_identity() {
         let store = in_memory(&Arc::new(FixedClock::at(T0)));
-        assert_eq!(store.schema_version(), 5);
-        assert_eq!(store.migrations_applied(), 5);
+        assert_eq!(store.schema_version(), 1);
+        assert_eq!(store.migrations_applied(), 1);
         assert_eq!(store.identity().unwrap(), None);
         assert!(sessions(&store).is_empty());
     }
@@ -628,106 +628,6 @@ mod tests {
         assert_ne!(second, first);
     }
 
-    /// A `server.db` as the first migration left it, with an identity and
-    /// a session in it.
-    const SAVED_0001: &str = include_str!("../saved/server/0001.sql");
-
-    #[test]
-    fn a_database_saved_at_the_first_migration_is_taken_forward_with_what_it_holds() {
-        let scratch = Scratch::new();
-        let path = scratch.path().join("server.db");
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch(SAVED_0001)
-            .unwrap();
-
-        let store = on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 4);
-        assert_eq!(store.schema_version(), 5);
-        // Who the server is, and the credential it issued, are as they
-        // were.
-        let identity = store.identity().unwrap().unwrap();
-        assert_eq!(
-            identity.server_id.to_string(),
-            "019a7afd-1e00-7021-a223-242526272829"
-        );
-        assert_eq!(
-            (identity.name.as_str(), identity.role, identity.library_id),
-            ("desk", Role::Unassigned, None)
-        );
-        let token =
-            SessionToken::new("2a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40414243444546474849");
-        assert!(store.is_local_credential(&token).unwrap());
-        assert_eq!(sessions(&store).len(), 1);
-
-        // What the second migration adds is there to be used, and a job
-        // may name the session that was there before it.
-        store
-            .writer
-            .call(|connection| {
-                Ok(connection.execute_batch(
-                    "INSERT INTO root (name, abs_path, created_at_ms)
-                     VALUES ('main', '/srv/invented', 0);
-                     INSERT INTO job (public_id, kind, params_json, created_by_session_id, created_at_ms)
-                     VALUES (zeroblob(16), 'scan', '{}', 1, 0);
-                     INSERT INTO job_item (job_id, item_ref, state) VALUES (1, 'a.flac', 'succeeded');
-                     INSERT INTO command_receipt
-                       (command_id, request_fingerprint, method, result_json, created_at_ms)
-                     VALUES (zeroblob(16), x'f0', 'queue.clear', '{}', 0);
-                     INSERT INTO outbox (kind, dedupe_key, next_attempt_at_ms, created_at_ms)
-                     VALUES ('history.ingest', x'01', 0, 0);",
-                )?)
-            })
-            .unwrap();
-        store.close().unwrap();
-
-        let store = on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.identity().unwrap(), Some(identity));
-    }
-
-    #[test]
-    fn the_saved_database_is_one_the_first_migration_made() {
-        let mut saved = Connection::open_in_memory().unwrap();
-        saved.execute_batch(SAVED_0001).unwrap();
-        let mut made = Connection::open_in_memory().unwrap();
-        migrate::run(
-            &mut made,
-            migrate::SERVER.get(..1).unwrap(),
-            &FixedClock::at(T0),
-        )
-        .unwrap();
-        let schema = |connection: &Connection| -> Vec<String> {
-            connection
-                .prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
-                .unwrap()
-                .query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        };
-        assert_eq!(schema(&saved), schema(&made));
-        let ledger = |connection: &Connection| -> (i64, String, Vec<u8>) {
-            connection
-                .query_row(
-                    "SELECT version, name, checksum FROM schema_migration",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap()
-        };
-        assert_eq!(ledger(&saved), ledger(&made));
-        // Running the same first migration over it changes nothing: it is
-        // at that schema already.
-        let again = migrate::run(
-            &mut saved,
-            migrate::SERVER.get(..1).unwrap(),
-            &FixedClock::at(T0),
-        )
-        .unwrap();
-        assert_eq!((again.applied, again.version), (0, 1));
-    }
-
     #[test]
     fn a_token_the_server_did_not_issue_is_not_the_local_credential() {
         let store = in_memory(&Arc::new(FixedClock::at(T0)));
@@ -772,7 +672,7 @@ mod tests {
         let path = scratch.path().join("server.db");
 
         let store = on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 5);
+        assert_eq!(store.migrations_applied(), 1);
         let (first, token) = store.ensure_identity("desk").unwrap();
         let token = token.unwrap();
         store.close().unwrap();
@@ -780,7 +680,7 @@ mod tests {
 
         let store = on_disk(&path).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 5);
+        assert_eq!(store.schema_version(), 1);
         let (second, none) = store.ensure_identity("desk").unwrap();
         assert_eq!(second, first);
         assert!(none.is_none());
@@ -837,11 +737,11 @@ mod tests {
         on_disk(&path).unwrap().close().unwrap();
         tamper(
             &path,
-            "INSERT INTO schema_migration VALUES (6, '0006_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (2, '0002_from_the_future', x'00', 0)",
         );
         let refused = on_disk(&path);
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 6, known: 5 })),
+            matches!(refused, Err(Error::NewerSchema { found: 2, known: 1 })),
             "{refused:?}"
         );
     }

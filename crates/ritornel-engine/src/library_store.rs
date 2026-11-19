@@ -870,7 +870,7 @@ mod tests {
         // gives the library's ID the bytes 00 to 09.
         let library_id = "019a7afd-1e00-7001-8203-040506070809";
         assert_eq!(store.library_id().to_string(), library_id);
-        assert_eq!(store.schema_version(), 5);
+        assert_eq!(store.schema_version(), 1);
         assert_eq!(
             store.meta().unwrap(),
             LibraryMeta {
@@ -1259,7 +1259,7 @@ mod tests {
         let scratch = Scratch::new();
         let path = library_db(&scratch);
         let (store, _) = create_on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 5);
+        assert_eq!(store.migrations_applied(), 1);
         let created = store.meta().unwrap();
         store
             .write(request("test.write", None), set("kept"))
@@ -1269,7 +1269,7 @@ mod tests {
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 5);
+        assert_eq!(store.schema_version(), 1);
         assert_eq!(store.library_id(), created.library_id);
         assert_eq!(
             store.meta().unwrap(),
@@ -1426,11 +1426,11 @@ mod tests {
         create_on_disk(&path).unwrap().0.close().unwrap();
         tamper_file(
             &path,
-            "INSERT INTO schema_migration VALUES (6, '0006_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (2, '0002_from_the_future', x'00', 0)",
         );
         let refused = open_on_disk(&path, id(0x11));
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 6, known: 5 })),
+            matches!(refused, Err(Error::NewerSchema { found: 2, known: 1 })),
             "{refused:?}"
         );
     }
@@ -1453,113 +1453,5 @@ mod tests {
             (claimed.role, claimed.library_id),
             (Role::Hub, Some(library.library_id()))
         );
-    }
-
-    /// A `library.db` as the first migration left it, with a scan of three
-    /// fixtures in it.
-    const SAVED_0001: &str = include_str!("../saved/library/0001.sql");
-
-    #[test]
-    fn a_library_saved_at_the_first_migration_is_taken_forward_with_what_it_holds() {
-        use ritornel_contract::{ListKind, Query, Row};
-
-        let scratch = Scratch::new();
-        let path = library_db(&scratch);
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch(SAVED_0001)
-            .unwrap();
-
-        let store = open_on_disk(&path, id(0x11)).unwrap();
-        assert_eq!(store.migrations_applied(), 4);
-        assert_eq!(store.schema_version(), 5);
-        // The library is the one it was, at the revision it was.
-        assert_eq!(
-            store.library_id().to_string(),
-            "019a7afd-1e00-7001-8203-040506070809"
-        );
-        assert_eq!(store.meta().unwrap().revision, 4);
-        // The indexes the second migration adds are there, and the lists
-        // read what the scan made through them.
-        assert_eq!(
-            rows(
-                &store,
-                "SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL
-                 AND name IN ('track_appearance_release', 'release_release_group',
-                   'release_display_artist_credit', 'assignment_current_appearance',
-                   'revision_picture_picture')
-                 ORDER BY name"
-            )
-            .len(),
-            5
-        );
-        let albums = store
-            .list_open(ListKind::Albums, &Query::default())
-            .unwrap();
-        let rows = store.list_rows(ListKind::Albums, &albums.ids).unwrap();
-        let [Row::Album(album)] = &rows[..] else {
-            panic!("{rows:?}");
-        };
-        assert_eq!(
-            (album.title.as_deref(), album.track_count),
-            (Some("Tin Weather"), 2)
-        );
-        assert!(album.art_id.is_some());
-        let songs = store.list_open(ListKind::Songs, &Query::default()).unwrap();
-        assert_eq!(songs.ids.len(), 3);
-
-        // It takes writes, and the next start applies nothing.
-        store
-            .write(request("test.write", None), set("after"))
-            .unwrap();
-        store.close().unwrap();
-        let store = open_on_disk(&path, id(0x11)).unwrap();
-        assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.meta().unwrap().revision, 5);
-    }
-
-    #[test]
-    fn the_saved_library_is_one_the_first_migration_made() {
-        let mut saved = Connection::open_in_memory().unwrap();
-        saved.execute_batch(SAVED_0001).unwrap();
-        let mut made = Connection::open_in_memory().unwrap();
-        migrate::run(
-            &mut made,
-            migrate::LIBRARY.get(..1).unwrap(),
-            &FixedClock::at(T0),
-        )
-        .unwrap();
-        // The search index's own tables are left out: the dump writes them
-        // as rows, and SQLite keeps no statement for them.
-        let schema = |connection: &Connection| -> Vec<String> {
-            connection
-                .prepare(
-                    "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL
-                     AND name NOT LIKE 'search_text_%' ORDER BY name",
-                )
-                .unwrap()
-                .query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
-        };
-        assert_eq!(schema(&saved), schema(&made));
-        let ledger = |connection: &Connection| -> (i64, String, Vec<u8>) {
-            connection
-                .query_row(
-                    "SELECT version, name, checksum FROM schema_migration",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap()
-        };
-        assert_eq!(ledger(&saved), ledger(&made));
-        let again = migrate::run(
-            &mut saved,
-            migrate::LIBRARY.get(..1).unwrap(),
-            &FixedClock::at(T0),
-        )
-        .unwrap();
-        assert_eq!((again.applied, again.version), (0, 1));
     }
 }

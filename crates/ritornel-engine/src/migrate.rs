@@ -29,63 +29,26 @@ impl Migration {
     }
 }
 
+// A change to a schema is the next numbered file, `0002_<name>.sql`,
+// added to its list below. It runs over data, so it comes with a saved
+// database at the schema before it: a dump of a database the migrations
+// so far made, with rows in it, in `saved/<server or library>/0001.sql`,
+// and a test, among the tests of the store it changes, that opens the
+// dump through that store and finds what it held. AGENTS.md has the rule.
+
 /// The migrations of `server.db`.
-pub(crate) const SERVER: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "0001_identity",
-        sql: include_str!("../migrations/server/0001_identity.sql"),
-    },
-    Migration {
-        version: 2,
-        name: "0002_work",
-        sql: include_str!("../migrations/server/0002_work.sql"),
-    },
-    Migration {
-        version: 3,
-        name: "0003_playback",
-        sql: include_str!("../migrations/server/0003_playback.sql"),
-    },
-    Migration {
-        version: 4,
-        name: "0004_listen_detail",
-        sql: include_str!("../migrations/server/0004_listen_detail.sql"),
-    },
-    Migration {
-        version: 5,
-        name: "0005_service_session",
-        sql: include_str!("../migrations/server/0005_service_session.sql"),
-    },
-];
+pub(crate) const SERVER: &[Migration] = &[Migration {
+    version: 1,
+    name: "0001_server",
+    sql: include_str!("../migrations/server/0001_server.sql"),
+}];
 
 /// The migrations of `library.db`.
-pub(crate) const LIBRARY: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "0001_library",
-        sql: include_str!("../migrations/library/0001_library.sql"),
-    },
-    Migration {
-        version: 2,
-        name: "0002_list_indexes",
-        sql: include_str!("../migrations/library/0002_list_indexes.sql"),
-    },
-    Migration {
-        version: 3,
-        name: "0003_listen_detail",
-        sql: include_str!("../migrations/library/0003_listen_detail.sql"),
-    },
-    Migration {
-        version: 4,
-        name: "0004_lastfm",
-        sql: include_str!("../migrations/library/0004_lastfm.sql"),
-    },
-    Migration {
-        version: 5,
-        name: "0005_artist_pictures",
-        sql: include_str!("../migrations/library/0005_artist_pictures.sql"),
-    },
-];
+pub(crate) const LIBRARY: &[Migration] = &[Migration {
+    version: 1,
+    name: "0001_library",
+    sql: include_str!("../migrations/library/0001_library.sql"),
+}];
 
 /// What a run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

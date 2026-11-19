@@ -1,10 +1,12 @@
 -- =============================================================================
--- Ritornel library.db, migration 0001: every table the library has in M1's
--- first slice. Catalog, evidence, files, history from our own player, ratings,
--- and the bookkeeping that says whose library this is and what changed.
+-- Ritornel library.db, migration 0001: every table the library has. Catalog,
+-- evidence, files, artist pictures, history from our own player and from
+-- outside services, ratings, and the bookkeeping that says whose library this
+-- is and what changed.
 -- The hub holds the one library.db and is its one writer. The tables are
--- docs/design/schema/library.sql, whose summary, value lists and flags are in
--- docs/design/schema.md.
+-- drafted in docs/design/schema/library.sql, whose summary, value lists and
+-- flags are in docs/design/schema.md. The draft has no tables for Last.fm or
+-- for artist pictures; the tag lines of those name their design notes.
 --
 -- This file is never edited once it has shipped: the runner keeps a checksum
 -- of every migration it applied and refuses to start if one has changed. A
@@ -35,6 +37,12 @@
 --     the one place they are written out. A list a later source will extend
 --     (source and item kinds, namespaces, fields, job kinds) stays a comment,
 --     because SQLite cannot alter a CHECK without rebuilding the table.
+--   * The indexes the lists and covers read by, beside track_appearance,
+--     release, assignment and revision_picture, are each here because a query
+--     the walls run was measured reading a whole table without it, on an
+--     invented library of 100,000 records (1.36 million tracks). The comment
+--     above each names the query; docs/design/schema.md left them to be added
+--     from measurements.
 -- =============================================================================
 
 
@@ -178,6 +186,17 @@ CREATE TABLE release (
   CHECK ((redirect_to_id IS NULL) = (canonical_id = id))
 ) STRICT;
 
+-- A window of Albums: every version of the groups it shows, for the version a
+-- group shows and how many it has. Songs, searched or filtered: the versions
+-- of the groups its songs are on. (list/rows.rs `albums`; list/open.rs
+-- `releases_of_groups`.)
+CREATE INDEX release_release_group ON release (release_group_id);
+
+-- A window of Artists: the records that name each artist, by their credit.
+-- (list/rows.rs, `artists`.) The credit's names are read whole: by artist
+-- they were no quicker.
+CREATE INDEX release_display_artist_credit ON release (display_artist_credit_id);
+
 -- [catalog|durable] One recording at one position on a release; a loose file has no release. The unit of Songs rows, queue entries and sync membership. Redirected when its release is merged, so queue entries follow. identity.md decision 1 and "Merge, split and never-link"; playback.md "The queue".
 CREATE TABLE track_appearance (
   id                        INTEGER PRIMARY KEY,
@@ -196,6 +215,43 @@ CREATE TABLE track_appearance (
   UNIQUE (id, recording_id),                                             -- the target of assignment's composite foreign key
   CHECK ((redirect_to_id IS NULL) = (canonical_id = id))
 ) STRICT;
+
+-- A window of Albums or Artists: the tracks of the records it shows, for how
+-- many there are, how long they are and their copies. Songs in album order.
+-- (list/rows.rs, `albums` and `track_counts`.)
+CREATE INDEX track_appearance_release ON track_appearance (release_id);
+
+-- [catalog|durable] A folder of artist pictures on one server, by the name its server.db `root` maps to a path.
+-- The server only ever reads it. plan.md, open question "Artist pictures".
+CREATE TABLE picture_folder (
+  id                INTEGER PRIMARY KEY,
+  public_id         BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
+  server_id         INTEGER NOT NULL REFERENCES server(id),
+  name              TEXT NOT NULL,
+  created_at_ms     INTEGER NOT NULL,
+  rev               INTEGER NOT NULL,
+  UNIQUE (server_id, name)
+) STRICT;
+
+-- [catalog|derived] An artist's picture of one kind, as a picture folder's manifest chose it. Rebuilt by importing the folder again.
+-- The file is read in place, as a folder image beside the music is. Each import replaces a folder's rows, so a picture taken out of the folder goes on the next one.
+CREATE TABLE artist_picture (
+  id                INTEGER PRIMARY KEY,
+  artist_id         INTEGER NOT NULL REFERENCES artist(id),
+  kind              TEXT NOT NULL CHECK (kind IN ('portrait')),   -- the square picture for the circle and the banner
+  picture_id        INTEGER NOT NULL REFERENCES picture(id),
+  folder_id         INTEGER NOT NULL REFERENCES picture_folder(id),
+  path              TEXT NOT NULL,                                -- relative to the folder, such as '<mbid>/portrait.deezer.0a1b2c.jpg'
+  matched_by        TEXT NOT NULL CHECK (matched_by IN ('mbid', 'name')),   -- the artist's MusicBrainz ID, or their name where they have none
+  source            TEXT,                                         -- who supplied it, as the manifest says: 'theaudiodb', 'deezer', 'owner'
+  chosen_by         TEXT,                                         -- who chose it, as the manifest says: 'rule:v1', 'owner'
+  rev               INTEGER NOT NULL,
+  UNIQUE (artist_id, kind)
+) STRICT;
+
+-- A picture served: where in a folder its file is. (covers/mod.rs,
+-- `picture_sources`.)
+CREATE INDEX artist_picture_picture ON artist_picture (picture_id);
 
 
 -- -----------------------------------------------------------------------------
@@ -230,7 +286,7 @@ CREATE TABLE library_root (
 CREATE TABLE source_instance (
   id                INTEGER PRIMARY KEY,
   public_id         BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),   -- the contract's sourceId
-  kind              TEXT NOT NULL,                                         -- 'folder' in M1; later 'beets', 'device', 'lastfm', 'musicbrainz'
+  kind              TEXT NOT NULL,                                         -- 'folder' and 'lastfm' in M1; later 'beets', 'device', 'musicbrainz'
   name              TEXT NOT NULL,
   root_id           INTEGER UNIQUE REFERENCES library_root(id),            -- a folder's root, of kind 'master'; one folder per root
   created_at_ms     INTEGER NOT NULL,
@@ -245,7 +301,7 @@ CREATE TABLE source_item (
   id                    INTEGER PRIMARY KEY,
   public_id             BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
   source_instance_id    INTEGER NOT NULL REFERENCES source_instance(id),   -- for a file, the folder, which names the root
-  item_kind             TEXT NOT NULL,                              -- 'file' in M1; later 'device_object', 'scrobble_subject'
+  item_kind             TEXT NOT NULL,                              -- 'file' and 'scrobble_subject' in M1; later 'device_object'
   provider_key          TEXT NOT NULL,                              -- for a file, the path relative to the root; re-keyed when the file moves
   current_revision_id   INTEGER,                                    -- one of this item's own revisions, by the composite key below
   current_recording_id  INTEGER REFERENCES recording(id),           -- derived cache of the current assignment, for reads
@@ -307,6 +363,12 @@ CREATE TABLE identifier_claim (
   FOREIGN KEY (source_item_id, revision_id) REFERENCES source_item_revision (source_item_id, id)
 ) STRICT;
 
+-- The MusicBrainz ID each artist is known by: a file's claims of a namespace,
+-- counted for every file. (resolve_store.rs, `artist_mbids`, which an import
+-- and every resolution run.) On a real library of 13,000 files it took 30 s
+-- without this and 54 ms with it.
+CREATE INDEX identifier_claim_item ON identifier_claim (source_item_id, namespace);
+
 -- [evidence|derived] One tag value a source item stated, extracted from one of its revisions. Rebuilt by the extractor. Displayed metadata is the projection of these and of metadata_edit, by rank. identity.md decisions 3 and 11.
 CREATE TABLE metadata_claim (
   id                  INTEGER PRIMARY KEY,
@@ -342,7 +404,7 @@ CREATE UNIQUE INDEX metadata_edit_in_force
   ON metadata_edit (entity_kind, entity_id, field, ordinal)
   WHERE withdrawn_at_ms IS NULL;
 
--- [evidence|durable] Why one binding, merge or undo was made, with the full score shape. Immutable. identity.md decision 8 and "Resolver policy 1"; review 5.4, 5.10.
+-- [evidence|durable] Why one binding, merge or undo was made, with the full score shape. Immutable. identity.md decision 8, "Resolver policy 1" and "Scrobbles"; review 5.4, 5.10.
 CREATE TABLE identity_decision (
   id                   INTEGER PRIMARY KEY,
   action               TEXT NOT NULL CHECK (action IN ('bind', 'merge', 'unmerge')),
@@ -350,7 +412,7 @@ CREATE TABLE identity_decision (
   entity_kind          TEXT CHECK (entity_kind IN ('recording', 'artist', 'release', 'track_appearance')),   -- merge and unmerge: what was redirected
   entity_id            INTEGER,                              -- the row whose redirect was set or cleared
   target_entity_id     INTEGER,                              -- merge: where it now points
-  method               TEXT NOT NULL CHECK (method IN ('user', 'same_audio', 'identifier', 'tags_duration', 'new')),
+  method               TEXT NOT NULL CHECK (method IN ('user', 'same_audio', 'identifier', 'tags_duration', 'new', 'scrobble_text')),   -- scrobble_text: a text-only item bound by its artist and title
   resolver_version     INTEGER NOT NULL,
   normalizer_version   INTEGER NOT NULL,
   score                REAL CHECK (score BETWEEN 0 AND 1),   -- a distance; 0 for exact methods, NULL for a user decision
@@ -398,6 +460,12 @@ CREATE TABLE assignment (
 -- One current row per source item. A retired item keeps its current row.
 CREATE UNIQUE INDEX assignment_current
   ON assignment (source_item_id)
+  WHERE superseded_at_ms IS NULL;
+
+-- A window of Albums or Songs: where each track's current copies are, and in
+-- what format. (list/rows.rs, `for_each_formats`.)
+CREATE INDEX assignment_current_appearance
+  ON assignment (appearance_id)
   WHERE superseded_at_ms IS NULL;
 
 -- The binding columns can never change, a supersession is set once, and no row is deleted.
@@ -514,6 +582,10 @@ CREATE TABLE revision_picture (
   CHECK ((source_kind = 'folder_image') = (file_name IS NOT NULL))
 ) STRICT;
 
+-- A cover: the files a picture came with, to read it from one of them.
+-- (covers/mod.rs, `picture_sources`.)
+CREATE INDEX revision_picture_picture ON revision_picture (picture_id);
+
 
 -- -----------------------------------------------------------------------------
 -- Search: derived
@@ -541,11 +613,11 @@ CREATE TABLE listener (
   rev               INTEGER NOT NULL
 ) STRICT;
 
--- [history|durable] One place reports come from: a server's player, the library's manual endpoint, later a device log, an account at a service or an import. history.md "Observation kinds".
+-- [history|durable] One place reports come from: a server's player, the library's manual endpoint, an account at a service, later a device log or an import. history.md "Observation kinds".
 CREATE TABLE history_endpoint (
   id                INTEGER PRIMARY KEY,
   public_id         BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
-  kind              TEXT NOT NULL CHECK (kind IN ('player', 'device_log', 'service', 'import', 'manual')),   -- 'player' and 'manual' in M1
+  kind              TEXT NOT NULL CHECK (kind IN ('player', 'device_log', 'service', 'import', 'manual')),   -- 'player', 'manual' and 'service' in M1
   server_id         INTEGER REFERENCES server(id),   -- a player's server
   name              TEXT NOT NULL,
   rev               INTEGER NOT NULL,
@@ -556,9 +628,23 @@ CREATE TABLE history_endpoint (
 CREATE UNIQUE INDEX history_endpoint_player ON history_endpoint (server_id) WHERE kind = 'player';
 CREATE UNIQUE INDEX history_endpoint_manual ON history_endpoint (kind) WHERE kind = 'manual';
 
+-- [history|durable] One account at an outside service: where its plays come from and what names what they were of. history.md "Last.fm"; identity.md "Scrobbles".
+CREATE TABLE service_account (
+  id                  INTEGER PRIMARY KEY,
+  public_id           BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
+  service             TEXT NOT NULL CHECK (service IN ('lastfm')),
+  account_name        TEXT NOT NULL,                                          -- as the service spells it; untrusted display text
+  listener_id         INTEGER NOT NULL REFERENCES listener(id),               -- whose plays and loves these are
+  endpoint_id         INTEGER NOT NULL UNIQUE REFERENCES history_endpoint(id),   -- of kind 'service': the account's plays are its observations
+  source_instance_id  INTEGER NOT NULL UNIQUE REFERENCES source_instance(id),    -- of the service's kind: what a play was of is one of its items
+  created_at_ms       INTEGER NOT NULL,
+  rev                 INTEGER NOT NULL,
+  UNIQUE (service, account_name COLLATE NOCASE)
+) STRICT;
+
 -- [history|durable] The envelope every raw record shares, whatever its kind: who reported it, about which source item, for which listener, and every clock that touched it. Immutable. It names the source item and never the recording. history.md decisions 1, 2, 5, 18, 19, 20 and "Observation kinds".
--- Each row has one row in the detail table of its kind. M1 creates two: observation_listen and observation_correction.
--- Device log lines and import records get no detail table here. Each arrives as a new table with its milestone (M3, the Last.fm side track), so no row recorded earlier is reshaped.
+-- Each row has one row in the detail table of its kind: observation_listen, observation_import or observation_correction.
+-- Device log lines get no detail table here. Theirs arrives as a new table with M3, so no row recorded earlier is reshaped.
 CREATE TABLE history_observation (
   id                  INTEGER PRIMARY KEY,
   endpoint_id         INTEGER NOT NULL REFERENCES history_endpoint(id),
@@ -596,33 +682,54 @@ CREATE INDEX history_observation_source_item ON history_observation (source_item
 
 -- [history|durable] The detail of one listen: every field the player's staged row carries. Immutable. None of it can be backfilled. playback.md "Recording a listen"; history.md "What a listen contains".
 CREATE TABLE observation_listen (
-  observation_id        INTEGER PRIMARY KEY REFERENCES history_observation(id),
-  played_on_server_id   INTEGER NOT NULL REFERENCES server(id),          -- the server whose player made the sound
-  actor_session_pid     BLOB CHECK (length(actor_session_pid) = 16),     -- the client session that queued the track
-  source_revision_no    INTEGER NOT NULL,                                -- which payload of the envelope's source item was heard
-  queued_appearance_id  INTEGER REFERENCES track_appearance(id),         -- a hint for display only; the recording always comes from the source item
-  audio_asset_id        INTEGER REFERENCES audio_asset(id),              -- the asset that played
-  copy_kind             TEXT NOT NULL CHECK (copy_kind IN ('master', 'derived', 'stream_master', 'stream_transcode')),
-  started_at_utc_ms     INTEGER NOT NULL,                                -- the playing server's wall clock; its zone is on the envelope
-  ended_at_utc_ms       INTEGER NOT NULL,
-  started_mono_ms       INTEGER NOT NULL,                                -- the playing server's monotonic clock when the track started
-  boot_id               BLOB NOT NULL CHECK (length(boot_id) = 16),      -- the boot it started in
-  start_reason          TEXT NOT NULL CHECK (start_reason IN ('user_pick', 'auto_advance', 'repeat', 'resume')),
-  continues_source_key  BLOB,                                            -- the earlier listen on this endpoint that this one resumes
-  start_position_ms     INTEGER NOT NULL,
-  end_position_ms       INTEGER NOT NULL,
-  max_position_ms       INTEGER NOT NULL,
-  track_duration_ms     INTEGER NOT NULL,
-  ms_played             INTEGER NOT NULL,                                -- audio actually rendered
-  heard_ranges_json     TEXT NOT NULL,                                   -- merged ranges of the track that were heard, with no cap on how many
-  seek_count            INTEGER NOT NULL,
-  pause_count           INTEGER NOT NULL,
-  end_reason            TEXT NOT NULL CHECK (end_reason IN ('finished', 'next', 'previous', 'jump', 'replaced', 'removed', 'stopped', 'error', 'shutdown', 'crash')),
-  context_kind          TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'playlist', 'query', 'agent')),
-  context_ref           BLOB CHECK (length(context_ref) = 16),           -- public ID of the release, playlist, definition or agent session
-  shuffle               INTEGER NOT NULL CHECK (shuffle IN (0, 1)),
-  rev                   INTEGER NOT NULL
+  observation_id            INTEGER PRIMARY KEY REFERENCES history_observation(id),
+  played_on_server_id       INTEGER NOT NULL REFERENCES server(id),          -- the server whose player made the sound
+  actor_session_pid         BLOB CHECK (length(actor_session_pid) = 16),     -- the client session that queued the track
+  source_revision_no        INTEGER NOT NULL CHECK (source_revision_no > 0),   -- which payload of the envelope's source item was heard
+  queued_appearance_id      INTEGER REFERENCES track_appearance(id),         -- a hint for display only; the recording always comes from the source item
+  audio_asset_id            INTEGER REFERENCES audio_asset(id),              -- the asset that played
+  copy_kind                 TEXT NOT NULL CHECK (copy_kind IN ('master', 'derived', 'stream_master', 'stream_transcode')),
+  started_at_utc_ms         INTEGER NOT NULL,                                -- the playing server's wall clock; its zone is on the envelope
+  ended_at_utc_ms           INTEGER NOT NULL,                                -- the same clock, which can have been set back since the start
+  started_mono_ms           INTEGER NOT NULL,                                -- the playing server's monotonic clock when the track started
+  ended_mono_ms             INTEGER,                                         -- the same clock at the end: for a crash, at the last checkpoint. NULL only for a listen recorded before the clock was kept
+  boot_id                   BLOB NOT NULL CHECK (length(boot_id) = 16),      -- the boot that clock counts from: the machine's, as its kernel names it, or the playing server's run where the machine's could not be read
+  start_reason              TEXT NOT NULL CHECK (start_reason IN ('user_pick', 'auto_advance', 'repeat', 'resume')),
+  continues_source_key      BLOB CHECK (length(continues_source_key) = 16),   -- the earlier listen on this endpoint that this one resumes
+  start_position_ms         INTEGER NOT NULL CHECK (start_position_ms >= 0),
+  end_position_ms           INTEGER NOT NULL CHECK (end_position_ms >= 0),
+  max_position_ms           INTEGER NOT NULL CHECK (max_position_ms >= 0),
+  track_duration_ms         INTEGER NOT NULL CHECK (track_duration_ms >= 0),
+  ms_played                 INTEGER NOT NULL CHECK (ms_played >= 0),         -- audio actually rendered
+  heard_ranges_json         TEXT NOT NULL CHECK (json_valid(heard_ranges_json)),   -- merged ranges of the track that were heard, with no cap on how many
+  heard_ranges_approximate  INTEGER NOT NULL CHECK (heard_ranges_approximate IN (0, 1)),   -- neighbouring ranges were joined to keep them under the player's cap
+  seek_count                INTEGER NOT NULL CHECK (seek_count >= 0),
+  pause_count               INTEGER NOT NULL CHECK (pause_count >= 0),
+  end_reason                TEXT NOT NULL CHECK (end_reason IN ('finished', 'next', 'previous', 'jump', 'replaced', 'removed', 'stopped', 'error', 'output_lost', 'shutdown', 'crash')),
+  context_kind              TEXT NOT NULL CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
+  context_ref               BLOB CHECK (length(context_ref) = 16),           -- public ID of the release, playlist, definition or agent session
+  shuffle                   INTEGER NOT NULL CHECK (shuffle IN (0, 1)),
+  rev                       INTEGER NOT NULL
 ) STRICT;
+
+-- "Which listen continues this one?": the chain a new listen joins. history.md "From observations to plays" step 2.
+CREATE INDEX observation_listen_continues ON observation_listen (continues_source_key)
+  WHERE continues_source_key IS NOT NULL;
+
+-- [history|durable] The detail of one import record: a play another service reported, and the facts read from it. The record verbatim is the observation's payload. Immutable. history.md "Observation kinds".
+CREATE TABLE observation_import (
+  observation_id    INTEGER PRIMARY KEY REFERENCES history_observation(id),
+  played_at_utc_ms  INTEGER NOT NULL,   -- when the service dates the play; for Last.fm its start, to the second
+  artist            TEXT NOT NULL,      -- what it was of, as the service spells it; the envelope's source item stands for the three
+  album             TEXT,
+  title             TEXT NOT NULL,
+  artist_mbid       TEXT,               -- the identifiers the service attached. They support a match and never make one alone
+  album_mbid        TEXT,
+  track_mbid        TEXT,
+  rev               INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX observation_import_played_at ON observation_import (played_at_utc_ms);
 
 -- [history|durable] The detail of one correction: its verb, and what it targets. A target is either a list of observations, in correction_target, or an endpoint with a time range, here. Immutable. history.md decision 16 and "Corrections".
 CREATE TABLE observation_correction (
@@ -662,6 +769,13 @@ BEGIN
   SELECT RAISE(ABORT, 'observation_listen holds the detail of a listen and of nothing else');
 END;
 
+CREATE TRIGGER observation_import_kind
+BEFORE INSERT ON observation_import
+WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'import'
+BEGIN
+  SELECT RAISE(ABORT, 'observation_import holds the detail of an import record and of nothing else');
+END;
+
 CREATE TRIGGER observation_correction_kind
 BEFORE INSERT ON observation_correction
 WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'correction'
@@ -692,6 +806,18 @@ CREATE TRIGGER observation_listen_no_delete
 BEFORE DELETE ON observation_listen
 BEGIN
   SELECT RAISE(ABORT, 'observation_listen is immutable: nothing is deleted');
+END;
+
+CREATE TRIGGER observation_import_no_update
+BEFORE UPDATE ON observation_import
+BEGIN
+  SELECT RAISE(ABORT, 'observation_import is immutable: record a correction instead');
+END;
+
+CREATE TRIGGER observation_import_no_delete
+BEFORE DELETE ON observation_import
+BEGIN
+  SELECT RAISE(ABORT, 'observation_import is immutable: nothing is deleted');
 END;
 
 CREATE TRIGGER observation_correction_no_update
@@ -775,6 +901,48 @@ CREATE TABLE history_ingest_conflict (
   rev                      INTEGER NOT NULL
 ) STRICT;
 
+-- [history|durable] How far a reader has got in a paged import or a log, in a form only that reader reads. Committed with the observations it covers. history.md "Observation kinds".
+CREATE TABLE history_cursor (
+  id             INTEGER PRIMARY KEY,
+  endpoint_id    INTEGER NOT NULL UNIQUE REFERENCES history_endpoint(id),
+  cursor_json    TEXT NOT NULL CHECK (json_valid(cursor_json)),
+  updated_at_ms  INTEGER NOT NULL,
+  rev            INTEGER NOT NULL
+) STRICT;
+
+-- [history|durable] One play sent to one destination, recorded before it is sent: what was sent, and what became of it. It names the play's primary observation, never the derived play. history.md decision 3 and "Last.fm".
+-- Recording it first is what lets its echo be matched exactly when the import brings it back.
+CREATE TABLE history_delivery (
+  id                  INTEGER PRIMARY KEY,
+  observation_id      INTEGER NOT NULL REFERENCES history_observation(id),   -- the play's primary observation: a listen
+  endpoint_id         INTEGER NOT NULL REFERENCES history_endpoint(id),      -- the destination, a service account's endpoint
+  state               TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'accepted', 'ignored', 'refused', 'unknown', 'withdrawn')),   -- 'sending' is written before the request leaves; 'accepted' and 'ignored' are the service's answers, final and apart; 'withdrawn' was never sent, because its play was no longer eligible when its turn came
+  sent_timestamp_s    INTEGER NOT NULL,   -- the time it is sent with, in seconds: what its echo is matched on
+  artist              TEXT NOT NULL,      -- what it is sent as
+  title               TEXT NOT NULL,
+  album               TEXT,
+  album_artist        TEXT,
+  track_number        INTEGER,
+  duration_ms         INTEGER,
+  accepted_artist     TEXT,               -- the names the service took it under, which it may have corrected
+  accepted_title      TEXT,
+  ignored_code        INTEGER,            -- the service's reason, as it sent it
+  detail              TEXT,               -- the service's message, or why it was not sent or was withdrawn
+  attempts            INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at_ms  INTEGER,            -- when a pending row is next due
+  created_at_ms       INTEGER NOT NULL,
+  updated_at_ms       INTEGER NOT NULL,
+  rev                 INTEGER NOT NULL,
+  UNIQUE (observation_id, endpoint_id),
+  CHECK ((state = 'accepted') = (accepted_artist IS NOT NULL AND accepted_title IS NOT NULL)),
+  CHECK ((state = 'ignored') = (ignored_code IS NOT NULL))
+) STRICT;
+
+CREATE INDEX history_delivery_echo ON history_delivery (endpoint_id, sent_timestamp_s);
+
+CREATE INDEX history_delivery_due ON history_delivery (endpoint_id, next_attempt_at_ms)
+  WHERE state = 'pending';
+
 
 -- -----------------------------------------------------------------------------
 -- History, derived: dropped and rebuilt by `ritornelctl history rebuild`
@@ -815,14 +983,15 @@ CREATE TABLE play_event (
   play_rule_version   INTEGER NOT NULL,
   grouper_version     INTEGER NOT NULL,
   excluded            INTEGER NOT NULL DEFAULT 0 CHECK (excluded IN (0, 1)),   -- an active 'exclude' targets one of its observations
-  context_kind        TEXT CHECK (context_kind IN ('manual', 'album', 'playlist', 'query', 'agent')),
+  context_kind        TEXT CHECK (context_kind IN ('manual', 'album', 'artist', 'playlist', 'query', 'agent')),
   context_ref         BLOB CHECK (length(context_ref) = 16),
   shuffle             INTEGER CHECK (shuffle IN (0, 1)),
   rev                 INTEGER NOT NULL
 ) STRICT;
 
--- The three indexes history.md "Queries M1 must answer" names.
-CREATE INDEX play_event_recent ON play_event (listener_id, event_at_utc_ms DESC);
+-- The three indexes history.md "Queries M1 must answer" names. Recent plays
+-- are paged by their instant and then their ID, which no two plays share.
+CREATE INDEX play_event_recent ON play_event (listener_id, event_at_utc_ms DESC, public_id DESC);
 CREATE INDEX play_event_counted ON play_event (listener_id, recording_id, event_at_utc_ms DESC)
   WHERE counts = 1 AND excluded = 0;
 CREATE INDEX play_event_on_this_day ON play_event (listener_id, month_day, local_date);

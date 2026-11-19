@@ -1,8 +1,8 @@
 //! Reading the rows of a view: what each row says now.
 //!
 //! Each kind is read in a few statements over the whole window, never one
-//! a row, each by an index: a primary key, or one of those migration 0002
-//! adds for these reads, named where they are used.
+//! a row, each by an index: a primary key, or one of those the library's
+//! migration adds for these reads, named where they are used.
 
 use std::collections::HashMap;
 

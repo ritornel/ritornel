@@ -865,21 +865,10 @@ impl ServerStore {
 mod tests {
     use std::sync::Arc;
 
-    use rusqlite::Connection;
-
     use super::*;
-    use crate::migrate;
+    use crate::OsEntropy;
     use crate::playback::queue::{Queue, Random};
-    use crate::testing::{FixedClock, Scratch};
-    use crate::{OsEntropy, SessionToken, SystemClock};
-
-    /// A `server.db` as the second migration left it: an identity, the
-    /// local credential's session, a root, a finished scan and its receipt.
-    const SAVED_0002: &str = include_str!("../../saved/server/0002.sql");
-
-    /// A `server.db` as the third migration left it: an album queued, a
-    /// listen closed and waiting for the hub, and one left open by a crash.
-    const SAVED_0003: &str = include_str!("../../saved/server/0003.sql");
+    use crate::testing::FixedClock;
 
     const T0: i64 = 1_763_000_000_000;
 
@@ -941,209 +930,38 @@ mod tests {
         }
     }
 
-    fn schema(connection: &Connection) -> Vec<String> {
-        connection
-            .prepare("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    }
-
     #[test]
-    fn the_saved_database_is_one_the_first_two_migrations_made() {
-        let mut saved = Connection::open_in_memory().unwrap();
-        saved.execute_batch(SAVED_0002).unwrap();
-        let mut made = Connection::open_in_memory().unwrap();
-        migrate::run(
-            &mut made,
-            migrate::SERVER.get(..2).unwrap(),
-            &FixedClock::at(T0),
+    fn one_listen_is_open_at_most_and_one_from_an_artists_page_is_taken() {
+        let store = ServerStore::open_in_memory(
+            Arc::new(FixedClock::at(T0)),
+            Arc::new(crate::testing::CountingEntropy::default()),
         )
         .unwrap();
-        assert_eq!(schema(&saved), schema(&made));
-        let again = migrate::run(
-            &mut saved,
-            migrate::SERVER.get(..2).unwrap(),
-            &FixedClock::at(T0),
-        )
-        .unwrap();
-        assert_eq!((again.applied, again.version), (0, 2));
-    }
-
-    #[test]
-    fn a_database_saved_at_the_second_migration_is_taken_forward_with_what_it_holds() {
-        let scratch = Scratch::new();
-        let path = scratch.path().join("server.db");
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch(SAVED_0002)
-            .unwrap();
-
-        let store = ServerStore::open(&path, Arc::new(SystemClock), Arc::new(OsEntropy)).unwrap();
-        assert_eq!(store.migrations_applied(), 3);
-        assert_eq!(store.schema_version(), 5);
-        // Who the server is, its credential, its root and its scan are as
-        // they were.
-        let identity = store.identity().unwrap().unwrap();
-        assert_eq!(
-            identity.server_id.to_string(),
-            "019a7afd-1e00-7021-a223-242526272829"
-        );
-        let token =
-            SessionToken::new("2a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40414243444546474849");
-        assert!(store.is_local_credential(&token).unwrap());
-        assert_eq!(
-            store.roots().unwrap(),
-            [("music".to_owned(), "/srv/invented/music".to_owned())]
-        );
-        let [scan] = store.jobs(10).unwrap().try_into().unwrap();
-        assert_eq!((scan.kind.as_str(), scan.done), ("scan", 2));
-        assert_eq!(store.failed_job_items(scan.id, 10).unwrap().len(), 1);
-
-        // The player's tables are there to be used, and name the session
-        // that was there before them.
-        let session = store.local_session().unwrap();
-        let fresh = store.playback_session().unwrap();
-        assert_eq!((fresh.queue_revision, fresh.current), (0, None));
-        let added_by = store.session_row(session.unwrap()).unwrap();
-        let (queue, answer) = replace(&store, 0xc3, 1, ContextKind::Manual, added_by);
-        assert_eq!((queue.len(), answer.as_str()), (1, "1"));
-        assert_eq!(queue[0].added_by, Some(1));
-        store.close().unwrap();
-
-        let store = ServerStore::open(&path, Arc::new(SystemClock), Arc::new(OsEntropy)).unwrap();
-        assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.queue().unwrap().len(), 1);
-        assert_eq!(
-            store.playback_session().unwrap().current,
-            Some(queue[0].row)
-        );
-    }
-
-    #[test]
-    fn the_saved_database_is_one_the_first_three_migrations_made() {
-        let saved = Connection::open_in_memory().unwrap();
-        saved.execute_batch(SAVED_0003).unwrap();
-        let mut made = Connection::open_in_memory().unwrap();
-        migrate::run(
-            &mut made,
-            migrate::SERVER.get(..3).unwrap(),
-            &FixedClock::at(T0),
-        )
-        .unwrap();
-        assert_eq!(schema(&saved), schema(&made));
-    }
-
-    /// A `server.db` as the fourth migration left it: [`SAVED_0003`] taken
-    /// forward one migration.
-    const SAVED_0004: &str = include_str!("../../saved/server/0004.sql");
-
-    #[test]
-    fn a_database_saved_at_the_fourth_migration_is_taken_forward_with_its_listens() {
-        let made = |count: usize| {
-            let mut made = Connection::open_in_memory().unwrap();
-            migrate::run(
-                &mut made,
-                migrate::SERVER.get(..count).unwrap(),
-                &FixedClock::at(T0),
-            )
-            .unwrap();
-            made
-        };
-        let saved = Connection::open_in_memory().unwrap();
-        saved.execute_batch(SAVED_0004).unwrap();
-        assert_eq!(schema(&saved), schema(&made(4)));
-
-        let scratch = Scratch::new();
-        let path = scratch.path().join("server.db");
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch(SAVED_0004)
-            .unwrap();
-        let clock = Arc::new(FixedClock::at(1_794_776_600_000));
-        let store = ServerStore::open(&path, clock, Arc::new(OsEntropy)).unwrap();
-        assert_eq!((store.migrations_applied(), store.schema_version()), (1, 5));
-        assert_eq!(store.queue().unwrap().len(), 4);
-        assert_eq!(store.undelivered_listens().unwrap(), 1);
-    }
-
-    #[test]
-    fn a_database_saved_with_listens_staged_is_taken_forward_with_every_one() {
-        let scratch = Scratch::new();
-        let path = scratch.path().join("server.db");
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch(SAVED_0003)
-            .unwrap();
-
-        let clock = Arc::new(FixedClock::at(1_794_776_600_000));
-        let store = ServerStore::open(&path, clock, Arc::new(OsEntropy)).unwrap();
-        assert_eq!((store.migrations_applied(), store.schema_version()), (2, 5));
-        let queue = store.queue().unwrap();
-        let session = store.playback_session().unwrap();
-        assert_eq!(queue.len(), 4);
-        assert_eq!(
-            (session.current, session.position_ms),
-            (Some(queue[1].row), 10_000)
-        );
-        assert_eq!(store.undelivered_listens().unwrap(), 1);
-
-        let staged: Vec<Staged> = store
-            .read(|connection| {
-                let mut statement = connection.prepare(&format!(
-                    "SELECT {STAGED_COLUMNS} FROM listen_staging ORDER BY id"
-                ))?;
-                let rows = statement.query_map([], staged)?;
-                Ok(rows.collect::<Result<_, _>>()?)
-            })
-            .unwrap();
-        let [skipped, open] = staged.try_into().unwrap();
-        // The first track's listen, skipped at 1:40: closed, as it was.
-        let ended = skipped.ended.clone().unwrap();
-        assert_eq!(
-            (ended.end_reason, ended.end_position_ms, ended.ended_mono_ms),
-            (EndReason::Next, 100_000, None)
-        );
-        assert_eq!(
-            (skipped.heard.ms_played, skipped.checkpoint_position_ms),
-            (100_000, 100_000)
-        );
-        assert_eq!(skipped.heard.ranges_json, "[[0,100000]]");
-        // The second's, open at its 10-second checkpoint: its entry and
-        // position are the session's, and its clock then was not kept.
-        assert_eq!(open.ended, None);
-        assert_eq!(open.started.entry, Some(queue[1].entry_id));
-        assert_eq!(
-            (
-                open.heard.ms_played,
-                open.checkpoint_position_ms,
-                open.checkpoint_mono_ms
-            ),
-            (10_000, 10_000, None)
-        );
-
-        store
-            .read(|connection| {
-                let dangling: i64 = connection.query_row(
-                    "SELECT count(*) FROM pragma_foreign_key_check",
-                    [],
-                    |row| row.get(0),
-                )?;
-                let whole: String =
-                    connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-                assert_eq!((dangling, whole.as_str()), (0, "ok"));
-                let mut fresh = Connection::open_in_memory()?;
-                migrate::run(&mut fresh, migrate::SERVER, &FixedClock::at(T0))?;
-                assert_eq!(schema(connection), schema(&fresh));
-                Ok(())
-            })
-            .unwrap();
-
-        // One listen is open at most: a second is refused while it is.
-        let second = |started: Started| Saved {
-            started,
+        store.playback_session().unwrap();
+        let (queue, _) = replace(&store, 0xc5, 1, ContextKind::Artist, None);
+        let opened = |listen: u8| Saved {
+            started: Started {
+                listen_id: Id::from_bytes([listen; 16]),
+                entry: Some(queue[0].entry_id),
+                listener: Id::from_bytes([0x11; 16]),
+                actor_session: None,
+                played_on_server: Id::from_bytes([0x5e; 16]),
+                appearance: Id::from_bytes([0xa0; 16]),
+                asset: Id::from_bytes([0xa5; 16]),
+                source_item: Id::from_bytes([0x51; 16]),
+                source_revision: 1,
+                started_at_ms: T0,
+                zone: None,
+                started_mono_ms: 1_000,
+                boot: Id::from_bytes([0xba; 16]),
+                start_reason: StartReason::UserPick,
+                continues: None,
+                start_position_ms: 0,
+                track_duration_ms: 200_000,
+                context_kind: ContextKind::Artist,
+                context_ref: None,
+                shuffle: false,
+            },
             heard: Heard {
                 ranges_json: "[]".to_owned(),
                 ..Heard::default()
@@ -1151,34 +969,153 @@ mod tests {
             position_ms: 0,
             ended: None,
         };
-        let opened = Started {
-            listen_id: Id::from_bytes([0xd2; 16]),
-            ..open.started.clone()
-        };
-        let save = |started: Started| store.save_listens(vec![second(started)], (None, 0, None), 5);
-        assert!(save(opened.clone()).is_err());
-
-        // The next run closes the open one as a crash, and then the second
-        // can open, queued from an artist's page.
+        let place = (Some(queue[0].row), 0, None);
+        store
+            .save_listens(vec![opened(0xd1)], place, 1_000)
+            .unwrap();
+        // A second is refused while the first is open.
+        assert!(
+            store
+                .save_listens(vec![opened(0xd2)], place, 1_000)
+                .is_err()
+        );
+        // Once the first is closed, as the next run closes it, it can open.
         assert_eq!(
             store.close_crashed_listens().unwrap(),
-            [open.started.listen_id]
+            [Id::from_bytes([0xd1; 16])]
         );
-        let closed = store
-            .staged_listen(open.started.listen_id)
-            .unwrap()
+        store
+            .save_listens(vec![opened(0xd2)], place, 2_000)
             .unwrap();
-        let ended = closed.ended.unwrap();
+        assert_eq!(store.undelivered_listens().unwrap(), 1);
+    }
+
+    /// Two listens as a build that kept no monotonic clock at a checkpoint
+    /// or an end left them staged, and as a database from then still holds
+    /// them: one closed and waiting for the hub, which named no queue
+    /// entry, and one a crash left open, whose entry and place were the
+    /// session's.
+    #[test]
+    fn listens_staged_before_the_clocks_were_kept_are_read_and_the_open_one_closed_as_a_crash() {
+        let store = ServerStore::open_in_memory(
+            Arc::new(FixedClock::at(T0)),
+            Arc::new(crate::testing::CountingEntropy::default()),
+        )
+        .unwrap();
+        store.playback_session().unwrap();
+        let (queue, _) = replace(&store, 0xc6, 2, ContextKind::Album, None);
+        store.save_place(Some(queue[1].row), 10_000, None).unwrap();
+        let (skipped, open) = (Id::from_bytes([0xd3; 16]), Id::from_bytes([0xd4; 16]));
+        let entry = queue[1].entry_id;
+        store
+            .transact(move |transaction, _, _| {
+                let stage = "INSERT INTO listen_staging (
+                       listen_id, queue_entry_pid, listener_pid, played_on_server_pid,
+                       appearance_pid, asset_pid, copy_kind, source_item_pid,
+                       source_revision_no, started_at_utc_ms, zone_name, started_mono_ms,
+                       boot_id, start_reason, start_position_ms, track_duration_ms, ms_played,
+                       heard_ranges_json, max_position_ms, context_kind, shuffle,
+                       checkpoint_position_ms, checkpoint_at_ms, checkpoint_mono_ms,
+                       end_position_ms, end_reason, ended_at_utc_ms, ended_mono_ms)
+                     VALUES (?1, ?2, zeroblob(16), zeroblob(16), x'a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0',
+                       zeroblob(16), 'master', zeroblob(16), 1, ?3, 'America/New_York', ?4,
+                       x'babababababababababababababababa', 'user_pick', 0, ?5, ?6, ?7, ?6,
+                       'album', 0, ?8, ?9, NULL, ?10, ?11, ?12, NULL)";
+                // Skipped at 1:40: closed, its place its end, no entry.
+                transaction.execute(
+                    stage,
+                    rusqlite::params![
+                        skipped.as_bytes(),
+                        None::<Vec<u8>>,
+                        T0,
+                        1_000_000,
+                        240_000,
+                        100_000,
+                        "[[0,100000]]",
+                        100_000,
+                        T0 + 100_000,
+                        Some(100_000),
+                        Some("next"),
+                        Some(T0 + 100_000),
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO outbox (kind, dedupe_key, next_attempt_at_ms, created_at_ms)
+                     VALUES ('history.ingest', ?1, ?2, ?2)",
+                    (skipped.as_bytes(), T0 + 100_000),
+                )?;
+                // Open at its 10-second checkpoint when the run died.
+                transaction.execute(
+                    stage,
+                    rusqlite::params![
+                        open.as_bytes(),
+                        Some(entry.as_bytes()),
+                        T0 + 100_000,
+                        1_100_000,
+                        300_000,
+                        10_000,
+                        "[[0,10000]]",
+                        10_000,
+                        T0 + 110_000,
+                        None::<i64>,
+                        None::<&str>,
+                        None::<i64>,
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let read = |listen| store.staged_listen(listen).unwrap().unwrap();
+        let before = read(skipped);
+        assert_eq!(before.started.entry, None);
         assert_eq!(
-            (ended.end_reason, ended.end_position_ms, ended.ended_mono_ms),
-            (EndReason::Crash, 10_000, None)
+            before.ended,
+            Some(Ended {
+                end_position_ms: 100_000,
+                end_reason: EndReason::Next,
+                ended_at_ms: T0 + 100_000,
+                ended_mono_ms: None,
+            })
         );
-        let artist = Started {
-            context_kind: ContextKind::Artist,
-            ..opened
-        };
-        save(artist).unwrap();
+        assert_eq!(
+            (
+                before.heard.ms_played,
+                before.checkpoint_position_ms,
+                before.checkpoint_mono_ms
+            ),
+            (100_000, 100_000, None)
+        );
+        let left = read(open);
+        assert_eq!(
+            (left.started.entry, left.ended.clone()),
+            (Some(entry), None)
+        );
+        assert_eq!(
+            (left.checkpoint_position_ms, left.checkpoint_mono_ms),
+            (10_000, None)
+        );
+        assert_eq!(store.undelivered_listens().unwrap(), 1);
+
+        // The next run closes it where and when its last checkpoint was,
+        // with no clock reading to give, and a resume of the session's
+        // entry continues it.
+        assert_eq!(store.close_crashed_listens().unwrap(), [open]);
+        let closed = read(open);
+        assert_eq!(
+            closed.ended,
+            Some(Ended {
+                end_position_ms: 10_000,
+                end_reason: EndReason::Crash,
+                ended_at_ms: T0 + 110_000,
+                ended_mono_ms: None,
+            })
+        );
+        assert_eq!(closed.heard, left.heard);
+        assert_eq!(store.playback_session().unwrap().resume_listen, Some(open));
         assert_eq!(store.undelivered_listens().unwrap(), 2);
+        // The closed one is as it was.
+        assert_eq!(read(skipped), before);
     }
 
     #[test]
