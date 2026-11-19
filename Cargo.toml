@@ -11,15 +11,16 @@ members = [
     "apps/ritornelctl",
 ]
 # The lab material holds Cargo workspaces of its own and is never built
-# from here. Neither is the desktop app's shell: it is built with Tauri,
-# which needs WebKit and GTK libraries that the hub's Linux build must not,
-# so it is a workspace of its own (apps/desktop/src-tauri/Cargo.toml) with
-# tasks of its own in mise.toml.
-exclude = ["bakeoff", "prototypes", "spikes", "apps/desktop"]
+# from here. Neither is the desktop app (apps/desktop): it is built with
+# GPUI, which the hub's Linux build must not need, so it is a workspace of
+# its own with tasks of its own in mise.toml. So is the Tauri app it
+# replaced, kept for reference (apps/desktop-tauri/src-tauri/Cargo.toml).
+exclude = ["bakeoff", "prototypes", "spikes", "apps/desktop", "apps/desktop-tauri"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 publish = false
 
 # Dependencies point one way: contract <- domain <- engine <- server, and
@@ -33,7 +34,7 @@ ritornel-engine = { path = "crates/ritornel-engine" }
 ritornel-client = { path = "crates/ritornel-client" }
 ritornel-source = { path = "crates/ritornel-source" }
 ritornel-lastfm = { path = "crates/ritornel-lastfm" }
-# The owner's Last.fm crate, which `ritornel-lastfm` stands on: sign-in, a
+# The Last.fm crate that `ritornel-lastfm` stands on: sign-in, a
 # history read with every page checked, loved tracks and scrobbling. Pinned
 # exactly. Before 1.0 a minor release may add or break, and a patch fixes.
 scrobl = "=0.3.0"

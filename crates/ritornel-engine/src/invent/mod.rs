@@ -237,8 +237,8 @@ struct Album {
     added_ms: i64,
     /// The cover: its seed and side. `None` for a record with none.
     cover: Option<(u64, u32)>,
-    /// Whether its files say what kind of record it is. Most of the
-    /// owner's do not.
+    /// Whether its files say what kind of record it is. Most in a real
+    /// library do not.
     typed: bool,
     /// The marks beside its kind, such as `live` or `compilation`.
     marks: &'static [&'static str],

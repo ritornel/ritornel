@@ -96,8 +96,10 @@ impl Transport {
     /// Says goodbye, if the transport has a way to.
     pub(crate) async fn close(&mut self) {
         if let Self::Socket(socket) = self {
-            // The other side may have gone already.
-            let _ = socket.close(None).await;
+            // The other side may have gone already. Called by its full name:
+            // where futures-sink's `alloc` is on, `Box<WebSocketStream>` is a
+            // `Sink`, and `socket.close` would be `SinkExt::close`.
+            let _ = WebSocketStream::close(socket, None).await;
         }
     }
 }

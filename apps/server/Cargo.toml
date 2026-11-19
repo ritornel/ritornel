@@ -3,6 +3,7 @@ name = "ritornel-server"
 description = "The server: config, lock, listener, and routing from contract calls to engine methods."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [features]

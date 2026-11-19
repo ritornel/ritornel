@@ -1,0 +1,193 @@
+//! A connection to the server, once one is found (`link.rs` finds it, and
+//! finds it again). Calls and events go over `ritornel_client` on one Tokio
+//! runtime for the app's life; GPUI's foreground awaits Tokio's join handles
+//! directly, since they wake on any executor.
+//!
+//! Covers come over HTTP (`GET /v1/art/{artId}/{size}?token=`), on a few
+//! kept-alive connections. `ritornel_client::get` reads at most 64 KB of a
+//! body, which a large cover passes, so this has its own small GET.
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use http_body_util::{BodyExt, Empty, Limited};
+use hyper::body::Bytes;
+use hyper::client::conn::http1::SendRequest;
+use hyper::header::HOST;
+use hyper_util::rt::TokioIo;
+use ritornel_client::Client;
+use ritornel_client::local::LocalServer;
+use ritornel_contract::{
+    CONTRACT_VERSION, ClientKind, Event, HelloParams, Id, MEDIA_TOKEN_PARAM, ServerRole, Topic,
+    Versions, route,
+};
+use tokio::net::TcpStream;
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::mpsc::UnboundedReceiver;
+
+/// The runtime calls, events and covers run on, for as long as the app does.
+pub(crate) fn rt() -> &'static Handle {
+    static RUNTIME: OnceLock<Option<Runtime>> = OnceLock::new();
+    static FALLBACK: OnceLock<Runtime> = OnceLock::new();
+    let built = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("net")
+            .enable_all()
+            .build()
+            .ok()
+    });
+    match built {
+        Some(runtime) => runtime.handle(),
+        // A runtime that cannot be built with two threads is built with the
+        // current one: the app works, a little less smoothly.
+        None => FALLBACK
+            .get_or_init(|| {
+                #[allow(clippy::expect_used)]
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a Tokio runtime")
+            })
+            .handle(),
+    }
+}
+
+/// One session with the server.
+pub(crate) struct Net {
+    pub client: Arc<Client>,
+    pub art: Arc<ArtHttp>,
+    pub art_sizes: Vec<u32>,
+    /// The server's name, as the title bar shows it.
+    pub name: String,
+    pub role: ServerRole,
+    pub versions: Option<Versions>,
+    /// Whether the server holds a library.
+    pub holds: bool,
+}
+
+impl Net {
+    /// Opens a session with a server that has been found: says hello,
+    /// subscribes to everything the app follows, and reads what the Library
+    /// page needs to say. The events come back apart, to be read on a task
+    /// of their own; their end is the session's.
+    pub(crate) async fn open(
+        server: &LocalServer,
+    ) -> Result<(Self, UnboundedReceiver<Event>), ritornel_client::Error> {
+        let mut client = server.connect().await?;
+        let descriptor = client
+            .hello(&HelloParams {
+                name: "ritornel-desktop-gpui".to_owned(),
+                kind: ClientKind::Desktop,
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                contract_version: CONTRACT_VERSION,
+            })
+            .await?;
+        let events = client.take_events();
+        client
+            .subscribe(&[
+                Topic::Servers,
+                // Scans and imports as they run, for Settings.
+                Topic::Jobs,
+                Topic::Library,
+                Topic::List,
+                Topic::Playback,
+                Topic::Progress,
+                Topic::Queue,
+            ])
+            .await?;
+        let token = client.media_token().await?.token;
+        // A session of the local owner is `full`, and may read the status.
+        let status = client.status().await.ok();
+        let art = Arc::new(ArtHttp {
+            endpoint: server.endpoint,
+            token,
+            idle: Mutex::new(Vec::new()),
+        });
+        Ok((
+            Self {
+                client: Arc::new(client),
+                art,
+                art_sizes: descriptor.server.art_sizes,
+                name: status
+                    .as_ref()
+                    .map_or(descriptor.server.name, |status| status.name.clone()),
+                role: status
+                    .as_ref()
+                    .map_or(descriptor.server.role, |status| status.role),
+                versions: status.as_ref().map(|status| status.versions.clone()),
+                holds: status
+                    .as_ref()
+                    .is_none_or(|status| status.library.is_some()),
+            },
+            events,
+        ))
+    }
+
+    pub(crate) fn rt(&self) -> &'static Handle {
+        rt()
+    }
+
+    /// The bucket a cover drawn `px` pixels wide is asked for at.
+    pub(crate) fn bucket(&self, px: u32) -> u32 {
+        self.art_sizes
+            .iter()
+            .copied()
+            .find(|size| *size >= px)
+            .or_else(|| self.art_sizes.last().copied())
+            .unwrap_or(256)
+    }
+}
+
+/// A few HTTP/1.1 connections to the server, kept alive between covers.
+pub(crate) struct ArtHttp {
+    endpoint: SocketAddr,
+    token: String,
+    idle: Mutex<Vec<SendRequest<Empty<Bytes>>>>,
+}
+
+/// The largest cover read: 1024 pixels square is well under it.
+const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
+
+impl ArtHttp {
+    /// Reads one cover. `None` when it is not there (404) or the server
+    /// could not be read. Dropped part way, the connection is closed, and
+    /// the server drops the cover from its queue if it has not begun it.
+    pub(crate) async fn get(&self, art: Id, size: u32) -> Option<Vec<u8>> {
+        let idle = self.idle.lock().ok().and_then(|mut idle| idle.pop());
+        let mut sender = match idle {
+            Some(sender) if !sender.is_closed() => sender,
+            _ => {
+                let stream = TcpStream::connect(self.endpoint).await.ok()?;
+                stream.set_nodelay(true).ok()?;
+                let (sender, connection) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                        .await
+                        .ok()?;
+                tokio::spawn(connection);
+                sender
+            }
+        };
+        sender.ready().await.ok()?;
+        let path = format!(
+            "{}/{art}/{size}?{MEDIA_TOKEN_PARAM}={}",
+            route::ART,
+            self.token
+        );
+        let request = hyper::Request::get(path)
+            .header(HOST, self.endpoint.to_string())
+            .body(Empty::<Bytes>::new())
+            .ok()?;
+        let response = sender.send_request(request).await.ok()?;
+        let ok = response.status().is_success();
+        let body = Limited::new(response.into_body(), MAX_ART_BYTES)
+            .collect()
+            .await
+            .ok()?
+            .to_bytes();
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.push(sender);
+        }
+        ok.then(|| body.to_vec())
+    }
+}

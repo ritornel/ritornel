@@ -3,6 +3,7 @@ name = "ritornel-client"
 description = "Rust client for the contract, plus find, start and stop of a local server."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]
@@ -39,6 +40,13 @@ tokio = { version = "1.54.1", features = ["macros", "net", "rt", "sync", "time"]
 # there is one tungstenite in the build. No TLS: a route that needs it
 # arrives with pairing.
 tokio-tungstenite = "0.29.0"
+
+[dev-dependencies]
+# Not used by a test: it turns on futures-sink's `alloc`, as a program that
+# links `futures` with `std` does (GPUI does), so that the tests build the
+# client as such a program would. With it, `Box<S>` is a `Sink`, and a call
+# on a boxed socket can resolve to `SinkExt` before the socket's own method.
+futures-sink = { version = "0.3.34", features = ["alloc"] }
 
 [lints]
 workspace = true

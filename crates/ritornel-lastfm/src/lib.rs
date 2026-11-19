@@ -1,5 +1,5 @@
 //! Last.fm: a history source, the sign-in that gives a session, and the
-//! place plays are scrobbled to and what is playing is shown. It stands on the owner's `scrobl` crate,
+//! place plays are scrobbled to and what is playing is shown. It stands on the `scrobl` crate,
 //! which makes every request, checks every page of a history against the
 //! others, and keeps credentials out of every error and `Debug`. See
 //! "Last.fm" in docs/design/history.md and "The crates" in

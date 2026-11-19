@@ -282,6 +282,17 @@ impl Client {
     pub fn try_next_event(&mut self) -> Option<Event> {
         self.events.try_recv().ok()
     }
+
+    /// Takes the events, for a program that reads them on a task of their
+    /// own while the client is shared for calls (calls take `&self`, and
+    /// reading an event takes `&mut self`). They arrive in the order the
+    /// server sent them, and the stream ends when the connection closes,
+    /// which is how such a program learns that it has. After this,
+    /// [`next_event`](Self::next_event) has nothing more to give.
+    pub fn take_events(&mut self) -> UnboundedReceiver<Event> {
+        let (_, closed) = mpsc::unbounded_channel();
+        std::mem::replace(&mut self.events, closed)
+    }
 }
 
 /// Owns the transport: sends each call, and hands each frame that arrives
@@ -523,6 +534,27 @@ mod tests {
             })
             .collect();
         assert_eq!(revisions, [2, 3]);
+    }
+
+    #[tokio::test]
+    async fn taken_events_arrive_while_the_client_is_shared_and_end_with_the_connection() {
+        let (mut client, mut from_client, to_client) = pair();
+        let mut events = client.take_events();
+        let client = std::sync::Arc::new(client);
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.call_raw("first", json!({})).await }
+        });
+        let (id, _, _) = sent(&mut from_client).await;
+        to_client.send(server_event(4)).await.unwrap();
+        to_client.send(result(id, json!({}))).await.unwrap();
+        assert!(matches!(events.recv().await, Some(Event::Servers(_))));
+        assert!(call.await.unwrap().is_ok());
+        drop(to_client);
+        assert!(
+            events.recv().await.is_none(),
+            "the stream ends with the connection"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,25 @@
+# Which licences a dependency may carry. The app is MIT (LICENSE), so every
+# crate it is built from must allow that: the permissive licences, and
+# MPL-2.0, which asks only that changes to its own files stay open. GPL,
+# LGPL and AGPL are not here, and a crate under one fails `mise run licenses`.
+# AGENTS.md, "Rules".
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    # A dedication to the public domain: the file watcher.
+    "CC0-1.0",
+    # A permissive licence for data: the root certificates.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
