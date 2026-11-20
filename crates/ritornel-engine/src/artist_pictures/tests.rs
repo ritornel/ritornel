@@ -341,11 +341,28 @@ fn fifo(path: &Path) {
 }
 
 #[test]
+fn a_manifest_too_large_is_unreadable() {
+    let (rig, folder) = rig();
+    // A manifest larger than any manifest is.
+    let named = folder.path().join("by-name/Various Artists");
+    std::fs::create_dir_all(&named).unwrap();
+    let mut huge = br#"{"format": 1, "chosen": {}, "padding": ""#.to_vec();
+    huge.resize(super::MANIFEST_CAP as usize + 10, b' ');
+    huge.extend_from_slice(br#""}"#);
+    std::fs::write(named.join("manifest.json"), huge).unwrap();
+    let (_, counts) = import_within(rig, folder.path().to_path_buf(), 0xa0);
+    assert_eq!(
+        (counts.unreadable, counts.by_mbid, counts.by_name),
+        (1, 0, 0)
+    );
+}
+
+#[test]
 #[cfg_attr(
     windows,
     ignore = "Windows has no named pipe that can stand in a folder: its pipes live only in the system's pipe namespace, so there is none here to wait on"
 )]
-fn a_pipe_or_a_file_too_large_is_unreadable_and_never_waited_on() {
+fn a_pipe_is_unreadable_and_never_waited_on() {
     let (rig, folder) = rig();
     // A portrait that is a named pipe, which a plain read would wait on.
     let dir = folder.path().join(MOSS_ARCADE);
@@ -357,17 +374,10 @@ fn a_pipe_or_a_file_too_large_is_unreadable_and_never_waited_on() {
     );
     std::fs::remove_file(dir.join("portrait.jpg")).unwrap();
     fifo(&dir.join("portrait.jpg"));
-    // A manifest larger than any manifest is.
-    let named = folder.path().join("by-name/Various Artists");
-    std::fs::create_dir_all(&named).unwrap();
-    let mut huge = br#"{"format": 1, "chosen": {}, "padding": ""#.to_vec();
-    huge.resize(super::MANIFEST_CAP as usize + 10, b' ');
-    huge.extend_from_slice(br#""}"#);
-    std::fs::write(named.join("manifest.json"), huge).unwrap();
     let (rig, counts) = import_within(rig, folder.path().to_path_buf(), 0xa1);
     assert_eq!(
         (counts.unreadable, counts.by_mbid, counts.by_name),
-        (2, 0, 0)
+        (1, 0, 0)
     );
 
     // A portrait served is read the same way: one replaced by a pipe since
