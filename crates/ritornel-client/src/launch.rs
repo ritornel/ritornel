@@ -48,10 +48,6 @@ const RACES: usize = 3;
 /// not start.
 const STDERR_KEPT: u64 = 16 * 1024;
 
-/// `CREATE_NO_WINDOW`: the process gets no console window.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 /// The server program a launcher starts.
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -235,11 +231,8 @@ impl Ready {
 impl Owned {
     fn spawn(program: &Program, data_dir: &Path) -> Result<(Self, Ready), Error> {
         let mut command = Command::new(&program.path);
-        // A console program started by one without a console, as the
-        // desktop app is, gets a console window of its own unless told not
-        // to make one. The pipes are all it needs.
-        #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+        // The pipes are all it needs.
+        crate::platform::start_without_console(&mut command);
         let mut child = command
             .arg("serve")
             .arg("--data-dir")
@@ -348,24 +341,11 @@ mod tests {
         /// A program that is a script, standing in for the server: `unix`,
         /// for the shell, on Unix, and `windows`, a batch file, on Windows.
         fn program(&self, unix: &str, windows: &str) -> Program {
-            #[cfg(unix)]
-            let path = {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = windows;
-                let path = self.0.join("fake-server");
-                std::fs::write(&path, format!("#!/bin/sh\n{unix}\n")).unwrap();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-                path
-            };
-            #[cfg(windows)]
-            let path = {
-                let _ = unix;
-                let path = self.0.join("fake-server.cmd");
-                let lines: Vec<&str> = windows.lines().collect();
-                std::fs::write(&path, format!("@echo off\r\n{}\r\n", lines.join("\r\n"))).unwrap();
-                path
-            };
-            Program::new(path)
+            Program::new(crate::platform::script(
+                &self.0.join("fake-server"),
+                unix,
+                windows,
+            ))
         }
     }
 
