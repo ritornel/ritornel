@@ -31,6 +31,7 @@
 mod credentials;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
+mod platform;
 mod scrobble;
 mod source;
 
