@@ -10,6 +10,8 @@
 //!   which is all macOS needs to deliver the keys ([`wait`]).
 //! - Linux: MPRIS on the session bus, served from the server's own async
 //!   runtime ([`mpris`]). A server with no session bus has none, quietly.
+//! - Windows: none yet. The system's media transport controls are to be
+//!   tied to the hidden window `serve` opens there.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1061,10 +1061,20 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
             401
         );
         drop(client);
-        let killed = Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status()
-            .unwrap();
+        // SIGTERM, or on Windows `taskkill /PID` without `/F`, which asks
+        // the server's hidden window to close.
+        let killed = if cfg!(windows) {
+            Command::new("taskkill")
+                .args(["/PID", &child.id().to_string()])
+                .output()
+                .unwrap()
+                .status
+        } else {
+            Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .unwrap()
+        };
         assert!(killed.success());
         let output = child.wait_with_output().unwrap();
         let mut written = String::from_utf8_lossy(&output.stdout).into_owned();

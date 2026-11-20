@@ -28,6 +28,15 @@ use serde_json::Value;
 /// How long a test waits for a process before it kills it and fails.
 const WAIT: Duration = Duration::from_secs(60);
 
+/// What a server that `std::process::abort` ended exits with: no code on
+/// Unix, where SIGABRT ended it, and on Windows the fast-fail status
+/// (`0xC0000409`) that abort ends a process with.
+const ABORTED: Option<i32> = if cfg!(windows) {
+    Some(-1_073_740_791)
+} else {
+    None
+};
+
 /// How long a track of the invented album is.
 const TRACK_SECONDS: u32 = 40;
 
@@ -186,7 +195,8 @@ struct Server {
 }
 
 fn spawn(data_dir: &Path, variables: &[(&str, &str)]) -> (Child, Receiver<String>) {
-    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl")).with_file_name("ritornel-server");
+    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl"))
+        .with_file_name(format!("ritornel-server{}", std::env::consts::EXE_SUFFIX));
     assert!(
         binary.exists(),
         "there is no ritornel-server beside ritornelctl: build the workspace"
@@ -237,11 +247,22 @@ impl Server {
     }
 
     fn stop(self) {
-        let sent = Command::new("kill")
-            .arg("-TERM")
-            .arg(self.child.id().to_string())
-            .status()
-            .unwrap();
+        // `taskkill /PID` without `/F` is what Windows has for SIGTERM: it
+        // asks the server's hidden window to close.
+        let sent = if cfg!(windows) {
+            Command::new("taskkill")
+                .arg("/PID")
+                .arg(self.child.id().to_string())
+                .output()
+                .unwrap()
+                .status
+        } else {
+            Command::new("kill")
+                .arg("-TERM")
+                .arg(self.child.id().to_string())
+                .status()
+                .unwrap()
+        };
         assert!(sent.success());
         assert_eq!(self.ended(), Some(0));
     }
@@ -349,13 +370,13 @@ fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_on
     assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
     assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
     assert_eq!(ritornelctl(&data_dir, &["play", folder]).0, Some(0));
-    assert_eq!(dying.ended(), None);
+    assert_eq!(dying.ended(), ABORTED);
 
     // The next run closes the listen as a crash, and dies itself just
     // after the library has taken it in and before server.db lets it go.
     assert_eq!(
         run_until_it_dies(&data_dir, &[("RITORNEL_TEST_FAIL_AFTER_INGEST", "1")]),
-        None
+        ABORTED
     );
 
     // The run after that is a normal one.
@@ -390,7 +411,7 @@ fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_on
     assert_eq!(listen["endReason"], "crash");
     // Sent by the next run on the same boot of the machine, it is still
     // dated by its age, where the kernel's boot ID can be read.
-    let expected_basis = if cfg!(any(target_os = "linux", target_os = "macos")) {
+    let expected_basis = if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         "hub_age"
     } else {
         "server_wall"
@@ -451,7 +472,7 @@ fn a_server_killed_just_after_a_join_keeps_both_listens_and_the_boundary_between
     assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
     assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
     assert_eq!(ritornelctl(&data_dir, &["play", folder]).0, Some(0));
-    assert_eq!(dying.ended(), None);
+    assert_eq!(dying.ended(), ABORTED);
 
     let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
     let now = json(&data_dir, &["now"]);

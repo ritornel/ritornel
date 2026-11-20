@@ -1,0 +1,43 @@
+[package]
+name = "ritornel-windows"
+description = "What Ritornel asks of Windows that the standard library cannot: a lock on one byte, owner-only access, a file's identity, a clock that counts through sleep, and a hidden window."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Every other crate of the workspace forbids unsafe code. This one is where
+# the calls into Win32 that need it are kept, each behind a safe function,
+# so that the rest of the workspace stays free of it. It is empty on every
+# other platform.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# The workspace's lints, but for unsafe code, which is allowed here and held
+# to a written reason for each block.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"

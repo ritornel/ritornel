@@ -41,10 +41,6 @@ clap = { version = "4.6.7", default-features = false, features = ["std", "derive
 # neither adds to the lock file.
 hyper = { version = "1.12.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
-# Free disk space, for `server.status`, and the user ID that names the
-# login session the background service runs in. The standard library cannot
-# ask for either without unsafe code.
-rustix = { version = "1.1.6", features = ["fs", "process"] }
 # Compares a presented credential with the server's own in constant time.
 # It is already in the lock file, under the engine's signing key.
 subtle = "2.6.1"
@@ -63,6 +59,18 @@ tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "s
 toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 # What log lines are written through, here and in the libraries to come.
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+
+# Free disk space, for `server.status`, and the user ID that names the
+# login session the background service runs in. The standard library cannot
+# ask for either without unsafe code.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["fs", "process"] }
+
+# The same on Windows, and what Windows has in place of the rest of Unix: a
+# lock on one byte, owner-only access lists, a folder's identity, and the
+# hidden window that hears `taskkill` and the end of the session.
+[target.'cfg(windows)'.dependencies]
+ritornel-windows.workspace = true
 
 # The media session on macOS, as the Now Playing spike used it: souvlaki for
 # Now Playing and the remote commands, and Core Foundation's run loop for

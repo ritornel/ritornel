@@ -4,7 +4,7 @@
 //! "Scanning one file" step 1 and "Rescans" in docs/design/identity.md.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
@@ -38,16 +38,36 @@ pub(crate) struct Walked {
     pub(crate) images: BTreeMap<String, Vec<Seen>>,
     /// Files passed over, with why: a name that is not UTF-8.
     pub(crate) skipped: Vec<(String, &'static str)>,
-    /// Which folder the root was when it was walked: its device and inode.
-    /// An unmounted disk leaves another folder at the same path.
+    /// Which folder the root was when it was walked: its device and inode,
+    /// or on Windows its volume's serial number and its file index. An
+    /// unmounted disk leaves another folder at the same path.
     pub(crate) root_id: Option<(u64, u64)>,
 }
 
 /// Which folder is at `root` now, if one is.
 pub(crate) fn root_id(root: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata(root).ok()?;
-    metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
+    if !metadata.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        ritornel_windows::file::id(root).ok()
+    }
+}
+
+/// The file at `rel`, a path relative to `root` with `/` between its parts,
+/// as the system names it. Each part is joined in turn: a root in the `\\?\`
+/// form, as `canonicalize` gives on Windows, takes no `/` as a separator.
+pub(crate) fn under(root: &Path, rel: &str) -> PathBuf {
+    let mut path = root.to_owned();
+    path.extend(rel.split('/').filter(|part| !part.is_empty()));
+    path
 }
 
 /// The folder a file is in, relative to the root: empty at the root.

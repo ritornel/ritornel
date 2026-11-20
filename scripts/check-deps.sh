@@ -64,6 +64,11 @@ only ritornel-lastfm ritornel-source
 forbid ritornel-lastfm rusqlite
 forbid ritornel-engine ritornel-lastfm scrobl
 
+# What Windows asks for that takes unsafe code stands beside the core: it
+# builds on no crate of the workspace, and the engine, the server and the
+# tests build on it.
+only ritornel-windows
+
 # A server built without its default features, as the hub is, has no
 # Last.fm code, no media session and no audio output in it, so on Linux it
 # builds with no ALSA or D-Bus library installed.

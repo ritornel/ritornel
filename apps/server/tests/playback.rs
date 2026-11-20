@@ -176,7 +176,12 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
         // decides.
         let refused = client
             .call::<SourcesTracks>(&SourcesTracksParams {
-                path: "/not/a/root".to_owned(),
+                // Absolute on every system, and under none of its roots.
+                path: std::env::temp_dir()
+                    .join("not-a-root")
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
             })
             .await
             .unwrap_err();

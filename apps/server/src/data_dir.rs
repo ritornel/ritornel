@@ -19,9 +19,8 @@
 //! `credential`, are the contract's (`ritornel_contract::local`): a local client reads
 //! what the server writes here.
 
-use std::fs::{DirBuilder, OpenOptions, Permissions};
+use std::fs::{DirBuilder, OpenOptions};
 use std::io::ErrorKind;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ritornel_contract::local;
@@ -42,7 +41,60 @@ pub(crate) fn resolve(flag: Option<&Path>, env: Env<'_>) -> Result<PathBuf, Erro
 }
 
 /// The mode of a file that only its owner may read or write.
+#[cfg(unix)]
 const OWNER_ONLY: u32 = 0o600;
+
+/// Creates the folder at `path`, and those above it that are missing, so
+/// that only the OS user can open what it creates: mode `0700` on Unix,
+/// and on Windows an access list of that user alone, which what is later
+/// made inside it inherits. A folder that is there already is left as it is.
+fn create_private_dir(path: &Path) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(io_error("create", path))
+    }
+    #[cfg(windows)]
+    {
+        if path.is_dir() {
+            return Ok(());
+        }
+        // The highest folder this call makes is closed, and those it makes
+        // inside it inherit that.
+        let mut highest = path;
+        while let Some(parent) = highest
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            if parent.exists() {
+                break;
+            }
+            highest = parent;
+        }
+        DirBuilder::new()
+            .recursive(true)
+            .create(path)
+            .map_err(io_error("create", path))?;
+        ritornel_windows::private::restrict(highest).map_err(io_error("close", highest))
+    }
+}
+
+/// Closes the file at `path` to everyone but the OS user.
+fn close(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(OWNER_ONLY))
+    }
+    #[cfg(windows)]
+    {
+        ritornel_windows::private::restrict(path)
+    }
+}
 
 /// A data directory that exists.
 #[derive(Debug, Clone)]
@@ -61,11 +113,7 @@ impl DataDir {
     pub(crate) fn prepare(root: PathBuf) -> Result<Self, Error> {
         let dir = Self { root };
         for path in [dir.root.clone(), dir.logs()] {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&path)
-                .map_err(io_error("create", &path))?;
+            create_private_dir(&path)?;
         }
         close_database(&dir.server_db())?;
         Ok(dir)
@@ -116,11 +164,7 @@ impl DataDir {
     /// `tmp/` are in it. Nothing in it need be backed up.
     pub(crate) fn cache(&self) -> Result<PathBuf, Error> {
         let cache = self.root.join("cache");
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&cache)
-            .map_err(io_error("create", &cache))?;
+        create_private_dir(&cache)?;
         Ok(cache)
     }
 }
@@ -133,18 +177,19 @@ impl DataDir {
 /// to a file this call creates, so one that was already there is closed as
 /// well, with any log left beside it.
 fn close_database(database: &Path) -> Result<(), Error> {
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(OWNER_ONLY)
+    let mut options = OpenOptions::new();
+    options.append(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, OWNER_ONLY);
+    options
         .open(database)
-        .and_then(|file| file.set_permissions(Permissions::from_mode(OWNER_ONLY)))
+        .and_then(|_| close(database))
         .map_err(io_error("create", database))?;
     for suffix in ["-wal", "-shm"] {
         let mut sidecar = database.to_owned().into_os_string();
         sidecar.push(suffix);
         let sidecar = PathBuf::from(sidecar);
-        match std::fs::set_permissions(&sidecar, Permissions::from_mode(OWNER_ONLY)) {
+        match close(&sidecar) {
             Err(error) if error.kind() != ErrorKind::NotFound => {
                 return Err(io_error("close", &sidecar)(error));
             }
@@ -195,18 +240,29 @@ impl HeldDir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Scratch, env, mode};
+    use crate::testing::{Scratch, env, open_to_others, private};
 
     #[test]
     fn the_flag_wins_then_the_variable_then_the_default() {
-        let both = env(&[(local::DATA_DIR_VAR, "/from/env"), ("HOME", "/home/pat")]);
+        // Absolute on this platform: Windows takes `/from` as on the
+        // current drive.
+        let (flag, from_env) = if cfg!(windows) {
+            (r"C:\from\flag", r"C:\from\env")
+        } else {
+            ("/from/flag", "/from/env")
+        };
+        let home = ("HOME", "/home/pat");
+        let local_app_data = ("LOCALAPPDATA", r"C:\Users\pat\AppData\Local");
+        let both = [(local::DATA_DIR_VAR, from_env), home, local_app_data];
+        let both = env(&both);
         assert_eq!(
-            resolve(Some(Path::new("/from/flag")), &both).unwrap(),
-            Path::new("/from/flag")
+            resolve(Some(Path::new(flag)), &both).unwrap(),
+            Path::new(flag)
         );
-        assert_eq!(resolve(None, &both).unwrap(), Path::new("/from/env"));
+        assert_eq!(resolve(None, &both).unwrap(), Path::new(from_env));
 
-        let home_only = env(&[("HOME", "/home/pat")]);
+        let home_only = [home, local_app_data];
+        let home_only = env(&home_only);
         assert_eq!(
             resolve(None, &home_only).unwrap(),
             local::default_data_dir(&home_only).unwrap()
@@ -233,9 +289,16 @@ mod tests {
         let scratch = Scratch::new();
         let root = scratch.path().join("deep/inside/data");
         let dir = DataDir::prepare(root.clone()).unwrap();
-        assert_eq!(mode(&root), 0o700);
-        assert_eq!(mode(&dir.logs()), 0o700);
-        assert_eq!(mode(&dir.server_db()), 0o600);
+        assert!(private(&root));
+        assert!(private(&dir.logs()));
+        assert!(private(&dir.server_db()));
+        #[cfg(unix)]
+        {
+            use crate::testing::mode;
+            assert_eq!(mode(&root), 0o700);
+            assert_eq!(mode(&dir.logs()), 0o700);
+            assert_eq!(mode(&dir.server_db()), 0o600);
+        }
     }
 
     #[test]
@@ -245,16 +308,16 @@ mod tests {
         // database and a log left beside it can all be read by anyone.
         let root = scratch.path().join("data");
         std::fs::create_dir(&root).unwrap();
-        let open = Permissions::from_mode(0o644);
         for name in ["server.db", "server.db-wal", "server.db-shm"] {
             std::fs::write(root.join(name), "").unwrap();
-            std::fs::set_permissions(root.join(name), open.clone()).unwrap();
+            open_to_others(&root.join(name));
+            assert!(!private(&root.join(name)));
         }
 
         let dir = DataDir::prepare(root.clone()).unwrap();
-        assert_eq!(mode(&dir.server_db()), 0o600);
-        assert_eq!(mode(&root.join("server.db-wal")), 0o600);
-        assert_eq!(mode(&root.join("server.db-shm")), 0o600);
+        assert!(private(&dir.server_db()));
+        assert!(private(&root.join("server.db-wal")));
+        assert!(private(&root.join("server.db-shm")));
     }
 
     #[test]

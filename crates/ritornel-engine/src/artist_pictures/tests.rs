@@ -341,6 +341,10 @@ fn fifo(path: &Path) {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Windows has no named pipe that can stand in a folder: its pipes live only in the system's pipe namespace, so there is none here to wait on"
+)]
 fn a_pipe_or_a_file_too_large_is_unreadable_and_never_waited_on() {
     let (rig, folder) = rig();
     // A portrait that is a named pipe, which a plain read would wait on.
@@ -403,6 +407,33 @@ fn named_art(rig: &Rig, name: &str) -> Id {
     artist.art_id.unwrap()
 }
 
+/// Makes `link` a symbolic link to the file `target`. Windows lets only an
+/// administrator, or anyone on a machine in developer mode, make one.
+fn link_file(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target, link)
+        .expect("a symbolic link needs developer mode or an administrator on Windows");
+}
+
+/// Makes `link` lead to the folder `target`: a symbolic link, or on Windows
+/// a junction, which anyone may make.
+fn link_folder(target: &Path, link: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let done = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "{done:?}");
+    }
+}
+
 #[test]
 fn a_link_out_of_the_folder_is_not_followed_on_import_or_when_served() {
     let (rig, folder) = rig();
@@ -413,16 +444,15 @@ fn a_link_out_of_the_folder_is_not_followed_on_import_or_when_served() {
     portrait(folder.path(), MOSS_ARCADE, "portrait.jpg", &picture);
     let dir = folder.path().join(MOSS_ARCADE);
     std::fs::remove_file(dir.join("portrait.jpg")).unwrap();
-    std::os::unix::fs::symlink(
-        outside.path().join("elsewhere.jpg"),
-        dir.join("portrait.jpg"),
-    )
-    .unwrap();
+    link_file(
+        &outside.path().join("elsewhere.jpg"),
+        &dir.join("portrait.jpg"),
+    );
     // An artist's folder that is a link to a folder outside.
     let away = outside.path().join("away");
     portrait(outside.path(), "away", "me.jpg", &picture);
     std::fs::create_dir_all(folder.path().join("by-name")).unwrap();
-    std::os::unix::fs::symlink(&away, folder.path().join("by-name/Various Artists")).unwrap();
+    link_folder(&away, &folder.path().join("by-name/Various Artists"));
     let counts = import(&rig, folder.path(), 0xa1).unwrap();
     assert_eq!(
         (counts.unreadable, counts.by_mbid, counts.by_name),
@@ -435,11 +465,10 @@ fn a_link_out_of_the_folder_is_not_followed_on_import_or_when_served() {
     assert_eq!(import(&rig, folder.path(), 0xa2).unwrap().by_mbid, 1);
     let art = named_art(&rig, "Moss Arcade");
     std::fs::remove_file(dir.join("portrait.jpg")).unwrap();
-    std::os::unix::fs::symlink(
-        outside.path().join("elsewhere.jpg"),
-        dir.join("portrait.jpg"),
-    )
-    .unwrap();
+    link_file(
+        &outside.path().join("elsewhere.jpg"),
+        &dir.join("portrait.jpg"),
+    );
     let cache = Scratch::new();
     let covers = Covers::new(cache.path()).unwrap();
     assert!(matches!(
@@ -575,11 +604,30 @@ fn a_picture_disk_that_goes_away_mid_import_drops_no_portrait() {
     // An artist's folder the system will not read is kept as it was. A
     // process that may read anything cannot be shown this.
     let dir = folder.path().join(MOSS_ARCADE);
-    let mode = |bits| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(bits)).unwrap();
+    let mode = |readable: bool| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let bits = if readable { 0o755 } else { 0o000 };
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(bits)).unwrap();
+        }
+        // Windows lets a process pass through a folder it may not list, so
+        // reading what is in it is denied too, by an entry each file
+        // inherits.
+        #[cfg(windows)]
+        {
+            let mut icacls = std::process::Command::new("icacls");
+            icacls.arg(&dir);
+            if readable {
+                icacls.args(["/remove:d", "*S-1-1-0"]);
+            } else {
+                icacls.args(["/deny", "*S-1-1-0:(OI)(CI)(RD)"]);
+            }
+            let done = icacls.output().unwrap();
+            assert!(done.status.success(), "{done:?}");
+        }
     };
-    mode(0o000);
+    mode(false);
     if std::fs::read_dir(&dir).is_err() {
         let checked = super::check_picture_folder(folder.path()).unwrap();
         assert_eq!(refresh(&checked).unwrap(), None);
@@ -587,7 +635,7 @@ fn a_picture_disk_that_goes_away_mid_import_drops_no_portrait() {
         assert_eq!((counts.unreadable, counts.dropped), (1, 0));
         assert_eq!(rig.rows(rows), held);
     }
-    mode(0o755);
+    mode(true);
 
     // Read, and no longer chosen: dropped.
     std::fs::remove_dir_all(&dir).unwrap();

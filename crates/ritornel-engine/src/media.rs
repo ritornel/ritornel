@@ -630,7 +630,7 @@ pub(crate) fn read_file(
         folder_images,
         error: None,
     };
-    payload.error = read_audio(&root.join(rel_path), &mut payload).err();
+    payload.error = read_audio(&crate::walk::under(root, rel_path), &mut payload).err();
     if payload
         .error
         .as_ref()

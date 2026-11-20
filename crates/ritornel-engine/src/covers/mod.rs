@@ -406,7 +406,7 @@ fn scale(decoded: &image::DynamicImage, size: u32) -> Result<Vec<u8>, CoverError
 /// `roots` are the roots this server has a path for.
 fn read_source(roots: &[(String, String)], source: &Source) -> Option<Vec<u8>> {
     let (_, root) = roots.iter().find(|(name, _)| *name == source.root)?;
-    let file = Path::new(root).join(&source.path);
+    let file = crate::walk::under(Path::new(root), &source.path);
     let same = |bytes: &Vec<u8>| blake3::hash(bytes).as_bytes().as_slice() == source.hash;
     match &source.place {
         Place::FolderImage(name) => std::fs::read(file.parent()?.join(name)).ok().filter(same),

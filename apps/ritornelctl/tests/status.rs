@@ -144,7 +144,8 @@ fn status(data_dir: &Path, extra: &[&str]) -> Ended {
 
 /// The `ritornel-server` that was built beside `ritornelctl`.
 fn server_binary() -> PathBuf {
-    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl")).with_file_name("ritornel-server");
+    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl"))
+        .with_file_name(format!("ritornel-server{}", std::env::consts::EXE_SUFFIX));
     assert!(
         binary.exists(),
         "there is no ritornel-server beside ritornelctl at {}. Build the workspace: `mise run \
@@ -205,12 +206,31 @@ impl Server {
     }
 
     /// Sends the server a signal, by name: `TERM`, `KILL`.
+    /// On Windows `TERM` is `taskkill /PID`, which asks the server's hidden
+    /// window to close, and `KILL` is `taskkill /F /PID`, which ends it.
     fn signal(&self, name: &str) {
-        let sent = Command::new("kill")
-            .arg(format!("-{name}"))
-            .arg(self.child.id().to_string())
-            .status()
-            .unwrap();
+        let sent = if cfg!(windows) {
+            let mut taskkill = Command::new("taskkill");
+            match name {
+                "TERM" => {}
+                "KILL" => {
+                    taskkill.arg("/F");
+                }
+                other => panic!("no Windows equivalent of SIG{other}"),
+            }
+            taskkill
+                .arg("/PID")
+                .arg(self.child.id().to_string())
+                .output()
+                .unwrap()
+                .status
+        } else {
+            Command::new("kill")
+                .arg(format!("-{name}"))
+                .arg(self.child.id().to_string())
+                .status()
+                .unwrap()
+        };
         assert!(sent.success());
     }
 
@@ -490,7 +510,9 @@ fn a_server_that_was_killed_is_not_taken_for_a_running_one_and_its_port_is_not_a
     let scratch = Scratch::new();
     let data_dir = scratch.data_dir();
     let killed = Server::start(&data_dir).end("KILL");
-    assert_eq!(killed.code, None);
+    // A signal ended it on Unix, with no code; `taskkill /F` ends a process
+    // with 1.
+    assert_eq!(killed.code, if cfg!(windows) { Some(1) } else { None });
     // It had no chance to clear up after itself.
     let left = read_json(&data_dir.join("server.json"));
     let endpoint = left["endpoint"].as_str().unwrap();

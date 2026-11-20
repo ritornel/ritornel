@@ -9,7 +9,6 @@ use std::sync::mpsc::{self, Sender};
 use ritornel_engine::playback::Output;
 use ritornel_engine::{Clock, Entropy, OsEntropy, ScanSettings, SystemClock, new_id};
 use tokio::runtime::Runtime;
-use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info};
 
 use crate::cli::ServeArgs;
@@ -20,16 +19,40 @@ use crate::{Bounds, Env, Error, PlaybackRun, Run, Server, logs};
 /// Why a run is stopping.
 #[derive(Debug, Clone, Copy)]
 enum Stop {
+    /// SIGINT, or Ctrl+C in a console on Windows.
     Interrupt,
+    /// SIGTERM, or on Windows a polite `taskkill /PID`, which asks the
+    /// server's hidden window to close.
     Terminate,
+    /// Ctrl+Break in a console on Windows.
+    #[cfg(windows)]
+    Break,
+    /// The console the server runs in was closed, on Windows.
+    #[cfg(windows)]
+    ConsoleClosed,
+    /// The user is signing out or the machine is shutting down, on Windows.
+    #[cfg(windows)]
+    SessionEnding,
     OwnerGone,
 }
 
 impl Stop {
     fn as_str(self) -> &'static str {
         match self {
+            #[cfg(unix)]
             Self::Interrupt => "SIGINT",
+            #[cfg(unix)]
             Self::Terminate => "SIGTERM",
+            #[cfg(windows)]
+            Self::Interrupt => "Ctrl+C",
+            #[cfg(windows)]
+            Self::Terminate => "asked to close",
+            #[cfg(windows)]
+            Self::Break => "Ctrl+Break",
+            #[cfg(windows)]
+            Self::ConsoleClosed => "console closed",
+            #[cfg(windows)]
+            Self::SessionEnding => "session ending",
             Self::OwnerGone => "standard input closed",
         }
     }
@@ -100,7 +123,12 @@ fn run(
         .build()
         .map_err(Error::Runtime)?;
     let (stop, stopped) = mpsc::channel();
+    // On Windows this holds the hidden window that hears the session end,
+    // for the whole run.
+    #[cfg(unix)]
     watch_signals(&runtime, &stop).map_err(Error::Runtime)?;
+    #[cfg(windows)]
+    let signals = watch_signals(&runtime, &stop).map_err(Error::Runtime)?;
     if args.owned {
         watch_stdin(stop.clone()).map_err(Error::Runtime)?;
     }
@@ -163,6 +191,9 @@ fn run(
 
     let stopped = runtime.block_on(server.stop());
     runtime.shutdown_background();
+    // A session that is ending waits for this before it ends the process.
+    #[cfg(windows)]
+    signals.stopped();
     ready.and(stopped)
 }
 
@@ -259,7 +290,9 @@ fn lastfm(env: Env<'_>) -> crate::LastfmRun {
 
 /// Sends a stop when the process gets SIGINT or SIGTERM. The handlers are in
 /// place when this returns.
+#[cfg(unix)]
 fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
     let _in_runtime = runtime.enter();
     for (kind, reason) in [
         (SignalKind::interrupt(), Stop::Interrupt),
@@ -275,6 +308,48 @@ fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::Result<()> 
         });
     }
     Ok(())
+}
+
+/// Sends a stop on what Windows has in place of signals: Ctrl+C, Ctrl+Break
+/// and the console closing, when the server runs in one, and for a server
+/// with no console, as one the desktop app or the background service starts
+/// is, a hidden window asked to close (`taskkill /PID <pid>`, without `/F`)
+/// or told that the session is ending. The handlers and the window are in
+/// place when this returns. The window lives as long as what is returned,
+/// which the run keeps until it has stopped and then tells so.
+#[cfg(windows)]
+fn watch_signals(
+    runtime: &Runtime,
+    stop: &Sender<Stop>,
+) -> std::io::Result<ritornel_windows::window::Window> {
+    use ritornel_windows::window::{Closing, Window};
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+
+    let _in_runtime = runtime.enter();
+    macro_rules! on {
+        ($listen:expr, $reason:expr) => {{
+            let mut signals = $listen?;
+            let stop = stop.clone();
+            runtime.spawn(async move {
+                if signals.recv().await.is_some() {
+                    // The main thread has gone only if it is stopping already.
+                    let _ = stop.send($reason);
+                }
+            });
+        }};
+    }
+    on!(ctrl_c(), Stop::Interrupt);
+    on!(ctrl_break(), Stop::Break);
+    on!(ctrl_close(), Stop::ConsoleClosed);
+    on!(ctrl_logoff(), Stop::SessionEnding);
+    on!(ctrl_shutdown(), Stop::SessionEnding);
+    let stop = stop.clone();
+    Window::open("Ritornel server", move |why| {
+        let _ = stop.send(match why {
+            Closing::Asked => Stop::Terminate,
+            Closing::SessionEnding => Stop::SessionEnding,
+        });
+    })
 }
 
 /// Sends a stop when standard input reaches its end: the program that

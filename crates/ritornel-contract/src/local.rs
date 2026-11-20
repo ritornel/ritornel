@@ -29,7 +29,20 @@ pub const DATA_DIR_VAR: &str = "RITORNEL_DATA_DIR";
 /// tries the lock before it believes `server.json`, and believes it only if
 /// both name the same pid ([`lock_holder`]). Only the user who owns the
 /// data directory can open the lock file, so nobody else can hold it.
+///
+/// On Unix the lock is `flock` on the whole file, taken exclusively by the
+/// server and shared, for an instant, by a client that asks. Windows
+/// enforces a lock: bytes held exclusively cannot be read through another
+/// handle. So a server there holds [`WINDOWS_LOCK_BYTE`] alone, past the
+/// end of the file, and its pid stays readable. A client asks as on Unix,
+/// with a shared lock on the whole file, which covers that byte.
 pub const SERVER_LOCK: &str = "server.lock";
+
+/// The one byte of [`SERVER_LOCK`] that a server on Windows holds
+/// exclusively for its life: the last byte a lock on the whole file covers,
+/// as the standard library takes one there (`u64::MAX` bytes from 0), and
+/// far past anything the file holds.
+pub const WINDOWS_LOCK_BYTE: u64 = u64::MAX - 1;
 
 /// The pid that the text of [`SERVER_LOCK`] names, if it names one. It
 /// names none for the instant between a server taking the lock and writing
@@ -80,9 +93,23 @@ fn set(env: Env<'_>, name: &str) -> Option<PathBuf> {
 pub fn default_data_dir(env: Env<'_>) -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         macos_default(env)
+    } else if cfg!(windows) {
+        windows_default(env)
     } else {
         xdg_default(env)
     }
+}
+
+/// `%LOCALAPPDATA%\Ritornel`, which is `C:\Users\<user>\AppData\Local\Ritornel`.
+/// It is the local application data folder and not the roaming one
+/// (`%APPDATA%`): a roaming profile is copied to every machine the user
+/// signs in to, and `server.db` holds this server's own identity, which two
+/// machines must never share, beside a library, a lock and a cache that
+/// belong to this machine. A relative value is ignored.
+fn windows_default(env: Env<'_>) -> Option<PathBuf> {
+    set(env, "LOCALAPPDATA")
+        .filter(|base| base.is_absolute())
+        .map(|base| base.join("Ritornel"))
 }
 
 /// `~/Library/Application Support/Ritornel`: where macOS keeps what an
@@ -147,14 +174,21 @@ mod tests {
 
     #[test]
     fn the_flag_wins_then_the_variable_then_the_default() {
-        let both = env(&[(DATA_DIR_VAR, "/from/env"), ("HOME", "/home/pat")]);
+        let both = env(&[
+            (DATA_DIR_VAR, "/from/env"),
+            ("HOME", "/home/pat"),
+            ("LOCALAPPDATA", r"C:\Users\pat\AppData\Local"),
+        ]);
         assert_eq!(
             data_dir(Some(Path::new("/from/flag")), &both).unwrap(),
             Path::new("/from/flag")
         );
         assert_eq!(data_dir(None, &both).unwrap(), Path::new("/from/env"));
 
-        let home_only = env(&[("HOME", "/home/pat")]);
+        let home_only = env(&[
+            ("HOME", "/home/pat"),
+            ("LOCALAPPDATA", r"C:\Users\pat\AppData\Local"),
+        ]);
         assert_eq!(
             data_dir(None, &home_only).unwrap(),
             default_data_dir(&home_only).unwrap()
@@ -163,7 +197,11 @@ mod tests {
 
     #[test]
     fn an_empty_variable_counts_as_unset() {
-        let empty = env(&[(DATA_DIR_VAR, ""), ("HOME", "/home/pat")]);
+        let empty = env(&[
+            (DATA_DIR_VAR, ""),
+            ("HOME", "/home/pat"),
+            ("LOCALAPPDATA", r"C:\Users\pat\AppData\Local"),
+        ]);
         assert_eq!(
             data_dir(None, &empty).unwrap(),
             default_data_dir(&empty).unwrap()
@@ -193,6 +231,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_default_elsewhere_follows_the_xdg_data_directory() {
         assert_eq!(
             xdg_default(&env(&[("HOME", "/home/pat")])).unwrap(),
@@ -212,6 +251,22 @@ mod tests {
             Path::new("/home/pat/.local/share/ritornel")
         );
         assert_eq!(xdg_default(&env(&[])), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_windows_default_is_in_local_application_data() {
+        assert_eq!(
+            windows_default(&env(&[("LOCALAPPDATA", r"C:\Users\pat\AppData\Local")])).unwrap(),
+            Path::new(r"C:\Users\pat\AppData\Local\Ritornel")
+        );
+        // Never the roaming folder, nor a relative one.
+        assert_eq!(
+            windows_default(&env(&[("APPDATA", r"C:\Users\pat\AppData\Roaming")])),
+            None
+        );
+        assert_eq!(windows_default(&env(&[("LOCALAPPDATA", "AppData")])), None);
+        assert_eq!(windows_default(&env(&[])), None);
     }
 
     #[test]

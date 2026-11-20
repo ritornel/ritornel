@@ -17,7 +17,6 @@
 )]
 
 use std::io::{BufRead, BufReader, Read};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -194,6 +193,7 @@ impl Server {
     }
 
     /// Sends the server a signal, by name: `TERM`, `INT`.
+    #[cfg(unix)]
     fn signal(&self, name: &str) {
         let sent = Command::new("kill")
             .arg(format!("-{name}"))
@@ -201,6 +201,21 @@ impl Server {
             .status()
             .unwrap();
         assert!(sent.success());
+    }
+
+    /// Asks the server to stop as Windows does in place of `TERM`:
+    /// `taskkill /PID` without `/F` asks its hidden window to close. A
+    /// process with no console of its own has no Ctrl+C to be sent, so
+    /// `INT` is not one of them.
+    #[cfg(windows)]
+    fn signal(&self, name: &str) {
+        assert_eq!(name, "TERM", "only TERM has a Windows equivalent here");
+        let sent = Command::new("taskkill")
+            .arg("/PID")
+            .arg(self.pid.to_string())
+            .output()
+            .unwrap();
+        assert!(sent.status.success(), "{sent:?}");
     }
 
     /// Closes the server's standard input.
@@ -223,7 +238,7 @@ impl Server {
         }
     }
 
-    /// Stops the server with SIGTERM and checks that it stopped cleanly.
+    /// Stops the server with `TERM` and checks that it stopped cleanly.
     fn stop(self, data_dir: &Path) {
         self.signal("TERM");
         assert_clean_stop(&self.wait(), data_dir);
@@ -286,8 +301,27 @@ fn messages(lines: &[Value]) -> Vec<&str> {
         .collect()
 }
 
-fn mode(path: &Path) -> u32 {
-    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+/// The reason a server logs when it is stopped by [`Server::signal`] with
+/// `TERM`.
+const TERM_REASON: &str = if cfg!(windows) {
+    "asked to close"
+} else {
+    "SIGTERM"
+};
+
+/// Whether only the owner can open a file or directory: the modes `0600`
+/// and `0700` on Unix, and an access list that names the owner alone on
+/// Windows.
+fn private(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o077 == 0
+    }
+    #[cfg(windows)]
+    {
+        ritornel_windows::private::path_is_private(path).unwrap()
+    }
 }
 
 fn credential(data_dir: &Path) -> String {
@@ -368,14 +402,15 @@ fn a_restart_keeps_the_identity_and_the_credential() {
 
     let first = Server::start(&data_dir, &[]);
     let server_id = first.server_id.clone();
-    first.signal("INT");
+    let first_stop = if cfg!(windows) { "TERM" } else { "INT" };
+    first.signal(first_stop);
     assert_clean_stop(&first.wait(), &data_dir);
 
     let token = credential(&data_dir);
     assert_eq!(token.trim().len(), 64);
-    assert_eq!(mode(&data_dir.join("credential")), 0o600);
-    assert_eq!(mode(&data_dir), 0o700);
-    assert_eq!(mode(&data_dir.join("server.db")), 0o600);
+    assert!(private(&data_dir.join("credential")));
+    assert!(private(&data_dir));
+    assert!(private(&data_dir.join("server.db")));
     assert!(accepts(&data_dir, &token));
 
     let second = Server::start(&data_dir, &[]);
@@ -390,7 +425,8 @@ fn a_restart_keeps_the_identity_and_the_credential() {
         .filter(|line| line["message"] == "stopping")
         .map(|line| line["reason"].as_str().unwrap())
         .collect();
-    assert_eq!(reasons, ["SIGINT", "SIGTERM"]);
+    let first_reason = if cfg!(windows) { TERM_REASON } else { "SIGINT" };
+    assert_eq!(reasons, [first_reason, TERM_REASON]);
 }
 
 #[test]
@@ -409,7 +445,7 @@ fn a_lost_credential_file_is_replaced_at_the_next_start() {
 
     let replacement = credential(&data_dir);
     assert_ne!(replacement, lost);
-    assert_eq!(mode(&data_dir.join("credential")), 0o600);
+    assert!(private(&data_dir.join("credential")));
     assert!(accepts(&data_dir, &replacement));
     assert!(!accepts(&data_dir, &lost));
     let lines = log_lines(&data_dir);
@@ -465,7 +501,7 @@ fn a_server_nobody_owns_outlives_its_standard_input() {
         .iter()
         .find(|line| line["message"] == "stopping")
         .unwrap();
-    assert_eq!(stopping["reason"], "SIGTERM");
+    assert_eq!(stopping["reason"], TERM_REASON);
 }
 
 #[test]
