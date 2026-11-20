@@ -6,7 +6,10 @@
 //! system's default names, as the Tauri app's is. A `ritornel-server` beside
 //! the program is started when none is running, as the app bundle's is
 //! (with `--output` from `RITORNEL_TEST_OUTPUT`); with none beside it, the
-//! app only finds one. While there is no server it keeps looking, a little
+//! app only finds one. Where the server outlives the app
+//! (`platform::SERVER_APART`), it is started apart from it, and Quit stops
+//! it, on this run or a later one; elsewhere the launcher holds it, and it
+//! stops when the app ends. While there is no server it keeps looking, a little
 //! less often each time up to every two seconds, and says why in the words
 //! the Tauri app uses; "Look again" looks at once. A session that ends is
 //! "lost", and looked for again.
@@ -14,11 +17,12 @@
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{AppContext, Context, EventEmitter, Task};
 use ritornel_client::launch::{Launcher, Program};
+use ritornel_client::local::LocalServer;
 use ritornel_client::{Error, NotRunning, local};
 use ritornel_contract::Event;
 
@@ -113,6 +117,8 @@ pub(crate) enum LinkEvent {
 pub(crate) struct Link {
     pub(crate) state: State,
     launcher: Option<Arc<Launcher>>,
+    /// The server to start apart from the app, where it outlives it.
+    apart: Option<Arc<Program>>,
     /// Whether a look is under way, for "Looking…".
     pub(crate) looking: bool,
     attempt: Option<Task<()>>,
@@ -143,12 +149,18 @@ impl Link {
                 }
                 program
             });
+        let (held, apart) = if crate::platform::SERVER_APART {
+            (None, program.map(Arc::new))
+        } else {
+            (program, None)
+        };
         let launcher = local::data_dir(data_dir, &env)
             .ok()
-            .map(|dir| Arc::new(Launcher::new(dir, program)));
+            .map(|dir| Arc::new(Launcher::new(dir, held)));
         let mut link = Self {
             state: State::Looking,
             launcher,
+            apart,
             looking: false,
             attempt: None,
         };
@@ -185,6 +197,23 @@ impl Link {
         }
     }
 
+    /// What Quit stops: the server this app started, held or apart, on this
+    /// run or an earlier one. A server it found is left running.
+    pub(crate) fn stop_started(&self) {
+        self.stop_owned();
+        let Some(dir) = self.data_dir() else {
+            return;
+        };
+        let holder = std::fs::read_to_string(dir.join(ritornel_contract::local::SERVER_LOCK))
+            .ok()
+            .and_then(|text| ritornel_contract::local::lock_holder(&text));
+        if let Some(pid) = holder
+            && crate::platform::started_here(pid)
+        {
+            crate::platform::stop_server(pid, ritornel_client::launch::STOP_WAIT);
+        }
+    }
+
     fn look(&mut self, cx: &mut Context<Self>) {
         let Some(launcher) = self.launcher.clone() else {
             self.state = State::Away {
@@ -198,14 +227,15 @@ impl Link {
         };
         self.looking = true;
         cx.notify();
+        let apart = self.apart.clone();
         // Dropping the attempt before stops the looking it was doing.
         self.attempt = Some(cx.spawn(async move |link, cx| {
             let mut tries = 0usize;
             loop {
-                let launched = Arc::clone(&launcher);
+                let (launched, apart) = (Arc::clone(&launcher), apart.clone());
                 let found = rt()
                     .spawn(async move {
-                        let server = launched.find_or_start().await?;
+                        let server = find_or_start(&launched, apart.as_deref()).await?;
                         Net::open(&server).await
                     })
                     .await;
@@ -287,6 +317,60 @@ impl Link {
             });
         }));
     }
+}
+
+/// How long a server started apart has to come up.
+const START_WITHIN: Duration = Duration::from_secs(10);
+
+/// Finds the server, or, with a program to start apart from the app and
+/// none running, starts it and finds it once it is up. One that loses the
+/// race to another ends, and the other is found.
+async fn find_or_start(launcher: &Launcher, apart: Option<&Program>) -> Result<LocalServer, Error> {
+    let error = match launcher.find_or_start().await {
+        Ok(server) => return Ok(server),
+        Err(error) => error,
+    };
+    let (
+        Error::NotRunning {
+            why: NotRunning::NoServerJson | NotRunning::Killed,
+            ..
+        },
+        Some(program),
+    ) = (&error, apart)
+    else {
+        return Err(error);
+    };
+    let mut child = crate::platform::start_server(program, launcher.data_dir())
+        .map_err(|error| Error::Start(format!("{}: {error}", program.path.display())))?;
+    let started = Instant::now();
+    let mut ended = None;
+    let found = loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if ended.is_none() {
+            ended = child.try_wait().ok().flatten();
+        }
+        let lost_race = ended.is_some_and(|status| {
+            status.code() == Some(i32::from(ritornel_contract::local::EXIT_IN_USE))
+        });
+        match launcher.find_or_start().await {
+            Ok(server) => break Ok(server),
+            Err(_) if ended.is_some() && !lost_race => {
+                let status = ended.map(|status| status.to_string()).unwrap_or_default();
+                break Err(Error::Start(format!(
+                    "the server ended before it was ready ({status})"
+                )));
+            }
+            Err(error) if started.elapsed() >= START_WITHIN => break Err(error),
+            Err(_) => {}
+        }
+    };
+    // It is reaped when it ends, while the app runs; after, it is the system's.
+    if ended.is_none() {
+        let _ = std::thread::Builder::new()
+            .name("server reaper".to_owned())
+            .spawn(move || child.wait());
+    }
+    found
 }
 
 /// The link, made once for the app.

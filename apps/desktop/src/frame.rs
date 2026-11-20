@@ -1,10 +1,15 @@
 //! The frame: the title bar with its tabs (the player bar is `bar.rs`).
-//! And the menu bar, which is the system's.
+//! And the app's menus and keys: the menus are the system's menu bar's
+//! where it has one, and otherwise opened from a button at the title bar's
+//! left (`drawn.rs`), from the same definition.
+
+use std::rc::Rc;
 
 use gpui::{
-    App, FontWeight, InteractiveElement, IntoElement, KeyBinding, Menu, MenuItem, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, WindowControlArea, actions, div,
-    prelude::FluentBuilder, px,
+    Action, App, FontWeight, InteractiveElement, IntoElement, KeyBinding,
+    KeyBindingContextPredicate, Menu, MenuItem, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, WindowControlArea, actions, div, prelude::FluentBuilder,
+    px,
 };
 
 use crate::icons::icon;
@@ -34,23 +39,65 @@ actions!(
     ]
 );
 
+/// A binding that may hold `secondary-`, the system's own modifier: ⌘ on a
+/// Mac, Ctrl elsewhere.
+pub(crate) fn key<A: Action>(
+    keys: &str,
+    action: A,
+    context: Option<&str>,
+    cx: &App,
+) -> Option<KeyBinding> {
+    let context = match context {
+        Some(context) => Some(Rc::new(KeyBindingContextPredicate::parse(context).ok()?)),
+        None => None,
+    };
+    let binding = KeyBinding::load(keys, Box::new(action), context, false, None, cx);
+    if binding.is_err() {
+        crate::debug(format_args!("keys: {keys} is not a key"));
+    }
+    binding.ok()
+}
+
+/// Each of the system's keys in `keys` for `action`.
+pub(crate) fn keys<A: Action + Clone>(
+    keys: &'static [&'static str],
+    action: A,
+    context: Option<&str>,
+) -> impl Iterator<Item = KeyBinding> {
+    keys.iter()
+        .map(move |keys| KeyBinding::new(keys, action.clone(), context))
+}
+
 pub(crate) fn menus(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    // Quit is `main.rs`'s, which knows the server.
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-    cx.bind_keys([
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-h", Hide, None),
-        KeyBinding::new("alt-cmd-h", HideOthers, None),
-        KeyBinding::new("cmd-[", Back, None),
-        KeyBinding::new("cmd-left", Back, None),
-        KeyBinding::new("cmd-m", Minimize, None),
-        KeyBinding::new("cmd-f", Find, None),
-        KeyBinding::new("shift-cmd-f", LeanBack, None),
-        KeyBinding::new("alt-cmd-u", ToggleUpNext, None),
-    ]);
-    cx.set_menus([
+    // The window in front, as Window › Minimize and Zoom say.
+    cx.on_action(|_: &Minimize, cx| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.minimize_window());
+        }
+    });
+    cx.on_action(|_: &Zoom, cx| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.zoom_window());
+        }
+    });
+    let system = platform::KEYS;
+    let mut bindings: Vec<KeyBinding> = Vec::new();
+    bindings.extend(keys(system.quit, Quit, None));
+    bindings.extend(keys(system.hide, Hide, None));
+    bindings.extend(keys(system.hide_others, HideOthers, None));
+    bindings.extend(keys(system.back, Back, None));
+    bindings.extend(keys(system.minimize, Minimize, None));
+    bindings.extend(key("secondary-f", Find, None, cx));
+    bindings.extend(key("shift-secondary-f", LeanBack, None, cx));
+    bindings.extend(key("alt-secondary-u", ToggleUpNext, None, cx));
+    cx.bind_keys(bindings);
+    // A menu bar's app menu has the system's own items; a menu opened from
+    // the title bar has only the app's.
+    let app = if platform::CHROME.menu_bar {
         Menu::new("Ritornel").items([
             MenuItem::action("Settings…", crate::settings::OpenSettings),
             MenuItem::separator(),
@@ -61,7 +108,16 @@ pub(crate) fn menus(cx: &mut App) {
             MenuItem::action("Show All", ShowAll),
             MenuItem::separator(),
             MenuItem::action("Quit Ritornel", Quit),
-        ]),
+        ])
+    } else {
+        Menu::new("Ritornel").items([
+            MenuItem::action("Settings…", crate::settings::OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action("Quit Ritornel", Quit),
+        ])
+    };
+    cx.set_menus([
+        app,
         // Up Next and Lean Back at Music's keys, as the real app's View menu has them.
         Menu::new("View").items([
             MenuItem::action("Up Next", ToggleUpNext),
@@ -163,6 +219,8 @@ pub(crate) fn title_bar(
                 .when_some(platform::CHROME.system_buttons, |left, width| {
                     left.child(div().w(px(width)).h(px(14.)).mr(px(4.)))
                 })
+                // With no menu bar, the app's menus are a button away.
+                .when(!platform::CHROME.menu_bar, |left| left.child(menu_button()))
                 .child(
                     div()
                         .id("back")
@@ -218,6 +276,28 @@ pub(crate) fn title_bar(
         .when(platform::CHROME.app_buttons, |bar| {
             bar.child(caption_buttons())
         })
+}
+
+/// The button that opens the app's menus where the system has no menu
+/// bar, as Back is drawn; they open below it on a press, as a menu bar's do.
+fn menu_button() -> impl IntoElement {
+    div()
+        .id("menus")
+        .w(px(28.))
+        .h(px(28.))
+        .mx(px(-6.))
+        .rounded(px(6.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .hover(|style| style.bg(theme::fill()))
+        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+            // The press must not start a window drag.
+            cx.stop_propagation();
+            let at = gpui::point(px(platform::CHROME.padding.0 - 6.), px(TITLE_BAR - 10.));
+            crate::drawn::app_menus(at, window, cx);
+        })
+        .child(icon("menu", 16., theme::dim()))
 }
 
 /// Windows draws no caption buttons on a window whose title bar is the

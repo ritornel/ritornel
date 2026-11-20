@@ -20,7 +20,8 @@ jobs:
     # The hub is Linux and the desktop is macOS, so both run everything they
     # build. On Linux that includes the server's audio output, which links
     # ALSA, so the job installs ALSA's development files; the hub job below
-    # proves the hub needs none. The desktop app is built on macOS alone.
+    # proves the hub needs none. The desktop app is built here on macOS, and
+    # on Linux in its own job, desktop-linux.
     strategy:
       fail-fast: false
       matrix:
@@ -70,3 +71,20 @@ jobs:
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
       - run: cargo clippy --locked --package ritornel-server --no-default-features --all-targets -- -D warnings
       - run: cargo test --locked --package ritornel-server --no-default-features
+
+  desktop-linux:
+    # The desktop app on Linux, with GPUI's Wayland and X11 backends, which
+    # link fontconfig, xcb and xkbcommon. scripts/desktop.sh skips without
+    # them, and fails instead in CI, so this job cannot pass by skipping.
+    runs-on: blacksmith-8vcpu-ubuntu-2604
+    # It compiles GPUI twice: for clippy and the tests, and in release.
+    timeout-minutes: 45
+    env:
+      MISE_DISABLE_TOOLS: conda:ffmpeg,node,pnpm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends pkg-config libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+      - run: mise run desktop:check

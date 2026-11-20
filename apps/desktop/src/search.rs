@@ -660,7 +660,7 @@ fn empty(text: &'static str) -> impl IntoElement {
 }
 
 /// The real card's `--shadow`, in each palette.
-fn shadow() -> Vec<BoxShadow> {
+pub(crate) fn shadow() -> Vec<BoxShadow> {
     if theme::dark() {
         vec![
             theme::css_shadow(14., 40., gpui::rgba(0x00000073)),
@@ -746,7 +746,13 @@ impl Render for SearchBox {
             .child(icon("search", 16., theme::faint()))
             .child(field)
             .when(!focused, |bar| {
-                bar.child(div().text_size(px(12.)).child("⌘F"))
+                // ⌘F, or Ctrl+F: the key that finds, as the system writes it.
+                let key = window
+                    .highest_precedence_binding_for_action(&crate::frame::Find)
+                    .and_then(|binding| {
+                        binding.keystrokes().first().map(crate::platform::key_text)
+                    });
+                bar.children(key.map(|key| div().text_size(px(12.)).child(key)))
             })
             .children(self.dropdown(window, cx))
     }

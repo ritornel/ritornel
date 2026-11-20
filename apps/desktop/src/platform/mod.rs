@@ -4,9 +4,10 @@
 //!
 //! Each system has a file of its own (`mac.rs`, `windows.rs`), and each
 //! offers the same names. What a system has no code of its own for, it takes
-//! from `fallback`, the plain behaviour: no system menu, no stretch at a
-//! page's ends, no picture of the window. A system with no file at all
-//! (Linux, for now) takes the fallback whole.
+//! from `fallback`, the plain behaviour: menus the app draws itself
+//! (`drawn.rs`), Ctrl's keys, a server held by the launcher's pipe, no
+//! stretch at a page's ends, no picture of the window. Linux (`linux.rs`)
+//! takes all of it but the server, which outlives the app there.
 //!
 //! What is decided here is the system's feel as well as its plumbing: a Mac
 //! page stretches at its ends because a Mac's do, not because the app's do
@@ -30,13 +31,19 @@ mod windows;
 #[cfg(windows)]
 use windows as system;
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as system;
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 use fallback as system;
 
 pub(crate) use system::{
-    CHROME, FEEL, FITTING_SHOWS, bring_forward_quietly, choose_folder, dismiss_menu, fit_window,
-    footprint, give_back, hold_appearance, keep_out_of_the_dock, locale, memory_line, pop_up_menu,
-    screenshot, scroll_details, settings_dir, start, swiped_back,
+    CHROME, FEEL, FITTING_SHOWS, KEYS, SERVER_APART, bring_forward_quietly, choose_folder,
+    dismiss_menu, fit_window, footprint, give_back, hold_appearance, keep_out_of_the_dock,
+    key_text, locale, memory_line, pop_up_menu, screenshot, scroll_details, settings_dir, start,
+    start_server, started_here, stop_server, swiped_back,
 };
 
 /// One line of the system's context menu. Its actions are numbered in
@@ -70,6 +77,51 @@ pub(crate) struct Chrome {
     pub app_moves_window: bool,
     /// The bar's padding at its left and right.
     pub padding: (f32, f32),
+    /// Whether the system shows the app's menus in a menu bar of its own (a
+    /// Mac's), with its own items in the app's menu (Services, Hide, Show
+    /// All). Without one, a button at the bar's left opens them.
+    pub menu_bar: bool,
+}
+
+/// The keys that differ from one system to another. A key that is the same
+/// idea everywhere under the system's own modifier is bound once, as
+/// `secondary-` (⌘ on a Mac, Ctrl elsewhere), and is not here. Each list may
+/// be empty: the system has no key for it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Keys {
+    pub quit: &'static [&'static str],
+    pub hide: &'static [&'static str],
+    pub hide_others: &'static [&'static str],
+    pub minimize: &'static [&'static str],
+    /// Back, besides the mouse's back button.
+    pub back: &'static [&'static str],
+    /// What is held with ← or → to go to the previous or next song.
+    pub skip: gpui::Modifiers,
+    /// A text field's: a word at a time, to the line's ends, and what
+    /// deletes as far. Home and End are the same everywhere.
+    pub word_left: &'static [&'static str],
+    pub word_right: &'static [&'static str],
+    pub select_word_left: &'static [&'static str],
+    pub select_word_right: &'static [&'static str],
+    pub delete_word_left: &'static [&'static str],
+    pub delete_to_start: &'static [&'static str],
+    pub line_start: &'static [&'static str],
+    pub line_end: &'static [&'static str],
+    pub select_line_start: &'static [&'static str],
+    pub select_line_end: &'static [&'static str],
+    pub character_palette: &'static [&'static str],
+}
+
+/// Modifiers as a constant: `Modifiers::default()` is not one.
+#[allow(dead_code, reason = "each system names its own")]
+const fn held(control: bool, alt: bool) -> gpui::Modifiers {
+    gpui::Modifiers {
+        control,
+        alt,
+        shift: false,
+        platform: false,
+        function: false,
+    }
 }
 
 /// How things feel on the system.
@@ -109,14 +161,61 @@ mod fallback {
 
     use gpui::{AnyWindowHandle, AsyncApp, PathPromptOptions, Pixels, Point, px, size};
 
-    use super::{Chrome, Feel, ScrollDetails};
+    use super::{Chrome, Feel, Keys, ScrollDetails, held};
 
     pub(crate) const CHROME: Chrome = Chrome {
         system_buttons: None,
         app_buttons: false,
         app_moves_window: false,
         padding: (12., 16.),
+        menu_bar: false,
     };
+
+    /// Ctrl's keys, as Linux's and Windows' own fields and apps have them:
+    /// Alt+← is Back, as in a browser, and Ctrl+← and Ctrl+→ skip, as in
+    /// the players there; a field moves by words with Ctrl. Nothing hides
+    /// the app or minimizes the window from the keyboard but the system.
+    pub(crate) const KEYS: Keys = Keys {
+        quit: &["ctrl-q"],
+        hide: &[],
+        hide_others: &[],
+        minimize: &[],
+        back: &["alt-left"],
+        skip: held(true, false),
+        word_left: &["ctrl-left"],
+        word_right: &["ctrl-right"],
+        select_word_left: &["ctrl-shift-left"],
+        select_word_right: &["ctrl-shift-right"],
+        delete_word_left: &["ctrl-backspace"],
+        delete_to_start: &[],
+        line_start: &[],
+        line_end: &[],
+        select_line_start: &["shift-home"],
+        select_line_end: &["shift-end"],
+        character_palette: &[],
+    };
+
+    /// A key as a menu shows it: `Ctrl+Shift+F`.
+    pub(crate) fn key_text(keystroke: &gpui::KeybindingKeystroke) -> String {
+        let held = keystroke.modifiers();
+        let mut parts: Vec<String> = [
+            (held.control, "Ctrl"),
+            (held.platform, "Super"),
+            (held.alt, "Alt"),
+            (held.shift, "Shift"),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| name.to_owned())
+        .collect();
+        let key = keystroke.key();
+        let mut letters = key.chars();
+        parts.push(match letters.next() {
+            Some(first) => first.to_uppercase().chain(letters).collect(),
+            None => String::new(),
+        });
+        parts.join("+")
+    }
 
     pub(crate) const FEEL: Feel = Feel { rubber_band: false };
 
@@ -137,21 +236,46 @@ mod fallback {
         false
     }
 
-    /// The system's context menu of `items` at `at` in the window, opened
-    /// with the action numbered `under` beneath the pointer, as a pop-up
-    /// button's is: the number of the action chosen, or `None`.
+    /// A context menu of `items` at `at` in the window, opened with the
+    /// action numbered `under` beneath the pointer, as a pop-up button's
+    /// is: the number of the action chosen, or `None`. The app draws it
+    /// (`drawn.rs`).
     pub(crate) async fn pop_up_menu(
-        _window: AnyWindowHandle,
-        _items: Vec<super::MenuItem>,
-        _under: Option<usize>,
-        _at: Point<Pixels>,
-        _cx: &mut AsyncApp,
+        window: AnyWindowHandle,
+        items: Vec<super::MenuItem>,
+        under: Option<usize>,
+        at: Point<Pixels>,
+        cx: &mut AsyncApp,
     ) -> Option<usize> {
-        None
+        crate::drawn::pop_up(window, items, under, at, cx).await
     }
 
     /// Puts away the menu open, for a script.
-    pub(crate) fn dismiss_menu() {}
+    pub(crate) fn dismiss_menu(cx: &mut gpui::App) {
+        crate::drawn::dismiss(cx);
+    }
+
+    /// Whether the server the app starts outlives it. Here it does not:
+    /// the launcher holds it by a pipe and it stops when the app ends,
+    /// however it ends (`ritornel_client::launch`), and the app ends only
+    /// when it is quit.
+    pub(crate) const SERVER_APART: bool = false;
+
+    /// Starts a server apart from the app, where `SERVER_APART` says one is.
+    pub(crate) fn start_server(
+        _program: &ritornel_client::launch::Program,
+        _data_dir: &Path,
+    ) -> std::io::Result<std::process::Child> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// Whether the process `pid` is a server the app started apart from it.
+    pub(crate) fn started_here(_pid: u32) -> bool {
+        false
+    }
+
+    /// Stops a server the app started apart from it.
+    pub(crate) fn stop_server(_pid: u32, _wait: std::time::Duration) {}
 
     /// Whether a window opened hidden is shown by its first fit. Here it
     /// is opened shown, and fitted after.

@@ -1,7 +1,8 @@
 //! Windows: its window chrome and feel, and the few things done through
 //! Win32 directly: the process's memory as Task Manager counts it, and a
-//! picture of the window for checking by eye. Its context menu would be a
-//! `TrackPopupMenu` over the window's HWND, not written yet.
+//! picture of the window for checking by eye. Its menus, the app's and the
+//! context menus, are the ones the app draws (`drawn.rs`), as its keys are
+//! the fallback's.
 
 // Win32 is reached through `unsafe`, each block saying why it is sound.
 #![allow(unsafe_code)]
@@ -19,10 +20,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
 use super::{Chrome, Feel};
 
 pub(crate) use super::fallback::{
-    FITTING_SHOWS, bring_forward_quietly, choose_folder, dismiss_menu, fit_window, give_back,
-    hold_appearance, keep_out_of_the_dock, locale, pop_up_menu, reduce_motion, scroll_details,
-    start, swiped_back,
+    FITTING_SHOWS, KEYS, bring_forward_quietly, choose_folder, dismiss_menu, fit_window, give_back,
+    hold_appearance, keep_out_of_the_dock, key_text, locale, pop_up_menu, reduce_motion,
+    scroll_details, start, swiped_back,
 };
+// The server is held by the launcher's pipe, as the fallback's is.
+pub(crate) use super::fallback::{SERVER_APART, start_server, started_here, stop_server};
 
 /// The bar is the caption, by the system's hit test, and the app draws the
 /// window's buttons at its right for the system to treat as its own.
@@ -31,6 +34,7 @@ pub(crate) const CHROME: Chrome = Chrome {
     app_buttons: true,
     app_moves_window: false,
     padding: (12., 0.),
+    menu_bar: false,
 };
 
 /// Windows' pages stop at their ends.

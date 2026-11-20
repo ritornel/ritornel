@@ -16,7 +16,11 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSView, NSWindow};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use super::{Chrome, Feel, ScrollDetails, ScrollPhase};
+use super::{Chrome, Feel, Keys, ScrollDetails, ScrollPhase, held};
+
+// The app ends only when it is quit, and its server with it, held by the
+// launcher's pipe.
+pub(crate) use super::fallback::{SERVER_APART, start_server, started_here, stop_server};
 
 /// The three window buttons at the bar's left, 14 points each and 9 apart,
 /// are the system's; a press on the bar moves the window, as a title bar's does.
@@ -25,7 +29,35 @@ pub(crate) const CHROME: Chrome = Chrome {
     app_buttons: false,
     app_moves_window: true,
     padding: (20., 16.),
+    menu_bar: true,
 };
+
+/// A Mac's keys: ⌘[ and ⌘← are Back, ⌥← and ⌥→ skip, and a field moves by
+/// words with ⌥ and to the line's ends with ⌘, as a Mac's own fields do.
+pub(crate) const KEYS: Keys = Keys {
+    quit: &["cmd-q"],
+    hide: &["cmd-h"],
+    hide_others: &["alt-cmd-h"],
+    minimize: &["cmd-m"],
+    back: &["cmd-[", "cmd-left"],
+    skip: held(false, true),
+    word_left: &["alt-left"],
+    word_right: &["alt-right"],
+    select_word_left: &["alt-shift-left"],
+    select_word_right: &["alt-shift-right"],
+    delete_word_left: &["alt-backspace"],
+    delete_to_start: &["cmd-backspace"],
+    line_start: &["cmd-left"],
+    line_end: &["cmd-right"],
+    select_line_start: &["cmd-shift-left"],
+    select_line_end: &["cmd-shift-right"],
+    character_palette: &["ctrl-cmd-space"],
+};
+
+/// A key as a Mac's menus show it: `⌘F`.
+pub(crate) fn key_text(keystroke: &gpui::KeybindingKeystroke) -> String {
+    keystroke.display(gpui::OperatingSystem::Mac).to_string()
+}
 
 /// A Mac's pages stretch at their ends under a touchpad.
 pub(crate) const FEEL: Feel = Feel { rubber_band: true };
@@ -58,7 +90,7 @@ pub(crate) async fn pop_up_menu(
     super::mac_menu::pop_up(view, items, under, f32::from(at.x), f32::from(at.y)).await
 }
 
-pub(crate) fn dismiss_menu() {
+pub(crate) fn dismiss_menu(_cx: &mut gpui::App) {
     super::mac_menu::dismiss();
 }
 

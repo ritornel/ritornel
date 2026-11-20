@@ -1637,7 +1637,8 @@ impl Render for Shell {
                         return;
                     }
                     // Space plays or pauses, and ⌥← and ⌥→ go to the
-                    // previous and next song. Esc puts Up next away.
+                    // previous and next song (Ctrl+← and Ctrl+→ off a
+                    // Mac: `platform::KEYS`). Esc puts Up next away.
                     let keys = &event.keystroke;
                     let mods = keys.modifiers;
                     let bare = !mods.platform && !mods.control && !mods.function;
@@ -1648,10 +1649,10 @@ impl Render for Shell {
                     }
                     let action = match keys.key.as_str() {
                         "space" if bare && !mods.alt && !mods.shift => Some(None),
-                        "left" if bare && mods.alt && !mods.shift => {
+                        "left" if mods == crate::platform::KEYS.skip => {
                             Some(Some(SkipDirection::Previous))
                         }
-                        "right" if bare && mods.alt && !mods.shift => {
+                        "right" if mods == crate::platform::KEYS.skip => {
                             Some(Some(SkipDirection::Next))
                         }
                         _ => None,
@@ -1708,6 +1709,7 @@ impl Render for Shell {
             .children(flying)
             .children(self.lean.as_ref().map(|(lean, _)| lean.clone()))
             .children(toast)
+            .children(crate::drawn::layer(window, cx))
     }
 }
 

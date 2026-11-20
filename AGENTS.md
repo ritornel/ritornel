@@ -17,9 +17,10 @@ Ritornel is a music player for a collection you own: a server, `ritornel-server`
 - A call is defined once, in the method table in `crates/ritornel-contract/src/methods.rs`.
 - A migration that is on `main` is not edited, because the server refuses a database whose recorded checksum differs. A schema change is a new numbered file.
 - The desktop app, `apps/desktop`, is a Cargo workspace of its own, so the server builds without any desktop library.
-- macOS came first. Linux and Windows are in progress, so code for one platform goes behind `cfg`. The server runs on Linux with sound, MPRIS and a systemd user service; the desktop app does not yet.
+- macOS came first. Linux and Windows are in progress, so code for one platform goes behind `cfg`. The server runs on Linux with sound, MPRIS and a systemd user service, and the desktop app runs there on Wayland or X11.
 - On Linux the whole workspace links ALSA for the server's audio output, so it needs ALSA's development files (`alsa-lib` on Arch, `libasound2-dev` on Debian and Ubuntu). The hub, built without default features, links no system library, and CI's `hub` job holds it to that.
-- With `RITORNEL_OFFSCREEN=1`, `scripts/desktop.sh` opens the app on a display no one sees (macOS only so far), and a server run with `--output null` makes no sound. Both help when an agent works on a machine someone is using.
+- On Linux the desktop app needs the development files of fontconfig, xcb and xkbcommon (`fontconfig`, `libxcb`, `libxkbcommon` and `libxkbcommon-x11` on Arch; `libfontconfig-dev`, `libxcb1-dev`, `libxkbcommon-dev` and `libxkbcommon-x11-dev` on Debian and Ubuntu). Without them `scripts/desktop.sh` names what is missing and skips. `scripts/desktop.sh app` makes `apps/desktop/target/release/bundle/ritornel/`, the app with the server it starts beside it.
+- With `RITORNEL_OFFSCREEN=1`, `scripts/desktop.sh` opens the app on a display no one sees (macOS only so far; on Linux it refuses to start), and a server run with `--output null` makes no sound. Both help when an agent works on a machine someone is using.
 - Comments cite design notes under `docs/design/` and decisions by number. Those notes are not in this repository yet.
 
 ## Rules
