@@ -8,8 +8,9 @@ publish.workspace = true
 
 [features]
 default = ["audio-output", "lastfm", "media-session"]
-# The system's audio output, through the engine: CoreAudio on macOS and
-# ALSA on Linux, where it needs ALSA's development files to build. The
+# The system's audio output, through the engine: CoreAudio on macOS,
+# WASAPI on Windows, and ALSA on Linux, where it needs ALSA's development
+# files to build. The
 # headless hub is built without it, links no audio library, and has no
 # player unless `--output null` asks for one. See docs/design/platforms.md.
 audio-output = ["ritornel-engine/audio-output"]
