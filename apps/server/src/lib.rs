@@ -40,6 +40,9 @@ mod listener;
 mod lock;
 mod logs;
 mod media;
+// Windows has no media session yet: the system's media transport controls,
+// tied to the hidden window `serve` opens there, are still to come. Until
+// then a server on Windows has no Now Playing and no media keys.
 #[cfg(all(
     feature = "media-session",
     any(target_os = "macos", target_os = "linux")

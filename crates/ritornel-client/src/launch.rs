@@ -48,6 +48,10 @@ const RACES: usize = 3;
 /// not start.
 const STDERR_KEPT: u64 = 16 * 1024;
 
+/// `CREATE_NO_WINDOW`: the process gets no console window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// The server program a launcher starts.
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -230,7 +234,13 @@ impl Ready {
 
 impl Owned {
     fn spawn(program: &Program, data_dir: &Path) -> Result<(Self, Ready), Error> {
-        let mut child = Command::new(&program.path)
+        let mut command = Command::new(&program.path);
+        // A console program started by one without a console, as the
+        // desktop app is, gets a console window of its own unless told not
+        // to make one. The pipes are all it needs.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+        let mut child = command
             .arg("serve")
             .arg("--data-dir")
             .arg(data_dir)
@@ -317,7 +327,6 @@ impl Drop for Owned {
 mod tests {
     use std::fs::File;
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
 
     use ritornel_contract::{CONTRACT_VERSION, Id, Limits, PublicDescriptor, ServerRole};
 
@@ -336,11 +345,26 @@ mod tests {
             Self(path)
         }
 
-        /// A program that is a shell script, standing in for the server.
-        fn program(&self, script: &str) -> Program {
-            let path = self.0.join("fake-server");
-            std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        /// A program that is a script, standing in for the server: `unix`,
+        /// for the shell, on Unix, and `windows`, a batch file, on Windows.
+        fn program(&self, unix: &str, windows: &str) -> Program {
+            #[cfg(unix)]
+            let path = {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = windows;
+                let path = self.0.join("fake-server");
+                std::fs::write(&path, format!("#!/bin/sh\n{unix}\n")).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            };
+            #[cfg(windows)]
+            let path = {
+                let _ = unix;
+                let path = self.0.join("fake-server.cmd");
+                let lines: Vec<&str> = windows.lines().collect();
+                std::fs::write(&path, format!("@echo off\r\n{}\r\n", lines.join("\r\n"))).unwrap();
+                path
+            };
             Program::new(path)
         }
     }
@@ -354,8 +378,10 @@ mod tests {
     #[tokio::test]
     async fn a_server_that_fails_to_start_is_reported_in_its_own_words() {
         let scratch = Scratch::new("fails");
-        let program = scratch
-            .program("echo 'ritornel-server: server.db is newer than this program' >&2; exit 1");
+        let program = scratch.program(
+            "echo 'ritornel-server: server.db is newer than this program' >&2; exit 1",
+            "1>&2 echo ritornel-server: server.db is newer than this program\nexit /b 1",
+        );
         let launcher = Launcher::new(scratch.0.join("data"), Some(program));
         let failed = launcher.find_or_start().await.unwrap_err();
         assert!(
@@ -368,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn a_start_that_keeps_losing_the_race_ends_and_says_none_is_running() {
         let scratch = Scratch::new("races");
-        let program = scratch.program("exit 3");
+        let program = scratch.program("exit 3", "exit /b 3");
         let launcher = Launcher::new(scratch.0.join("data"), Some(program));
         let found = launcher.find_or_start().await.unwrap_err();
         assert!(
@@ -396,7 +422,10 @@ mod tests {
     fn a_server_is_stopped_by_its_pipe_and_killed_if_it_ignores_it() {
         let scratch = Scratch::new("stops");
         // It ends when its standard input does, as an owned server does.
-        let polite = scratch.program("echo ready pid=$$ server_id=x; cat >/dev/null");
+        let polite = scratch.program(
+            "echo ready pid=$$ server_id=x; cat >/dev/null",
+            "echo ready pid=1 server_id=x\nfindstr \"^\" >nul\nexit /b 0",
+        );
         let (owned, ready) = Owned::spawn(&polite, &scratch.0).unwrap();
         ready.wait().unwrap();
         let stopped = owned.stop(STOP_WAIT);
@@ -405,7 +434,12 @@ mod tests {
             "{stopped:?}"
         );
 
-        let deaf = scratch.program("echo ready pid=$$ server_id=x; exec sleep 60");
+        // On Windows a batch file that spins, which starts nothing that
+        // would outlive it.
+        let deaf = scratch.program(
+            "echo ready pid=$$ server_id=x; exec sleep 60",
+            "echo ready pid=1 server_id=x\n:spin\ngoto spin",
+        );
         let (owned, ready) = Owned::spawn(&deaf, &scratch.0).unwrap();
         ready.wait().unwrap();
         let begun = Instant::now();
@@ -465,7 +499,7 @@ mod tests {
         let lock = data_dir.join(agreed::SERVER_LOCK);
         std::fs::write(&lock, "4312\n").unwrap();
         let held = File::open(&lock).unwrap();
-        held.try_lock().unwrap();
+        crate::testing::hold_as_a_server(&held);
         std::fs::write(
             data_dir.join(agreed::SERVER_JSON),
             format!(
@@ -477,7 +511,10 @@ mod tests {
 
         // Starting this would fail the test.
         let started = scratch.0.join("started");
-        let program = scratch.program(&format!("touch '{}'; exit 1", started.display()));
+        let program = scratch.program(
+            &format!("touch '{}'; exit 1", started.display()),
+            &format!("type nul > \"{}\"\nexit /b 1", started.display()),
+        );
         let launcher = Launcher::new(data_dir, Some(program));
         let found = tokio::time::timeout(Duration::from_secs(30), launcher.find_or_start())
             .await

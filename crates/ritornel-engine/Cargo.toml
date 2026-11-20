@@ -36,11 +36,6 @@ rtrb = "=0.4.1"
 # resampler docs/design/playback.md names. Pinned exactly: three major
 # versions came out in four months.
 rubato = "=5.1.0"
-# The monotonic clock that keeps counting while the machine sleeps, which
-# every listen is stamped with: the standard library's does not on macOS.
-# The server builds it already. `fs` opens a picture folder's files one
-# component at a time, following no link and waiting on no pipe.
-rustix = { version = "1.1.6", features = ["fs", "time"] }
 # A stored payload, a decision's evidence and a job's checkpoint are JSON.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -58,18 +53,32 @@ image = { version = "=0.25.10", default-features = false, features = ["jpeg", "p
 # The version the domain's normaliser pins.
 unicode-normalization = "=0.1.25"
 
-# The system's audio output: CoreAudio on macOS, and ALSA on Linux, which
-# reaches PipeWire and PulseAudio through their ALSA plugins. On Linux cpal
-# links libasound, so a build with the feature needs ALSA's development
-# files (alsa-lib, or libasound2-dev). The headless hub is built without it
+# The monotonic clock that keeps counting while the machine sleeps, which
+# every listen is stamped with: the standard library's does not on macOS.
+# The server builds it already. `fs` opens a picture folder's files one
+# component at a time, following no link and waiting on no pipe.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["fs", "time"] }
+
+# The same on Windows, where the standard library cannot ask: the time
+# since boot, a folder's volume and file index, and where an open file
+# really is.
+[target.'cfg(windows)'.dependencies]
+ritornel-windows.workspace = true
+
+# The system's audio output: CoreAudio on macOS, WASAPI on Windows, and ALSA
+# on Linux, which reaches PipeWire and PulseAudio through their ALSA
+# plugins. On Linux cpal links libasound, so a build with the feature needs
+# ALSA's development files (alsa-lib, or libasound2-dev); WASAPI is part of
+# Windows and needs nothing installed. The headless hub is built without it
 # and links no audio library. See docs/design/platforms.md.
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 cpal = { version = "=0.18.2", optional = true }
 
 [features]
 default = ["audio-output"]
 # Plays through the system's default output where the platform has one
-# (macOS and Linux). Without it, a server can still play into the null
+# (macOS, Linux and Windows). Without it, a server can still play into the null
 # output, which discards what it is given.
 audio-output = ["dep:cpal"]
 

@@ -18,7 +18,7 @@
 pub(crate) mod decode;
 #[cfg(all(
     feature = "audio-output",
-    any(target_os = "macos", target_os = "linux")
+    any(target_os = "macos", target_os = "linux", windows)
 ))]
 mod device;
 mod null;
@@ -62,7 +62,7 @@ impl Output {
     pub const fn has_device() -> bool {
         cfg!(all(
             feature = "audio-output",
-            any(target_os = "macos", target_os = "linux")
+            any(target_os = "macos", target_os = "linux", windows)
         ))
     }
 }
@@ -354,7 +354,7 @@ impl AudioRenderer {
 
     #[cfg(all(
         feature = "audio-output",
-        any(target_os = "macos", target_os = "linux")
+        any(target_os = "macos", target_os = "linux", windows)
     ))]
     fn open_device(shared: Arc<Shared>) -> Result<Self, RenderError> {
         let (running, spec, ends) = device::start(&shared, queues)?;
@@ -369,7 +369,7 @@ impl AudioRenderer {
 
     #[cfg(not(all(
         feature = "audio-output",
-        any(target_os = "macos", target_os = "linux")
+        any(target_os = "macos", target_os = "linux", windows)
     )))]
     fn open_device(_shared: Arc<Shared>) -> Result<Self, RenderError> {
         Err(RenderError::new(

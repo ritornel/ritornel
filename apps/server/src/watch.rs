@@ -213,7 +213,8 @@ struct Watched {
     /// When the folder was first found. The timer leaves a new one alone a
     /// moment, as whoever added it may be about to scan it.
     seen_ms: i64,
-    /// Which folder was watched: its device and inode. A disk mounted again
+    /// Which folder was watched: its device and inode (on Windows, its
+    /// volume and file index). A disk mounted again
     /// is another folder at the same path, and its old watch hears nothing.
     id: Option<(u64, u64)>,
     /// The system lost track of it: it is watched afresh at the next look.
@@ -222,9 +223,20 @@ struct Watched {
 
 /// Which folder is at `path` now, if one is.
 fn folder_id(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata(path).ok()?;
-    metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
+    if !metadata.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    // The volume's serial number and the folder's index on it.
+    #[cfg(windows)]
+    {
+        ritornel_windows::file::id(path).ok()
+    }
 }
 
 /// Watches a folder that is there, or says why it cannot be.

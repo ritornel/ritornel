@@ -288,17 +288,23 @@ mod tests {
 
     #[test]
     fn the_data_directory_is_resolved_as_the_server_resolves_it() {
+        // Absolute on this platform: Windows takes `/from` as on the
+        // current drive.
+        let (flag, env) = if cfg!(windows) {
+            (r"C:\from\flag", r"C:\from\env")
+        } else {
+            ("/from/flag", "/from/env")
+        };
         assert_eq!(
-            data_dir(Some(Path::new("/from/flag")), &no_env).unwrap(),
-            Path::new("/from/flag")
+            data_dir(Some(Path::new(flag)), &no_env).unwrap(),
+            Path::new(flag)
         );
         assert_eq!(
             data_dir(Some(Path::new("some/where")), &no_env).unwrap(),
             std::env::current_dir().unwrap().join("some/where")
         );
-        let from_env =
-            |name: &str| (name == local::DATA_DIR_VAR).then(|| OsString::from("/from/env"));
-        assert_eq!(data_dir(None, &from_env).unwrap(), Path::new("/from/env"));
+        let from_env = |name: &str| (name == local::DATA_DIR_VAR).then(|| OsString::from(env));
+        assert_eq!(data_dir(None, &from_env).unwrap(), Path::new(env));
         assert!(matches!(data_dir(None, &no_env), Err(Error::NoDataDir)));
     }
 
@@ -323,7 +329,10 @@ mod tests {
         let path = dir.join(local::SERVER_LOCK);
         std::fs::write(&path, pid).unwrap();
         let file = File::open(&path).unwrap();
-        assert!(soon(|| file.try_lock().is_ok()), "the lock stays held");
+        assert!(
+            soon(|| crate::testing::try_hold_as_a_server(&file)),
+            "the lock stays held"
+        );
         file
     }
 

@@ -2,6 +2,12 @@
 //! page, the travelling cover and the system's menus, on the real server.
 //! See NOTES.md.
 
+// A release build on Windows is a windowed program, so starting it from the
+// Start menu opens no console beside it, as a Mac app opens no terminal. A
+// debug build keeps its console for the developer lines; a release build
+// prints them only where its output is redirected.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod album;
 mod artist;
 mod banner;

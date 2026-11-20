@@ -56,13 +56,10 @@ const INDEX_CAP: u64 = 16 << 20;
 pub(crate) const PORTRAIT_CAP: u64 = 32 << 20;
 
 /// Reads the regular file at `rel`, a path of plain names under `root`, of
-/// at most `cap` bytes. Each part is opened from the last without following
-/// a link, so nothing outside `root` is reached even if the folder changes
-/// meanwhile, and the file is opened without waiting, then checked by its
-/// handle, so a pipe or a device is refused rather than read.
+/// at most `cap` bytes. Nothing outside `root` is reached through a link,
+/// even if the folder changes meanwhile ([`open_inside`]), and the file is
+/// checked by its handle, so a pipe or a device is refused rather than read.
 pub(crate) fn read_inside(root: &Path, rel: &str, cap: u64) -> std::io::Result<Vec<u8>> {
-    use rustix::fs::{Mode, OFlags, open, openat};
-    let refused = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, why.to_owned());
     let parts: Vec<&str> = rel.split('/').collect();
     if parts
         .iter()
@@ -73,13 +70,7 @@ pub(crate) fn read_inside(root: &Path, rel: &str, cap: u64) -> std::io::Result<V
     let Some((name, dirs)) = parts.split_last() else {
         return Err(refused("no path"));
     };
-    let into = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut dir = open(root, into, Mode::empty())?;
-    for part in dirs {
-        dir = openat(&dir, *part, into | OFlags::NOFOLLOW, Mode::empty())?;
-    }
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let file = std::fs::File::from(openat(&dir, *name, flags, Mode::empty())?);
+    let file = open_inside(root, dirs, name)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(refused("not a regular file"));
@@ -93,6 +84,79 @@ pub(crate) fn read_inside(root: &Path, rel: &str, cap: u64) -> std::io::Result<V
         return Err(refused("larger than it may be"));
     }
     Ok(bytes)
+}
+
+/// An error that says the folder holds something that may not be read.
+fn refused(why: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, why.to_owned())
+}
+
+/// Opens `name` in the folders `dirs` under `root`. Each part is opened
+/// from the last without following a link, and the file without waiting,
+/// so a pipe cannot hold the read up.
+#[cfg(unix)]
+fn open_inside(root: &Path, dirs: &[&str], name: &str) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    let into = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let mut dir = open(root, into, Mode::empty())?;
+    for part in dirs {
+        dir = openat(&dir, *part, into | OFlags::NOFOLLOW, Mode::empty())?;
+    }
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    Ok(std::fs::File::from(openat(
+        &dir,
+        name,
+        flags,
+        Mode::empty(),
+    )?))
+}
+
+/// Opens `name` in the folders `dirs` under `root`. Windows opens nothing
+/// relative to a folder that is open, so each folder on the way is looked
+/// at without following it, and a link or a junction is refused, as on
+/// Unix; the file is opened without following a link either. What was
+/// looked at may change before the open, so the handle is then asked where
+/// the file really is, and that must be inside where the root really is.
+#[cfg(windows)]
+fn open_inside(root: &Path, dirs: &[&str], name: &str) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    // FILE_ATTRIBUTE_REPARSE_POINT: a symbolic link, a junction, or another
+    // thing that sends the system elsewhere.
+    const REPARSE_POINT: u32 = 0x400;
+    // FILE_FLAG_OPEN_REPARSE_POINT and FILE_FLAG_BACKUP_SEMANTICS.
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let mut path = root.to_owned();
+    for part in dirs {
+        path.push(part);
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_attributes() & REPARSE_POINT != 0 {
+            return Err(refused("a link"));
+        }
+        if !meta.is_dir() {
+            return Err(std::io::ErrorKind::NotADirectory.into());
+        }
+    }
+    path.push(name);
+    if std::fs::symlink_metadata(&path)?.is_dir() {
+        return Err(refused("not a regular file"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_REPARSE_POINT)
+        .open(&path)?;
+    if file.metadata()?.file_attributes() & REPARSE_POINT != 0 {
+        return Err(refused("a link"));
+    }
+    let real_root = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(BACKUP_SEMANTICS)
+        .open(root)
+        .and_then(|root| ritornel_windows::file::final_path(&root))?;
+    if !ritornel_windows::file::final_path(&file)?.starts_with(&real_root) {
+        return Err(refused("a link"));
+    }
+    Ok(file)
 }
 
 /// A folder found to be a picture folder of format 1. An import takes one,
@@ -226,9 +290,13 @@ enum Unread {
 /// Whether a failed read says something of the folder, or only of the
 /// system.
 fn unread(error: &std::io::Error) -> Unread {
+    // A link where a folder or the file should be.
+    #[cfg(unix)]
     let link = [rustix::io::Errno::LOOP, rustix::io::Errno::NOTDIR]
         .iter()
         .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()));
+    #[cfg(windows)]
+    let link = error.kind() == std::io::ErrorKind::NotADirectory;
     if error.kind() == std::io::ErrorKind::InvalidInput || link {
         Unread::Content
     } else {

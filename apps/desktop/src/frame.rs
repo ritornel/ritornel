@@ -310,6 +310,10 @@ fn caption_buttons() -> impl IntoElement {
         div()
             .id(id)
             .window_control_area(area)
+            // GPUI answers the system's hit test with the first area under
+            // the pointer, outermost first: the bar's caption, unless each
+            // button hides what is behind it.
+            .occlude()
             .w(px(46.))
             .h(px(TITLE_BAR))
             .flex()

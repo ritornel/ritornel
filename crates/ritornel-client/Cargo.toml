@@ -48,5 +48,9 @@ tokio-tungstenite = "0.29.0"
 # on a boxed socket can resolve to `SinkExt` before the socket's own method.
 futures-sink = { version = "0.3.34", features = ["alloc"] }
 
+# A test holds a data directory's lock as a server on Windows does.
+[target.'cfg(windows)'.dev-dependencies]
+ritornel-windows.workspace = true
+
 [lints]
 workspace = true

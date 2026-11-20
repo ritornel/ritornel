@@ -51,8 +51,8 @@ pub(crate) fn run(args: &ServiceArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
 }
 
 /// The launchd agent and how it is driven. It is built on macOS, and for
-/// the tests everywhere.
-#[cfg(any(target_os = "macos", test))]
+/// the tests on every Unix: they make an exit status from a raw wait status.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 mod launchd {
     use std::ffi::OsStr;
     use std::io::ErrorKind;
@@ -454,8 +454,9 @@ mod platform {
 }
 
 /// The systemd user unit and how it is driven. It is built on Linux, and
-/// for the tests everywhere.
-#[cfg(any(target_os = "linux", test))]
+/// for the tests on every Unix: they make an exit status from a raw wait
+/// status.
+#[cfg(any(target_os = "linux", all(test, unix)))]
 mod systemd {
     use std::ffi::OsStr;
     use std::io::ErrorKind;
@@ -957,6 +958,9 @@ mod platform {
     }
 }
 
+/// Elsewhere there is no service yet. On Windows it is still to come: a
+/// task at sign-in, in the user's session, where the media keys and the
+/// default audio device are.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod platform {
     use std::io::Write;
@@ -966,7 +970,7 @@ mod platform {
 
     pub(super) fn run(_: &Action, _: Env<'_>, _: &mut dyn Write) -> Result<(), Error> {
         Err(Error::Service(
-            "it is built for macOS and Linux only; elsewhere run `ritornel-server serve` under \
+            "it is built for macOS and Linux only so far; elsewhere run `ritornel-server serve` under \
              the system's service manager"
                 .to_owned(),
         ))

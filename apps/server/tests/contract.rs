@@ -1552,7 +1552,20 @@ fn hold(data_dir: &Path) -> std::fs::File {
     let path = data_dir.join("server.lock");
     std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
     let file = std::fs::File::open(&path).unwrap();
+    // Windows enforces a lock on what it covers, so a server there holds
+    // one byte past the end and leaves the pid readable.
+    #[cfg(unix)]
     file.try_lock().unwrap();
+    #[cfg(windows)]
+    assert!(
+        ritornel_windows::lock::try_lock(
+            &file,
+            ritornel_contract::local::WINDOWS_LOCK_BYTE,
+            1,
+            ritornel_windows::lock::Hold::Exclusive,
+        )
+        .unwrap()
+    );
     file
 }
 

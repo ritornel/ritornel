@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::{Job, Progress, step_command};
 use crate::media::{UNAVAILABLE, read_file, read_folder_image};
 use crate::scan_store::{Known, RecordOp, Source};
-use crate::walk::{Seen, Walked, folder_of, root_id, walk};
+use crate::walk::{Seen, Walked, folder_of, root_id, under, walk};
 use crate::{Command, Error, Fingerprint, LibraryStore, ServerStore, WriteRequest};
 
 /// How a scan runs.
@@ -257,7 +257,7 @@ impl ScanRun {
                         .flatten()
                         .filter_map(|image| {
                             let name = image.path.rsplit('/').next().unwrap_or(&image.path);
-                            read_folder_image(&self.root.join(&image.path), name, image.mtime_ms)
+                            read_folder_image(&under(&self.root, &image.path), name, image.mtime_ms)
                         })
                         .collect();
                     self.images.insert(folder.to_owned(), images);

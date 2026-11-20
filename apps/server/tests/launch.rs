@@ -175,7 +175,16 @@ async fn a_server_started_by_hand_is_used_and_never_stopped() {
         assert_eq!(again.descriptor.server_id, found.descriptor.server_id);
     })
     .await;
-    let _ = Command::new("kill").arg(by_hand.id().to_string()).status();
+    // SIGTERM, or on Windows `taskkill /PID` without `/F`, which asks the
+    // server's hidden window to close.
+    if cfg!(windows) {
+        let _ = Command::new("taskkill")
+            .arg("/PID")
+            .arg(by_hand.id().to_string())
+            .output();
+    } else {
+        let _ = Command::new("kill").arg(by_hand.id().to_string()).status();
+    }
     assert!(by_hand.wait().unwrap().success());
     launched.unwrap();
 }

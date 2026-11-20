@@ -28,6 +28,15 @@ use serde_json::Value;
 /// How long a test waits for a process before it kills it and fails.
 const WAIT: Duration = Duration::from_secs(60);
 
+/// What a server that `std::process::abort` ended exits with: no code on
+/// Unix, where SIGABRT ended it, and on Windows the fast-fail status
+/// (`0xC0000409`) that abort ends a process with.
+const ABORTED: Option<i32> = if cfg!(windows) {
+    Some(-1_073_740_791)
+} else {
+    None
+};
+
 /// How long a track of the invented album is.
 const TRACK_SECONDS: u32 = 40;
 
@@ -222,7 +231,8 @@ struct Server {
 }
 
 fn spawn(data_dir: &Path, fake: &FakeLastfm, more: &[(&str, &str)]) -> (Child, Receiver<String>) {
-    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl")).with_file_name("ritornel-server");
+    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl"))
+        .with_file_name(format!("ritornel-server{}", std::env::consts::EXE_SUFFIX));
     assert!(
         binary.exists(),
         "there is no ritornel-server beside ritornelctl: build the workspace"
@@ -278,11 +288,22 @@ impl Server {
     }
 
     fn stop(self) {
-        let sent = Command::new("kill")
-            .arg("-TERM")
-            .arg(self.child.id().to_string())
-            .status()
-            .unwrap();
+        // `taskkill /PID` without `/F` is what Windows has for SIGTERM: it
+        // asks the server's hidden window to close.
+        let sent = if cfg!(windows) {
+            Command::new("taskkill")
+                .arg("/PID")
+                .arg(self.child.id().to_string())
+                .output()
+                .unwrap()
+                .status
+        } else {
+            Command::new("kill")
+                .arg("-TERM")
+                .arg(self.child.id().to_string())
+                .status()
+                .unwrap()
+        };
         assert!(sent.success());
         assert_eq!(self.ended(), Some(0));
     }
@@ -487,7 +508,7 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
         ritornelctl(&data_dir, &["lastfm", "sync", "--no-wait"]).0,
         Some(0)
     );
-    assert_eq!(dying.ended(), None);
+    assert_eq!(dying.ended(), ABORTED);
 
     // The next run carries the sync on from its cursor, by itself.
     let server = Server::start(&data_dir, &fake, &[]);

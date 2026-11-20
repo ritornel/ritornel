@@ -6,10 +6,13 @@
 //! local client relies on that: it tries the lock, for an instant and
 //! shared, to learn whether a server is alive before it believes
 //! `server.json` (`ritornel_contract::local::SERVER_LOCK`).
+//!
+//! On Unix the server holds the whole file. On Windows, which enforces
+//! locks, it holds one byte past the file's end, so that the pid in it can
+//! still be read ([`local::WINDOWS_LOCK_BYTE`]).
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -44,34 +47,26 @@ impl DirLock {
     /// good, and it is refused at once. A client that is looking holds the
     /// lock shared for an instant, and that is waited out.
     pub(crate) fn acquire(dir: &Path, path: &Path) -> Result<Self, Error> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)
-            .map_err(io_error("open", path))?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        // On Windows the data directory's own access list closes it.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(path).map_err(io_error("open", path))?;
         let started = Instant::now();
         loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(TryLockError::WouldBlock) => {}
-                Err(TryLockError::Error(source)) => return Err(io_error("lock", path)(source)),
+            if take(&file).map_err(io_error("lock", path))? {
+                break;
             }
             // Something has it. A server has it to itself, and shares it
             // with nobody. If it can be shared, there is no server, only
             // clients looking.
-            match file.try_lock_shared() {
-                Ok(()) => file.unlock().map_err(io_error("unlock", path))?,
-                Err(TryLockError::WouldBlock) => {
-                    return Err(Error::InUse {
-                        dir: dir.to_owned(),
-                        pid: holder(&mut file),
-                        endpoint: None,
-                    });
-                }
-                Err(TryLockError::Error(source)) => return Err(io_error("lock", path)(source)),
+            if !shareable(&file).map_err(io_error("lock", path))? {
+                return Err(Error::InUse {
+                    dir: dir.to_owned(),
+                    pid: holder(&mut file),
+                    endpoint: None,
+                });
             }
             if started.elapsed() >= LOOK_PATIENCE {
                 return Err(Error::InUse {
@@ -91,6 +86,42 @@ impl DirLock {
             .map_err(io_error("write", path))?;
         Ok(Self { _file: file })
     }
+}
+
+/// Tries to take the lock as a server holds it, without waiting.
+#[cfg(unix)]
+fn take(file: &File) -> std::io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(source)) => Err(source),
+    }
+}
+
+/// Whether the lock can be had shared: nothing but clients looking has it.
+/// It is let go at once.
+#[cfg(unix)]
+fn shareable(file: &File) -> std::io::Result<bool> {
+    match file.try_lock_shared() {
+        Ok(()) => file.unlock().map(|()| true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(source)) => Err(source),
+    }
+}
+
+#[cfg(windows)]
+fn take(file: &File) -> std::io::Result<bool> {
+    use ritornel_windows::lock::{Hold, try_lock};
+    try_lock(file, local::WINDOWS_LOCK_BYTE, 1, Hold::Exclusive)
+}
+
+#[cfg(windows)]
+fn shareable(file: &File) -> std::io::Result<bool> {
+    use ritornel_windows::lock::{Hold, try_lock, unlock};
+    if !try_lock(file, local::WINDOWS_LOCK_BYTE, 1, Hold::Shared)? {
+        return Ok(false);
+    }
+    unlock(file, local::WINDOWS_LOCK_BYTE, 1).map(|()| true)
 }
 
 /// The pid the holder wrote. It is missing for the instant between a server

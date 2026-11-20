@@ -803,10 +803,12 @@ impl Player {
             let listen = self.facts(entry, &copy, self.start_reason)?;
             let span = self.next_span();
             let start = u64::try_from(from_ms).unwrap_or(0);
-            match self
-                .renderer
-                .load(&root.join(&copy.rel_path), copy.facts, start, span)
-            {
+            match self.renderer.load(
+                &crate::walk::under(root, &copy.rel_path),
+                copy.facts,
+                start,
+                span,
+            ) {
                 Ok(format) => {
                     let duration_ms = duration_of(&copy, &format);
                     let listen = Started {
@@ -1396,10 +1398,11 @@ impl Player {
             };
             let listen = self.facts(&entry, &copy, reason)?;
             let span = self.next_span();
-            match self
-                .renderer
-                .queue_next(&root.join(&copy.rel_path), copy.facts, span)
-            {
+            match self.renderer.queue_next(
+                &crate::walk::under(root, &copy.rel_path),
+                copy.facts,
+                span,
+            ) {
                 Ok(Some(format)) => {
                     let duration_ms = duration_of(&copy, &format);
                     let listen = Started {

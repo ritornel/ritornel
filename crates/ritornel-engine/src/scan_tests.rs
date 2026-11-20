@@ -809,9 +809,16 @@ fn a_folders_image_is_recorded_for_each_file_and_replacing_it_reads_them_again()
     );
 }
 
-/// Every file and folder under a path: its name, size, time and mode.
+/// Every file and folder under a path: its name, size, time and mode (on
+/// Windows, whether it is read-only).
 fn listing(root: &Path) -> Vec<String> {
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    let mode = |metadata: &std::fs::Metadata| {
+        use std::os::unix::fs::PermissionsExt;
+        format!("{:o}", metadata.permissions().mode())
+    };
+    #[cfg(windows)]
+    let mode = |metadata: &std::fs::Metadata| format!("{}", metadata.permissions().readonly());
     let mut found = Vec::new();
     let mut folders = vec![root.to_owned()];
     while let Some(folder) = folders.pop() {
@@ -819,11 +826,11 @@ fn listing(root: &Path) -> Vec<String> {
             let path = entry.unwrap().path();
             let metadata = std::fs::metadata(&path).unwrap();
             found.push(format!(
-                "{} {} {:?} {:o}",
+                "{} {} {:?} {}",
                 path.strip_prefix(root).unwrap().display(),
                 if metadata.is_dir() { 0 } else { metadata.len() },
                 metadata.modified().unwrap(),
-                metadata.permissions().mode()
+                mode(&metadata)
             ));
             if metadata.is_dir() {
                 folders.push(path);
@@ -836,8 +843,15 @@ fn listing(root: &Path) -> Vec<String> {
 
 #[test]
 fn a_scan_only_reads_a_root_that_cannot_be_written() {
-    use std::os::unix::fs::PermissionsExt;
-    fn set_mode(root: &Path, folder: u32, file: u32) {
+    /// Makes nothing under `root` writable, or everything again.
+    #[cfg(unix)]
+    fn seal(root: &Path, sealed: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let (folder, file) = if sealed {
+            (0o555, 0o444)
+        } else {
+            (0o755, 0o644)
+        };
         let mut folders = vec![root.to_owned()];
         while let Some(path) = folders.pop() {
             for entry in std::fs::read_dir(&path).unwrap() {
@@ -852,19 +866,50 @@ fn a_scan_only_reads_a_root_that_cannot_be_written() {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(folder)).unwrap();
         }
     }
+    /// On Windows a read-only folder can still be written in, so everyone,
+    /// this user too, is denied writing, deleting and renaming under it.
+    /// The entry is added through .NET, which leaves `SYNCHRONIZE` out of a
+    /// denial: icacls puts it in every entry it makes, and denying it
+    /// denies every open, reading included.
+    #[cfg(windows)]
+    fn seal(root: &Path, sealed: bool) {
+        const DENY: &str = "$folder = [System.IO.DirectoryInfo]::new($env:RITORNEL_SEAL); \
+            $acl = $folder.GetAccessControl(); \
+            $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new( \
+                [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'), \
+                'WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles', \
+                'ContainerInherit, ObjectInherit', 'None', 'Deny')); \
+            $folder.SetAccessControl($acl)";
+        let done = if sealed {
+            // A module path from PowerShell 7, when the tests run in it,
+            // would only confuse Windows PowerShell.
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", DENY])
+                .env("RITORNEL_SEAL", root)
+                .env_remove("PSModulePath")
+                .output()
+        } else {
+            std::process::Command::new("icacls")
+                .arg(root)
+                .args(["/remove:d", "*S-1-1-0"])
+                .output()
+        }
+        .unwrap();
+        assert!(done.status.success() && done.stderr.is_empty(), "{done:?}");
+    }
     let mut rig = Rig::new();
     album(&mut rig);
     rig.put("Moss Arcade/Tin Weather/cover.jpg", "not-audio.flac");
     let root = rig.root();
     // Nothing under the root can be written, renamed or deleted, so a
     // scan that tried to would fail.
-    set_mode(&root, 0o555, 0o444);
+    seal(&root, true);
     // Modes do not hold the superuser, which a container's tests may run
     // as. There the listing below is the whole of the check.
     let probe = root.join("Elsewhere/new-file");
     if std::fs::write(&probe, b"x").is_ok() {
         std::fs::remove_file(&probe).unwrap();
-        set_mode(&root, 0o555, 0o444);
+        seal(&root, true);
     }
     let before = listing(&root);
 
@@ -873,7 +918,7 @@ fn a_scan_only_reads_a_root_that_cannot_be_written() {
     assert_eq!(rig.scan().unchanged, 5);
     assert_eq!(listing(&root), before);
     assert_eq!(listing(rig.scratch.path()).len(), before.len() + 1);
-    set_mode(&root, 0o755, 0o644);
+    seal(&root, false);
 }
 
 /// A library of several folders, so that a scan of two files a step has

@@ -1255,7 +1255,7 @@ mod tests {
                 },
                 // There is no library, so nothing is said of one.
                 "freeDisk": { "dataBytes": free },
-                "logPath": scratch.path().join("data/logs").to_str().unwrap(),
+                "logPath": scratch.path().join("data").join("logs").to_str().unwrap(),
                 "watch": {
                     "on": false,
                     "enabled": true,
@@ -1313,7 +1313,7 @@ mod tests {
 
         // The library is a file only the OS user can read.
         let library_db = scratch.path().join("data/library.db");
-        assert_eq!(crate::testing::mode(&library_db), 0o600);
+        assert!(crate::testing::private(&library_db));
     }
 
     #[test]

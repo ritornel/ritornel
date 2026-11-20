@@ -50,8 +50,8 @@ fn output_error(error: impl std::fmt::Display) -> RenderError {
 }
 
 /// The device's default configuration, taken as 32-bit float. CoreAudio's
-/// default is always float, and so is that of ALSA's `default` device
-/// behind PipeWire or PulseAudio. A device whose default is another format
+/// default is always float, and so is WASAPI's shared-mode mix format and
+/// that of ALSA's `default` device behind PipeWire or PulseAudio. A device whose default is another format
 /// (an ALSA hardware device with no sound server) is asked for float at
 /// the same rate and channels, and refused if it has none.
 fn float_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, RenderError> {

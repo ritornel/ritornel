@@ -10,9 +10,8 @@
 //! also have read it.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use ritornel_contract::Id;
@@ -22,8 +21,39 @@ use subtle::ConstantTimeEq;
 use crate::Error;
 use crate::error::io_error;
 
-/// The permission bits that let anyone but the file's owner in.
-const OTHER_USERS: u32 = 0o077;
+/// Whether nobody but the OS user (and on Windows the system and the
+/// administrators, who can take any file) may open the file: on Unix no
+/// permission bit for the group or others, on Windows no entry in its
+/// access list for anyone else.
+fn private(file: &File) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(file.metadata()?.permissions().mode() & 0o077 == 0)
+    }
+    #[cfg(windows)]
+    {
+        ritornel_windows::private::is_private(file)
+    }
+}
+
+/// Creates a new file at `path` that only the OS user can open, from
+/// before anything is written to it. It fails if something is there.
+fn create_private(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        ritornel_windows::private::create_restricted(path)
+    }
+}
 
 /// What [`ensure`] found and did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,8 +149,7 @@ fn read(path: &Path) -> Result<Option<SessionToken>, Error> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error("read", path)(error)),
     };
-    let metadata = file.metadata().map_err(io_error("read", path))?;
-    if metadata.permissions().mode() & OTHER_USERS != 0 {
+    if !private(&file).map_err(io_error("read", path))? {
         return Ok(None);
     }
     let mut bytes = Vec::new();
@@ -141,11 +170,7 @@ fn write(path: &Path, token: &SessionToken) -> Result<(), Error> {
         }
         _ => {}
     }
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
+    create_private(&temporary)
         .and_then(|mut file| {
             writeln!(file, "{}", token.expose())?;
             file.sync_all()
@@ -161,7 +186,7 @@ mod tests {
     use ritornel_engine::{OsEntropy, SystemClock};
 
     use super::*;
-    use crate::testing::{Scratch, mode};
+    use crate::testing::{Scratch, open_to_others, private};
 
     fn store() -> ServerStore {
         ServerStore::open_in_memory(Arc::new(SystemClock), Arc::new(OsEntropy)).unwrap()
@@ -182,7 +207,7 @@ mod tests {
         let (did, verifier) = ensure(&store, &path, Some(issued.clone())).unwrap();
         assert_eq!(did, Credential::Issued);
         assert!(verifier.accepts(&issued));
-        assert_eq!(mode(&path), 0o600);
+        assert!(private(&path));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             format!("{}\n", issued.expose())
@@ -249,7 +274,7 @@ mod tests {
         // and the write, or a `server.db` restored from a backup.
 
         assert_eq!(ensure(&store, &path, None).unwrap().0, Credential::Replaced);
-        assert_eq!(mode(&path), 0o600);
+        assert!(private(&path));
         let replacement = token_in(&path);
         assert_ne!(replacement.expose(), lost.expose());
         assert!(store.is_local_credential(&replacement).unwrap());
@@ -273,8 +298,6 @@ mod tests {
 
     #[test]
     fn a_file_other_users_can_read_is_replaced_and_its_token_stops_working() {
-        use std::fs::Permissions;
-
         let scratch = Scratch::new();
         let path = scratch.path().join("credential");
         let store = store();
@@ -282,10 +305,10 @@ mod tests {
         ensure(&store, &path, issued).unwrap();
         let exposed = token_in(&path);
         // As after a restore that did not keep the file's mode.
-        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        open_to_others(&path);
 
         assert_eq!(ensure(&store, &path, None).unwrap().0, Credential::Replaced);
-        assert_eq!(mode(&path), 0o600);
+        assert!(private(&path));
         assert!(store.is_local_credential(&token_in(&path)).unwrap());
         assert!(!store.is_local_credential(&exposed).unwrap());
     }
@@ -313,7 +336,7 @@ mod tests {
         let (_, issued) = store.ensure_identity("desk").unwrap();
 
         ensure(&store, &path, issued).unwrap();
-        assert_eq!(mode(&path), 0o600);
+        assert!(private(&path));
         assert!(store.is_local_credential(&token_in(&path)).unwrap());
         assert!(!left_behind.exists());
     }

@@ -7,6 +7,7 @@ members = [
     "crates/ritornel-client",
     "crates/ritornel-source",
     "crates/ritornel-lastfm",
+    "crates/ritornel-windows",
     "apps/server",
     "apps/ritornelctl",
 ]
@@ -32,6 +33,7 @@ ritornel-engine = { path = "crates/ritornel-engine" }
 ritornel-client = { path = "crates/ritornel-client" }
 ritornel-source = { path = "crates/ritornel-source" }
 ritornel-lastfm = { path = "crates/ritornel-lastfm" }
+ritornel-windows = { path = "crates/ritornel-windows" }
 # The Last.fm crate that `ritornel-lastfm` stands on: sign-in, a
 # history read with every page checked, loved tracks and scrobbling. Pinned
 # exactly. Before 1.0 a minor release may add or break, and a patch fixes.

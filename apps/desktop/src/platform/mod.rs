@@ -7,7 +7,8 @@
 //! from `fallback`, the plain behaviour: menus the app draws itself
 //! (`drawn.rs`), Ctrl's keys, a server held by the launcher's pipe, no
 //! stretch at a page's ends, no picture of the window. Linux (`linux.rs`)
-//! takes all of it but the server, which outlives the app there.
+//! takes all of it but the server, which outlives the app there, as it
+//! does on Windows.
 //!
 //! What is decided here is the system's feel as well as its plumbing: a Mac
 //! page stretches at its ends because a Mac's do, not because the app's do

@@ -796,7 +796,13 @@ impl Core {
         let roots = stores.server.roots().map_err(refused)?;
         let found = roots.iter().find_map(|(name, root)| {
             let rel = path.strip_prefix(root).ok()?;
-            Some((name.clone(), rel.to_string_lossy().into_owned()))
+            // The library keeps a path under a root with `/` between its
+            // parts, whatever the system's separator.
+            let parts: Vec<_> = rel
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect();
+            Some((name.clone(), parts.join("/")))
         });
         let Some((root, rel)) = found else {
             return Err(RpcError::new(

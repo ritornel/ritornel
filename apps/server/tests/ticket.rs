@@ -739,10 +739,20 @@ impl Process {
 
     /// Asks the server to stop and waits until it has.
     fn stop(mut self) {
-        let asked = Command::new("kill")
-            .args(["-TERM", &self.0.id().to_string()])
-            .status()
-            .unwrap();
+        // SIGTERM, or on Windows `taskkill /PID` without `/F`, which asks
+        // the server's hidden window to close.
+        let asked = if cfg!(windows) {
+            Command::new("taskkill")
+                .args(["/PID", &self.0.id().to_string()])
+                .output()
+                .unwrap()
+                .status
+        } else {
+            Command::new("kill")
+                .args(["-TERM", &self.0.id().to_string()])
+                .status()
+                .unwrap()
+        };
         assert!(asked.success());
         assert!(self.0.wait().unwrap().success());
     }

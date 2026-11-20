@@ -38,6 +38,8 @@ mod error;
 mod http;
 pub mod launch;
 pub mod local;
+#[cfg(test)]
+mod testing;
 mod transport;
 
 pub use client::Client;

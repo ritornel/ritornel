@@ -5,10 +5,18 @@ use std::path::Path;
 /// The bytes this process may still write on the disk that holds `path`.
 /// `None` if the system would not say.
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
-    let disk = rustix::fs::statvfs(path).ok()?;
-    // Blocks an unprivileged process may use, in the size they are counted
-    // in.
-    disk.f_bavail.checked_mul(disk.f_frsize)
+    #[cfg(unix)]
+    {
+        let disk = rustix::fs::statvfs(path).ok()?;
+        // Blocks an unprivileged process may use, in the size they are
+        // counted in.
+        disk.f_bavail.checked_mul(disk.f_frsize)
+    }
+    // What this user may still write, after any quota.
+    #[cfg(windows)]
+    {
+        ritornel_windows::file::free_bytes(path).ok()
+    }
 }
 
 #[cfg(test)]
