@@ -60,6 +60,8 @@ const ICONS: &[(&str, &str, bool)] = &[
     ),
     // The sort menu's chevron, from the real Library page's CSS.
     ("chevron", "M4 6.2 8 10.2l4-4", true),
+    ("chevronRight", "M6.2 4l4 4-4 4", true),
+    ("menu", "M2.5 4h11M2.5 8h11M2.5 12h11", true),
 ];
 
 /// Whole pictures, not one path on the 16-point square: the Settings

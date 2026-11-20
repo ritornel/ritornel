@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Bounds, ClickEvent, Context, Entity, FocusHandle, FontWeight, Global,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement,
-    Styled, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
+    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement, Styled,
+    Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
     actions, canvas, div, prelude::FluentBuilder, px, size,
 };
 use jiff::tz::TimeZone;
@@ -124,10 +124,11 @@ pub(crate) fn install(link: Entity<Link>, quiet: bool, cx: &mut App) {
         opening: None,
     });
     cx.on_action(|_: &OpenSettings, cx| open(None, cx));
-    cx.bind_keys([
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-w", CloseSettings, Some("Settings")),
-    ]);
+    let bindings = [
+        crate::frame::key("secondary-,", OpenSettings, None, cx),
+        crate::frame::key("secondary-w", CloseSettings, Some("Settings"), cx),
+    ];
+    cx.bind_keys(bindings.into_iter().flatten());
 }
 
 /// Opens the Settings window, on `section` or the one it was last left on,
@@ -525,5 +526,6 @@ impl Render for Settings {
                     .child(section)
                     .child(measure),
             )
+            .children(crate::drawn::layer(window, cx))
     }
 }

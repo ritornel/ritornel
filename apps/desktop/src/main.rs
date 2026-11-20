@@ -10,6 +10,7 @@ mod blank;
 mod blur;
 mod carry;
 mod covers;
+mod drawn;
 mod elastic;
 mod find;
 mod frame;

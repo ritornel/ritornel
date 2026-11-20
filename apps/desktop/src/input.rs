@@ -70,38 +70,47 @@ actions!(
     ]
 );
 
-/// The keys a field takes, as a Mac field does.
+/// The keys a field takes, as the system's own fields do (`platform::KEYS`).
 pub(crate) fn bind_keys(cx: &mut App) {
+    use crate::frame::{key, keys};
     let here = Some("Field");
-    cx.bind_keys([
-        KeyBinding::new("backspace", Backspace, here),
-        KeyBinding::new("alt-backspace", DeleteWordLeft, here),
-        KeyBinding::new("cmd-backspace", DeleteToStart, here),
+    let system = crate::platform::KEYS;
+    let mut bindings: Vec<KeyBinding> = vec![KeyBinding::new("backspace", Backspace, here)];
+    bindings.extend(keys(system.delete_word_left, DeleteWordLeft, here));
+    bindings.extend(keys(system.delete_to_start, DeleteToStart, here));
+    bindings.extend([
         KeyBinding::new("delete", Delete, here),
         KeyBinding::new("left", Left, here),
         KeyBinding::new("right", Right, here),
-        KeyBinding::new("alt-left", WordLeft, here),
-        KeyBinding::new("alt-right", WordRight, here),
+    ]);
+    bindings.extend(keys(system.word_left, WordLeft, here));
+    bindings.extend(keys(system.word_right, WordRight, here));
+    bindings.extend([
         KeyBinding::new("shift-left", SelectLeft, here),
         KeyBinding::new("shift-right", SelectRight, here),
-        KeyBinding::new("alt-shift-left", SelectWordLeft, here),
-        KeyBinding::new("alt-shift-right", SelectWordRight, here),
-        KeyBinding::new("cmd-a", SelectAll, here),
+    ]);
+    bindings.extend(keys(system.select_word_left, SelectWordLeft, here));
+    bindings.extend(keys(system.select_word_right, SelectWordRight, here));
+    bindings.extend(key("secondary-a", SelectAll, here, cx));
+    bindings.extend([
         KeyBinding::new("home", Home, here),
         KeyBinding::new("end", End, here),
-        KeyBinding::new("cmd-left", Home, here),
-        KeyBinding::new("cmd-right", End, here),
-        KeyBinding::new("cmd-shift-left", SelectHome, here),
-        KeyBinding::new("cmd-shift-right", SelectEnd, here),
-        KeyBinding::new("cmd-v", Paste, here),
-        KeyBinding::new("cmd-c", Copy, here),
-        KeyBinding::new("cmd-x", Cut, here),
-        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, here),
+    ]);
+    bindings.extend(keys(system.line_start, Home, here));
+    bindings.extend(keys(system.line_end, End, here));
+    bindings.extend(keys(system.select_line_start, SelectHome, here));
+    bindings.extend(keys(system.select_line_end, SelectEnd, here));
+    bindings.extend(key("secondary-v", Paste, here, cx));
+    bindings.extend(key("secondary-c", Copy, here, cx));
+    bindings.extend(key("secondary-x", Cut, here, cx));
+    bindings.extend(keys(system.character_palette, ShowCharacterPalette, here));
+    bindings.extend([
         KeyBinding::new("up", Up, here),
         KeyBinding::new("down", Down, here),
         KeyBinding::new("enter", Enter, here),
         KeyBinding::new("escape", Escape, here),
     ]);
+    cx.bind_keys(bindings);
 }
 
 /// What a field tells what it is for.

@@ -730,7 +730,7 @@ impl Wall {
                 self.step(step, window, cx);
                 return true;
             }
-            "down" if mods.platform => {
+            "down" if mods.secondary(cx) => {
                 self.open_selected(cx);
                 return true;
             }

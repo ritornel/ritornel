@@ -453,7 +453,7 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
                     });
                 }
                 "dismiss" => {
-                    crate::platform::dismiss_menu();
+                    cx.update(crate::platform::dismiss_menu);
                 }
                 "rclick" | "click" => {
                     // `rclick <x> <y>`: a right-click there, in points from
