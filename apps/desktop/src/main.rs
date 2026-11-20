@@ -53,7 +53,9 @@ mod upnext;
 mod wall;
 mod words;
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::{
     App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
@@ -133,135 +135,215 @@ fn main() {
             std::process::exit(2);
         }
     };
-    gpui_platform::application()
-        .with_assets(icons::Icons)
-        .run(move |cx: &mut App| {
-            frame::menus(cx);
-            input::bind_keys(cx);
-            // Whatever the system needs set up: on a Mac, reading what a
-            // touchpad's scroll says that GPUI does not pass on.
-            platform::start();
-            let link = link::new(args.data_dir.as_deref(), cx);
-            // How the app looks, as remembered, for every window to follow.
-            cx.set_global(remember::Looks {
-                letters: remember::load().letters,
-            });
-            settings::install(link.clone(), args.script.is_some(), cx);
-            // Quit stops a server the app started; one it found it leaves.
-            let quitting = link.clone();
-            cx.on_action(move |_: &frame::Quit, cx| {
-                quitting.read(cx).stop_started();
-                cx.quit();
-            });
-            // The app ending stops a server it holds (`platform::SERVER_APART`
-            // says whether it holds one): where closing the window ends it,
-            // the server is apart, and plays on.
-            let stopping = link.clone();
-            cx.on_app_quit(move |cx| {
-                stopping.read(cx).stop_owned();
-                async {}
+    // What the Dock's icon does when the app is running, set once the app
+    // has started (GPUI takes the handler before then).
+    type Reopen = Box<dyn FnMut(&mut App)>;
+    let reopen: Rc<RefCell<Option<Reopen>>> = Rc::default();
+    let on_reopen = reopen.clone();
+    let app = gpui_platform::application().with_assets(icons::Icons);
+    app.on_reopen(move |cx| {
+        if let Some(reopen) = on_reopen.borrow_mut().as_mut() {
+            reopen(cx);
+        }
+    });
+    app.run(move |cx: &mut App| {
+        frame::menus(cx);
+        input::bind_keys(cx);
+        // Whatever the system needs set up: on a Mac, reading what a
+        // touchpad's scroll says that GPUI does not pass on.
+        platform::start();
+        let link = link::new(args.data_dir.as_deref(), cx);
+        // How the app looks, as remembered, for every window to follow.
+        cx.set_global(remember::Looks {
+            letters: remember::load().letters,
+        });
+        settings::install(link.clone(), args.script.is_some(), cx);
+        // Quit stops a server the app started; one it found it leaves.
+        let quitting = link.clone();
+        cx.on_action(move |_: &frame::Quit, cx| {
+            quitting.read(cx).stop_started();
+            cx.quit();
+        });
+        // The app ending stops a server it holds (`platform::SERVER_APART`
+        // says whether it holds one): where closing the window ends it,
+        // the server is apart, and plays on.
+        let stopping = link.clone();
+        cx.on_app_quit(move |cx| {
+            stopping.read(cx).stop_owned();
+            async {}
+        })
+        .detach();
+        // A test that must not be seen opens on the display it names
+        // (`tools/offscreen.m` makes one), out of the Dock (developer-only).
+        let display = match std::env::var("RITORNEL_TEST_DISPLAY") {
+            Err(_) => None,
+            Ok(wanted) => {
+                let displays = cx.displays();
+                // By the system's number for it (on a Mac, its
+                // `CGDirectDisplayID`), which GPUI keeps as its ID.
+                let found = displays
+                    .iter()
+                    .find(|display| u64::from(display.id()).to_string() == wanted.trim());
+                // Never on the screen in front instead: a test that cannot
+                // be hidden does not run.
+                let Some(found) = found else {
+                    let seen: Vec<String> = displays
+                        .iter()
+                        .map(|display| u64::from(display.id()).to_string())
+                        .collect();
+                    complain(format_args!(
+                        "no display at {wanted}; there are {}",
+                        seen.join(", ")
+                    ));
+                    cx.quit();
+                    return;
+                };
+                platform::keep_out_of_the_dock();
+                Some(found.id())
+            }
+        };
+        let first = Opening {
+            display,
+            width: args.width,
+            height: args.height,
+            // A measure and a script run whether or not the window has focus.
+            unfocused_frames: args.measure.is_some() || args.script.is_some(),
+            measure: args.measure.map(|seconds| Measure {
+                seconds,
+                out: args.out.clone(),
+                seed: args.seed,
+                label: args.label.clone(),
+                stay: args.script.is_some(),
+            }),
+        };
+        // On a Mac, closing the window leaves the app running, and the
+        // Dock's icon brings a window back: a new one when it was closed,
+        // the one there is otherwise (a measure never opens a second).
+        let reopening = link.clone();
+        *reopen.borrow_mut() = Some(Box::new(move |cx| {
+            let shown = cx
+                .windows()
+                .into_iter()
+                .find(|window| window.downcast::<Shell>().is_some());
+            match shown {
+                Some(window) => {
+                    let _ = window.update(cx, |_, window, _| window.activate_window());
+                }
+                None => {
+                    let again = Opening {
+                        display,
+                        width: args.width,
+                        height: args.height,
+                        unfocused_frames: false,
+                        measure: None,
+                    };
+                    if open_main(again, reopening.clone(), cx).is_err() {
+                        complain(format_args!("the window could not be opened again"));
+                    }
+                }
+            }
+            cx.activate(true);
+        }));
+        let window = open_main(first, link, cx);
+        let Ok(window) = window else {
+            complain(format_args!("the window could not be opened"));
+            cx.quit();
+            return;
+        };
+        match args.script.clone() {
+            // A script must not take the keyboard from whoever is at the machine.
+            Some(script) => {
+                let _ = window.update(cx, |_, window, _| platform::bring_forward_quietly(window));
+                script::run(script, window.into(), &mut cx.to_async()).detach();
+            }
+            None => cx.activate(true),
+        }
+    });
+}
+
+/// How the main window opens.
+struct Opening {
+    display: Option<gpui::DisplayId>,
+    width: f32,
+    height: f32,
+    /// Draw at full rate when the window does not have focus.
+    unfocused_frames: bool,
+    /// The measure's fling, on the first window only.
+    measure: Option<Measure>,
+}
+
+struct Measure {
+    seconds: f32,
+    out: Option<PathBuf>,
+    seed: u64,
+    label: String,
+    stay: bool,
+}
+
+/// Opens the main window, at its first start and whenever the Dock asks for
+/// one again after it was closed.
+fn open_main(
+    opening: Opening,
+    link: gpui::Entity<link::Link>,
+    cx: &mut App,
+) -> gpui::Result<gpui::WindowHandle<Shell>> {
+    let Opening {
+        display,
+        width,
+        height,
+        unfocused_frames,
+        measure,
+    } = opening;
+    let bounds = Bounds::centered(display, size(px(width), px(height)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        display_id: display,
+        window_min_size: Some(size(px(860.), px(560.))),
+        // The name the system knows the window by, for its launcher
+        // entry and icon on Linux (Wayland's app ID, X11's class).
+        app_id: Some("dev.ritornel.desktop".into()),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Ritornel".into()),
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(20.), px(19.))),
+        }),
+        inactive_frame_interval: if unfocused_frames {
+            None
+        } else {
+            WindowOptions::default().inactive_frame_interval
+        },
+        ..Default::default()
+    };
+    cx.open_window(options, move |window, cx| {
+        // Light and dark follow the system, as the real app's do.
+        theme::follow(window.appearance());
+        window
+            .observe_window_appearance(|window, _| {
+                theme::follow(window.appearance());
+                window.refresh();
             })
             .detach();
-            // A test that must not be seen opens on the display it names
-            // (`tools/offscreen.m` makes one), out of the Dock (developer-only).
-            let display = match std::env::var("RITORNEL_TEST_DISPLAY") {
-                Err(_) => None,
-                Ok(wanted) => {
-                    let displays = cx.displays();
-                    // By the system's number for it (on a Mac, its
-                    // `CGDirectDisplayID`), which GPUI keeps as its ID.
-                    let found = displays
-                        .iter()
-                        .find(|display| u64::from(display.id()).to_string() == wanted.trim());
-                    // Never on the screen in front instead: a test that cannot
-                    // be hidden does not run.
-                    let Some(found) = found else {
-                        let seen: Vec<String> = displays
-                            .iter()
-                            .map(|display| u64::from(display.id()).to_string())
-                            .collect();
-                        complain(format_args!(
-                            "no display at {wanted}; there are {}",
-                            seen.join(", ")
-                        ));
-                        cx.quit();
-                        return;
-                    };
-                    platform::keep_out_of_the_dock();
-                    Some(found.id())
-                }
-            };
-            let bounds = Bounds::centered(display, size(px(args.width), px(args.height)), cx);
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                display_id: display,
-                window_min_size: Some(size(px(860.), px(560.))),
-                // The name the system knows the window by, for its launcher
-                // entry and icon on Linux (Wayland's app ID, X11's class).
-                app_id: Some("dev.ritornel.desktop".into()),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Ritornel".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(20.), px(19.))),
-                }),
-                // A measure runs whether or not the window has focus.
-                inactive_frame_interval: if args.measure.is_some() || args.script.is_some() {
-                    None
-                } else {
-                    WindowOptions::default().inactive_frame_interval
-                },
-                ..Default::default()
-            };
-            let measure = args.measure;
-            let out = args.out.clone();
-            let seed = args.seed;
-            let label = args.label.clone();
-            let stay = args.script.is_some();
-            let window = cx.open_window(options, move |window, cx| {
-                // Light and dark follow the system, as the real app's do.
-                theme::follow(window.appearance());
-                window
-                    .observe_window_appearance(|window, _| {
-                        theme::follow(window.appearance());
-                        window.refresh();
-                    })
-                    .detach();
-                let scale = window.scale_factor();
-                let player = cx.new(|cx| player::Player::new(&link, cx));
-                let wall = cx.new(|cx| Wall::new(link.clone(), player.clone(), scale, cx));
-                if let Some(seconds) = measure {
-                    let wall = wall.clone();
-                    // Started once the first rows are in.
-                    window.on_next_frame(move |_, cx| {
-                        cx.spawn(async move |cx| {
-                            cx.background_executor().timer(measure::wait()).await;
-                            wall.update(cx, |wall, cx| {
-                                let fling = Fling::new(seconds, seed);
-                                wall.stats.out = out.clone();
-                                wall.stats.label = label.clone();
-                                wall.stats.stay = stay;
-                                wall.start_fling(fling);
-                                cx.notify();
-                            });
-                        })
-                        .detach();
+        let scale = window.scale_factor();
+        let player = cx.new(|cx| player::Player::new(&link, cx));
+        let wall = cx.new(|cx| Wall::new(link.clone(), player.clone(), scale, cx));
+        if let Some(measure) = measure {
+            let wall = wall.clone();
+            // Started once the first rows are in.
+            window.on_next_frame(move |_, cx| {
+                cx.spawn(async move |cx| {
+                    cx.background_executor().timer(measure::wait()).await;
+                    wall.update(cx, |wall, cx| {
+                        let fling = Fling::new(measure.seconds, measure.seed);
+                        wall.stats.out = measure.out.clone();
+                        wall.stats.label = measure.label.clone();
+                        wall.stats.stay = measure.stay;
+                        wall.start_fling(fling);
+                        cx.notify();
                     });
-                }
-                cx.new(|cx| Shell::new(link, wall, player, window, cx))
+                })
+                .detach();
             });
-            let Ok(window) = window else {
-                complain(format_args!("the window could not be opened"));
-                cx.quit();
-                return;
-            };
-            match args.script.clone() {
-                // A script must not take the keyboard from whoever is at the machine.
-                Some(script) => {
-                    let _ =
-                        window.update(cx, |_, window, _| platform::bring_forward_quietly(window));
-                    script::run(script, window.into(), &mut cx.to_async()).detach();
-                }
-                None => cx.activate(true),
-            }
-        });
+        }
+        cx.new(|cx| Shell::new(link, wall, player, window, cx))
+    })
 }

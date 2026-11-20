@@ -34,6 +34,7 @@
 //!   there, the pointer moved there in steps while it is held, and let go
 //!   where it is, as a drag by hand; in points from the window's top left
 //! - `mem <label>`: print the memory footprint
+//! - `close`: close the window, as its close button does; the app runs on
 //! - `quit`
 
 #![allow(
@@ -571,6 +572,9 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
                     pointer = to;
                 }
                 "settings" => settings(rest, cx),
+                "close" => {
+                    let _ = window.update(cx, |_, window, _| window.remove_window());
+                }
                 "mem" => eprintln!("mem {}: {}", rest.trim(), crate::platform::memory_line()),
                 "quit" => {
                     cx.update(|cx| cx.quit());
