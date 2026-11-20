@@ -181,6 +181,9 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 display_id: display,
                 window_min_size: Some(size(px(860.), px(560.))),
+                // The name the system knows the window by, for its launcher
+                // entry and icon on Linux (Wayland's app ID, X11's class).
+                app_id: Some("dev.ritornel.desktop".into()),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Ritornel".into()),
                     appears_transparent: true,

@@ -51,6 +51,11 @@ block2 = "=0.6.2"
 raw-window-handle = "=0.6.2"
 libc = "=0.2.191"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# GPUI's Wayland and X11 backends, on Linux alone: without one it has no
+# window to open. Cargo adds these features to the declaration above.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.13", default-features = false, features = ["font-kit", "wayland", "x11"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 raw-window-handle = "=0.6.2"

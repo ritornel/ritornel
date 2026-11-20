@@ -13,7 +13,7 @@ idiomatic_version_file_enable_tools = ["rust"]
 "aqua:EmbarkStudios/cargo-deny" = "0.21.0"
 
 [tasks.build]
-description = "Build every crate and both programs, and on a Mac the desktop app"
+description = "Build every crate and both programs, and on macOS and Linux the desktop app"
 run = ["cargo build --locked --workspace --all-targets", { task = "desktop:app" }]
 
 [tasks.install]
@@ -73,8 +73,9 @@ run = "cargo test --locked --package ritornel-contract typescript"
 env = { RITORNEL_BLESS = "1" }
 
 # The desktop app, in GPUI, is a Cargo workspace of its own in apps/desktop,
-# checked and built on macOS only: anywhere else these say so and do
-# nothing. See scripts/desktop.sh.
+# checked and built on macOS and Linux: anywhere else, or on a Linux machine
+# without the libraries it links, these say so and do nothing. See
+# scripts/desktop.sh.
 [tasks."desktop:check"]
 description = "Check, lint and test the desktop app, and build it"
 run = "scripts/desktop.sh check"
@@ -84,5 +85,5 @@ description = "Run the desktop app against an invented library, never a real one
 run = "scripts/desktop.sh run"
 
 [tasks."desktop:app"]
-description = "Build Ritornel.app, with its own server"
+description = "Build Ritornel.app, with its own server, or on Linux a folder of the two"
 run = "scripts/desktop.sh app"
