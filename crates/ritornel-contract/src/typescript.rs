@@ -427,10 +427,20 @@ fn an_id_is_a_string_and_a_field_left_out_is_optional_and_never_null() {
 /// fields serde leaves out, so this reads the source.
 #[test]
 fn a_field_serde_leaves_out_is_marked_optional_for_typescript() {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut folders = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    let mut files = Vec::new();
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
     let mut skipped = 0;
-    for file in std::fs::read_dir(source).unwrap() {
-        let path = file.unwrap().path();
+    for path in files {
         let text = std::fs::read_to_string(&path).unwrap();
         let mut lines = text.lines().map(str::trim);
         while let Some(line) = lines.next() {

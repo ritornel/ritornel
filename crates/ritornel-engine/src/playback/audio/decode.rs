@@ -290,10 +290,7 @@ impl Read for Held {
         if buffer.is_empty() {
             return Ok(0);
         }
-        #[cfg(unix)]
-        let read = std::os::unix::fs::FileExt::read_at(&*self.file, buffer, self.at)?;
-        #[cfg(windows)]
-        let read = std::os::windows::fs::FileExt::seek_read(&*self.file, buffer, self.at)?;
+        let read = crate::platform::read_at(&self.file, buffer, self.at)?;
         self.at += read as u64;
         Ok(read)
     }

@@ -330,7 +330,7 @@ mod tests {
         std::fs::write(&path, pid).unwrap();
         let file = File::open(&path).unwrap();
         assert!(
-            soon(|| crate::testing::try_hold_as_a_server(&file)),
+            soon(|| crate::platform::try_hold_as_a_server(&file)),
             "the lock stays held"
         );
         file

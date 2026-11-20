@@ -83,51 +83,19 @@ pub fn data_dir(flag: Option<&Path>, env: Env<'_>) -> Option<PathBuf> {
 }
 
 /// A variable's value as a path, unless it is unset or empty.
-fn set(env: Env<'_>, name: &str) -> Option<PathBuf> {
+pub(crate) fn set(env: Env<'_>, name: &str) -> Option<PathBuf> {
     env(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
-/// The platform's default data directory.
+/// The system's default data directory: `~/Library/Application
+/// Support/Ritornel` on a Mac, `%LOCALAPPDATA%\Ritornel` on Windows, and
+/// elsewhere `$XDG_DATA_HOME/ritornel`, which is `~/.local/share/ritornel`
+/// unless the user moved it. Each is explained where it is chosen, in this
+/// crate's `platform` module.
 pub fn default_data_dir(env: Env<'_>) -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        macos_default(env)
-    } else if cfg!(windows) {
-        windows_default(env)
-    } else {
-        xdg_default(env)
-    }
-}
-
-/// `%LOCALAPPDATA%\Ritornel`, which is `C:\Users\<user>\AppData\Local\Ritornel`.
-/// It is the local application data folder and not the roaming one
-/// (`%APPDATA%`): a roaming profile is copied to every machine the user
-/// signs in to, and `server.db` holds this server's own identity, which two
-/// machines must never share, beside a library, a lock and a cache that
-/// belong to this machine. A relative value is ignored.
-fn windows_default(env: Env<'_>) -> Option<PathBuf> {
-    set(env, "LOCALAPPDATA")
-        .filter(|base| base.is_absolute())
-        .map(|base| base.join("Ritornel"))
-}
-
-/// `~/Library/Application Support/Ritornel`: where macOS keeps what an
-/// application owns and the user does not handle.
-fn macos_default(env: Env<'_>) -> Option<PathBuf> {
-    Some(set(env, "HOME")?.join("Library/Application Support/Ritornel"))
-}
-
-/// `$XDG_DATA_HOME/ritornel`, which is `~/.local/share/ritornel` unless the
-/// user moved it. It is the data directory of the XDG base directory
-/// specification and not the state one: `server.db` holds this server's
-/// identity and pairings, and the hub's `library.db` sits beside it. The
-/// specification says to ignore a relative `XDG_DATA_HOME`.
-fn xdg_default(env: Env<'_>) -> Option<PathBuf> {
-    set(env, "XDG_DATA_HOME")
-        .filter(|base| base.is_absolute())
-        .or_else(|| Some(set(env, "HOME")?.join(".local/share")))
-        .map(|base| base.join("ritornel"))
+    crate::platform::default_data_dir(env)
 }
 
 /// What `server.json` holds: how a local client finds the running server.
@@ -153,13 +121,13 @@ pub struct ServerJson {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use serde_json::json;
 
     use super::*;
 
     /// An environment that holds exactly `variables`.
-    fn env(variables: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+    pub(crate) fn env(variables: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let variables: Vec<(String, OsString)> = variables
             .iter()
             .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
@@ -219,54 +187,6 @@ mod tests {
             data_dir(Some(Path::new("some/where")), &env(&[])).unwrap(),
             Path::new("some/where")
         );
-    }
-
-    #[test]
-    fn the_macos_default_is_in_application_support() {
-        assert_eq!(
-            macos_default(&env(&[("HOME", "/Users/pat")])).unwrap(),
-            Path::new("/Users/pat/Library/Application Support/Ritornel")
-        );
-        assert_eq!(macos_default(&env(&[])), None);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn the_default_elsewhere_follows_the_xdg_data_directory() {
-        assert_eq!(
-            xdg_default(&env(&[("HOME", "/home/pat")])).unwrap(),
-            Path::new("/home/pat/.local/share/ritornel")
-        );
-        assert_eq!(
-            xdg_default(&env(&[
-                ("HOME", "/home/pat"),
-                ("XDG_DATA_HOME", "/srv/data")
-            ]))
-            .unwrap(),
-            Path::new("/srv/data/ritornel")
-        );
-        // A relative XDG_DATA_HOME is ignored, as the specification says.
-        assert_eq!(
-            xdg_default(&env(&[("HOME", "/home/pat"), ("XDG_DATA_HOME", "data")])).unwrap(),
-            Path::new("/home/pat/.local/share/ritornel")
-        );
-        assert_eq!(xdg_default(&env(&[])), None);
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn the_windows_default_is_in_local_application_data() {
-        assert_eq!(
-            windows_default(&env(&[("LOCALAPPDATA", r"C:\Users\pat\AppData\Local")])).unwrap(),
-            Path::new(r"C:\Users\pat\AppData\Local\Ritornel")
-        );
-        // Never the roaming folder, nor a relative one.
-        assert_eq!(
-            windows_default(&env(&[("APPDATA", r"C:\Users\pat\AppData\Roaming")])),
-            None
-        );
-        assert_eq!(windows_default(&env(&[("LOCALAPPDATA", "AppData")])), None);
-        assert_eq!(windows_default(&env(&[])), None);
     }
 
     #[test]

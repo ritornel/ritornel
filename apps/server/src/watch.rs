@@ -21,6 +21,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ritornel_contract::{AutoRun, AutoTrigger, Id, JobState, WatchState, WatchedKind};
+use ritornel_engine::folder_id;
 use tracing::{info, warn};
 
 use crate::dispatch::Core;
@@ -219,24 +220,6 @@ struct Watched {
     id: Option<(u64, u64)>,
     /// The system lost track of it: it is watched afresh at the next look.
     rearm: bool,
-}
-
-/// Which folder is at `path` now, if one is.
-fn folder_id(path: &Path) -> Option<(u64, u64)> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_dir() {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some((metadata.dev(), metadata.ino()))
-    }
-    // The volume's serial number and the folder's index on it.
-    #[cfg(windows)]
-    {
-        ritornel_windows::file::id(path).ok()
-    }
 }
 
 /// Watches a folder that is there, or says why it cannot be.

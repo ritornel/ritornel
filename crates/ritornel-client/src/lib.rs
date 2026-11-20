@@ -38,6 +38,7 @@ mod error;
 mod http;
 pub mod launch;
 pub mod local;
+mod platform;
 #[cfg(test)]
 mod testing;
 mod transport;

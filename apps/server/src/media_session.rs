@@ -2,14 +2,14 @@
 //! server process so they work with no window open. See decision 23 and
 //! "OS integration" in docs/design/playback.md, and spikes/now-playing.
 //!
-//! A thread of its own owns the platform's controls: it shows the player's
+//! A thread of its own owns the system's controls: it shows the player's
 //! state, and passes each key on to the player by the path a contract call
-//! takes. The platform is behind [`Controls`]:
+//! takes. The system's own controls are `platform::MediaControls`:
 //!
 //! - macOS: souvlaki's Now Playing. The main thread blocks in the run loop,
-//!   which is all macOS needs to deliver the keys ([`wait`]).
+//!   which is all macOS needs to deliver the keys (`platform::wait`).
 //! - Linux: MPRIS on the session bus, served from the server's own async
-//!   runtime ([`mpris`]). A server with no session bus has none, quietly.
+//!   runtime. A server with no session bus has none, quietly.
 //! - Windows: none yet. The system's media transport controls are to be
 //!   tied to the hidden window `serve` opens there.
 
@@ -25,21 +25,11 @@ use tokio::runtime::Handle;
 use tracing::debug;
 
 use crate::dispatch::Core;
-
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "linux")]
-mod mpris;
-
-#[cfg(target_os = "macos")]
-use self::macos::Controls;
-#[cfg(target_os = "macos")]
-pub(crate) use self::macos::wait;
-#[cfg(target_os = "linux")]
-use self::mpris::Controls;
+use crate::platform::MediaControls;
 
 /// What a media key asks of the player.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code, reason = "each system's controls send only some keys")]
 pub(crate) enum Key {
     Toggle,
     Play,
@@ -48,23 +38,20 @@ pub(crate) enum Key {
     Previous,
     /// To this position, in milliseconds, in whichever entry the player is
     /// on. Only macOS's seeks name no entry.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Seek(u64),
     /// To this position, in milliseconds, in this entry only: nothing if
     /// the player has moved on from it. Only MPRIS names the entry.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     SeekIn {
         entry: Id,
         position_ms: u64,
     },
     /// The player's own volume, 0 to 1. Only MPRIS sets it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Volume(f64),
 }
 
-/// Where the platform's controls send each key: back to the session's
+/// Where the system's controls send each key: back to the session's
 /// thread, which carries it out.
-type Keys = Arc<dyn Fn(Key) + Send + Sync>;
+pub(crate) type Keys = Arc<dyn Fn(Key) + Send + Sync>;
 
 enum Message {
     State(Box<PlayerState>),
@@ -110,9 +97,8 @@ impl MediaSession {
 
     /// Stops the thread and waits for it, which takes the player off the
     /// session bus. The server does this while its runtime still runs,
-    /// on Linux only (`Server::stop`). The wait is at most one attempt to
-    /// connect, which is bounded.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// where the session is served from it (`Server::stop`). The wait is at
+    /// most one attempt to connect, which is bounded.
     pub(crate) fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
         let _ = self.send.send(Message::Stop);
@@ -141,7 +127,7 @@ fn run(
     runtime: &Handle,
     stopping: &AtomicBool,
 ) {
-    let mut controls: Option<Controls> = None;
+    let mut controls: Option<MediaControls> = None;
     // The entry and track shown, so the metadata is sent once a track.
     let mut shown: Option<(Id, Option<Id>)> = None;
     while let Ok(message) = receive.recv() {
@@ -165,7 +151,7 @@ fn run(
                     let keys: Keys = Arc::new(move |key| {
                         let _ = keys.send(Message::Key(key));
                     });
-                    controls = Controls::open(keys, runtime);
+                    controls = MediaControls::open(keys, runtime);
                 }
                 if let Some(controls) = &mut controls {
                     show(core, controls, &state, &mut shown);
@@ -179,7 +165,7 @@ fn run(
 /// with the position, from which macOS decides who has the keys.
 fn show(
     core: &Weak<Core>,
-    controls: &mut Controls,
+    controls: &mut MediaControls,
     state: &PlayerState,
     shown: &mut Option<(Id, Option<Id>)>,
 ) {
@@ -209,13 +195,6 @@ fn file_url(path: &Path) -> String {
     url
 }
 
-/// Waits until `stopped` gives a reason to stop. Only macOS needs the main
-/// thread for its media session; elsewhere it simply waits.
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn wait<T: Send + 'static>(stopped: Receiver<T>) -> Option<T> {
-    stopped.recv().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,12 +208,5 @@ mod tests {
             url,
             "file:///Users/a/Library/Application%20Support/Ritornel/cache/x-512.jpg"
         );
-    }
-
-    #[test]
-    fn off_the_main_thread_waiting_is_only_waiting() {
-        let (send, receive) = mpsc::channel();
-        send.send(7).unwrap();
-        assert_eq!(wait(receive), Some(7));
     }
 }

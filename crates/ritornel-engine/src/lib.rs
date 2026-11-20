@@ -57,6 +57,7 @@ mod media;
 #[cfg(test)]
 mod media_fixtures;
 mod migrate;
+mod platform;
 pub mod playback;
 mod ratings;
 mod resolve_store;
@@ -116,3 +117,4 @@ pub use server_store::{Role, ServerIdentity, ServerStore};
 pub use service_session::{ServiceKey, ServiceSession};
 pub use sqlite::SQLITE_VERSION;
 pub use timekeeping::{SystemTimekeeper, Timekeeper, clock_boot};
+pub use walk::folder_id;

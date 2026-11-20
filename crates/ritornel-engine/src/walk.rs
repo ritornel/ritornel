@@ -44,21 +44,15 @@ pub(crate) struct Walked {
     pub(crate) root_id: Option<(u64, u64)>,
 }
 
-/// Which folder is at `root` now, if one is.
-pub(crate) fn root_id(root: &Path) -> Option<(u64, u64)> {
-    let metadata = std::fs::metadata(root).ok()?;
+/// Which folder is at `path` now, if one is: its device and inode, or on
+/// Windows its volume's serial number and its file index. A disk mounted
+/// again is another folder at the same path.
+pub fn folder_id(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_dir() {
         return None;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some((metadata.dev(), metadata.ino()))
-    }
-    #[cfg(windows)]
-    {
-        ritornel_windows::file::id(root).ok()
-    }
+    crate::platform::file_id(path, &metadata)
 }
 
 /// The file at `rel`, a path relative to `root` with `/` between its parts,
@@ -158,7 +152,7 @@ pub(crate) fn walk(root: &Path, stop: &AtomicBool) -> Result<Walked, Error> {
     };
     std::fs::read_dir(root).map_err(|_| offline())?;
     let mut walked = Walked {
-        root_id: root_id(root),
+        root_id: folder_id(root),
         ..Walked::default()
     };
     walk_into(root, "", &mut walked, stop)?;

@@ -15,15 +15,15 @@ use souvlaki::{
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
 
-use super::{Key, Keys};
+use crate::media_session::{Key, Keys};
 
 /// souvlaki's controls, registered with the system.
-pub(super) struct Controls(MediaControls);
+pub(crate) struct Controls(MediaControls);
 
 impl Controls {
     /// Registers with the system, with each key it delivers passed to
     /// `keys`. macOS needs no runtime of ours.
-    pub(super) fn open(keys: Keys, _: &Handle) -> Option<Self> {
+    pub(crate) fn open(keys: Keys, _: &Handle) -> Option<Self> {
         let config = PlatformConfig {
             display_name: "Ritornel",
             dbus_name: "ritornel",
@@ -50,7 +50,7 @@ impl Controls {
     }
 
     /// Shows the track the player is on, with its cover.
-    pub(super) fn set_track(&mut self, state: &PlayerState, cover: Option<&str>) {
+    pub(crate) fn set_track(&mut self, state: &PlayerState, cover: Option<&str>) {
         let track = state.current.as_ref().and_then(|now| now.track.as_ref());
         let metadata = MediaMetadata {
             title: track.and_then(|track| track.title.as_deref()),
@@ -66,7 +66,7 @@ impl Controls {
 
     /// Shows the status with the position, from which macOS decides who
     /// has the keys.
-    pub(super) fn set_state(&mut self, state: &PlayerState) {
+    pub(crate) fn set_state(&mut self, state: &PlayerState) {
         let progress = Some(MediaPosition(millis(state.position_ms)));
         let playback = match state.status {
             Status::Playing => MediaPlayback::Playing { progress },

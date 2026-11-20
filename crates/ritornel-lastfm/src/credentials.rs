@@ -58,7 +58,7 @@ impl ApiCredentials {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("cannot read {}: {}", path.display(), error.kind())),
         };
-        if !private(&path) {
+        if !crate::platform::private(&path) {
             return Err(format!(
                 "{} can be read by other users; make it readable by its owner alone \
                  (chmod 600) and start the server again",
@@ -94,32 +94,18 @@ impl ApiCredentials {
     }
 }
 
-/// Whether only the file's owner may read or write it.
-#[cfg(unix)]
-fn private(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o077 == 0)
-}
-
-/// Whether only the file's owner may read or write it. Nothing to check
-/// where there are no Unix modes.
-#[cfg(not(unix))]
-fn private(_path: &Path) -> bool {
-    true
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn dir() -> std::path::PathBuf {
+    /// A folder of its own for each test, even for two that start at the
+    /// same instant in parallel.
+    pub(crate) fn dir() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "ritornel-lastfm-credentials-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -137,15 +123,7 @@ mod tests {
             "# Last.fm\nSCROBL_API_KEY=SENTINEL_KEY\nexport SCROBL_API_SECRET=\"SENTINEL_SECRET\"\n",
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            let refused = ApiCredentials::find(none, &dir).unwrap_err();
-            assert!(refused.contains("chmod 600"), "{refused}");
-            assert!(!refused.contains("SENTINEL"), "{refused}");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        crate::platform::close_to_others(&path);
         let found = ApiCredentials::find(none, &dir).unwrap().unwrap();
         let (key, secret) = found.clone().into_parts();
         assert_eq!(

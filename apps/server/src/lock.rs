@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use ritornel_contract::local;
 
-use crate::Error;
 use crate::error::io_error;
+use crate::{Error, platform};
 
 /// How long a starting server goes on trying for the lock while all that is
 /// in its way is clients looking at it. A look lasts microseconds, so this
@@ -49,19 +49,17 @@ impl DirLock {
     pub(crate) fn acquire(dir: &Path, path: &Path) -> Result<Self, Error> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
-        // On Windows the data directory's own access list closes it.
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        platform::create_owner_only(&mut options);
         let mut file = options.open(path).map_err(io_error("open", path))?;
         let started = Instant::now();
         loop {
-            if take(&file).map_err(io_error("lock", path))? {
+            if platform::take_lock(&file).map_err(io_error("lock", path))? {
                 break;
             }
             // Something has it. A server has it to itself, and shares it
             // with nobody. If it can be shared, there is no server, only
             // clients looking.
-            if !shareable(&file).map_err(io_error("lock", path))? {
+            if !platform::lock_shareable(&file).map_err(io_error("lock", path))? {
                 return Err(Error::InUse {
                     dir: dir.to_owned(),
                     pid: holder(&mut file),
@@ -86,42 +84,6 @@ impl DirLock {
             .map_err(io_error("write", path))?;
         Ok(Self { _file: file })
     }
-}
-
-/// Tries to take the lock as a server holds it, without waiting.
-#[cfg(unix)]
-fn take(file: &File) -> std::io::Result<bool> {
-    match file.try_lock() {
-        Ok(()) => Ok(true),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-        Err(std::fs::TryLockError::Error(source)) => Err(source),
-    }
-}
-
-/// Whether the lock can be had shared: nothing but clients looking has it.
-/// It is let go at once.
-#[cfg(unix)]
-fn shareable(file: &File) -> std::io::Result<bool> {
-    match file.try_lock_shared() {
-        Ok(()) => file.unlock().map(|()| true),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
-        Err(std::fs::TryLockError::Error(source)) => Err(source),
-    }
-}
-
-#[cfg(windows)]
-fn take(file: &File) -> std::io::Result<bool> {
-    use ritornel_windows::lock::{Hold, try_lock};
-    try_lock(file, local::WINDOWS_LOCK_BYTE, 1, Hold::Exclusive)
-}
-
-#[cfg(windows)]
-fn shareable(file: &File) -> std::io::Result<bool> {
-    use ritornel_windows::lock::{Hold, try_lock, unlock};
-    if !try_lock(file, local::WINDOWS_LOCK_BYTE, 1, Hold::Shared)? {
-        return Ok(false);
-    }
-    unlock(file, local::WINDOWS_LOCK_BYTE, 1).map(|()| true)
 }
 
 /// The pid the holder wrote. It is missing for the instant between a server

@@ -51,6 +51,7 @@ pub mod local;
 mod media;
 pub mod methods;
 mod pages;
+mod platform;
 mod playback;
 mod rating;
 mod search;
