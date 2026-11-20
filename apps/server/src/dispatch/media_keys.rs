@@ -23,7 +23,6 @@ impl Core {
     }
 
     /// Takes the media session off the system, if the server has one.
-    #[cfg(target_os = "linux")]
     pub(crate) fn stop_media_session(&self) {
         if let Some(session) = self.media_session.get() {
             session.stop();

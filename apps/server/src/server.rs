@@ -230,19 +230,16 @@ impl Server {
         &self.core
     }
 
-    /// Starts the system's media session, for a server with a player.
-    /// Only `serve` does, on the main thread that then runs the loop the
-    /// session needs on macOS; a server in a test has none. MPRIS on
-    /// Linux is served from `runtime`.
-    #[cfg(all(
-        feature = "media-session",
-        any(target_os = "macos", target_os = "linux")
-    ))]
+    /// Starts the system's media session, for a server with a player on a
+    /// system that has one. Only `serve` does, on the main thread that then
+    /// runs the loop the session needs on macOS; a server in a test has
+    /// none. MPRIS on Linux is served from `runtime`.
+    #[cfg(feature = "media-session")]
     pub(crate) fn start_media_session(
         &self,
         runtime: &tokio::runtime::Handle,
     ) -> Result<(), Error> {
-        if self.core.has_player() {
+        if self.core.has_player() && crate::platform::HAS_MEDIA_SESSION {
             let session = crate::media_session::MediaSession::start(
                 Arc::downgrade(&self.core),
                 runtime.clone(),
@@ -291,12 +288,12 @@ impl Server {
         tokio::task::spawn_blocking(move || playback.stop())
             .await
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
-        // MPRIS leaves the session bus while the runtime that serves it
-        // still runs. On macOS the session's thread is left to end by
-        // itself, as souvlaki may need the main run loop, which has
-        // stopped by now.
-        #[cfg(all(feature = "media-session", target_os = "linux"))]
-        {
+        // A media session served from the runtime (MPRIS) leaves the
+        // session bus while the runtime still runs. Elsewhere (a Mac) the
+        // session's thread is left to end by itself, as souvlaki may need
+        // the main run loop, which has stopped by now.
+        #[cfg(feature = "media-session")]
+        if crate::platform::MEDIA_SESSION_ON_RUNTIME {
             let core = Arc::clone(&self.core);
             tokio::task::spawn_blocking(move || core.stop_media_session())
                 .await

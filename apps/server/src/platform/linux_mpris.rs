@@ -21,7 +21,7 @@ use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::object_server::SignalEmitter;
 use zbus::{Connection, ObjectPath, Variant, interface};
 
-use super::{Key, Keys};
+use crate::media_session::{Key, Keys};
 
 /// The object every MPRIS player serves its interfaces at.
 const PATH: &str = "/org/mpris/MediaPlayer2";
@@ -44,7 +44,7 @@ const CONNECT_WITHIN: Duration = Duration::from_secs(3);
 
 /// The connection that serves the player. Dropping it takes the player off
 /// the bus.
-pub(super) struct Controls {
+pub(crate) struct Controls {
     connection: Connection,
     runtime: Handle,
     /// The cover of the track the player is on, as a file URL.
@@ -55,7 +55,7 @@ impl Controls {
     /// Connects to the session bus and serves the player there. `None`,
     /// logged at debug, when there is no session bus or it does not
     /// answer within [`CONNECT_WITHIN`].
-    pub(super) fn open(keys: Keys, runtime: &Handle) -> Option<Self> {
+    pub(crate) fn open(keys: Keys, runtime: &Handle) -> Option<Self> {
         Self::open_on(
             zbus::connection::Builder::session(),
             keys,
@@ -106,12 +106,12 @@ impl Controls {
 
     /// Takes the cover of the track the player is now on. The state that
     /// comes with it shows the track.
-    pub(super) fn set_track(&mut self, _: &PlayerState, cover: Option<&str>) {
+    pub(crate) fn set_track(&mut self, _: &PlayerState, cover: Option<&str>) {
         self.art_url = cover.map(str::to_owned);
     }
 
     /// Shows the track, the status, the position and the volume.
-    pub(super) fn set_state(&mut self, state: &PlayerState) {
+    pub(crate) fn set_state(&mut self, state: &PlayerState) {
         self.update(Shown::of(state, self.art_url.clone()));
     }
 

@@ -19,7 +19,7 @@
 //! `credential`, are the contract's (`ritornel_contract::local`): a local client reads
 //! what the server writes here.
 
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +27,7 @@ use ritornel_contract::local;
 
 use crate::error::io_error;
 use crate::lock::DirLock;
+use crate::platform::{close_to_others, create_owner_only, create_private_dir};
 use crate::{Env, Error, server_json};
 
 /// Where the data directory is: `--data-dir`, then `RITORNEL_DATA_DIR`, then
@@ -38,62 +39,6 @@ use crate::{Env, Error, server_json};
 pub(crate) fn resolve(flag: Option<&Path>, env: Env<'_>) -> Result<PathBuf, Error> {
     let chosen = local::data_dir(flag, env).ok_or(Error::NoDataDir)?;
     std::path::absolute(&chosen).map_err(io_error("resolve", &chosen))
-}
-
-/// The mode of a file that only its owner may read or write.
-#[cfg(unix)]
-const OWNER_ONLY: u32 = 0o600;
-
-/// Creates the folder at `path`, and those above it that are missing, so
-/// that only the OS user can open what it creates: mode `0700` on Unix,
-/// and on Windows an access list of that user alone, which what is later
-/// made inside it inherits. A folder that is there already is left as it is.
-fn create_private_dir(path: &Path) -> Result<(), Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .map_err(io_error("create", path))
-    }
-    #[cfg(windows)]
-    {
-        if path.is_dir() {
-            return Ok(());
-        }
-        // The highest folder this call makes is closed, and those it makes
-        // inside it inherit that.
-        let mut highest = path;
-        while let Some(parent) = highest
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            if parent.exists() {
-                break;
-            }
-            highest = parent;
-        }
-        DirBuilder::new()
-            .recursive(true)
-            .create(path)
-            .map_err(io_error("create", path))?;
-        ritornel_windows::private::restrict(highest).map_err(io_error("close", highest))
-    }
-}
-
-/// Closes the file at `path` to everyone but the OS user.
-fn close(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(OWNER_ONLY))
-    }
-    #[cfg(windows)]
-    {
-        ritornel_windows::private::restrict(path)
-    }
 }
 
 /// A data directory that exists.
@@ -179,17 +124,16 @@ impl DataDir {
 fn close_database(database: &Path) -> Result<(), Error> {
     let mut options = OpenOptions::new();
     options.append(true).create(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, OWNER_ONLY);
+    create_owner_only(&mut options);
     options
         .open(database)
-        .and_then(|_| close(database))
+        .and_then(|_| close_to_others(database))
         .map_err(io_error("create", database))?;
     for suffix in ["-wal", "-shm"] {
         let mut sidecar = database.to_owned().into_os_string();
         sidecar.push(suffix);
         let sidecar = PathBuf::from(sidecar);
-        match close(&sidecar) {
+        match close_to_others(&sidecar) {
             Err(error) if error.kind() != ErrorKind::NotFound => {
                 return Err(io_error("close", &sidecar)(error));
             }
@@ -240,7 +184,8 @@ impl HeldDir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Scratch, env, open_to_others, private};
+    use crate::platform::{open_to_others, path_is_private as private};
+    use crate::testing::{Scratch, env};
 
     #[test]
     fn the_flag_wins_then_the_variable_then_the_default() {
@@ -292,13 +237,6 @@ mod tests {
         assert!(private(&root));
         assert!(private(&dir.logs()));
         assert!(private(&dir.server_db()));
-        #[cfg(unix)]
-        {
-            use crate::testing::mode;
-            assert_eq!(mode(&root), 0o700);
-            assert_eq!(mode(&dir.logs()), 0o700);
-            assert_eq!(mode(&dir.server_db()), 0o600);
-        }
     }
 
     #[test]

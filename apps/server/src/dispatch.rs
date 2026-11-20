@@ -38,7 +38,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::credential::Verifier;
 use crate::data_dir::DataDir;
-use crate::disk;
 use crate::media::{CoverPool, MediaTokens};
 use crate::session::Session;
 use crate::transport::{self, Wire};
@@ -50,10 +49,7 @@ mod churn;
 mod history;
 mod lastfm;
 mod lists;
-#[cfg(all(
-    feature = "media-session",
-    any(target_os = "macos", target_os = "linux")
-))]
+#[cfg(feature = "media-session")]
 mod media_keys;
 mod pages;
 mod playback;
@@ -135,10 +131,7 @@ pub(crate) struct Core {
     /// Watching the hub's folders, once the server has started.
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// The system's media session, once `serve` has started one.
-    #[cfg(all(
-        feature = "media-session",
-        any(target_os = "macos", target_os = "linux")
-    ))]
+    #[cfg(feature = "media-session")]
     media_session: std::sync::OnceLock<crate::media_session::MediaSession>,
 }
 
@@ -229,10 +222,7 @@ impl Core {
             deliveries: crate::playback::Wake::default(),
             lastfm: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
-            #[cfg(all(
-                feature = "media-session",
-                any(target_os = "macos", target_os = "linux")
-            ))]
+            #[cfg(feature = "media-session")]
             media_session: std::sync::OnceLock::new(),
         })
     }
@@ -803,7 +793,7 @@ impl Core {
             },
             library,
             free_disk: FreeDisk {
-                data_bytes: disk::free_bytes(self.dir.root()),
+                data_bytes: crate::platform::free_bytes(self.dir.root()),
             },
             log_path: self.dir.logs().to_string_lossy().into_owned(),
             watch: Some(watch),
@@ -1313,7 +1303,7 @@ mod tests {
 
         // The library is a file only the OS user can read.
         let library_db = scratch.path().join("data/library.db");
-        assert!(crate::testing::private(&library_db));
+        assert!(crate::platform::path_is_private(&library_db));
     }
 
     #[test]

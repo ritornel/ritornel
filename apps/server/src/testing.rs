@@ -45,45 +45,6 @@ pub(crate) fn env(variables: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsStrin
     }
 }
 
-/// The permission bits of a file or directory.
-#[cfg(unix)]
-pub(crate) fn mode(path: &Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
-}
-
-/// Whether only the owner can open a file or directory: what the modes
-/// `0600` and `0700` are on Unix.
-pub(crate) fn private(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        mode(path) & 0o077 == 0
-    }
-    #[cfg(windows)]
-    {
-        ritornel_windows::private::path_is_private(path).unwrap()
-    }
-}
-
-/// Opens a file to other users, as a copy that did not keep its mode or
-/// access list might be.
-pub(crate) fn open_to_others(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    }
-    #[cfg(windows)]
-    {
-        let done = std::process::Command::new("icacls")
-            .arg(path)
-            .args(["/grant", "*S-1-1-0:(R)"])
-            .output()
-            .unwrap();
-        assert!(done.status.success(), "{done:?}");
-    }
-}
-
 /// A clock a test sets.
 #[derive(Debug)]
 pub(crate) struct SetClock(std::sync::atomic::AtomicI64);

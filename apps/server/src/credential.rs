@@ -18,42 +18,8 @@ use ritornel_contract::Id;
 use ritornel_engine::{ServerStore, SessionToken};
 use subtle::ConstantTimeEq;
 
-use crate::Error;
 use crate::error::io_error;
-
-/// Whether nobody but the OS user (and on Windows the system and the
-/// administrators, who can take any file) may open the file: on Unix no
-/// permission bit for the group or others, on Windows no entry in its
-/// access list for anyone else.
-fn private(file: &File) -> std::io::Result<bool> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        Ok(file.metadata()?.permissions().mode() & 0o077 == 0)
-    }
-    #[cfg(windows)]
-    {
-        ritornel_windows::private::is_private(file)
-    }
-}
-
-/// Creates a new file at `path` that only the OS user can open, from
-/// before anything is written to it. It fails if something is there.
-fn create_private(path: &Path) -> std::io::Result<File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-    }
-    #[cfg(windows)]
-    {
-        ritornel_windows::private::create_restricted(path)
-    }
-}
+use crate::{Error, platform};
 
 /// What [`ensure`] found and did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +115,7 @@ fn read(path: &Path) -> Result<Option<SessionToken>, Error> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error("read", path)(error)),
     };
-    if !private(&file).map_err(io_error("read", path))? {
+    if !platform::is_private(&file).map_err(io_error("read", path))? {
         return Ok(None);
     }
     let mut bytes = Vec::new();
@@ -170,7 +136,7 @@ fn write(path: &Path, token: &SessionToken) -> Result<(), Error> {
         }
         _ => {}
     }
-    create_private(&temporary)
+    platform::create_private_file(&temporary)
         .and_then(|mut file| {
             writeln!(file, "{}", token.expose())?;
             file.sync_all()
@@ -186,7 +152,8 @@ mod tests {
     use ritornel_engine::{OsEntropy, SystemClock};
 
     use super::*;
-    use crate::testing::{Scratch, open_to_others, private};
+    use crate::platform::{open_to_others, path_is_private as private};
+    use crate::testing::Scratch;
 
     fn store() -> ServerStore {
         ServerStore::open_in_memory(Arc::new(SystemClock), Arc::new(OsEntropy)).unwrap()
