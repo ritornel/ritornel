@@ -12,6 +12,7 @@
 //!   runtime ([`mpris`]). A server with no session bus has none, quietly.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError, Weak, mpsc};
 use std::thread::JoinHandle;
@@ -43,8 +44,17 @@ pub(crate) enum Key {
     Pause,
     Next,
     Previous,
-    /// To this position, in milliseconds.
+    /// To this position, in milliseconds, in whichever entry the player is
+    /// on. Only macOS's seeks name no entry.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Seek(u64),
+    /// To this position, in milliseconds, in this entry only: nothing if
+    /// the player has moved on from it. Only MPRIS names the entry.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    SeekIn {
+        entry: Id,
+        position_ms: u64,
+    },
     /// The player's own volume, 0 to 1. Only MPRIS sets it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Volume(f64),
@@ -65,6 +75,9 @@ enum Message {
 #[derive(Debug)]
 pub(crate) struct MediaSession {
     send: Sender<Message>,
+    /// Set as the session stops, so that the thread does not work through
+    /// what is queued before the stop, opening the controls again.
+    stopping: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -76,11 +89,14 @@ impl MediaSession {
     pub(crate) fn start(core: Weak<Core>, runtime: Handle) -> std::io::Result<Self> {
         let (send, receive) = mpsc::channel();
         let keys = send.clone();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopping);
         let thread = std::thread::Builder::new()
             .name("ritornel-media-session".to_owned())
-            .spawn(move || run(&core, &receive, &keys, &runtime))?;
+            .spawn(move || run(&core, &receive, &keys, &runtime, &stop))?;
         Ok(Self {
             send,
+            stopping,
             thread: Mutex::new(Some(thread)),
         })
     }
@@ -92,9 +108,11 @@ impl MediaSession {
 
     /// Stops the thread and waits for it, which takes the player off the
     /// session bus. The server does this while its runtime still runs,
-    /// on Linux only (`Server::stop`).
+    /// on Linux only (`Server::stop`). The wait is at most one attempt to
+    /// connect, which is bounded.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
         let _ = self.send.send(Message::Stop);
         let thread = self
             .thread
@@ -109,15 +127,25 @@ impl MediaSession {
 
 impl Drop for MediaSession {
     fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         let _ = self.send.send(Message::Stop);
     }
 }
 
-fn run(core: &Weak<Core>, receive: &Receiver<Message>, keys: &Sender<Message>, runtime: &Handle) {
+fn run(
+    core: &Weak<Core>,
+    receive: &Receiver<Message>,
+    keys: &Sender<Message>,
+    runtime: &Handle,
+    stopping: &AtomicBool,
+) {
     let mut controls: Option<Controls> = None;
     // The entry and track shown, so the metadata is sent once a track.
     let mut shown: Option<(Id, Option<Id>)> = None;
     while let Ok(message) = receive.recv() {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
         match message {
             Message::Stop => break,
             Message::Key(key) => {

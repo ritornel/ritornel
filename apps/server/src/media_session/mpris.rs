@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use ritornel_engine::Id;
 use ritornel_engine::playback::{PlayerState, Status};
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -32,9 +33,14 @@ const NAME: &str = "org.mpris.MediaPlayer2.ritornel";
 /// The track ID MPRIS reserves for no track.
 const NO_TRACK: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
 
-/// How far the position may move other than by playing before MPRIS is
-/// told it was sought.
+/// How far the position may drift from where playing would have taken it
+/// before MPRIS is told it was sought. A seek asked for is told however
+/// small.
 const SEEKED_AFTER: Duration = Duration::from_secs(1);
+
+/// How long the session bus has to let the player in and give it its name.
+/// A bus that takes the connection and never answers is no bus.
+const CONNECT_WITHIN: Duration = Duration::from_secs(3);
 
 /// The connection that serves the player. Dropping it takes the player off
 /// the bus.
@@ -47,25 +53,52 @@ pub(super) struct Controls {
 
 impl Controls {
     /// Connects to the session bus and serves the player there. `None`,
-    /// logged at debug, when there is no session bus.
+    /// logged at debug, when there is no session bus or it does not
+    /// answer within [`CONNECT_WITHIN`].
     pub(super) fn open(keys: Keys, runtime: &Handle) -> Option<Self> {
-        let connection = match runtime.block_on(connect(keys)) {
-            Ok(connection) => connection,
-            Err(error) => {
-                debug!(%error, "no session bus, so no MPRIS");
-                return None;
-            }
-        };
+        Self::open_on(
+            zbus::connection::Builder::session(),
+            keys,
+            runtime,
+            CONNECT_WITHIN,
+        )
+    }
+
+    fn open_on(
+        bus: zbus::connection::Builder<'static>,
+        keys: Keys,
+        runtime: &Handle,
+        within: Duration,
+    ) -> Option<Self> {
         let runtime = runtime.clone();
-        match runtime.block_on(take_name(&connection)) {
-            Ok(name) => debug!(name, "MPRIS is on the session bus"),
-            Err(error) => {
-                warn!(%error, "MPRIS could not take a name on the session bus");
-                return None;
+        let opened = runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + within;
+            let connection = match tokio::time::timeout_at(deadline, connect(bus, keys)).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error)) => {
+                    debug!(%error, "no session bus, so no MPRIS");
+                    return None;
+                }
+                Err(_) => {
+                    debug!(?within, "the session bus did not answer, so no MPRIS");
+                    return None;
+                }
+            };
+            match tokio::time::timeout_at(deadline, take_name(&connection)).await {
+                Ok(Ok(name)) => debug!(name, "MPRIS is on the session bus"),
+                Ok(Err(error)) => {
+                    warn!(%error, "MPRIS could not take a name on the session bus");
+                    return None;
+                }
+                Err(_) => {
+                    debug!(?within, "the session bus did not answer, so no MPRIS");
+                    return None;
+                }
             }
-        }
+            Some(connection)
+        })?;
         Some(Self {
-            connection,
+            connection: opened,
             runtime,
             art_url: None,
         })
@@ -128,8 +161,8 @@ impl Controls {
     }
 }
 
-async fn connect(keys: Keys) -> zbus::Result<Connection> {
-    let connection = zbus::connection::Builder::session().build().await?;
+async fn connect(bus: zbus::connection::Builder<'static>, keys: Keys) -> zbus::Result<Connection> {
+    let connection = bus.build().await?;
     let server = connection.object_server();
     server.at(PATH, Root).await?;
     server
@@ -169,6 +202,8 @@ fn instance_name(pid: u32) -> String {
 #[derive(Debug, Clone, PartialEq)]
 struct Shown {
     status: Status,
+    /// The entry the player is on.
+    entry: Option<Id>,
     /// The entry's track ID, an object path.
     track_id: String,
     title: Option<String>,
@@ -180,12 +215,15 @@ struct Shown {
     /// Where the player was, in microseconds, when this was shown.
     position: i64,
     volume: f64,
+    /// The player's count of the seeks asked for.
+    seeks: u64,
 }
 
 impl Default for Shown {
     fn default() -> Self {
         Self {
             status: Status::Stopped,
+            entry: None,
             track_id: NO_TRACK.to_owned(),
             title: None,
             album: None,
@@ -194,6 +232,7 @@ impl Default for Shown {
             length: None,
             position: 0,
             volume: 1.0,
+            seeks: 0,
         }
     }
 }
@@ -217,6 +256,7 @@ impl Shown {
         let track = now.and_then(|now| now.track.as_ref());
         Self {
             status: state.status,
+            entry: now.map(|now| now.entry_id),
             track_id: now.map_or_else(|| NO_TRACK.to_owned(), |now| track_id(&now.entry_id)),
             title: track.and_then(|track| track.title.clone()),
             album: track.and_then(|track| track.album.clone()),
@@ -225,6 +265,7 @@ impl Shown {
             length: state.duration_ms.map(micros),
             position: micros(state.position_ms.max(0)),
             volume: if state.muted { 0.0 } else { state.volume },
+            seeks: state.seeks,
         }
     }
 
@@ -295,13 +336,24 @@ fn track_id(entry: &impl std::fmt::Display) -> String {
 }
 
 /// The position to announce with `Seeked`, when the player is still on the
-/// same track and is not where playing would have taken it.
+/// same track and was asked to seek, by any client, or is not where
+/// playing would have taken it.
 fn sought(before: &Shown, expected: i64, now: &Shown) -> Option<i64> {
-    let moved = now.position.abs_diff(expected);
-    (now.has_track()
-        && now.track_id == before.track_id
-        && moved > u64::try_from(SEEKED_AFTER.as_micros()).unwrap_or(u64::MAX))
-    .then_some(now.position)
+    let asked = now.seeks != before.seeks;
+    let drifted = now.position.abs_diff(expected)
+        > u64::try_from(SEEKED_AFTER.as_micros()).unwrap_or(u64::MAX);
+    (now.has_track() && now.track_id == before.track_id && (asked || drifted))
+        .then_some(now.position)
+}
+
+/// A seek to `position`, in microseconds, in the entry shown, which the
+/// player ignores if it has moved on from that entry by the time it
+/// carries the key out.
+fn seek_in(shown: &Shown, position: i64) -> Option<Key> {
+    Some(Key::SeekIn {
+        entry: shown.entry?,
+        position_ms: u64::try_from(position / 1000).unwrap_or(0),
+    })
 }
 
 /// What `Seek` asks for: an offset from where the player is now. Past the
@@ -315,15 +367,18 @@ fn seek_by(shown: &Shown, now: i64, offset: i64) -> Option<Key> {
     if shown.length.is_some_and(|length| to > length) {
         return Some(Key::Next);
     }
-    Some(Key::Seek(u64::try_from(to / 1000).unwrap_or(0)))
+    seek_in(shown, to)
 }
 
 /// What `SetPosition` asks for: a position in the track it names, which
 /// is ignored if that is no longer the track or the position is outside it.
 fn set_position(shown: &Shown, track: &str, position: i64) -> Option<Key> {
     let inside = position >= 0 && shown.length.is_none_or(|length| position <= length);
-    (shown.can_seek() && track == shown.track_id && inside)
-        .then(|| Key::Seek(u64::try_from(position / 1000).unwrap_or(0)))
+    if shown.can_seek() && track == shown.track_id && inside {
+        seek_in(shown, position)
+    } else {
+        None
+    }
 }
 
 /// `org.mpris.MediaPlayer2`: the application. The server has no window to
@@ -549,6 +604,7 @@ mod tests {
             output: ("null".to_owned(), 48_000, 2),
             volume: 0.5,
             muted: false,
+            seeks: 0,
         }
     }
 
@@ -628,6 +684,19 @@ mod tests {
     }
 
     #[test]
+    fn a_seek_asked_for_is_told_however_small() {
+        let before = Shown::of(&state(Status::Playing, 10_000), None);
+        let mut half_a_second = state(Status::Playing, 10_500);
+        half_a_second.seeks = 1;
+        let after = Shown::of(&half_a_second, None);
+        assert_eq!(sought(&before, 10_000_000, &after), Some(10_500_000));
+        // The same state shown again, after a pause, is no new seek.
+        let mut paused = half_a_second.clone();
+        paused.status = Status::Paused;
+        assert_eq!(sought(&after, 10_500_000, &Shown::of(&paused, None)), None);
+    }
+
+    #[test]
     fn a_jump_on_the_same_track_is_a_seek_and_playing_on_is_not() {
         let before = Shown::of(&state(Status::Playing, 10_000), None);
         let played_on = Shown::of(&state(Status::Playing, 12_100), None);
@@ -644,15 +713,20 @@ mod tests {
     #[test]
     fn seek_and_set_position_become_the_players_seek() {
         let shown = Shown::of(&state(Status::Playing, 10_000), None);
-        assert_eq!(
-            seek_by(&shown, 10_000_000, 5_000_000),
-            Some(Key::Seek(15_000))
-        );
-        assert_eq!(seek_by(&shown, 10_000_000, -60_000_000), Some(Key::Seek(0)));
+        let seek = |position_ms| {
+            Some(Key::SeekIn {
+                entry: id(1),
+                position_ms,
+            })
+        };
+        assert_eq!(seek_by(&shown, 10_000_000, 5_000_000), seek(15_000));
+        assert_eq!(seek_by(&shown, 10_000_000, -60_000_000), seek(0));
         assert_eq!(seek_by(&shown, 10_000_000, 500_000_000), Some(Key::Next));
+        // The seek names the entry it was asked of, so that it lands
+        // nowhere if a next goes before it.
         assert_eq!(
             set_position(&shown, &shown.track_id, 42_000_000),
-            Some(Key::Seek(42_000))
+            seek(42_000)
         );
         assert_eq!(
             set_position(&shown, "/dev/ritornel/entry/other", 42_000_000),
@@ -660,6 +734,37 @@ mod tests {
         );
         assert_eq!(set_position(&shown, &shown.track_id, -1), None);
         assert_eq!(set_position(&shown, &shown.track_id, 300_000_000), None);
+    }
+
+    /// A bus that takes the connection and never answers is given up on,
+    /// so that neither a play nor the server's stop waits on it for ever.
+    #[test]
+    fn a_bus_that_never_answers_is_no_bus() {
+        let dir = std::env::temp_dir().join(format!("ritornel-mpris-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("bus");
+        let _ = std::fs::remove_file(&socket);
+        // Listening, it takes each connection into its backlog, and never
+        // answers.
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // As the server's: a handle drives a current-thread runtime's
+        // timers and sockets only while it is run elsewhere.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let address = format!("unix:path={}", socket.display());
+        let bus = zbus::connection::Builder::address(address.as_str());
+        let keys: Keys = std::sync::Arc::new(|_| {});
+        let started = Instant::now();
+        let opened = Controls::open_on(bus, keys, runtime.handle(), Duration::from_millis(200));
+        assert!(opened.is_none());
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(200), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

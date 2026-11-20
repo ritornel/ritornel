@@ -483,14 +483,18 @@ mod systemd {
         text.replace('%', "%%")
     }
 
-    /// One word of an `ExecStart=` line, quoted: a path may hold spaces,
-    /// quotes, `$` (a variable there) and `%`.
-    fn exec_word(text: &str) -> String {
-        let escaped = specifiers(text)
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('$', "$$");
+    /// The program of an `ExecStart=` line, quoted: a path may hold
+    /// spaces, quotes and `%`. systemd takes the program before it expands
+    /// variables, so a `$` in it stays as it is.
+    fn exec_program(text: &str) -> String {
+        let escaped = specifiers(text).replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{escaped}\"")
+    }
+
+    /// An argument of an `ExecStart=` line, quoted as the program is, and
+    /// with `$`, which would start a variable, doubled.
+    fn exec_argument(text: &str) -> String {
+        exec_program(text).replace('$', "$$")
     }
 
     /// The user unit that runs `program serve --data-dir <data_dir>`.
@@ -501,8 +505,8 @@ mod systemd {
     /// output and error, which hold only the ready line and a failed
     /// start's reason, go to `service.log` beside the server's own log.
     pub(super) fn unit(program: &Path, data_dir: &Path) -> String {
-        let program = exec_word(&program.display().to_string());
-        let data = exec_word(&data_dir.display().to_string());
+        let program = exec_program(&program.display().to_string());
+        let data = exec_argument(&data_dir.display().to_string());
         let log = specifiers(&data_dir.join("logs/service.log").display().to_string());
         format!(
             "[Unit]
@@ -553,19 +557,21 @@ WantedBy=default.target
     }
 
     /// Reads what `systemctl show --property=LoadState,ActiveState,MainPID`
-    /// prints.
-    pub(super) fn shown(printed: &str) -> Shown {
+    /// prints: `None` if it says no load state, which it says of every
+    /// unit, one it has no file for included.
+    pub(super) fn shown(printed: &str) -> Option<Shown> {
         let value = |key: &str| {
             printed
                 .lines()
                 .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
-                .unwrap_or("")
         };
-        Shown {
-            loaded: value("LoadState") == "loaded",
-            active: value("ActiveState").to_owned(),
-            pid: value("MainPID").parse().ok().filter(|pid| *pid != 0),
-        }
+        Some(Shown {
+            loaded: value("LoadState").filter(|state| !state.is_empty())? == "loaded",
+            active: value("ActiveState").unwrap_or("").to_owned(),
+            pid: value("MainPID")
+                .and_then(|pid| pid.parse().ok())
+                .filter(|pid| *pid != 0),
+        })
     }
 
     /// Why systemctl failed, in its own words.
@@ -589,6 +595,45 @@ WantedBy=default.target
             .first()
             .map_or_else(String::new, |verb| verb.to_string_lossy().into_owned());
         Err(failed(&doing, &output))
+    }
+
+    /// What `service status` says of the unit, whose file is at `path`
+    /// and holds `installed` if it is there. A systemctl that cannot say
+    /// (no user manager, say) is an error, not a unit that is not there.
+    pub(super) fn status(
+        path: &Path,
+        installed: Option<&str>,
+        systemctl: Systemctl<'_>,
+    ) -> Result<String, Error> {
+        let printed = systemctl(&[
+            "show".as_ref(),
+            "--property=LoadState,ActiveState,MainPID".as_ref(),
+            UNIT.as_ref(),
+        ])?;
+        if !printed.status.success() {
+            return Err(failed("show", &printed));
+        }
+        let state = shown(&String::from_utf8_lossy(&printed.stdout))
+            .ok_or_else(|| Error::Service("systemctl show said nothing of the unit".to_owned()))?;
+        let mut lines = match installed {
+            Some(unit) => vec![
+                format!("Installed: {}", path.display()),
+                format!(
+                    "Data directory: {}",
+                    served_dir(unit).unwrap_or_else(|| "unknown".to_owned())
+                ),
+            ],
+            None => vec!["Not installed".to_owned()],
+        };
+        match (state.loaded, state.pid) {
+            (true, Some(pid)) => lines.push(format!("Running: pid {pid}")),
+            (true, None) => lines.push(format!("Registered, not running ({})", state.active)),
+            (false, _) if installed.is_some() => {
+                lines.push("Not registered with systemd".to_owned());
+            }
+            (false, _) => {}
+        }
+        Ok(lines.join("\n"))
     }
 
     /// Stops the unit, waiting for its server to stop as `systemctl stop`
@@ -638,7 +683,7 @@ WantedBy=default.target
         #[test]
         fn the_unit_runs_serve_on_the_directory_and_logs_beside_the_server() {
             let written = unit(
-                Path::new("/home/pat/.local/bin/ritornel-server"),
+                Path::new("/home/pat/$tools/100%/ritornel-server"),
                 Path::new("/home/pat/Music \"100%\" $HOME\\data"),
             );
             assert_eq!(
@@ -648,7 +693,7 @@ Description=Ritornel server
 
 [Service]
 Type=exec
-ExecStart=\"/home/pat/.local/bin/ritornel-server\" serve --data-dir \"/home/pat/Music \\\"100%%\\\" $$HOME\\\\data\"
+ExecStart=\"/home/pat/$tools/100%%/ritornel-server\" serve --data-dir \"/home/pat/Music \\\"100%%\\\" $$HOME\\\\data\"
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=15
@@ -671,21 +716,65 @@ WantedBy=default.target
             let running = "LoadState=loaded\nActiveState=active\nMainPID=4312\n";
             assert_eq!(
                 shown(running),
-                Shown {
+                Some(Shown {
                     loaded: true,
                     active: "active".to_owned(),
                     pid: Some(4312),
-                }
+                })
             );
             let absent = "MainPID=0\nLoadState=not-found\nActiveState=inactive\n";
             assert_eq!(
                 shown(absent),
-                Shown {
+                Some(Shown {
                     loaded: false,
                     active: "inactive".to_owned(),
                     pid: None,
-                }
+                })
             );
+            // Nothing is not a unit that is not there.
+            assert_eq!(shown(""), None);
+        }
+
+        fn printed(stdout: &str) -> Output {
+            Output {
+                stdout: stdout.as_bytes().to_vec(),
+                ..output(0, "")
+            }
+        }
+
+        #[test]
+        fn a_unit_systemd_has_no_file_for_is_not_registered() {
+            let file = UnitFile::new("status-absent");
+            let fake = Fake::new(vec![(
+                "show",
+                printed("LoadState=not-found\nActiveState=inactive\nMainPID=0\n"),
+            )]);
+            let said = status(&file.0, Some("[Unit]\n"), &|args| fake.run(args)).unwrap();
+            assert!(said.ends_with("Not registered with systemd"), "{said}");
+            let fake = Fake::new(vec![(
+                "show",
+                printed("LoadState=loaded\nActiveState=active\nMainPID=4312\n"),
+            )]);
+            let said = status(&file.0, Some("[Unit]\n"), &|args| fake.run(args)).unwrap();
+            assert!(said.ends_with("Running: pid 4312"), "{said}");
+        }
+
+        #[test]
+        fn a_status_systemctl_cannot_give_is_an_error() {
+            let file = UnitFile::new("status-failed");
+            let fake = Fake::new(vec![(
+                "show",
+                output(1, "Failed to connect to user scope bus via local transport"),
+            )]);
+            let failed = status(&file.0, Some("[Unit]\n"), &|args| fake.run(args)).unwrap_err();
+            assert_eq!(
+                failed.to_string(),
+                "the background service: systemctl show failed: Failed to connect to user scope \
+                 bus via local transport"
+            );
+            // Nor is a show that says nothing of the unit.
+            let fake = Fake::new(vec![("show", printed(""))]);
+            assert!(status(&file.0, None, &|args| fake.run(args)).is_err());
         }
 
         fn output(code: i32, stderr: &str) -> Output {
@@ -789,7 +878,7 @@ mod platform {
     use std::process::{Command, Output};
 
     use super::Action;
-    use super::systemd::{UNIT, must, served_dir, shown, stop, uninstall, unit};
+    use super::systemd::{UNIT, must, status, stop, uninstall, unit};
     use crate::data_dir::{self, DataDir};
     use crate::error::io_error;
     use crate::{Env, Error};
@@ -853,33 +942,8 @@ mod platform {
             }
             Action::Status => {
                 let installed = std::fs::read_to_string(&path).ok();
-                let printed = systemctl(&[
-                    "show".as_ref(),
-                    "--property=LoadState,ActiveState,MainPID".as_ref(),
-                    UNIT.as_ref(),
-                ])?;
-                let state = shown(&String::from_utf8_lossy(&printed.stdout));
-                let mut lines = match installed.as_deref() {
-                    Some(unit) => vec![
-                        format!("Installed: {}", path.display()),
-                        format!(
-                            "Data directory: {}",
-                            served_dir(unit).unwrap_or_else(|| "unknown".to_owned())
-                        ),
-                    ],
-                    None => vec!["Not installed".to_owned()],
-                };
-                match (state.loaded, state.pid) {
-                    (true, Some(pid)) => lines.push(format!("Running: pid {pid}")),
-                    (true, None) => {
-                        lines.push(format!("Registered, not running ({})", state.active))
-                    }
-                    (false, _) if installed.is_some() => {
-                        lines.push("Not registered with systemd".to_owned());
-                    }
-                    (false, _) => {}
-                }
-                writeln!(out, "{}", lines.join("\n")).map_err(Error::Output)
+                let said = status(&path, installed.as_deref(), &systemctl)?;
+                writeln!(out, "{said}").map_err(Error::Output)
             }
         }
     }

@@ -151,6 +151,9 @@ pub struct PlayerState {
     pub volume: f64,
     /// Whether it is muted.
     pub muted: bool,
+    /// Counts the jumps within an entry that were asked for: a seek, or a
+    /// previous that starts the track again. Not kept across a restart.
+    pub seeks: u64,
 }
 
 /// What a command answers with once it has been carried out.
@@ -307,6 +310,7 @@ pub struct Player {
     listener: Option<Id>,
     queue_revision: i64,
     revision: u64,
+    seeks: u64,
     failures_in_a_row: u32,
     last_progress_mono: i64,
     volume: f64,
@@ -410,6 +414,7 @@ impl Player {
             listener,
             queue_revision: session.queue_revision,
             revision: u64::try_from(session.state_revision).unwrap_or(0),
+            seeks: 0,
             failures_in_a_row: 0,
             last_progress_mono: mono,
             volume,
@@ -482,6 +487,7 @@ impl Player {
             ),
             volume: self.volume,
             muted: self.muted,
+            seeks: self.seeks,
         }
     }
 
@@ -1070,6 +1076,7 @@ impl Player {
         library: Option<&LibraryStore>,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
+        self.seeks += 1;
         let Some(loaded) = self.loaded.clone() else {
             self.position_ms = position_ms.max(0);
             return Ok(());

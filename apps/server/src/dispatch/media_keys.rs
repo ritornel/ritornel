@@ -39,7 +39,8 @@ impl Core {
 
     /// Carries out a media key. Play and pause name nothing, so a toggle
     /// becomes whichever the player's state asks for; the others act on
-    /// the entry the player is on.
+    /// the entry the player is on, but for a seek that names its own,
+    /// which the player ignores once it has moved on from it.
     pub(crate) fn media_key(&self, key: Key) {
         let done = self.with_stores(|stores| {
             let state = self.playback_get(stores)?;
@@ -73,7 +74,14 @@ impl Core {
                         },
                     },
                 ),
-                (Key::Seek(position_ms), Some(entry_id)) => self.playback_seek(
+                (Key::Seek(position_ms), Some(entry_id))
+                | (
+                    Key::SeekIn {
+                        entry: entry_id,
+                        position_ms,
+                    },
+                    _,
+                ) => self.playback_seek(
                     stores,
                     &PlaybackSeekParams {
                         idempotency_key,
