@@ -18,8 +18,9 @@ env:
 jobs:
   check:
     # The hub is Linux and the desktop is macOS, so both run everything they
-    # build. The desktop app is built on macOS alone, and the Linux job
-    # proves the hub builds with no desktop library installed.
+    # build. On Linux that includes the server's audio output, which links
+    # ALSA, so the job installs ALSA's development files; the hub job below
+    # proves the hub needs none. The desktop app is built on macOS alone.
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +40,9 @@ jobs:
       # Installs what mise.toml pins, and the Rust that rust-toolchain.toml
       # names.
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      # cpal's ALSA backend, for the server's audio output on Linux.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libasound2-dev
       # The steps are the tasks behind `mise run check`, one each so a
       # failure names itself.
       - run: mise run fmt
@@ -48,3 +52,21 @@ jobs:
       - run: mise run test
       - if: runner.os == 'macOS'
         run: mise run desktop:check
+
+  hub:
+    # The headless hub, as it is built for a Linux machine with no desktop:
+    # the server without its default features, so no audio output, media
+    # session or Last.fm. pkg-config is pointed at nothing, so any crate
+    # that would link a system library (ALSA among them) fails the build.
+    runs-on: blacksmith-2vcpu-ubuntu-2604
+    timeout-minutes: 30
+    env:
+      MISE_DISABLE_TOOLS: conda:ffmpeg,node,pnpm
+      PKG_CONFIG_LIBDIR: /nonexistent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - run: cargo clippy --locked --package ritornel-server --no-default-features --all-targets -- -D warnings
+      - run: cargo test --locked --package ritornel-server --no-default-features

@@ -2,38 +2,67 @@
 //! server process so they work with no window open. See decision 23 and
 //! "OS integration" in docs/design/playback.md, and spikes/now-playing.
 //!
-//! Only macOS has one in M1. A thread of its own owns souvlaki's controls:
-//! it shows the player's state, and passes each key on to the player by
-//! the path a contract call takes. The main thread blocks in the run loop,
-//! which is all macOS needs to deliver the keys ([`wait`]).
+//! A thread of its own owns the platform's controls: it shows the player's
+//! state, and passes each key on to the player by the path a contract call
+//! takes. The platform is behind [`Controls`]:
+//!
+//! - macOS: souvlaki's Now Playing. The main thread blocks in the run loop,
+//!   which is all macOS needs to deliver the keys ([`wait`]).
+//! - Linux: MPRIS on the session bus, served from the server's own async
+//!   runtime ([`mpris`]). A server with no session bus has none, quietly.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Weak, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError, Weak, mpsc};
+use std::thread::JoinHandle;
 
-use objc2_core_foundation::CFRunLoop;
 use ritornel_engine::Id;
 use ritornel_engine::playback::{PlayerState, Status};
-use souvlaki::{
-    MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
-};
-use tracing::{debug, warn};
+use tokio::runtime::Handle;
+use tracing::debug;
 
 use crate::dispatch::Core;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+mod mpris;
+
+#[cfg(target_os = "macos")]
+use self::macos::Controls;
+#[cfg(target_os = "macos")]
+pub(crate) use self::macos::wait;
+#[cfg(target_os = "linux")]
+use self::mpris::Controls;
+
 /// What a media key asks of the player.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Key {
     Toggle,
     Play,
     Pause,
     Next,
     Previous,
-    /// To this position, in milliseconds.
+    /// To this position, in milliseconds, in whichever entry the player is
+    /// on. Only macOS's seeks name no entry.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Seek(u64),
+    /// To this position, in milliseconds, in this entry only: nothing if
+    /// the player has moved on from it. Only MPRIS names the entry.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    SeekIn {
+        entry: Id,
+        position_ms: u64,
+    },
+    /// The player's own volume, 0 to 1. Only MPRIS sets it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Volume(f64),
 }
+
+/// Where the platform's controls send each key: back to the session's
+/// thread, which carries it out.
+type Keys = Arc<dyn Fn(Key) + Send + Sync>;
 
 enum Message {
     State(Box<PlayerState>),
@@ -41,42 +70,82 @@ enum Message {
     Stop,
 }
 
-/// The session's thread. Dropping it stops the thread.
+/// The session's thread. Dropping it, or [`stop`](Self::stop), stops the
+/// thread.
 #[derive(Debug)]
 pub(crate) struct MediaSession {
     send: Sender<Message>,
+    /// Set as the session stops, so that the thread does not work through
+    /// what is queued before the stop, opening the controls again.
+    stopping: Arc<AtomicBool>,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl MediaSession {
-    /// Starts the session for `core`. Nothing is shown to the system until
+    /// Starts the session for `core`, with `runtime` for a platform that
+    /// serves the session from it. Nothing is shown to the system until
     /// the player first plays, so a server restored paused leaves the keys
     /// with whatever played last, as macOS does for every player.
-    pub(crate) fn start(core: Weak<Core>) -> std::io::Result<Self> {
+    pub(crate) fn start(core: Weak<Core>, runtime: Handle) -> std::io::Result<Self> {
         let (send, receive) = mpsc::channel();
         let keys = send.clone();
-        std::thread::Builder::new()
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopping);
+        let thread = std::thread::Builder::new()
             .name("ritornel-media-session".to_owned())
-            .spawn(move || run(&core, &receive, &keys))?;
-        Ok(Self { send })
+            .spawn(move || run(&core, &receive, &keys, &runtime, &stop))?;
+        Ok(Self {
+            send,
+            stopping,
+            thread: Mutex::new(Some(thread)),
+        })
     }
 
     /// Shows the player's state.
     pub(crate) fn show(&self, state: &PlayerState) {
         let _ = self.send.send(Message::State(Box::new(state.clone())));
     }
+
+    /// Stops the thread and waits for it, which takes the player off the
+    /// session bus. The server does this while its runtime still runs,
+    /// on Linux only (`Server::stop`). The wait is at most one attempt to
+    /// connect, which is bounded.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        let _ = self.send.send(Message::Stop);
+        let thread = self
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Drop for MediaSession {
     fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
         let _ = self.send.send(Message::Stop);
     }
 }
 
-fn run(core: &Weak<Core>, receive: &Receiver<Message>, keys: &Sender<Message>) {
-    let mut controls: Option<MediaControls> = None;
+fn run(
+    core: &Weak<Core>,
+    receive: &Receiver<Message>,
+    keys: &Sender<Message>,
+    runtime: &Handle,
+    stopping: &AtomicBool,
+) {
+    let mut controls: Option<Controls> = None;
     // The entry and track shown, so the metadata is sent once a track.
     let mut shown: Option<(Id, Option<Id>)> = None;
     while let Ok(message) = receive.recv() {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
         match message {
             Message::Stop => break,
             Message::Key(key) => {
@@ -90,7 +159,11 @@ fn run(core: &Weak<Core>, receive: &Receiver<Message>, keys: &Sender<Message>) {
                     if state.status != Status::Playing {
                         continue;
                     }
-                    controls = open(keys.clone());
+                    let keys = keys.clone();
+                    let keys: Keys = Arc::new(move |key| {
+                        let _ = keys.send(Message::Key(key));
+                    });
+                    controls = Controls::open(keys, runtime);
                 }
                 if let Some(controls) = &mut controls {
                     show(core, controls, &state, &mut shown);
@@ -100,58 +173,11 @@ fn run(core: &Weak<Core>, receive: &Receiver<Message>, keys: &Sender<Message>) {
     }
 }
 
-/// Registers with the system, with each key it delivers passed back here.
-fn open(keys: Sender<Message>) -> Option<MediaControls> {
-    let config = PlatformConfig {
-        display_name: "Ritornel",
-        dbus_name: "ritornel",
-        hwnd: None,
-    };
-    let mut controls = match MediaControls::new(config) {
-        Ok(controls) => controls,
-        Err(error) => {
-            warn!(%error, "the media session could not be made");
-            return None;
-        }
-    };
-    // Handlers run on the main thread's run loop, so they only forward.
-    let attached = controls.attach(move |event| {
-        if let Some(key) = key_of(event) {
-            let _ = keys.send(Message::Key(key));
-        }
-    });
-    if let Err(error) = attached {
-        warn!(%error, "the media keys could not be taken");
-        return None;
-    }
-    debug!("the media session is open");
-    Some(controls)
-}
-
-fn key_of(event: MediaControlEvent) -> Option<Key> {
-    Some(match event {
-        MediaControlEvent::Toggle => Key::Toggle,
-        MediaControlEvent::Play => Key::Play,
-        MediaControlEvent::Pause | MediaControlEvent::Stop => Key::Pause,
-        MediaControlEvent::Next => Key::Next,
-        MediaControlEvent::Previous => Key::Previous,
-        MediaControlEvent::SetPosition(MediaPosition(at)) => {
-            Key::Seek(u64::try_from(at.as_millis()).unwrap_or(u64::MAX))
-        }
-        _ => return None,
-    })
-}
-
-fn millis(ms: i64) -> Duration {
-    Duration::from_millis(u64::try_from(ms).unwrap_or(0))
-}
-
-/// Sends the state: the track's metadata when the track has changed, and
-/// always the status with the position, from which macOS decides who has
-/// the keys.
+/// Sends the state: the track when it has changed, and always the status
+/// with the position, from which macOS decides who has the keys.
 fn show(
     core: &Weak<Core>,
-    controls: &mut MediaControls,
+    controls: &mut Controls,
     state: &PlayerState,
     shown: &mut Option<(Id, Option<Id>)>,
 ) {
@@ -159,30 +185,13 @@ fn show(
     let showing = now.map(|now| (now.entry_id, now.track.as_ref().map(|t| t.appearance)));
     if showing != *shown {
         *shown = showing;
-        let track = now.and_then(|now| now.track.as_ref());
-        let cover = track
+        let cover = now
+            .and_then(|now| now.track.as_ref())
             .and_then(|track| core.upgrade()?.now_playing_cover(track.appearance))
             .map(|path| file_url(&path));
-        let metadata = MediaMetadata {
-            title: track.and_then(|track| track.title.as_deref()),
-            album: track.and_then(|track| track.album.as_deref()),
-            artist: track.and_then(|track| track.artist.as_deref()),
-            cover_url: cover.as_deref(),
-            duration: state.duration_ms.map(millis),
-        };
-        if let Err(error) = controls.set_metadata(metadata) {
-            warn!(%error, "Now Playing could not be told the track");
-        }
+        controls.set_track(state, cover.as_deref());
     }
-    let progress = Some(MediaPosition(millis(state.position_ms)));
-    let playback = match state.status {
-        Status::Playing => MediaPlayback::Playing { progress },
-        Status::Paused => MediaPlayback::Paused { progress },
-        Status::Stopped => MediaPlayback::Stopped,
-    };
-    if let Err(error) = controls.set_playback(playback) {
-        warn!(%error, "Now Playing could not be told the state");
-    }
+    controls.set_state(state);
 }
 
 /// A file URL for a path, escaped: the data directory has a space in it.
@@ -198,51 +207,11 @@ fn file_url(path: &Path) -> String {
     url
 }
 
-/// Blocks in the run loop until `stopped` gives a reason to stop, when
-/// called on the main thread: macOS delivers the media keys only to a
-/// process whose main thread runs one. Anywhere else it simply waits.
+/// Waits until `stopped` gives a reason to stop. Only macOS needs the main
+/// thread for its media session; elsewhere it simply waits.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn wait<T: Send + 'static>(stopped: Receiver<T>) -> Option<T> {
-    let on_main = match (CFRunLoop::current(), CFRunLoop::main()) {
-        (Some(current), Some(main)) => std::ptr::eq(&*current, &*main),
-        _ => false,
-    };
-    if !on_main {
-        return stopped.recv().ok();
-    }
-    let done = Arc::new(AtomicBool::new(false));
-    let left = Arc::new(AtomicBool::new(false));
-    let waiter = {
-        let (done, left) = (Arc::clone(&done), Arc::clone(&left));
-        std::thread::Builder::new()
-            .name("ritornel-stop".to_owned())
-            .spawn(move || {
-                let reason = stopped.recv().ok();
-                done.store(true, Ordering::SeqCst);
-                // A stop can come before the loop runs, so it is sent until
-                // the main thread has left it.
-                while !left.load(Ordering::SeqCst) {
-                    if let Some(main) = CFRunLoop::main() {
-                        main.stop();
-                        main.wake_up();
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                reason
-            })
-    };
-    let Ok(waiter) = waiter else {
-        warn!("the run loop could not be watched; the media keys will not arrive");
-        return None;
-    };
-    while !done.load(Ordering::SeqCst) {
-        CFRunLoop::run();
-        // It returns at once while nothing is registered with it.
-        if !done.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-    left.store(true, Ordering::SeqCst);
-    waiter.join().ok().flatten()
+    stopped.recv().ok()
 }
 
 #[cfg(test)]
@@ -258,18 +227,6 @@ mod tests {
             url,
             "file:///Users/a/Library/Application%20Support/Ritornel/cache/x-512.jpg"
         );
-    }
-
-    #[test]
-    fn the_keys_macos_sends_are_the_players_commands() {
-        assert_eq!(key_of(MediaControlEvent::Toggle), Some(Key::Toggle));
-        assert_eq!(
-            key_of(MediaControlEvent::SetPosition(MediaPosition(
-                Duration::from_secs(90)
-            ))),
-            Some(Key::Seek(90_000))
-        );
-        assert_eq!(key_of(MediaControlEvent::Raise), None);
     }
 
     #[test]

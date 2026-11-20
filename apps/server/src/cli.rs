@@ -33,8 +33,9 @@ Commands:
   serve              Run until asked to stop: by SIGINT or SIGTERM, or
                      with --owned by the end of standard input
   service install    Run serve on the data directory in the background,
-                     now and at each login, as a launchd user agent
-                     (macOS). The desktop app then uses it and starts no
+                     now and at each login, as a launchd user agent on
+                     macOS or a systemd user unit on Linux. The desktop
+                     app then uses it and starts no
                      server of its own, and quitting the app leaves it
                      playing. It replaces one installed before
   service uninstall  Stop the background service and remove it

@@ -1406,6 +1406,30 @@ fn a_track_is_said_to_begin_when_it_is_first_heard_joined_to_and_resumed_but_not
 }
 
 #[test]
+fn a_jump_asked_for_within_the_entry_is_counted_and_playing_on_is_not() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(10_000);
+    assert_eq!(rig.player.state().seeks, 0);
+    // However small the jump.
+    rig.seek(10_500);
+    assert_eq!(rig.player.state().seeks, 1);
+    // A seek that names an entry the player has left does nothing.
+    let request = rig.request("playback.seek");
+    let gone = id(0xee);
+    rig.player
+        .seek(request, gone, 1_000, &rig.server, Some(&rig.library))
+        .unwrap();
+    assert_eq!(rig.player.state().seeks, 1);
+    // A previous that starts the track again is a jump; a skip is not.
+    rig.pass(5_000);
+    rig.skip(Direction::Previous);
+    assert_eq!(rig.player.state().seeks, 2);
+    rig.skip(Direction::Next);
+    assert_eq!(rig.player.state().seeks, 2);
+}
+
+#[test]
 fn an_album_plays_at_its_album_gain_and_a_mix_at_each_tracks_own() {
     let mut rig = Rig::new();
     rig.fake.gapless();

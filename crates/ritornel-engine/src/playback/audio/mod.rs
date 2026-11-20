@@ -16,7 +16,10 @@
 //! must make no sound.
 
 pub(crate) mod decode;
-#[cfg(all(feature = "audio-output", target_os = "macos"))]
+#[cfg(all(
+    feature = "audio-output",
+    any(target_os = "macos", target_os = "linux")
+))]
 mod device;
 mod null;
 pub(crate) mod output;
@@ -57,7 +60,10 @@ pub enum Output {
 impl Output {
     /// Whether this build can open the system's output device.
     pub const fn has_device() -> bool {
-        cfg!(all(feature = "audio-output", target_os = "macos"))
+        cfg!(all(
+            feature = "audio-output",
+            any(target_os = "macos", target_os = "linux")
+        ))
     }
 }
 
@@ -346,7 +352,10 @@ impl AudioRenderer {
         Ok((Self::null(spec, speed, Some(Arc::clone(&tap)))?, tap))
     }
 
-    #[cfg(all(feature = "audio-output", target_os = "macos"))]
+    #[cfg(all(
+        feature = "audio-output",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     fn open_device(shared: Arc<Shared>) -> Result<Self, RenderError> {
         let (running, spec, ends) = device::start(&shared, queues)?;
         Ok(Self::new(
@@ -358,7 +367,10 @@ impl AudioRenderer {
         ))
     }
 
-    #[cfg(not(all(feature = "audio-output", target_os = "macos")))]
+    #[cfg(not(all(
+        feature = "audio-output",
+        any(target_os = "macos", target_os = "linux")
+    )))]
     fn open_device(_shared: Arc<Shared>) -> Result<Self, RenderError> {
         Err(RenderError::new(
             "output",

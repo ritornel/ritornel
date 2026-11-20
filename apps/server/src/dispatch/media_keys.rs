@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use ritornel_contract::{
-    Id, PlaybackCommandParams, PlaybackSeekParams, PlaybackSkipParams, PlaybackStatus,
-    SkipDirection,
+    Id, PlaybackCommandParams, PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams,
+    PlaybackStatus, SkipDirection,
 };
 use tracing::warn;
 
@@ -22,6 +22,14 @@ impl Core {
         let _ = self.media_session.set(session);
     }
 
+    /// Takes the media session off the system, if the server has one.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stop_media_session(&self) {
+        if let Some(session) = self.media_session.get() {
+            session.stop();
+        }
+    }
+
     /// Shows the player's state, if the server has a media session.
     pub(super) fn show_in_media_session(&self, state: &ritornel_engine::playback::PlayerState) {
         if let Some(session) = self.media_session.get() {
@@ -31,7 +39,8 @@ impl Core {
 
     /// Carries out a media key. Play and pause name nothing, so a toggle
     /// becomes whichever the player's state asks for; the others act on
-    /// the entry the player is on.
+    /// the entry the player is on, but for a seek that names its own,
+    /// which the player ignores once it has moved on from it.
     pub(crate) fn media_key(&self, key: Key) {
         let done = self.with_stores(|stores| {
             let state = self.playback_get(stores)?;
@@ -43,6 +52,16 @@ impl Core {
                 (Key::Toggle, _) if playing => self.playback_pause(stores, &command),
                 (Key::Toggle | Key::Play, _) => self.playback_resume(stores, &command),
                 (Key::Pause, _) => self.playback_pause(stores, &command),
+                (Key::Volume(volume), _) => self.playback_set(
+                    stores,
+                    &PlaybackSetParams {
+                        idempotency_key,
+                        volume: Some(volume),
+                        muted: Some(false),
+                        shuffle: None,
+                        repeat: None,
+                    },
+                ),
                 (Key::Next | Key::Previous, Some(from_entry_id)) => self.playback_skip(
                     stores,
                     &PlaybackSkipParams {
@@ -55,7 +74,14 @@ impl Core {
                         },
                     },
                 ),
-                (Key::Seek(position_ms), Some(entry_id)) => self.playback_seek(
+                (Key::Seek(position_ms), Some(entry_id))
+                | (
+                    Key::SeekIn {
+                        entry: entry_id,
+                        position_ms,
+                    },
+                    _,
+                ) => self.playback_seek(
                     stores,
                     &PlaybackSeekParams {
                         idempotency_key,

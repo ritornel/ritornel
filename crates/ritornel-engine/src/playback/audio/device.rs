@@ -49,6 +49,32 @@ fn output_error(error: impl std::fmt::Display) -> RenderError {
     RenderError::new("output", error.to_string())
 }
 
+/// The device's default configuration, taken as 32-bit float. CoreAudio's
+/// default is always float, and so is that of ALSA's `default` device
+/// behind PipeWire or PulseAudio. A device whose default is another format
+/// (an ALSA hardware device with no sound server) is asked for float at
+/// the same rate and channels, and refused if it has none.
+fn float_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, RenderError> {
+    let config = device.default_output_config().map_err(output_error)?;
+    if config.sample_format() == cpal::SampleFormat::F32 {
+        return Ok(config);
+    }
+    device
+        .supported_output_configs()
+        .map_err(output_error)?
+        .filter(|range| {
+            range.sample_format() == cpal::SampleFormat::F32
+                && range.channels() == config.channels()
+        })
+        .find_map(|range| range.try_with_sample_rate(config.sample_rate()))
+        .ok_or_else(|| {
+            output_error(format!(
+                "the default output takes {} samples, not 32-bit float",
+                config.sample_format()
+            ))
+        })
+}
+
 type Queues = (Ends, Callback);
 
 /// The device running, what it takes, and the control side's queues.
@@ -73,10 +99,10 @@ pub(super) fn start(
                 let _ = found_tx.send(Err(output_error("there is no default output device")));
                 return;
             };
-            let config = match device.default_output_config() {
+            let config = match float_config(&device) {
                 Ok(config) => config,
                 Err(error) => {
-                    let _ = found_tx.send(Err(output_error(error)));
+                    let _ = found_tx.send(Err(error));
                     return;
                 }
             };
@@ -147,4 +173,32 @@ pub(super) fn start(
         .recv()
         .map_err(|_| output_error("the output thread stopped"))??;
     Ok((output, spec, ends))
+}
+
+#[cfg(test)]
+mod tests {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    use super::float_config;
+
+    /// Opens the system's default output and builds a stream on it, never
+    /// starting it, so nothing is played. It touches a real device, so no
+    /// run of the tests does it unasked:
+    /// `cargo test --package ritornel-engine -- --ignored the_default_output_opens`.
+    #[test]
+    #[ignore = "opens the system's default output device"]
+    fn the_default_output_opens() {
+        let host = cpal::default_host();
+        let device = host.default_output_device().unwrap();
+        let config = float_config(&device).unwrap();
+        let stream = device
+            .build_output_stream::<f32, _, _>(
+                config.config(),
+                |data: &mut [f32], _: &cpal::OutputCallbackInfo| data.fill(0.0),
+                |_: cpal::Error| {},
+                None,
+            )
+            .unwrap();
+        drop(stream);
+    }
 }

@@ -65,10 +65,11 @@ forbid ritornel-lastfm rusqlite
 forbid ritornel-engine ritornel-lastfm scrobl
 
 # A server built without its default features, as the hub is, has no
-# Last.fm code and no media session in it.
+# Last.fm code, no media session and no audio output in it, so on Linux it
+# builds with no ALSA or D-Bus library installed.
 without_defaults=$(cargo tree --manifest-path Cargo.toml --package ritornel-server --no-default-features \
     --edges normal --target all --prefix none --format '{p}' | awk '{ print $1 }')
-for crate in ritornel-lastfm scrobl souvlaki; do
+for crate in ritornel-lastfm scrobl souvlaki zbus cpal alsa alsa-sys; do
     if grep --quiet --line-regexp --fixed-strings "$crate" <<<"$without_defaults"; then
         echo "error: ritornel-server without its default features is built with $crate" >&2
         failed=1

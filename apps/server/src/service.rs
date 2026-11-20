@@ -8,10 +8,12 @@
 //! ```
 //!
 //! On macOS it is a launchd user agent in the login session, where media
-//! keys work; a system daemon would have no media session. It runs `serve`
-//! on the data directory, starts at login, and starts again if it fails.
-//! The desktop app then finds it and starts nothing, and quitting the app
-//! leaves it playing.
+//! keys work; a system daemon would have no media session. On Linux it is
+//! a systemd user unit, for the same reason: the user's manager runs it with
+//! the session bus and the sound server that MPRIS and ALSA's default
+//! device reach. Either way it runs `serve` on the data directory, starts
+//! at login, and starts again if it fails. The desktop app then finds it
+//! and starts nothing, and quitting the app leaves it playing.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -32,8 +34,8 @@ enum Action {
     /// Registers the service and starts it, replacing one registered
     /// before.
     Install {
-        // Only macOS installs anything.
-        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        // Only macOS and Linux install anything.
+        #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
@@ -451,7 +453,511 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The systemd user unit and how it is driven. It is built on Linux, and
+/// for the tests everywhere.
+#[cfg(any(target_os = "linux", test))]
+mod systemd {
+    use std::ffi::OsStr;
+    use std::io::ErrorKind;
+    use std::path::Path;
+    use std::process::Output;
+
+    use crate::Error;
+    use crate::error::io_error;
+
+    /// The unit's name, and the name of its file.
+    pub(super) const UNIT: &str = "dev.ritornel.server.service";
+
+    /// How long systemd waits for the server to stop before it kills it,
+    /// as the desktop app does.
+    const STOP_TIMEOUT_SECONDS: u32 = 15;
+
+    /// The exit code of `systemctl stop` for a unit that is not loaded.
+    const NOT_LOADED: i32 = 5;
+
+    /// Runs `systemctl --user` with these arguments. A test passes a fake.
+    pub(super) type Systemctl<'a> = &'a dyn Fn(&[&OsStr]) -> Result<Output, Error>;
+
+    /// Escapes text for a unit file, where `%` starts a specifier.
+    fn specifiers(text: &str) -> String {
+        text.replace('%', "%%")
+    }
+
+    /// The program of an `ExecStart=` line, quoted: a path may hold
+    /// spaces, quotes and `%`. systemd takes the program before it expands
+    /// variables, so a `$` in it stays as it is.
+    fn exec_program(text: &str) -> String {
+        let escaped = specifiers(text).replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    }
+
+    /// An argument of an `ExecStart=` line, quoted as the program is, and
+    /// with `$`, which would start a variable, doubled.
+    fn exec_argument(text: &str) -> String {
+        exec_program(text).replace('$', "$$")
+    }
+
+    /// The user unit that runs `program serve --data-dir <data_dir>`.
+    ///
+    /// It starts at login (`default.target`), and again ten seconds after
+    /// an exit that was not clean: a crash, or a start refused because
+    /// another server held the directory, until it is free. Its standard
+    /// output and error, which hold only the ready line and a failed
+    /// start's reason, go to `service.log` beside the server's own log.
+    pub(super) fn unit(program: &Path, data_dir: &Path) -> String {
+        let program = exec_program(&program.display().to_string());
+        let data = exec_argument(&data_dir.display().to_string());
+        let log = specifiers(&data_dir.join("logs/service.log").display().to_string());
+        format!(
+            "[Unit]
+Description=Ritornel server
+
+[Service]
+Type=exec
+ExecStart={program} serve --data-dir {data}
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec={STOP_TIMEOUT_SECONDS}
+StandardOutput=append:{log}
+StandardError=append:{log}
+
+[Install]
+WantedBy=default.target
+"
+        )
+    }
+
+    /// The data directory a unit written by [`unit`] serves.
+    pub(super) fn served_dir(unit: &str) -> Option<String> {
+        let exec = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))?;
+        let after = exec.split_once(" --data-dir ")?.1;
+        let mut quoted = after.strip_prefix('"')?.chars();
+        let mut value = String::new();
+        loop {
+            match quoted.next()? {
+                '"' => break,
+                '\\' => value.push(quoted.next()?),
+                c => value.push(c),
+            }
+        }
+        Some(value.replace("$$", "$").replace("%%", "%"))
+    }
+
+    /// What `systemctl show` says of the unit.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct Shown {
+        /// Whether systemd has read the unit file.
+        pub(super) loaded: bool,
+        /// `active`, `inactive`, `failed`, `activating` and so on.
+        pub(super) active: String,
+        /// The server's pid, while it runs.
+        pub(super) pid: Option<u32>,
+    }
+
+    /// Reads what `systemctl show --property=LoadState,ActiveState,MainPID`
+    /// prints: `None` if it says no load state, which it says of every
+    /// unit, one it has no file for included.
+    pub(super) fn shown(printed: &str) -> Option<Shown> {
+        let value = |key: &str| {
+            printed
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        };
+        Some(Shown {
+            loaded: value("LoadState").filter(|state| !state.is_empty())? == "loaded",
+            active: value("ActiveState").unwrap_or("").to_owned(),
+            pid: value("MainPID")
+                .and_then(|pid| pid.parse().ok())
+                .filter(|pid| *pid != 0),
+        })
+    }
+
+    /// Why systemctl failed, in its own words.
+    pub(super) fn failed(doing: &str, output: &Output) -> Error {
+        let said = String::from_utf8_lossy(&output.stderr);
+        let said = said.trim();
+        Error::Service(match (said.is_empty(), output.status.code()) {
+            (false, _) => format!("systemctl {doing} failed: {said}"),
+            (true, Some(code)) => format!("systemctl {doing} failed with exit code {code}"),
+            (true, None) => format!("systemctl {doing} was killed"),
+        })
+    }
+
+    /// Runs systemctl and fails unless it succeeded.
+    pub(super) fn must(systemctl: Systemctl<'_>, args: &[&OsStr]) -> Result<(), Error> {
+        let output = systemctl(args)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let doing = args
+            .first()
+            .map_or_else(String::new, |verb| verb.to_string_lossy().into_owned());
+        Err(failed(&doing, &output))
+    }
+
+    /// What `service status` says of the unit, whose file is at `path`
+    /// and holds `installed` if it is there. A systemctl that cannot say
+    /// (no user manager, say) is an error, not a unit that is not there.
+    pub(super) fn status(
+        path: &Path,
+        installed: Option<&str>,
+        systemctl: Systemctl<'_>,
+    ) -> Result<String, Error> {
+        let printed = systemctl(&[
+            "show".as_ref(),
+            "--property=LoadState,ActiveState,MainPID".as_ref(),
+            UNIT.as_ref(),
+        ])?;
+        if !printed.status.success() {
+            return Err(failed("show", &printed));
+        }
+        let state = shown(&String::from_utf8_lossy(&printed.stdout))
+            .ok_or_else(|| Error::Service("systemctl show said nothing of the unit".to_owned()))?;
+        let mut lines = match installed {
+            Some(unit) => vec![
+                format!("Installed: {}", path.display()),
+                format!(
+                    "Data directory: {}",
+                    served_dir(unit).unwrap_or_else(|| "unknown".to_owned())
+                ),
+            ],
+            None => vec!["Not installed".to_owned()],
+        };
+        match (state.loaded, state.pid) {
+            (true, Some(pid)) => lines.push(format!("Running: pid {pid}")),
+            (true, None) => lines.push(format!("Registered, not running ({})", state.active)),
+            (false, _) if installed.is_some() => {
+                lines.push("Not registered with systemd".to_owned());
+            }
+            (false, _) => {}
+        }
+        Ok(lines.join("\n"))
+    }
+
+    /// Stops the unit, waiting for its server to stop as `systemctl stop`
+    /// does. `Ok(false)` when systemd has no such unit.
+    pub(super) fn stop(systemctl: Systemctl<'_>) -> Result<bool, Error> {
+        let stopped = systemctl(&["stop".as_ref(), UNIT.as_ref()])?;
+        match stopped.status.code() {
+            Some(0) => Ok(true),
+            Some(NOT_LOADED) => Ok(false),
+            _ => Err(failed("stop", &stopped)),
+        }
+    }
+
+    /// Stops the unit, disables it and removes its file, and says what was
+    /// done. The file stays if the unit could not be stopped, so that it
+    /// can be tried again.
+    pub(super) fn uninstall(unit: &Path, systemctl: Systemctl<'_>) -> Result<&'static str, Error> {
+        let stopped = stop(systemctl)?;
+        let removed = if unit.exists() {
+            must(systemctl, &["disable".as_ref(), UNIT.as_ref()])?;
+            match std::fs::remove_file(unit) {
+                Ok(()) => true,
+                Err(error) if error.kind() == ErrorKind::NotFound => false,
+                Err(error) => return Err(io_error("remove", unit)(error)),
+            }
+        } else {
+            false
+        };
+        if removed {
+            must(systemctl, &["daemon-reload".as_ref()])?;
+        }
+        Ok(if stopped || removed {
+            "Removed the background service"
+        } else {
+            "The background service is not installed"
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::cell::RefCell;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        use super::*;
+
+        #[test]
+        fn the_unit_runs_serve_on_the_directory_and_logs_beside_the_server() {
+            let written = unit(
+                Path::new("/home/pat/$tools/100%/ritornel-server"),
+                Path::new("/home/pat/Music \"100%\" $HOME\\data"),
+            );
+            assert_eq!(
+                written,
+                "[Unit]
+Description=Ritornel server
+
+[Service]
+Type=exec
+ExecStart=\"/home/pat/$tools/100%%/ritornel-server\" serve --data-dir \"/home/pat/Music \\\"100%%\\\" $$HOME\\\\data\"
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+StandardOutput=append:/home/pat/Music \"100%%\" $HOME\\data/logs/service.log
+StandardError=append:/home/pat/Music \"100%%\" $HOME\\data/logs/service.log
+
+[Install]
+WantedBy=default.target
+"
+            );
+            assert!(!written.contains("--owned"));
+            assert_eq!(
+                served_dir(&written).as_deref(),
+                Some("/home/pat/Music \"100%\" $HOME\\data")
+            );
+        }
+
+        #[test]
+        fn the_state_is_read_from_what_systemctl_shows() {
+            let running = "LoadState=loaded\nActiveState=active\nMainPID=4312\n";
+            assert_eq!(
+                shown(running),
+                Some(Shown {
+                    loaded: true,
+                    active: "active".to_owned(),
+                    pid: Some(4312),
+                })
+            );
+            let absent = "MainPID=0\nLoadState=not-found\nActiveState=inactive\n";
+            assert_eq!(
+                shown(absent),
+                Some(Shown {
+                    loaded: false,
+                    active: "inactive".to_owned(),
+                    pid: None,
+                })
+            );
+            // Nothing is not a unit that is not there.
+            assert_eq!(shown(""), None);
+        }
+
+        fn printed(stdout: &str) -> Output {
+            Output {
+                stdout: stdout.as_bytes().to_vec(),
+                ..output(0, "")
+            }
+        }
+
+        #[test]
+        fn a_unit_systemd_has_no_file_for_is_not_registered() {
+            let file = UnitFile::new("status-absent");
+            let fake = Fake::new(vec![(
+                "show",
+                printed("LoadState=not-found\nActiveState=inactive\nMainPID=0\n"),
+            )]);
+            let said = status(&file.0, Some("[Unit]\n"), &|args| fake.run(args)).unwrap();
+            assert!(said.ends_with("Not registered with systemd"), "{said}");
+            let fake = Fake::new(vec![(
+                "show",
+                printed("LoadState=loaded\nActiveState=active\nMainPID=4312\n"),
+            )]);
+            let said = status(&file.0, Some("[Unit]\n"), &|args| fake.run(args)).unwrap();
+            assert!(said.ends_with("Running: pid 4312"), "{said}");
+        }
+
+        #[test]
+        fn a_status_systemctl_cannot_give_is_an_error() {
+            let file = UnitFile::new("status-failed");
+            let fake = Fake::new(vec![(
+                "show",
+                output(1, "Failed to connect to user scope bus via local transport"),
+            )]);
+            let failed = status(&file.0, Some("[Unit]\n"), &|args| fake.run(args)).unwrap_err();
+            assert_eq!(
+                failed.to_string(),
+                "the background service: systemctl show failed: Failed to connect to user scope \
+                 bus via local transport"
+            );
+            // Nor is a show that says nothing of the unit.
+            let fake = Fake::new(vec![("show", printed(""))]);
+            assert!(status(&file.0, None, &|args| fake.run(args)).is_err());
+        }
+
+        fn output(code: i32, stderr: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+
+        /// A fake systemctl that answers each call with the next of
+        /// `answers`, by its first argument, and records the calls.
+        struct Fake {
+            answers: RefCell<Vec<(&'static str, Output)>>,
+            calls: RefCell<Vec<String>>,
+        }
+
+        impl Fake {
+            fn new(answers: Vec<(&'static str, Output)>) -> Self {
+                Self {
+                    answers: RefCell::new(answers),
+                    calls: RefCell::new(Vec::new()),
+                }
+            }
+
+            fn run(&self, args: &[&OsStr]) -> Result<Output, Error> {
+                let verb = args[0].to_string_lossy().into_owned();
+                self.calls.borrow_mut().push(verb.clone());
+                let (expected, answer) = self.answers.borrow_mut().remove(0);
+                assert_eq!(verb, expected);
+                Ok(answer)
+            }
+        }
+
+        struct UnitFile(std::path::PathBuf);
+
+        impl UnitFile {
+            fn new(name: &str) -> Self {
+                let path = std::env::temp_dir().join(format!(
+                    "ritornel-service-{}-{name}.service",
+                    std::process::id()
+                ));
+                std::fs::write(&path, "[Unit]\n").unwrap();
+                Self(path)
+            }
+        }
+
+        impl Drop for UnitFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        #[test]
+        fn a_running_service_is_stopped_disabled_and_its_unit_removed() {
+            let file = UnitFile::new("running");
+            let fake = Fake::new(vec![
+                ("stop", output(0, "")),
+                ("disable", output(0, "")),
+                ("daemon-reload", output(0, "")),
+            ]);
+            let said = uninstall(&file.0, &|args| fake.run(args)).unwrap();
+            assert_eq!(said, "Removed the background service");
+            assert!(!file.0.exists());
+            assert_eq!(*fake.calls.borrow(), ["stop", "disable", "daemon-reload"]);
+        }
+
+        #[test]
+        fn a_unit_that_is_not_there_is_not_an_error() {
+            let file = UnitFile::new("absent");
+            std::fs::remove_file(&file.0).unwrap();
+            let not_loaded = || output(NOT_LOADED, "Unit dev.ritornel.server.service not loaded.");
+            let fake = Fake::new(vec![("stop", not_loaded())]);
+            let said = uninstall(&file.0, &|args| fake.run(args)).unwrap();
+            assert_eq!(said, "The background service is not installed");
+        }
+
+        #[test]
+        fn a_stop_that_fails_otherwise_is_reported_and_keeps_the_unit() {
+            let file = UnitFile::new("failed");
+            let fake = Fake::new(vec![(
+                "stop",
+                output(1, "Failed to connect to bus: No medium found"),
+            )]);
+            let failed = uninstall(&file.0, &|args| fake.run(args)).unwrap_err();
+            assert_eq!(
+                failed.to_string(),
+                "the background service: systemctl stop failed: Failed to connect to bus: No \
+                 medium found"
+            );
+            assert!(file.0.exists());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::ffi::OsStr;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::{Command, Output};
+
+    use super::Action;
+    use super::systemd::{UNIT, must, status, stop, uninstall, unit};
+    use crate::data_dir::{self, DataDir};
+    use crate::error::io_error;
+    use crate::{Env, Error};
+
+    /// Where systemd looks for a user's own units.
+    fn units_dir(env: Env<'_>) -> Result<PathBuf, Error> {
+        let config = env("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .or_else(|| {
+                env("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| PathBuf::from(home).join(".config"))
+            })
+            .ok_or_else(|| Error::Service("HOME is not set".to_owned()))?;
+        Ok(config.join("systemd/user"))
+    }
+
+    pub(super) fn run(action: &Action, env: Env<'_>, out: &mut dyn Write) -> Result<(), Error> {
+        let units = units_dir(env)?;
+        let path = units.join(UNIT);
+        match action {
+            Action::Install { data_dir } => {
+                let root = data_dir::resolve(data_dir.as_deref(), env)?;
+                // The log directory must be there before systemd opens the
+                // log in it.
+                let dir = DataDir::prepare(root)?;
+                let program = std::env::current_exe()
+                    .and_then(std::fs::canonicalize)
+                    .map_err(|error| {
+                        Error::Service(format!("cannot find this program: {error}"))
+                    })?;
+                // One registered before goes first, and its server stops.
+                stop(&systemctl)?;
+                std::fs::create_dir_all(&units).map_err(io_error("create", &units))?;
+                let staged = path.with_extension("service.new");
+                std::fs::write(&staged, unit(&program, dir.root()))
+                    .map_err(io_error("write", &staged))?;
+                std::fs::rename(&staged, &path).map_err(io_error("write", &path))?;
+                must(&systemctl, &["daemon-reload".as_ref()])?;
+                must(
+                    &systemctl,
+                    &["enable".as_ref(), "--now".as_ref(), UNIT.as_ref()],
+                )?;
+                writeln!(
+                    out,
+                    "Installed the background service: {} serve --data-dir {}\n\
+                     It runs now and at each login, and the desktop app uses it. If another \
+                     server is running on that directory, the service starts once it stops.\n\
+                     Its log is in {}",
+                    program.display(),
+                    dir.root().display(),
+                    dir.logs().display()
+                )
+                .map_err(Error::Output)
+            }
+            Action::Uninstall => {
+                let said = uninstall(&path, &systemctl)?;
+                writeln!(out, "{said}").map_err(Error::Output)
+            }
+            Action::Status => {
+                let installed = std::fs::read_to_string(&path).ok();
+                let said = status(&path, installed.as_deref(), &systemctl)?;
+                writeln!(out, "{said}").map_err(Error::Output)
+            }
+        }
+    }
+
+    fn systemctl(args: &[&OsStr]) -> Result<Output, Error> {
+        Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .output()
+            .map_err(|error| Error::Service(format!("cannot run systemctl: {error}")))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod platform {
     use std::io::Write;
 
@@ -460,8 +966,8 @@ mod platform {
 
     pub(super) fn run(_: &Action, _: Env<'_>, _: &mut dyn Write) -> Result<(), Error> {
         Err(Error::Service(
-            "it is built for macOS only; elsewhere run `ritornel-server serve` under the \
-             system's service manager"
+            "it is built for macOS and Linux only; elsewhere run `ritornel-server serve` under \
+             the system's service manager"
                 .to_owned(),
         ))
     }

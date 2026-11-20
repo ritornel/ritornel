@@ -232,12 +232,22 @@ impl Server {
 
     /// Starts the system's media session, for a server with a player.
     /// Only `serve` does, on the main thread that then runs the loop the
-    /// session needs; a server in a test has none.
-    #[cfg(all(feature = "media-session", target_os = "macos"))]
-    pub(crate) fn start_media_session(&self) -> Result<(), Error> {
+    /// session needs on macOS; a server in a test has none. MPRIS on
+    /// Linux is served from `runtime`.
+    #[cfg(all(
+        feature = "media-session",
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    pub(crate) fn start_media_session(
+        &self,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<(), Error> {
         if self.core.has_player() {
-            let session = crate::media_session::MediaSession::start(Arc::downgrade(&self.core))
-                .map_err(Error::Runtime)?;
+            let session = crate::media_session::MediaSession::start(
+                Arc::downgrade(&self.core),
+                runtime.clone(),
+            )
+            .map_err(Error::Runtime)?;
             self.core.attach_media_session(session);
         }
         Ok(())
@@ -281,6 +291,17 @@ impl Server {
         tokio::task::spawn_blocking(move || playback.stop())
             .await
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
+        // MPRIS leaves the session bus while the runtime that serves it
+        // still runs. On macOS the session's thread is left to end by
+        // itself, as souvlaki may need the main run loop, which has
+        // stopped by now.
+        #[cfg(all(feature = "media-session", target_os = "linux"))]
+        {
+            let core = Arc::clone(&self.core);
+            tokio::task::spawn_blocking(move || core.stop_media_session())
+                .await
+                .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
+        }
         // The watcher first, so that it queues no scan the worker would
         // leave behind.
         let watcher = self.watcher;

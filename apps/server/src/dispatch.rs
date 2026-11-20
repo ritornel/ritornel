@@ -50,7 +50,10 @@ mod churn;
 mod history;
 mod lastfm;
 mod lists;
-#[cfg(all(feature = "media-session", target_os = "macos"))]
+#[cfg(all(
+    feature = "media-session",
+    any(target_os = "macos", target_os = "linux")
+))]
 mod media_keys;
 mod pages;
 mod playback;
@@ -132,7 +135,10 @@ pub(crate) struct Core {
     /// Watching the hub's folders, once the server has started.
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// The system's media session, once `serve` has started one.
-    #[cfg(all(feature = "media-session", target_os = "macos"))]
+    #[cfg(all(
+        feature = "media-session",
+        any(target_os = "macos", target_os = "linux")
+    ))]
     media_session: std::sync::OnceLock<crate::media_session::MediaSession>,
 }
 
@@ -223,7 +229,10 @@ impl Core {
             deliveries: crate::playback::Wake::default(),
             lastfm: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
-            #[cfg(all(feature = "media-session", target_os = "macos"))]
+            #[cfg(all(
+                feature = "media-session",
+                any(target_os = "macos", target_os = "linux")
+            ))]
             media_session: std::sync::OnceLock::new(),
         })
     }

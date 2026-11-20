@@ -215,7 +215,10 @@ impl Core {
                         self.publish(&Event::Playback(Box::new(PlaybackEvent {
                             state: self.playback_state(state),
                         })));
-                        #[cfg(all(feature = "media-session", target_os = "macos"))]
+                        #[cfg(all(
+                            feature = "media-session",
+                            any(target_os = "macos", target_os = "linux")
+                        ))]
                         self.show_in_media_session(state);
                         if state.status != Status::Playing {
                             self.nothing_playing();

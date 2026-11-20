@@ -40,7 +40,10 @@ mod listener;
 mod lock;
 mod logs;
 mod media;
-#[cfg(all(feature = "media-session", target_os = "macos"))]
+#[cfg(all(
+    feature = "media-session",
+    any(target_os = "macos", target_os = "linux")
+))]
 mod media_session;
 mod memory;
 mod playback;
