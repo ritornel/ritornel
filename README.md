@@ -72,7 +72,7 @@ The server reads the file when it starts, so start it again: quit and reopen the
 
 ## Design notes and history
 
-Comments throughout the code cite design notes, such as `docs/design/server.md`, decisions by number, and now and then a prototype or a spike. All of that was written while Ritornel was being worked out in private. The notes are not in this repository yet, and will be added as each is brought up to date.
+Comments throughout the code cite design notes, such as `docs/design/server.md`, decisions by number, and now and then a prototype or a spike. All of that was written while Ritornel was being worked out in private. The notes are being added as each is brought up to date; the first is [`docs/design/platforms.md`](docs/design/platforms.md), what runs on each platform and what each still lacks.
 
 For the same reason this repository's history begins as a few large commits, one for each milestone of that private work. An earlier desktop app, built with Tauri and Svelte, came before the GPUI one. Some comments mention it as `apps/desktop-tauri`, and it is not here either.
 
