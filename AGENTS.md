@@ -9,7 +9,7 @@ Ritornel is a music player for a collection you own: a server, `ritornel-server`
 - `mise run check` runs everything CI runs.
 - `mise run test` runs the tests. Some run `ritornelctl` against `ritornel-server` and take the server from the whole workspace's build, which `cargo test --package` alone does not rebuild.
 - `mise run schema` writes `schema/` again after a migration is added, and `mise run contract` writes `contract/contract.ts` again after a call or a wire type changes. A test fails when either is out of date.
-- `mise run desktop:run` runs the desktop app on an invented library. `scripts/desktop.sh tones` runs it on a small one that plays.
+- `mise run desktop:run` runs the desktop app on an invented library. `scripts/desktop.sh tones` runs it on a small one that plays. On Windows, `scripts/desktop.ps1 run`, `tones` and `app` do the same, building the server too.
 
 ## Good to know
 
@@ -17,7 +17,8 @@ Ritornel is a music player for a collection you own: a server, `ritornel-server`
 - A call is defined once, in the method table in `crates/ritornel-contract/src/methods.rs`.
 - A migration that is on `main` is not edited, because the server refuses a database whose recorded checksum differs. A schema change is a new numbered file.
 - The desktop app, `apps/desktop`, is a Cargo workspace of its own, so the server builds without any desktop library.
-- macOS came first. Linux and Windows are in progress, so code for one platform goes behind `cfg`. The server runs on Linux with sound, MPRIS and a systemd user service, and the desktop app runs there on Wayland or X11.
+- macOS came first. Linux and Windows are in progress, so code for one platform goes behind `cfg`. The server runs on Linux with sound, MPRIS and a systemd user service, and the desktop app runs there on Wayland or X11. On Windows the server and the desktop app both run, with sound through WASAPI, but without media keys or a background service yet.
+- Every crate of the main workspace forbids unsafe code but `ritornel-windows`, which holds the Win32 calls the standard library cannot make (a lock on one byte, owner-only access lists, a file's identity, the clock since boot, a hidden window) behind safe functions.
 - On Linux the whole workspace links ALSA for the server's audio output, so it needs ALSA's development files (`alsa-lib` on Arch, `libasound2-dev` on Debian and Ubuntu). The hub, built without default features, links no system library, and CI's `hub` job holds it to that.
 - On Linux the desktop app needs the development files of fontconfig, xcb and xkbcommon (`fontconfig`, `libxcb`, `libxkbcommon` and `libxkbcommon-x11` on Arch; `libfontconfig-dev`, `libxcb1-dev`, `libxkbcommon-dev` and `libxkbcommon-x11-dev` on Debian and Ubuntu). Without them `scripts/desktop.sh` names what is missing and skips. `scripts/desktop.sh app` makes `apps/desktop/target/release/bundle/ritornel/`, the app with the server it starts beside it.
 - With `RITORNEL_OFFSCREEN=1`, `scripts/desktop.sh` opens the app on a display no one sees (macOS only so far; on Linux it refuses to start), and a server run with `--output null` makes no sound. Both help when an agent works on a machine someone is using.
