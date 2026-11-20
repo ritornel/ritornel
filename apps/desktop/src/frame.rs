@@ -69,7 +69,7 @@ pub(crate) fn keys<A: Action + Clone>(
 }
 
 pub(crate) fn menus(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    // Quit is `main.rs`'s, which knows the server.
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());

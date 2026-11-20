@@ -141,7 +141,15 @@ fn main() {
                 letters: remember::load().letters,
             });
             settings::install(link.clone(), args.script.is_some(), cx);
-            // Quitting stops a server the app started; one it found it leaves.
+            // Quit stops a server the app started; one it found it leaves.
+            let quitting = link.clone();
+            cx.on_action(move |_: &frame::Quit, cx| {
+                quitting.read(cx).stop_started();
+                cx.quit();
+            });
+            // The app ending stops a server it holds (`platform::SERVER_APART`
+            // says whether it holds one): where closing the window ends it,
+            // the server is apart, and plays on.
             let stopping = link.clone();
             cx.on_app_quit(move |cx| {
                 stopping.read(cx).stop_owned();

@@ -18,6 +18,10 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use super::{Chrome, Feel, Keys, ScrollDetails, ScrollPhase, held};
 
+// The app ends only when it is quit, and its server with it, held by the
+// launcher's pipe.
+pub(crate) use super::fallback::{SERVER_APART, start_server, started_here, stop_server};
+
 /// The three window buttons at the bar's left, 14 points each and 9 apart,
 /// are the system's; a press on the bar moves the window, as a title bar's does.
 pub(crate) const CHROME: Chrome = Chrome {

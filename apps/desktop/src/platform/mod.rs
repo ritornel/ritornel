@@ -5,9 +5,9 @@
 //! Each system has a file of its own (`mac.rs`, `windows.rs`), and each
 //! offers the same names. What a system has no code of its own for, it takes
 //! from `fallback`, the plain behaviour: menus the app draws itself
-//! (`drawn.rs`), Ctrl's keys, no stretch at a page's ends, no picture of the
-//! window. A system with no file at all (Linux, for now) takes the fallback
-//! whole.
+//! (`drawn.rs`), Ctrl's keys, a server held by the launcher's pipe, no
+//! stretch at a page's ends, no picture of the window. Linux (`linux.rs`)
+//! takes all of it but the server, which outlives the app there.
 //!
 //! What is decided here is the system's feel as well as its plumbing: a Mac
 //! page stretches at its ends because a Mac's do, not because the app's do
@@ -31,13 +31,19 @@ mod windows;
 #[cfg(windows)]
 use windows as system;
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as system;
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 use fallback as system;
 
 pub(crate) use system::{
-    CHROME, FEEL, FITTING_SHOWS, KEYS, bring_forward_quietly, choose_folder, dismiss_menu,
-    fit_window, footprint, give_back, hold_appearance, keep_out_of_the_dock, key_text, locale,
-    memory_line, pop_up_menu, screenshot, scroll_details, settings_dir, start, swiped_back,
+    CHROME, FEEL, FITTING_SHOWS, KEYS, SERVER_APART, bring_forward_quietly, choose_folder,
+    dismiss_menu, fit_window, footprint, give_back, hold_appearance, keep_out_of_the_dock,
+    key_text, locale, memory_line, pop_up_menu, screenshot, scroll_details, settings_dir, start,
+    start_server, started_here, stop_server, swiped_back,
 };
 
 /// One line of the system's context menu. Its actions are numbered in
@@ -248,6 +254,28 @@ mod fallback {
     pub(crate) fn dismiss_menu(cx: &mut gpui::App) {
         crate::drawn::dismiss(cx);
     }
+
+    /// Whether the server the app starts outlives it. Here it does not:
+    /// the launcher holds it by a pipe and it stops when the app ends,
+    /// however it ends (`ritornel_client::launch`), and the app ends only
+    /// when it is quit.
+    pub(crate) const SERVER_APART: bool = false;
+
+    /// Starts a server apart from the app, where `SERVER_APART` says one is.
+    pub(crate) fn start_server(
+        _program: &ritornel_client::launch::Program,
+        _data_dir: &Path,
+    ) -> std::io::Result<std::process::Child> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
+    /// Whether the process `pid` is a server the app started apart from it.
+    pub(crate) fn started_here(_pid: u32) -> bool {
+        false
+    }
+
+    /// Stops a server the app started apart from it.
+    pub(crate) fn stop_server(_pid: u32, _wait: std::time::Duration) {}
 
     /// Whether a window opened hidden is shown by its first fit. Here it
     /// is opened shown, and fitted after.
