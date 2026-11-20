@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::jobs::{Job, Progress, step_command};
 use crate::media::{UNAVAILABLE, read_file, read_folder_image};
 use crate::scan_store::{Known, RecordOp, Source};
-use crate::walk::{Seen, Walked, folder_of, root_id, under, walk};
+use crate::walk::{Seen, Walked, folder_id, folder_of, under, walk};
 use crate::{Command, Error, Fingerprint, LibraryStore, ServerStore, WriteRequest};
 
 /// How a scan runs.
@@ -291,7 +291,7 @@ impl ScanRun {
                         .is_some_and(|error| error.kind == UNAVAILABLE)
                 });
                 let walked_id = self.walked.as_ref().and_then(|walked| walked.root_id);
-                if unavailable && root_id(&self.root) != walked_id {
+                if unavailable && folder_id(&self.root) != walked_id {
                     return Err(Error::RootOffline {
                         path: self.root.clone(),
                     });
