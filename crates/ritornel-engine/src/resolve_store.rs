@@ -13,6 +13,7 @@ use ritornel_domain::library::{
     Current, Evidence, ExistingCredit, ExistingRelease, Item, Kind, Library, Method, Ref,
     Resolution,
 };
+use ritornel_domain::normalize::normalize;
 use ritornel_domain::{
     Claim, EXTRACTOR_VERSION, Facts, NORMALIZER_VERSION, Policy, RESOLVER_VERSION, Scope, Source,
 };
@@ -368,6 +369,19 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
         library.groups.insert(id, preferred);
         shown.groups.insert(id, display);
     }
+    // A row is found by the key the normaliser made of its name. When the
+    // library was last resolved by another normaliser, the stored key is
+    // that one's, and the row's name is keyed again, or an artist with no
+    // ID would take a new row and a new public ID.
+    let normalizer_changed = connection
+        .query_row(
+            "SELECT json_extract(value_json, '$.normalizer') FROM library_setting WHERE key = ?1",
+            [VERSIONS_SETTING],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten()
+        .is_some_and(|stored| stored != NORMALIZER_VERSION);
     for (id, redirected, name, sort, match_name) in rows(
         connection,
         "SELECT id, redirect_to_id IS NOT NULL, display_name, display_sort_name, match_name
@@ -382,8 +396,12 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
             ))
         },
     )? {
-        if let (false, Some(match_name)) = (redirected, &match_name) {
-            library.artists.push((id, match_name.clone()));
+        let key = match (&name, normalizer_changed) {
+            (Some(name), true) => Some(normalize(name)),
+            _ => match_name.clone(),
+        };
+        if let (false, Some(key)) = (redirected, key) {
+            library.artists.push((id, key));
         }
         shown.artists.insert(id, (name, sort, match_name));
     }
@@ -432,11 +450,17 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
     .into_iter()
     .collect();
     // Pairs the owner's own actions linked. What the resolver learned it
-    // learns again, in the order it learned it.
+    // learns again, in the order it learned it. A pair is of keys, and a key
+    // made by another version of the normaliser is not comparable with
+    // today's, so such a pair is not read: the call that teaches one keeps
+    // its spellings, to make its keys again.
     for (scope, a, b) in rows(
         connection,
-        "SELECT o.scope, o.name_a, o.name_b FROM alias_observation o
-         JOIN identity_decision d ON d.id = o.decision_id WHERE d.actor_kind <> 'resolver'",
+        &format!(
+            "SELECT o.scope, o.name_a, o.name_b FROM alias_observation o
+             JOIN identity_decision d ON d.id = o.decision_id
+             WHERE d.actor_kind <> 'resolver' AND o.normalizer_version = {NORMALIZER_VERSION}"
+        ),
         |row| {
             Ok((
                 row.get::<_, String>(0)?,

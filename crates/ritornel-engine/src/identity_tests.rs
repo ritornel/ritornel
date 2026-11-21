@@ -507,8 +507,9 @@ fn a_library_resolved_by_policy_1_is_resolved_by_policy_2_at_the_next_scan() {
     assert_eq!(
         rig.one("SELECT value_json FROM library_setting WHERE key = 'identity.versions'"),
         format!(
-            r#"{{"extractor":{},"resolver":2,"normalizer":1}}"#,
-            ritornel_domain::EXTRACTOR_VERSION
+            r#"{{"extractor":{},"resolver":2,"normalizer":{}}}"#,
+            ritornel_domain::EXTRACTOR_VERSION,
+            ritornel_domain::NORMALIZER_VERSION
         )
     );
     // The evidence names the cause, the file it nearly matched and that
@@ -594,4 +595,121 @@ fn policy_2_binds_across_albums_at_an_equal_length_and_says_so() {
     let run = rig.library.dry_run(&strict).unwrap();
     assert_eq!(run.policy.across_albums_within_ms, 0);
     assert_eq!((run.would_change, run.reviews_added), (1, 1));
+}
+
+#[test]
+fn an_alias_the_owner_taught_under_another_normaliser_is_not_read_as_a_key() {
+    let rig = scanned();
+    let request = WriteRequest {
+        method: "test.alias",
+        command: None,
+        client: None,
+    };
+    rig.library
+        .write(request, move |write| {
+            let connection = write.connection();
+            let item: i64 = connection.query_row(
+                "SELECT id FROM source_item WHERE provider_key = ?1",
+                [FLAC],
+                |row| row.get(0),
+            )?;
+            connection.execute(
+                "INSERT INTO identity_decision
+                   (action, source_item_id, method, resolver_version, normalizer_version, evidence_json,
+                    actor_kind, decided_at_ms, rev)
+                 VALUES ('bind', ?1, 'user', 1, 1, '{}', 'person', ?2, ?3)",
+                (item, write.now_ms(), write.rev()),
+            )?;
+            let decision = connection.last_insert_rowid();
+            // The first key was made by normaliser 1, which joined the
+            // letters round a dash: it cannot be compared with a key of
+            // today's.
+            for (a, b, version) in [
+                ("moss arcade", "mossarcade", 1),
+                ("moss arcade", "the moss arcade", ritornel_domain::NORMALIZER_VERSION),
+            ] {
+                connection.execute(
+                    "INSERT INTO alias_observation
+                       (scope, name_a, name_b, normalizer_version, decision_id, observed_at_ms, rev)
+                     VALUES ('artist', ?1, ?2, ?3, ?4, ?5, ?6)",
+                    (a, b, version, decision, write.now_ms(), write.rev()),
+                )?;
+            }
+            Ok(String::new())
+        })
+        .unwrap();
+    let (library, _) = rig.library.load().unwrap();
+    assert_eq!(
+        library.aliases,
+        [(
+            ritornel_domain::library::Kind::Artist,
+            "moss arcade".to_owned(),
+            "the moss arcade".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn an_artist_with_no_id_keeps_its_row_when_the_normaliser_changes() {
+    let mut rig = Rig::new();
+    rig.put(FLAC, "a.flac");
+    rig.put("Loose/tone.ogg", "a.retagged.ogg");
+    rig.scan();
+    let (library, _) = rig.library.load().unwrap();
+    let (row, key) = library
+        .artists
+        .iter()
+        .find(|(row, _)| !library.artist_mbids.contains_key(row))
+        .cloned()
+        .unwrap();
+    let before = rig.rows("SELECT id, hex(public_id), display_name FROM artist ORDER BY id");
+    let old_key = format!("{key}~old");
+    // As an earlier normaliser left it: another key on the row, and that
+    // normaliser's version on the library.
+    let request = WriteRequest {
+        method: "test.normaliser",
+        command: None,
+        client: None,
+    };
+    rig.library
+        .write(request, move |write| {
+            let connection = write.connection();
+            connection.execute(
+                "UPDATE artist SET match_name = ?2 WHERE id = ?1",
+                (row, &old_key),
+            )?;
+            let versions: String = connection.query_row(
+                "SELECT value_json FROM library_setting WHERE key = 'identity.versions'",
+                [],
+                |row| row.get(0),
+            )?;
+            let old = versions.replace(
+                &format!("\"normalizer\":{}", ritornel_domain::NORMALIZER_VERSION),
+                "\"normalizer\":0",
+            );
+            assert_ne!(old, versions);
+            connection.execute(
+                "UPDATE library_setting SET value_json = ?1 WHERE key = 'identity.versions'",
+                [old],
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolve",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    // No row is made for it: it keeps its row and public ID, under the key
+    // today's normaliser makes.
+    assert_eq!(
+        rig.rows("SELECT id, hex(public_id), display_name FROM artist ORDER BY id"),
+        before
+    );
+    assert_eq!(
+        rig.one(&format!("SELECT match_name FROM artist WHERE id = {row}")),
+        key
+    );
 }

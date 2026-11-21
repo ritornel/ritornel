@@ -4,20 +4,62 @@
 //! 12 and "Displayed metadata" in docs/design/identity.md.
 
 use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 
 /// The version of [`normalize`] and [`core`]. A stored key is only
 /// comparable with one made by the same version.
-pub const NORMALIZER_VERSION: i64 = 1;
+///
+/// 2: a mark is kept wherever NFKC leaves it, so a virama or a tone mark
+/// keeps two names apart; punctuation that parts words (a dash, a slash, a
+/// plus) parts them as a space does; and "&" reads as "and".
+pub const NORMALIZER_VERSION: i64 = 2;
 
-/// The key of a name: NFKC, lower case, punctuation and symbols removed,
-/// runs of white space made one space. A name that is nothing but
-/// punctuation keeps it, so that `!!!` and `???` stay two names.
+/// Whether a mark between two words parts them as a space does: dashes,
+/// slashes and the like. Everything else that is not a letter, a digit or a
+/// mark joins what is on either side of it, as an apostrophe does.
+fn parts_words(c: char) -> bool {
+    matches!(
+        c,
+        '-' | '\u{2010}'
+            ..='\u{2015}'
+                | '\u{2212}'
+                | '\u{2E3A}'
+                | '\u{2E3B}'
+                | '/'
+                | '\\'
+                | '|'
+                | '+'
+                | ','
+                | ';'
+                | ':'
+                | '_'
+                | '~'
+                | '\u{00B7}'
+                | '\u{2022}'
+    )
+}
+
+/// The key of a name: NFKC, lower case, "&" as "and", punctuation that
+/// parts words made a space, other punctuation and symbols removed, runs of
+/// white space made one space. A name that is nothing but punctuation
+/// keeps it, so that `!!!` and `???` stay two names.
 pub fn normalize(text: &str) -> String {
     let folded: String = text.nfkc().flat_map(char::to_lowercase).collect();
-    let mut key = String::with_capacity(folded.len());
-    for word in folded.split_whitespace() {
-        let kept: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
-        if kept.is_empty() {
+    let mut spaced = String::with_capacity(folded.len());
+    for c in folded.chars() {
+        match c {
+            '&' => spaced.push_str(" and "),
+            c if parts_words(c) => spaced.push(' '),
+            c => spaced.push(c),
+        }
+    }
+    let mut key = String::with_capacity(spaced.len());
+    for word in spaced.split_whitespace() {
+        let kept: String = word
+            .chars()
+            .filter(|c| c.is_alphanumeric() || is_combining_mark(*c))
+            .collect();
+        if !kept.chars().any(char::is_alphanumeric) {
             continue;
         }
         if !key.is_empty() {
@@ -134,6 +176,43 @@ mod tests {
         assert_eq!(normalize("Ne$ta"), "neta");
         assert_eq!(normalize("Song - Part 2"), "song part 2");
         assert_eq!(normalize("ÉTÉ"), "été");
+    }
+
+    #[test]
+    fn punctuation_between_words_is_the_same_with_or_without_spaces_round_it() {
+        // A dash, a slash or a plus parts the words on either side, as the
+        // same mark with spaces round it does.
+        for (joined, spaced) in [
+            ("Lanterns-42", "Lanterns - 42"),
+            ("lanterns\u{2010}42", "Lanterns 42"),
+            ("Here/There", "Here / There"),
+            ("Tide+Shore", "Tide + Shore"),
+            ("Glass:Water", "Glass: Water"),
+        ] {
+            assert_eq!(normalize(joined), normalize(spaced), "{joined}");
+        }
+        assert_eq!(normalize("Lanterns\u{2014}42"), "lanterns 42");
+        // "&" reads as the word it stands for, wherever it is written.
+        assert_eq!(normalize("Mira & Vale"), "mira and vale");
+        assert_eq!(normalize("Mira&Vale"), normalize("Mira and Vale"));
+        // What joins a word stays joined.
+        assert_eq!(normalize("Don't"), normalize("Dont"));
+        assert_eq!(normalize("M.I.R.A."), normalize("MIRA"));
+        assert_eq!(normalize("Ne$ta"), "neta");
+    }
+
+    #[test]
+    fn a_mark_that_makes_another_letter_keeps_two_names_apart() {
+        // A virama, which joins two consonants, and a Thai tone mark: none
+        // has a composed form for NFKC to fold it into.
+        let virama = "\u{0915}\u{094D}\u{0937}";
+        assert_ne!(normalize(virama), normalize("\u{0915}\u{0937}"));
+        let tone = "\u{0E43}\u{0E01}\u{0E25}\u{0E49}";
+        assert_ne!(normalize(tone), normalize("\u{0E43}\u{0E01}\u{0E25}"));
+        // A Latin letter with a mark it has no composed form for.
+        assert_ne!(normalize("Spin\u{0308}al"), normalize("Spinal"));
+        // Folding accents to find candidates still takes the Latin one off.
+        assert_eq!(fold_accents(&normalize("Spin\u{0308}al")), "spinal");
     }
 
     #[test]
