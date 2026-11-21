@@ -14,7 +14,8 @@ use std::hash::Hash;
 /// the policy's. A library last resolved by another is resolved again.
 ///
 /// 1: a name with no ID written as one artist's sort name is that artist.
-pub const CATALOG_VERSION: i64 = 1;
+/// 2: a disc marker before an album title's bracketed notes is a disc.
+pub const CATALOG_VERSION: i64 = 2;
 
 use crate::extract::{Facts, parse_date};
 use crate::library::{

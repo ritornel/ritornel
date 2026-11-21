@@ -40,10 +40,31 @@ fn marker(text: &str) -> Option<i64> {
     digits.parse().ok().filter(|disc| *disc >= 1)
 }
 
-/// An album title with a trailing disc marker, split into the title
-/// without it and the disc. A title that is nothing but the marker is
-/// left alone.
+/// An album title with a disc marker at its end, or before the bracketed
+/// notes at its end, split into the title without it and the disc. The
+/// notes are kept: "White Field Disk 1 [Half-Speed]" is disc 1 of "White Field
+/// [Half-Speed]". A title that is nothing but the marker is left alone.
 pub(crate) fn disc_in_title(album: &str) -> Option<(String, i64)> {
+    if let Some(found) = trailing_disc(album) {
+        return Some(found);
+    }
+    // Take the last bracketed note off and look again before it.
+    let album = album.trim_end();
+    let close = album.chars().last()?;
+    let open = match close {
+        ')' => '(',
+        ']' => '[',
+        _ => return None,
+    };
+    let at = album.rfind(open)?;
+    let (before, note) = (album.get(..at)?, album.get(at..)?);
+    let (title, disc) = disc_in_title(before)?;
+    Some((format!("{title} {note}"), disc))
+}
+
+/// An album title whose last words or last bracketed note are a disc
+/// marker, split into the title without it and the disc.
+fn trailing_disc(album: &str) -> Option<(String, i64)> {
     let album = album.trim_end();
     let (before, disc) = if let Some(open) = album
         .strip_suffix(')')
@@ -225,6 +246,43 @@ mod tests {
             "Discovery 2",
             "Night Drives (Disc 0)",
             "Night Drives CD 123",
+        ] {
+            assert_eq!(split(title), None, "{title}");
+        }
+    }
+
+    #[test]
+    fn a_disc_marker_before_an_edition_note_is_split_and_the_note_kept() {
+        let split = |title: &str| disc_in_title(title);
+        let some = |title: &str, disc| Some((title.to_owned(), disc));
+        assert_eq!(
+            split("White Field Disk 1 [Half-Speed]"),
+            some("White Field [Half-Speed]", 1)
+        );
+        assert_eq!(
+            split("White Field Disk 2 [Half-Speed]"),
+            some("White Field [Half-Speed]", 2)
+        );
+        assert_eq!(
+            split("Night Drives (Disc 2) [Remastered]"),
+            some("Night Drives [Remastered]", 2)
+        );
+        assert_eq!(
+            split("Night Drives - CD2 (Deluxe Edition) [24-96]"),
+            some("Night Drives (Deluxe Edition) [24-96]", 2)
+        );
+        // Titles that only hold the word, or a marker that is not last
+        // before the notes, are left alone.
+        for title in [
+            "Disk 1 [Half-Speed]",
+            "Slipped Disc (Remastered)",
+            "The Disk Drive [Deluxe]",
+            "Disco 2 [Live]",
+            "Discs 3 (Live)",
+            "Disc Jockey (Disco Mix)",
+            "Night Drives (Disc 2 Bonus) [Live]",
+            "Disc 2 Sessions (Live)",
+            "Night Drives [Disc]",
         ] {
             assert_eq!(split(title), None, "{title}");
         }
