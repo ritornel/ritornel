@@ -7,7 +7,7 @@
 //! with what the rows hold and keeps only what differs, so a resolution
 //! that changes nothing writes nothing, and takes no library revision.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ritornel_domain::library::{
     Current, Evidence, ExistingCredit, ExistingRelease, Item, Kind, Library, Method, Ref,
@@ -369,11 +369,11 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
         library.groups.insert(id, preferred);
         shown.groups.insert(id, display);
     }
-    // A row is found by the key the normaliser made of its name. When the
-    // library was last resolved by another normaliser, the stored key is
-    // that one's, and the row's name is keyed again, or an artist with no
-    // ID would take a new row and a new public ID.
-    let normalizer_changed = connection
+    // A row is found by the key the normaliser made of its names. When the
+    // library was last resolved by another normaliser, the stored keys are
+    // that one's, and the resolver also looks rows up by them, or an artist
+    // with no ID would take a new row and a new public ID.
+    library.artist_keys_by = connection
         .query_row(
             "SELECT json_extract(value_json, '$.normalizer') FROM library_setting WHERE key = ?1",
             [VERSIONS_SETTING],
@@ -381,7 +381,7 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
         )
         .optional()?
         .flatten()
-        .is_some_and(|stored| stored != NORMALIZER_VERSION);
+        .filter(|stored| *stored != NORMALIZER_VERSION);
     for (id, redirected, name, sort, match_name) in rows(
         connection,
         "SELECT id, redirect_to_id IS NOT NULL, display_name, display_sort_name, match_name
@@ -396,12 +396,8 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
             ))
         },
     )? {
-        let key = match (&name, normalizer_changed) {
-            (Some(name), true) => Some(normalize(name)),
-            _ => match_name.clone(),
-        };
-        if let (false, Some(key)) = (redirected, key) {
-            library.artists.push((id, key));
+        if let (false, Some(match_name)) = (redirected, &match_name) {
+            library.artists.push((id, match_name.clone()));
         }
         shown.artists.insert(id, (name, sort, match_name));
     }
@@ -547,6 +543,9 @@ pub(crate) struct Plan {
     search: Vec<Option<(String, String, String)>>,
     /// Appearances in the search index that no file is bound to any more.
     unsearchable: Vec<i64>,
+    /// Artist rows no file credits now, keyed again after the normaliser
+    /// changed, so that their key is today's when their files return.
+    rekeyed: Vec<(i64, String)>,
     versions: bool,
     /// The version of the policy that made the resolution, which its
     /// decisions record.
@@ -700,8 +699,42 @@ impl Plan {
             .copied()
             .collect();
         unsearchable.sort_unstable();
+        // After the normaliser changed, a row the resolution does not reach
+        // is keyed again from its name, unless that name is the owner's
+        // edit, which its files never gave, or the new key is an artist's
+        // the resolution has: then the change joined the two, and the row
+        // would take that artist's place at the next resolution.
+        let mut rekeyed = Vec::new();
+        if library.artist_keys_by.is_some() {
+            let reached: HashSet<i64> = resolution
+                .artists
+                .iter()
+                .filter_map(|out| as_row(out.r))
+                .collect();
+            let held: HashSet<&str> = resolution
+                .artists
+                .iter()
+                .map(|out| out.match_name.as_str())
+                .collect();
+            for (row, stored) in &library.artists {
+                let edited = library
+                    .edits
+                    .contains_key(&(Kind::Artist, *row, "name".to_owned()));
+                let name = shown
+                    .artists
+                    .get(row)
+                    .and_then(|(name, _, _)| name.as_deref());
+                if let (false, false, Some(name)) = (reached.contains(row), edited, name) {
+                    let key = normalize(name);
+                    if key != *stored && !held.contains(key.as_str()) {
+                        rekeyed.push((*row, key));
+                    }
+                }
+            }
+        }
         let mut plan = Self {
             unsearchable,
+            rekeyed,
             canonical: library.recording_canonical.clone(),
             artists,
             recordings,
@@ -749,6 +782,7 @@ impl Plan {
             && none(&self.appearances)
             && self.search.iter().all(Option::is_none)
             && self.unsearchable.is_empty()
+            && self.rekeyed.is_empty()
     }
 
     /// Writes what differs, in the write's transaction.
@@ -798,6 +832,11 @@ impl Plan {
                 }
             };
             artist_rows.push(row);
+        }
+        for (row, key) in &self.rekeyed {
+            connection
+                .prepare_cached("UPDATE artist SET match_name = ?2, rev = ?3 WHERE id = ?1")?
+                .execute((row, key, rev))?;
         }
 
         let mut credit_rows = Vec::with_capacity(resolution.credits.len());

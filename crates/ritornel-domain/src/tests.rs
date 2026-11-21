@@ -956,6 +956,39 @@ fn artists_bind_by_id_then_by_exact_normalised_name_and_strings_are_not_parsed()
 }
 
 #[test]
+fn an_artist_with_no_id_keeps_its_row_across_a_change_of_normaliser() {
+    for edited in [false, true] {
+        let mut world = World::default();
+        world.add(file("A/1.flac", 1).song("Lanterns", "Tin-Harbour", 200));
+        let first = world.settle();
+        let row = match first.artists[0].r {
+            Ref::Row(row) => row,
+            Ref::New(_) => world.library.artists[0].0,
+        };
+        // As normaliser 1 left it: its key, which joined the letters
+        // round the dash, and maybe the owner's name for it.
+        world.library.artists = vec![(row, "tinharbour".to_owned())];
+        world.library.artist_keys_by = Some(1);
+        if edited {
+            world.library.edits.insert(
+                (Kind::Artist, row, "name".to_owned()),
+                "Harbour of Tin".to_owned(),
+            );
+        }
+        let resolution = world.settle();
+        assert_eq!(resolution.artists[0].r, Ref::Row(row), "edited: {edited}");
+        assert_eq!(resolution.artists[0].match_name, "tin harbour");
+        // Without the earlier version named, the row is not found.
+        world.library.artists = vec![(row, "tinharbour".to_owned())];
+        world.library.artist_keys_by = None;
+        assert!(matches!(
+            catalog::resolve(&world.library, &world.policy).artists[0].r,
+            Ref::New(_)
+        ));
+    }
+}
+
+#[test]
 fn the_owners_assignment_is_kept_and_an_exclusion_removes_a_candidate() {
     let mut world = World::default();
     let first = world.add(file("A/1.flac", 1).song("Glass Pier", "Ninefold", 200));

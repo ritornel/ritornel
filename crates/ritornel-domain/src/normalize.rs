@@ -74,6 +74,38 @@ pub fn normalize(text: &str) -> String {
     }
 }
 
+/// The key of a name as normaliser `version` made it, for finding what an
+/// earlier version keyed: `None` for a version this one does not know.
+pub fn normalize_by(version: i64, text: &str) -> Option<String> {
+    match version {
+        1 => Some(normalize_v1(text)),
+        NORMALIZER_VERSION => Some(normalize(text)),
+        _ => None,
+    }
+}
+
+/// Version 1's key: punctuation inside a word joined the letters on either
+/// side, and every mark was dropped.
+fn normalize_v1(text: &str) -> String {
+    let folded: String = text.nfkc().flat_map(char::to_lowercase).collect();
+    let mut key = String::with_capacity(folded.len());
+    for word in folded.split_whitespace() {
+        let kept: String = word.chars().filter(|c| c.is_alphanumeric()).collect();
+        if kept.is_empty() {
+            continue;
+        }
+        if !key.is_empty() {
+            key.push(' ');
+        }
+        key.push_str(&kept);
+    }
+    if key.is_empty() {
+        folded.split_whitespace().collect::<Vec<_>>().join(" ")
+    } else {
+        key
+    }
+}
+
 /// The key of a title without what is written in brackets after it, such as
 /// `(Remastered 2011)` or `[Deluxe Edition]`. It finds candidates among
 /// titles that differ only in such a note. A title that is all brackets
@@ -213,6 +245,20 @@ mod tests {
         assert_ne!(normalize("Spin\u{0308}al"), normalize("Spinal"));
         // Folding accents to find candidates still takes the Latin one off.
         assert_eq!(fold_accents(&normalize("Spin\u{0308}al")), "spinal");
+    }
+
+    #[test]
+    fn the_first_version_of_a_key_can_be_made_again() {
+        assert_eq!(
+            normalize_by(1, "Lanterns-42"),
+            Some("lanterns42".to_owned())
+        );
+        assert_eq!(normalize_by(1, "Mira & Vale"), Some("mira vale".to_owned()));
+        assert_eq!(
+            normalize_by(NORMALIZER_VERSION, "Lanterns-42"),
+            Some(normalize("Lanterns-42"))
+        );
+        assert_eq!(normalize_by(0, "Lanterns"), None);
     }
 
     #[test]

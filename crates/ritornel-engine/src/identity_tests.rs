@@ -650,22 +650,10 @@ fn an_alias_the_owner_taught_under_another_normaliser_is_not_read_as_a_key() {
 }
 
 #[test]
-fn an_artist_with_no_id_keeps_its_row_when_the_normaliser_changes() {
-    let mut rig = Rig::new();
-    rig.put(FLAC, "a.flac");
-    rig.put("Loose/tone.ogg", "a.retagged.ogg");
-    rig.scan();
-    let (library, _) = rig.library.load().unwrap();
-    let (row, key) = library
-        .artists
-        .iter()
-        .find(|(row, _)| !library.artist_mbids.contains_key(row))
-        .cloned()
-        .unwrap();
-    let before = rig.rows("SELECT id, hex(public_id), display_name FROM artist ORDER BY id");
-    let old_key = format!("{key}~old");
-    // As an earlier normaliser left it: another key on the row, and that
-    // normaliser's version on the library.
+fn an_artist_no_file_credits_is_keyed_again_when_the_normaliser_changes() {
+    let rig = scanned();
+    // Two rows no file credits, as normaliser 1 keyed them; the owner
+    // renamed the second.
     let request = WriteRequest {
         method: "test.normaliser",
         command: None,
@@ -674,9 +662,25 @@ fn an_artist_with_no_id_keeps_its_row_when_the_normaliser_changes() {
     rig.library
         .write(request, move |write| {
             let connection = write.connection();
+            // The third is the scanned artist under another spelling, which
+            // today's normaliser joins to it.
+            for (row, name) in [(901, "Lanterns-42"), (902, "Tin/Harbour"), (903, "Moss/Arcade")] {
+                connection.execute(
+                    "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
+                     VALUES (?1, ?2, ?1, ?3, ?3, ?4, ?5)",
+                    (
+                        row,
+                        write.new_id()?.as_bytes(),
+                        name,
+                        ritornel_domain::normalize::normalize_by(1, name),
+                        write.rev(),
+                    ),
+                )?;
+            }
             connection.execute(
-                "UPDATE artist SET match_name = ?2 WHERE id = ?1",
-                (row, &old_key),
+                "INSERT INTO metadata_edit (entity_kind, entity_id, field, value, actor_kind, edited_at_ms, rev)
+                 VALUES ('artist', 902, 'name', 'Tin/Harbour', 'person', ?1, ?2)",
+                (write.now_ms(), write.rev()),
             )?;
             let versions: String = connection.query_row(
                 "SELECT value_json FROM library_setting WHERE key = 'identity.versions'",
@@ -685,7 +689,7 @@ fn an_artist_with_no_id_keeps_its_row_when_the_normaliser_changes() {
             )?;
             let old = versions.replace(
                 &format!("\"normalizer\":{}", ritornel_domain::NORMALIZER_VERSION),
-                "\"normalizer\":0",
+                "\"normalizer\":1",
             );
             assert_ne!(old, versions);
             connection.execute(
@@ -695,6 +699,8 @@ fn an_artist_with_no_id_keeps_its_row_when_the_normaliser_changes() {
             Ok(String::new())
         })
         .unwrap();
+    let (library, _) = rig.library.load().unwrap();
+    assert_eq!(library.artist_keys_by, Some(1));
     rig.library
         .resolve(WriteRequest {
             method: "test.resolve",
@@ -702,14 +708,24 @@ fn an_artist_with_no_id_keeps_its_row_when_the_normaliser_changes() {
             client: None,
         })
         .unwrap();
-    // No row is made for it: it keeps its row and public ID, under the key
-    // today's normaliser makes.
+    // The first has today's key, so its files find it when they return;
+    // the renamed one keeps the key its files gave, and the library is
+    // marked as keyed by today's normaliser.
     assert_eq!(
-        rig.rows("SELECT id, hex(public_id), display_name FROM artist ORDER BY id"),
-        before
+        rig.rows("SELECT id || '|' || match_name FROM artist WHERE id > 900 ORDER BY id"),
+        ["901|lanterns 42", "902|tinharbour", "903|mossarcade"]
     );
-    assert_eq!(
-        rig.one(&format!("SELECT match_name FROM artist WHERE id = {row}")),
-        key
+    // A second resolution changes nothing.
+    assert!(
+        rig.library
+            .resolve(WriteRequest {
+                method: "test.resolve",
+                command: None,
+                client: None,
+            })
+            .unwrap()
+            .is_none()
     );
+    let (library, _) = rig.library.load().unwrap();
+    assert_eq!(library.artist_keys_by, None);
 }

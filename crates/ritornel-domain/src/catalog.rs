@@ -15,7 +15,7 @@ use crate::library::{
     AppearanceOut, ArtistOut, CreditOut, GroupOut, Item, ItemOut, Kind, Library, RecordingOut, Ref,
     ReleaseOut, Resolution,
 };
-use crate::normalize::{core, normalize};
+use crate::normalize::{core, normalize, normalize_by};
 use crate::resolve::{Policy, RecKey, fold};
 
 /// The name of the album artist of an album whose tracks have different
@@ -743,12 +743,26 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 id_rows.get_mut(mbid.as_str()).and_then(VecDeque::pop_front),
                 Some(mbid.clone()),
             ),
-            ArtistKey::Name(_) => (
-                free_rows
+            ArtistKey::Name(_) => {
+                let mut row = free_rows
                     .get_mut(match_name.as_str())
-                    .and_then(VecDeque::pop_front),
-                None,
-            ),
+                    .and_then(VecDeque::pop_front);
+                // After the normaliser changed, its row may still hold the
+                // key the earlier version made of the names its files give.
+                if let Some(version) = library.artist_keys_by {
+                    for spelling in &entry.names {
+                        if row.is_some() {
+                            break;
+                        }
+                        if let Some(old) = normalize_by(version, spelling) {
+                            row = free_rows
+                                .get_mut(old.as_str())
+                                .and_then(VecDeque::pop_front);
+                        }
+                    }
+                }
+                (row, None)
+            }
         };
         let r = row.map_or(Ref::New(artists.len()), Ref::Row);
         let name = edit(Kind::Artist, r, "name").unwrap_or(name);
