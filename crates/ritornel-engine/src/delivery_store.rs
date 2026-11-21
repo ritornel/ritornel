@@ -111,7 +111,7 @@ fn endpoint_of(connection: &Connection, account: Id) -> Result<(i64, i64), Error
 }
 
 /// Why a play is not sent when the account has it from another player.
-const ALREADY_SCROBBLED: &str = "the account already has this play from another player";
+pub(crate) const ALREADY_SCROBBLED: &str = "the account already has this play from another player";
 
 /// Whether the account already has a scrobble of this track within a
 /// second of `seconds` that is not an echo of ours: one another player

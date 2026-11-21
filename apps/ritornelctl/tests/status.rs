@@ -300,7 +300,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
         })
         .collect();
     let logs_dir = data_dir.join("logs");
-    assert_eq!(facts.len(), 12, "{}", printed.stdout);
+    assert_eq!(facts.len(), 13, "{}", printed.stdout);
     assert_eq!(
         facts[..7],
         [
@@ -328,6 +328,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             "none: no backup folder is named (backup_dir in config.toml)"
         )
     );
+    assert_eq!(facts[12], ("Record", "advancing"));
 
     // For a program: the status as the server sent it.
     let printed = status(&data_dir, &["--json"]);
@@ -356,6 +357,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
                 "folders": [],
             },
             "backup": {},
+            "record": { "problems": [] },
         })
     );
 
@@ -433,7 +435,7 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
     // The status shows what now exists.
     let printed = status(&data_dir, &[]);
     let shown = facts(&printed);
-    assert_eq!(shown.len(), 14, "{}", printed.stdout);
+    assert_eq!(shown.len(), 15, "{}", printed.stdout);
     assert_eq!(shown[12], ("Watching", "on"));
     assert_eq!(shown[2], ("Role", "hub"));
     assert_eq!(

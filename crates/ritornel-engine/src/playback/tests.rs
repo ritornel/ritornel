@@ -231,6 +231,7 @@ fn setup(
         entropy: entropy.clone(),
         checkpoint_every_ms: super::CHECKPOINT_EVERY_MS,
         fail_at_position_ms: None,
+        fail_saves_after_ms: None,
     }
 }
 

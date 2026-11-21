@@ -3,21 +3,39 @@
 
 use std::io::Write;
 
+use ritornel_client::contract::methods::RecordDismiss;
 use ritornel_client::contract::{
-    BackupStatus, ServerStatus, WatchStatus, WatchedFolder, WatchedKind,
+    BackupStatus, DismissParams, RecordProblem, RecordProblemKind, RecordStatus, ServerStatus,
+    WatchStatus, WatchedFolder, WatchedKind,
 };
 use ritornel_client::local;
 
-use crate::cli::{Error, ServerArgs};
+use crate::cli::{Error, StatusArgs};
 use crate::server;
 
 pub(crate) fn status(
-    args: &ServerArgs,
+    args: &StatusArgs,
     env: local::Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    let status = server::ask(args, env, async |client| client.status().await)?;
-    server::print(args, out, &status, serde_json::to_string_pretty, render)
+    let dismiss = args.dismiss;
+    let status = server::ask(&args.server, env, async |client| {
+        if dismiss {
+            client
+                .call::<RecordDismiss>(&DismissParams {
+                    idempotency_key: ritornel_client::idempotency_key()?,
+                })
+                .await?;
+        }
+        client.status().await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &status,
+        serde_json::to_string_pretty,
+        render,
+    )
 }
 
 /// The status as a person reads it: one fact a line.
@@ -53,7 +71,63 @@ fn render(status: &ServerStatus) -> String {
     if let Some(backup) = &status.backup {
         backups(backup, &mut lines);
     }
+    if let Some(record) = &status.record {
+        recording(record, &mut lines);
+    }
     server::facts(&lines)
+}
+
+/// Whether the record advances, and if not, a line for each thing that
+/// stops it, with since when.
+fn recording(record: &RecordStatus, lines: &mut Vec<(&str, String)>) {
+    if record.problems.is_empty() {
+        lines.push(("Record", "advancing".to_owned()));
+        return;
+    }
+    for (n, problem) in record.problems.iter().enumerate() {
+        lines.push((if n == 0 { "Record" } else { "" }, stopped(problem)));
+    }
+    if record.problems.iter().any(|problem| problem.dismissable) {
+        lines.push((
+            "",
+            "`ritornelctl status --dismiss` sets these scrobbles aside".to_owned(),
+        ));
+    }
+}
+
+/// One thing that stops the record: what, how many, since when and why.
+fn stopped(problem: &RecordProblem) -> String {
+    let n = problem.count;
+    let many = |one: &str, more: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {more}")
+        }
+    };
+    let what = match problem.kind {
+        RecordProblemKind::ListenUnsaved => "the listen playing cannot be saved".to_owned(),
+        RecordProblemKind::ListensUndelivered => {
+            format!("{} not reached history", many("listen has", "listens have"))
+        }
+        RecordProblemKind::ScrobblesUnknown => format!(
+            "{} not have reached Last.fm",
+            many("scrobble may", "scrobbles may")
+        ),
+        RecordProblemKind::ScrobblesWithdrawn => format!(
+            "{} not sent to Last.fm",
+            many("scrobble was", "scrobbles were")
+        ),
+        RecordProblemKind::ImportFailed if n == 1 => "importing from Last.fm failed".to_owned(),
+        RecordProblemKind::ImportFailed => {
+            format!("importing from Last.fm failed {n} times in a row")
+        }
+    };
+    let mut line = format!("{what}, since {}", crate::lastfm::utc(problem.since));
+    if let Some(detail) = &problem.detail {
+        line.push_str(&format!(": {detail}"));
+    }
+    line
 }
 
 /// Where backups go, the last one and the last failure. With no folder
@@ -179,6 +253,7 @@ mod tests {
             log_path: "/srv/ritornel/logs".to_owned(),
             watch: None,
             backup: None,
+            record: None,
         }
     }
 
@@ -271,6 +346,65 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
             .starts_with(
                 "Backup            none: the last, 2025-11-21 17:01 UTC, is no longer at "
             )
+        );
+    }
+
+    #[test]
+    fn the_record_says_what_stops_it_and_since_when() {
+        let tail = |record: RecordStatus| {
+            let mut status = example();
+            status.record = Some(record);
+            render(&status)
+                .split_once("Log path          /srv/ritornel/logs\n")
+                .unwrap()
+                .1
+                .to_owned()
+        };
+        assert_eq!(
+            tail(RecordStatus { problems: vec![] }),
+            "Record            advancing\n"
+        );
+        let at = 1_763_744_462_000;
+        let problem = |kind, count, detail: Option<&str>, dismissable| RecordProblem {
+            kind,
+            since: at,
+            count,
+            detail: detail.map(str::to_owned),
+            dismissable,
+        };
+        assert_eq!(
+            tail(RecordStatus {
+                problems: vec![
+                    problem(
+                        RecordProblemKind::ListenUnsaved,
+                        1,
+                        Some("disk I/O error"),
+                        false
+                    ),
+                    problem(RecordProblemKind::ListensUndelivered, 3, None, false),
+                    problem(RecordProblemKind::ScrobblesUnknown, 1, None, true),
+                    problem(
+                        RecordProblemKind::ScrobblesWithdrawn,
+                        2,
+                        Some("its play is excluded"),
+                        true
+                    ),
+                    problem(
+                        RecordProblemKind::ImportFailed,
+                        1,
+                        Some("Last.fm did not answer"),
+                        false
+                    ),
+                ],
+            }),
+            "\
+Record            the listen playing cannot be saved, since 2025-11-21 17:01 UTC: disk I/O error
+                  3 listens have not reached history, since 2025-11-21 17:01 UTC
+                  1 scrobble may not have reached Last.fm, since 2025-11-21 17:01 UTC
+                  2 scrobbles were not sent to Last.fm, since 2025-11-21 17:01 UTC: its play is excluded
+                  importing from Last.fm failed, since 2025-11-21 17:01 UTC: Last.fm did not answer
+                  `ritornelctl status --dismiss` sets these scrobbles aside
+"
         );
     }
 

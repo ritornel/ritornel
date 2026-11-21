@@ -205,6 +205,7 @@ fn playback(output: Option<&str>, env: Env<'_>) -> PlaybackRun {
     PlaybackRun {
         output,
         fail_at_position_ms: number("RITORNEL_TEST_FAIL_AT_POSITION_MS"),
+        fail_saves_after_ms: number("RITORNEL_TEST_FAIL_SAVES_AFTER_MS"),
         fail_after_ingest: env("RITORNEL_TEST_FAIL_AFTER_INGEST").is_some(),
         media_session: env("RITORNEL_TEST_NO_MEDIA_SESSION").is_none(),
     }

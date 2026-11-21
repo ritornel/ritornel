@@ -109,6 +109,10 @@ pub struct PlayerSetup {
     /// For the crash test alone: stop with [`Error::FailPoint`] once the
     /// track playing passes this position, without saving anything.
     pub fail_at_position_ms: Option<i64>,
+    /// For the record's tests alone: once the track playing passes this
+    /// position, every save fails as a full disk's would, and playback
+    /// goes on.
+    pub fail_saves_after_ms: Option<i64>,
 }
 
 /// The track in an entry, with the copy that was opened for it.
@@ -630,7 +634,13 @@ impl Player {
         }
         let place = (self.entry_row(), self.position(), self.resume_listen);
         let mono = self.setup.timekeeper.mono_ms();
-        match server.save_listens(self.recorder.unsaved(live), place, mono) {
+        let saved = match self.setup.fail_saves_after_ms {
+            Some(limit) if self.position() >= limit => Err(Error::Io(std::io::Error::other(
+                "a test asked for saves to fail",
+            ))),
+            _ => server.save_listens(self.recorder.unsaved(live), place, mono),
+        };
+        match saved {
             Ok(()) => {
                 self.unsaved = None;
                 if self.recorder.saved(live) {

@@ -216,6 +216,97 @@ pub struct ServerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub backup: Option<BackupStatus>,
+    /// Whether the listening record is advancing, and what has stopped it
+    /// if not. Left out by a server that does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub record: Option<RecordStatus>,
+}
+
+/// Whether the listening record is advancing: each listen saved and taken
+/// into history, each scrobble answered, each import done. Music can go on
+/// playing while it does not, so this is said wherever the status is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct RecordStatus {
+    /// What is wrong now, oldest first. Empty when the record advances.
+    pub problems: Vec<RecordProblem>,
+}
+
+/// One thing that has stopped the record advancing, and since when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct RecordProblem {
+    pub kind: RecordProblemKind,
+    /// When it began, as Unix milliseconds.
+    pub since: i64,
+    /// How many listens, scrobbles or imports.
+    pub count: u64,
+    /// What the newest said went wrong, as the server or the service put
+    /// it. Display text only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub detail: Option<String>,
+    /// Whether it lasts until `record.dismiss` sets it aside. The others
+    /// end when what is wrong is put right.
+    pub dismissable: bool,
+}
+
+/// What has stopped the record advancing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum RecordProblemKind {
+    /// The player cannot save the listen it is recording.
+    ListenUnsaved,
+    /// Listens saved on this server have failed to reach history. They are
+    /// tried again.
+    ListensUndelivered,
+    /// Scrobbles were sent and never answered, and no import has brought
+    /// them back since: the service may not have them. They are not sent
+    /// again. One an import brings back stops counting here.
+    ScrobblesUnknown,
+    /// Scrobbles were never sent, because their plays stopped being ones
+    /// to send.
+    ScrobblesWithdrawn,
+    /// Importing the service's history failed, and has not worked since.
+    ImportFailed,
+}
+
+impl RecordProblemKind {
+    /// The kind as it is written on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ListenUnsaved => "listen_unsaved",
+            Self::ListensUndelivered => "listens_undelivered",
+            Self::ScrobblesUnknown => "scrobbles_unknown",
+            Self::ScrobblesWithdrawn => "scrobbles_withdrawn",
+            Self::ImportFailed => "import_failed",
+        }
+    }
+}
+
+/// The params of `record.dismiss`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct DismissParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+}
+
+/// The result of `record.dismiss`: the receipt, and the record as the
+/// status now says it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct Dismissed {
+    /// The receipt.
+    #[serde(flatten)]
+    pub receipt: crate::Receipt,
+    pub record: RecordStatus,
 }
 
 /// Where a server writes its backups, and the last it wrote. A backup is a
@@ -712,6 +803,7 @@ mod tests {
             log_path: "/srv/ritornel/logs".to_owned(),
             watch: None,
             backup: None,
+            record: None,
         };
         let mut wire = json!({
             "serverId": "11111111-1111-1111-1111-111111111111",

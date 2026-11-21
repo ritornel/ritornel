@@ -20,8 +20,8 @@ use ritornel_contract::methods::{
     ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
     PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
     PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
-    RatingsSet, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList, SourcesAdd,
-    SourcesList, SourcesTracks, TracksGet,
+    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList,
+    SourcesAdd, SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -57,6 +57,7 @@ mod media_keys;
 mod pages;
 mod playback;
 mod ratings;
+mod record;
 mod watch;
 
 pub(crate) use backup::record_backup;
@@ -136,6 +137,8 @@ pub(crate) struct Core {
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// Where backups go, once the server has started.
     backups: std::sync::OnceLock<crate::backup::Backups>,
+    /// A listen the player could not save, while it cannot.
+    unsaved: Mutex<record::Unsaved>,
     /// The system's media session, once `serve` has started one.
     #[cfg(feature = "media-session")]
     media_session: std::sync::OnceLock<crate::media_session::MediaSession>,
@@ -229,6 +232,7 @@ impl Core {
             lastfm: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
+            unsaved: Mutex::default(),
             #[cfg(feature = "media-session")]
             media_session: std::sync::OnceLock::new(),
         })
@@ -702,6 +706,9 @@ impl Core {
             HistoryExport::NAME => {
                 run::<HistoryExport>(params, |params| self.history_export(stores, &params))
             }
+            RecordDismiss::NAME => {
+                run::<RecordDismiss>(params, |params| self.record_dismiss(stores, &params))
+            }
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {
                 run::<HistorySetZones>(params, |params| self.history_set_zones(stores, &params))
@@ -811,6 +818,7 @@ impl Core {
             log_path: self.dir.logs().to_string_lossy().into_owned(),
             watch: Some(watch),
             backup: Some(self.backup_status(stores)),
+            record: Some(self.record_status(stores)),
         })
     }
 
@@ -1268,6 +1276,8 @@ mod tests {
                 },
                 // No backup folder is named, so there is no backup.
                 "backup": {},
+                // Nothing has stopped the record.
+                "record": { "problems": [] },
             })
         );
     }
@@ -1495,6 +1505,7 @@ mod tests {
                     entropy: Arc::new(OsEntropy),
                     checkpoint_every_ms: ritornel_engine::playback::CHECKPOINT_EVERY_MS,
                     fail_at_position_ms: None,
+                    fail_saves_after_ms: None,
                 };
                 let renderer = Box::new(OnDemand::new(Output::Null { speed: 1 }));
                 Player::restore(setup, renderer, stores.server(), None)

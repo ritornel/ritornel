@@ -1690,3 +1690,72 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
     let plays = reading_an_export::table(&again.path().join("plays.csv"));
     assert!(plays.iter().all(|play| play["source"].is_empty()));
 }
+
+#[test]
+fn scrobbles_that_ended_unknown_or_withdrawn_are_counted_from_when_they_ended_until_set_aside() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 + 10 * MINUTE;
+    let sent = at.listen(1, 0, start, 200_000);
+    let excluded = at.listen(2, 1, start + 5 * MINUTE, 300_000);
+    for listen in [&sent, &excluded] {
+        at.send(listen, PlayRule::V1);
+    }
+    assert_eq!(
+        at.library.lost_scrobbles(i64::MIN).unwrap(),
+        crate::LostScrobbles::default()
+    );
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 2);
+    // One is being sent when the run ends; the other is excluded first.
+    at.clock.set(start + 20 * MINUTE);
+    let due = at.library.take_due_deliveries(account, 0, 1).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(at.library.abandon_sending().unwrap(), 1);
+    at.clock.set(start + 30 * MINUTE);
+    exclude_listen(&at, excluded.listen_id);
+    assert!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+
+    let lost = at.library.lost_scrobbles(i64::MIN).unwrap();
+    let unknown = lost.unknown.unwrap();
+    assert_eq!((unknown.count, unknown.since_ms), (1, start + 20 * MINUTE));
+    assert_eq!(
+        unknown.detail.as_deref(),
+        Some("the server stopped while it was being sent")
+    );
+    let withdrawn = lost.withdrawn.unwrap();
+    assert_eq!(withdrawn.count, 1);
+    assert_eq!(withdrawn.detail.as_deref(), Some("its play is excluded"));
+
+    // The first's echo comes back with the next import: it arrived after
+    // all, and is not lost.
+    let echoed = at.library.lost_scrobbles(i64::MIN).unwrap();
+    assert!(echoed.unknown.is_some());
+    scrobble_of(
+        &at,
+        account,
+        due[0].timestamp_s,
+        &due[0].artist,
+        &due[0].title,
+    );
+    let echoed = at.library.lost_scrobbles(i64::MIN).unwrap();
+    assert_eq!(echoed.unknown, None);
+    assert_eq!(echoed.withdrawn.unwrap().count, 1);
+
+    // Set aside after the first: only the second is left.
+    let lost = at.library.lost_scrobbles(start + 25 * MINUTE).unwrap();
+    assert!(lost.unknown.is_none());
+    assert_eq!(lost.withdrawn.unwrap().count, 1);
+    // And after both, nothing.
+    assert_eq!(
+        at.library.lost_scrobbles(start + 30 * MINUTE).unwrap(),
+        crate::LostScrobbles::default()
+    );
+}
