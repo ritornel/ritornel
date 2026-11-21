@@ -188,7 +188,13 @@ pub(crate) struct Artist {
     reading: Option<Task<()>>,
     problem: bool,
     face: Option<Arc<RenderImage>>,
-    portrait: Option<(Arc<RenderImage>, Instant)>,
+    /// Their portrait as it came, at its own shape.
+    portrait: Option<Arc<image::RgbaImage>>,
+    /// The portrait made for the banner's box (`banner::melted`): the box's
+    /// size in device pixels, the picture, and when the first was shown.
+    melted: Option<((u32, u32), Arc<RenderImage>, Instant)>,
+    /// The size a portrait is being made for.
+    melting: Option<(u32, u32)>,
     /// Their picture blurred for the wash, and for the banner.
     pub blur: Option<(Arc<RenderImage>, Instant)>,
     banner_blur: Option<(Arc<RenderImage>, Instant)>,
@@ -248,6 +254,8 @@ impl Artist {
             problem: false,
             face: None,
             portrait: None,
+            melted: None,
+            melting: None,
             blur: None,
             banner_blur: None,
             pictured_for: None,
@@ -281,7 +289,7 @@ impl Artist {
         if let Some(image) = self.face.take() {
             drop_one(image);
         }
-        if let Some((image, _)) = self.portrait.take() {
+        if let Some((_, image, _)) = self.melted.take() {
             drop_one(image);
         }
         if let Some((image, _)) = self.blur.take() {
@@ -429,6 +437,41 @@ impl Artist {
         .detach();
     }
 
+    /// Makes the portrait for a box `size` device pixels, off the UI thread,
+    /// unless it is made or being made. The one it replaces is let go, so a
+    /// window resized narrow does not leave one behind at every width.
+    fn melt(&mut self, size: (u32, u32), cx: &mut Context<Self>) {
+        let Some(source) = &self.portrait else { return };
+        if self.melting == Some(size) || self.melted.as_ref().is_some_and(|made| made.0 == size) {
+            return;
+        }
+        self.melting = Some(size);
+        let source = Arc::clone(source);
+        let made = self
+            .net
+            .rt()
+            .spawn_blocking(move || crate::banner::melted(&source, size.0, size.1));
+        cx.spawn(async move |this, cx| {
+            let Ok(image) = made.await else { return };
+            this.update(cx, |page, cx| {
+                if page.melting != Some(size) {
+                    return;
+                }
+                page.melting = None;
+                let since = page
+                    .melted
+                    .as_ref()
+                    .map_or_else(Instant::now, |made| made.2);
+                if let Some((_, old, _)) = page.melted.replace((size, Arc::new(image), since)) {
+                    cx.drop_image(old, None);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Their picture: the face for the strip, the portrait, and the blurs
     /// for the banner and the wash; with no picture, soft colour from their name.
     fn pictures(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -452,10 +495,31 @@ impl Artist {
             page.face = Some(image);
         });
         // A portrait stands at most 380 points wide; a cover never stands there.
+        // It is kept at its own shape, and cropped to its box as it is made.
         if portrait {
-            self.fetch(art, (380. * scale).ceil() as u32, cx, |page, image| {
-                page.portrait = Some((image, Instant::now()));
+            let http = Arc::clone(&self.net.art);
+            let bucket = self.net.bucket((380. * scale).ceil() as u32);
+            let read = self.net.rt().spawn(async move {
+                let bytes = http.get(art, bucket).await?;
+                tokio::task::spawn_blocking(move || crate::covers::decode_picture(&bytes))
+                    .await
+                    .ok()
+                    .flatten()
             });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Some(source)) = read.await {
+                    this.update(cx, |page, cx| {
+                        page.portrait = Some(Arc::new(source));
+                        page.melting = None;
+                        if let Some((_, old, _)) = page.melted.take() {
+                            cx.drop_image(old, None);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
         }
         let http = Arc::clone(&self.net.art);
         let tone = crate::blur::wash_tone(theme::dark());
@@ -895,6 +959,15 @@ impl Render for Artist {
         self.pictures(window, cx);
         self.menued = crate::menu::marked(window, cx);
         let (width, viewport) = viewport_of(window);
+        // The portrait for its box in the banner, made again when that changes.
+        let pixels = window.scale_factor();
+        self.melt(
+            (
+                (banner::portrait_wide(width) * pixels).round() as u32,
+                (banner::HEIGHT * pixels).round() as u32,
+            ),
+            cx,
+        );
         // With Up next moving the page over, the page keeps to the room left
         // of the card; the banner still runs to the window's edge.
         let rail = crate::upnext::rail(cx);
@@ -1073,7 +1146,10 @@ impl Render for Artist {
             color: theme::deep(artist.and_then(|artist| artist.art_color)),
             face: self.face.clone(),
             hung: None,
-            portrait: self.portrait.clone(),
+            portrait: self
+                .melted
+                .as_ref()
+                .map(|(_, image, since)| (Arc::clone(image), *since)),
             picture: (self.look.picture, self.look.scale),
         };
         let actions = Actions {
