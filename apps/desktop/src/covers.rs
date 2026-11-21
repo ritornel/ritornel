@@ -252,6 +252,76 @@ impl Loader {
     }
 }
 
+/// Images evicted or released while another borrower (a flying cover, an
+/// ebbing wash in `Shell`, a lifted search thumbnail, or `frost::LAST`) still
+/// held a clone, waiting until only this queue holds the last reference.
+#[derive(Default)]
+struct PendingDrops {
+    images: Vec<Arc<RenderImage>>,
+}
+
+impl PendingDrops {
+    fn push(&mut self, image: Arc<RenderImage>) {
+        if !self.images.iter().any(|held| Arc::ptr_eq(held, &image)) {
+            self.images.push(image);
+        }
+    }
+
+    fn take_unshared(&mut self) -> Vec<Arc<RenderImage>> {
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < self.images.len() {
+            let unshared = self
+                .images
+                .get(i)
+                .is_some_and(|image| Arc::strong_count(image) == 1);
+            if unshared {
+                ready.push(self.images.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    }
+}
+
+thread_local! {
+    static PENDING_DROPS: std::cell::RefCell<PendingDrops> = Default::default();
+}
+
+/// Drops `image` from every window's sprite atlas immediately when nothing else
+/// still holds a clone, or queues it for `flush_dropped` once the last external
+/// borrower lets go so it is never stranded in the atlas.
+pub(crate) fn drop_unshared(
+    image: Arc<RenderImage>,
+    window: Option<&mut gpui::Window>,
+    cx: &mut App,
+) {
+    if Arc::strong_count(&image) == 1 {
+        cx.drop_image(image, window);
+    } else {
+        PENDING_DROPS.with(|pending| pending.borrow_mut().push(image));
+    }
+}
+
+/// Drops any queued view images whose external borrowers have released them.
+pub(crate) fn flush_dropped(window: &mut gpui::Window, cx: &mut App) {
+    let ready = PENDING_DROPS.with(|pending| {
+        let mut queue = pending.borrow_mut();
+        if queue.images.is_empty() {
+            return Vec::new();
+        }
+        queue.take_unshared()
+    });
+    if ready.is_empty() {
+        return;
+    }
+    for image in ready {
+        cx.drop_image(image, Some(window));
+    }
+    crate::platform::give_back();
+}
+
 /// Decodes a JPEG, resizes it to `px` square when it is larger, swaps it to
 /// BGRA for GPUI and reads its average colour.
 pub(crate) fn decode_cover(jpeg: &[u8], px: u32) -> Option<(RenderImage, Rgba, usize)> {
@@ -441,5 +511,32 @@ impl Cache {
                 cx.drop_image(gone.image, window.as_deref_mut());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    fn tiny_image() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]))
+    }
+
+    #[test]
+    fn pending_drops_waits_until_external_borrower_releases() {
+        let mut queue = PendingDrops::default();
+        let original = tiny_image();
+        let borrower = Arc::clone(&original);
+        queue.push(Arc::clone(&original));
+        // Duplicate push of the same image is deduplicated.
+        queue.push(original);
+        assert_eq!(queue.images.len(), 1);
+        assert!(queue.take_unshared().is_empty());
+        drop(borrower);
+        let ready = queue.take_unshared();
+        assert_eq!(ready.len(), 1);
+        assert!(queue.images.is_empty());
     }
 }

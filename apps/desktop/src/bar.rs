@@ -85,6 +85,12 @@ pub(crate) struct PlayerBar {
 impl PlayerBar {
     pub(crate) fn new(link: Entity<Link>, player: Entity<Player>, cx: &mut Context<Self>) -> Self {
         let followed = cx.observe(&player, |_, _, cx| cx.notify());
+        cx.on_release(|bar, cx| {
+            if let Some((_, image, _)) = bar.cover.take() {
+                crate::covers::drop_unshared(image, None, cx);
+            }
+        })
+        .detach();
         Self {
             link,
             player,
@@ -102,9 +108,11 @@ impl PlayerBar {
     }
 
     /// Reads the cover of the song playing, at the pixels it is drawn at.
-    fn want_cover(&mut self, art: Option<Id>, window: &Window, cx: &mut Context<Self>) {
+    fn want_cover(&mut self, art: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(art) = art else {
-            self.cover = None;
+            if let Some((_, old, _)) = self.cover.take() {
+                crate::covers::drop_unshared(old, Some(window), cx);
+            }
             self.reading = None;
             return;
         };
@@ -130,8 +138,11 @@ impl PlayerBar {
             let image = read.await.ok().flatten();
             this.update(cx, |bar, cx| {
                 bar.reading = None;
-                if let Some((image, _, _)) = image {
-                    bar.cover = Some((art, Arc::new(image), Instant::now()));
+                if let Some((image, _, _)) = image
+                    && let Some((_, old, _)) =
+                        bar.cover.replace((art, Arc::new(image), Instant::now()))
+                {
+                    crate::covers::drop_unshared(old, None, cx);
                 }
                 cx.notify();
             })
@@ -243,6 +254,7 @@ impl Render for PlayerBar {
             self.arrived = Some((entry, Instant::now()));
         }
         self.want_cover(track.as_ref().and_then(|track| track.art_id), window, cx);
+        crate::covers::flush_dropped(window, cx);
         let mut animating = false;
 
         // What is playing: the cover, the words, and the rating in a place

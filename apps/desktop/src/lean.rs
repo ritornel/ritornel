@@ -537,10 +537,33 @@ impl LeanBack {
             _link: heard,
             _player: followed,
         };
+        cx.on_release(|lean, cx| {
+            lean.release_images(cx);
+        })
+        .detach();
         lean.turn_every(cx);
         lean.follow(cx);
         crate::debug(format_args!("lean: opened"));
         lean
+    }
+
+    /// Drops the large covers and blurred grounds this view owns from the
+    /// sprite atlas. `fill` belongs to `theme::soft_cached` and is left alone.
+    fn release_images(&mut self, cx: &mut gpui::App) {
+        let mut released = false;
+        for picture in self.pictures.drain(..) {
+            if let Some(large) = picture.large {
+                released = true;
+                crate::covers::drop_unshared(large, None, cx);
+            }
+            if let Some((ground, _)) = picture.ground {
+                released = true;
+                crate::covers::drop_unshared(ground, None, cx);
+            }
+        }
+        if released {
+            crate::platform::give_back();
+        }
     }
 
     /// Whether it is on its way out.
@@ -726,7 +749,7 @@ impl LeanBack {
         &mut self,
         track: &TrackSummary,
         sizes: (f32, f32),
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let key = match track.art_id {
@@ -769,8 +792,9 @@ impl LeanBack {
                         lean.retoning = None;
                         if let (Some(ground), Some(top)) = (ground, lean.pictures.last_mut())
                             && top.key == key
+                            && let Some((old, _)) = top.ground.replace((Arc::new(ground), dark))
                         {
-                            top.ground = Some((Arc::new(ground), dark));
+                            crate::covers::drop_unshared(old, None, cx);
                         }
                         cx.notify();
                     })
@@ -785,13 +809,21 @@ impl LeanBack {
         let fill = theme::soft_cached(&name, (COVER * window.scale_factor()).ceil() as u32);
         let first = self.pictures.is_empty() || crate::platform::reduce_motion();
         if first {
-            self.pictures = vec![Picture {
+            for old in self.pictures.drain(..) {
+                if let Some(large) = old.large {
+                    crate::covers::drop_unshared(large, Some(window), cx);
+                }
+                if let Some((ground, _)) = old.ground {
+                    crate::covers::drop_unshared(ground, Some(window), cx);
+                }
+            }
+            self.pictures.push(Picture {
                 key: key.clone(),
                 fill: Arc::clone(&fill),
                 large: None,
                 ground: None,
                 since: None,
-            }];
+            });
         }
         let large = self.read_large(track.art_id, window);
         let ground = self.read_ground(track.art_id, &name, radius, saturation, brightness);
@@ -800,7 +832,7 @@ impl LeanBack {
         let read = cx.spawn(async move |this, cx| {
             let (large, ground) = (large.await, ground.await);
             this.update(cx, |lean, cx| {
-                lean.took_picture(&read_key, &read_fill, large, ground, dark);
+                lean.took_picture(&read_key, &read_fill, large, ground, dark, cx);
                 cx.notify();
             })
             .ok();
@@ -810,7 +842,7 @@ impl LeanBack {
         let late = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(WAIT_PICTURE).await;
             this.update(cx, |lean, cx| {
-                lean.took_picture(&late_key, &fill, None, None, dark);
+                lean.took_picture(&late_key, &fill, None, None, dark, cx);
                 cx.notify();
             })
             .ok();
@@ -827,13 +859,18 @@ impl LeanBack {
         large: Option<RenderImage>,
         ground: Option<RenderImage>,
         dark: bool,
+        cx: &mut gpui::App,
     ) {
         if let Some(shown) = self.pictures.iter_mut().find(|each| each.key == key) {
-            if let Some(large) = large {
-                shown.large = Some(Arc::new(large));
+            if let Some(large) = large
+                && let Some(old) = shown.large.replace(Arc::new(large))
+            {
+                crate::covers::drop_unshared(old, None, cx);
             }
-            if let Some(ground) = ground {
-                shown.ground = Some((Arc::new(ground), dark));
+            if let Some(ground) = ground
+                && let Some((old, _)) = shown.ground.replace((Arc::new(ground), dark))
+            {
+                crate::covers::drop_unshared(old, None, cx);
             }
             return;
         }
@@ -1425,7 +1462,14 @@ impl Render for LeanBack {
                 .is_none_or(|at| still || since(at, now) >= crate::moves::TINT_MS)
         {
             let keep = self.pictures.len() - 1;
-            self.pictures.drain(..keep);
+            for old in self.pictures.drain(..keep) {
+                if let Some(large) = old.large {
+                    crate::covers::drop_unshared(large, Some(window), cx);
+                }
+                if let Some((ground, _)) = old.ground {
+                    crate::covers::drop_unshared(ground, Some(window), cx);
+                }
+            }
         }
         // A wash of the window's colour keeps the type readable over any
         // cover, light or dark: thicker behind the words than the cover.
