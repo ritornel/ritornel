@@ -216,12 +216,21 @@ struct Wanted {
 }
 
 /// What the matcher says of a subject's text.
-fn wanted(catalog: &Catalog, artist: &str, album: Option<&str>, title: &str) -> Option<Wanted> {
-    match catalog.judge(Scrobbled {
-        artist,
-        album,
-        title,
-    }) {
+fn wanted(
+    catalog: &Catalog,
+    except: &HashSet<i64>,
+    artist: &str,
+    album: Option<&str>,
+    title: &str,
+) -> Option<Wanted> {
+    match catalog.judge_except(
+        Scrobbled {
+            artist,
+            album,
+            title,
+        },
+        except,
+    ) {
         Verdict::Bind {
             recording,
             appearance,
@@ -260,30 +269,24 @@ fn current(connection: &Connection, item: i64) -> Result<Result<Current, ()>, Er
     })
 }
 
-/// Whether the owner said this item is not that recording, or one merged
-/// with it: the two are compared by the recording each ends at.
-fn excluded(connection: &Connection, item: i64, recording: i64) -> Result<bool, Error> {
-    Ok(connection
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM identity_exclusion e
-                            JOIN recording x ON x.id = e.recording_id
-                            JOIN recording r ON r.id = ?2
-                            WHERE e.source_item_id = ?1 AND x.canonical_id = r.canonical_id)",
-        )?
-        .query_row((item, recording), |row| row.get(0))?)
-}
+/// The recordings the owner said each item is not, as the canonical
+/// recordings they end at, so that a merge cannot carry a binding past
+/// one.
+type Exclusions = HashMap<i64, HashSet<i64>>;
 
-/// What the matcher would bind an item to, once the owner's exclusions
-/// are heeded.
-fn allowed(
-    connection: &Connection,
-    item: i64,
-    wanted: Option<Wanted>,
-) -> Result<Option<Wanted>, Error> {
-    Ok(match wanted {
-        Some(wanted) if excluded(connection, item, wanted.recording)? => None,
-        wanted => wanted,
-    })
+fn exclusions(connection: &Connection) -> Result<Exclusions, Error> {
+    let mut statement = connection.prepare(
+        "SELECT e.source_item_id, x.canonical_id FROM identity_exclusion e
+         JOIN recording x ON x.id = e.recording_id
+         JOIN source_item si ON si.id = e.source_item_id
+         WHERE si.item_kind = 'scrobble_subject'",
+    )?;
+    let mut found: Exclusions = HashMap::new();
+    for row in statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
+        let (item, recording): (i64, i64) = row?;
+        found.entry(item).or_default().insert(recording);
+    }
+    Ok(found)
 }
 
 /// Binds a subject item as the matcher says: a binding in force that
@@ -297,7 +300,6 @@ fn settle(
     wanted: Option<Wanted>,
 ) -> Result<bool, Error> {
     let connection = write.connection();
-    let wanted = allowed(connection, item, wanted)?;
     // The owner may have bound it since it was judged.
     let Ok(now) = current(connection, item)? else {
         return Ok(false);
@@ -383,9 +385,12 @@ fn settle(
 /// Judges these subject items and binds them as the matcher says. Returns
 /// how many bindings changed.
 fn match_items(write: &Write<'_>, catalog: &Catalog, items: &[Subject]) -> Result<usize, Error> {
+    let except = exclusions(write.connection())?;
+    let none = HashSet::new();
     let mut changed = 0;
     for (item, artist, album, title) in items {
-        let wanted = wanted(catalog, artist, album.as_deref(), title);
+        let except = except.get(item).unwrap_or(&none);
+        let wanted = wanted(catalog, except, artist, album.as_deref(), title);
         if settle(write, *item, (artist, album.as_deref(), title), wanted)? {
             changed += 1;
         }
@@ -877,11 +882,13 @@ impl LibraryStore {
         let sure = self.read(move |connection| {
             let rows = rows_of(connection, account)?;
             let catalog = catalog(connection)?;
+            let except = exclusions(connection)?;
+            let none = HashSet::new();
             let mut differ = Vec::new();
             for (subject, now) in judged_subjects(connection, rows.instance)? {
                 let (_, artist, album, title) = &subject;
-                let wanted = wanted(&catalog, artist, album.as_deref(), title);
-                let wanted = allowed(connection, subject.0, wanted)?;
+                let except = except.get(&subject.0).unwrap_or(&none);
+                let wanted = wanted(&catalog, except, artist, album.as_deref(), title);
                 if wanted.map(|wanted| (wanted.recording, wanted.appearance)) != now {
                     differ.push(subject);
                 }
@@ -1057,6 +1064,8 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
     report.matched_tracks = plays_of.keys().filter(|item| bound.contains(item)).count() as i64;
 
     let catalog = catalog(connection)?;
+    let except = exclusions(connection)?;
+    let none = HashSet::new();
     let shows = |recording: i64| -> Result<(Option<String>, Option<String>), Error> {
         Ok(connection.query_row(
             "SELECT r.display_title, ac.display_text FROM recording r
@@ -1070,11 +1079,14 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
         let Some(&plays) = plays_of.get(&item) else {
             continue;
         };
-        match catalog.judge(Scrobbled {
-            artist: &artist,
-            album: album.as_deref(),
-            title: &title,
-        }) {
+        match catalog.judge_except(
+            Scrobbled {
+                artist: &artist,
+                album: album.as_deref(),
+                title: &title,
+            },
+            except.get(&item).unwrap_or(&none),
+        ) {
             Verdict::Doubtful { doubt, candidates } => {
                 report.doubtful_tracks += 1;
                 report.doubtful_plays += plays;

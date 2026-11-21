@@ -28,7 +28,7 @@
 //! pure; the engine reads the library into a [`Catalog`], judges every
 //! scrobbled track again at each sync, and binds what it says to bind.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::discs::disc_in_title;
 use crate::normalize::{core, fold_accents, normalize};
@@ -185,7 +185,7 @@ const FEATURED: &[&str] = &[
 ];
 
 /// The text without a featured artist: "(feat. Somebody)" taken out, and
-/// " feat. Somebody" up to the next bracket or the end.
+/// " feat. Somebody" up to the next bracket, dash or the end.
 pub(crate) fn without_featured(text: &str) -> String {
     let mut text = text.to_owned();
     loop {
@@ -203,10 +203,19 @@ pub(crate) fn without_featured(text: &str) -> String {
                 .get(at..)
                 .and_then(|rest| rest.find(']'))
                 .map(|end| at + end + 1),
-            _ => lower
-                .get(at..)
-                .and_then(|rest| rest.find(['(', '[']))
-                .map(|end| at + end),
+            // A bare one runs to the next bracket or dash.
+            _ => lower.get(at + 1..).and_then(|rest| {
+                [
+                    rest.find(['(', '[']),
+                    rest.find(" - "),
+                    rest.find(" – "),
+                    rest.find(" — "),
+                ]
+                .into_iter()
+                .flatten()
+                .min()
+                .map(|end| at + 1 + end)
+            }),
         }
         .unwrap_or(text.len());
         text.replace_range(at..end, " ");
@@ -235,9 +244,16 @@ fn squash(key: &str) -> String {
 /// takes a version with it.
 fn loose_key(artist: &str, title: &str) -> (String, String) {
     let key = |text: &str| squash(&normalize(&without_featured(text)));
-    let mut markers = markers_of(title, 2);
-    markers.sort();
-    (key(artist), format!("{}|{}", key(title), markers.join(",")))
+    let mut kept = markers_of(title, 2);
+    // And its numbers, as in "Take 2", but a featured artist's.
+    kept.extend(
+        normalize(&without_featured(title))
+            .split(' ')
+            .filter(|word| word.chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_owned),
+    );
+    kept.sort();
+    (key(artist), format!("{}|{}", key(title), kept.join(",")))
 }
 
 /// The near key: accents off, and the title without what is in brackets.
@@ -264,28 +280,41 @@ fn album_words(album: &str) -> Vec<String> {
     words.into_iter().map(str::to_owned).collect()
 }
 
-/// The numbers an album title gives, notes and all: a volume or a part,
-/// or a roman numeral such as "II", which tell "Low Tide (Vol. 2)" from
-/// "Low Tide". Other digits, such as a year or "10,000", are not.
+/// The numbers an album title gives, notes and all: a volume or a part
+/// ("Vol. 2", "Vol.2"), a roman numeral such as "II", or a number standing
+/// on its own ("Low Tide (2)"), which tell those from "Low Tide". A year, a
+/// range such as "01 - 09" and "10,000" are not.
 fn album_numbers(album: &str) -> Vec<u32> {
     let album = disc_in_title(album).map_or_else(|| album.to_owned(), |(title, _)| title);
     let key = normalize(&album);
     let words: Vec<&str> = key.split(' ').collect();
+    let digits = |word: &str| word.starts_with(|c: char| c.is_ascii_digit());
     let mut found: Vec<u32> = Vec::new();
     for (at, word) in words.iter().enumerate() {
-        let after_volume = at
-            .checked_sub(1)
-            .and_then(|before| words.get(before))
-            .is_some_and(|before| {
-                matches!(
-                    *before,
-                    "vol" | "vols" | "volume" | "part" | "pt" | "book" | "chapter"
-                )
-            });
+        let before = at.checked_sub(1).and_then(|before| words.get(before));
+        let after = words.get(at + 1);
+        let after_volume = before.is_some_and(|before| {
+            matches!(
+                *before,
+                "vol" | "vols" | "volume" | "part" | "pt" | "book" | "chapter"
+            )
+        });
+        // A volume and its number written as one word: "vol2".
+        let joined = ["vol", "volume", "pt", "part"]
+            .iter()
+            .find_map(|prefix| word.strip_prefix(prefix))
+            .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
         // A roman numeral of one letter is a word as often as not.
         let roman = word.len() > 1 && word.chars().all(|c| "ivx".contains(c));
-        let number = if after_volume || roman {
+        let alone = word.chars().all(|c| c.is_ascii_digit())
+            && !before.is_some_and(|w| digits(w))
+            && !after.is_some_and(|w| digits(w));
+        let number = if let Some(rest) = joined {
+            rest.parse().ok()
+        } else if after_volume || roman {
             part_number(word)
+        } else if alone {
+            word.parse().ok().filter(|number| *number < 100)
         } else {
             None
         };
@@ -301,41 +330,80 @@ fn album_key(album: &str) -> String {
 }
 
 /// The album a scrobble names, as it is compared: its normalised title,
-/// which picks an appearance first, its [`album_key`], and its version
-/// markers, which must agree.
+/// which picks an appearance first, its [`album_key`] and words, its
+/// version markers and its numbers, which must agree, and the title as
+/// written.
 struct Album {
     exact: String,
     loose: String,
     words: Vec<String>,
     markers: Vec<String>,
     numbers: Vec<u32>,
+    written: String,
+    /// The artist's name, as an album's key: a subtitle that is the
+    /// artist's name is set off as surely as one after a colon.
+    artist: String,
 }
 
+/// Words that begin an edition's name after an album's title.
+const EDITION: &[&str] = &[
+    "deluxe",
+    "expanded",
+    "edition",
+    "version",
+    "remastered",
+    "remaster",
+    "anniversary",
+    "special",
+    "bonus",
+    "reissue",
+    "extra",
+    "soundtrack",
+    "ost",
+];
+
 impl Album {
-    /// The album as it is compared. "S/T" or "Self-Titled" is the album
-    /// named after the artist, and "null" is no album.
-    fn of(album: &str, artist: &str) -> Option<Self> {
-        let album = match normalize(album).as_str() {
-            "null" | "undefined" => return None,
-            "s t" | "st" | "self titled" | "selftitled" => artist,
-            _ => album,
-        };
+    fn new(album: &str, artist: &str) -> Option<Self> {
         let loose = album_key(album);
         (!loose.is_empty()).then(|| Self {
+            artist: album_key(artist),
             exact: normalize(album),
             loose,
             words: album_words(album),
             markers: album_markers_of(album),
             numbers: album_numbers(album),
+            written: album.to_owned(),
         })
     }
 
+    /// The albums a scrobble's album may be, in order: as written, then,
+    /// for "S/T" or "Self-Titled", the album named after the artist, and,
+    /// for "null", no album at all.
+    fn read(album: Option<&str>, artist: &str) -> Vec<Option<Self>> {
+        let Some(album) = album else {
+            return vec![None];
+        };
+        let mut read: Vec<Option<Self>> = Self::new(album, artist).into_iter().map(Some).collect();
+        match normalize(album).as_str() {
+            "null" | "undefined" => read.push(None),
+            "s t" | "st" | "self titled" | "selftitled" => {
+                read.extend(Self::new(artist, artist).map(Some))
+            }
+            _ => {}
+        }
+        if read.is_empty() {
+            read.push(None);
+        }
+        read
+    }
+
     /// Whether an appearance's album is this one, loosely: the same, or the
-    /// one is the other's first two words or more and an unbracketed
-    /// subtitle or edition after them, as "Low Tide: Rarities" is "Low
-    /// Tide". What follows is not a number or a volume: "Low Tide II" is
-    /// another album. Their version markers, such as "live", and their
-    /// numbers, in a note or not, agree.
+    /// one is the other's first two words or more and a subtitle or an
+    /// edition after them, set off by punctuation or begun by a word such
+    /// as "Deluxe", as "Low Tide: Rarities" is "Low Tide". What follows is
+    /// not a number or a volume: "Low Tide II" is another album. Their
+    /// version markers, such as "live", and their numbers, in a note or
+    /// not, agree.
     fn fits(&self, album: &str) -> bool {
         if album_markers_of(album) != self.markers || album_numbers(album) != self.numbers {
             return false;
@@ -344,39 +412,27 @@ impl Album {
             return true;
         }
         let words = album_words(album);
-        let (short, long) = if words.len() < self.words.len() {
-            (&words, &self.words)
+        let (short, long, written) = if words.len() < self.words.len() {
+            (&words, &self.words, self.written.as_str())
         } else {
-            (&self.words, &words)
+            (&self.words, &words, album)
         };
-        let numbered = long.get(short.len()).is_some_and(|next| {
-            part_number(next).is_some()
-                || matches!(
-                    next.as_str(),
-                    "vol" | "volume" | "part" | "pt" | "chapter" | "book"
-                )
-        });
-        short.len() >= 2 && long.starts_with(short) && !numbered
-    }
-}
-
-/// The appearances of a recording on the album: those whose album is the
-/// same by its normalised title, or else those that fit it by its
-/// [`album_key`], so that of an album and its deluxe edition the one named
-/// is picked.
-fn on_album<'r>(recording: &'r Recording, album: &Album) -> Vec<&'r Appearance> {
-    let by = |fits: &dyn Fn(&str) -> bool| -> Vec<&'r Appearance> {
-        recording
-            .appearances
-            .iter()
-            .filter(|a| a.album.as_deref().is_some_and(fits))
-            .collect()
-    };
-    let exact = by(&|other| normalize(other) == album.exact);
-    if exact.is_empty() {
-        by(&|other| album.fits(other))
-    } else {
-        exact
+        let Some(next) = long.get(short.len()) else {
+            return false;
+        };
+        let numbered = part_number(next).is_some()
+            || matches!(
+                next.as_str(),
+                "vol" | "volume" | "part" | "pt" | "chapter" | "book"
+            );
+        let rest = long.get(short.len()..).unwrap_or_default();
+        let by_artist = squash(&rest.join(" ")) == self.artist;
+        let set_off = by_artist
+            || EDITION.contains(&next.as_str())
+            || [":", " - ", " – ", " — ", ", ", " / "]
+                .iter()
+                .any(|mark| written.contains(mark));
+        short.len() >= 2 && long.starts_with(short) && !numbered && set_off
     }
 }
 
@@ -438,22 +494,56 @@ impl Catalog {
 
     /// What the scrobble is of, if the library can say with confidence.
     pub fn judge(&self, scrobbled: Scrobbled<'_>) -> Verdict {
+        self.judge_except(scrobbled, &HashSet::new())
+    }
+
+    /// The same, with these canonical recordings no candidates: those the
+    /// owner said the scrobble is not.
+    pub fn judge_except(&self, scrobbled: Scrobbled<'_>, except: &HashSet<i64>) -> Verdict {
         let (artist, title) = (scrobbled.artist, scrobbled.title);
-        let album = scrobbled.album.and_then(|album| Album::of(album, artist));
+        let albums = Album::read(scrobbled.album, artist);
+        let allowed = |found: &BTreeSet<usize>| -> BTreeSet<usize> {
+            found
+                .iter()
+                .copied()
+                .filter(|at| {
+                    self.recordings
+                        .get(*at)
+                        .is_some_and(|recording| !except.contains(&recording.recording))
+                })
+                .collect()
+        };
+        // The exact keys first, then the loose ones; the first binding
+        // wins, and otherwise the first doubt is the verdict.
+        let mut doubt = None;
         for (index, key, rule) in [
             (&self.exact, exact_key(artist, title), Rule::Exact),
             (&self.loose, loose_key(artist, title), Rule::Loose),
         ] {
-            if let Some(found) = index.get(&key) {
-                return self.choose(found, album.as_ref(), rule);
+            let Some(found) = index
+                .get(&key)
+                .map(allowed)
+                .filter(|found| !found.is_empty())
+            else {
+                continue;
+            };
+            for album in &albums {
+                let verdict = self.choose(&found, album.as_ref(), rule);
+                if matches!(verdict, Verdict::Bind { .. }) {
+                    return verdict;
+                }
+                doubt.get_or_insert(verdict);
             }
         }
-        match self.near.get(&near_key(artist, title)) {
-            Some(near) => Verdict::Doubtful {
+        if let Some(doubt) = doubt {
+            return doubt;
+        }
+        match self.near.get(&near_key(artist, title)).map(allowed) {
+            Some(near) if !near.is_empty() => Verdict::Doubtful {
                 doubt: Doubt::Near,
-                candidates: self.rows(near),
+                candidates: self.rows(&near),
             },
-            None => Verdict::Absent,
+            _ => Verdict::Absent,
         }
     }
 
@@ -474,11 +564,28 @@ impl Catalog {
                 _ => return doubtful(Doubt::Several),
             },
             Some(album) => {
-                let fit: Vec<(&Recording, Vec<&Appearance>)> = candidates
-                    .iter()
-                    .map(|recording| (*recording, on_album(recording, album)))
-                    .filter(|(_, on)| !on.is_empty())
-                    .collect();
+                // The recordings on the album as named, or else on one that
+                // fits it.
+                let on = |fits: &dyn Fn(&str) -> bool| -> Vec<(&Recording, Vec<&Appearance>)> {
+                    candidates
+                        .iter()
+                        .map(|recording| {
+                            let on: Vec<&Appearance> = recording
+                                .appearances
+                                .iter()
+                                .filter(|a| a.album.as_deref().is_some_and(fits))
+                                .collect();
+                            (*recording, on)
+                        })
+                        .filter(|(_, on)| !on.is_empty())
+                        .collect()
+                };
+                let exact = on(&|other| normalize(other) == album.exact);
+                let fit = if exact.is_empty() {
+                    on(&|other| album.fits(other))
+                } else {
+                    exact
+                };
                 match (fit.as_slice(), candidates.as_slice()) {
                     ([(one, on)], _) => (*one, on.clone()),
                     ([], [_]) => return doubtful(Doubt::Album),
@@ -836,5 +943,136 @@ mod tests {
             }
         );
         assert_eq!(judge("Nobody We Have", None, "Lanterns"), Verdict::Absent);
+    }
+}
+
+#[cfg(test)]
+mod review_cases {
+    use super::*;
+
+    fn on(row: i64, artist: &str, title: &str, album: &str) -> Recording {
+        Recording {
+            recording: row,
+            title: Some(title.to_owned()),
+            artist: Some(artist.to_owned()),
+            appearances: vec![Appearance {
+                appearance: row * 10,
+                recording: row,
+                title: None,
+                artist: None,
+                album: Some(album.to_owned()),
+            }],
+        }
+    }
+
+    fn bound(catalog: &Catalog, album: Option<&str>, title: &str) -> Option<i64> {
+        let except = HashSet::new();
+        match catalog.judge_except(
+            Scrobbled {
+                artist: "Mira Vale",
+                album,
+                title,
+            },
+            &except,
+        ) {
+            Verdict::Bind { recording, .. } => Some(recording),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_take_number_after_a_featured_artist_is_kept() {
+        let catalog = Catalog::new(vec![on(1, "Mira Vale", "Echo feat. Nia - Take 1", "Glass")]);
+        assert_eq!(
+            bound(&catalog, Some("Glass"), "Echo feat. Nia - Take 1"),
+            Some(1)
+        );
+        assert_eq!(
+            bound(&catalog, Some("Glass"), "Echo feat. Nia - Take 2"),
+            None
+        );
+        // A featured artist's numbers are not the title's.
+        let catalog = Catalog::new(vec![on(2, "Mira Vale", "Echo", "Glass")]);
+        assert_eq!(
+            bound(&catalog, Some("Glass"), "Echo (feat. Nia 99)"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn a_numbered_or_merely_longer_album_is_another() {
+        let catalog = Catalog::new(vec![on(1, "Mira Vale", "Echo", "Low Tide")]);
+        for album in ["Low Tide (2)", "Low Tide Vol.2", "Low Tide Strikes Back"] {
+            assert_eq!(bound(&catalog, Some(album), "Echo"), None, "{album}");
+        }
+        for album in [
+            "Low Tide: Rarities",
+            "Low Tide - Deluxe",
+            "Low Tide Expanded Edition",
+            "Low Tide Soundtrack",
+            "Low Tide Mira Vale",
+        ] {
+            assert_eq!(bound(&catalog, Some(album), "Echo"), Some(1), "{album}");
+        }
+    }
+
+    #[test]
+    fn an_album_named_literally_comes_before_what_it_may_stand_for() {
+        let catalog = Catalog::new(vec![
+            on(1, "Mira Vale", "Echo", "ST"),
+            on(2, "Mira Vale", "Echo", "Mira Vale"),
+            on(3, "Mira Vale", "Salt", "Null"),
+            on(4, "Mira Vale", "Salt", "Glass"),
+        ]);
+        assert_eq!(bound(&catalog, Some("ST"), "Echo"), Some(1));
+        assert_eq!(bound(&catalog, Some("Self-Titled"), "Echo"), Some(2));
+        assert_eq!(bound(&catalog, Some("Null"), "Salt"), Some(3));
+    }
+
+    #[test]
+    fn an_exact_album_beats_a_loose_one_across_recordings() {
+        let catalog = Catalog::new(vec![
+            on(1, "Mira Vale", "Echo", "Glass"),
+            on(2, "Mira Vale", "Echo", "Glass (Deluxe)"),
+        ]);
+        assert_eq!(bound(&catalog, Some("Glass"), "Echo"), Some(1));
+        assert_eq!(bound(&catalog, Some("Glass (Deluxe)"), "Echo"), Some(2));
+    }
+
+    #[test]
+    fn a_loose_match_on_the_album_named_is_not_hidden_by_an_exact_one_elsewhere() {
+        let catalog = Catalog::new(vec![
+            on(1, "Mira Vale", "Echo", "Slate"),
+            on(2, "Mira Vale", "Echo feat. Nia", "Glass"),
+        ]);
+        assert_eq!(bound(&catalog, Some("Glass"), "Echo"), Some(2));
+    }
+
+    #[test]
+    fn an_excluded_recording_is_no_candidate() {
+        let catalog = Catalog::new(vec![
+            on(1, "Mira Vale", "Echo", "Glass"),
+            on(2, "Mira Vale", "Echo", "Slate"),
+        ]);
+        let scrobbled = Scrobbled {
+            artist: "Mira Vale",
+            album: None,
+            title: "Echo",
+        };
+        assert!(matches!(
+            catalog.judge(scrobbled),
+            Verdict::Doubtful {
+                doubt: Doubt::Several,
+                ..
+            }
+        ));
+        assert!(matches!(
+            catalog.judge_except(scrobbled, &HashSet::from([2])),
+            Verdict::Bind { recording: 1, .. }
+        ));
+        assert!(matches!(
+            catalog.judge_except(scrobbled, &HashSet::from([1, 2])),
+            Verdict::Absent
+        ));
     }
 }

@@ -513,6 +513,10 @@ fn a_recording_the_owner_excluded_is_never_bound_even_through_a_merge() {
         .unwrap();
     assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 1);
     assert_eq!(rig.bound(), ["Paper Kites -> -"]);
+    // The report counts it, as absent: the library has nothing else it
+    // could be.
+    let report = rig.library.import_report(rig.account, 10).unwrap();
+    assert_eq!((report.matched_tracks, report.absent_tracks), (0, 1));
     // And judged again, nothing is written.
     let before = rig.revision();
     assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
