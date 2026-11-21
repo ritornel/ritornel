@@ -19,7 +19,7 @@
 //! soft colours blurred instead, as the real page blurs them.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -86,6 +86,9 @@ pub(crate) struct Album {
     history: Option<HistoryOf>,
     more: Vec<AlbumTile>,
     more_covers: HashMap<Id, Arc<RenderImage>>,
+    more_asked: HashSet<(Id, u32)>,
+    more_px: u32,
+    fetches: crate::covers::FetchBag,
     revision: u64,
     reading: Option<Task<()>>,
     problem: Option<String>,
@@ -148,6 +151,9 @@ impl Album {
             history: None,
             more: Vec::new(),
             more_covers: HashMap::new(),
+            more_asked: HashSet::new(),
+            more_px: 0,
+            fetches: crate::covers::FetchBag::default(),
             revision: 0,
             reading: None,
             problem: None,
@@ -303,7 +309,6 @@ impl Album {
         }
         if let Some(more) = read.more {
             self.more = more;
-            self.more_pictures(cx);
         }
         let credit = read
             .page
@@ -322,45 +327,76 @@ impl Album {
         self.problem = None;
     }
 
-    /// The covers of the row at the foot, at the pixels they are drawn at.
-    fn more_pictures(&mut self, cx: &mut Context<Self>) {
-        let px = (MORE_CARD * 2.).ceil() as u32;
-        for tile in &self.more {
-            let Some(art) = tile.art_id else { continue };
-            if self.more_covers.contains_key(&art) {
+    /// The covers of the row at the foot, for only the columns that fit.
+    fn more_pictures(&mut self, columns: usize, scale: f32, cx: &mut Context<Self>) {
+        let px = (MORE_CARD * scale).ceil() as u32;
+        if self.more_px != px {
+            self.more_px = px;
+            self.more_asked.clear();
+        }
+        let arts: Vec<Id> = self
+            .more
+            .iter()
+            .take(columns)
+            .filter_map(|tile| tile.art_id)
+            .collect();
+        for art in arts {
+            if !self.more_asked.insert((art, px)) {
                 continue;
             }
-            self.fetch(art, px, cx, move |page, image| {
-                page.more_covers.insert(art, image);
+            self.fetch_opt(art, px, cx, move |page, image, cx| match image {
+                Some(image) => {
+                    if let Some(old) = page.more_covers.insert(art, image) {
+                        crate::covers::drop_unshared(old, None, cx);
+                    }
+                }
+                None => {
+                    page.more_asked.remove(&(art, px));
+                }
             });
         }
     }
 
     /// Reads a cover at `px` pixels, and gives it to `took`.
     fn fetch(
-        &self,
+        &mut self,
         art: Id,
         px: u32,
         cx: &mut Context<Self>,
         took: impl FnOnce(&mut Self, Arc<RenderImage>) + 'static,
     ) {
+        self.fetch_opt(art, px, cx, move |page, image, _| {
+            if let Some(image) = image {
+                took(page, image);
+            }
+        });
+    }
+
+    fn fetch_opt(
+        &mut self,
+        art: Id,
+        px: u32,
+        cx: &mut Context<Self>,
+        took: impl FnOnce(&mut Self, Option<Arc<RenderImage>>, &mut gpui::App) + 'static,
+    ) {
         let http = Arc::clone(&self.net.art);
         let bucket = self.net.bucket(px);
         let read = self.net.rt().spawn(async move {
             let bytes = http.get(art, bucket).await?;
-            tokio::task::spawn_blocking(move || crate::covers::decode_cover(&bytes, px))
+            crate::covers::decode(move || crate::covers::decode_cover(&bytes, px)).await
+        });
+        self.fetches.push(read.abort_handle());
+        cx.spawn(async move |this, cx| {
+            let image = read
                 .await
                 .ok()
                 .flatten()
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Some((image, _, _))) = read.await {
-                this.update(cx, |page, cx| {
-                    took(page, Arc::new(image));
-                    cx.notify();
-                })
-                .ok();
-            }
+                .map(|(image, _, _)| Arc::new(image));
+            this.update(cx, |page, cx| {
+                took(page, image, cx);
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -389,16 +425,15 @@ impl Album {
         let tone = crate::blur::wash_tone(theme::dark());
         let blurs = self.net.rt().spawn(async move {
             let bytes = http.get(art, crate::blur::SIDE).await?;
-            tokio::task::spawn_blocking(move || {
+            crate::covers::decode(move || {
                 Some((
                     crate::blur::jpeg(&bytes, banner_radius, crate::blur::BANNER.1)?,
                     crate::blur::jpeg_toned(&bytes, wash_radius, tone.0, tone.1)?,
                 ))
             })
             .await
-            .ok()
-            .flatten()
         });
+        self.fetches.push(blurs.abort_handle());
         cx.spawn(async move |this, cx| {
             let blurs = blurs.await.ok().flatten();
             this.update(cx, |page, cx| {
@@ -686,7 +721,7 @@ impl Album {
             .as_ref()
             .map_or_else(String::new, |credit| credit.text.clone());
         // As many as fit, the room left over spread evenly between them.
-        let columns = (((content + MORE_GAP) / (MORE_CARD + MORE_GAP)).floor() as usize).max(1);
+        let columns = more_columns(content);
         let gap = if columns > 1 {
             (content - columns as f32 * MORE_CARD) / (columns - 1) as f32
         } else {
@@ -769,6 +804,11 @@ fn gutter(width: f32) -> f32 {
 
 fn content_width(width: f32) -> f32 {
     width - 2. * gutter(width)
+}
+
+/// How many cards fit across the row at the foot for `content` points.
+fn more_columns(content: f32) -> usize {
+    (((content + MORE_GAP) / (MORE_CARD + MORE_GAP)).floor() as usize).max(1)
 }
 
 /// A format, said briefly: "FLAC 24/96", "MP3 320".
@@ -991,6 +1031,7 @@ impl Render for Album {
                     )
                     .child(left);
             }
+            self.more_pictures(more_columns(content), window.scale_factor(), cx);
             body = body.children(self.more(page, content, window, cx));
         } else {
             body = body.child(
@@ -1107,5 +1148,17 @@ impl Render for Album {
                     .opacity(self.look.banner)
                     .child(crate::frost::faded(self.look.banner, banner)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn more_columns_matches_visible_row_width() {
+        assert_eq!(more_columns(100.), 1);
+        assert_eq!(more_columns(content_width(1400.)), 10);
+        assert_eq!(more_columns(content_width(3000.)), 10);
     }
 }

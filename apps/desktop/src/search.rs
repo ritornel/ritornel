@@ -340,10 +340,7 @@ impl SearchBox {
             let bucket = net.bucket(px);
             let read = net.rt().spawn(async move {
                 let bytes = http.get(art, bucket).await?;
-                tokio::task::spawn_blocking(move || crate::covers::decode_cover(&bytes, px))
-                    .await
-                    .ok()
-                    .flatten()
+                crate::covers::decode(move || crate::covers::decode_cover(&bytes, px)).await
             });
             cx.spawn(async move |this, cx| {
                 let result = read.await.ok().flatten();

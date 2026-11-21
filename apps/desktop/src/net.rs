@@ -23,6 +23,7 @@ use ritornel_contract::{
 };
 use tokio::net::TcpStream;
 use tokio::runtime::{Handle, Runtime};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// The runtime calls, events and covers run on, for as long as the app does.
@@ -103,6 +104,7 @@ impl Net {
             endpoint: server.endpoint,
             token,
             idle: Mutex::new(Vec::new()),
+            in_flight: Semaphore::new(MAX_ART_IN_FLIGHT),
         });
         Ok((
             Self {
@@ -144,16 +146,21 @@ pub(crate) struct ArtHttp {
     endpoint: SocketAddr,
     token: String,
     idle: Mutex<Vec<SendRequest<Empty<Bytes>>>>,
+    in_flight: Semaphore,
 }
 
 /// The largest cover read: 1024 pixels square is well under it.
 const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
+/// Most cover fetches run at once, across the wall and any open view, so a
+/// prolific artist or album page does not open dozens of sockets at once.
+const MAX_ART_IN_FLIGHT: usize = 12;
 
 impl ArtHttp {
     /// Reads one cover. `None` when it is not there (404) or the server
     /// could not be read. Dropped part way, the connection is closed, and
     /// the server drops the cover from its queue if it has not begun it.
     pub(crate) async fn get(&self, art: Id, size: u32) -> Option<Vec<u8>> {
+        let _permit = self.in_flight.acquire().await.ok()?;
         let idle = self.idle.lock().ok().and_then(|mut idle| idle.pop());
         let mut sender = match idle {
             Some(sender) if !sender.is_closed() => sender,
@@ -185,9 +192,89 @@ impl ArtHttp {
             .await
             .ok()?
             .to_bytes();
+        // At most MAX_ART_IN_FLIGHT permits exist, so the idle pool stays bounded.
         if let Ok(mut idle) = self.idle.lock() {
             idle.push(sender);
         }
         ok.then(|| body.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn art_http_bounds_in_flight_requests_and_idle_connections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = listener.local_addr()?;
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let server_active = Arc::clone(&active);
+            let server_peak = Arc::clone(&peak);
+            let server = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let active = Arc::clone(&server_active);
+                    let peak = Arc::clone(&server_peak);
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while let Ok(n) = socket.read(&mut chunk).await {
+                            if n == 0 {
+                                break;
+                            }
+                            if let Some(bytes) = chunk.get(..n) {
+                                buf.extend_from_slice(bytes);
+                            }
+                            while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                buf.drain(..end + 4);
+                                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(now, Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                                let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                                let sent = socket.write_all(reply).await.is_ok();
+                                active.fetch_sub(1, Ordering::SeqCst);
+                                if !sent {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+
+            let art = Arc::new(ArtHttp {
+                endpoint,
+                token: "test".to_owned(),
+                idle: Mutex::new(Vec::new()),
+                in_flight: Semaphore::new(MAX_ART_IN_FLIGHT),
+            });
+            let mut tasks = Vec::new();
+            for i in 0..(MAX_ART_IN_FLIGHT * 3) {
+                let art = Arc::clone(&art);
+                let id = Id::from_bytes([i as u8; 16]);
+                tasks.push(tokio::spawn(async move { art.get(id, 256).await }));
+            }
+            for task in tasks {
+                let got = tokio::time::timeout(Duration::from_secs(5), task).await??;
+                assert_eq!(got, Some(b"ok".to_vec()));
+            }
+            assert!(peak.load(Ordering::SeqCst) <= MAX_ART_IN_FLIGHT);
+            let idle_len = art.idle.lock().map_or(usize::MAX, |idle| idle.len());
+            assert!(idle_len <= MAX_ART_IN_FLIGHT);
+            server.abort();
+            Ok(())
+        })
     }
 }

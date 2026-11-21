@@ -894,10 +894,8 @@ impl LeanBack {
             let http = Arc::clone(&net.art);
             net.rt().spawn(async move {
                 let bytes = http.get(art, bucket).await?;
-                tokio::task::spawn_blocking(move || crate::covers::decode_cover(&bytes, px))
+                crate::covers::decode(move || crate::covers::decode_cover(&bytes, px))
                     .await
-                    .ok()
-                    .flatten()
                     .map(|(image, _, _)| image)
             })
         });
@@ -928,21 +926,18 @@ impl LeanBack {
                 let http = Arc::clone(&net.art);
                 Some(net.rt().spawn(async move {
                     let bytes = http.get(art, crate::blur::SIDE).await?;
-                    tokio::task::spawn_blocking(move || {
+                    crate::covers::decode(move || {
                         crate::blur::jpeg_toned(&bytes, radius, saturation, brightness)
                     })
                     .await
-                    .ok()
-                    .flatten()
                 }))
             }
             (None, Some(net)) => soft.map(|soft| {
                 net.rt().spawn(async move {
-                    tokio::task::spawn_blocking(move || {
-                        crate::blur::toned(&soft, radius, saturation, brightness)
+                    crate::covers::decode(move || {
+                        Some(crate::blur::toned(&soft, radius, saturation, brightness))
                     })
                     .await
-                    .ok()
                 })
             }),
             _ => None,

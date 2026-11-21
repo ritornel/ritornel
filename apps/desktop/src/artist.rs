@@ -183,6 +183,7 @@ pub(crate) struct Artist {
     history: Option<HistoryOf>,
     covers: HashMap<(Id, u32), Arc<RenderImage>>,
     asked: HashSet<(Id, u32)>,
+    fetches: crate::covers::FetchBag,
     revision: u64,
     reading: Option<Task<()>>,
     problem: bool,
@@ -241,6 +242,7 @@ impl Artist {
             history: None,
             covers: HashMap::new(),
             asked: HashSet::new(),
+            fetches: crate::covers::FetchBag::default(),
             revision: 0,
             reading: None,
             problem: false,
@@ -402,7 +404,7 @@ impl Artist {
     }
 
     fn fetch(
-        &self,
+        &mut self,
         art: Id,
         px: u32,
         cx: &mut Context<Self>,
@@ -412,11 +414,9 @@ impl Artist {
         let bucket = self.net.bucket(px);
         let read = self.net.rt().spawn(async move {
             let bytes = http.get(art, bucket).await?;
-            tokio::task::spawn_blocking(move || crate::covers::decode_cover(&bytes, px))
-                .await
-                .ok()
-                .flatten()
+            crate::covers::decode(move || crate::covers::decode_cover(&bytes, px)).await
         });
+        self.fetches.push(read.abort_handle());
         cx.spawn(async move |this, cx| {
             if let Ok(Some((image, _, _))) = read.await {
                 this.update(cx, |page, cx| {
@@ -434,6 +434,7 @@ impl Artist {
     fn pictures(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(artist) = &self.page else { return };
         let art = artist.artist.art_id;
+        let portrait = artist.artist.portrait;
         if self.pictured_for == Some(art) {
             return;
         }
@@ -451,7 +452,7 @@ impl Artist {
             page.face = Some(image);
         });
         // A portrait stands at most 380 points wide; a cover never stands there.
-        if artist.artist.portrait {
+        if portrait {
             self.fetch(art, (380. * scale).ceil() as u32, cx, |page, image| {
                 page.portrait = Some((image, Instant::now()));
             });
