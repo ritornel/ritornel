@@ -33,7 +33,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::data_dir::DataDir;
-use crate::platform::create_private_dir;
+use crate::platform::{create_new_private_dir, create_private_dir, sync_dir};
 
 /// The version of `backup.json`.
 const MANIFEST_VERSION: u32 = 1;
@@ -63,6 +63,8 @@ pub(crate) enum BackupError {
     NoPlace,
     /// The place named is not a folder that is there.
     Missing(PathBuf),
+    /// The place named is, as it resolves now, in the data directory.
+    Inside(PathBuf),
     /// Another backup is being taken.
     Busy,
     /// A file could not be written.
@@ -85,6 +87,12 @@ impl fmt::Display for BackupError {
             Self::Missing(path) => write!(
                 f,
                 "the backup folder {} is not there: is its disk connected?",
+                path.display()
+            ),
+            Self::Inside(path) => write!(
+                f,
+                "the backup folder {} is inside the data directory, where a backup is lost with \
+                 what it copies",
                 path.display()
             ),
             Self::Busy => f.write_str("a backup is already being taken"),
@@ -156,6 +164,7 @@ impl Backups {
     ) -> Result<Taken, BackupError> {
         let place = self.place.as_deref().ok_or(BackupError::NoPlace)?;
         let _taking = self.taking.try_lock().map_err(|_| BackupError::Busy)?;
+        outside(dir, place)?;
         write(dir, place, at_ms, reason, about)
     }
 }
@@ -195,7 +204,7 @@ pub(crate) fn before_migrations(
     let reason = BackupReason::BeforeMigration;
     let mut failed = None;
     if let Some(place) = place {
-        match write(dir, place, at_ms, reason, about) {
+        match outside(dir, place).and_then(|()| write(dir, place, at_ms, reason, about)) {
             Ok(taken) => {
                 info!(path = %taken.path.display(), "backed up before migrating");
                 return Ok(BeforeMigrations {
@@ -223,6 +232,15 @@ pub(crate) fn before_migrations(
     })
 }
 
+/// Refuses a place that resolves, now, into the data directory.
+fn outside(dir: &DataDir, place: &Path) -> Result<(), BackupError> {
+    if is_inside(place, dir.root()) {
+        Err(BackupError::Inside(place.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
 /// [`before_migrations`] as the server runs it: each database is asked
 /// whether opening it would migrate it.
 pub(crate) fn before_migrating(
@@ -242,6 +260,46 @@ pub(crate) struct BeforeMigrations {
     pub(crate) failed: Option<String>,
 }
 
+/// Whether `path` is `root` or inside it, as the system resolves each: a
+/// link is followed as far as the path exists, and `.` and `..` are taken
+/// out of the rest. A folder named for backups is asked this when it is
+/// named and again before each backup, when what it resolves to may have
+/// changed.
+pub(crate) fn is_inside(path: &Path, root: &Path) -> bool {
+    resolved(path).starts_with(resolved(root))
+}
+
+fn resolved(path: &Path) -> PathBuf {
+    use std::path::Component;
+    // The longest part of the path that is there, as the system resolves
+    // it, and then the rest.
+    let mut existing = path;
+    let mut rest = Vec::new();
+    let base = loop {
+        if let Ok(real) = existing.canonicalize() {
+            break real;
+        }
+        match (existing.parent(), existing.components().next_back()) {
+            (Some(parent), Some(last)) => {
+                rest.push(last);
+                existing = parent;
+            }
+            _ => break PathBuf::new(),
+        }
+    };
+    let mut resolved = base;
+    for part in rest.into_iter().rev() {
+        match part {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            other => resolved.push(other),
+        }
+    }
+    resolved
+}
+
 /// Writes a backup of the databases in `dir` into a new folder in `place`.
 fn write(
     dir: &DataDir,
@@ -255,19 +313,23 @@ fn write(
     if !place.is_dir() {
         return Err(BackupError::Missing(place.to_owned()));
     }
-    let (name, partial) = folder_names(place, at_ms, reason);
+    let (name, partial) = reserve(place, at_ms, reason)?;
     let finished = place.join(&name);
-    create_private_dir(&partial).map_err(|error| BackupError::Io {
-        doing: "create",
-        path: partial.clone(),
-        source: std::io::Error::other(error.to_string()),
-    })?;
-    let written = fill(dir, &partial, at_ms, reason, about)
+    // Each file is synced as it is written; then the folder, so that its
+    // names are kept, and once it is renamed, the place, so that the new
+    // name is. Only then is the backup said to be taken.
+    let whole = fill(dir, &partial, at_ms, reason, about)
+        .and_then(|()| sync_dir(&partial).map_err(io("sync", &partial)))
         .and_then(|()| std::fs::rename(&partial, &finished).map_err(io("finish", &finished)));
-    if let Err(error) = written {
+    if let Err(error) = whole {
         // What was written of it is no backup.
         let _ = std::fs::remove_dir_all(&partial);
         return Err(error);
+    }
+    if let Err(error) = sync_dir(place) {
+        // Renamed, it is this backup's alone; unsynced, it is not one.
+        let _ = std::fs::remove_dir_all(&finished);
+        return Err(io("sync", place)(error));
     }
     Ok(Taken {
         path: finished,
@@ -276,9 +338,15 @@ fn write(
     })
 }
 
-/// A new backup's folder name, and the name it is written under first.
-/// Two in the same second are told apart by a number.
-fn folder_names(place: &Path, at_ms: i64, reason: BackupReason) -> (String, PathBuf) {
+/// A new backup's folder name, and the folder it is written in first,
+/// which this call makes and no other can: two in the same second, by this
+/// server or another writing to the same place, are told apart by a
+/// number.
+fn reserve(
+    place: &Path,
+    at_ms: i64,
+    reason: BackupReason,
+) -> Result<(String, PathBuf), BackupError> {
     let stamp = crate::logs::utc(at_ms);
     // `2026-11-21T17:01:02.123Z` to `2026-11-21-170102`: no colon, which
     // Windows does not allow in a name.
@@ -289,14 +357,23 @@ fn folder_names(place: &Path, at_ms: i64, reason: BackupReason) -> (String, Path
         BackupReason::BeforeMigration => "-before-migration",
     };
     let base = format!("ritornel-backup-{date}-{time}{suffix}");
-    let mut name = base.clone();
-    let mut n = 1;
-    while place.join(&name).exists() || place.join(format!(".{name}.partial")).exists() {
-        n += 1;
-        name = format!("{base}-{n}");
+    for n in 1_u32.. {
+        let name = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
+        if place.join(&name).exists() {
+            continue;
+        }
+        let partial = place.join(format!(".{name}.partial"));
+        match create_new_private_dir(&partial) {
+            Ok(()) => return Ok((name, partial)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io("create", &partial)(error)),
+        }
     }
-    let partial = place.join(format!(".{name}.partial"));
-    (name, partial)
+    Err(BackupError::Missing(place.to_owned()))
 }
 
 fn fill(
@@ -320,7 +397,11 @@ fn fill(
     }
     let config = dir.config_toml();
     if config.is_file() {
-        std::fs::copy(&config, into.join("config.toml")).map_err(io("copy", &config))?;
+        let copy = into.join("config.toml");
+        std::fs::copy(&config, &copy)
+            .and_then(|_| std::fs::OpenOptions::new().write(true).open(&copy))
+            .and_then(|file| file.sync_all())
+            .map_err(io("copy", &config))?;
         files.push("config.toml");
     }
     let manifest = json!({
@@ -429,6 +510,64 @@ mod tests {
         }));
         // And nothing was written in the data directory.
         assert!(!dir.backups().exists());
+    }
+
+    #[test]
+    fn two_servers_backing_up_to_one_place_in_the_same_second_write_two_backups() {
+        let scratch = Scratch::new();
+        let place = scratch.path().join("shared");
+        std::fs::create_dir(&place).unwrap();
+        let taken: Vec<_> = (0..2)
+            .map(|n| {
+                let other = Scratch::new();
+                let dir = data(&other);
+                let place = place.clone();
+                std::thread::spawn(move || {
+                    let backups = Backups::new(Some(place));
+                    let taken: Vec<_> = (0..10)
+                        .map(|_| {
+                            backups
+                                .take(&dir, AT, BackupReason::OnDemand, About::default())
+                                .unwrap()
+                                .path
+                        })
+                        .collect();
+                    drop(other);
+                    (n, taken)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap().1)
+            .collect();
+        let mut names: Vec<_> = taken.iter().collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 20);
+        for backup in &taken {
+            assert!(backup.join("server.db").is_file(), "{backup:?}");
+        }
+    }
+
+    // A link is made differently on each system, and on Windows only with
+    // a privilege a test does not have.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_that_has_come_to_lead_into_the_data_directory_is_refused() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = scratch.path().join("alias");
+        std::os::unix::fs::symlink(dir.root(), &place).unwrap();
+        let backups = Backups::new(Some(place.join("later")));
+        std::fs::create_dir(dir.root().join("later")).unwrap();
+        let refused = backups
+            .take(&dir, AT, BackupReason::OnDemand, About::default())
+            .unwrap_err();
+        assert!(matches!(refused, BackupError::Inside(_)), "{refused}");
+        assert_eq!(
+            std::fs::read_dir(dir.root().join("later")).unwrap().count(),
+            0
+        );
     }
 
     #[test]

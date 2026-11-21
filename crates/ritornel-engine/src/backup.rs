@@ -88,7 +88,10 @@ pub fn copy_database(from: &Path, to: &Path) -> Result<(), Error> {
     let source = Location::File(from.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     source.execute("VACUUM INTO ?1", [target])?;
     drop(source);
-    std::fs::File::open(to)
+    // Opened to write, as Windows asks of a file it is to flush.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(to)
         .and_then(|file| file.sync_all())
         .map_err(Error::Io)?;
 

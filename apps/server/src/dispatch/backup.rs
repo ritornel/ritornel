@@ -133,6 +133,7 @@ fn refused(error: &BackupError) -> RpcError {
     let (code, reason) = match error {
         BackupError::NoPlace => (ErrorCode::Invalid, "no_backup_place"),
         BackupError::Missing(_) => (ErrorCode::Unavailable, "backup_place_missing"),
+        BackupError::Inside(_) => (ErrorCode::Unavailable, "backup_place_inside"),
         BackupError::Busy => (ErrorCode::Unavailable, "backup_running"),
         BackupError::Io { .. } | BackupError::Copy(..) => (ErrorCode::Unavailable, "backup_failed"),
     };

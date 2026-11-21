@@ -46,6 +46,20 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), Error> {
     ritornel_windows::private::restrict(highest).map_err(io_error("close", highest))
 }
 
+/// Creates the one folder at `path`, with an access list of the OS user
+/// alone, and fails if it is there already: two writers never share it.
+/// Its parent must be there.
+pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)?;
+    ritornel_windows::private::restrict(path)
+}
+
+/// Nothing: NTFS journals a folder's names with the files in it, and the
+/// standard library cannot open a folder to flush it.
+pub(crate) fn sync_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Closes the file at `path` to everyone but the OS user.
 pub(crate) fn close_to_others(path: &Path) -> std::io::Result<()> {
     ritornel_windows::private::restrict(path)

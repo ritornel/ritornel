@@ -238,17 +238,17 @@ fn resolve(
 }
 
 /// The backup folder, which must be an absolute path and outside the data
-/// directory `root`. Each is compared as the system resolves it where it
-/// can be, so a link to the data directory is inside it too. The folder
-/// need not be there yet: a disk that is not connected is found out when a
-/// backup is taken, and said in the status.
+/// directory `root`, as the system resolves each
+/// ([`crate::backup::is_inside`]), so a link to the data directory is
+/// inside it too. The folder need not be there yet: a disk that is not
+/// connected is found out when a backup is taken, and said in the status,
+/// and the folder is asked again then.
 fn backup_dir(root: &Path, text: Option<String>, origin: Origin) -> Result<PathBuf, ConfigError> {
     let path = PathBuf::from(text.ok_or(ConfigError::BackupRelative(origin))?);
     if !path.is_absolute() {
         return Err(ConfigError::BackupRelative(origin));
     }
-    let resolved = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
-    if resolved(&path).starts_with(resolved(root)) || path.starts_with(root) {
+    if crate::backup::is_inside(&path, root) {
         return Err(ConfigError::BackupInside(origin));
     }
     Ok(path)
@@ -501,6 +501,9 @@ mod tests {
             Ok(Some(PathBuf::from(elsewhere)))
         );
         // The same order as every other setting.
+        // A `..` that leads out of it is outside.
+        let out = Path::new(ROOT).join("..").join("outside");
+        assert_eq!(backup_dir(out.to_str(), None, None), Ok(Some(out.clone())));
         let flag = Path::new(ROOT).with_file_name("by-flag");
         assert_eq!(
             backup_dir(flag.to_str(), Some(elsewhere), Some(&file)),
@@ -515,6 +518,10 @@ mod tests {
             ),
             (ROOT, "--backup-dir must be outside the data directory"),
             ("backups", "--backup-dir must be an absolute path"),
+            (
+                &format!("{ROOT}/elsewhere/../backups"),
+                "--backup-dir must be outside the data directory",
+            ),
         ] {
             let refused = backup_dir(Some(given), None, None).unwrap_err();
             assert!(refused.starts_with(message), "{given}: {refused}");
@@ -542,14 +549,23 @@ mod tests {
         std::fs::create_dir_all(root.join("backups")).unwrap();
         let link = scratch.path().join("looks-elsewhere");
         std::os::unix::fs::symlink(root.join("backups"), &link).unwrap();
-        let flags = Flags {
-            backup_dir: link.to_str().map(str::to_owned),
-            ..Flags::default()
-        };
-        assert!(matches!(
-            resolve(&root, &flags, &env(&[]), None),
-            Err(ConfigError::BackupInside(Origin::Flag))
-        ));
+        // The link, and a folder not made yet beneath a link to the data
+        // directory itself.
+        let to_data = scratch.path().join("alias");
+        std::os::unix::fs::symlink(&root, &to_data).unwrap();
+        for given in [link, to_data.join("later")] {
+            let flags = Flags {
+                backup_dir: given.to_str().map(str::to_owned),
+                ..Flags::default()
+            };
+            assert!(
+                matches!(
+                    resolve(&root, &flags, &env(&[]), None),
+                    Err(ConfigError::BackupInside(Origin::Flag))
+                ),
+                "{given:?}"
+            );
+        }
     }
 
     #[test]

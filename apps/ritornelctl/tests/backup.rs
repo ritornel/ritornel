@@ -344,11 +344,16 @@ fn a_backup_taken_while_the_server_plays_is_restored_elsewhere_with_its_history_
         serde_json::json!(["server.db", "library.db"])
     );
     assert_eq!(manifest["libraryId"], status["library"]["libraryId"]);
-    let played = json(&data_dir, &["history"])["plays"]
+    let history = json(&data_dir, &["history"]);
+    let played = history["plays"].as_array().unwrap().len();
+    assert_eq!(played, 2);
+    let before_backup: Vec<Value> = history["plays"]
         .as_array()
         .unwrap()
-        .len();
-    assert_eq!(played, 2);
+        .iter()
+        .flat_map(|play| play["listens"].as_array().unwrap())
+        .map(|listen| listen["listenId"].clone())
+        .collect();
     server.stop();
     // The backup is not beside the data.
     assert!(!data_dir.join("backups").exists());
@@ -368,9 +373,18 @@ fn a_backup_taken_while_the_server_plays_is_restored_elsewhere_with_its_history_
     // server.db, and arrives too. Then the history the server kept is the
     // one a rebuild would make.
     let recent = until(&restored, &["history"], |recent| recent["undelivered"] == 0);
+    let plays = recent["plays"].as_array().unwrap();
+    assert_eq!(plays.len(), played + 1, "{recent}");
+    // Newest first: the long album's first track, which was playing, and
+    // which the backup's server.db still held as a listen in progress.
+    let [listen] = plays[0]["listens"].as_array().unwrap().as_slice() else {
+        panic!("one listen: {recent}");
+    };
+    assert_eq!(plays[0]["durationMs"], 600_000);
+    assert_eq!(listen["endReason"], "crash");
     assert!(
-        recent["plays"].as_array().unwrap().len() >= played,
-        "{recent}"
+        !before_backup.contains(&listen["listenId"]),
+        "it was not in the library before: {recent}"
     );
     let rebuilt = json(&restored, &["history", "rebuild", "--dry-run"]);
     assert_eq!(rebuilt["changed"].as_u64(), Some(0), "{rebuilt}");
