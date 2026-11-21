@@ -66,6 +66,9 @@ fn stopped(problem: &RecordProblem) -> String {
             "{} not sent to Last.fm",
             many("scrobble was", "scrobbles were")
         ),
+        RecordProblemKind::Unreadable => {
+            "Can’t tell whether every listen is being recorded".to_owned()
+        }
         RecordProblemKind::ImportFailed if n == 1 => "Importing from Last.fm failed".to_owned(),
         RecordProblemKind::ImportFailed => format!(
             "Importing from Last.fm failed {} times in a row",

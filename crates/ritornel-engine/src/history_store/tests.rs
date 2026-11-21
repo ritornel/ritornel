@@ -1714,6 +1714,7 @@ fn scrobbles_that_ended_unknown_or_withdrawn_are_counted_from_when_they_ended_un
     let due = at.library.take_due_deliveries(account, 0, 1).unwrap();
     assert_eq!(due.len(), 1);
     assert_eq!(at.library.abandon_sending().unwrap(), 1);
+    let after_unknown = at.library.meta().unwrap().revision;
     at.clock.set(start + 30 * MINUTE);
     exclude_listen(&at, excluded.listen_id);
     assert!(
@@ -1749,13 +1750,16 @@ fn scrobbles_that_ended_unknown_or_withdrawn_are_counted_from_when_they_ended_un
     assert_eq!(echoed.unknown, None);
     assert_eq!(echoed.withdrawn.unwrap().count, 1);
 
-    // Set aside after the first: only the second is left.
-    let lost = at.library.lost_scrobbles(start + 25 * MINUTE).unwrap();
-    assert!(lost.unknown.is_none());
+    // Set aside by the revision after the first: only the second is
+    // left, whatever the clock says.
+    at.clock.set(T0);
+    let lost = at.library.lost_scrobbles(after_unknown).unwrap();
     assert_eq!(lost.withdrawn.unwrap().count, 1);
-    // And after both, nothing.
+    // And by the revision now, nothing.
     assert_eq!(
-        at.library.lost_scrobbles(start + 30 * MINUTE).unwrap(),
+        at.library
+            .lost_scrobbles(at.library.meta().unwrap().revision)
+            .unwrap(),
         crate::LostScrobbles::default()
     );
 }

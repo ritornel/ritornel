@@ -8,9 +8,17 @@ use rusqlite::OptionalExtension;
 
 use crate::{Error, LibraryStore, ServerStore};
 
-/// The `server_setting` row that says until when the scrobbles that ended
-/// unknown or withdrawn have been seen and set aside.
-const DISMISSED: &str = "record.dismissed_through_ms";
+/// The `server_setting` row that says which scrobbles that ended unknown
+/// or withdrawn have been seen and set aside: those that ended by a
+/// library revision. A revision only rises, whatever a clock does.
+const DISMISSED: &str = "record.dismissed";
+
+/// The last dismissal: through which library revision, by which command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Dismissal {
+    pub through_revision: i64,
+    pub command: crate::Id,
+}
 
 /// Something that has gone wrong since a time, and is still wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,18 +65,19 @@ impl ServerStore {
         })
     }
 
-    /// The jobs of `kind` that failed since the last that succeeded: none
-    /// once one succeeds again.
-    pub fn failing_jobs(&self, kind: &str) -> Result<Option<Failing>, Error> {
-        let kind = kind.to_owned();
+    /// The jobs of `kind` for `key`, such as one account's imports, that
+    /// failed since the last that succeeded: none once one succeeds again.
+    pub fn failing_jobs(&self, kind: &str, key: &str) -> Result<Option<Failing>, Error> {
+        let (kind, key) = (kind.to_owned(), key.to_owned());
         self.read(move |connection| {
             let (n, since): (i64, Option<i64>) = connection.query_row(
                 "SELECT count(*), min(finished_at_ms) FROM job
-                 WHERE kind = ?1 AND state = 'failed'
+                 WHERE kind = ?1 AND dedupe_key = ?2 AND state = 'failed'
                    AND finished_at_ms > coalesce(
-                     (SELECT max(finished_at_ms) FROM job WHERE kind = ?1 AND state = 'succeeded'),
+                     (SELECT max(finished_at_ms) FROM job
+                      WHERE kind = ?1 AND dedupe_key = ?2 AND state = 'succeeded'),
                      -1)",
-                [&kind],
+                [&kind, &key],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             let Some(since_ms) = since else {
@@ -76,9 +85,10 @@ impl ServerStore {
             };
             let detail: Option<String> = connection
                 .query_row(
-                    "SELECT error_json FROM job WHERE kind = ?1 AND state = 'failed'
+                    "SELECT error_json FROM job WHERE kind = ?1 AND dedupe_key = ?2
+                       AND state = 'failed'
                      ORDER BY finished_at_ms DESC, id DESC LIMIT 1",
-                    [&kind],
+                    [&kind, &key],
                     |row| row.get(0),
                 )
                 .optional()?
@@ -93,33 +103,44 @@ impl ServerStore {
         })
     }
 
-    /// Until when the scrobbles that ended unknown or withdrawn have been
-    /// set aside: none before it count against the record.
-    pub fn record_dismissed_through(&self) -> Result<Option<i64>, Error> {
-        self.read(|connection| {
-            let value: Option<String> = connection
-                .query_row(
-                    "SELECT value_json FROM server_setting WHERE key = ?1",
-                    [DISMISSED],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            Ok(value.and_then(|value| value.parse().ok()))
-        })
+    /// The last dismissal of the scrobbles that ended unknown or
+    /// withdrawn: none that ended by its revision count against the record.
+    pub fn record_dismissal(&self) -> Result<Option<Dismissal>, Error> {
+        self.read(held_dismissal)
     }
 
-    /// Sets aside every scrobble that ended unknown or withdrawn until
-    /// `through_ms`.
-    pub fn dismiss_record_through(&self, through_ms: i64) -> Result<(), Error> {
+    /// Sets aside every scrobble that ended unknown or withdrawn by the
+    /// library revision of `dismissal`, and answers the dismissal in force.
+    /// The same command again changes nothing, so a client that sends it
+    /// again for want of an answer hides nothing that ended since. A
+    /// dismissal never moves back.
+    pub fn dismiss_record(&self, dismissal: Dismissal) -> Result<Dismissal, Error> {
         self.transact(move |transaction, _, _| {
+            if let Some(held) = held_dismissal(transaction)?
+                && (held.command == dismissal.command
+                    || held.through_revision >= dismissal.through_revision)
+            {
+                return Ok(held);
+            }
             transaction.execute(
                 "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
                  ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
-                (DISMISSED, through_ms.to_string()),
+                (DISMISSED, serde_json::to_string(&dismissal)?),
             )?;
-            Ok(())
+            Ok(dismissal)
         })
     }
+}
+
+fn held_dismissal(connection: &rusqlite::Connection) -> Result<Option<Dismissal>, Error> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value_json FROM server_setting WHERE key = ?1",
+            [DISMISSED],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.map(|json| serde_json::from_str(&json)).transpose()?)
 }
 
 /// The scrobbles that may not have reached the service, by how they ended.
@@ -135,14 +156,15 @@ pub struct LostScrobbles {
 }
 
 impl LibraryStore {
-    /// The scrobbles that ended unknown or withdrawn after `after_ms`, and
+    /// The scrobbles that ended unknown or withdrawn after the library
+    /// revision `after`, and
     /// whose echo has not come back.
-    pub fn lost_scrobbles(&self, after_ms: i64) -> Result<LostScrobbles, Error> {
+    pub fn lost_scrobbles(&self, after: i64) -> Result<LostScrobbles, Error> {
         self.read(move |connection| {
             let mut statement = connection.prepare(
                 "WITH lost AS (
                    SELECT d.id, d.updated_at_ms, d.detail FROM history_delivery d
-                   WHERE d.state = ?1 AND d.updated_at_ms > ?2 AND coalesce(d.detail, '') <> ?3
+                   WHERE d.state = ?1 AND d.rev > ?2 AND coalesce(d.detail, '') <> ?3
                      -- Its echo, imported from the account it was sent to, joined its play.
                      AND NOT EXISTS (
                        SELECT 1 FROM play_event_observation mine
@@ -156,7 +178,7 @@ impl LibraryStore {
             )?;
             let mut of = |state: &str| -> Result<Option<Failing>, Error> {
                 let (n, since, detail): (i64, Option<i64>, Option<String>) = statement.query_row(
-                    (state, after_ms, crate::delivery_store::ALREADY_SCROBBLED),
+                    (state, after, crate::delivery_store::ALREADY_SCROBBLED),
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
                 Ok(since.map(|since_ms| Failing {
@@ -195,13 +217,24 @@ mod tests {
         at_ms: i64,
         error: Option<&'static str>,
     ) {
+        account_job(store, n, "someone", state, at_ms, error);
+    }
+
+    fn account_job(
+        store: &ServerStore,
+        n: u8,
+        account: &'static str,
+        state: &'static str,
+        at_ms: i64,
+        error: Option<&'static str>,
+    ) {
         store
             .transact(move |transaction, _, _| {
                 transaction.execute(
-                    "INSERT INTO job (public_id, kind, params_json, state, error_json, created_at_ms,
-                                      finished_at_ms)
-                     VALUES (?1, 'lastfm.sync', '{}', ?2, ?3, ?4, ?4)",
-                    rusqlite::params![[n; 16], state, error, at_ms],
+                    "INSERT INTO job (public_id, kind, dedupe_key, params_json, state, error_json,
+                                      created_at_ms, finished_at_ms)
+                     VALUES (?1, 'lastfm.sync', ?5, '{}', ?2, ?3, ?4, ?4)",
+                    rusqlite::params![[n; 16], state, error, at_ms, account],
                 )?;
                 Ok(())
             })
@@ -211,10 +244,10 @@ mod tests {
     #[test]
     fn imports_fail_from_the_first_failure_after_the_last_success_until_the_next() {
         let store = store();
-        assert_eq!(store.failing_jobs("lastfm.sync").unwrap(), None);
+        assert_eq!(store.failing_jobs("lastfm.sync", "someone").unwrap(), None);
         job(&store, 1, "failed", 1_000, Some("\"long ago\""));
         job(&store, 2, "succeeded", 2_000, None);
-        assert_eq!(store.failing_jobs("lastfm.sync").unwrap(), None);
+        assert_eq!(store.failing_jobs("lastfm.sync", "someone").unwrap(), None);
         job(
             &store,
             3,
@@ -231,7 +264,7 @@ mod tests {
             Some("the service refused the key"),
         );
         assert_eq!(
-            store.failing_jobs("lastfm.sync").unwrap(),
+            store.failing_jobs("lastfm.sync", "someone").unwrap(),
             Some(Failing {
                 since_ms: 3_000,
                 count: 2,
@@ -239,9 +272,9 @@ mod tests {
             })
         );
         // Another kind of job is not an import.
-        assert_eq!(store.failing_jobs("scan").unwrap(), None);
+        assert_eq!(store.failing_jobs("scan", "someone").unwrap(), None);
         job(&store, 6, "succeeded", 5_000, None);
-        assert_eq!(store.failing_jobs("lastfm.sync").unwrap(), None);
+        assert_eq!(store.failing_jobs("lastfm.sync", "someone").unwrap(), None);
     }
 
     #[test]
@@ -271,11 +304,46 @@ mod tests {
     }
 
     #[test]
-    fn a_dismissal_is_kept() {
+    fn one_accounts_imports_are_not_put_right_by_anothers() {
         let store = store();
-        assert_eq!(store.record_dismissed_through().unwrap(), None);
-        store.dismiss_record_through(1_234).unwrap();
-        store.dismiss_record_through(5_678).unwrap();
-        assert_eq!(store.record_dismissed_through().unwrap(), Some(5_678));
+        account_job(&store, 1, "alice", "failed", 1_000, Some("refused"));
+        account_job(&store, 2, "bob", "succeeded", 2_000, None);
+        assert_eq!(
+            store
+                .failing_jobs("lastfm.sync", "alice")
+                .unwrap()
+                .map(|failing| failing.since_ms),
+            Some(1_000)
+        );
+        assert_eq!(store.failing_jobs("lastfm.sync", "bob").unwrap(), None);
+    }
+
+    #[test]
+    fn a_dismissal_is_kept_never_moves_back_and_is_not_moved_by_its_own_command_again() {
+        let store = store();
+        assert_eq!(store.record_dismissal().unwrap(), None);
+        let first = Dismissal {
+            through_revision: 10,
+            command: crate::Id::from_bytes([1; 16]),
+        };
+        assert_eq!(store.dismiss_record(first).unwrap(), first);
+        // The same command, sent again when the library has moved on.
+        let again = Dismissal {
+            through_revision: 20,
+            ..first
+        };
+        assert_eq!(store.dismiss_record(again).unwrap(), first);
+        // Another, through an earlier revision, moves nothing back.
+        let earlier = Dismissal {
+            through_revision: 5,
+            command: crate::Id::from_bytes([2; 16]),
+        };
+        assert_eq!(store.dismiss_record(earlier).unwrap(), first);
+        let later = Dismissal {
+            through_revision: 30,
+            command: crate::Id::from_bytes([3; 16]),
+        };
+        assert_eq!(store.dismiss_record(later).unwrap(), later);
+        assert_eq!(store.record_dismissal().unwrap(), Some(later));
     }
 }

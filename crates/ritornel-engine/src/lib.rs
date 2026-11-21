@@ -108,7 +108,7 @@ pub use library_store::{
 };
 pub use list::{ListError, View};
 pub use ratings::Said;
-pub use record_health::{Failing, LostScrobbles};
+pub use record_health::{Dismissal, Failing, LostScrobbles};
 pub use resolve_store::Resolved;
 /// What a server, a session and every stored entity is named by. The type
 /// is the contract's.
