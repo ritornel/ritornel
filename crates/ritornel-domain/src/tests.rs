@@ -1101,6 +1101,26 @@ fn a_name_written_as_an_artists_sort_name_is_that_artist() {
 }
 
 #[test]
+fn a_sort_name_claimed_by_one_artist_under_and_without_its_id_names_it() {
+    let mut world = World::default();
+    for (at, mbid) in [Some("art-iris"), None].into_iter().enumerate() {
+        world.add(
+            file(["A/1.flac", "A/2.flac"][at], at as i64 + 1)
+                .song(&format!("Song {at}"), "Iris Vane", 200)
+                .with(|facts| {
+                    facts.artist_sort = Some("Vane, Iris".to_owned());
+                    facts.artist_mbids = mbid.into_iter().map(str::to_owned).collect();
+                }),
+        );
+    }
+    world.add(file("B/1.flac", 3).song("Lanterns", "Vane, Iris", 200));
+    let resolution = world.settle();
+    let names: Vec<&str> = resolution.artists.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["Iris Vane"]);
+    world.assert_settled();
+}
+
+#[test]
 fn a_sort_name_two_artists_claim_names_neither() {
     let mut world = World::default();
     for (at, (artist, mbid)) in [("Iris Vane", "art-iris"), ("Iris  Vane", "art-other")]

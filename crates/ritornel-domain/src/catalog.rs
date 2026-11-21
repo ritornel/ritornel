@@ -693,20 +693,6 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             }
         }
     }
-    // A name with no ID that is written as one artist's sort name, and as
-    // no other's, is that artist: "Vane, Iris" where Iris Vane's files claim
-    // that sort name. A sort name that is the artist's own name, as for most
-    // bands, says nothing.
-    let mut sorted_as: HashMap<String, BTreeSet<&ArtistKey>> = HashMap::new();
-    for (key, entry) in &seen {
-        let names: HashSet<String> = entry.names.iter().map(|name| normalize(name)).collect();
-        for sort in &entry.sorts {
-            let sort = normalize(sort);
-            if !names.contains(&sort) {
-                sorted_as.entry(sort).or_default().insert(key);
-            }
-        }
-    }
     let credited_under = |key: &ArtistKey| -> Option<ArtistKey> {
         if let ArtistKey::Name(name) = key
             && let Some(ids) = under.get(name)
@@ -716,6 +702,22 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         }
         None
     };
+    // A name with no ID that is written as one artist's sort name, and as
+    // no other's, is that artist: "Vane, Iris" where Iris Vane's files claim
+    // that sort name. A sort name that is the artist's own name, as for most
+    // bands, says nothing. The artists that claim it are counted once each,
+    // whether their files name them by ID or by name alone.
+    let mut sorted_as: HashMap<String, BTreeSet<ArtistKey>> = HashMap::new();
+    for (key, entry) in &seen {
+        let names: HashSet<String> = entry.names.iter().map(|name| normalize(name)).collect();
+        let claimant = credited_under(key).unwrap_or_else(|| key.clone());
+        for sort in &entry.sorts {
+            let sort = normalize(sort);
+            if !names.contains(&sort) {
+                sorted_as.entry(sort).or_default().insert(claimant.clone());
+            }
+        }
+    }
     let stands_for = |key: &ArtistKey| -> ArtistKey {
         if let Some(found) = credited_under(key) {
             return found;
@@ -724,7 +726,7 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             && let Some(keys) = sorted_as.get(name)
             && let [one] = keys.iter().collect::<Vec<_>>().as_slice()
         {
-            return credited_under(one).unwrap_or_else(|| (**one).clone());
+            return (*one).clone();
         }
         key.clone()
     };
