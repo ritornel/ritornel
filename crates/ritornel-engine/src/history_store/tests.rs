@@ -1366,3 +1366,232 @@ fn a_play_another_scrobbler_already_sent_to_the_account_is_not_sent_again() {
     );
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
 }
+
+/// What a program that knows nothing of Ritornel would do with an export:
+/// read each line as JSON, and the table as CSV, with nothing of this
+/// crate's but the folder's name.
+mod reading_an_export {
+    use serde_json::Value;
+
+    pub(super) fn lines(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// RFC 4180, as far as a quoted cell with a comma, a quote or a line
+    /// break.
+    pub(super) fn table(path: &std::path::Path) -> Vec<std::collections::HashMap<String, String>> {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut rows = Vec::new();
+        let (mut row, mut cell, mut quoted, mut chars) =
+            (Vec::new(), String::new(), false, text.chars().peekable());
+        while let Some(c) = chars.next() {
+            match (quoted, c) {
+                (true, '"') if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    cell.push('"');
+                }
+                (true, '"') => quoted = false,
+                (true, c) => cell.push(c),
+                (false, '"') => quoted = true,
+                (false, ',') => row.push(std::mem::take(&mut cell)),
+                (false, '\r') => {}
+                (false, '\n') => {
+                    row.push(std::mem::take(&mut cell));
+                    rows.push(std::mem::take(&mut row));
+                }
+                (false, c) => cell.push(c),
+            }
+        }
+        let mut rows = rows.into_iter();
+        let header = rows.next().unwrap();
+        rows.map(|row| header.iter().cloned().zip(row).collect())
+            .collect()
+    }
+}
+
+#[test]
+fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_play_and_a_cleared_rating()
+ {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let (release, release_title): ([u8; 16], String) = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT public_id, display_title FROM release ORDER BY id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .unwrap();
+
+    // A listen skipped twenty seconds into the second track, begun from
+    // the album's page, and one that finished.
+    let start = T0 + 10 * MINUTE;
+    let mut skipped = at.listen(7, 1, start, 20_000);
+    skipped.end_reason = "next".to_owned();
+    skipped.context_ref = Some(Id::from_bytes(release));
+    at.send(&skipped, PlayRule::V1);
+    let finished = at.listen(8, 0, start + 5 * MINUTE, ALBUM[0].length_ms);
+    at.send(&finished, PlayRule::V1);
+    // One taken out of history again.
+    exclude_listen(&at, Id::from_bytes([8; 16]));
+    // A scrobble from years before, imported.
+    scrobble_of(
+        &at,
+        account,
+        1_500_000_000,
+        "Ada Example, \"Quoted\"",
+        "Tin Roof",
+    );
+    // Four stars, then none.
+    let recording: [u8; 16] = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT rec.public_id FROM source_item si
+                 JOIN recording rec ON rec.id = si.current_recording_id
+                 WHERE si.public_id = ?1",
+                [at.tracks[0].1.as_bytes()],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    for (key, value) in [(0x51, Some(80)), (0x52, None)] {
+        at.library
+            .set_rating(
+                WriteRequest {
+                    method: "ratings.set",
+                    command: Some(crate::Command {
+                        id: Id::from_bytes([key; 16]),
+                        fingerprint: crate::Fingerprint::of("ratings.set", &[key]),
+                    }),
+                    client: None,
+                },
+                Id::from_bytes(recording),
+                value,
+                |_, _| String::new(),
+            )
+            .unwrap();
+    }
+
+    let scratch = crate::testing::Scratch::new();
+    let exported = at
+        .library
+        .export_record(scratch.path(), T0 + 99 * MINUTE)
+        .unwrap();
+    assert_eq!(
+        (exported.observations, exported.ratings),
+        (4, 2),
+        "two listens, an import and a correction"
+    );
+
+    // From here on, only what is in the folder.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(scratch.path().join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        (&manifest["format"], &manifest["version"]),
+        (&serde_json::json!("ritornel-record"), &serde_json::json!(1))
+    );
+    let observations = reading_an_export::lines(&scratch.path().join("observations.jsonl"));
+    let endpoint_kind = |id: &serde_json::Value| {
+        manifest["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|endpoint| endpoint["id"] == *id)
+            .unwrap()["kind"]
+            .clone()
+    };
+
+    // The skipped listen, with what it was played from.
+    let listen = observations
+        .iter()
+        .find(|line| line["kind"] == "listen" && line["listen"]["endReason"] == "next")
+        .unwrap();
+    assert_eq!(endpoint_kind(&listen["endpoint"]), "player");
+    assert_eq!(listen["listen"]["msPlayed"], 20_000);
+    assert_eq!(listen["listen"]["playedFrom"]["kind"], "album");
+    assert_eq!(
+        listen["listen"]["playedFrom"]["id"],
+        Id::from_bytes(release).to_string()
+    );
+    assert_eq!(
+        listen["listen"]["playedFrom"]["title"],
+        release_title.as_str()
+    );
+    assert_eq!(listen["sourceKey"], "07".repeat(16));
+    assert_eq!(listen["record"]["endReason"], "next");
+
+    // The imported play, as the service gave it.
+    let import = observations
+        .iter()
+        .find(|line| line["kind"] == "import")
+        .unwrap();
+    assert_eq!(endpoint_kind(&import["endpoint"]), "service");
+    assert_eq!(import["import"]["artist"], "Ada Example, \"Quoted\"");
+    assert_eq!(import["import"]["title"], "Tin Roof");
+    assert_eq!(import["import"]["playedAt"], "2017-07-14T02:40:00Z");
+
+    // The correction names what it excludes by endpoint and source key.
+    let correction = observations
+        .iter()
+        .find(|line| line["kind"] == "correction")
+        .unwrap();
+    assert_eq!(correction["correction"]["verb"], "exclude");
+    assert_eq!(
+        correction["correction"]["targets"][0]["sourceKey"],
+        "08".repeat(16)
+    );
+
+    // The rating, then its clearing.
+    let ratings = reading_an_export::lines(&scratch.path().join("ratings.jsonl"));
+    let of_it: Vec<_> = ratings
+        .iter()
+        .filter(|line| line["recording"]["id"] == Id::from_bytes(recording).to_string())
+        .collect();
+    assert_eq!(of_it.len(), 2);
+    assert_eq!(
+        (&of_it[0]["value"], &of_it[0]["cleared"]),
+        (&80.into(), &false.into())
+    );
+    assert_eq!(
+        (&of_it[1]["value"], &of_it[1]["cleared"]),
+        (&serde_json::Value::Null, &true.into())
+    );
+
+    // The plays as a table: the import's, the skip's and the excluded one.
+    let plays = reading_an_export::table(&scratch.path().join("plays.csv"));
+    assert_eq!(plays.len() as u64, exported.plays);
+    let imported = plays
+        .iter()
+        .find(|play| play["source"] == "service")
+        .unwrap();
+    assert_eq!(imported["artist"], "Ada Example, \"Quoted\"");
+    assert_eq!(imported["played_at_utc"], "2017-07-14T02:40:00Z");
+    let skip = plays
+        .iter()
+        .find(|play| play["source_key"] == "07".repeat(16))
+        .unwrap();
+    assert_eq!(
+        (
+            skip["outcome"].as_str(),
+            skip["counts"].as_str(),
+            skip["played_from"].as_str()
+        ),
+        ("skipped", "0", "album")
+    );
+    let excluded = plays
+        .iter()
+        .find(|play| play["source_key"] == "08".repeat(16))
+        .unwrap();
+    assert_eq!(excluded["excluded"], "1");
+}

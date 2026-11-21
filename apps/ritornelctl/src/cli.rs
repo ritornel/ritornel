@@ -3,6 +3,7 @@
 //! ```text
 //! ritornelctl status [--data-dir <dir>] [--json]
 //! ritornelctl backup [--data-dir <dir>] [--json]
+//! ritornelctl export <folder> [--data-dir <dir>] [--json]
 //! ritornelctl library create [--data-dir <dir>] [--json]
 //! ritornelctl library stats [--data-dir <dir>] [--json]
 //! ritornelctl scan <folder> [--name <name>] [--no-wait] [--data-dir <dir>] [--json]
@@ -43,7 +44,9 @@ use clap::{Args, Parser, Subcommand};
 use ritornel_client::contract::SkipDirection;
 use ritornel_client::contract::local::Env;
 
-use crate::{artists, backup, history, identity, jobs, lastfm, library, playback, scan, status};
+use crate::{
+    artists, backup, export, history, identity, jobs, lastfm, library, playback, scan, status,
+};
 
 const USAGE: &str = "\
 The command-line client of a Ritornel server. It talks to the server that is
@@ -52,6 +55,7 @@ running on a data directory, and never starts one.
 Usage:
   ritornelctl status [--data-dir <dir>] [--json]
   ritornelctl backup [--data-dir <dir>] [--json]
+  ritornelctl export <folder> [--data-dir <dir>] [--json]
   ritornelctl library create [--data-dir <dir>] [--json]
   ritornelctl library stats [--data-dir <dir>] [--json]
   ritornelctl scan <folder> [--name <name>] [--no-wait] [--data-dir <dir>] [--json]
@@ -89,6 +93,11 @@ Commands:
                    it goes on playing. The backup folder is named when the
                    server starts (`ritornel-server serve --backup-dir`), and
                    with none named there is no backup
+  export <folder>  Write the listening record into a new folder in
+                   <folder>, to be read without Ritornel: every listen,
+                   imported scrobble and correction, and every rating and
+                   love, as JSON Lines, and the plays as a CSV table.
+                   manifest.json says what each file holds
   library create   Create a library on the server and make the server its
                    hub. A server holds one library, and one that has a
                    library already refuses
@@ -331,6 +340,7 @@ struct Cli {
 enum Command {
     Status(ServerArgs),
     Backup(ServerArgs),
+    Export(ExportArgs),
     #[command(subcommand)]
     Library(LibraryCommand),
     Scan(ScanArgs),
@@ -353,6 +363,15 @@ enum Command {
     Show(ShowArgs),
     #[command(subcommand)]
     Lastfm(LastfmCommand),
+}
+
+/// What `export` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ExportArgs {
+    /// The folder the export's own folder is made in.
+    pub(crate) folder: PathBuf,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `show` takes.
@@ -701,6 +720,7 @@ fn try_run(
     match command {
         Command::Status(args) => status::status(&args, env, out),
         Command::Backup(args) => backup::backup(&args, env, out),
+        Command::Export(args) => export::export(&args, env, out),
         Command::Library(LibraryCommand::Create(args)) => library::create(&args, env, out),
         Command::Library(LibraryCommand::Stats(args)) => library::stats(&args, env, out),
         Command::Scan(args) => scan::scan(&args, env, out),

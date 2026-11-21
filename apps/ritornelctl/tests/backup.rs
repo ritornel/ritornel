@@ -1,9 +1,11 @@
-//! The real `ritornelctl backup` on the real `ritornel-server`: a backup
-//! taken while the server plays is restored into another data directory,
-//! where the history it holds is the history a rebuild makes; and with no
-//! backup folder named there is no backup, nothing is written beside the
-//! data in its place, and the status says so. See "The data directory" in
-//! docs/design/server.md.
+//! The real `ritornelctl backup` and `export` on the real
+//! `ritornel-server`. A backup taken while the server plays is restored
+//! into another data directory, where the history it holds is the history
+//! a rebuild makes; with no backup folder named there is no backup,
+//! nothing is written beside the data in its place, and the status says
+//! so. An export is read back as plain JSON Lines and CSV. See "The data
+//! directory" in docs/design/server.md and "Export" in
+//! docs/design/history.md.
 //!
 //! As in `play.rs`, `ritornel-server` is taken from beside `ritornelctl`,
 //! and nothing here sleeps: each wait is for a process to print a line or
@@ -392,4 +394,71 @@ fn a_backup_taken_while_the_server_plays_is_restored_elsewhere_with_its_history_
     server.stop();
     // Nothing needed migrating, so nothing was copied beside it.
     assert!(!restored.join("backups").exists());
+}
+
+#[test]
+fn an_export_is_read_back_without_ritornel_and_holds_a_skipped_listen_with_where_it_was_played_from()
+ {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let album = scratch.album("Long Album", [600, 600]);
+    let out = scratch.0.join("exports");
+    std::fs::create_dir_all(&out).unwrap();
+    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
+    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    let folder = album.to_str().unwrap();
+    assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
+
+    // The first track is skipped a little way in, and the second stopped.
+    assert_eq!(ritornelctl(&data_dir, &["play", folder]).0, Some(0));
+    until(&data_dir, &["now"], |now| {
+        now["status"] == "playing" && now["positionMs"].as_u64() > Some(0)
+    });
+    assert_eq!(ritornelctl(&data_dir, &["next"]).0, Some(0));
+    until(&data_dir, &["now"], |now| now["index"] == 1);
+    assert_eq!(ritornelctl(&data_dir, &["stop"]).0, Some(0));
+    until(&data_dir, &["history"], |recent| {
+        recent["undelivered"] == 0 && recent["plays"].as_array().unwrap().len() == 2
+    });
+
+    let exported = json(&data_dir, &["export", out.to_str().unwrap()]);
+    assert_eq!(exported["observations"], 2, "{exported}");
+    let path = PathBuf::from(exported["path"].as_str().unwrap());
+    assert_eq!(path.parent(), Some(out.as_path()));
+    server.stop();
+
+    // From here on, only what is in the folder.
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(path.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["format"], "ritornel-record");
+    let lines: Vec<Value> = std::fs::read_to_string(path.join("observations.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let skipped = lines
+        .iter()
+        .find(|line| line["listen"]["endReason"] == "next")
+        .unwrap();
+    assert_eq!(skipped["kind"], "listen");
+    assert_eq!(skipped["listen"]["startReason"], "user_pick");
+    assert_eq!(
+        skipped["listen"]["playedFrom"]["kind"],
+        skipped["record"]["contextKind"]
+    );
+    assert!(skipped["listen"]["msPlayed"].as_u64() > Some(0));
+    assert!(
+        skipped["item"]["key"]
+            .as_str()
+            .unwrap()
+            .ends_with("01 First.wav")
+    );
+    let plays = std::fs::read_to_string(path.join("plays.csv")).unwrap();
+    let mut rows = plays.lines();
+    assert!(
+        rows.next()
+            .unwrap()
+            .starts_with("play,listener,played_at_utc,")
+    );
+    assert_eq!(rows.count(), 2);
 }

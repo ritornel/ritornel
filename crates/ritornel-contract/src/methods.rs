@@ -440,6 +440,14 @@ methods! {
     /// another, so the receipt is made and not stored.
     ServerBackup: "server.backup", Command, needs_full: true,
     BackupParams => BackedUp;
+
+    /// `history.export`: writes the record into a new folder of its own in
+    /// the folder named: every observation and every rating as JSON Lines,
+    /// and the plays derived from them as a table, readable without
+    /// Ritornel. It answers when the folder is whole. Exporting again
+    /// writes another, so the receipt is made and not stored.
+    HistoryExport: "history.export", Command, needs_full: true,
+    HistoryExportParams => HistoryExported;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -517,7 +525,8 @@ mod tests {
                 "artists.importPictures",
                 "artists.pictureFolders",
                 "library.setWatching",
-                "server.backup"
+                "server.backup",
+                "history.export"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -558,7 +567,8 @@ mod tests {
                 "artists.importPictures",
                 "artists.pictureFolders",
                 "library.setWatching",
-                "server.backup"
+                "server.backup",
+                "history.export"
             ]
         );
         // Everything but reading the library and controlling playback

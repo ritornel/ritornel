@@ -194,6 +194,9 @@ impl Write<'_> {
 /// a thread of its own, and a read-only connection for reads.
 #[derive(Debug)]
 pub struct LibraryStore {
+    /// Where the database is, for a read that wants a connection of its
+    /// own: an export.
+    location: Location,
     writer: Writer,
     reader: Reader,
     clock: Arc<dyn Clock>,
@@ -328,6 +331,7 @@ impl LibraryStore {
         let (migrated, library_id, written) = created;
         let reader = Reader::open(&location)?;
         let store = Self {
+            location,
             writer,
             reader,
             clock,
@@ -375,6 +379,7 @@ impl LibraryStore {
         };
         let reader = Reader::open(&location)?;
         Ok(Self {
+            location,
             writer,
             reader,
             clock,
@@ -470,6 +475,11 @@ impl LibraryStore {
             .0
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Some(hook);
+    }
+
+    /// Where the database is.
+    pub(crate) fn location(&self) -> &Location {
+        &self.location
     }
 
     /// The clock the store takes its times from.
