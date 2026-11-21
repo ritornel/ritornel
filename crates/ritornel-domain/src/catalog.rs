@@ -7,8 +7,14 @@
 //! back onto the rows that exist, so that a run over an unchanged library
 //! asks for no change.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
+
+/// The version of how claims become releases, discs and credits, beside
+/// the policy's. A library last resolved by another is resolved again.
+///
+/// 1: a name with no ID written as one artist's sort name is that artist.
+pub const CATALOG_VERSION: i64 = 1;
 
 use crate::extract::{Facts, parse_date};
 use crate::library::{
@@ -687,12 +693,38 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             }
         }
     }
-    let stands_for = |key: &ArtistKey| -> ArtistKey {
+    // A name with no ID that is written as one artist's sort name, and as
+    // no other's, is that artist: "Vane, Iris" where Iris Vane's files claim
+    // that sort name. A sort name that is the artist's own name, as for most
+    // bands, says nothing.
+    let mut sorted_as: HashMap<String, BTreeSet<&ArtistKey>> = HashMap::new();
+    for (key, entry) in &seen {
+        let names: HashSet<String> = entry.names.iter().map(|name| normalize(name)).collect();
+        for sort in &entry.sorts {
+            let sort = normalize(sort);
+            if !names.contains(&sort) {
+                sorted_as.entry(sort).or_default().insert(key);
+            }
+        }
+    }
+    let credited_under = |key: &ArtistKey| -> Option<ArtistKey> {
         if let ArtistKey::Name(name) = key
             && let Some(ids) = under.get(name)
             && let Some((_, mbid)) = ids.iter().max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(a.1)))
         {
-            return ArtistKey::Mbid((*mbid).to_owned());
+            return Some(ArtistKey::Mbid((*mbid).to_owned()));
+        }
+        None
+    };
+    let stands_for = |key: &ArtistKey| -> ArtistKey {
+        if let Some(found) = credited_under(key) {
+            return found;
+        }
+        if let ArtistKey::Name(name) = key
+            && let Some(keys) = sorted_as.get(name)
+            && let [one] = keys.iter().collect::<Vec<_>>().as_slice()
+        {
+            return credited_under(one).unwrap_or_else(|| (**one).clone());
         }
         key.clone()
     };

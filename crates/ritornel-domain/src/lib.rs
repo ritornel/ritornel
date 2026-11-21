@@ -51,7 +51,7 @@ pub mod selection;
 #[cfg(test)]
 mod tests;
 
-pub use catalog::resolve;
+pub use catalog::{CATALOG_VERSION, resolve};
 pub use extract::{Claim, EXTRACTOR_VERSION, Facts, Scope, Source, extract};
 pub use library::{Library, Resolution};
 pub use normalize::NORMALIZER_VERSION;

@@ -507,9 +507,10 @@ fn a_library_resolved_by_policy_1_is_resolved_by_policy_2_at_the_next_scan() {
     assert_eq!(
         rig.one("SELECT value_json FROM library_setting WHERE key = 'identity.versions'"),
         format!(
-            r#"{{"extractor":{},"resolver":2,"normalizer":{}}}"#,
+            r#"{{"extractor":{},"resolver":2,"normalizer":{},"catalog":{}}}"#,
             ritornel_domain::EXTRACTOR_VERSION,
-            ritornel_domain::NORMALIZER_VERSION
+            ritornel_domain::NORMALIZER_VERSION,
+            ritornel_domain::CATALOG_VERSION
         )
     );
     // The evidence names the cause, the file it nearly matched and that

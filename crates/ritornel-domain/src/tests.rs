@@ -1070,6 +1070,59 @@ fn an_artist_with_no_id_keeps_its_row_across_a_change_of_normaliser() {
 }
 
 #[test]
+fn a_name_written_as_an_artists_sort_name_is_that_artist() {
+    for mbid in [Some("art-iris"), None] {
+        let mut world = World::default();
+        for (at, path) in ["A/1.flac", "A/2.flac"].into_iter().enumerate() {
+            world.add(
+                file(path, at as i64 + 1)
+                    .song(&format!("Song {at}"), "Iris Vane", 200)
+                    .on("Tin Weather", None, at as i64 + 1)
+                    .with(|facts| {
+                        facts.artist_sort = Some("Vane, Iris".to_owned());
+                        facts.artist_mbids = mbid.into_iter().map(str::to_owned).collect();
+                    }),
+            );
+        }
+        // Another album whose artist tag holds the sort name.
+        world.add(
+            file("B/1.flac", 3)
+                .song("Lanterns", "Vane, Iris", 200)
+                .on("Low Field", None, 1),
+        );
+        let resolution = world.settle();
+        let names: Vec<&str> = resolution.artists.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Iris Vane"], "{mbid:?}");
+        // Credited as written.
+        let credit = &resolution.credits[resolution.appearances[2].credit.unwrap()];
+        assert_eq!(credit.names, [(0, "Vane, Iris".to_owned(), String::new())]);
+        world.assert_settled();
+    }
+}
+
+#[test]
+fn a_sort_name_two_artists_claim_names_neither() {
+    let mut world = World::default();
+    for (at, (artist, mbid)) in [("Iris Vane", "art-iris"), ("Iris  Vane", "art-other")]
+        .into_iter()
+        .enumerate()
+    {
+        world.add(
+            file(["A/1.flac", "C/1.flac"][at], at as i64 + 1)
+                .song("Song", artist, 200)
+                .with(|facts| {
+                    facts.artist_sort = Some("Vane, Iris".to_owned());
+                    facts.artist_mbids = vec![mbid.to_owned()];
+                }),
+        );
+    }
+    world.add(file("B/1.flac", 3).song("Lanterns", "Vane, Iris", 200));
+    let resolution = world.settle();
+    assert_eq!(resolution.artists.len(), 3);
+    world.assert_settled();
+}
+
+#[test]
 fn the_owners_assignment_is_kept_and_an_exclusion_removes_a_candidate() {
     let mut world = World::default();
     let first = world.add(file("A/1.flac", 1).song("Glass Pier", "Ninefold", 200));
