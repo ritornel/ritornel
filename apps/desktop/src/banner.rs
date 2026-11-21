@@ -202,49 +202,13 @@ impl Banner {
             let (shown, going) = came(*at, 300.);
             animating |= going;
             let wide = (width * 0.4).min(380.);
-            banner = banner.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .w(px(wide))
-                    .h_full()
-                    .opacity(fade(1. - p * 1.25) * shown)
-                    .child(
-                        img(Arc::clone(portrait))
-                            .size_full()
-                            .object_fit(ObjectFit::Cover),
-                    )
-                    .children(frost::piece(
-                        frost::Fill::Picture(Arc::clone(portrait)),
-                        fade(1. - p * 1.25) * shown,
-                    ))
-                    // GPUI has no mask: the melt is the picture's own ground
-                    // laid over its left half, fading to nothing.
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .h_full()
-                            .w(px(wide * 0.52))
-                            .bg(linear_gradient(
-                                90.,
-                                linear_color_stop(rgba(0x17181bff), 0.),
-                                linear_color_stop(rgba(0x17181b00), 1.),
-                            ))
-                            .children(frost::piece(
-                                frost::Fill::Gradient {
-                                    toward: frost::Toward::Right,
-                                    from: rgba(0x17181bff),
-                                    to: rgba(0x17181b00),
-                                    start: 0.,
-                                    end: 1.,
-                                },
-                                fade(1. - p * 1.25) * shown,
-                            )),
-                    ),
-            );
+            banner = banner.child(portrait_melted(
+                portrait,
+                wide,
+                fade(1. - p * 1.25) * shown,
+                width - wide,
+                window.scale_factor(),
+            ));
         }
 
         // An album's cover hangs out of the banner: this is the part of it
@@ -538,6 +502,122 @@ impl Banner {
     }
 }
 
+/// How much of the portrait's width, from its left edge, melts into the
+/// blur (`mask-image: linear-gradient(90deg, transparent, #000 52%)`).
+const MELT: f32 = 0.52;
+/// The width of each step of the melt, in points: two device pixels on a
+/// Retina screen, too fine for its steps of opacity to be seen.
+const MELT_STEP: f32 = 1.;
+/// How many steps of the melt the frost behind Up next's card takes as
+/// one: blurred 40 points, it cannot tell them apart.
+const MELT_FROSTED: usize = 12;
+
+/// Where a picture `iw` by `ih` lies in a portrait's box `wide` points
+/// across and as tall as the banner, its left and top and its size: it
+/// covers the box, kept at the middle across and 30% down (`object-fit:
+/// cover; object-position: center 30%`).
+fn placed(iw: f32, ih: f32, wide: f32) -> (f32, f32, f32, f32) {
+    let (iw, ih) = (iw.max(1.), ih.max(1.));
+    let scale = (wide / iw).max(HEIGHT / ih);
+    let (dw, dh) = (iw * scale, ih * scale);
+    ((wide - dw) * 0.5, (HEIGHT - dh) * 0.3, dw, dh)
+}
+
+/// The steps of a portrait's melt, from its left edge, each where it starts
+/// and ends in the box and how opaque it is: the mask's opacity at its
+/// middle. Their edges fall on whole device pixels, `pixels` to a point,
+/// the box's left edge being `left` points across the window, so that no
+/// pixel is drawn by two steps, or by none.
+fn melt_steps(wide: f32, left: f32, pixels: f32) -> Vec<(f32, f32, f32)> {
+    let melt = wide * MELT;
+    let steps = (melt / MELT_STEP).ceil().max(1.) as usize;
+    let snap = |at: f32| ((left + at) * pixels).round() / pixels - left;
+    let mut edges: Vec<f32> = (0..=steps)
+        .map(|at| snap(melt * at as f32 / steps as f32))
+        .collect();
+    edges.dedup();
+    edges
+        .iter()
+        .zip(edges.iter().skip(1))
+        .map(|(&from, &to)| (from, to, ((from + to) / 2. / melt).clamp(0., 1.)))
+        .collect()
+}
+
+/// An artist's portrait, `wide` points across and as tall as the banner,
+/// placed as [`placed`] says, its left edge melting into what lies under
+/// it, at `opacity` as a whole. GPUI has no mask, so the melt is the
+/// picture drawn in the narrow upright steps of [`melt_steps`], each
+/// clipped to itself and as opaque as the mask is at its middle.
+fn portrait_melted(
+    portrait: &Arc<RenderImage>,
+    wide: f32,
+    opacity: f32,
+    left: f32,
+    pixels: f32,
+) -> gpui::Div {
+    let size = portrait.size(0);
+    let (x, y, dw, dh) = placed(size.width.0 as f32, size.height.0 as f32, wide);
+    // The picture where it lies in the portrait's box, seen from a piece
+    // of it that starts `from` points in.
+    let picture = |from: f32| {
+        img(Arc::clone(portrait))
+            .absolute()
+            .left(px(x - from))
+            .top(px(y))
+            .w(px(dw))
+            .h(px(dh))
+            .object_fit(ObjectFit::Fill)
+    };
+    // What the card frosts of the picture, seen from `from` points in.
+    let frosted = |from: f32, opacity: f32| {
+        frost::piece(frost::Fill::Picture(Arc::clone(portrait)), opacity)
+            .map(|piece| piece.left(px(x - from)).top(px(y)).w(px(dw)).h(px(dh)))
+    };
+    let piece = |from: f32, across: f32| {
+        div()
+            .absolute()
+            .top_0()
+            .left(px(from))
+            .w(px(across))
+            .h_full()
+            .overflow_hidden()
+    };
+
+    let mut held = div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .w(px(wide))
+        .h_full()
+        .overflow_hidden()
+        .opacity(opacity);
+    // The melt, a group of steps at a time, each group frosted as one.
+    let steps = melt_steps(wide, left, pixels);
+    for group in steps.chunks(MELT_FROSTED) {
+        let (Some(first), Some(last)) = (group.first(), group.last()) else {
+            continue;
+        };
+        let mean = (first.2 + last.2) / 2.;
+        let mut held_group =
+            piece(first.0, last.1 - first.0).children(frosted(first.0, opacity * mean));
+        for &(from, to, shown) in group {
+            held_group = held_group.child(
+                piece(from - first.0, to - from)
+                    .opacity(shown)
+                    .child(picture(from)),
+            );
+        }
+        held = held.child(held_group);
+    }
+    // The rest, whole.
+    let rest = steps.last().map_or(0., |step| step.1);
+    held.child(
+        piece(rest, wide - rest)
+            .child(picture(rest))
+            .children(frosted(rest, opacity)),
+    )
+}
+
 /// The real cover's shadow, in each palette.
 pub(crate) fn cover_shadow() -> Vec<BoxShadow> {
     vec![if theme::dark() {
@@ -545,4 +625,48 @@ pub(crate) fn cover_shadow() -> Vec<BoxShadow> {
     } else {
         theme::css_shadow(16., 40., theme::cover_shadow())
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_square_portrait_covers_its_box_kept_30_percent_down() {
+        // As wide as the box, and cut 30% of the way down its overflow.
+        let (x, y, w, h) = placed(1000., 1000., 380.);
+        assert!((x, w, h) == (0., 380., 380.), "{x} {w} {h}");
+        assert!((y - 0.3 * (HEIGHT - 380.)).abs() < 1e-3, "{y}");
+        // A narrow window's box, narrower than the banner is tall: as tall
+        // as the banner, kept at the middle across.
+        let (x, y, w, h) = placed(1000., 1000., 180.);
+        assert!((w, h, y) == (HEIGHT, HEIGHT, 0.), "{w} {h} {y}");
+        assert!((x - (180. - HEIGHT) / 2.).abs() < 1e-3, "{x}");
+    }
+
+    #[test]
+    fn the_melt_runs_from_clear_to_whole_on_whole_pixels() {
+        for (left, pixels) in [(1020., 2.), (461.6, 2.), (1020.25, 1.), (700.3, 1.5)] {
+            let steps = melt_steps(380., left, pixels);
+            let melt = 380. * MELT;
+            let first = steps.first().copied().unwrap_or_default();
+            let last = steps.last().copied().unwrap_or_default();
+            assert!(first.0.abs() * pixels <= 0.5 && first.2 < 0.01, "{first:?}");
+            assert!(
+                (last.1 - melt).abs() * pixels <= 0.5 && last.2 > 0.99,
+                "{last:?}"
+            );
+            let mut before = (first.0, 0.);
+            for &(from, to, shown) in &steps {
+                // Each step meets the last, on a whole pixel, and is more opaque.
+                assert!(
+                    from == before.0 && to > from && shown > before.1,
+                    "{from} {to}"
+                );
+                let edge = (left + to) * pixels;
+                assert!((edge - edge.round()).abs() < 1e-2, "{edge}");
+                before = (to, shown);
+            }
+        }
+    }
 }
