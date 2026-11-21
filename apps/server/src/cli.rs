@@ -3,6 +3,7 @@
 //! ```text
 //! ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
 //!                       [--log-level <level>] [--output <output>]
+//!                       [--backup-dir <dir>]
 //! ritornel-server service install [--data-dir <dir>]
 //! ritornel-server service uninstall | status
 //! ```
@@ -26,6 +27,7 @@ The Ritornel server. It owns a data directory and the databases in it.
 Usage:
   ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
                         [--log-level <level>] [--output <output>]
+                        [--backup-dir <dir>]
   ritornel-server service install [--data-dir <dir>]
   ritornel-server service uninstall | status
 
@@ -62,6 +64,12 @@ Options:
                         where this build has an audio output, and none
                         elsewhere. The device is opened when something is
                         first played
+  --backup-dir <dir>    The folder backups are written to, outside the data
+                        directory: on another disk where there is one. It
+                        must already exist. Each backup is a folder of its
+                        own in it, taken by `ritornelctl backup` and before
+                        a database is migrated. With none named there is no
+                        backup, and `ritornelctl status` says so
   -h, --help            Show this help
   -V, --version         Show the version
 
@@ -73,6 +81,7 @@ Environment:
                         ~/.local/share/ritornel unless you moved it
   RITORNEL_LISTEN       The listen address, when --listen is not given
   RITORNEL_LOG_LEVEL    The log level, when --log-level is not given
+  RITORNEL_BACKUP_DIR   The backup folder, when --backup-dir is not given
 
 A setting is read from its flag, then its environment variable, then
 config.toml in the data directory, then its default.
@@ -126,6 +135,8 @@ pub(crate) struct ServeArgs {
     pub(crate) invent_churn: Option<u32>,
     #[arg(long, value_parser = ["default", "null", "none"])]
     pub(crate) output: Option<String>,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub(crate) backup_dir: Option<String>,
 }
 
 /// What a wrong command line is answered with. The messages are fixed and
@@ -159,6 +170,11 @@ fn usage(error: &clap::Error) -> Error {
         }
         ErrorKind::InvalidValue | ErrorKind::ValueValidation if option.starts_with("--output") => {
             "--output is default, null or none"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation
+            if option.starts_with("--backup-dir") =>
+        {
+            "--backup-dir needs a folder"
         }
         _ => "the command line is wrong; try `ritornel-server --help`",
     })
@@ -255,6 +271,7 @@ mod tests {
             log_level: Some("debug".to_owned()),
             invent_churn: None,
             output: None,
+            backup_dir: None,
         });
         for line in [
             &[

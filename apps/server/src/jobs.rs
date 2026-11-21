@@ -63,6 +63,10 @@ pub struct Run {
     pub lastfm: crate::lastfm::LastfmRun,
     /// Whether and how this run watches the hub's folders.
     pub watch: crate::watch::WatchRun,
+    /// The folder backups are written to, outside the data directory.
+    /// With none there is no backup, and a database is migrated with a
+    /// copy kept in the data directory's `backups/` as its way back.
+    pub backup_dir: Option<std::path::PathBuf>,
 }
 
 /// The running worker.

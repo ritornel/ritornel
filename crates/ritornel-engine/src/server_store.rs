@@ -22,6 +22,31 @@ const LOCAL_CREDENTIAL_SESSION: &str = "local_credential_session_id";
 /// Absent means it does.
 const WATCH_SETTING: &str = "library.watch";
 
+/// The `server_setting` rows that say when this server last backed up, and
+/// when a backup last failed if none has worked since.
+const BACKUP_TAKEN: &str = "backup.last";
+const BACKUP_FAILED: &str = "backup.failed";
+
+/// A backup that was written: when, where and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackupTaken {
+    /// When it was taken.
+    pub at_ms: i64,
+    /// The folder it was written to.
+    pub path: String,
+    /// `on_demand` or `before_migration`.
+    pub reason: String,
+}
+
+/// A backup that could not be written.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackupFailed {
+    /// When it failed.
+    pub at_ms: i64,
+    /// What went wrong, as a person reads it.
+    pub message: String,
+}
+
 /// The label of the local credential's session. Display text only.
 const LOCAL_CREDENTIAL_LABEL: &str = "local owner";
 
@@ -241,6 +266,59 @@ impl ServerStore {
                 "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
                  ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
                 (WATCH_SETTING, if on { "true" } else { "false" }),
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The last backup this server wrote, and the last that failed if
+    /// none has been written since.
+    pub fn backups(&self) -> Result<(Option<BackupTaken>, Option<BackupFailed>), Error> {
+        self.reader.call(|connection| {
+            let read = |key: &str| -> Result<Option<String>, Error> {
+                Ok(connection
+                    .query_row(
+                        "SELECT value_json FROM server_setting WHERE key = ?1",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .optional()?)
+            };
+            let taken = read(BACKUP_TAKEN)?
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?;
+            let failed = read(BACKUP_FAILED)?
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?;
+            Ok((taken, failed))
+        })
+    }
+
+    /// Records a backup that was written. A failure before it is over.
+    pub fn backup_taken(&self, taken: &BackupTaken) -> Result<(), Error> {
+        let json = serde_json::to_string(taken)?;
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+                (BACKUP_TAKEN, &json),
+            )?;
+            transaction.execute("DELETE FROM server_setting WHERE key = ?1", [BACKUP_FAILED])?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Records a backup that could not be written. The last one that was
+    /// is kept.
+    pub fn backup_failed(&self, failed: &BackupFailed) -> Result<(), Error> {
+        let json = serde_json::to_string(failed)?;
+        self.writer.call(move |connection| {
+            connection.execute(
+                "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+                (BACKUP_FAILED, &json),
             )?;
             Ok(())
         })

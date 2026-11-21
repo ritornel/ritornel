@@ -99,7 +99,16 @@ impl Server {
     ) -> Result<Self, Error> {
         let dir = held.dir();
         let tickets = Tickets::new(Arc::clone(&entropy), bounds.ticket_life);
+        // Nothing is migrated without a copy of it.
+        let started_ms = clock.now_ms();
+        let before = crate::backup::before_migrating(dir, run.backup_dir.as_deref(), started_ms)?;
         let store = ServerStore::open(&dir.server_db(), clock.clone(), entropy.clone())?;
+        crate::dispatch::record_backup(
+            &store,
+            started_ms,
+            before.taken.as_ref(),
+            before.failed.as_deref(),
+        );
         info!(
             sqlite = SQLITE_VERSION,
             schema_version = store.schema_version(),
@@ -166,6 +175,7 @@ impl Server {
         }
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
         core.set_watch(run.watch);
+        core.set_backups(crate::backup::Backups::new(run.backup_dir));
         let listening = Listening::start(Arc::clone(&core), tickets, listener, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         let worker = Worker::start(Arc::clone(&core), boot_id, run.scan).map_err(Error::Runtime)?;

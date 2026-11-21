@@ -246,6 +246,7 @@ fn spawn(data_dir: &Path, fake: &FakeLastfm, more: &[(&str, &str)]) -> (Child, R
         .env_remove("RITORNEL_DATA_DIR")
         .env_remove("RITORNEL_LISTEN")
         .env_remove("RITORNEL_LOG_LEVEL")
+        .env_remove("RITORNEL_BACKUP_DIR")
         // A test that plays leaves the media keys where they were.
         .env("RITORNEL_TEST_NO_MEDIA_SESSION", "1")
         .env("SCROBL_API_KEY", API_KEY)

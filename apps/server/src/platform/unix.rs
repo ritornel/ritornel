@@ -25,6 +25,19 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), Error> {
         .map_err(io_error("create", path))
 }
 
+/// Creates the one folder at `path`, with mode `0700`, and fails if it is
+/// there already: two writers never share it. Its parent must be there.
+pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    DirBuilder::new().mode(0o700).create(path)
+}
+
+/// Syncs the folder at `path`, so that the names made, renamed or removed
+/// in it survive a loss of power.
+pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
 /// Closes the file at `path` to everyone but the OS user: mode `0600`.
 pub(crate) fn close_to_others(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;

@@ -126,6 +126,7 @@ Ordered by how much a person using it would notice. Remove an item when it lands
 - **No media keys or Now Playing.** These would be the system's media transport controls, tied to the hidden window `serve` already opens.
 - **No background service.** This would be a task at sign-in, in the user's session, where the media keys and the default audio device are.
 - **No CI job and no mise tasks.** `scripts/desktop.ps1` is the way in.
+- **A backup's folder name isn't flushed to disk.** Each file in a backup is flushed before the folder is renamed into place, but the rename itself isn't, since the standard library can't open a folder to flush it (`sync_dir` in the server's `platform/windows.rs` does nothing). A loss of power just after `ritornelctl backup` reports success could leave the backup under its unfinished dotted name. The fix: rename it with `MoveFileExW` and `MOVEFILE_WRITE_THROUGH`, through `ritornel-windows`.
 - **A data directory that already exists keeps its access list,** as one keeps its mode on Unix. The default under `%LOCALAPPDATA%` is the user's alone already, so this only matters for a `--data-dir` pointed at a shared folder.
 
 ### Later

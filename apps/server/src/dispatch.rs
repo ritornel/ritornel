@@ -20,7 +20,8 @@ use ritornel_contract::methods::{
     ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet, PlaybackJump,
     PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet, PlaybackSkip,
     PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow, RatingsSet, ScanStart,
-    ServerHello, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks, TracksGet,
+    ServerBackup, ServerHello, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks,
+    TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -44,6 +45,7 @@ use crate::transport::{self, Wire};
 use crate::views::{MAX_VIEWS, MAX_WINDOW_ROWS, VIEW_IDLE};
 use crate::{Bounds, Error};
 
+mod backup;
 mod calls;
 mod churn;
 mod history;
@@ -56,6 +58,7 @@ mod playback;
 mod ratings;
 mod watch;
 
+pub(crate) use backup::record_backup;
 pub(crate) use calls::job_state;
 use lists::Fanout;
 
@@ -130,6 +133,8 @@ pub(crate) struct Core {
     lastfm: std::sync::OnceLock<crate::lastfm::Lastfm>,
     /// Watching the hub's folders, once the server has started.
     watch: std::sync::OnceLock<crate::watch::Watching>,
+    /// Where backups go, once the server has started.
+    backups: std::sync::OnceLock<crate::backup::Backups>,
     /// The system's media session, once `serve` has started one.
     #[cfg(feature = "media-session")]
     media_session: std::sync::OnceLock<crate::media_session::MediaSession>,
@@ -222,6 +227,7 @@ impl Core {
             deliveries: crate::playback::Wake::default(),
             lastfm: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
+            backups: std::sync::OnceLock::new(),
             #[cfg(feature = "media-session")]
             media_session: std::sync::OnceLock::new(),
         })
@@ -585,6 +591,9 @@ impl Core {
             LibrarySetWatching::NAME => run::<LibrarySetWatching>(params, |params| {
                 self.library_set_watching(stores, &params)
             }),
+            ServerBackup::NAME => {
+                run::<ServerBackup>(params, |params| self.server_backup(stores, &params))
+            }
             ArtistsPictureFolders::NAME => {
                 run::<ArtistsPictureFolders>(params, |_| self.artists_picture_folders(stores))
             }
@@ -797,6 +806,7 @@ impl Core {
             },
             log_path: self.dir.logs().to_string_lossy().into_owned(),
             watch: Some(watch),
+            backup: Some(self.backup_status(stores)),
         })
     }
 
@@ -1252,8 +1262,53 @@ mod tests {
                     "off": "this run of the server does not watch",
                     "folders": [],
                 },
+                // No backup folder is named, so there is no backup.
+                "backup": {},
             })
         );
+    }
+
+    #[test]
+    fn a_backup_that_failed_is_said_until_one_works_and_one_since_removed_is_no_backup() {
+        let (core, scratch) = core();
+        // This core's server.db is in memory; a backup copies the file.
+        ServerStore::open(
+            &scratch.path().join("data").join("server.db"),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+        )
+        .unwrap()
+        .ensure_identity("desk")
+        .unwrap();
+        let place = scratch.path().join("elsewhere");
+        core.set_backups(crate::backup::Backups::new(Some(place.clone())));
+        let session = greeted(&core, SessionKind::Full);
+        let status = || call(&core, &session, "server.status", Some(json!({}))).unwrap();
+
+        // Its disk is not connected: refused, and said.
+        let refused = call(&core, &session, "server.backup", Some(key(0xb1))).unwrap_err();
+        assert_eq!(refused.0, ErrorCode::Unavailable);
+        let backup = status()["backup"].clone();
+        assert!(
+            backup["failed"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("is not there"),
+            "{backup}"
+        );
+        assert!(backup.get("last").is_none(), "{backup}");
+
+        // Connected: taken, and the failure is over.
+        std::fs::create_dir(&place).unwrap();
+        let taken = call(&core, &session, "server.backup", Some(key(0xb2))).unwrap();
+        let backup = status()["backup"].clone();
+        assert!(backup.get("failed").is_none(), "{backup}");
+        assert_eq!(backup["last"]["path"], taken["backup"]["path"]);
+        assert_eq!(backup["last"]["present"], true);
+
+        // Removed since: there is no backup.
+        std::fs::remove_dir_all(taken["backup"]["path"].as_str().unwrap()).unwrap();
+        assert_eq!(status()["backup"]["last"]["present"], false);
     }
 
     /// The params of a command with this byte for every byte of its key.

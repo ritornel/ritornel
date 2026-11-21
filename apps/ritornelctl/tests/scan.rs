@@ -168,6 +168,7 @@ impl Server {
             .env_remove("RITORNEL_DATA_DIR")
             .env_remove("RITORNEL_LISTEN")
             .env_remove("RITORNEL_LOG_LEVEL")
+            .env_remove("RITORNEL_BACKUP_DIR")
             .envs(variables.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
