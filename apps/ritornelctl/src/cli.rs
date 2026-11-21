@@ -434,8 +434,11 @@ pub(crate) struct VolumeArgs {
     pub(crate) server: ServerArgs,
 }
 
-/// What `history` takes.
+/// What `history` takes. Its options are for the recent plays alone, and
+/// one given before a command is refused: each command takes its own, and
+/// one read here and then ignored would act on the wrong data directory.
 #[derive(Debug, Default, PartialEq, Eq, Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct HistoryArgs {
     #[command(subcommand)]
     pub(crate) command: Option<HistoryCommand>,
@@ -917,6 +920,71 @@ mod tests {
         assert_eq!(
             err,
             "ritornelctl: re-resolve only runs with --dry-run: a scan resolves the library at its end\n"
+        );
+    }
+
+    #[test]
+    fn an_option_before_a_history_command_is_refused_and_never_dropped() {
+        // `history` takes options of its own for the recent plays. Placed
+        // before one of its commands they were once read and then
+        // ignored, so `zone clear` acted on the default data directory.
+        for line in [
+            &["history", "--data-dir", "/srv/ritornel", "zone", "clear"][..],
+            &["history", "--data-dir", "/srv/ritornel", "rebuild"],
+            &[
+                "history",
+                "--data-dir",
+                "/srv/ritornel",
+                "zone",
+                "add",
+                "UTC",
+            ],
+            &["history", "--json", "zones"],
+            &["history", "--limit", "5", "on-this-day"],
+        ] {
+            assert!(parse(args(line)).is_err(), "{line:?}");
+            let (code, out, _) = program(line);
+            assert_eq!((code, out.as_str()), (EXIT_USAGE, ""), "{line:?}");
+        }
+        // After the command, or with no command, they are read as before.
+        let given = ServerArgs {
+            data_dir: Some(PathBuf::from("/srv/ritornel")),
+            json: false,
+        };
+        assert_eq!(
+            parse(args(&[
+                "history",
+                "zone",
+                "clear",
+                "--data-dir",
+                "/srv/ritornel"
+            ]))
+            .unwrap()
+            .command,
+            Command::History(HistoryArgs {
+                command: Some(HistoryCommand::Zone(ZoneCommand::Clear(ServerArgs {
+                    data_dir: Some(PathBuf::from("/srv/ritornel")),
+                    json: false,
+                }))),
+                limit: None,
+                server: ServerArgs::default(),
+            })
+        );
+        assert_eq!(
+            parse(args(&[
+                "history",
+                "--data-dir",
+                "/srv/ritornel",
+                "--limit",
+                "5"
+            ]))
+            .unwrap()
+            .command,
+            Command::History(HistoryArgs {
+                command: None,
+                limit: Some(5),
+                server: given,
+            })
         );
     }
 
