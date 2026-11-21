@@ -215,8 +215,8 @@ pub struct SyncSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub loved: Option<u64>,
-    /// Tracks bound to the library at the end, which the library did not
-    /// have when they were first seen.
+    /// Tracks whose binding changed when every track was judged again at
+    /// the end: newly bound, moved to another recording, or released.
     #[serde(default)]
     pub matched_after: u64,
 }
@@ -288,9 +288,10 @@ pub struct DoubtfulTrack {
     /// How often it was played.
     pub plays: u64,
     /// Why it was not bound: `several`, when the artist and title name
-    /// several recordings the album cannot tell apart, or `near`, when
-    /// nothing matches exactly but something does without accents and
-    /// bracketed notes.
+    /// several recordings the album cannot tell apart; `album`, when they
+    /// name one and the album is none it is on, so the play may be of
+    /// another version; or `near`, when nothing matches exactly but
+    /// something does without accents and bracketed notes.
     pub doubt: String,
     /// What it nearly matched.
     pub candidates: Vec<NearlyMatched>,

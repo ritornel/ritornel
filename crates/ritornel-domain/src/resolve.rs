@@ -293,7 +293,7 @@ struct Ev {
 
 /// The number a part is written as: digits, a roman numeral up to
 /// thirty-nine, or a word up to ten.
-fn part_number(word: &str) -> Option<u32> {
+pub(crate) fn part_number(word: &str) -> Option<u32> {
     if let Ok(number) = word.parse::<u32>() {
         return Some(number);
     }
@@ -381,6 +381,14 @@ fn apart(a: Option<(Option<i64>, i64)>, b: Option<(Option<i64>, i64)>) -> bool {
 #[cfg(test)]
 pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
     markers(Some(title), VERSION_MARKERS, list)
+}
+
+/// The version markers of an album title, such as "live" or "acoustic", by
+/// policy 2's list.
+pub(crate) fn album_markers_of(album: &str) -> Vec<String> {
+    let mut found = markers(Some(album), ALBUM_MARKERS, 2);
+    found.sort();
+    found
 }
 
 impl Ev {

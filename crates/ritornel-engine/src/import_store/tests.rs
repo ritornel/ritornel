@@ -318,3 +318,155 @@ fn the_loved_tracks_follow_the_list_and_show_on_the_track() {
     let report = rig.library.import_report(rig.account, 10).unwrap();
     assert_eq!((report.loved, report.loved_matched), (1, 0));
 }
+
+impl Rig {
+    /// Binds the subject of this text to the appearance of `title`, as
+    /// another matcher or the owner did: a decision by `actor` and an
+    /// assignment, superseding the one in force.
+    fn force(&self, text: (&str, &str, &str), title: &str, actor: &'static str) {
+        let (artist, album, scrobbled) = text;
+        let key = provider_key(artist, Some(album), scrobbled);
+        let title = title.to_owned();
+        self.library
+            .write(
+                WriteRequest {
+                    method: "test.force",
+                    command: None,
+                    client: None,
+                },
+                move |write| {
+                    let connection = write.connection();
+                    let item: i64 = connection.query_row(
+                        "SELECT id FROM source_item WHERE provider_key = ?1",
+                        [&key],
+                        |row| row.get(0),
+                    )?;
+                    let (recording, appearance): (i64, i64) = connection.query_row(
+                        "SELECT recording_id, id FROM track_appearance WHERE display_title = ?1",
+                        [&title],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    connection.execute(
+                        "INSERT INTO identity_decision
+                           (action, source_item_id, method, resolver_version, normalizer_version,
+                            evidence_json, actor_kind, decided_at_ms, rev)
+                         VALUES ('bind', ?1, ?2, 1, 1, '{}', ?3, ?4, ?5)",
+                        (
+                            item,
+                            if actor == "resolver" {
+                                "scrobble_text"
+                            } else {
+                                "user"
+                            },
+                            actor,
+                            write.now_ms(),
+                            write.rev(),
+                        ),
+                    )?;
+                    let decision = connection.last_insert_rowid();
+                    connection.execute(
+                        "UPDATE assignment SET superseded_at_ms = ?2, rev = ?3
+                         WHERE source_item_id = ?1 AND superseded_at_ms IS NULL",
+                        (item, write.now_ms(), write.rev()),
+                    )?;
+                    connection.execute(
+                        "INSERT INTO assignment
+                           (source_item_id, recording_id, appearance_id, decision_id,
+                            effective_from_ms, rev)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        (
+                            item,
+                            recording,
+                            appearance,
+                            decision,
+                            write.now_ms(),
+                            write.rev(),
+                        ),
+                    )?;
+                    connection.execute(
+                        "UPDATE source_item SET current_recording_id = ?2 WHERE id = ?1",
+                        (item, recording),
+                    )?;
+                    crate::history_store::rebind(write)?;
+                    Ok(String::new())
+                },
+            )
+            .unwrap();
+    }
+
+    /// The title each counted play is bound to, by what was scrobbled.
+    fn bound(&self) -> Vec<String> {
+        let sql = "SELECT o.title || ' -> ' || coalesce(ta.display_title, '-')
+                   FROM play_event pe
+                   JOIN play_event_observation peo ON peo.play_event_id = pe.id AND peo.role = 'primary'
+                   JOIN observation_import o ON o.observation_id = peo.observation_id
+                   LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
+                   ORDER BY o.title";
+        self.library
+            .read(move |connection| {
+                let mut statement = connection.prepare(sql)?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                Ok(rows.collect::<Result<Vec<String>, _>>()?)
+            })
+            .unwrap()
+    }
+}
+
+#[test]
+fn a_bound_track_is_judged_again_at_each_sync() {
+    let rig = rig();
+    let mut acoustic = record(T0 - 2 * HOUR, "Moss Arcade", "Paper Kites", 0);
+    acoustic.track.album = Some("Acoustic Sessions".to_owned());
+    rig.ingest(&batch(
+        vec![acoustic, record(T0 - HOUR, "Moss Arcade", "Salt Road", 0)],
+        T0 - 4 * HOUR,
+        T0,
+    ));
+    // The album fits none of the one recording's appearances: held back.
+    assert_eq!(rig.bound(), ["Paper Kites -> -", "Salt Road -> Salt Road"]);
+    let report = rig.library.import_report(rig.account, 10).unwrap();
+    assert_eq!(report.doubtful[0].doubt, "album");
+
+    // Bound as matcher 1 bound them: the acoustic play to the album track,
+    // and Salt Road to the wrong song.
+    rig.force(
+        ("Moss Arcade", "Acoustic Sessions", "Paper Kites"),
+        "Paper Kites",
+        "resolver",
+    );
+    rig.force(
+        ("Moss Arcade", "Tin Weather", "Salt Road"),
+        "Lanternfish",
+        "resolver",
+    );
+    assert_eq!(
+        rig.bound(),
+        ["Paper Kites -> Paper Kites", "Salt Road -> Lanternfish"]
+    );
+    // Judged again, the one is released and the other moved.
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 2);
+    assert_eq!(rig.bound(), ["Paper Kites -> -", "Salt Road -> Salt Road"]);
+    assert_eq!(
+        rig.one(
+            "SELECT count(*) FROM source_item WHERE item_kind = 'scrobble_subject'
+                 AND current_recording_id IS NULL"
+        ),
+        "1"
+    );
+    // A second judgement changes nothing and writes nothing.
+    let before = rig.revision();
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.revision(), before);
+
+    // The owner's own binding is never judged again.
+    rig.force(
+        ("Moss Arcade", "Acoustic Sessions", "Paper Kites"),
+        "Paper Kites",
+        "person",
+    );
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(
+        rig.bound(),
+        ["Paper Kites -> Paper Kites", "Salt Road -> Salt Road"]
+    );
+}
