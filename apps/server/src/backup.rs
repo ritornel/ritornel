@@ -420,11 +420,21 @@ fn fill(
         ("server.db", dir.server_db()),
         ("library.db", dir.library_db()),
     ] {
-        // A server that holds no library has an empty file, or none. One
-        // that holds a library has no backup without it.
+        // A server that holds no library has an empty file, or none. A
+        // backup of a server that knows itself is none without server.db,
+        // which holds who it is, and of one that holds a library none
+        // without library.db.
         if !present(&source)? {
-            if name == "library.db" && about.library_id.is_some() {
-                return Err(BackupError::Copy(name, ritornel_engine::Error::NoLibrary));
+            let required = match name {
+                "server.db" => about.server_id.is_some(),
+                _ => about.library_id.is_some(),
+            };
+            if required {
+                return Err(BackupError::Io {
+                    doing: "copy",
+                    path: source.clone(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                });
             }
             continue;
         }
@@ -630,6 +640,20 @@ mod tests {
         let place = scratch.path().join("elsewhere");
         std::fs::create_dir_all(&place).unwrap();
         place
+    }
+
+    #[test]
+    fn a_server_has_no_backup_without_its_own_database() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = elsewhere(&scratch);
+        std::fs::remove_file(dir.server_db()).unwrap();
+        let about = About {
+            server_id: Some(Id::from_bytes([0x11; 16])),
+            ..About::default()
+        };
+        assert!(backup(&dir, &place, about).is_err());
+        assert_eq!(std::fs::read_dir(&place).unwrap().count(), 0);
     }
 
     #[test]

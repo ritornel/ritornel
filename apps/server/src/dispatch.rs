@@ -1271,6 +1271,15 @@ mod tests {
     #[test]
     fn a_backup_that_failed_is_said_until_one_works_and_one_since_removed_is_no_backup() {
         let (core, scratch) = core();
+        // This core's server.db is in memory; a backup copies the file.
+        ServerStore::open(
+            &scratch.path().join("data").join("server.db"),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+        )
+        .unwrap()
+        .ensure_identity("desk")
+        .unwrap();
         let place = scratch.path().join("elsewhere");
         core.set_backups(crate::backup::Backups::new(Some(place.clone())));
         let session = greeted(&core, SessionKind::Full);
