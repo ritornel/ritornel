@@ -32,7 +32,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::discs::disc_in_title;
 use crate::normalize::{core, fold_accents, normalize};
-use crate::resolve::{album_markers_of, part_number};
+use crate::resolve::{album_markers_of, markers_of, part_number};
 
 /// The matcher's version, recorded on each binding it makes.
 ///
@@ -230,10 +230,14 @@ fn squash(key: &str) -> String {
 }
 
 /// The loose key: spacing, punctuation, a leading "The", accents and a
-/// featured artist passed over.
+/// featured artist passed over. The title's version markers, such as
+/// "live", are kept beside it, so that taking a featured artist out never
+/// takes a version with it.
 fn loose_key(artist: &str, title: &str) -> (String, String) {
     let key = |text: &str| squash(&normalize(&without_featured(text)));
-    (key(artist), key(title))
+    let mut markers = markers_of(title, 2);
+    markers.sort();
+    (key(artist), format!("{}|{}", key(title), markers.join(",")))
 }
 
 /// The near key: accents off, and the title without what is in brackets.
@@ -248,6 +252,9 @@ fn album_words(album: &str) -> Vec<String> {
     let album = disc_in_title(album).map_or_else(|| album.to_owned(), |(title, _)| title);
     let key = fold_accents(&core(&album));
     let mut words: Vec<&str> = key.split(' ').filter(|word| *word != "and").collect();
+    if words.is_empty() {
+        words = key.split(' ').collect();
+    }
     while words.len() > 1 && matches!(words.last(), Some(&("ep" | "the"))) {
         words.pop();
     }
@@ -255,6 +262,37 @@ fn album_words(album: &str) -> Vec<String> {
         words.remove(0);
     }
     words.into_iter().map(str::to_owned).collect()
+}
+
+/// The numbers an album title gives, notes and all: a volume or a part,
+/// or a roman numeral such as "II", which tell "Low Tide (Vol. 2)" from
+/// "Low Tide". Other digits, such as a year or "10,000", are not.
+fn album_numbers(album: &str) -> Vec<u32> {
+    let album = disc_in_title(album).map_or_else(|| album.to_owned(), |(title, _)| title);
+    let key = normalize(&album);
+    let words: Vec<&str> = key.split(' ').collect();
+    let mut found: Vec<u32> = Vec::new();
+    for (at, word) in words.iter().enumerate() {
+        let after_volume = at
+            .checked_sub(1)
+            .and_then(|before| words.get(before))
+            .is_some_and(|before| {
+                matches!(
+                    *before,
+                    "vol" | "vols" | "volume" | "part" | "pt" | "book" | "chapter"
+                )
+            });
+        // A roman numeral of one letter is a word as often as not.
+        let roman = word.len() > 1 && word.chars().all(|c| "ivx".contains(c));
+        let number = if after_volume || roman {
+            part_number(word)
+        } else {
+            None
+        };
+        found.extend(number);
+    }
+    found.sort_unstable();
+    found
 }
 
 /// What an album is compared by: [`album_words`] with no spaces.
@@ -270,6 +308,7 @@ struct Album {
     loose: String,
     words: Vec<String>,
     markers: Vec<String>,
+    numbers: Vec<u32>,
 }
 
 impl Album {
@@ -287,6 +326,7 @@ impl Album {
             loose,
             words: album_words(album),
             markers: album_markers_of(album),
+            numbers: album_numbers(album),
         })
     }
 
@@ -294,9 +334,10 @@ impl Album {
     /// one is the other's first two words or more and an unbracketed
     /// subtitle or edition after them, as "Low Tide: Rarities" is "Low
     /// Tide". What follows is not a number or a volume: "Low Tide II" is
-    /// another album. Their version markers, such as "live", agree.
+    /// another album. Their version markers, such as "live", and their
+    /// numbers, in a note or not, agree.
     fn fits(&self, album: &str) -> bool {
-        if album_markers_of(album) != self.markers {
+        if album_markers_of(album) != self.markers || album_numbers(album) != self.numbers {
             return false;
         }
         if album_key(album) == self.loose {
@@ -610,7 +651,12 @@ mod tests {
             Verdict::Bind { recording: 6, .. }
         ));
         // Nor is a subtitle or an edition after two words or more.
-        for album in ["Low Tide: Rarities 2001-2009", "Low Tide Deluxe Version"] {
+        for album in [
+            "Low Tide: Rarities 2001-2009",
+            "Low Tide Deluxe Version",
+            "Low Tide (Remastered 2011)",
+            "Low Tide [Rarities 01 - 09]",
+        ] {
             assert!(
                 matches!(
                     judge("The Quiet Harbour", Some(album), "Lanterns"),
@@ -627,6 +673,9 @@ mod tests {
             "Low Tide 2",
             "Low Tide Vol. 3",
             "Low Tide Part Two",
+            "Low Tide (Vol. 2)",
+            "Low Tide [II]",
+            "And",
         ] {
             assert!(
                 matches!(
@@ -726,6 +775,20 @@ mod tests {
         );
         assert_eq!(
             bound("Quiet Harbour", Some("Acoustic Sessions"), "Lanterns"),
+            None
+        );
+        // Nor does a version said after a bare featured artist, or inside
+        // its brackets.
+        assert_eq!(
+            bound("Mira Vale", None, "Mira Vale feat. Ninefold"),
+            Some((6, Rule::Loose))
+        );
+        assert_eq!(
+            bound("Mira Vale", None, "Mira Vale feat. Ninefold - Live"),
+            None
+        );
+        assert_eq!(
+            bound("Mira Vale", None, "Mira Vale (feat. Ninefold - Live)"),
             None
         );
         // "Feat" that begins a title is the title.

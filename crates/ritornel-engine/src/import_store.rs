@@ -237,27 +237,53 @@ fn wanted(catalog: &Catalog, artist: &str, album: Option<&str>, title: &str) -> 
     }
 }
 
-/// The binding in force on an item: its assignment, recording and
-/// appearance.
-fn current(connection: &Connection, item: i64) -> Result<Option<(i64, i64, Option<i64>)>, Error> {
-    Ok(connection
+/// The binding in force on an item, when the matcher made it or there is
+/// none: its assignment, recording and appearance. `Err` holds back an item
+/// the owner bound.
+type Current = Option<(i64, i64, Option<i64>)>;
+
+fn current(connection: &Connection, item: i64) -> Result<Result<Current, ()>, Error> {
+    let found: Option<(i64, i64, Option<i64>, String)> = connection
         .prepare_cached(
-            "SELECT id, recording_id, appearance_id FROM assignment
-             WHERE source_item_id = ?1 AND superseded_at_ms IS NULL",
+            "SELECT a.id, a.recording_id, a.appearance_id, d.actor_kind FROM assignment a
+             JOIN identity_decision d ON d.id = a.decision_id
+             WHERE a.source_item_id = ?1 AND a.superseded_at_ms IS NULL",
         )?
-        .query_row([item], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-        .optional()?)
+        .query_row([item], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .optional()?;
+    Ok(match found {
+        Some((.., actor)) if actor != "resolver" => Err(()),
+        Some((id, recording, appearance, _)) => Ok(Some((id, recording, appearance))),
+        None => Ok(None),
+    })
 }
 
-/// Whether the owner said this item is not that recording.
+/// Whether the owner said this item is not that recording, or one merged
+/// with it: the two are compared by the recording each ends at.
 fn excluded(connection: &Connection, item: i64, recording: i64) -> Result<bool, Error> {
     Ok(connection
         .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM identity_exclusion e JOIN recording r ON r.id = ?2
-                            WHERE e.source_item_id = ?1
-                              AND e.recording_id IN (r.id, r.canonical_id))",
+            "SELECT EXISTS (SELECT 1 FROM identity_exclusion e
+                            JOIN recording x ON x.id = e.recording_id
+                            JOIN recording r ON r.id = ?2
+                            WHERE e.source_item_id = ?1 AND x.canonical_id = r.canonical_id)",
         )?
         .query_row((item, recording), |row| row.get(0))?)
+}
+
+/// What the matcher would bind an item to, once the owner's exclusions
+/// are heeded.
+fn allowed(
+    connection: &Connection,
+    item: i64,
+    wanted: Option<Wanted>,
+) -> Result<Option<Wanted>, Error> {
+    Ok(match wanted {
+        Some(wanted) if excluded(connection, item, wanted.recording)? => None,
+        wanted => wanted,
+    })
 }
 
 /// Binds a subject item as the matcher says: a binding in force that
@@ -271,11 +297,11 @@ fn settle(
     wanted: Option<Wanted>,
 ) -> Result<bool, Error> {
     let connection = write.connection();
-    let wanted = match wanted {
-        Some(wanted) if excluded(connection, item, wanted.recording)? => None,
-        wanted => wanted,
+    let wanted = allowed(connection, item, wanted)?;
+    // The owner may have bound it since it was judged.
+    let Ok(now) = current(connection, item)? else {
+        return Ok(false);
     };
-    let now = current(connection, item)?;
     let same = match (now, wanted) {
         (None, None) => true,
         (Some((_, recording, appearance)), Some(wanted)) => {
@@ -855,6 +881,7 @@ impl LibraryStore {
             for (subject, now) in judged_subjects(connection, rows.instance)? {
                 let (_, artist, album, title) = &subject;
                 let wanted = wanted(&catalog, artist, album.as_deref(), title);
+                let wanted = allowed(connection, subject.0, wanted)?;
                 if wanted.map(|wanted| (wanted.recording, wanted.appearance)) != now {
                     differ.push(subject);
                 }

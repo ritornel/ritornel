@@ -470,3 +470,90 @@ fn a_bound_track_is_judged_again_at_each_sync() {
         ["Paper Kites -> Paper Kites", "Salt Road -> Salt Road"]
     );
 }
+
+#[test]
+fn a_recording_the_owner_excluded_is_never_bound_even_through_a_merge() {
+    let rig = rig();
+    rig.ingest(&batch(
+        vec![record(T0 - HOUR, "Moss Arcade", "Paper Kites", 0)],
+        T0 - 2 * HOUR,
+        T0,
+    ));
+    assert_eq!(rig.bound(), ["Paper Kites -> Paper Kites"]);
+    // The owner said the track is not a recording that has since been
+    // merged into the one it is bound to.
+    let key = provider_key("Moss Arcade", Some("Tin Weather"), "Paper Kites");
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.exclude",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let connection = write.connection();
+                let kept: i64 = connection.query_row(
+                    "SELECT recording_id FROM track_appearance WHERE display_title = 'Paper Kites'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                connection.execute(
+                    "INSERT INTO recording (id, public_id, redirect_to_id, canonical_id, display_title, rev)
+                     VALUES (900, ?1, ?2, ?2, 'Paper Kites', ?3)",
+                    (write.new_id()?.as_bytes(), kept, write.rev()),
+                )?;
+                connection.execute(
+                    "INSERT INTO identity_exclusion (source_item_id, recording_id, actor_kind, created_at_ms, rev)
+                     SELECT id, 900, 'person', ?2, ?3 FROM source_item WHERE provider_key = ?1",
+                    (&key, write.now_ms(), write.rev()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 1);
+    assert_eq!(rig.bound(), ["Paper Kites -> -"]);
+    // And judged again, nothing is written.
+    let before = rig.revision();
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.revision(), before);
+}
+
+#[test]
+fn the_matcher_never_writes_over_the_owners_binding() {
+    let rig = rig();
+    let mut acoustic = record(T0 - HOUR, "Moss Arcade", "Paper Kites", 0);
+    acoustic.track.album = Some("Acoustic Sessions".to_owned());
+    rig.ingest(&batch(vec![acoustic], T0 - 2 * HOUR, T0));
+    // The owner binds it between the matcher's reading and its writing:
+    // the write judges only what is not the owner's.
+    rig.force(
+        ("Moss Arcade", "Acoustic Sessions", "Paper Kites"),
+        "Lanternfish",
+        "person",
+    );
+    let item: Subject = (
+        rig.one("SELECT id FROM source_item WHERE item_kind = 'scrobble_subject'")
+            .parse()
+            .unwrap(),
+        "Moss Arcade".to_owned(),
+        Some("Acoustic Sessions".to_owned()),
+        "Paper Kites".to_owned(),
+    );
+    let changed = rig
+        .library
+        .write(
+            WriteRequest {
+                method: "test.match",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let catalog = super::catalog(write.connection())?;
+                Ok(match_items(write, &catalog, &[item])?.to_string())
+            },
+        )
+        .unwrap();
+    assert_eq!(changed.result_json, "0");
+    assert_eq!(rig.bound(), ["Paper Kites -> Lanternfish"]);
+}

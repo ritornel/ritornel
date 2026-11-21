@@ -377,8 +377,7 @@ fn apart(a: Option<(Option<i64>, i64)>, b: Option<(Option<i64>, i64)>) -> bool {
     }
 }
 
-/// The version markers of a title by a marker list, for tests.
-#[cfg(test)]
+/// The version markers of a title by a marker list.
 pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
     markers(Some(title), VERSION_MARKERS, list)
 }
