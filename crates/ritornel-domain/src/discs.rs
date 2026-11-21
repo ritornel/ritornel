@@ -45,35 +45,55 @@ fn marker(text: &str) -> Option<i64> {
 /// notes are kept: "White Field Disk 1 [Half-Speed]" is disc 1 of "White Field
 /// [Half-Speed]". A title that is nothing but the marker is left alone.
 pub(crate) fn disc_in_title(album: &str) -> Option<(String, i64)> {
-    if let Some(found) = trailing_disc(album) {
-        return Some(found);
+    // The notes taken off the end, last first.
+    let mut notes: Vec<&str> = Vec::new();
+    let mut rest = album.trim_end();
+    loop {
+        if let Some((mut title, disc)) = trailing_disc(rest) {
+            for note in notes.iter().rev() {
+                title.push(' ');
+                title.push_str(note);
+            }
+            return Some((title, disc));
+        }
+        let at = last_note(rest)?;
+        notes.push(rest.get(at..)?);
+        rest = rest.get(..at)?.trim_end();
     }
-    // Take the last bracketed note off and look again before it.
-    let album = album.trim_end();
-    let close = album.chars().last()?;
-    let open = match close {
-        ')' => '(',
-        ']' => '[',
-        _ => return None,
-    };
-    let at = album.rfind(open)?;
-    let (before, note) = (album.get(..at)?, album.get(at..)?);
-    let (title, disc) = disc_in_title(before)?;
-    Some((format!("{title} {note}"), disc))
+}
+
+/// Where the bracketed note that ends `text` opens: the bracket that
+/// matches the last one, round brackets with round and square with square.
+/// `None` when the text does not end in a note, or its brackets do not pair.
+fn last_note(text: &str) -> Option<usize> {
+    let mut open: Vec<char> = Vec::new();
+    for (at, c) in text.char_indices().rev() {
+        match c {
+            ')' | ']' => open.push(c),
+            '(' | '[' => {
+                let close = open.pop()?;
+                if (c == '(') != (close == ')') {
+                    return None;
+                }
+                if open.is_empty() {
+                    return Some(at);
+                }
+            }
+            _ if open.is_empty() => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// An album title whose last words or last bracketed note are a disc
 /// marker, split into the title without it and the disc.
 fn trailing_disc(album: &str) -> Option<(String, i64)> {
     let album = album.trim_end();
-    let (before, disc) = if let Some(open) = album
-        .strip_suffix(')')
-        .map(|inner| (inner, '('))
-        .or_else(|| album.strip_suffix(']').map(|inner| (inner, '[')))
-    {
-        let (inner, bracket) = open;
-        let at = inner.rfind(bracket)?;
-        (inner.get(..at)?, marker(inner.get(at + 1..)?)?)
+    let (before, disc) = if album.ends_with([')', ']']) {
+        let at = last_note(album)?;
+        let inner = album.get(at + 1..album.len() - 1)?;
+        (album.get(..at)?, marker(inner)?)
     } else {
         // The marker is the last word, or the last two: "CD2", "Disc 2".
         let mut starts: Vec<usize> = Vec::new();
@@ -283,9 +303,21 @@ mod tests {
             "Night Drives (Disc 2 Bonus) [Live]",
             "Disc 2 Sessions (Live)",
             "Night Drives [Disc]",
+            // A marker inside a note is not before it, and a bracket that
+            // closes nothing is not a note.
+            "Night Drives [Edition CD2 [Live]]",
+            "Night Drives Disc 2 ]",
+            "Night Drives Disc 2 (Live]",
         ] {
             assert_eq!(split(title), None, "{title}");
         }
+        assert_eq!(
+            split("Night Drives Disc 1 [Remastered [Gold]]"),
+            some("Night Drives [Remastered [Gold]]", 1)
+        );
+        // Many notes are read without a frame for each.
+        let long = format!("Night Drives Disc 1{}", " []".repeat(200_000));
+        assert_eq!(split(&long).map(|(_, disc)| disc), Some(1));
     }
 
     #[test]
