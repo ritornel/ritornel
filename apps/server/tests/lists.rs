@@ -1008,6 +1008,7 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
             .env_remove("RITORNEL_DATA_DIR")
             .env_remove("RITORNEL_LISTEN")
             .env_remove("RITORNEL_LOG_LEVEL")
+            .env_remove("RITORNEL_BACKUP_DIR")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

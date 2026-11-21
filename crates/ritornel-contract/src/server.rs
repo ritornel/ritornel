@@ -211,6 +211,113 @@ pub struct ServerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub watch: Option<WatchStatus>,
+    /// Where this server backs up, and what its backups last did. Left out
+    /// by a server that does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub backup: Option<BackupStatus>,
+}
+
+/// Where a server writes its backups, and the last it wrote. A backup is a
+/// copy of the server's databases in a folder of its own, written to a
+/// place outside the data directory that has to be named: with none named
+/// there is no backup. See "The data directory" in
+/// docs/design/server.md.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct BackupStatus {
+    /// The folder backups are written to, on the server's own disk. Left
+    /// out when none is named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub place: Option<String>,
+    /// The last backup written. Left out when there has been none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub last: Option<BackupMade>,
+    /// The last backup that could not be written, when none has been
+    /// written since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub failed: Option<BackupFailure>,
+}
+
+/// A backup that was written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct BackupMade {
+    /// When it was taken, as Unix milliseconds.
+    pub at: i64,
+    /// Its folder, on the server's own disk.
+    pub path: String,
+    /// Why it was taken.
+    pub reason: BackupReason,
+    /// Whether its folder is still there.
+    pub present: bool,
+}
+
+/// Why a backup was taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum BackupReason {
+    /// Someone asked for it, with `server.backup`.
+    OnDemand,
+    /// The server took it before migrating a database.
+    BeforeMigration,
+}
+
+impl BackupReason {
+    /// The reason as it is written on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OnDemand => "on_demand",
+            Self::BeforeMigration => "before_migration",
+        }
+    }
+
+    /// The reason a wire name names.
+    pub fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "on_demand" => Some(Self::OnDemand),
+            "before_migration" => Some(Self::BeforeMigration),
+            _ => None,
+        }
+    }
+}
+
+/// A backup that could not be written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct BackupFailure {
+    /// When it failed, as Unix milliseconds.
+    pub at: i64,
+    /// What went wrong, as a person reads it.
+    pub message: String,
+}
+
+/// The params of `server.backup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct BackupParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+}
+
+/// The result of `server.backup`: the receipt, and the backup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct BackedUp {
+    /// The receipt.
+    #[serde(flatten)]
+    pub receipt: crate::Receipt,
+    /// The backup that was written.
+    pub backup: BackupMade,
 }
 
 /// How a hub notices changes to its folders: it watches them, rescans a
@@ -604,6 +711,7 @@ mod tests {
             },
             log_path: "/srv/ritornel/logs".to_owned(),
             watch: None,
+            backup: None,
         };
         let mut wire = json!({
             "serverId": "11111111-1111-1111-1111-111111111111",

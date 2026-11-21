@@ -113,7 +113,8 @@ pub use playback::{
 pub use rating::{MAX_RATING, RatingSet, RatingSetParams};
 pub use search::{MAX_SEARCH_RESULTS, SearchParams, SearchResults, SongFound};
 pub use server::{
-    AutoRun, AutoTrigger, ClientKind, Descriptor, FreeDisk, HelloParams, LibraryStatus, Limits,
+    AutoRun, AutoTrigger, BackedUp, BackupFailure, BackupMade, BackupParams, BackupReason,
+    BackupStatus, ClientKind, Descriptor, FreeDisk, HelloParams, LibraryStatus, Limits,
     MAX_CLIENT_TEXT, NoParams, PublicDescriptor, ServerInfo, ServerRole, ServerStatus, ServersList,
     SessionKind, Versions, WatchState, WatchStatus, WatchedFolder, WatchedKind, WatchingParams,
     WatchingSet,

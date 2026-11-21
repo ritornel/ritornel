@@ -4,12 +4,13 @@
 //!
 //! `config.toml` holds only what the server needs before a database opens,
 //! and a container needs no file at all. The settings so far are the log
-//! level and the listen address.
+//! level, the listen address and where backups go, which a migration
+//! needs before it opens a database.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use tracing::Level;
@@ -22,6 +23,9 @@ pub(crate) const LOG_LEVEL_VAR: &str = "RITORNEL_LOG_LEVEL";
 
 /// The environment variable that sets the listen address.
 pub(crate) const LISTEN_VAR: &str = "RITORNEL_LISTEN";
+
+/// The environment variable that names where backups go.
+pub(crate) const BACKUP_DIR_VAR: &str = "RITORNEL_BACKUP_DIR";
 
 /// The port a server listens on when nobody has said and it is free.
 pub(crate) const DEFAULT_PORT: u16 = 4747;
@@ -66,12 +70,15 @@ impl Listen {
 }
 
 /// The settings a run uses, each already resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Settings {
     /// The least severe level that is logged. `info` unless set.
     pub(crate) log_level: Level,
     /// Where the server listens.
     pub(crate) listen: Listen,
+    /// The folder backups are written to: an absolute path outside the
+    /// data directory. With none there is no backup.
+    pub(crate) backup_dir: Option<PathBuf>,
 }
 
 /// The settings given on the command line.
@@ -79,6 +86,7 @@ pub(crate) struct Settings {
 pub(crate) struct Flags {
     pub(crate) log_level: Option<String>,
     pub(crate) listen: Option<String>,
+    pub(crate) backup_dir: Option<String>,
 }
 
 /// `config.toml`. A key it does not know is refused, so a misspelt setting
@@ -88,6 +96,7 @@ pub(crate) struct Flags {
 struct File {
     log_level: Option<String>,
     listen: Option<String>,
+    backup_dir: Option<String>,
 }
 
 /// Where a setting's value came from.
@@ -122,6 +131,11 @@ pub enum ConfigError {
     LogLevel(Origin),
     /// The listen address is not 127.0.0.1 and a port.
     Listen(Origin),
+    /// The backup folder is not an absolute path.
+    BackupRelative(Origin),
+    /// The backup folder is the data directory or inside it, where a
+    /// backup would be lost with what it copies.
+    BackupInside(Origin),
 }
 
 impl fmt::Display for ConfigError {
@@ -139,6 +153,17 @@ impl fmt::Display for ConfigError {
                  listens on loopback only",
                 origin.place("--listen", LISTEN_VAR, "listen")
             ),
+            Self::BackupRelative(origin) => write!(
+                f,
+                "{} must be an absolute path",
+                origin.place("--backup-dir", BACKUP_DIR_VAR, "backup_dir")
+            ),
+            Self::BackupInside(origin) => write!(
+                f,
+                "{} must be outside the data directory: a backup beside what it copies is lost \
+                 with it",
+                origin.place("--backup-dir", BACKUP_DIR_VAR, "backup_dir")
+            ),
         }
     }
 }
@@ -147,26 +172,35 @@ impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::File(error) => Some(error),
-            Self::LogLevel(_) | Self::Listen(_) => None,
+            Self::LogLevel(_)
+            | Self::Listen(_)
+            | Self::BackupRelative(_)
+            | Self::BackupInside(_) => None,
         }
     }
 }
 
-/// Reads `config.toml` at `path`, if there is one, and resolves every
-/// setting.
-pub(crate) fn load(path: &Path, flags: &Flags, env: Env<'_>) -> Result<Settings, Error> {
-    let file = match std::fs::read_to_string(path) {
+/// Reads `config.toml` in the data directory `root`, if there is one, and
+/// resolves every setting.
+pub(crate) fn load(root: &Path, flags: &Flags, env: Env<'_>) -> Result<Settings, Error> {
+    let path = root.join("config.toml");
+    let file = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(io_error("read", path)(error)),
+        Err(error) => return Err(io_error("read", &path)(error)),
     };
-    Ok(resolve(flags, env, file.as_deref())?)
+    Ok(resolve(root, flags, env, file.as_deref())?)
 }
 
 /// Resolves every setting from the flags, the environment and the text of
 /// `config.toml`. The file is checked whole even when nothing is taken from
 /// it.
-fn resolve(flags: &Flags, env: Env<'_>, file: Option<&str>) -> Result<Settings, ConfigError> {
+fn resolve(
+    root: &Path,
+    flags: &Flags,
+    env: Env<'_>,
+    file: Option<&str>,
+) -> Result<Settings, ConfigError> {
     let file: File = file
         .map(toml::from_str)
         .transpose()
@@ -188,7 +222,36 @@ fn resolve(flags: &Flags, env: Env<'_>, file: Option<&str>) -> Result<Settings, 
             .ok_or(ConfigError::Listen(origin))?,
         None => Listen::DEFAULT,
     };
-    Ok(Settings { log_level, listen })
+    let backup_dir = match chosen(
+        flags.backup_dir.as_deref(),
+        env(BACKUP_DIR_VAR),
+        file.backup_dir,
+    ) {
+        Some((text, origin)) => Some(backup_dir(root, text, origin)?),
+        None => None,
+    };
+    Ok(Settings {
+        log_level,
+        listen,
+        backup_dir,
+    })
+}
+
+/// The backup folder, which must be an absolute path and outside the data
+/// directory `root`. Each is compared as the system resolves it where it
+/// can be, so a link to the data directory is inside it too. The folder
+/// need not be there yet: a disk that is not connected is found out when a
+/// backup is taken, and said in the status.
+fn backup_dir(root: &Path, text: Option<String>, origin: Origin) -> Result<PathBuf, ConfigError> {
+    let path = PathBuf::from(text.ok_or(ConfigError::BackupRelative(origin))?);
+    if !path.is_absolute() {
+        return Err(ConfigError::BackupRelative(origin));
+    }
+    let resolved = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    if resolved(&path).starts_with(resolved(root)) || path.starts_with(root) {
+        return Err(ConfigError::BackupInside(origin));
+    }
+    Ok(path)
 }
 
 /// The value of a setting from the first place that gives one, and which
@@ -227,10 +290,19 @@ mod tests {
 
     const FILE: &str = "log_level = \"warn\"\n";
 
+    /// A data directory the tests' settings are resolved for. Nothing is
+    /// made there.
+    const ROOT: &str = if cfg!(windows) {
+        r"C:\ritornel-config-test\data"
+    } else {
+        "/ritornel-config-test/data"
+    };
+
     fn flags(log_level: Option<&str>, listen: Option<&str>) -> Flags {
         Flags {
             log_level: log_level.map(str::to_owned),
             listen: listen.map(str::to_owned),
+            backup_dir: None,
         }
     }
 
@@ -239,7 +311,7 @@ mod tests {
             .map(|value| (LOG_LEVEL_VAR, value))
             .into_iter()
             .collect();
-        resolve(&flags(flag, None), &env(&variables), file)
+        resolve(Path::new(ROOT), &flags(flag, None), &env(&variables), file)
             .unwrap()
             .log_level
     }
@@ -253,7 +325,7 @@ mod tests {
             .map(|value| (LISTEN_VAR, value))
             .into_iter()
             .collect();
-        resolve(&flags(None, flag), &env(&variables), file)
+        resolve(Path::new(ROOT), &flags(None, flag), &env(&variables), file)
             .map(|settings| settings.listen)
             .map_err(|error| error.to_string())
     }
@@ -288,7 +360,7 @@ mod tests {
                 .map(|value| (LOG_LEVEL_VAR, value))
                 .into_iter()
                 .collect();
-            resolve(&flags(flag, None), &env(&variables), file)
+            resolve(Path::new(ROOT), &flags(flag, None), &env(&variables), file)
                 .unwrap_err()
                 .to_string()
         };
@@ -309,13 +381,19 @@ mod tests {
     #[test]
     fn a_file_that_is_wrong_is_refused_even_when_a_flag_would_win() {
         for file in ["log_levle = \"warn\"", "log_level = 3", "not toml at all ["] {
-            let refused = resolve(&flags(Some("info"), None), &env(&[]), Some(file));
+            let refused = resolve(
+                Path::new(ROOT),
+                &flags(Some("info"), None),
+                &env(&[]),
+                Some(file),
+            );
             assert!(
                 matches!(refused, Err(ConfigError::File(_))),
                 "{file}: {refused:?}"
             );
         }
         let message = resolve(
+            Path::new(ROOT),
             &Flags::default(),
             &env(&[]),
             Some("cache_dir = \"/big/disk\""),
@@ -391,26 +469,107 @@ mod tests {
         );
     }
 
+    fn backup_dir(
+        flag: Option<&str>,
+        variable: Option<&str>,
+        file: Option<&str>,
+    ) -> Result<Option<PathBuf>, String> {
+        let variables: Vec<_> = variable
+            .map(|value| (BACKUP_DIR_VAR, value))
+            .into_iter()
+            .collect();
+        let flags = Flags {
+            backup_dir: flag.map(str::to_owned),
+            ..Flags::default()
+        };
+        resolve(Path::new(ROOT), &flags, &env(&variables), file)
+            .map(|settings| settings.backup_dir)
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn the_backup_folder_is_unset_until_named_and_never_in_the_data_directory() {
+        let elsewhere = if cfg!(windows) {
+            r"D:\Backups\Ritornel"
+        } else {
+            "/Volumes/Backups/Ritornel"
+        };
+        let file = format!("backup_dir = {:?}\n", elsewhere);
+        assert_eq!(backup_dir(None, None, None), Ok(None));
+        assert_eq!(
+            backup_dir(None, None, Some(&file)),
+            Ok(Some(PathBuf::from(elsewhere)))
+        );
+        // The same order as every other setting.
+        let flag = Path::new(ROOT).with_file_name("by-flag");
+        assert_eq!(
+            backup_dir(flag.to_str(), Some(elsewhere), Some(&file)),
+            Ok(Some(flag.clone()))
+        );
+
+        let inside = Path::new(ROOT).join("backups");
+        for (given, message) in [
+            (
+                inside.to_str().unwrap(),
+                "--backup-dir must be outside the data directory",
+            ),
+            (ROOT, "--backup-dir must be outside the data directory"),
+            ("backups", "--backup-dir must be an absolute path"),
+        ] {
+            let refused = backup_dir(Some(given), None, None).unwrap_err();
+            assert!(refused.starts_with(message), "{given}: {refused}");
+        }
+        assert!(
+            backup_dir(None, Some("relative"), None)
+                .unwrap_err()
+                .starts_with("RITORNEL_BACKUP_DIR must be an absolute path")
+        );
+        let inside_file = format!("backup_dir = {:?}\n", inside.to_str().unwrap());
+        assert!(
+            backup_dir(None, None, Some(&inside_file))
+                .unwrap_err()
+                .starts_with("backup_dir in config.toml must be outside the data directory")
+        );
+    }
+
+    // A link is made differently on each system, and on Windows only with
+    // a privilege a test does not have.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_the_data_directory_is_inside_it() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("data");
+        std::fs::create_dir_all(root.join("backups")).unwrap();
+        let link = scratch.path().join("looks-elsewhere");
+        std::os::unix::fs::symlink(root.join("backups"), &link).unwrap();
+        let flags = Flags {
+            backup_dir: link.to_str().map(str::to_owned),
+            ..Flags::default()
+        };
+        assert!(matches!(
+            resolve(&root, &flags, &env(&[]), None),
+            Err(ConfigError::BackupInside(Origin::Flag))
+        ));
+    }
+
     #[test]
     fn the_file_is_read_from_the_data_directory_and_may_be_missing() {
         let scratch = Scratch::new();
-        let path = scratch.path().join("config.toml");
+        let (root, path) = (scratch.path(), scratch.path().join("config.toml"));
         let none = Flags::default();
         assert_eq!(
-            load(&path, &none, &env(&[])).unwrap(),
+            load(root, &none, &env(&[])).unwrap(),
             Settings {
                 log_level: Level::INFO,
-                listen: Listen::DEFAULT
+                listen: Listen::DEFAULT,
+                backup_dir: None,
             }
         );
 
         std::fs::write(&path, FILE).unwrap();
+        assert_eq!(load(root, &none, &env(&[])).unwrap().log_level, Level::WARN);
         assert_eq!(
-            load(&path, &none, &env(&[])).unwrap().log_level,
-            Level::WARN
-        );
-        assert_eq!(
-            load(&path, &none, &env(&[(LOG_LEVEL_VAR, "debug")]))
+            load(root, &none, &env(&[(LOG_LEVEL_VAR, "debug")]))
                 .unwrap()
                 .log_level,
             Level::DEBUG

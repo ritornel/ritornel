@@ -33,6 +33,7 @@
 )]
 
 mod artist_pictures;
+pub mod backup;
 mod clock;
 pub mod covers;
 mod delivery_store;
@@ -113,7 +114,7 @@ pub use ritornel_domain::history::{LocalTime, known_zone, local_time, start_of_d
 pub use scan::{ScanRun, ScanSettings, run_scan, scan_summary};
 pub use scan_store::Source;
 pub use secret::SessionToken;
-pub use server_store::{Role, ServerIdentity, ServerStore};
+pub use server_store::{BackupFailed, BackupTaken, Role, ServerIdentity, ServerStore};
 pub use service_session::{ServiceKey, ServiceSession};
 pub use sqlite::SQLITE_VERSION;
 pub use timekeeping::{SystemTimekeeper, Timekeeper, clock_boot};

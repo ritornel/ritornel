@@ -48,8 +48,9 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
     let flags = Flags {
         log_level: args.log_level.clone(),
         listen: args.listen.clone(),
+        backup_dir: args.backup_dir.clone(),
     };
-    let settings = config::load(&held.dir().config_toml(), &flags, env)?;
+    let settings = config::load(held.dir().root(), &flags, env)?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let entropy: Arc<dyn Entropy> = Arc::new(OsEntropy);
     let boot_id = new_id(clock.now_ms(), &*entropy)?;
@@ -73,6 +74,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         playback: playback(args.output.as_deref(), env),
         lastfm: lastfm(env),
         watch: crate::WatchRun::on(),
+        backup_dir: settings.backup_dir.clone(),
     };
     let run = run(held, args, settings, clock, entropy, jobs, out);
     match &run {

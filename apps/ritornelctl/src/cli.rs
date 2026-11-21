@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! ritornelctl status [--data-dir <dir>] [--json]
+//! ritornelctl backup [--data-dir <dir>] [--json]
 //! ritornelctl library create [--data-dir <dir>] [--json]
 //! ritornelctl library stats [--data-dir <dir>] [--json]
 //! ritornelctl scan <folder> [--name <name>] [--no-wait] [--data-dir <dir>] [--json]
@@ -42,7 +43,7 @@ use clap::{Args, Parser, Subcommand};
 use ritornel_client::contract::SkipDirection;
 use ritornel_client::contract::local::Env;
 
-use crate::{artists, history, identity, jobs, lastfm, library, playback, scan, status};
+use crate::{artists, backup, history, identity, jobs, lastfm, library, playback, scan, status};
 
 const USAGE: &str = "\
 The command-line client of a Ritornel server. It talks to the server that is
@@ -50,6 +51,7 @@ running on a data directory, and never starts one.
 
 Usage:
   ritornelctl status [--data-dir <dir>] [--json]
+  ritornelctl backup [--data-dir <dir>] [--json]
   ritornelctl library create [--data-dir <dir>] [--json]
   ritornelctl library stats [--data-dir <dir>] [--json]
   ritornelctl scan <folder> [--name <name>] [--no-wait] [--data-dir <dir>] [--json]
@@ -81,7 +83,12 @@ Usage:
 Commands:
   status           Show the running server's ID, name and role, the versions
                    it is built from, the library it holds, the free disk
-                   space and where its logs are
+                   space, where its logs are and its last backup
+  backup           Copy the server's databases, with the listening history,
+                   into a new folder in the server's backup folder, while
+                   it goes on playing. The backup folder is named when the
+                   server starts (`ritornel-server serve --backup-dir`), and
+                   with none named there is no backup
   library create   Create a library on the server and make the server its
                    hub. A server holds one library, and one that has a
                    library already refuses
@@ -323,6 +330,7 @@ struct Cli {
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum Command {
     Status(ServerArgs),
+    Backup(ServerArgs),
     #[command(subcommand)]
     Library(LibraryCommand),
     Scan(ScanArgs),
@@ -692,6 +700,7 @@ fn try_run(
     };
     match command {
         Command::Status(args) => status::status(&args, env, out),
+        Command::Backup(args) => backup::backup(&args, env, out),
         Command::Library(LibraryCommand::Create(args)) => library::create(&args, env, out),
         Command::Library(LibraryCommand::Stats(args)) => library::stats(&args, env, out),
         Command::Scan(args) => scan::scan(&args, env, out),

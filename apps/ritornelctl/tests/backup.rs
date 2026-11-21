@@ -1,0 +1,381 @@
+//! The real `ritornelctl backup` on the real `ritornel-server`: a backup
+//! taken while the server plays is restored into another data directory,
+//! where the history it holds is the history a rebuild makes; and with no
+//! backup folder named there is no backup, nothing is written beside the
+//! data in its place, and the status says so. See "The data directory" in
+//! docs/design/server.md.
+//!
+//! As in `play.rs`, `ritornel-server` is taken from beside `ritornelctl`,
+//! and nothing here sleeps: each wait is for a process to print a line or
+//! to end, or for an answer from the server, and is bounded.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+/// How long a test waits for a process before it kills it and fails.
+const WAIT: Duration = Duration::from_secs(60);
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ritornelctl-backup-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        self.0.join("data")
+    }
+
+    /// A folder of two invented tracks of these lengths in seconds.
+    fn album(&self, name: &str, seconds: [u32; 2]) -> PathBuf {
+        let folder = self.0.canonicalize().unwrap().join("music").join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        let names = [("01 First.wav", 440.0), ("02 Second.wav", 660.0)];
+        for ((name, hz), seconds) in names.into_iter().zip(seconds) {
+            write_wav(&folder.join(name), seconds, hz);
+        }
+        folder
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_wav(path: &Path, seconds: u32, hz: f64) {
+    let rate: u32 = 8000;
+    let frames = rate * seconds;
+    let mut bytes = Vec::with_capacity(44 + frames as usize * 2);
+    let data = frames * 2;
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&rate.to_le_bytes());
+    bytes.extend_from_slice(&(rate * 2).to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data.to_le_bytes());
+    for frame in 0..frames {
+        let t = f64::from(frame) / f64::from(rate);
+        let sample = (0.25 * (2.0 * std::f64::consts::PI * hz * t).sin() * 32767.0) as i16;
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    std::fs::File::create(path)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
+}
+
+fn lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
+    let (send, lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(pipe).lines() {
+            if send.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    lines
+}
+
+fn rest(lines: &Receiver<String>) -> Option<String> {
+    let mut text = String::new();
+    loop {
+        match lines.recv_timeout(WAIT) {
+            Ok(line) => {
+                text.push_str(&line);
+                text.push('\n');
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(text),
+            Err(mpsc::RecvTimeoutError::Timeout) => return None,
+        }
+    }
+}
+
+fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ritornelctl"))
+        .args(args)
+        .arg("--data-dir")
+        .arg(data_dir)
+        .env_remove("RITORNEL_DATA_DIR")
+        .env_remove("RITORNEL_BACKUP_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = lines(child.stdout.take().unwrap());
+    let stderr = lines(child.stderr.take().unwrap());
+    let (Some(stdout), Some(stderr)) = (rest(&stdout), rest(&stderr)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("ritornelctl {args:?} did not end within {WAIT:?}");
+    };
+    (child.wait().unwrap().code(), stdout, stderr)
+}
+
+fn json(data_dir: &Path, args: &[&str]) -> Value {
+    let mut args = args.to_vec();
+    args.push("--json");
+    let (code, stdout, stderr) = ritornelctl(data_dir, &args);
+    assert_eq!(code, Some(0), "{args:?}: {stderr}");
+    serde_json::from_str(&stdout).unwrap()
+}
+
+/// Asks the server, again and again, until `done` says so, for at most
+/// [`WAIT`]. Each ask is a whole `ritornelctl` run, which is the wait.
+fn until(data_dir: &Path, args: &[&str], done: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let answer = json(data_dir, args);
+        if done(&answer) {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{args:?} never got there: {answer}"
+        );
+    }
+}
+
+/// A `ritornel-server` on the null output.
+struct Server {
+    child: Child,
+    stdout: Receiver<String>,
+}
+
+fn spawn(data_dir: &Path, variables: &[(&str, &str)]) -> (Child, Receiver<String>) {
+    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl"))
+        .with_file_name(format!("ritornel-server{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        binary.exists(),
+        "there is no ritornel-server beside ritornelctl: build the workspace"
+    );
+    let mut child = Command::new(binary)
+        .arg("serve")
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(["--listen", "127.0.0.1:0", "--output", "null"])
+        .env_remove("RITORNEL_DATA_DIR")
+        .env_remove("RITORNEL_LISTEN")
+        .env_remove("RITORNEL_LOG_LEVEL")
+        .env_remove("RITORNEL_BACKUP_DIR")
+        // A test that plays leaves the media keys where they were.
+        .env("RITORNEL_TEST_NO_MEDIA_SESSION", "1")
+        .envs(variables.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = lines(child.stdout.take().unwrap());
+    (child, stdout)
+}
+
+impl Server {
+    fn start(data_dir: &Path, variables: &[(&str, &str)]) -> Self {
+        let (mut child, stdout) = spawn(data_dir, variables);
+        let ready = stdout.recv_timeout(WAIT);
+        if !ready
+            .as_deref()
+            .is_ok_and(|line| line.starts_with("ready pid="))
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("no ready line within {WAIT:?}: {ready:?}");
+        }
+        Self { child, stdout }
+    }
+
+    /// Waits for the server to end by itself: `None` when a signal ended
+    /// it, as an abort does.
+    fn ended(mut self) -> Option<i32> {
+        assert!(
+            rest(&self.stdout).is_some(),
+            "the server did not end within {WAIT:?}"
+        );
+        self.child.wait().unwrap().code()
+    }
+
+    fn stop(self) {
+        // `taskkill /PID` without `/F` is what Windows has for SIGTERM: it
+        // asks the server's hidden window to close.
+        let sent = if cfg!(windows) {
+            Command::new("taskkill")
+                .arg("/PID")
+                .arg(self.child.id().to_string())
+                .output()
+                .unwrap()
+                .status
+        } else {
+            Command::new("kill")
+                .arg("-TERM")
+                .arg(self.child.id().to_string())
+                .status()
+                .unwrap()
+        };
+        assert!(sent.success());
+        assert_eq!(self.ended(), Some(0));
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn with_no_backup_folder_there_is_no_backup_and_nothing_is_written_beside_the_data() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let server = Server::start(&data_dir, &[]);
+    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+
+    let status = json(&data_dir, &["status"]);
+    assert_eq!(status["backup"], serde_json::json!({}), "{status}");
+    let (code, stdout, _) = ritornelctl(&data_dir, &["status"]);
+    assert_eq!(code, Some(0));
+    assert!(
+        stdout.contains("Backup            none: no backup folder is named"),
+        "{stdout}"
+    );
+
+    let (code, stdout, stderr) = ritornelctl(&data_dir, &["backup"]);
+    assert_eq!((code, stdout.as_str()), (Some(1), ""));
+    assert!(stderr.contains("no backup folder is named"), "{stderr}");
+    server.stop();
+
+    // Nothing was written in its place: the data directory holds what it
+    // held, and no backups.
+    assert!(!data_dir.join("backups").exists());
+    let mut names: Vec<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with("server.") && !name.starts_with("library."))
+        .collect();
+    names.sort();
+    assert_eq!(names, ["cache", "credential", "logs"]);
+}
+
+#[test]
+fn a_backup_taken_while_the_server_plays_is_restored_elsewhere_with_its_history_whole() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let place = scratch.0.join("backups elsewhere");
+    std::fs::create_dir_all(&place).unwrap();
+    let short = scratch.album("Short Album", [40, 40]);
+    let long = scratch.album("Long Album", [600, 600]);
+
+    // Twenty times real time: the short album is over in four seconds and
+    // the long one plays on for a minute.
+    let server = Server::start(
+        &data_dir,
+        &[
+            ("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20"),
+            ("RITORNEL_BACKUP_DIR", place.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    for folder in [&short, &long] {
+        assert_eq!(
+            ritornelctl(&data_dir, &["scan", folder.to_str().unwrap()]).0,
+            Some(0)
+        );
+    }
+    let status = json(&data_dir, &["status"]);
+    assert_eq!(status["backup"]["place"], place.to_str().unwrap());
+    assert!(status["backup"].get("last").is_none(), "{status}");
+
+    let (code, _, stderr) = ritornelctl(&data_dir, &["play", short.to_str().unwrap(), "--follow"]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+    until(&data_dir, &["history"], |recent| recent["undelivered"] == 0);
+
+    // The long album plays, and the backup is taken while it does.
+    assert_eq!(
+        ritornelctl(&data_dir, &["play", long.to_str().unwrap()]).0,
+        Some(0)
+    );
+    until(&data_dir, &["now"], |now| {
+        now["status"] == "playing" && now["positionMs"].as_u64() > Some(0)
+    });
+    let backed_up = json(&data_dir, &["backup"]);
+    let now = json(&data_dir, &["now"]);
+    assert_eq!(now["status"], "playing", "playback goes on: {now}");
+    let backup = PathBuf::from(backed_up["backup"]["path"].as_str().unwrap());
+    assert_eq!(backup.parent(), Some(place.as_path()));
+    let status = json(&data_dir, &["status"]);
+    assert_eq!(
+        status["backup"]["last"]["path"],
+        backed_up["backup"]["path"]
+    );
+    assert_eq!(status["backup"]["last"]["reason"], "on_demand");
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(backup.join("backup.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["files"],
+        serde_json::json!(["server.db", "library.db"])
+    );
+    assert_eq!(manifest["libraryId"], status["library"]["libraryId"]);
+    let played = json(&data_dir, &["history"])["plays"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(played, 2);
+    server.stop();
+    // The backup is not beside the data.
+    assert!(!data_dir.join("backups").exists());
+
+    // Another machine: an empty data directory with the backup's two
+    // databases put in it.
+    let restored = scratch.0.join("restored");
+    std::fs::create_dir_all(&restored).unwrap();
+    for name in ["server.db", "library.db"] {
+        std::fs::copy(backup.join(name), restored.join(name)).unwrap();
+    }
+    let server = Server::start(&restored, &[]);
+    let status = json(&restored, &["status"]);
+    assert_eq!(status["serverId"], manifest["serverId"]);
+    assert_eq!(status["library"]["libraryId"], manifest["libraryId"]);
+    // The listen that was playing when the backup was taken was in
+    // server.db, and arrives too. Then the history the server kept is the
+    // one a rebuild would make.
+    let recent = until(&restored, &["history"], |recent| recent["undelivered"] == 0);
+    assert!(
+        recent["plays"].as_array().unwrap().len() >= played,
+        "{recent}"
+    );
+    let rebuilt = json(&restored, &["history", "rebuild", "--dry-run"]);
+    assert_eq!(rebuilt["changed"].as_u64(), Some(0), "{rebuilt}");
+    assert_eq!(rebuilt["before"], rebuilt["after"]);
+    server.stop();
+    // Nothing needed migrating, so nothing was copied beside it.
+    assert!(!restored.join("backups").exists());
+}

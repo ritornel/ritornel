@@ -246,7 +246,7 @@ fn date_of(timestamp: &str) -> &str {
 }
 
 /// Unix milliseconds as UTC, to the millisecond: `2026-11-15T22:33:02.123Z`.
-fn utc(ms: i64) -> String {
+pub(crate) fn utc(ms: i64) -> String {
     let (days, ms_of_day) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
     let (hour, minute) = (ms_of_day / 3_600_000, ms_of_day % 3_600_000 / 60_000);
     let (second, milli) = (ms_of_day % 60_000 / 1_000, ms_of_day % 1_000);

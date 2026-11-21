@@ -122,6 +122,7 @@ export const METHODS = {
   "artists.importPictures": { kind: "command", needsFull: true },
   "artists.pictureFolders": { kind: "query", needsFull: true },
   "library.setWatching": { kind: "command", needsFull: true },
+  "server.backup": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -189,6 +190,7 @@ export type MethodMap = {
   "artists.importPictures": { params: ImportPicturesParams; result: PicturesImported };
   "artists.pictureFolders": { params: NoParams; result: PictureFolders };
   "library.setWatching": { params: WatchingParams; result: WatchingSet };
+  "server.backup": { params: BackupParams; result: BackedUp };
 };
 
 /** The name of a method. */
@@ -564,6 +566,104 @@ export type AutoRun = {
  * What starts a rescan or an import on its own.
  */
 export type AutoTrigger = "change" | "lost" | "returned" | "start" | "timer";
+
+/**
+ * The result of `server.backup`: the receipt, and the backup.
+ */
+export type BackedUp = {
+  /**
+   * The backup that was written.
+   */
+  backup: BackupMade,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * A backup that could not be written.
+ */
+export type BackupFailure = {
+  /**
+   * When it failed, as Unix milliseconds.
+   */
+  at: number,
+  /**
+   * What went wrong, as a person reads it.
+   */
+  message: string,
+};
+
+/**
+ * A backup that was written.
+ */
+export type BackupMade = {
+  /**
+   * When it was taken, as Unix milliseconds.
+   */
+  at: number,
+  /**
+   * Its folder, on the server's own disk.
+   */
+  path: string,
+  /**
+   * Why it was taken.
+   */
+  reason: BackupReason,
+  /**
+   * Whether its folder is still there.
+   */
+  present: boolean,
+};
+
+/**
+ * The params of `server.backup`.
+ */
+export type BackupParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+};
+
+/**
+ * Why a backup was taken.
+ */
+export type BackupReason = "on_demand" | "before_migration";
+
+/**
+ * Where a server writes its backups, and the last it wrote. A backup is a
+ * copy of the server's databases in a folder of its own, written to a
+ * place outside the data directory that has to be named: with none named
+ * there is no backup. See "The data directory" in
+ * docs/design/server.md.
+ */
+export type BackupStatus = {
+  /**
+   * The folder backups are written to, on the server's own disk. Left
+   * out when none is named.
+   */
+  place?: string,
+  /**
+   * The last backup written. Left out when there has been none.
+   */
+  last?: BackupMade,
+  /**
+   * The last backup that could not be written, when none has been
+   * written since.
+   */
+  failed?: BackupFailure,
+};
 
 /**
  * One side of a dry run's comparison: what an item is bound to, and how
@@ -3732,6 +3832,11 @@ export type ServerStatus = {
    * did on its own. Left out by a server that does not say.
    */
   watch?: WatchStatus,
+  /**
+   * Where this server backs up, and what its backups last did. Left out
+   * by a server that does not say.
+   */
+  backup?: BackupStatus,
 };
 
 /**

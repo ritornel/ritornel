@@ -163,7 +163,7 @@ fn apply<'a>(
 /// The ledger, oldest first: each applied migration's number and checksum.
 /// An empty database has none. A database with tables and no ledger is not
 /// ours.
-fn recorded(connection: &Connection) -> Result<Vec<(i64, Vec<u8>)>, Error> {
+pub(crate) fn recorded(connection: &Connection) -> Result<Vec<(i64, Vec<u8>)>, Error> {
     let ledger: Option<String> = connection
         .query_row(
             "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'schema_migration'",

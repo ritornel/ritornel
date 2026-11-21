@@ -24,6 +24,7 @@
     )
 )]
 
+mod backup;
 mod bounds;
 mod cli;
 mod config;

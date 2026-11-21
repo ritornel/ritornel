@@ -47,7 +47,7 @@ impl Location {
         Self::Memory(format!("/engine-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
     }
 
-    fn open(&self, access: OpenFlags) -> Result<Connection, Error> {
+    pub(crate) fn open(&self, access: OpenFlags) -> Result<Connection, Error> {
         // Without SQLITE_OPEN_URI a path is only ever a path, whatever
         // characters it holds.
         let flags = access | OpenFlags::SQLITE_OPEN_NO_MUTEX;

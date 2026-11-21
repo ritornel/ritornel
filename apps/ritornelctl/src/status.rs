@@ -3,7 +3,9 @@
 
 use std::io::Write;
 
-use ritornel_client::contract::{ServerStatus, WatchStatus, WatchedFolder, WatchedKind};
+use ritornel_client::contract::{
+    BackupStatus, ServerStatus, WatchStatus, WatchedFolder, WatchedKind,
+};
 use ritornel_client::local;
 
 use crate::cli::{Error, ServerArgs};
@@ -48,7 +50,41 @@ fn render(status: &ServerStatus) -> String {
     if let Some(watch) = &status.watch {
         watching(watch, &mut lines);
     }
+    if let Some(backup) = &status.backup {
+        backups(backup, &mut lines);
+    }
     server::facts(&lines)
+}
+
+/// Where backups go, the last one and the last failure. With no folder
+/// named, it says there is no backup, whatever was taken before.
+fn backups(backup: &BackupStatus, lines: &mut Vec<(&str, String)>) {
+    let Some(place) = &backup.place else {
+        lines.push((
+            "Backup",
+            "none: no backup folder is named (backup_dir in config.toml)".to_owned(),
+        ));
+        return;
+    };
+    lines.push((
+        "Backup",
+        match &backup.last {
+            Some(last) if last.present => format!("{}, {}", crate::lastfm::utc(last.at), last.path),
+            Some(last) => format!(
+                "none: the last, {}, is no longer at {}",
+                crate::lastfm::utc(last.at),
+                last.path
+            ),
+            None => "none yet: run `ritornelctl backup`".to_owned(),
+        },
+    ));
+    lines.push(("Backup folder", place.clone()));
+    if let Some(failed) = &backup.failed {
+        lines.push((
+            "Backup failed",
+            format!("{}: {}", crate::lastfm::utc(failed.at), failed.message),
+        ));
+    }
 }
 
 /// Whether the server notices changes to its folders, and each folder's
@@ -142,6 +178,7 @@ mod tests {
             },
             log_path: "/srv/ritornel/logs".to_owned(),
             watch: None,
+            backup: None,
         }
     }
 
@@ -161,6 +198,79 @@ Library           none
 Free disk, data   412.3 GB
 Log path          /srv/ritornel/logs
 "
+        );
+    }
+
+    #[test]
+    fn backups_say_where_they_go_and_when_there_is_none() {
+        use ritornel_client::contract::{BackupFailure, BackupMade, BackupReason};
+
+        let tail = |backup: BackupStatus| {
+            let mut status = example();
+            status.backup = Some(backup);
+            render(&status)
+                .split_once("Log path          /srv/ritornel/logs\n")
+                .unwrap()
+                .1
+                .to_owned()
+        };
+        let none = BackupStatus {
+            place: None,
+            last: None,
+            failed: None,
+        };
+        assert_eq!(
+            tail(none.clone()),
+            "Backup            none: no backup folder is named (backup_dir in config.toml)\n"
+        );
+        let place = "/Volumes/Backups/Ritornel".to_owned();
+        let at = 1_763_744_462_000;
+        assert_eq!(
+            tail(BackupStatus {
+                place: Some(place.clone()),
+                ..none.clone()
+            }),
+            "\
+Backup            none yet: run `ritornelctl backup`
+Backup folder     /Volumes/Backups/Ritornel
+"
+        );
+        let last = BackupMade {
+            at,
+            path: format!("{place}/ritornel-backup-2025-11-21-170102"),
+            reason: BackupReason::OnDemand,
+            present: true,
+        };
+        assert_eq!(
+            tail(BackupStatus {
+                place: Some(place.clone()),
+                last: Some(last.clone()),
+                failed: Some(BackupFailure {
+                    at: at + 86_400_000,
+                    message: "the backup folder /Volumes/Backups/Ritornel is not there: is its \
+                              disk connected?"
+                        .to_owned(),
+                }),
+            }),
+            "\
+Backup            2025-11-21 17:01 UTC, /Volumes/Backups/Ritornel/ritornel-backup-2025-11-21-170102
+Backup folder     /Volumes/Backups/Ritornel
+Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritornel is not there: is its disk connected?
+"
+        );
+        // A backup that has since gone is no backup.
+        assert!(
+            tail(BackupStatus {
+                place: Some(place),
+                last: Some(BackupMade {
+                    present: false,
+                    ..last
+                }),
+                failed: None,
+            })
+            .starts_with(
+                "Backup            none: the last, 2025-11-21 17:01 UTC, is no longer at "
+            )
         );
     }
 

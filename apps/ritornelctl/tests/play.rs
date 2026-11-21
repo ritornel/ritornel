@@ -209,6 +209,7 @@ fn spawn(data_dir: &Path, variables: &[(&str, &str)]) -> (Child, Receiver<String
         .env_remove("RITORNEL_DATA_DIR")
         .env_remove("RITORNEL_LISTEN")
         .env_remove("RITORNEL_LOG_LEVEL")
+        .env_remove("RITORNEL_BACKUP_DIR")
         // A test that plays leaves the media keys where they were.
         .env("RITORNEL_TEST_NO_MEDIA_SESSION", "1")
         .envs(variables.iter().copied())

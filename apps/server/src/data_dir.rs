@@ -11,9 +11,12 @@
 //!   library.db     the library, on the server that is its hub
 //!   logs/          JSON lines, one file a day
 //!   cache/         covers/, made on demand, and tmp/, where each is written first
+//!   backups/       made only when a database is migrated with no backup folder
+//!                  named: the copy taken before, as a way back from it
 //! ```
 //!
-//! `backups/` arrives with what first uses it.
+//! A backup is never written here: it goes to a folder named outside this
+//! directory (`crate::backup`).
 //!
 //! Where the directory is, and the names of `server.lock`, `server.json` and
 //! `credential`, are the contract's (`ritornel_contract::local`): a local client reads
@@ -99,6 +102,12 @@ impl DataDir {
 
     pub(crate) fn library_db(&self) -> PathBuf {
         self.root.join("library.db")
+    }
+
+    /// Where a database is copied before it is migrated when no backup
+    /// folder is named. It is not made until then.
+    pub(crate) fn backups(&self) -> PathBuf {
+        self.root.join("backups")
     }
 
     pub(crate) fn logs(&self) -> PathBuf {

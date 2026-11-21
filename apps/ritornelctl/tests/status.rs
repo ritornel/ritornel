@@ -177,6 +177,7 @@ impl Server {
             .env_remove("RITORNEL_DATA_DIR")
             .env_remove("RITORNEL_LISTEN")
             .env_remove("RITORNEL_LOG_LEVEL")
+            .env_remove("RITORNEL_BACKUP_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -299,7 +300,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
         })
         .collect();
     let logs_dir = data_dir.join("logs");
-    assert_eq!(facts.len(), 11, "{}", printed.stdout);
+    assert_eq!(facts.len(), 12, "{}", printed.stdout);
     assert_eq!(
         facts[..7],
         [
@@ -319,6 +320,13 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
     assert_eq!(
         facts[10],
         ("Watching", "off: this server is not the library's hub")
+    );
+    assert_eq!(
+        facts[11],
+        (
+            "Backup",
+            "none: no backup folder is named (backup_dir in config.toml)"
+        )
     );
 
     // For a program: the status as the server sent it.
@@ -347,6 +355,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
                 "off": "this server is not the library's hub",
                 "folders": [],
             },
+            "backup": {},
         })
     );
 
@@ -424,7 +433,7 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
     // The status shows what now exists.
     let printed = status(&data_dir, &[]);
     let shown = facts(&printed);
-    assert_eq!(shown.len(), 13, "{}", printed.stdout);
+    assert_eq!(shown.len(), 14, "{}", printed.stdout);
     assert_eq!(shown[12], ("Watching", "on"));
     assert_eq!(shown[2], ("Role", "hub"));
     assert_eq!(
