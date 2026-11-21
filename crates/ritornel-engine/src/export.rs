@@ -173,6 +173,29 @@ fn manifest(
     }))
 }
 
+/// A source item: a file by its path under its source's root, or what a
+/// service's play or love was of, by the text the service gave, which is
+/// what its key holds.
+fn item_of(id: Option<Vec<u8>>, kind: String, key_text: String, source: Option<Vec<u8>>) -> Value {
+    let subject = (kind == "scrobble_subject")
+        .then(|| serde_json::from_str::<(String, Option<String>, String)>(&key_text).ok())
+        .flatten();
+    let mut value = json!({
+        "id": key(id),
+        "kind": kind,
+        "key": key_text,
+        "source": key(source),
+    });
+    if let Some((artist, album, title)) = subject {
+        put(
+            &mut value,
+            "subject",
+            json!({ "artist": artist, "album": album, "title": title }),
+        );
+    }
+    value
+}
+
 /// The record as it was received, which is JSON; text that is not is
 /// given as text.
 fn record(text: &str) -> Value {
@@ -187,7 +210,8 @@ fn observations(connection: &Connection, path: &Path) -> Result<u64, Error> {
                 o.zone_name, o.zone_basis, o.utc_offset_minutes, o.local_date, o.local_hour,
                 o.payload_json,
                 si.public_id, si.item_kind, si.provider_key, src.public_id,
-                rec.public_id, rec.display_title, credit.display_text
+                rec.public_id, rec.display_title, credit.display_text,
+                o.sent_mono_ms, o.sent_boot_id
          FROM history_observation o
          JOIN history_endpoint e ON e.id = o.endpoint_id
          JOIN listener l ON l.id = o.listener_id
@@ -211,6 +235,10 @@ fn observations(connection: &Connection, path: &Path) -> Result<u64, Error> {
             "capturedAt": utc(row.get(5)?),
             "receivedAt": utc(row.get(6)?),
             "sentAt": utc(row.get(7)?),
+            // What a listen's age is read from: the sender's monotonic clock
+            // at the send, and the boot it counts from.
+            "sentMonoMs": row.get::<_, Option<i64>>(22)?,
+            "sentBoot": key(row.get(23)?),
             "clockSkewMs": row.get::<_, Option<i64>>(8)?,
             "zone": {
                 "name": row.get::<_, Option<String>>(9)?,
@@ -226,12 +254,7 @@ fn observations(connection: &Connection, path: &Path) -> Result<u64, Error> {
             put(
                 &mut value,
                 "item",
-                json!({
-                    "id": key(item),
-                    "kind": row.get::<_, String>(16)?,
-                    "key": row.get::<_, String>(17)?,
-                    "source": key(row.get(18)?),
-                }),
+                item_of(item, row.get(16)?, row.get(17)?, row.get(18)?),
             );
             put(
                 &mut value,
@@ -405,12 +428,7 @@ fn ratings(connection: &Connection, path: &Path) -> Result<u64, Error> {
                 }))
             }).transpose()?,
             "item": item.is_some().then(|| -> rusqlite::Result<Value> {
-                Ok(json!({
-                    "id": key(item.clone()),
-                    "kind": row.get::<_, String>(9)?,
-                    "key": row.get::<_, String>(10)?,
-                    "source": key(row.get(11)?),
-                }))
+                Ok(item_of(item.clone(), row.get(9)?, row.get(10)?, row.get(11)?))
             }).transpose()?,
             "endpoint": key(row.get(12)?),
             "by": row.get::<_, Option<String>>(13)?,
@@ -459,10 +477,12 @@ fn plays(connection: &Connection, path: &Path) -> Result<u64, Error> {
                 p.context_kind, e.kind, e.public_id, o.source_key
          FROM play_event p
          JOIN listener l ON l.id = p.listener_id
-         JOIN play_event_observation primary_one
+         -- Every play has a primary observation, and one that somehow had
+         -- none is still a row of the table, with its source left empty.
+         LEFT JOIN play_event_observation primary_one
            ON primary_one.play_event_id = p.id AND primary_one.role = 'primary'
-         JOIN history_observation o ON o.id = primary_one.observation_id
-         JOIN history_endpoint e ON e.id = o.endpoint_id
+         LEFT JOIN history_observation o ON o.id = primary_one.observation_id
+         LEFT JOIN history_endpoint e ON e.id = o.endpoint_id
          LEFT JOIN observation_import imported ON imported.observation_id = o.id
          LEFT JOIN recording rec ON rec.id = p.recording_id
          LEFT JOIN artist_credit credit ON credit.id = rec.display_artist_credit_id
@@ -495,9 +515,11 @@ fn plays(connection: &Connection, path: &Path) -> Result<u64, Error> {
             flag(row.get(11)?),
             flag(row.get(12)?),
             row.get::<_, Option<String>>(13)?.unwrap_or_default(),
-            row.get::<_, String>(14)?,
+            row.get::<_, Option<String>>(14)?.unwrap_or_default(),
             text(key(row.get(15)?)),
-            hex(&row.get::<_, Vec<u8>>(16)?),
+            row.get::<_, Option<Vec<u8>>>(16)?
+                .map(|bytes| hex(&bytes))
+                .unwrap_or_default(),
         ];
         csv_row(&mut file, cells.into_iter())?;
         written += 1;

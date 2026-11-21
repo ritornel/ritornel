@@ -1530,6 +1530,9 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
     );
     assert_eq!(listen["sourceKey"], "07".repeat(16));
     assert_eq!(listen["record"]["endReason"], "next");
+    // What its time is worked out from, beside the record.
+    assert_eq!(listen["sentBoot"], BOOT.to_string());
+    assert!(listen["sentMonoMs"].is_i64(), "{listen}");
 
     // The imported play, as the service gave it.
     let import = observations
@@ -1540,6 +1543,7 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
     assert_eq!(import["import"]["artist"], "Ada Example, \"Quoted\"");
     assert_eq!(import["import"]["title"], "Tin Roof");
     assert_eq!(import["import"]["playedAt"], "2017-07-14T02:40:00Z");
+    assert_eq!(import["item"]["subject"]["title"], "Tin Roof");
 
     // The correction names what it excludes by endpoint and source key.
     let correction = observations
@@ -1594,4 +1598,28 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
         .find(|play| play["source_key"] == "08".repeat(16))
         .unwrap();
     assert_eq!(excluded["excluded"], "1");
+
+    // A play that has lost its primary observation is still a row of the
+    // table, with no source.
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.orphan",
+                command: None,
+                client: None,
+            },
+            |write| {
+                write.connection().execute(
+                    "DELETE FROM play_event_observation WHERE role = 'primary'",
+                    [],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    let again = crate::testing::Scratch::new();
+    let exported_again = at.library.export_record(again.path(), T0).unwrap();
+    assert_eq!(exported_again.plays, exported.plays);
+    let plays = reading_an_export::table(&again.path().join("plays.csv"));
+    assert!(plays.iter().all(|play| play["source"].is_empty()));
 }
