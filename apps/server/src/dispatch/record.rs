@@ -168,25 +168,31 @@ impl Core {
         stores: &Stores,
         params: &DismissParams,
     ) -> Result<Dismissed, RpcError> {
-        let revision = Self::library(stores, |library| {
-            library
-                .meta()
-                .map(|meta| meta.revision)
-                .map_err(crate::Error::Library)
-                .map_err(super::failed)
-        })?;
-        stores
-            .server()
-            .dismiss_record(Dismissal {
-                through_revision: revision,
-                command: params.idempotency_key,
-            })
-            .map_err(crate::Error::Store)
+        // With no library there is no scrobble to set aside, and the
+        // dismissal changes nothing.
+        let revision = stores
+            .library
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|library| library.meta().map(|meta| meta.revision))
+            .transpose()
+            .map_err(crate::Error::Library)
             .map_err(super::failed)?;
-        info!(
-            revision,
-            "the scrobbles that ended unknown or withdrawn so far are dismissed"
-        );
+        if let Some(revision) = revision {
+            stores
+                .server()
+                .dismiss_record(Dismissal {
+                    through_revision: revision,
+                    command: params.idempotency_key,
+                })
+                .map_err(crate::Error::Store)
+                .map_err(super::failed)?;
+            info!(
+                revision,
+                "the scrobbles that ended unknown or withdrawn so far are dismissed"
+            );
+        }
         Ok(Dismissed {
             receipt: Receipt {
                 command_id: params.idempotency_key,

@@ -13,11 +13,34 @@ use crate::{Error, LibraryStore, ServerStore};
 /// library revision. A revision only rises, whatever a clock does.
 const DISMISSED: &str = "record.dismissed";
 
-/// The last dismissal: through which library revision, by which command.
+/// A dismissal: through which library revision, by which command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Dismissal {
     pub through_revision: i64,
     pub command: crate::Id,
+}
+
+/// How many of the last dismissals' commands are kept, so that one sent
+/// again, however late, is known.
+const COMMANDS_KEPT: usize = 64;
+
+/// What is kept of the dismissals: the one in force, and the commands of
+/// the last [`COMMANDS_KEPT`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Held {
+    through_revision: i64,
+    command: crate::Id,
+    #[serde(default)]
+    commands: Vec<crate::Id>,
+}
+
+impl Held {
+    fn dismissal(&self) -> Dismissal {
+        Dismissal {
+            through_revision: self.through_revision,
+            command: self.command,
+        }
+    }
 }
 
 /// Something that has gone wrong since a time, and is still wrong.
@@ -106,33 +129,44 @@ impl ServerStore {
     /// The last dismissal of the scrobbles that ended unknown or
     /// withdrawn: none that ended by its revision count against the record.
     pub fn record_dismissal(&self) -> Result<Option<Dismissal>, Error> {
-        self.read(held_dismissal)
+        self.read(|connection| Ok(held_dismissal(connection)?.map(|held| held.dismissal())))
     }
 
     /// Sets aside every scrobble that ended unknown or withdrawn by the
     /// library revision of `dismissal`, and answers the dismissal in force.
-    /// The same command again changes nothing, so a client that sends it
-    /// again for want of an answer hides nothing that ended since. A
-    /// dismissal never moves back.
+    /// A command already seen changes nothing, so a client that sends one
+    /// again for want of an answer, however late, hides nothing that ended
+    /// since. A dismissal never moves back.
     pub fn dismiss_record(&self, dismissal: Dismissal) -> Result<Dismissal, Error> {
         self.transact(move |transaction, _, _| {
-            if let Some(held) = held_dismissal(transaction)?
+            let held = held_dismissal(transaction)?;
+            if let Some(held) = &held
                 && (held.command == dismissal.command
+                    || held.commands.contains(&dismissal.command)
                     || held.through_revision >= dismissal.through_revision)
             {
-                return Ok(held);
+                return Ok(held.dismissal());
             }
+            let mut commands = held.map(|held| held.commands).unwrap_or_default();
+            commands.push(dismissal.command);
+            let excess = commands.len().saturating_sub(COMMANDS_KEPT);
+            commands.drain(..excess);
+            let kept = Held {
+                through_revision: dismissal.through_revision,
+                command: dismissal.command,
+                commands,
+            };
             transaction.execute(
                 "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
                  ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
-                (DISMISSED, serde_json::to_string(&dismissal)?),
+                (DISMISSED, serde_json::to_string(&kept)?),
             )?;
             Ok(dismissal)
         })
     }
 }
 
-fn held_dismissal(connection: &rusqlite::Connection) -> Result<Option<Dismissal>, Error> {
+fn held_dismissal(connection: &rusqlite::Connection) -> Result<Option<Held>, Error> {
     let value: Option<String> = connection
         .query_row(
             "SELECT value_json FROM server_setting WHERE key = ?1",
@@ -345,5 +379,12 @@ mod tests {
         };
         assert_eq!(store.dismiss_record(later).unwrap(), later);
         assert_eq!(store.record_dismissal().unwrap(), Some(later));
+        // The first again, long after, as a client that never had its
+        // answer might send it: it hides nothing lost since the last.
+        let late_retry = Dismissal {
+            through_revision: 40,
+            ..first
+        };
+        assert_eq!(store.dismiss_record(late_retry).unwrap(), later);
     }
 }

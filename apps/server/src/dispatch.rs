@@ -1325,6 +1325,14 @@ mod tests {
         assert_eq!(status()["backup"]["last"]["present"], false);
     }
 
+    #[test]
+    fn dismissing_with_no_library_changes_nothing_and_answers_the_record() {
+        let (core, _scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        let dismissed = call(&core, &session, "record.dismiss", Some(key(0xd1))).unwrap();
+        assert_eq!(dismissed["record"], json!({ "problems": [] }));
+    }
+
     /// The params of a command with this byte for every byte of its key.
     fn key(byte: u8) -> Value {
         json!({ "idempotencyKey": Id::from_bytes([byte; 16]).to_string() })
