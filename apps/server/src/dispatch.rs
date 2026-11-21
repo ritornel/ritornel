@@ -1268,6 +1268,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_backup_that_failed_is_said_until_one_works_and_one_since_removed_is_no_backup() {
+        let (core, scratch) = core();
+        let place = scratch.path().join("elsewhere");
+        core.set_backups(crate::backup::Backups::new(Some(place.clone())));
+        let session = greeted(&core, SessionKind::Full);
+        let status = || call(&core, &session, "server.status", Some(json!({}))).unwrap();
+
+        // Its disk is not connected: refused, and said.
+        let refused = call(&core, &session, "server.backup", Some(key(0xb1))).unwrap_err();
+        assert_eq!(refused.0, ErrorCode::Unavailable);
+        let backup = status()["backup"].clone();
+        assert!(
+            backup["failed"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("is not there"),
+            "{backup}"
+        );
+        assert!(backup.get("last").is_none(), "{backup}");
+
+        // Connected: taken, and the failure is over.
+        std::fs::create_dir(&place).unwrap();
+        let taken = call(&core, &session, "server.backup", Some(key(0xb2))).unwrap();
+        let backup = status()["backup"].clone();
+        assert!(backup.get("failed").is_none(), "{backup}");
+        assert_eq!(backup["last"]["path"], taken["backup"]["path"]);
+        assert_eq!(backup["last"]["present"], true);
+
+        // Removed since: there is no backup.
+        std::fs::remove_dir_all(taken["backup"]["path"].as_str().unwrap()).unwrap();
+        assert_eq!(status()["backup"]["last"]["present"], false);
+    }
+
     /// The params of a command with this byte for every byte of its key.
     fn key(byte: u8) -> Value {
         json!({ "idempotencyKey": Id::from_bytes([byte; 16]).to_string() })

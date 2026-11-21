@@ -51,7 +51,10 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), Error> {
 /// Its parent must be there.
 pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir(path)?;
-    ritornel_windows::private::restrict(path)
+    // A folder open to others is not left behind.
+    ritornel_windows::private::restrict(path).inspect_err(|_| {
+        let _ = std::fs::remove_dir(path);
+    })
 }
 
 /// Nothing yet: the standard library cannot open a folder to flush it, so

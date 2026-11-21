@@ -33,7 +33,9 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::data_dir::DataDir;
-use crate::platform::{create_new_private_dir, create_private_dir, sync_dir};
+use crate::platform::{
+    close_to_others, create_new_private_dir, create_private_dir, create_private_file, sync_dir,
+};
 
 /// The version of `backup.json`.
 const MANIFEST_VERSION: u32 = 1;
@@ -418,20 +420,27 @@ fn fill(
         ("server.db", dir.server_db()),
         ("library.db", dir.library_db()),
     ] {
-        // A server that holds no library has an empty file, or none.
-        if std::fs::metadata(&source).map_or(true, |file| file.len() == 0) {
+        // A server that holds no library has an empty file, or none. One
+        // that holds a library has no backup without it.
+        if !present(&source)? {
+            if name == "library.db" && about.library_id.is_some() {
+                return Err(BackupError::Copy(name, ritornel_engine::Error::NoLibrary));
+            }
             continue;
         }
-        copy_database(&source, &into.join(name)).map_err(|error| BackupError::Copy(name, error))?;
+        let copy = into.join(name);
+        copy_database(&source, &copy).map_err(|error| BackupError::Copy(name, error))?;
+        // SQLite makes a file anyone may read, and server.db holds this
+        // server's signing key.
+        close_to_others(&copy).map_err(io("close", &copy))?;
         files.push(name);
     }
     let config = dir.config_toml();
-    if config.is_file() {
-        let copy = into.join("config.toml");
-        std::fs::copy(&config, &copy)
-            .and_then(|_| std::fs::OpenOptions::new().write(true).open(&copy))
-            .and_then(|file| file.sync_all())
-            .map_err(io("copy", &config))?;
+    if present(&config)? {
+        // Read and written again, so that the copy is the owner's alone and
+        // can be synced whatever the file's own mode.
+        let text = std::fs::read(&config).map_err(io("read", &config))?;
+        write_synced(&into.join("config.toml"), &text)?;
         files.push("config.toml");
     }
     let manifest = json!({
@@ -452,9 +461,21 @@ fn fill(
     write_synced(&into.join("README.txt"), README.as_bytes())
 }
 
+/// Whether there is a file with something in it at `path`. One whose
+/// details cannot be read is an error, never taken for one that is not
+/// there.
+fn present(path: &Path) -> Result<bool, BackupError> {
+    match std::fs::metadata(path) {
+        Ok(file) => Ok(file.len() > 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io("read", path)(error)),
+    }
+}
+
+/// Writes a new file that only its owner may open, and syncs it.
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), BackupError> {
     use std::io::Write;
-    std::fs::File::create(path)
+    create_private_file(path)
         .and_then(|mut file| {
             file.write_all(bytes)?;
             file.sync_all()
@@ -470,6 +491,7 @@ mod tests {
 
     use super::*;
     use crate::testing::Scratch;
+    use ritornel_contract::Id;
 
     const AT: i64 = 1_763_744_462_123;
 
@@ -597,6 +619,90 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(dir.root().join("later")).unwrap().count(),
             0
+        );
+    }
+
+    fn backup(dir: &DataDir, place: &Path, about: About) -> Result<Taken, BackupError> {
+        Backups::new(Some(place.to_owned())).take(dir, AT, BackupReason::OnDemand, about)
+    }
+
+    fn elsewhere(scratch: &Scratch) -> PathBuf {
+        let place = scratch.path().join("elsewhere");
+        std::fs::create_dir_all(&place).unwrap();
+        place
+    }
+
+    #[test]
+    fn a_server_that_holds_a_library_has_no_backup_without_it() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = elsewhere(&scratch);
+        let about = About {
+            library_id: Some(Id::from_bytes([0x1b; 16])),
+            ..About::default()
+        };
+        assert!(backup(&dir, &place, about).is_err());
+        assert_eq!(std::fs::read_dir(&place).unwrap().count(), 0);
+    }
+
+    // A link to itself is a file whose details cannot be read, as one on a
+    // failing disk or in a folder closed to the server is; the link is
+    // made differently on each system, and on Windows only with a
+    // privilege a test does not have.
+    #[cfg(unix)]
+    #[test]
+    fn a_database_whose_details_cannot_be_read_is_no_database_that_is_not_there() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = elsewhere(&scratch);
+        std::os::unix::fs::symlink(dir.library_db(), dir.library_db()).unwrap();
+        assert!(backup(&dir, &place, About::default()).is_err());
+        assert_eq!(std::fs::read_dir(&place).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_settings_file_only_its_owner_may_change_is_copied_all_the_same() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = elsewhere(&scratch);
+        std::fs::write(dir.config_toml(), "log_level = \"warn\"\n").unwrap();
+        let mut read_only = std::fs::metadata(dir.config_toml()).unwrap().permissions();
+        read_only.set_readonly(true);
+        std::fs::set_permissions(dir.config_toml(), read_only).unwrap();
+        let taken = backup(&dir, &place, About::default()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(taken.path.join("config.toml")).unwrap(),
+            "log_level = \"warn\"\n"
+        );
+    }
+
+    #[test]
+    fn every_file_of_a_backup_is_its_owners_alone() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = elsewhere(&scratch);
+        std::fs::write(dir.config_toml(), "log_level = \"warn\"\n").unwrap();
+        let taken = backup(&dir, &place, About::default()).unwrap();
+        assert!(crate::platform::path_is_private(&taken.path));
+        for name in ["server.db", "config.toml", "backup.json", "README.txt"] {
+            assert!(
+                crate::platform::path_is_private(&taken.path.join(name)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_neither_place_to_copy_to_no_migration_is_run() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        // The named folder is not there, and where the way back would go
+        // is a file.
+        std::fs::write(dir.backups(), b"").unwrap();
+        let pending: &IsPending =
+            &|_, database| Ok((database == Database::Server).then_some(Pending { from: 1, to: 2 }));
+        assert!(
+            before_migrations(&dir, Some(&scratch.path().join("unplugged")), AT, pending).is_err()
         );
     }
 

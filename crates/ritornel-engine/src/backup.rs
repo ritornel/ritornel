@@ -50,8 +50,13 @@ pub struct Pending {
 ///
 /// The file is only read.
 pub fn pending_migrations(path: &Path, database: Database) -> Result<Option<Pending>, Error> {
-    if std::fs::metadata(path).map_or(true, |file| file.len() == 0) {
-        return Ok(None);
+    // One whose details cannot be read is an error, never taken for one
+    // that is not there.
+    match std::fs::metadata(path) {
+        Ok(file) if file.len() == 0 => return Ok(None),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::Io(error)),
     }
     let connection = Location::File(path.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     pending_in(&connection, database.migrations())
@@ -167,6 +172,19 @@ mod tests {
             copy_database(&path, &copy),
             Err(Error::Invalid(_))
         ));
+    }
+
+    // A link to itself is a file whose details cannot be read, as one on a
+    // failing disk or in a folder closed to the server is; the link is
+    // made differently on each system, and on Windows only with a
+    // privilege a test does not have.
+    #[cfg(unix)]
+    #[test]
+    fn a_database_whose_details_cannot_be_read_is_an_error_and_not_nothing_to_migrate() {
+        let scratch = Scratch::new("unreadable");
+        let path = scratch.0.join("library.db");
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        assert!(pending_migrations(&path, Database::Library).is_err());
     }
 
     #[test]
