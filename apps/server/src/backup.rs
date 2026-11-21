@@ -314,23 +314,12 @@ fn write(
         return Err(BackupError::Missing(place.to_owned()));
     }
     let (name, partial) = reserve(place, at_ms, reason)?;
-    let finished = place.join(&name);
-    // Each file is synced as it is written; then the folder, so that its
-    // names are kept, and once it is renamed, the place, so that the new
-    // name is. Only then is the backup said to be taken.
-    let whole = fill(dir, &partial, at_ms, reason, about)
-        .and_then(|()| sync_dir(&partial).map_err(io("sync", &partial)))
-        .and_then(|()| std::fs::rename(&partial, &finished).map_err(io("finish", &finished)));
-    if let Err(error) = whole {
+    if let Err(error) = fill(dir, &partial, at_ms, reason, about) {
         // What was written of it is no backup.
         let _ = std::fs::remove_dir_all(&partial);
         return Err(error);
     }
-    if let Err(error) = sync_dir(place) {
-        // Renamed, it is this backup's alone; unsynced, it is not one.
-        let _ = std::fs::remove_dir_all(&finished);
-        return Err(io("sync", place)(error));
-    }
+    let finished = publish(&partial, place, &name)?;
     Ok(Taken {
         path: finished,
         at_ms,
@@ -338,28 +327,39 @@ fn write(
     })
 }
 
-/// A new backup's folder name, and the folder it is written in first,
-/// which this call makes and no other can: two in the same second, by this
-/// server or another writing to the same place, are told apart by a
-/// number.
+/// A new backup's folder name, and the folder it is written in first.
 fn reserve(
     place: &Path,
     at_ms: i64,
     reason: BackupReason,
 ) -> Result<(String, PathBuf), BackupError> {
-    let stamp = crate::logs::utc(at_ms);
-    // `2026-11-21T17:01:02.123Z` to `2026-11-21-170102`: no colon, which
-    // Windows does not allow in a name.
-    let (date, time) = stamp.split_once('T').unwrap_or((&stamp, ""));
-    let time: String = time.chars().filter(char::is_ascii_digit).take(6).collect();
     let suffix = match reason {
         BackupReason::OnDemand => "",
         BackupReason::BeforeMigration => "-before-migration",
     };
-    let base = format!("ritornel-backup-{date}-{time}{suffix}");
-    for n in 1_u32.. {
+    reserve_named(place, &format!("ritornel-backup-{}{suffix}", stamp(at_ms)))
+}
+
+/// A time as it is put in a folder's name: `2026-11-21-170102`, in UTC,
+/// with no colon, which Windows does not allow in a name.
+pub(crate) fn stamp(at_ms: i64) -> String {
+    let utc = crate::logs::utc(at_ms);
+    let (date, time) = utc.split_once('T').unwrap_or((&utc, ""));
+    let time: String = time.chars().filter(char::is_ascii_digit).take(6).collect();
+    format!("{date}-{time}")
+}
+
+/// How many folders of one name and second a place may already hold.
+const SAME_SECOND: u32 = 1_000;
+
+/// A new folder's name in `place`, `base` or `base-2` and on, and the
+/// folder it is written in first, under a dotted name, which this call
+/// makes and no other can: two writers in the same second, in this server
+/// or another writing to the same place, take two names.
+pub(crate) fn reserve_named(place: &Path, base: &str) -> Result<(String, PathBuf), BackupError> {
+    for n in 1..=SAME_SECOND {
         let name = if n == 1 {
-            base.clone()
+            base.to_owned()
         } else {
             format!("{base}-{n}")
         };
@@ -368,12 +368,42 @@ fn reserve(
         }
         let partial = place.join(format!(".{name}.partial"));
         match create_new_private_dir(&partial) {
+            // Another writer may have finished a folder of this name since
+            // it was looked for; then the next name is taken.
+            Ok(()) if place.join(&name).exists() => {
+                let _ = std::fs::remove_dir(&partial);
+            }
             Ok(()) => return Ok((name, partial)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(io("create", &partial)(error)),
         }
     }
-    Err(BackupError::Missing(place.to_owned()))
+    Err(BackupError::Io {
+        doing: "name a new folder in",
+        path: place.to_owned(),
+        source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+    })
+}
+
+/// Makes the folder written under `partial` whole, as `name` in `place`:
+/// it is synced, so that its names are kept, renamed, and the place synced,
+/// so that the new name is. Each file in it was synced as it was written.
+/// On an error nothing of it is left, and it is not to be called whole.
+pub(crate) fn publish(partial: &Path, place: &Path, name: &str) -> Result<PathBuf, BackupError> {
+    let finished = place.join(name);
+    let renamed = sync_dir(partial)
+        .map_err(io("sync", partial))
+        .and_then(|()| std::fs::rename(partial, &finished).map_err(io("finish", &finished)));
+    if let Err(error) = renamed {
+        let _ = std::fs::remove_dir_all(partial);
+        return Err(error);
+    }
+    if let Err(error) = sync_dir(place) {
+        // Renamed, it is this writer's alone; unsynced, it is not whole.
+        let _ = std::fs::remove_dir_all(&finished);
+        return Err(io("sync", place)(error));
+    }
+    Ok(finished)
 }
 
 fn fill(
