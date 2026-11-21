@@ -956,6 +956,35 @@ fn artists_bind_by_id_then_by_exact_normalised_name_and_strings_are_not_parsed()
 }
 
 #[test]
+fn after_a_change_of_normaliser_an_artist_takes_its_own_row_before_another_s() {
+    let mut world = World::default();
+    world.add(file("A/1.flac", 1).song("Lanterns", "Tin-Harbour", 200));
+    world.add(file("B/1.flac", 2).song("Salt Road", "Tin & Harbour", 200));
+    world.settle();
+    let rows: Vec<i64> = world.library.artists.iter().map(|(row, _)| *row).collect();
+    // As normaliser 1 keyed them: "tinharbour" and "tin harbour". Today's
+    // key of the first is the second's old one.
+    world.library.artists = vec![
+        (rows[0], "tinharbour".to_owned()),
+        (rows[1], "tin harbour".to_owned()),
+    ];
+    world.library.artist_keys_by = Some(1);
+    let resolution = world.settle();
+    let found: Vec<(Ref, &str)> = resolution
+        .artists
+        .iter()
+        .map(|out| (out.r, out.name.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (Ref::Row(rows[0]), "Tin-Harbour"),
+            (Ref::Row(rows[1]), "Tin & Harbour")
+        ]
+    );
+}
+
+#[test]
 fn an_artist_with_no_id_keeps_its_row_across_a_change_of_normaliser() {
     for edited in [false, true] {
         let mut world = World::default();
@@ -1934,6 +1963,9 @@ fn policy_2_reads_every_spelling_of_a_cappella_and_part_numbers_as_markers() {
     ] {
         assert!(two(title).is_empty(), "{title}");
     }
+    // A marker written across punctuation inside a word is still one.
+    assert_eq!(two("Lantern (Re-recorded)"), ["rerecorded"]);
+    assert_eq!(two("Lantern (Re-Recorded Version)"), ["rerecorded"]);
     // Policy 1's list is as it was: two spellings are two markers, and a
     // part is none.
     assert_eq!(markers_of("Lantern (Acapella)", 1), ["acapella"]);

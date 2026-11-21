@@ -45,6 +45,10 @@ fn parts_words(c: char) -> bool {
 /// keeps it, so that `!!!` and `???` stay two names.
 pub fn normalize(text: &str) -> String {
     let folded: String = text.nfkc().flat_map(char::to_lowercase).collect();
+    // "&" alone is a name of punctuation, not the word "and".
+    if !folded.chars().any(char::is_alphanumeric) {
+        return folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
     let mut spaced = String::with_capacity(folded.len());
     for c in folded.chars() {
         match c {
@@ -82,6 +86,13 @@ pub fn normalize_by(version: i64, text: &str) -> Option<String> {
         NORMALIZER_VERSION => Some(normalize(text)),
         _ => None,
     }
+}
+
+/// The words of a name with punctuation inside a word joining the letters
+/// on either side, as "Re-recorded" is `rerecorded`: what version markers
+/// are read from, beside the words punctuation parts.
+pub(crate) fn joined_words(text: &str) -> String {
+    normalize_v1(text)
 }
 
 /// Version 1's key: punctuation inside a word joined the letters on either
@@ -264,6 +275,8 @@ mod tests {
     #[test]
     fn a_name_of_punctuation_alone_keeps_it() {
         assert_eq!(normalize("!!!"), "!!!");
+        assert_eq!(normalize("&"), "&");
+        assert_ne!(normalize("&"), normalize("And"));
         assert_ne!(normalize("!!!"), normalize("???"));
         assert_eq!(normalize(""), "");
     }

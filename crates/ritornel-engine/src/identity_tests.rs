@@ -664,7 +664,14 @@ fn an_artist_no_file_credits_is_keyed_again_when_the_normaliser_changes() {
             let connection = write.connection();
             // The third is the scanned artist under another spelling, which
             // today's normaliser joins to it.
-            for (row, name) in [(901, "Lanterns-42"), (902, "Tin/Harbour"), (903, "Moss/Arcade")] {
+            // The fourth and fifth would share a key.
+            for (row, name) in [
+                (901, "Lanterns-42"),
+                (902, "Tin/Harbour"),
+                (903, "Moss/Arcade"),
+                (904, "Salt-Road"),
+                (905, "Salt/Road"),
+            ] {
                 connection.execute(
                     "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
                      VALUES (?1, ?2, ?1, ?3, ?3, ?4, ?5)",
@@ -713,7 +720,13 @@ fn an_artist_no_file_credits_is_keyed_again_when_the_normaliser_changes() {
     // marked as keyed by today's normaliser.
     assert_eq!(
         rig.rows("SELECT id || '|' || match_name FROM artist WHERE id > 900 ORDER BY id"),
-        ["901|lanterns 42", "902|tinharbour", "903|mossarcade"]
+        [
+            "901|lanterns 42",
+            "902|tinharbour",
+            "903|mossarcade",
+            "904|saltroad",
+            "905|saltroad"
+        ]
     );
     // A second resolution changes nothing.
     assert!(

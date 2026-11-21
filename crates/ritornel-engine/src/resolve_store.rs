@@ -731,6 +731,27 @@ impl Plan {
                     }
                 }
             }
+            // Two rows no file credits that would share a key, or one that
+            // would take a key another row holds, keep theirs: which
+            // artist a returning file is cannot be told.
+            let moving: HashSet<i64> = rekeyed.iter().map(|(row, _)| *row).collect();
+            let mut taken: HashMap<&str, usize> = HashMap::new();
+            for (_, key) in library
+                .artists
+                .iter()
+                .filter(|(row, _)| !moving.contains(row))
+            {
+                *taken.entry(key.as_str()).or_default() += 1;
+            }
+            for (_, key) in &rekeyed {
+                *taken.entry(key.as_str()).or_default() += 1;
+            }
+            let shared: HashSet<String> = taken
+                .into_iter()
+                .filter(|(_, count)| *count > 1)
+                .map(|(key, _)| key.to_owned())
+                .collect();
+            rekeyed.retain(|(_, key)| !shared.contains(key));
         }
         let mut plan = Self {
             unsearchable,

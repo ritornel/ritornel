@@ -744,11 +744,11 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 Some(mbid.clone()),
             ),
             ArtistKey::Name(_) => {
-                let mut row = free_rows
-                    .get_mut(match_name.as_str())
-                    .and_then(VecDeque::pop_front);
-                // After the normaliser changed, its row may still hold the
-                // key the earlier version made of the names its files give.
+                // After the normaliser changed, its row holds the key the
+                // earlier version made of the names its files give. That
+                // is looked for first: today's key may be another
+                // artist's old one.
+                let mut row = None;
                 if let Some(version) = library.artist_keys_by {
                     for spelling in &entry.names {
                         if row.is_some() {
@@ -761,6 +761,11 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                         }
                     }
                 }
+                let row = row.or_else(|| {
+                    free_rows
+                        .get_mut(match_name.as_str())
+                        .and_then(VecDeque::pop_front)
+                });
                 (row, None)
             }
         };
