@@ -663,7 +663,16 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         first: usize,
     }
     let mut seen: HashMap<ArtistKey, Seen> = HashMap::new();
+    // The keys a track's own credit names, as opposed to an album credit
+    // made of its tracks' artists.
+    let mut on_tracks: HashSet<ArtistKey> = HashSet::new();
     for active in &actives {
+        on_tracks.extend(
+            active
+                .track_credit
+                .iter()
+                .flat_map(|spec| spec.names.iter().map(|(key, _, _)| key.clone())),
+        );
         for spec in [&active.track_credit, &active.release_credit]
             .into_iter()
             .flatten()
@@ -718,17 +727,25 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             }
         }
     }
+    // Only a name a track is credited to, whose own files claim no sort
+    // name, is read as another artist's sort name: one whose files say how
+    // it sorts speaks for itself.
+    let by_sort = |key: &ArtistKey| -> Option<ArtistKey> {
+        let ArtistKey::Name(name) = key else {
+            return None;
+        };
+        if !on_tracks.contains(key) || seen.get(key).is_some_and(|entry| !entry.sorts.is_empty()) {
+            return None;
+        }
+        match sorted_as.get(name)?.iter().collect::<Vec<_>>().as_slice() {
+            [one] => Some((*one).clone()),
+            _ => None,
+        }
+    };
     let stands_for = |key: &ArtistKey| -> ArtistKey {
-        if let Some(found) = credited_under(key) {
-            return found;
-        }
-        if let ArtistKey::Name(name) = key
-            && let Some(keys) = sorted_as.get(name)
-            && let [one] = keys.iter().collect::<Vec<_>>().as_slice()
-        {
-            return (*one).clone();
-        }
-        key.clone()
+        credited_under(key)
+            .or_else(|| by_sort(key))
+            .unwrap_or_else(|| key.clone())
     };
     let mut merged: HashMap<ArtistKey, Seen> = HashMap::new();
     let mut ordered: Vec<(&ArtistKey, &Seen)> = seen.iter().collect();
@@ -741,10 +758,12 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         });
         merged.first = merged.first.min(entry.first);
         // The names an ID is credited under come first: they are how its
-        // own tags spell it.
+        // own tags spell it. A sort name written as a name is credited as
+        // written, and is not a name the artist is shown by.
+        let sort_written = credited_under(key).is_none() && by_sort(key).is_some();
         if matches!(key, ArtistKey::Mbid(_)) {
             merged.names.splice(0..0, entry.names.iter().cloned());
-        } else {
+        } else if !sort_written {
             merged.names.extend(entry.names.iter().cloned());
         }
         merged.sorts.extend(entry.sorts.iter().cloned());
@@ -827,7 +846,12 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         let Some(name) = pick(entry.names.iter().cloned()) else {
             continue;
         };
-        let match_name = normalize(&name);
+        // An artist with no ID is found by its own key, whichever of its
+        // names is shown.
+        let match_name = match key {
+            ArtistKey::Name(own) => own.clone(),
+            ArtistKey::Mbid(_) => normalize(&name),
+        };
         let (row, mbid) = match key {
             ArtistKey::Mbid(mbid) => (
                 id_rows.get_mut(mbid.as_str()).and_then(VecDeque::pop_front),
