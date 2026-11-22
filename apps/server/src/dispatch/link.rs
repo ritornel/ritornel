@@ -7,15 +7,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::PoisonError;
 
-use ritornel_contract::methods::{LinkListen, Method};
+use ritornel_contract::methods::{LinkListen, LinkSetAwake, Method};
 use ritornel_contract::{
-    CONTRACT_VERSION, ErrorCode, HubCopy, HubStatus, Id, InviteLink, LinkCopies, LinkCopiesParams,
-    LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened,
-    LinkPingParams, LinkPinged, LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken,
-    MAX_CLIENT_TEXT, RpcError, SatelliteStatus, ServerRole, hex, link_request_proof,
+    Awake, AwakeParams, AwakeSet, CONTRACT_VERSION, ErrorCode, HubCopy, HubStatus, Id, InviteLink,
+    LinkCopies, LinkCopiesParams, LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams,
+    LinkListenParams, LinkListened, LinkPingParams, LinkPinged, LinkRequest, LinkStatus,
+    LinkTracks, LinkTracksParams, ListenTaken, MAX_CLIENT_TEXT, Receipt, ReceiptStatus, RpcError,
+    SatelliteStatus, ServerRole, hex, link_request_proof,
 };
 use ritornel_engine::playback::{Catalog, Delivered, FileFacts, deliver_listens_to};
-use ritornel_engine::{Clock, HubLink, Ingested, LISTEN_RECORD_VERSION, ListenRecord, SendStamps};
+use ritornel_engine::{
+    Clock, Command, HubLink, Ingested, LISTEN_RECORD_VERSION, ListenRecord, SendStamps,
+    SettingChange,
+};
 use tracing::{info, warn};
 
 use super::{Core, Stores, lock};
@@ -61,6 +65,9 @@ pub(super) enum Route {
     /// cannot see. It is made on the hub.
     Refused(&'static str),
 }
+
+/// The longest window `link.setAwake` takes: a week.
+const MAX_AWAKE_MINUTES: u32 = 7 * 24 * 60;
 
 /// Where `method` is answered on a satellite: library calls go to the
 /// hub; playback, output and pairing are local. See "Hub and satellites"
@@ -114,6 +121,7 @@ pub(super) fn kept_from_a_link(method: &str) -> bool {
             | "server.backup"
             | "link.invite"
             | "link.join"
+            | "link.setAwake"
     )
 }
 
@@ -498,6 +506,49 @@ impl Core {
     /// `link.listen`, on a hub: one listen from a satellite's outbox, taken
     /// in as the hub's own player's are. A satellite reports listens for
     /// its own player only.
+    /// `link.setAwake`: the setting is kept in `server.db` with the
+    /// command's receipt, and followed at once. Sent again, after a newer
+    /// command or not, it changes nothing, and answers with the link as it
+    /// is.
+    pub(super) fn link_set_awake(
+        &self,
+        stores: &Stores,
+        params: &AwakeParams,
+    ) -> Result<AwakeSet, RpcError> {
+        if let Awake::WhileActive { minutes } = params.awake
+            && minutes > MAX_AWAKE_MINUTES
+        {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!("minutes are at most {MAX_AWAKE_MINUTES}, a week"),
+            ));
+        }
+        let command = Command {
+            id: params.idempotency_key,
+            fingerprint: super::fingerprint::<LinkSetAwake>(params)?,
+        };
+        let changed = stores
+            .server()
+            .change_once(
+                command,
+                LinkSetAwake::NAME,
+                SettingChange::Awake(params.awake),
+            )
+            .map_err(crate::Error::Store)
+            .map_err(super::failed)?;
+        if changed.now {
+            self.set_awake(params.awake);
+        }
+        Ok(AwakeSet {
+            receipt: Receipt {
+                command_id: params.idempotency_key,
+                status: ReceiptStatus::Done,
+                revision: None,
+            },
+            link: self.link_status(stores)?,
+        })
+    }
+
     /// `link.ping`: a satellite says it is there and whether it plays.
     pub(super) fn link_ping(
         &self,
@@ -671,10 +722,13 @@ impl Core {
                 linked_at_ms: session.created_at_ms,
             })
             .collect();
+        let (awake, kept_awake) = self.awake();
         Ok(LinkStatus {
             role: lock(&self.this).role,
             hub,
             satellites,
+            awake,
+            kept_awake,
         })
     }
 }

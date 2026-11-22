@@ -512,6 +512,12 @@ methods! {
     /// hub's machine awake; the ping alone does not.
     LinkPing: "link.ping", Session, needs_full: true,
     LinkPingParams => LinkPinged;
+
+    /// `link.setAwake`: when this server keeps its machine from sleeping
+    /// for its linked servers, kept with it. Only a session on its own
+    /// machine may set it, never a satellite's.
+    LinkSetAwake: "link.setAwake", Command, needs_full: true,
+    AwakeParams => AwakeSet;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -598,7 +604,8 @@ mod tests {
                 "link.tracks",
                 "link.copies",
                 "link.listen",
-                "link.ping"
+                "link.ping",
+                "link.setAwake"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -648,7 +655,8 @@ mod tests {
                 "link.tracks",
                 "link.copies",
                 "link.listen",
-                "link.ping"
+                "link.ping",
+                "link.setAwake"
             ]
         );
         // Everything but reading the library and controlling playback

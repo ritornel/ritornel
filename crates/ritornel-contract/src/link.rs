@@ -63,6 +63,61 @@ pub struct LinkStatus {
     /// On a hub, the satellites linked to it, oldest first.
     #[serde(default)]
     pub satellites: Vec<SatelliteStatus>,
+    /// When this server keeps its machine from sleeping for its linked
+    /// servers.
+    pub awake: Awake,
+    /// Whether it does now.
+    pub kept_awake: bool,
+}
+
+/// When a hub keeps its machine from sleeping for its linked servers: a
+/// preference of the server's own, set with `link.setAwake` and kept with
+/// it. The display may sleep in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum Awake {
+    /// While a linked server plays, or has made a call within the last
+    /// `minutes`.
+    WhileActive {
+        /// How long after a linked server's last call.
+        minutes: u32,
+    },
+    /// For as long as the server runs.
+    Always,
+    /// Never: the machine sleeps as its own settings say.
+    Never,
+}
+
+impl Default for Awake {
+    /// While active, for 30 minutes.
+    fn default() -> Self {
+        Self::WhileActive { minutes: 30 }
+    }
+}
+
+/// The params of `link.setAwake`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AwakeParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// When to keep the machine awake from now on.
+    pub awake: Awake,
+}
+
+/// The result of `link.setAwake`: the receipt, and the link as
+/// `link.status` now says it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AwakeSet {
+    /// The receipt.
+    #[serde(flatten)]
+    pub receipt: crate::Receipt,
+    /// The link, as `link.status` now says it.
+    pub link: LinkStatus,
 }
 
 /// A satellite's hub, as the satellite knows it.

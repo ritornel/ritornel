@@ -1,19 +1,15 @@
 //! When a hub keeps its machine from sleeping. A sleeping hub is one its
 //! satellites cannot reach, but a satellite or a player stays linked for
-//! good, so being linked is not reason enough: the hub stays awake while a
-//! linked server is active, and lets the machine sleep otherwise.
-//! [`Activity::keeps_awake`] is the rule, and the one place it is written.
+//! good, so being linked is not reason enough. The owner chooses, with
+//! [`Awake`]: while a linked server is active, the default; always; or
+//! never. [`keeps_awake`] is the rule, and the one place it is written.
 //! See "Keeping a hub awake" in docs/internals/server.md.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use ritornel_contract::Id;
+use ritornel_contract::{Awake, Id};
 use tracing::{info, warn};
-
-/// How long after a linked server's last call the hub stays awake, unless
-/// `awake_minutes` says otherwise.
-pub(crate) const DEFAULT_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// How long a linked server's word that it plays holds without another. A
 /// satellite says so every ten seconds, so this is three missed.
@@ -24,6 +20,18 @@ pub(crate) const CHECK_EVERY: Duration = Duration::from_secs(60);
 
 /// How long the hub waits to ask the system again after it refused.
 const ASK_AGAIN_MS: i64 = 60_000;
+
+/// The rule: whether the machine is kept awake at `now_ms`, as `setting`
+/// says, given what the linked servers have done.
+pub(crate) fn keeps_awake(setting: Awake, activity: &Activity, now_ms: i64) -> bool {
+    match setting {
+        Awake::WhileActive { minutes } => {
+            activity.plays(now_ms) || activity.called_within(i64::from(minutes) * 60_000, now_ms)
+        }
+        Awake::Always => true,
+        Awake::Never => false,
+    }
+}
 
 /// Whether a linked server's call to `method` is activity. Saying hello,
 /// subscribing to events and pinging are how a link keeps itself, and a
@@ -37,10 +45,9 @@ pub(crate) fn is_activity(method: &str) -> bool {
 }
 
 /// What a hub knows of its linked servers' activity.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct Activity {
-    window_ms: i64,
-    /// Each linked server's last call, but for its pings, in Unix
+    /// Each linked server's last call that is activity, in Unix
     /// milliseconds.
     called: HashMap<Id, i64>,
     /// Until when each linked server that said it plays is taken to play.
@@ -48,14 +55,6 @@ pub(crate) struct Activity {
 }
 
 impl Activity {
-    pub(crate) fn new(window: Duration) -> Self {
-        Self {
-            window_ms: i64::try_from(window.as_millis()).unwrap_or(i64::MAX),
-            called: HashMap::new(),
-            playing: HashMap::new(),
-        }
-    }
-
     /// The linked server `server` made a call at `now_ms`.
     pub(crate) fn called(&mut self, server: Id, now_ms: i64) {
         self.called.insert(server, now_ms);
@@ -71,34 +70,32 @@ impl Activity {
         }
     }
 
-    /// The rule: the hub stays awake while a linked server plays, or has
-    /// made a call within the window.
-    pub(crate) fn keeps_awake(&self, now_ms: i64) -> bool {
+    fn plays(&self, now_ms: i64) -> bool {
         self.playing.values().any(|until| now_ms < *until)
-            || self
-                .called
-                .values()
-                .any(|at| now_ms.saturating_sub(*at) < self.window_ms)
+    }
+
+    fn called_within(&self, window_ms: i64, now_ms: i64) -> bool {
+        self.called
+            .values()
+            .any(|at| now_ms.saturating_sub(*at) < window_ms)
     }
 }
 
-/// A hub's activity, and what keeps its machine awake while the rule says
-/// so.
-#[derive(Debug)]
-pub(crate) struct Awake {
+/// A hub's wake setting, its linked servers' activity, and what keeps the
+/// machine awake while the rule says so.
+#[derive(Debug, Default)]
+pub(crate) struct KeptAwake {
+    pub(crate) setting: Awake,
     pub(crate) activity: Activity,
     held: Option<crate::platform::Awake>,
     /// When the system last refused to keep the machine awake.
     refused_at_ms: Option<i64>,
 }
 
-impl Awake {
-    pub(crate) fn new(window: Duration) -> Self {
-        Self {
-            activity: Activity::new(window),
-            held: None,
-            refused_at_ms: None,
-        }
+impl KeptAwake {
+    /// Whether the machine is kept awake now.
+    pub(crate) fn held(&self) -> bool {
+        self.held.is_some()
     }
 
     /// Holds the machine awake, or lets it go, as the rule says at
@@ -111,33 +108,31 @@ impl Awake {
             self.held = None;
             self.refused_at_ms = Some(now_ms);
             warn!(
-                "the system did not keep this machine from sleeping for a linked server: keep it \
-                 awake by its own settings"
+                "the system did not keep this machine from sleeping: keep it awake by its own \
+                 settings"
             );
         }
-        let wanted = self.activity.keeps_awake(now_ms);
+        let wanted = keeps_awake(self.setting, &self.activity, now_ms);
         let may_ask = self
             .refused_at_ms
             .is_none_or(|at| now_ms.saturating_sub(at) >= ASK_AGAIN_MS);
         if wanted && self.held.is_none() && may_ask {
             match crate::platform::stay_awake("a linked server is active") {
                 Ok(held) => {
-                    info!(
-                        "a linked server is active: the system is asked to keep this machine from sleeping"
-                    );
+                    info!(setting = ?self.setting, "the system is asked to keep this machine from sleeping");
                     self.held = Some(held);
                 }
                 Err(error) => {
                     self.refused_at_ms = Some(now_ms);
                     warn!(
                         %error,
-                        "a linked server is active and this machine may sleep: keep it awake by its own settings"
+                        "this machine may sleep: keep it awake by its own settings"
                     );
                 }
             }
         } else if !wanted && let Some(held) = self.held.take() {
             drop(held);
-            info!("no linked server is active: the machine may sleep");
+            info!(setting = ?self.setting, "the machine may sleep");
         }
         self.held.is_some()
     }
@@ -157,6 +152,7 @@ mod tests {
     use super::*;
 
     const MINUTE: i64 = 60_000;
+    const WHILE_ACTIVE: Awake = Awake::WhileActive { minutes: 30 };
 
     fn server(n: u8) -> Id {
         Id::from_bytes([n; 16])
@@ -173,29 +169,57 @@ mod tests {
     }
 
     #[test]
+    fn the_default_is_while_active_for_thirty_minutes() {
+        assert_eq!(Awake::default(), WHILE_ACTIVE);
+    }
+
+    #[test]
     fn a_call_keeps_the_hub_awake_for_the_window_and_no_longer() {
-        let mut activity = Activity::new(Duration::from_secs(30 * 60));
-        assert!(!activity.keeps_awake(0), "linked alone is not active");
+        let mut activity = Activity::default();
+        assert!(
+            !keeps_awake(WHILE_ACTIVE, &activity, 0),
+            "linked alone is not active"
+        );
         activity.called(server(1), 1_000);
-        assert!(activity.keeps_awake(1_000 + 30 * MINUTE - 1));
-        assert!(!activity.keeps_awake(1_000 + 30 * MINUTE));
+        assert!(keeps_awake(
+            WHILE_ACTIVE,
+            &activity,
+            1_000 + 30 * MINUTE - 1
+        ));
+        assert!(!keeps_awake(WHILE_ACTIVE, &activity, 1_000 + 30 * MINUTE));
         activity.called(server(2), 20 * MINUTE);
-        assert!(activity.keeps_awake(1_000 + 30 * MINUTE));
+        assert!(keeps_awake(WHILE_ACTIVE, &activity, 1_000 + 30 * MINUTE));
+        let five = Awake::WhileActive { minutes: 5 };
+        assert!(!keeps_awake(five, &activity, 25 * MINUTE));
     }
 
     #[test]
     fn a_server_that_plays_keeps_the_hub_awake_while_it_says_so() {
-        let mut activity = Activity::new(Duration::ZERO);
+        let only_playing = Awake::WhileActive { minutes: 0 };
+        let mut activity = Activity::default();
         activity.pinged(server(1), true, 0);
-        assert!(activity.keeps_awake(PLAYING_HOLDS_MS - 1));
+        assert!(keeps_awake(only_playing, &activity, PLAYING_HOLDS_MS - 1));
         activity.pinged(server(1), true, PLAYING_HOLDS_MS - 1);
-        assert!(activity.keeps_awake(2 * PLAYING_HOLDS_MS - 2));
+        assert!(keeps_awake(
+            only_playing,
+            &activity,
+            2 * PLAYING_HOLDS_MS - 2
+        ));
         // A server that stops saying so stops keeping it, and one that
         // says it has stopped does at once.
-        assert!(!activity.keeps_awake(2 * PLAYING_HOLDS_MS));
-        let mut activity = Activity::new(Duration::ZERO);
+        assert!(!keeps_awake(only_playing, &activity, 2 * PLAYING_HOLDS_MS));
+        let mut activity = Activity::default();
         activity.pinged(server(2), true, 0);
         activity.pinged(server(2), false, 1);
-        assert!(!activity.keeps_awake(2));
+        assert!(!keeps_awake(only_playing, &activity, 2));
+    }
+
+    #[test]
+    fn always_and_never_do_not_ask_what_linked_servers_do() {
+        let mut activity = Activity::default();
+        assert!(keeps_awake(Awake::Always, &activity, 0));
+        activity.pinged(server(1), true, 0);
+        activity.called(server(1), 0);
+        assert!(!keeps_awake(Awake::Never, &activity, 1));
     }
 }

@@ -27,10 +27,6 @@ pub(crate) const LISTEN_VAR: &str = "RITORNEL_LISTEN";
 /// The environment variable that names where backups go.
 pub(crate) const BACKUP_DIR_VAR: &str = "RITORNEL_BACKUP_DIR";
 
-/// The environment variable that says how long a hub stays awake after a
-/// linked server's last call, in minutes.
-pub(crate) const AWAKE_MINUTES_VAR: &str = "RITORNEL_AWAKE_MINUTES";
-
 /// The port a server listens on when nobody has said and it is free.
 pub(crate) const DEFAULT_PORT: u16 = 4747;
 
@@ -145,9 +141,6 @@ pub(crate) struct Settings {
     /// The folder backups are written to: an absolute path outside the
     /// data directory. With none there is no backup.
     pub(crate) backup_dir: Option<PathBuf>,
-    /// How long a hub stays awake after a linked server's last call.
-    /// [`crate::awake::DEFAULT_WINDOW`] unless set.
-    pub(crate) awake_window: std::time::Duration,
 }
 
 /// The settings given on the command line.
@@ -156,7 +149,6 @@ pub(crate) struct Flags {
     pub(crate) log_level: Option<String>,
     pub(crate) listen: Option<String>,
     pub(crate) backup_dir: Option<String>,
-    pub(crate) awake_minutes: Option<String>,
 }
 
 /// `config.toml`. A key it does not know is refused, so a misspelt setting
@@ -167,7 +159,6 @@ struct File {
     log_level: Option<String>,
     listen: Option<String>,
     backup_dir: Option<String>,
-    awake_minutes: Option<u32>,
 }
 
 /// Where a setting's value came from.
@@ -208,8 +199,6 @@ pub enum ConfigError {
     /// The backup folder is the data directory or inside it, where a
     /// backup would be lost with what it copies.
     BackupInside(Origin),
-    /// How long a hub stays awake is not a whole number of minutes.
-    AwakeMinutes(Origin),
 }
 
 impl fmt::Display for ConfigError {
@@ -239,11 +228,6 @@ impl fmt::Display for ConfigError {
                  with it",
                 origin.place("--backup-dir", BACKUP_DIR_VAR, "backup_dir")
             ),
-            Self::AwakeMinutes(origin) => write!(
-                f,
-                "{} must be a whole number of minutes",
-                origin.place("--awake-minutes", AWAKE_MINUTES_VAR, "awake_minutes")
-            ),
         }
     }
 }
@@ -255,8 +239,7 @@ impl std::error::Error for ConfigError {
             Self::LogLevel(_)
             | Self::Listen(_)
             | Self::BackupRelative(_)
-            | Self::BackupInside(_)
-            | Self::AwakeMinutes(_) => None,
+            | Self::BackupInside(_) => None,
         }
     }
 }
@@ -311,22 +294,10 @@ fn resolve(
         Some((text, origin)) => Some(backup_dir(root, text, origin)?),
         None => None,
     };
-    let awake_window = match chosen(
-        flags.awake_minutes.as_deref(),
-        env(AWAKE_MINUTES_VAR),
-        file.awake_minutes.map(|minutes| minutes.to_string()),
-    ) {
-        Some((text, origin)) => text
-            .and_then(|text| text.trim().parse::<u64>().ok())
-            .map(|minutes| std::time::Duration::from_secs(minutes.saturating_mul(60)))
-            .ok_or(ConfigError::AwakeMinutes(origin))?,
-        None => crate::awake::DEFAULT_WINDOW,
-    };
     Ok(Settings {
         log_level,
         listen,
         backup_dir,
-        awake_window,
     })
 }
 
@@ -396,7 +367,6 @@ mod tests {
             log_level: log_level.map(str::to_owned),
             listen: listen.map(str::to_owned),
             backup_dir: None,
-            awake_minutes: None,
         }
     }
 
@@ -620,44 +590,6 @@ mod tests {
             .map_err(|error| error.to_string())
     }
 
-    fn awake(
-        flag: Option<&str>,
-        variable: Option<&str>,
-        file: Option<&str>,
-    ) -> Result<std::time::Duration, String> {
-        let variables: Vec<_> = variable
-            .map(|value| (AWAKE_MINUTES_VAR, value))
-            .into_iter()
-            .collect();
-        let flags = Flags {
-            awake_minutes: flag.map(str::to_owned),
-            ..Flags::default()
-        };
-        resolve(Path::new(ROOT), &flags, &env(&variables), file)
-            .map(|settings| settings.awake_window)
-            .map_err(|error| error.to_string())
-    }
-
-    #[test]
-    fn how_long_a_hub_stays_awake_is_minutes_and_thirty_unless_said() {
-        let minutes = |n: u64| std::time::Duration::from_secs(n * 60);
-        assert_eq!(awake(None, None, None), Ok(minutes(30)));
-        assert_eq!(
-            awake(None, None, Some("awake_minutes = 5\n")),
-            Ok(minutes(5))
-        );
-        assert_eq!(
-            awake(None, Some("10"), Some("awake_minutes = 5\n")),
-            Ok(minutes(10))
-        );
-        assert_eq!(awake(Some("0"), Some("10"), None), Ok(minutes(0)));
-        assert_eq!(
-            awake(Some("half an hour"), None, None),
-            Err("--awake-minutes must be a whole number of minutes".to_owned())
-        );
-        assert!(awake(None, None, Some("awake_minutes = -1\n")).is_err());
-    }
-
     #[test]
     fn the_backup_folder_is_unset_until_named_and_never_in_the_data_directory() {
         let elsewhere = if cfg!(windows) {
@@ -750,7 +682,6 @@ mod tests {
                 log_level: Level::INFO,
                 listen: Listen::DEFAULT,
                 backup_dir: None,
-                awake_window: crate::awake::DEFAULT_WINDOW,
             }
         );
 

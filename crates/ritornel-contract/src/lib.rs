@@ -94,10 +94,10 @@ pub use library::{
     SourcesAddParams, SourcesList,
 };
 pub use link::{
-    HubCopy, HubStatus, InviteLink, LinkCopies, LinkCopiesParams, LinkGranted, LinkInvite,
-    LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened, LinkPingParams, LinkPinged,
-    LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken, SatelliteStatus,
-    link_request_proof,
+    Awake, AwakeParams, AwakeSet, HubCopy, HubStatus, InviteLink, LinkCopies, LinkCopiesParams,
+    LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened,
+    LinkPingParams, LinkPinged, LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken,
+    SatelliteStatus, link_request_proof,
 };
 pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,

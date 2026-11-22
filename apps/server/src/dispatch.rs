@@ -18,12 +18,12 @@ use ritornel_contract::methods::{
     IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall,
     LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
     LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkCopiesCall,
-    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall, ListClose,
-    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
-    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
-    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
-    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList,
-    SourcesAdd, SourcesList, SourcesTracks, TracksGet,
+    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkSetAwake, LinkStatusCall, LinkTracksCall,
+    ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
+    PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek,
+    PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove,
+    QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus,
+    ServersList, SourcesAdd, SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -133,7 +133,7 @@ pub(crate) struct Core {
     uplink: RwLock<Option<Arc<crate::uplink::Uplink>>>,
     /// On a hub, its linked servers' activity, and what keeps the machine
     /// from sleeping while one is active.
-    awake: Mutex<crate::awake::Awake>,
+    awake: Mutex<crate::awake::KeptAwake>,
     /// What a library created here takes its times and its IDs from.
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
@@ -265,7 +265,7 @@ impl Core {
             routes: std::sync::OnceLock::new(),
             runtime,
             uplink: RwLock::new(uplink),
-            awake: Mutex::new(crate::awake::Awake::new(crate::awake::DEFAULT_WINDOW)),
+            awake: Mutex::default(),
             clock,
             entropy,
             bounds,
@@ -354,10 +354,30 @@ impl Core {
         self.changed(&mut this);
     }
 
-    /// How long after a linked server's last call this hub stays awake.
-    /// Set once, before anything is linked.
-    pub(crate) fn set_awake_window(&self, window: std::time::Duration) {
-        *lock(&self.awake) = crate::awake::Awake::new(window);
+    /// When this server keeps its machine from sleeping for its linked
+    /// servers, as it is kept in `server.db`: read at start, and set again
+    /// by `link.setAwake`. The machine is held, or let go, at once.
+    pub(crate) fn set_awake(&self, setting: ritornel_contract::Awake) {
+        let now = self.clock.now_ms();
+        let mut awake = lock(&self.awake);
+        awake.setting = setting;
+        awake.follow_the_rule(now);
+    }
+
+    /// The wake setting `server.db` keeps.
+    pub(crate) fn stores_awake(&self) -> Result<ritornel_contract::Awake, crate::Error> {
+        let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
+        match stores.as_ref() {
+            Some(stores) => stores.server().awake().map_err(crate::Error::Store),
+            None => Ok(ritornel_contract::Awake::default()),
+        }
+    }
+
+    /// This server's wake setting, and whether the machine is kept awake
+    /// now.
+    pub(crate) fn awake(&self) -> (ritornel_contract::Awake, bool) {
+        let awake = lock(&self.awake);
+        (awake.setting, awake.held())
     }
 
     /// The linked server `peer` made a call: the machine stays awake for
@@ -932,6 +952,9 @@ impl Core {
                 run::<LinkListen>(params, |params| self.link_listen(stores, session, params))
             }
             LinkPing::NAME => run::<LinkPing>(params, |params| self.link_ping(session, params)),
+            LinkSetAwake::NAME => {
+                run::<LinkSetAwake>(params, |params| self.link_set_awake(stores, &params))
+            }
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {
                 run::<HistorySetZones>(params, |params| self.history_set_zones(stores, &params))

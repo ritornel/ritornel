@@ -157,7 +157,7 @@ All 69 methods are registered in `crates/ritornel-contract/src/methods.rs` (see 
 | Area | Methods |
 |---|---|
 | Session & server | `server.hello`, `server.status`, `servers.list`, `events.subscribe`, `events.unsubscribe`, `server.backup`, `record.dismiss` |
-| Linking | `link.invite`, `link.join`, `link.status`, `link.tracks`, `link.copies`, `link.listen`, `link.ping` |
+| Linking | `link.invite`, `link.join`, `link.status`, `link.tracks`, `link.copies`, `link.listen`, `link.ping`, `link.setAwake` |
 | Library & sources | `library.create`, `sources.list`, `sources.add`, `sources.tracks`, `scan.start`, `library.stats`, `library.setWatching`, `artists.importPictures`, `artists.pictureFolders` |
 | Jobs & identity | `jobs.list`, `jobs.get`, `jobs.cancel`, `identity.dryRun`, `identity.review` |
 | Browse & media | `list.open`, `list.window`, `list.sections`, `list.locate`, `list.close`, `library.search`, `album.get`, `artist.get`, `tracks.get`, `media.token` |

@@ -71,9 +71,6 @@ pub struct Run {
     /// The computer's name, which a server still called by the default
     /// name takes. `serve` reads it; a server in a test keeps the default.
     pub name: Option<String>,
-    /// How long after a linked server's last call a hub stays awake. With
-    /// none, [`crate::awake::DEFAULT_WINDOW`].
-    pub awake_window: Option<std::time::Duration>,
 }
 
 /// The running worker.

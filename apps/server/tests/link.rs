@@ -16,15 +16,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ritornel_client::contract::methods::{
-    LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, PlaybackPlay,
-    QueueWindow, RatingsSet, SourcesAdd,
+    LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkSetAwake, LinkStatusCall,
+    PlaybackPlay, QueueWindow, RatingsSet, SourcesAdd,
 };
 use ritornel_client::contract::{
-    CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink, LinkInviteParams,
-    LinkJoinParams, LinkListenParams, LinkPingParams, LinkRequest, LinkStatus, ListKind,
-    ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackPlayParams, PlaybackStatus, Query,
-    QueueWindowParams, RatingSetParams, Row, ServerRole, SourcesAddParams, Topic, Window,
-    capability, hex, link_request_proof, route,
+    Awake, AwakeParams, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink,
+    LinkInviteParams, LinkJoinParams, LinkListenParams, LinkPingParams, LinkRequest, LinkStatus,
+    ListKind, ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackPlayParams,
+    PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole, SourcesAddParams,
+    Topic, Window, capability, hex, link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -1002,7 +1002,7 @@ async fn a_listen_sent_again_is_taken_once_and_only_from_its_own_player() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_satellite_pings_its_hub_and_no_one_else_does() {
+async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_stays_awake() {
     bounded(async {
         let scratch = Scratch::new();
         let (hub, hub_client, _desk, _desk_client) = linked(&scratch).await;
@@ -1037,6 +1037,39 @@ async fn a_satellite_pings_its_hub_and_no_one_else_does() {
             .await
             .unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
+
+        // While active, for 30 minutes, until the owner says otherwise.
+        let status = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(status.awake, Awake::default());
+        let never = |awake| AwakeParams {
+            idempotency_key: ritornel_client::idempotency_key().unwrap(),
+            awake,
+        };
+        let set = hub_client
+            .call::<LinkSetAwake>(&never(Awake::Never))
+            .await
+            .unwrap();
+        assert_eq!(set.link.awake, Awake::Never);
+        assert!(!set.link.kept_awake);
+        // A satellite does not decide when its hub sleeps.
+        let refused = linked
+            .call::<LinkSetAwake>(&never(Awake::Always))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
+        let refused = hub_client
+            .call::<LinkSetAwake>(&never(Awake::WhileActive { minutes: 1_000_000 }))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Invalid), "{refused}");
+        let status = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(status.awake, Awake::Never);
     })
     .await;
 }

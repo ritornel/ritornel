@@ -48,7 +48,6 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         log_level: args.log_level.clone(),
         listen: args.listen.clone(),
         backup_dir: args.backup_dir.clone(),
-        awake_minutes: args.awake_minutes.clone(),
     };
     let settings = config::load(held.dir().root(), &flags, env)?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -75,7 +74,6 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         lastfm: lastfm(env),
         watch: crate::WatchRun::on(),
         backup_dir: settings.backup_dir.clone(),
-        awake_window: Some(settings.awake_window),
         // `RITORNEL_TEST_COMPUTER_NAME`, for the tests alone, stands in
         // for the machine's name, so that a test need not know it.
         name: env("RITORNEL_TEST_COMPUTER_NAME")

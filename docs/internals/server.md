@@ -43,7 +43,13 @@ A server is named after its computer (`platform::computer_name`), so a hub's sat
 
 ### Keeping a hub awake
 
-A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so a hub keeps its machine from idle sleep only while a linked server is active: while one plays, or for a window after its last call, 30 minutes unless `awake_minutes` says otherwise. `Activity::keeps_awake` in `apps/server/src/awake.rs` is the rule. Every call on a link session counts but those that keep the link itself (`awake::is_activity`): `server.hello` and `events.subscribe`, which a satellite makes whenever its connection comes back, and `link.ping`, which it sends every ten seconds to say whether it plays. A word that it plays holds for 30 seconds. The hub asks the system when the rule first holds (`platform::stay_awake`) and lets go when it no longer does, checked on each call and once a minute. The display may still sleep. Where the system refuses, or has no way to ask, the server logs a warning, runs on, and asks again a minute later at the soonest. [`platforms.md`](platforms.md) says how each system is asked.
+A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so being linked is not reason enough to keep a machine awake. When a hub keeps its machine from idle sleep is the owner's preference, kept in `server.db` (`server_setting` row `link.awake`) so it follows the server, and set with `link.setAwake` (`ritornelctl link awake`). It is one of three modes (`Awake`):
+
+- **While active**, the default, for 30 minutes: while a linked server plays, or has made a call within the minutes given.
+- **Always**, for as long as the server runs.
+- **Never**: the machine sleeps as its own settings say.
+
+`awake::keeps_awake` in `apps/server/src/awake.rs` is the rule. Every call on a link session counts as activity but those that keep the link itself (`awake::is_activity`): `server.hello` and `events.subscribe`, which a satellite makes whenever its connection comes back, and `link.ping`, which it sends every ten seconds to say whether it plays. A word that it plays holds for 30 seconds. The hub asks the system (`platform::stay_awake`) when the rule first holds, and lets go when it no longer does. It checks on each call, once a minute, and when the setting changes. The display may still sleep. Where the system refuses, or has no way to ask, the server logs a warning, runs on, and asks again a minute later at the soonest. [`platforms.md`](platforms.md) says how each system is asked, and `link.status` says the setting and whether the machine is kept awake now.
 
 ## Data directory
 
@@ -156,7 +162,6 @@ Settings resolve in order: **CLI flag → `RITORNEL_*` environment variable → 
 | Listen address | `--listen` | `RITORNEL_LISTEN` | `127.0.0.1:4747` (fallback: OS port); or `private:<port>` |
 | Log level | `--log-level` | `RITORNEL_LOG_LEVEL` | `info` |
 | Backup folder | `--backup-dir` | `RITORNEL_BACKUP_DIR` | None (backups disabled until set) |
-| How long a hub stays awake after a linked server's last call | `--awake-minutes` | `RITORNEL_AWAKE_MINUTES` | 30 |
 
 `--data-dir` / `RITORNEL_DATA_DIR` selects the data directory before `config.toml` is read, and `--output` (`default`, `null`, `none`) selects the audio output mode. All other persistent settings live in `library.db` (library-wide) or `server.db` (machine-local).
 
