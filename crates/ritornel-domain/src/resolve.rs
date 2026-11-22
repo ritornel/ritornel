@@ -427,7 +427,7 @@ impl Ev {
             album_artist: facts.album_artist_text().as_deref().map(normalize).map(key),
             release: facts.release_mbid.clone(),
             release_group: facts.release_group_mbid.clone(),
-            duration: facts.duration_ms,
+            duration: facts.duration_ms.filter(|ms| *ms >= 0),
             markers: markers(
                 facts.title.as_deref(),
                 VERSION_MARKERS,

@@ -2915,3 +2915,17 @@ fn an_album_part_number_does_not_make_its_songs_different_versions() {
     assert_eq!(decision.method, Method::TagsDuration);
     assert_eq!(world.recording(original), world.recording(loose));
 }
+
+#[test]
+fn a_negative_duration_claim_supplies_no_length_evidence() {
+    let first = file("A/1.flac", 1).song("Glass Pier", "Ninefold", 200);
+    let unknown = file("B/1.flac", 2)
+        .song("Glass Pier", "Ninefold", 200)
+        .with(|facts| facts.duration_ms = Some(i64::MIN));
+    let (_, _, _, decision) = after_first(first, unknown, Policy::current());
+    assert_eq!(decision.method, Method::New);
+    assert_eq!(
+        decision.evidence.candidates[0].penalties.unwrap().duration,
+        1.0
+    );
+}
