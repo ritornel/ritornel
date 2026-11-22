@@ -41,6 +41,10 @@ const FOOT: f32 = 48.;
 const PAGE: usize = 100;
 /// Pages of rows kept: 20,000 rows. The real client keeps 40.
 const KEEP_PAGES: usize = 200;
+/// How often the wall's view is used while nothing else reads it. The
+/// server lets a view go once it has gone ten minutes unused, and tells the
+/// wall of no more changes; a wall with its rows all read uses it no more.
+const KEEP_VIEW: Duration = Duration::from_secs(4 * 60);
 const PAGES_IN_FLIGHT: usize = 4;
 /// Decoded covers kept, in bytes of pixels. GPUI's sprite atlas holds a
 /// second copy of each on the GPU. `RITORNEL_GPUI_COVER_MB` overrides it,
@@ -268,6 +272,8 @@ pub(crate) struct Wall {
     _looks: gpui::Subscription,
     /// The task that takes covers in for this session.
     arrivals: Option<gpui::Task<()>>,
+    /// Uses the view now and then, so that the server keeps it.
+    keeping: Option<gpui::Task<()>>,
     /// Whether the view could not be opened.
     failed: bool,
     view: Option<String>,
@@ -328,6 +334,9 @@ pub(crate) struct Wall {
     /// wall or the session changes: an answer to any but the latest is let
     /// go, and the view it opened is closed.
     opening: u64,
+    /// The newest library revision a list event has named, of any view: one
+    /// newer than a view just opened says it changed while it was opening.
+    heard_revision: u64,
     /// Which wall, in which order, and whether the large letters stand beside it.
     pub kind: WallKind,
     pub order: Order,
@@ -383,6 +392,7 @@ impl Wall {
             _link: followed,
             _looks: looks,
             arrivals: None,
+            keeping: None,
             failed: false,
             view: None,
             total: 0,
@@ -418,6 +428,7 @@ impl Wall {
             replace_again: false,
             pending_anchor: None,
             opening: 0,
+            heard_revision: 0,
             kind: WallKind::Artists,
             order: BY_NAME,
             letters: true,
@@ -467,6 +478,14 @@ impl Wall {
         self.wants = Some(wants);
         self.loader = loader;
         self.net = Some(net);
+        self.keeping = Some(cx.spawn(async move |wall, cx| {
+            loop {
+                cx.background_executor().timer(KEEP_VIEW).await;
+                if wall.update(cx, |wall, cx| wall.keep_view(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
         self.forget_asks();
         self.view = None;
         self.pages.clear();
@@ -480,6 +499,7 @@ impl Wall {
     /// decoded are kept.
     fn end(&mut self, cx: &mut Context<Self>) {
         self.forget_asks();
+        self.keeping = None;
         self.net = None;
         self.wants = None;
         self.arrivals = None;
@@ -1055,6 +1075,7 @@ impl Wall {
     /// answered by a view that replaces this one, at most once a second,
     /// keeping the row at the top where it was on screen.
     fn heard(&mut self, event: &ritornel_contract::ListEvent, cx: &mut Context<Self>) {
+        self.heard_revision = self.heard_revision.max(event.library_revision);
         if self.view.as_deref() != Some(event.view.as_str())
             || event.library_revision <= self.revision
         {
@@ -1151,6 +1172,7 @@ impl Wall {
         self.opening += 1;
         let asked = self.opening;
         let selected = self.selected.clone();
+        let selected_id = selected.as_ref().map(|selected| selected.id);
         let offset = (index / PAGE * PAGE) as u64;
         let replaced = net.rt().spawn(async move {
             let opened = client
@@ -1236,12 +1258,16 @@ impl Wall {
                     if let Some(at) = opened.anchor_index {
                         wall.pending_anchor = Some((at as usize, screen));
                     }
+                    // Found again for the row selected when asked, not one
+                    // chosen since, whose place is in the old view.
                     wall.selected = match (wall.selected.take(), found) {
-                        (Some(selected), Some(index)) => Some(Selected {
-                            index: index as usize,
-                            view: opened.view.clone(),
-                            ..selected
-                        }),
+                        (Some(selected), Some(index)) if Some(selected.id) == selected_id => {
+                            Some(Selected {
+                                index: index as usize,
+                                view: opened.view.clone(),
+                                ..selected
+                            })
+                        }
                         _ => None,
                     };
                     crate::debug(format_args!(
@@ -1251,12 +1277,42 @@ impl Wall {
                     wall.revision = opened.library_revision;
                     wall.view = Some(opened.view);
                     wall.layout = None;
+                    // The library changed while it was opening.
+                    if wall.heard_revision > wall.revision {
+                        wall.replace_again = true;
+                    }
                 }
                 if std::mem::take(&mut wall.replace_again) {
                     wall.schedule_replace(cx);
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Uses the view, reading its first row, so that the server keeps it; one
+    /// the server has let go already is opened again in its place.
+    fn keep_view(&mut self, cx: &mut Context<Self>) {
+        let (Some(view), Some(net)) = (self.view.clone(), self.net.clone()) else {
+            return;
+        };
+        let asked_of = view.clone();
+        let client = Arc::clone(&net.client);
+        let read = net
+            .rt()
+            .spawn(async move { client.list_window(&view, 0, 1).await });
+        cx.spawn(async move |wall, cx| {
+            let answer = read.await;
+            wall.update(cx, |wall, cx| {
+                if wall.view.as_deref() == Some(asked_of.as_str())
+                    && expired(&answer)
+                    && wall.replacing.is_none()
+                {
+                    wall.schedule_replace(cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -1335,6 +1391,10 @@ impl Wall {
                         wall.revision = opened.library_revision;
                         wall.view = Some(opened.view);
                         wall.layout = None;
+                        // The library changed while it was opening.
+                        if wall.heard_revision > wall.revision {
+                            wall.schedule_replace(cx);
+                        }
                         if let Some(artist) = wall.reveal.take() {
                             wall.locate(artist, cx);
                         }
@@ -1391,8 +1451,13 @@ impl Wall {
                         );
                         wall.evict_pages();
                     }
-                    _ => {
+                    // Unused for long, the view was let go by the server: one
+                    // opened in its place keeps the row at the top where it is.
+                    answer => {
                         wall.pages.remove(&page);
+                        if expired(&answer) && wall.replacing.is_none() {
+                            wall.schedule_replace(cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -2080,6 +2145,15 @@ impl Wall {
         };
         self.fling = Some(fling);
     }
+}
+
+/// Whether a call on a view failed because the server had let the view go.
+fn expired<T>(answer: &Result<Result<T, ritornel_client::Error>, tokio::task::JoinError>) -> bool {
+    matches!(
+        answer,
+        Ok(Err(ritornel_client::Error::Call(error)))
+            if error.data.code == ritornel_contract::ErrorCode::ViewExpired
+    )
 }
 
 /// The letter's ink: faint at rest, full while the wall moves, fading back
