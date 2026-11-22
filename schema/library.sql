@@ -6,6 +6,7 @@
 -- that changes here means a migration that has shipped was edited.
 --   0001_library  62cec2a19a590384d34a42a3b8b3bb1c4cabdcc21f7f7371bcd49f848bebee56
 --   0002_fold_search_text  6c46673f3d3da76a0115cc787be0537d9f2ec2660002ca9f579514ff617b498e
+--   0003_claim_and_love_indexes  4247daecea906f0640d8aec80e338886d707b933201711d07a6ad210e0b9efb1
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -863,3 +864,7 @@ SELECT
   id   AS play_event_id
 FROM play_event
 WHERE counts = 1 AND excluded = 0 AND event_at_utc_ms IS NOT NULL;
+
+CREATE INDEX metadata_claim_item ON metadata_claim (source_item_id, field);
+
+CREATE INDEX listener_rating_reported ON listener_rating (endpoint_id, kind, source_item_id);

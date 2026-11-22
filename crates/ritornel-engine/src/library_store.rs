@@ -890,7 +890,7 @@ mod tests {
         // gives the library's ID the bytes 00 to 09.
         let library_id = "019a7afd-1e00-7001-8203-040506070809";
         assert_eq!(store.library_id().to_string(), library_id);
-        assert_eq!(store.schema_version(), 2);
+        assert_eq!(store.schema_version(), newest());
         assert_eq!(
             store.meta().unwrap(),
             LibraryMeta {
@@ -1270,6 +1270,13 @@ mod tests {
         assert_eq!(bookkeeping(&store), before);
     }
 
+    /// The schema version of a library this program makes.
+    fn newest() -> i64 {
+        crate::migrate::LIBRARY
+            .last()
+            .map_or(0, |last| last.version)
+    }
+
     fn library_db(scratch: &Scratch) -> PathBuf {
         scratch.path().join("library.db")
     }
@@ -1304,7 +1311,7 @@ mod tests {
         let scratch = Scratch::new();
         let path = library_db(&scratch);
         let (store, _) = create_on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 2);
+        assert_eq!(store.migrations_applied(), crate::migrate::LIBRARY.len());
         let created = store.meta().unwrap();
         store
             .write(request("test.write", None), set("kept"))
@@ -1314,7 +1321,7 @@ mod tests {
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 2);
+        assert_eq!(store.schema_version(), newest());
         assert_eq!(store.library_id(), created.library_id);
         assert_eq!(
             store.meta().unwrap(),
@@ -1469,13 +1476,16 @@ mod tests {
         let scratch = Scratch::new();
         let path = library_db(&scratch);
         create_on_disk(&path).unwrap().0.close().unwrap();
+        let future = newest() + 1;
         tamper_file(
             &path,
-            "INSERT INTO schema_migration VALUES (3, '0003_from_the_future', x'00', 0)",
+            &format!(
+                "INSERT INTO schema_migration VALUES ({future}, '{future:04}_from_the_future', x'00', 0)"
+            ),
         );
         let refused = open_on_disk(&path, id(0x11));
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 3, known: 2 })),
+            matches!(refused, Err(Error::NewerSchema { found, known }) if (found, known) == (future, newest())),
             "{refused:?}"
         );
     }
