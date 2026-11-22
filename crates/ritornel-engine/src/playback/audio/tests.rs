@@ -1501,18 +1501,31 @@ fn an_album_played_through_the_real_pipeline_is_its_samples_and_each_listen_begi
 #[test]
 fn a_song_taken_out_of_up_next_in_the_last_half_second_is_never_heard_through_the_real_pipeline() {
     use crate::playback::{Order, Status};
-    // At real time, ticking as the server does: the second is taken out
-    // 300 ms before the first ends, its decoder well into it by then.
-    let (renderer, tap) = AudioRenderer::tapped(AS_IS, 1).unwrap();
+    // At real time, ticking as the server does. The output holds 300 ms
+    // before the first ends, so that however slowly the machine runs, the
+    // second is taken out there; and only once the ring is full, so its
+    // decoder is 200 ms into the second by then.
+    let (renderer, tap, hold) = AudioRenderer::held(AS_IS, 1, 700 * 16).unwrap();
+    let full = usize::try_from(AS_IS.rate * super::RING_MS / 1000).unwrap() * AS_IS.channels;
     let mut rig = Pipeline::new(&[1_000, 1_000, 1_000], Box::new(renderer));
     rig.play();
-    rig.ticking(50, |state| state.position_ms >= 700);
-    let second = rig.player.window(Order::Queue, 1, 1).entries[0].0;
+    rig.ticking(50, |_| hold.waiting() == Some(full));
+    // Held, the output stands still: one more tick sees where it stands.
+    rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    let [first, second] = [0, 1].map(|at| rig.player.window(Order::Queue, at, 1).entries[0].0);
+    let state = rig.player.state();
+    assert_eq!(state.current.map(|now| now.entry_id), Some(first));
+    assert!(
+        (700..800).contains(&state.position_ms),
+        "{}",
+        state.position_ms
+    );
     let request = rig.request("queue.remove");
     let (server, library) = (&rig.server, Some(&rig.library));
     rig.player
         .remove(request, None, &[second], server, library)
         .unwrap();
+    hold.let_go();
     rig.ticking(50, |state| state.status == Status::Stopped);
     // The first played whole, the second never, and the third after it as
     // any track does.
@@ -1529,16 +1542,13 @@ fn a_song_taken_out_of_up_next_in_the_last_half_second_is_never_heard_through_th
     };
     let expected: Vec<f32> = samples(0).into_iter().chain(samples(2)).collect();
     assert_eq!(*tap.lock().unwrap(), expected);
-    let [first, third] = rig.staged().try_into().unwrap();
+    let [one, three] = rig.staged().try_into().unwrap();
     assert_eq!(
-        (
-            first.ended.unwrap().end_reason.as_str(),
-            first.heard.ms_played
-        ),
+        (one.ended.unwrap().end_reason.as_str(), one.heard.ms_played),
         ("finished", 1_000)
     );
-    assert_eq!(third.started.start_reason.as_str(), "auto_advance");
-    assert_eq!(third.heard.ms_played, 1_000);
+    assert_eq!(three.started.start_reason.as_str(), "auto_advance");
+    assert_eq!(three.heard.ms_played, 1_000);
 }
 
 #[test]
