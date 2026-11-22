@@ -1013,32 +1013,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::testing::Scratch;
-
-    /// A core on a database in memory, and the directory it reports on.
-    fn core() -> (Core, Scratch) {
-        let scratch = Scratch::new();
-        let dir = DataDir::prepare(scratch.path().join("data")).unwrap();
-        let store =
-            ServerStore::open_in_memory(Arc::new(SystemClock), Arc::new(OsEntropy)).unwrap();
-        let (identity, issued) = store.ensure_identity("desk").unwrap();
-        let (_, verifier) = crate::credential::ensure(&store, &dir.credential(), issued).unwrap();
-        let bounds = Bounds {
-            max_sessions: 4,
-            ..Bounds::default()
-        };
-        let core = Core::new(
-            Stores::new(store, None),
-            &identity,
-            &dir,
-            verifier,
-            Arc::new(SystemClock),
-            Arc::new(OsEntropy),
-            bounds,
-        )
-        .unwrap();
-        (core, scratch)
-    }
+    use crate::testing::core;
 
     fn hello() -> Value {
         json!({ "name": "test", "kind": "cli", "version": "1.2.3", "contractVersion": CONTRACT_VERSION })
