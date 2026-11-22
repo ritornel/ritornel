@@ -247,15 +247,17 @@ fn wanted(
 }
 
 /// The binding in force on an item, when the matcher made it or there is
-/// none: its assignment, recording and appearance. `Err` holds back an item
-/// the owner bound.
+/// none: its assignment, and the recording and appearance it ends at
+/// through redirects. `Err` holds back an item the owner bound.
 type Current = Option<(i64, i64, Option<i64>)>;
 
 fn current(connection: &Connection, item: i64) -> Result<Result<Current, ()>, Error> {
     let found: Option<(i64, i64, Option<i64>, String)> = connection
         .prepare_cached(
-            "SELECT a.id, a.recording_id, a.appearance_id, d.actor_kind FROM assignment a
+            "SELECT a.id, r.canonical_id, ta.canonical_id, d.actor_kind FROM assignment a
              JOIN identity_decision d ON d.id = a.decision_id
+             JOIN recording r ON r.id = a.recording_id
+             LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
              WHERE a.source_item_id = ?1 AND a.superseded_at_ms IS NULL",
         )?
         .query_row([item], |row| {
@@ -289,6 +291,22 @@ fn exclusions(connection: &Connection) -> Result<Exclusions, Error> {
     Ok(found)
 }
 
+/// Whether the binding in force, as the recording and appearance it ends at
+/// through redirects, is what is wanted. A binding a merge carries there is
+/// kept, so that undoing the merge gives it back. The matcher names
+/// canonical rows, and the recording of an appearance is its own.
+fn holds(now: Option<Bound>, wanted: Option<Wanted>) -> bool {
+    match (now, wanted) {
+        (None, None) => true,
+        (Some((recording, appearance)), Some(wanted)) => match (appearance, wanted.appearance) {
+            (Some(now), Some(wanted)) => now == wanted,
+            (None, None) => recording == wanted.recording,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Binds a subject item as the matcher says: a binding in force that
 /// differs is superseded, and a new one is a decision of its own, the
 /// assignment and the item's cached recording. With nothing wanted the item
@@ -304,14 +322,10 @@ fn settle(
     let Ok(now) = current(connection, item)? else {
         return Ok(false);
     };
-    let same = match (now, wanted) {
-        (None, None) => true,
-        (Some((_, recording, appearance)), Some(wanted)) => {
-            (recording, appearance) == (wanted.recording, wanted.appearance)
-        }
-        _ => false,
-    };
-    if same {
+    if holds(
+        now.map(|(_, recording, appearance)| (recording, appearance)),
+        wanted,
+    ) {
         return Ok(false);
     }
     if let Some((old, ..)) = now {
@@ -889,7 +903,7 @@ impl LibraryStore {
                 let (_, artist, album, title) = &subject;
                 let except = except.get(&subject.0).unwrap_or(&none);
                 let wanted = wanted(&catalog, except, artist, album.as_deref(), title);
-                if wanted.map(|wanted| (wanted.recording, wanted.appearance)) != now {
+                if !holds(now, wanted) {
                     differ.push(subject);
                 }
             }
@@ -961,15 +975,17 @@ fn loved_now(
 
 /// The account's subject items the matcher judges, which are all but those
 /// the owner bound, with their text and the recording and appearance they
-/// are bound to now.
+/// are bound to now, through redirects.
 fn judged_subjects(
     connection: &Connection,
     instance: i64,
 ) -> Result<Vec<(Subject, Option<Bound>)>, Error> {
     let mut statement = connection.prepare(
-        "SELECT si.id, si.provider_key, a.recording_id, a.appearance_id FROM source_item si
+        "SELECT si.id, si.provider_key, r.canonical_id, ta.canonical_id FROM source_item si
          LEFT JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
          LEFT JOIN identity_decision d ON d.id = a.decision_id
+         LEFT JOIN recording r ON r.id = a.recording_id
+         LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
          WHERE si.source_instance_id = ?1 AND si.item_kind = ?2 AND si.retired_at_ms IS NULL
            AND (a.id IS NULL OR d.actor_kind = 'resolver')",
     )?;

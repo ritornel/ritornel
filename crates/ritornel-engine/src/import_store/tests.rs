@@ -523,6 +523,108 @@ fn a_recording_the_owner_excluded_is_never_bound_even_through_a_merge() {
     assert_eq!(rig.revision(), before);
 }
 
+impl Rig {
+    /// Runs `sql` in a write, with `?1` the revision.
+    fn exec(&self, sql: &'static str) {
+        self.library
+            .write(
+                WriteRequest {
+                    method: "test.exec",
+                    command: None,
+                    client: None,
+                },
+                move |write| {
+                    let connection = write.connection();
+                    let mut rest = sql;
+                    while let Some(end) = rest.find(';') {
+                        let (one, after) = rest.split_at(end);
+                        rest = &after[1..];
+                        if !one.trim().is_empty() {
+                            connection.execute(one, [write.rev()])?;
+                        }
+                    }
+                    Ok(String::new())
+                },
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_binding_through_a_merge_is_kept_so_that_undoing_the_merge_is_exact() {
+    let rig = rig();
+    let mut plain = record(T0 - HOUR, "Moss Arcade", "Paper Kites", 0);
+    plain.track.album = None;
+    rig.ingest(&batch(vec![plain], T0 - 2 * HOUR, T0));
+    // A second file of the song, once a recording of its own and since
+    // merged into the first: the song is on two appearances, so a play
+    // with no album binds to the recording and to neither.
+    rig.exec(
+        "INSERT INTO recording (id, public_id, redirect_to_id, canonical_id, display_title, rev)
+           SELECT 900, randomblob(16), recording_id, recording_id, 'Paper Kites', ?1
+           FROM track_appearance WHERE display_title = 'Paper Kites';
+         INSERT INTO track_appearance
+           (id, public_id, recording_id, release_id, canonical_id, display_title, rev)
+           SELECT 900, randomblob(16), 900, release_id, 900, 'Paper Kites', ?1
+           FROM track_appearance WHERE display_title = 'Paper Kites' AND id <> 900;
+         INSERT INTO source_item
+           (id, public_id, source_instance_id, item_kind, provider_key, size_bytes, mtime_ms,
+            first_seen_at_ms, rev)
+           SELECT 900, randomblob(16), source_instance_id, 'file', 'Moss Arcade/copy.flac', 1, 0, 0, ?1
+           FROM source_item WHERE item_kind = 'file' LIMIT 1;
+         INSERT INTO identity_decision
+           (id, action, source_item_id, method, resolver_version, normalizer_version,
+            evidence_json, actor_kind, decided_at_ms, rev)
+           VALUES (900, 'bind', 900, 'new', 1, 1, '{}', 'resolver', 0, ?1);
+         INSERT INTO assignment
+           (source_item_id, recording_id, appearance_id, decision_id, effective_from_ms, rev)
+           VALUES (900, 900, 900, 900, 0, ?1);",
+    );
+    // The play was bound to the merged recording before the merge.
+    rig.exec(
+        "INSERT INTO identity_decision
+           (id, action, source_item_id, method, resolver_version, normalizer_version,
+            evidence_json, actor_kind, decided_at_ms, rev)
+           SELECT 901, 'bind', id, 'scrobble_text', 2, 2, '{}', 'resolver', 0, ?1
+           FROM source_item WHERE item_kind = 'scrobble_subject';
+         UPDATE assignment SET superseded_at_ms = 1, rev = ?1
+           WHERE superseded_at_ms IS NULL AND source_item_id IN
+             (SELECT id FROM source_item WHERE item_kind = 'scrobble_subject');
+         INSERT INTO assignment
+           (source_item_id, recording_id, appearance_id, decision_id, effective_from_ms, rev)
+           SELECT source_item_id, 900, NULL, 901, 1, ?1 FROM identity_decision WHERE id = 901;",
+    );
+    let bound = "SELECT a.recording_id || ' ' || coalesce(a.appearance_id, '-') FROM assignment a
+                 JOIN source_item si ON si.id = a.source_item_id
+                 WHERE si.item_kind = 'scrobble_subject' AND a.superseded_at_ms IS NULL";
+    assert_eq!(rig.one(bound), "900 -");
+    // Judged again, it is where the merge sends it: nothing is written, and
+    // the binding still names the recording a merge's undo gives back.
+    let before = rig.revision();
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.revision(), before);
+    assert_eq!(rig.one(bound), "900 -");
+
+    // So too a binding to an appearance merged into another.
+    rig.exec(
+        "UPDATE track_appearance SET redirect_to_id = 1, canonical_id = 1, rev = ?1 WHERE id = 900;
+         UPDATE assignment SET superseded_at_ms = 2, rev = ?1 WHERE decision_id = 901;
+         INSERT INTO assignment
+           (source_item_id, recording_id, appearance_id, decision_id, effective_from_ms, rev)
+           SELECT source_item_id, 900, 900, 901, 2, ?1 FROM identity_decision WHERE id = 901;",
+    );
+    assert_eq!(
+        rig.one(
+            "SELECT id FROM track_appearance WHERE display_title = 'Paper Kites' AND id <> 900"
+        ),
+        "1"
+    );
+    let before = rig.revision();
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.revision(), before);
+    assert_eq!(rig.one(bound), "900 900");
+}
+
 #[test]
 fn the_matcher_never_writes_over_the_owners_binding() {
     let rig = rig();
