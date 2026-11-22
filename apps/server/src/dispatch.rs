@@ -163,6 +163,9 @@ pub(crate) struct Core {
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// Where backups go, once the server has started.
     backups: std::sync::OnceLock<crate::backup::Backups>,
+    /// The most a satellite's cache of pulled masters holds, in bytes,
+    /// once the server has started.
+    cache_bytes: std::sync::OnceLock<u64>,
     /// What the record's sign knows only while the server runs.
     signs: Mutex<record::Signs>,
     /// The system's media session, once `serve` has started one.
@@ -286,6 +289,7 @@ impl Core {
             lastfm: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
+            cache_bytes: std::sync::OnceLock::new(),
             signs: Mutex::default(),
             #[cfg(feature = "media-session")]
             media_session: std::sync::OnceLock::new(),

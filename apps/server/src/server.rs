@@ -153,6 +153,7 @@ impl Server {
             }
         } else if identity.name == DEFAULT_NAME
             && let Some(name) = run.computer_name.as_deref()
+            && name != identity.name
             && let Some(renamed) = store.rename(name)?
         {
             info!(name = %renamed.name, "this server is named after its computer");
@@ -224,6 +225,7 @@ impl Server {
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
         core.set_watch(run.watch);
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
+        core.set_cache_bytes(run.cache_bytes);
         let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         if listen.is_private() {

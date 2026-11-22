@@ -75,6 +75,9 @@ pub struct Run {
     /// name at every start. With none, the stored name stands, or the
     /// computer's in place of the default.
     pub name: Option<String>,
+    /// The most a satellite's cache of masters pulled from its hub holds,
+    /// in bytes, by the `cache_size` setting. With none it is 2 GiB.
+    pub cache_bytes: Option<u64>,
     /// Whether this run asks the system to keep the machine awake when its
     /// wake setting says to. `serve` does. A server in a test does not, so
     /// that a test neither changes the machine's power settings nor starts

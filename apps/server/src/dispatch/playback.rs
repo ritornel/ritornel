@@ -29,7 +29,7 @@ use ritornel_engine::playback::{
 use ritornel_engine::{Command, LibraryStore, ServerStore};
 use tracing::{error, warn};
 
-use crate::hub_catalog::HubCatalog;
+use crate::hub_catalog::{CACHE_BYTES, HubCatalog};
 
 use super::lists::expired;
 use super::{Core, Stores, fingerprint, lock};
@@ -334,10 +334,18 @@ impl Core {
         ticked.unwrap_or(Ok(()))
     }
 
+    /// The most a satellite's cache of pulled masters holds, in bytes: the
+    /// `cache_size` setting, or [`CACHE_BYTES`] without one.
+    pub(crate) fn set_cache_bytes(&self, bytes: Option<u64>) {
+        let _ = self.cache_bytes.set(bytes.unwrap_or(CACHE_BYTES));
+    }
+
     /// On a satellite, the hub's library as its player reads it.
     pub(crate) fn hub_catalog(&self) -> Option<HubCatalog> {
+        let cache = self.dir.root().join("cache").join("audio");
+        let bytes = self.cache_bytes.get().copied().unwrap_or(CACHE_BYTES);
         self.uplink()
-            .map(|uplink| HubCatalog::new(uplink, self.dir.root().join("cache").join("audio")))
+            .map(|uplink| HubCatalog::new(uplink, cache, bytes))
     }
 
     /// The songs of a view the session holds at the hub, in order: read
