@@ -315,6 +315,20 @@ fn a_play_with_no_local_date_after_the_last_dated_one_is_not_taken_for_none() {
         "With you since *June 2018*. Not played for over two years."
     );
 
+    // Most of all in one year, unless the undated plays might outdo it.
+    let mut mostly = Facts::default();
+    for _ in 0..8 {
+        play(&mut mostly, 2_000, 20210504);
+    }
+    for _ in 0..4 {
+        play(&mut mostly, 400, 20251011);
+    }
+    assert!(said(&sentence(&mostly, since, TODAY)).ends_with("most of all in *2021*."));
+    for _ in 0..8 {
+        mostly.add(Some(NOW - 3_000 * DAY), None, None, TODAY);
+    }
+    assert!(!said(&sentence(&mostly, since, TODAY)).contains("most of all"));
+
     // Between one and two years ago: nor is it here.
     let mut quiet = Facts::default();
     play(&mut quiet, 1_000, 20240219);
@@ -397,8 +411,9 @@ fn the_span_holds_every_local_year_played_across_the_date_line() {
     // New Year's Eve, before 23:00 on New Year's Eve in Honolulu (UTC−10),
     // which is 09:00 UTC on New Year's Day: the first play in time is in
     // 2020, and the next, by local date, in 2019. And 00:30 on New Year's
-    // Day 2027 in Kiritimati is still 2026 where the server is. A play
-    // stamped a year ahead, by a clock that was wrong, is not heard yet.
+    // Day 2027 in Kiritimati is still 2026 where the server is, and comes
+    // before 01:00 on New Year's Eve in Honolulu. A play stamped a year
+    // ahead, by a clock that was wrong, is not heard yet.
     tamper(
         store,
         &format!(
@@ -408,6 +423,8 @@ fn the_span_holds_every_local_year_played_across_the_date_line() {
              WHERE id = ({of_artist} ORDER BY pe.id LIMIT 1 OFFSET 1);
              UPDATE play_event SET event_at_utc_ms = 1798713000000, local_date = 20270101
              WHERE id = ({of_artist} ORDER BY pe.id DESC LIMIT 1);
+             UPDATE play_event SET event_at_utc_ms = 1798714800000, local_date = 20261231
+             WHERE id = ({of_artist} ORDER BY pe.id DESC LIMIT 1 OFFSET 2);
              UPDATE play_event SET event_at_utc_ms = 1830254400000, local_date = 20280101
              WHERE id = ({of_artist} ORDER BY pe.id DESC LIMIT 1 OFFSET 1);"
         ),
@@ -427,6 +444,33 @@ fn the_span_holds_every_local_year_played_across_the_date_line() {
     assert_eq!((years.first(), years.last()), (Some(&2019), Some(&2028)));
     let span = history.span.unwrap();
     assert_eq!((span.from, span.to), (2019, 2027));
+}
+
+#[test]
+fn the_last_play_with_no_local_date_has_no_last_played_day() {
+    let (invented, listener, artist) = played(600);
+    let store = &invented.store;
+    let before = store
+        .artist_history(listener, artist, TODAY)
+        .unwrap()
+        .unwrap();
+    assert!(before.first_played.is_some() && before.last_played.is_some());
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET local_date = NULL
+             WHERE id = ({} ORDER BY pe.event_at_utc_ms DESC LIMIT 1)",
+            plays_of(artist)
+        ),
+    );
+    let after = store
+        .artist_history(listener, artist, TODAY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (after.first_played, after.last_played),
+        (before.first_played, None)
+    );
 }
 
 #[test]

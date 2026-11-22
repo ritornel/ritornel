@@ -240,8 +240,13 @@ pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Ve
         .0;
     }
     let dated: u64 = facts.years.values().sum();
+    // Never a year the undated plays might have outdone.
     let mostly = peak(&facts.years).filter(|&(year, most)| {
-        5 * most >= 2 * dated && dated >= 10 && facts.years.len() > 1 && year < today.year
+        5 * most >= 2 * dated
+            && dated >= 10
+            && facts.years.len() > 1
+            && year < today.year
+            && most > facts.plays - dated
     });
     if let Some((year, _)) = mostly {
         return said
@@ -314,17 +319,17 @@ fn history_of(
     }
     // Where the listener's history begins, whatever is bound: through the
     // index of plays by time, the oldest first.
-    let began: Option<(i64, i64)> = connection
+    let began: Option<i64> = connection
         .prepare_cached(
-            "SELECT event_at_utc_ms, local_date FROM play_event
+            "SELECT event_at_utc_ms FROM play_event
              WHERE listener_id = ?1 AND event_at_utc_ms IS NOT NULL
                AND counts = 1 AND excluded = 0 AND local_date IS NOT NULL
              ORDER BY event_at_utc_ms LIMIT 1",
         )?
-        .query_row([listener], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_row([listener], |row| row.get(0))
         .optional()?;
     let span = began
-        .map(|(at, _)| span(connection, listener, at, today))
+        .map(|at| span(connection, listener, at, today))
         .transpose()?;
     let records = if records {
         played_most(connection, &facts)?
@@ -334,7 +339,10 @@ fn history_of(
     Ok(HistoryOf {
         plays: facts.plays,
         first_played: facts.first.map(|(_, day)| date(day)),
-        last_played: facts.last.map(|(_, day)| date(day)),
+        last_played: facts
+            .last
+            .filter(|&(at, _)| facts.latest_ms.is_none_or(|latest| latest <= at))
+            .map(|(_, day)| date(day)),
         last_year: facts.last_year,
         years: facts
             .years
@@ -343,7 +351,7 @@ fn history_of(
             .collect(),
         span,
         records,
-        sentence: sentence(&facts, began.map(|(at, _)| at), today),
+        sentence: sentence(&facts, began, today),
         library_revision: u64::try_from(revision).unwrap_or(0),
     })
 }

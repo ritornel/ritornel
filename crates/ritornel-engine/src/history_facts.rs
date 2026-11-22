@@ -213,7 +213,12 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
         .filter_map(|heard| Some((heard.at_ms?, heard.date?, heard)))
         .collect();
 
-    if let Some(&(_, first, _)) = dated.iter().min_by_key(|(at, ..)| *at)
+    // A play with no local date before it may be from a day earlier still,
+    // so nothing is said.
+    if let Some(&(first_at, first, _)) = dated.iter().min_by_key(|(at, ..)| *at)
+        && !record.plays.iter().any(|heard| {
+            heard.date.is_none() && heard.at_ms.is_some_and(|earlier| earlier < first_at)
+        })
         && let Some(ago) = ago(first, today.date)
     {
         let since = if plays > 1 {
@@ -236,10 +241,13 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
     for &(_, date, _) in &dated {
         *years.entry(year_of(date)).or_default() += 1;
     }
+    // Never a year the undated plays might have outdone.
+    let undated = plays - u64::try_from(dated.len()).unwrap_or(plays);
     if let Some((year, most)) = peak(&years)
         && plays >= YEAR_PLAYS
         && 10 * most >= 3 * plays
         && year < today.year
+        && most > undated
     {
         let more = if most == plays {
             format!("All {} of its plays came then.", grouped(plays))

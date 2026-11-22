@@ -1290,7 +1290,8 @@ export type HistoryOf = {
    */
   firstPlayed?: string,
   /**
-   * The local date of the last.
+   * The local date of the last play, as `YYYY-MM-DD`. Left out when the
+   * last play has no local date, though an earlier one has.
    */
   lastPlayed?: string,
   /**

@@ -350,7 +350,8 @@ pub struct HistoryOf {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub first_played: Option<String>,
-    /// The local date of the last.
+    /// The local date of the last play, as `YYYY-MM-DD`. Left out when the
+    /// last play has no local date, though an earlier one has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub last_played: Option<String>,

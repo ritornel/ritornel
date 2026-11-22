@@ -350,6 +350,52 @@ fn a_record_unplayed_for_a_year_before_today_says_since_when() {
     assert_eq!(of(&facts(&undated, TODAY), FactKind::NotSince), None);
 }
 
+/// A play `days` before now with an instant and no local date.
+fn undated(days: i64, song: i64) -> Heard {
+    Heard {
+        at_ms: Some(NOW - days * DAY),
+        date: None,
+        song,
+        hour: None,
+        offset: None,
+    }
+}
+
+#[test]
+fn plays_with_no_local_date_leave_unsaid_what_they_might_contradict() {
+    // Heard first with no local date: when is not known.
+    let mut plays = vec![
+        heard(900, 20240530, 1, 12, 0),
+        heard(800, 20240907, 2, 12, 0),
+    ];
+    let first = |plays: &[Heard]| {
+        let gathered = Gathered {
+            record: Some(record(plays.to_vec())),
+            ..Gathered::default()
+        };
+        of(&facts(&gathered, TODAY), FactKind::FirstHeard)
+    };
+    assert!(first(&plays).is_some());
+    plays.push(undated(1_000, 1));
+    assert_eq!(first(&plays), None);
+
+    // 2024 held 30 of 50 plays. With 35 more that have no date, it may
+    // not have held most of them.
+    let mut many: Vec<Heard> = (0..30).map(|_| heard(800, 20240907, 1, 12, 0)).collect();
+    many.extend((0..20).map(|_| heard(300, 20250120, 2, 12, 0)));
+    let its_year = |plays: &[Heard]| {
+        let gathered = Gathered {
+            record: Some(record(plays.to_vec())),
+            ..Gathered::default()
+        };
+        of(&facts(&gathered, TODAY), FactKind::ItsYear)
+    };
+    let more: Vec<Heard> = (0..35).map(|_| undated(2_000, 1)).collect();
+    assert!(its_year(&many).is_some());
+    many.extend(more);
+    assert_eq!(its_year(&many), None);
+}
+
 /// The record played most, and an appearance on it that was played.
 fn favourite(store: &LibraryStore) -> (Id, Id) {
     store
