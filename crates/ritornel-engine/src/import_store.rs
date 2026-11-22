@@ -292,19 +292,25 @@ fn exclusions(connection: &Connection) -> Result<Exclusions, Error> {
 }
 
 /// Whether the binding in force, as the recording and appearance it ends at
-/// through redirects, is what is wanted. A binding a merge carries there is
-/// kept, so that undoing the merge gives it back. The matcher names
-/// canonical rows, and the recording of an appearance is its own.
-fn holds(now: Option<Bound>, wanted: Option<Wanted>) -> bool {
-    match (now, wanted) {
+/// through redirects, is what is wanted: both the recording its plays count
+/// for and the appearance. A binding a merge carries there is kept, so that
+/// undoing the merge gives it back. The matcher names a canonical
+/// appearance, and that appearance's own recording.
+fn holds(
+    connection: &Connection,
+    now: Option<Bound>,
+    wanted: Option<Wanted>,
+) -> Result<bool, Error> {
+    Ok(match (now, wanted) {
         (None, None) => true,
-        (Some((recording, appearance)), Some(wanted)) => match (appearance, wanted.appearance) {
-            (Some(now), Some(wanted)) => now == wanted,
-            (None, None) => recording == wanted.recording,
-            _ => false,
-        },
+        (Some((recording, appearance)), Some(wanted)) => {
+            let canonical: i64 = connection
+                .prepare_cached("SELECT canonical_id FROM recording WHERE id = ?1")?
+                .query_row([wanted.recording], |row| row.get(0))?;
+            recording == canonical && appearance == wanted.appearance
+        }
         _ => false,
-    }
+    })
 }
 
 /// Binds a subject item as the matcher says: a binding in force that
@@ -323,9 +329,10 @@ fn settle(
         return Ok(false);
     };
     if holds(
+        connection,
         now.map(|(_, recording, appearance)| (recording, appearance)),
         wanted,
-    ) {
+    )? {
         return Ok(false);
     }
     if let Some((old, ..)) = now {
@@ -903,7 +910,7 @@ impl LibraryStore {
                 let (_, artist, album, title) = &subject;
                 let except = except.get(&subject.0).unwrap_or(&none);
                 let wanted = wanted(&catalog, except, artist, album.as_deref(), title);
-                if !holds(now, wanted) {
+                if !holds(connection, now, wanted)? {
                     differ.push(subject);
                 }
             }
