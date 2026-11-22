@@ -1424,6 +1424,38 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_folder_again_answers_from_its_receipt_and_another_folder_under_its_key_is_refused()
+    {
+        let (core, scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
+        let music = scratch.path().join("music");
+        std::fs::create_dir(&music).unwrap();
+        let add = |name: &str| {
+            let mut params = key(0xc1);
+            params["name"] = json!(name);
+            params["path"] = json!(music.to_str().unwrap());
+            call(&core, &session, "sources.add", Some(params))
+        };
+        let added = add("music").unwrap();
+
+        // Sent again once the disk is gone, as after an answer that was
+        // lost: the answer it had.
+        std::fs::remove_dir(&music).unwrap();
+        assert_eq!(add("music"), Ok(added));
+
+        // The same key for another root is refused as that, and leaves no
+        // root behind.
+        std::fs::create_dir(&music).unwrap();
+        let (code, _) = add("records").unwrap_err();
+        assert_eq!(code, ErrorCode::IdempotencyMismatch);
+        let roots = core
+            .with_stores(|stores| stores.server().roots().unwrap())
+            .unwrap();
+        assert_eq!(roots.len(), 1, "{roots:?}");
+    }
+
+    #[test]
     fn becoming_a_hub_is_sent_to_the_sessions_that_subscribed() {
         let (core, _scratch) = core();
         let subscribed = greeted(&core, SessionKind::Full);

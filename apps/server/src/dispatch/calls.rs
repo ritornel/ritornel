@@ -87,14 +87,14 @@ fn no_library() -> RpcError {
 }
 
 /// What an import stored as its result, read back.
-fn stored_result(written: &ritornel_engine::Written) -> Result<PicturesImported, RpcError> {
+fn stored_result<T: serde::de::DeserializeOwned>(
+    method: &str,
+    written: &ritornel_engine::Written,
+) -> Result<T, RpcError> {
     serde_json::from_str(&written.result_json).map_err(|error| {
         RpcError::new(
             ErrorCode::Internal,
-            format!(
-                "the stored result of {} could not be read: {error}",
-                ArtistsImportPictures::NAME
-            ),
+            format!("the stored result of {method} could not be read: {error}"),
         )
     })
 }
@@ -239,13 +239,25 @@ impl Core {
         stores: &Stores,
         params: &SourcesAddParams,
     ) -> Result<SourceAdded, RpcError> {
+        let command = Command {
+            id: params.idempotency_key,
+            fingerprint: fingerprint::<SourcesAdd>(params)?,
+        };
+        // A call sent again answers from its receipt before the folder is
+        // looked at or a root recorded, as `artists.importPictures` does:
+        // the folder may have gone since, and a key sent with another root
+        // must not leave that root behind. The write checks again, for one
+        // sent twice at once.
+        let replayed = Self::library(stores, |library| {
+            library.replay(&command).map_err(in_library)
+        })?;
+        if let Some(written) = replayed {
+            return stored_result(SourcesAdd::NAME, &written);
+        }
         let name = root(&params.name, &params.path)?;
         let request = WriteRequest {
             method: SourcesAdd::NAME,
-            command: Some(Command {
-                id: params.idempotency_key,
-                fingerprint: fingerprint::<SourcesAdd>(params)?,
-            }),
+            command: Some(command),
             client: self.client(),
         };
         let (command_id, name, path) = (params.idempotency_key, name, params.path.clone());
@@ -275,15 +287,7 @@ impl Core {
         })?;
         // The library tells subscribers of the write itself, after it
         // commits (`lists::hook`).
-        serde_json::from_str(&written.result_json).map_err(|error| {
-            RpcError::new(
-                ErrorCode::Internal,
-                format!(
-                    "the stored result of {} could not be read: {error}",
-                    SourcesAdd::NAME
-                ),
-            )
-        })
+        stored_result(SourcesAdd::NAME, &written)
     }
 
     /// `artists.pictureFolders`: each picture folder, with its path where
@@ -337,7 +341,7 @@ impl Core {
             library.replay(&command).map_err(in_library)
         })?;
         if let Some(written) = replayed {
-            return stored_result(&written);
+            return stored_result(ArtistsImportPictures::NAME, &written);
         }
         let name = root(&params.name, &params.path)?;
         // Checked once, before the root is recorded, so a folder refused
@@ -378,7 +382,7 @@ impl Core {
                 .import_artist_pictures(request, &name, &folder, receipt)
                 .map_err(in_library)
         })?;
-        stored_result(&written)
+        stored_result(ArtistsImportPictures::NAME, &written)
     }
 
     /// `scan.start`: queues a scan of a source as a job, and wakes the
