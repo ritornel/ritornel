@@ -41,6 +41,17 @@ pub(crate) struct OutputSpec {
 /// The input frames the resampler takes at a time.
 const RESAMPLER_CHUNK: usize = 1024;
 
+/// How far past full scale a sample may go: 96 dB, far past what any
+/// real file holds, and far short of what would overflow the resampler's
+/// sums.
+const LOUDEST: f32 = 65_536.0;
+
+/// The rates a track may be at, from below the lowest any audio is
+/// recorded at to the highest. A file that says it is at another is
+/// broken, and resampling it could take an age or more memory than there
+/// is.
+const RATES: std::ops::RangeInclusive<u32> = 1_000..=768_000;
+
 /// One file, open and decoding, from a position.
 pub(crate) struct Source {
     format: Box<dyn FormatReader>,
@@ -107,7 +118,10 @@ impl GainTags {
             Some(peak) if peak > 0.0 && peak.is_finite() => PEAK_HEADROOM / peak,
             _ => 1.0,
         };
-        gain.min(ceiling)
+        // Tags past any real level can take it past what a float holds.
+        Some(gain.min(ceiling))
+            .filter(|factor| factor.is_finite())
+            .unwrap_or(1.0)
     }
 }
 
@@ -366,6 +380,12 @@ impl Source {
             .sample_rate
             .filter(|rate| *rate > 0)
             .ok_or_else(|| RenderError::new("unreadable", "the track has no sample rate"))?;
+        if !RATES.contains(&rate) {
+            return Err(RenderError::new(
+                "unsupported_format",
+                format!("the track says it is at {rate} Hz, which no audio is recorded at"),
+            ));
+        }
         let channels = params
             .channels
             .as_ref()
@@ -820,12 +840,24 @@ pub(crate) fn run_joined(
                 Some(convert) => convert,
                 None => convert.insert(Convert::new(rate, channels, to)?),
             };
-            let frames = if source.gain == 1.0 {
-                source.frames()
+            let frames = source.frames();
+            let fit = |sample: &f32| sample.abs() <= LOUDEST;
+            let frames = if source.gain == 1.0 && frames.iter().all(fit) {
+                frames
             } else {
+                // A broken float file can hold a sample that is not a
+                // number, which is silence, or one too large for the
+                // resampler, which is held to the loudest it takes.
                 let gain = source.gain;
                 scaled.clear();
-                scaled.extend(source.frames().iter().map(|sample| sample * gain));
+                scaled.extend(frames.iter().map(|sample| {
+                    let sample = sample * gain;
+                    if sample.is_finite() {
+                        sample.clamp(-LOUDEST, LOUDEST)
+                    } else {
+                        0.0
+                    }
+                }));
                 &scaled
             };
             if !convert.push(frames, &mut |frames| stream.write(frames))? {

@@ -534,24 +534,37 @@ fn a_track_offered_once_the_decoder_has_finished_is_refused_and_the_one_in_hand_
 
 /// Writes a WAV of `frames` frames of a tone, mono at 16 kHz.
 fn short_wav(path: &Path, frames: u32) {
-    let data = frames * 2;
+    let samples = (0..frames).map(|at| (f64::from(at) * 0.17).sin() * 4096.0);
+    wav(
+        path,
+        16_000,
+        1,
+        samples
+            .map(|sample| sample as i16)
+            .flat_map(i16::to_le_bytes),
+    );
+}
+
+/// Writes a mono WAV said to be at `rate`, of 16-bit samples (`format`
+/// 1) or 32-bit floats (`format` 3), from their bytes.
+fn wav(path: &Path, rate: u32, format: u16, data: impl Iterator<Item = u8>) {
+    let data: Vec<u8> = data.collect();
+    let width: u16 = if format == 3 { 4 } else { 2 };
+    let length = u32::try_from(data.len()).unwrap();
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(36 + data).to_le_bytes());
+    bytes.extend_from_slice(&(36 + length).to_le_bytes());
     bytes.extend_from_slice(b"WAVEfmt ");
     bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&format.to_le_bytes());
     bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&16_000_u32.to_le_bytes());
-    bytes.extend_from_slice(&32_000_u32.to_le_bytes());
-    bytes.extend_from_slice(&2_u16.to_le_bytes());
-    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(&rate.to_le_bytes());
+    bytes.extend_from_slice(&rate.wrapping_mul(u32::from(width)).to_le_bytes());
+    bytes.extend_from_slice(&width.to_le_bytes());
+    bytes.extend_from_slice(&(width * 8).to_le_bytes());
     bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&data.to_le_bytes());
-    for at in 0..frames {
-        let sample = (f64::from(at) * 0.17).sin() * 4096.0;
-        bytes.extend_from_slice(&(sample as i16).to_le_bytes());
-    }
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(&data);
     std::fs::write(path, bytes).unwrap();
 }
 
@@ -605,6 +618,65 @@ fn every_format_the_player_reads_plays_through_the_pipeline_to_its_length() {
 }
 
 #[test]
+fn a_file_that_says_it_is_at_a_rate_no_audio_is_recorded_at_is_refused() {
+    let scratch = crate::testing::Scratch::new();
+    let silence = |frames: usize| std::iter::repeat_n(0_u8, frames * 2);
+    // Each would take the resampler an age, or more memory than there is.
+    for rate in [1, 7, 900, 1_000_000, 100_000_007] {
+        let path = scratch.path().join(format!("{rate}.wav"));
+        wav(&path, rate, 1, silence(64));
+        let refused = Source::open(&path, 0).unwrap_err();
+        assert_eq!(refused.reason, "unsupported_format", "{rate} Hz");
+    }
+    for rate in [8_000, 11_025, 44_100, 192_000, 768_000] {
+        let path = scratch.path().join(format!("{rate}.wav"));
+        wav(&path, rate, 1, silence(64));
+        assert_eq!(
+            Source::open(&path, 0).unwrap().spec(),
+            (rate, 1),
+            "{rate} Hz"
+        );
+    }
+}
+
+#[test]
+fn a_sample_that_is_not_a_number_is_silence_and_one_far_past_full_scale_cannot_stop_the_track() {
+    let scratch = crate::testing::Scratch::new();
+    let path = scratch.path().join("float.wav");
+    let mut samples: Vec<f32> = (0..8000)
+        .map(|at| (at as f32 * 0.17).sin() * 0.25)
+        .collect();
+    samples[100] = f32::NAN;
+    samples[4000] = f32::INFINITY;
+    samples[6000] = f32::NEG_INFINITY;
+    // As large as a float holds: the resampler's sums would overflow.
+    samples[1000..3048].fill(f32::MAX);
+    wav(
+        &path,
+        16_000,
+        3,
+        samples.iter().flat_map(|sample| sample.to_le_bytes()),
+    );
+    // As it is, and resampled, which either would stop.
+    for (spec, frames) in [(AS_IS, 8000), (STEREO_48K, 24_000)] {
+        let (mut renderer, tap) = AudioRenderer::tapped(spec, 50).unwrap();
+        renderer.load(&path, facts(&path), 0, 1).unwrap();
+        renderer.play();
+        let mut said = Vec::new();
+        until(&mut renderer, &mut said, |said| ended(said, 1).is_some());
+        assert_eq!(ended(&said, 1), Some((frames, End::Drained)), "{spec:?}");
+        let heard = tap.lock().unwrap();
+        assert!(heard.iter().all(|sample| sample.is_finite()), "{spec:?}");
+        if spec == AS_IS {
+            assert_eq!(heard[100], 0.0);
+            assert_eq!(heard[4000], 0.0);
+            assert_eq!(heard[99], samples[99]);
+            assert_eq!(heard[1000], 1.0);
+        }
+    }
+}
+
+#[test]
 fn replay_gain_tags_are_read_from_vorbis_comments_and_id3() {
     for name in ["rg.flac", "rg.mp3"] {
         let tags = Source::open(&fixture(name), 0).unwrap().tags;
@@ -646,6 +718,13 @@ fn a_gain_is_held_under_full_scale_by_its_peak_and_never_raised_with_none() {
         album: decode::GainTag::default(),
     };
     assert!((quieter.factor(ReplayGain::Album) - 0.1).abs() < 1e-6);
+    // Tags that would take the gain past what a float holds leave the
+    // track as it is.
+    let absurd = decode::GainTags {
+        track: tag(800.0, Some(1e-40)),
+        album: decode::GainTag::default(),
+    };
+    assert_eq!(absurd.factor(ReplayGain::Track), 1.0);
 }
 
 fn peak(samples: &[f32]) -> f32 {
