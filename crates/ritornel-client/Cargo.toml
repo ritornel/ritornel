@@ -42,6 +42,7 @@ tokio = { version = "1.54.1", features = ["macros", "net", "rt", "sync", "time"]
 tokio-tungstenite = "0.29.0"
 
 [dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
 # Not used by a test: it turns on futures-sink's `alloc`, as a program that
 # links `futures` with `std` does (GPUI does), so that the tests build the
 # client as such a program would. With it, `Box<S>` is a `Sink`, and a call

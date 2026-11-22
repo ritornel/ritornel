@@ -32,7 +32,6 @@ use ritornel_contract::local::{self, ServerJson};
 use ritornel_contract::{CONTRACT_VERSION, PublicDescriptor, SocketTicket};
 use tokio::net::TcpStream;
 
-use crate::error::transport;
 use crate::{Client, Credential, Error, NotRunning, http};
 
 /// How long a server on this machine gets to answer for its descriptor
@@ -193,7 +192,7 @@ impl LocalServer {
     /// A connection that is known to be to the server, with nothing sent
     /// on it yet.
     async fn reach(&self) -> Result<TcpStream, Error> {
-        let stream = TcpStream::connect(self.endpoint).await.map_err(transport)?;
+        let stream = http::connect(self.endpoint).await?;
         if alive(&self.data_dir)? != self.named {
             // Another server has the directory now.
             return Err(Error::NotRunning {
@@ -226,6 +225,11 @@ pub async fn find(data_dir: &Path) -> Result<LocalServer, Error> {
         why,
     };
     let named = alive(data_dir)?;
+    if named.contract_version != CONTRACT_VERSION {
+        return Err(Error::ContractVersion {
+            server: named.contract_version,
+        });
+    }
 
     let endpoint = named.endpoint;
     let descriptor = match tokio::time::timeout(ANSWER_WAIT, http::descriptor(endpoint)).await {
@@ -419,6 +423,23 @@ mod tests {
         assert_eq!(why(find(&scratch.0).await), NotRunning::Starting);
 
         assert!(!asked());
+    }
+
+    #[tokio::test]
+    async fn a_newer_contract_is_reported_even_without_a_readable_descriptor() {
+        let scratch = Scratch::new("newer-schema");
+        let _held = hold(&scratch.0, "1\n");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut named: serde_json::Value =
+            serde_json::from_str(&server_json(1, &listener.local_addr().unwrap().to_string()))
+                .unwrap();
+        named["contractVersion"] = (CONTRACT_VERSION + 1).into();
+        std::fs::write(scratch.0.join(local::SERVER_JSON), named.to_string()).unwrap();
+        let result = find(&scratch.0).await;
+        assert!(
+            matches!(result, Err(Error::ContractVersion {server}) if server == CONTRACT_VERSION + 1),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

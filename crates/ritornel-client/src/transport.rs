@@ -5,7 +5,10 @@
 
 use std::net::SocketAddr;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 use ritornel_contract::route;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -32,7 +35,7 @@ impl Transport {
         endpoint: SocketAddr,
         credential: &Credential,
     ) -> Result<Self, Error> {
-        let stream = TcpStream::connect(endpoint).await.map_err(transport)?;
+        let stream = http::connect(endpoint).await?;
         Self::upgrade(stream, endpoint, credential).await
     }
 
@@ -51,15 +54,42 @@ impl Transport {
         request
             .headers_mut()
             .insert(AUTHORIZATION, http::authorization(credential)?);
-        match tokio_tungstenite::client_async(request, stream).await {
-            Ok((socket, _)) => Ok(Self::Socket(Box::new(socket))),
-            Err(tungstenite::Error::Http(response)) => Err(Error::Refused {
-                status: response.status().as_u16(),
-            }),
-            Err(other) => Err(transport(other)),
-        }
+        http::within_deadline(async {
+            match tokio_tungstenite::client_async(request, stream).await {
+                Ok((socket, _)) => Ok(Self::Socket(Box::new(socket))),
+                Err(tungstenite::Error::Http(response)) => Err(Error::Refused {
+                    status: response.status().as_u16(),
+                }),
+                Err(other) => Err(transport(other)),
+            }
+        })
+        .await
     }
 
+    pub(crate) fn split(self) -> (Writer, Reader) {
+        match self {
+            Self::Socket(socket) => {
+                let (writer, reader) = (*socket).split();
+                (Writer::Socket(writer), Reader::Socket(reader))
+            }
+            Self::Memory { outgoing, incoming } => {
+                (Writer::Memory(outgoing), Reader::Memory(incoming))
+            }
+        }
+    }
+}
+
+pub(crate) enum Writer {
+    Socket(SplitSink<WebSocketStream<TcpStream>, Message>),
+    Memory(Sender<String>),
+}
+
+pub(crate) enum Reader {
+    Socket(SplitStream<WebSocketStream<TcpStream>>),
+    Memory(Receiver<String>),
+}
+
+impl Writer {
     /// Sends one frame.
     pub(crate) async fn send(&mut self, text: String) -> Result<(), Error> {
         match self {
@@ -67,13 +97,21 @@ impl Transport {
                 .send(Message::Text(text.into()))
                 .await
                 .map_err(transport),
-            Self::Memory { outgoing, .. } => outgoing
+            Self::Memory(outgoing) => outgoing
                 .send(text)
                 .await
                 .map_err(|_| transport("the connection closed")),
         }
     }
 
+    pub(crate) async fn close(&mut self) {
+        if let Self::Socket(socket) = self {
+            let _ = socket.close().await;
+        }
+    }
+}
+
+impl Reader {
     /// The next frame. `None` when the other side has closed.
     pub(crate) async fn receive(&mut self) -> Option<Result<String, Error>> {
         match self {
@@ -89,17 +127,7 @@ impl Transport {
                     Err(error) => Some(Err(transport(error))),
                 };
             },
-            Self::Memory { incoming, .. } => incoming.recv().await.map(Ok),
-        }
-    }
-
-    /// Says goodbye, if the transport has a way to.
-    pub(crate) async fn close(&mut self) {
-        if let Self::Socket(socket) = self {
-            // The other side may have gone already. Called by its full name:
-            // where futures-sink's `alloc` is on, `Box<WebSocketStream>` is a
-            // `Sink`, and `socket.close` would be `SinkExt::close`.
-            let _ = WebSocketStream::close(socket, None).await;
+            Self::Memory(incoming) => incoming.recv().await.map(Ok),
         }
     }
 }

@@ -18,6 +18,19 @@ use crate::{Credential, Error};
 /// answer is small, and something else might be answering.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
+/// A local connection, upgrade, or HTTP exchange should answer promptly.
+pub(crate) async fn within_deadline<T>(
+    operation: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), operation)
+        .await
+        .map_err(|_| transport("timed out waiting for the server"))?
+}
+
+pub(crate) async fn connect(endpoint: SocketAddr) -> Result<TcpStream, Error> {
+    within_deadline(async { TcpStream::connect(endpoint).await.map_err(transport) }).await
+}
+
 /// What a request was answered with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
@@ -34,7 +47,7 @@ pub async fn get(
     path: &str,
     credential: Option<&Credential>,
 ) -> Result<Answer, Error> {
-    let stream = TcpStream::connect(endpoint).await.map_err(transport)?;
+    let stream = connect(endpoint).await?;
     send(stream, endpoint, Method::GET, path, credential).await
 }
 
@@ -48,34 +61,37 @@ async fn send(
     path: &str,
     credential: Option<&Credential>,
 ) -> Result<Answer, Error> {
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(transport)?;
-    // The connection does its reading and writing here, and ends when the
-    // sender is dropped.
-    tokio::spawn(connection);
+    within_deadline(async {
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(transport)?;
+        // The connection does its reading and writing here, and ends when the
+        // sender is dropped.
+        tokio::spawn(connection);
 
-    let mut request = Request::builder()
-        .method(&method)
-        .uri(path)
-        .header(HOST, endpoint.to_string());
-    if let Some(credential) = credential {
-        request = request.header(AUTHORIZATION, authorization(credential)?);
-    }
-    let request = request.body(Empty::<Bytes>::new()).map_err(transport)?;
-    let response = sender.send_request(request).await.map_err(transport)?;
-    let status = response.status().as_u16();
-    let body = Limited::new(response.into_body(), MAX_BODY_BYTES)
-        .collect()
-        .await
-        .map_err(|_| {
-            Error::Protocol(format!(
-                "the answer to {method} {path} was cut off or too long"
-            ))
-        })?
-        .to_bytes()
-        .to_vec();
-    Ok(Answer { status, body })
+        let mut request = Request::builder()
+            .method(&method)
+            .uri(path)
+            .header(HOST, endpoint.to_string());
+        if let Some(credential) = credential {
+            request = request.header(AUTHORIZATION, authorization(credential)?);
+        }
+        let request = request.body(Empty::<Bytes>::new()).map_err(transport)?;
+        let response = sender.send_request(request).await.map_err(transport)?;
+        let status = response.status().as_u16();
+        let body = Limited::new(response.into_body(), MAX_BODY_BYTES)
+            .collect()
+            .await
+            .map_err(|_| {
+                Error::Protocol(format!(
+                    "the answer to {method} {path} was cut off or too long"
+                ))
+            })?
+            .to_bytes()
+            .to_vec();
+        Ok(Answer { status, body })
+    })
+    .await
 }
 
 /// The `Authorization` header that carries a credential. It is marked
@@ -132,7 +148,7 @@ pub async fn health(endpoint: SocketAddr, credential: &Credential) -> Result<Hea
 /// [`LocalServer::ticket`](crate::local::LocalServer::ticket) makes sure
 /// that is the server, and this does not.
 pub async fn ticket(endpoint: SocketAddr, credential: &Credential) -> Result<SocketTicket, Error> {
-    let stream = TcpStream::connect(endpoint).await.map_err(transport)?;
+    let stream = connect(endpoint).await?;
     ticket_over(stream, endpoint, credential).await
 }
 
@@ -164,5 +180,27 @@ pub(crate) async fn ticket_over(
             "POST {path} was answered with HTTP {}",
             answer.status
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn http_and_socket_upgrades_time_out_when_the_peer_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let key = Credential::new("test");
+        let session = async {
+            tokio::join!(
+                get(endpoint, "/", None),
+                crate::Client::connect(endpoint, &key)
+            )
+        };
+        let (http, ws) = tokio::time::timeout(std::time::Duration::from_secs(60), session)
+            .await
+            .unwrap();
+        assert!(matches!(http, Err(Error::Transport(_))));
+        assert!(matches!(ws, Err(Error::Transport(_))));
     }
 }
