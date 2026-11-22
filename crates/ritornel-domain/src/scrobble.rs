@@ -1,6 +1,6 @@
 //! Matching a scrobble to the library: which recording, if any, a play that
-//! another service reported by its text alone was of. See "Scrobbles" in
-//! docs/design/identity.md.
+//! another service reported by its text alone was of. See "Scrobble
+//! matching" in docs/internals/identity.md.
 //!
 //! A scrobble names an artist, a title and maybe an album, as some other
 //! player sent them, and nothing else that can be trusted. So it binds only

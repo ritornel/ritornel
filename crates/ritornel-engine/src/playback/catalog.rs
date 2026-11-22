@@ -1,7 +1,7 @@
 //! What the player reads from the library: a track's copies on this server,
 //! what a track shows, and the tracks of an album or of a folder in the
-//! order they are played. See "Choosing a copy" and "The queue" in
-//! docs/design/playback.md.
+//! order they are played. See "Copy selection" and "Queue and session" in
+//! docs/internals/playback.md.
 
 use ritornel_domain::selection::{self, Candidate};
 use rusqlite::{Connection, OptionalExtension, Row};

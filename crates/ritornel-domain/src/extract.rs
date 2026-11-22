@@ -1,5 +1,5 @@
-//! Extractor 3: turns one stored payload into claims. See "Scanning one
-//! file" step 6 and decision 3 in docs/design/identity.md.
+//! Extractor 3: turns one stored payload into claims. See "Extraction and
+//! normalization" in docs/internals/identity.md.
 //!
 //! The tag names are the ones MusicBrainz Picard and beets write, taken
 //! from Picard's tag mapping appendix and from beets' `mediafile`, for

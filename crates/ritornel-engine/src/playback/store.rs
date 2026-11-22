@@ -1,7 +1,7 @@
 //! The player's rows in `server.db`: the queue, the one session, each
 //! listen while it is open and until the hub has it, and the outbox row
-//! that carries it there. See "The queue" and "Recording a listen" in
-//! docs/design/playback.md, and "Jobs and outbox" in
+//! that carries it there. See "Queue and session" and "Recording a listen"
+//! in docs/internals/playback.md, and "Jobs and outbox" in
 //! docs/internals/server.md.
 
 use ritornel_domain::history::{ContextKind, EndReason, StartReason};

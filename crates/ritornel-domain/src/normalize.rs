@@ -1,7 +1,7 @@
 //! Text normalisation: what makes two spellings of a name the same key.
 //! It is mechanical (NFKC, case fold, punctuation strip, whitespace
-//! collapse), it only finds candidates, and it never decides. See decision
-//! 12 and "Displayed metadata" in docs/design/identity.md.
+//! collapse), it only finds candidates, and it never decides. See
+//! "Extraction and normalization" in docs/internals/identity.md.
 
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;

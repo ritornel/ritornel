@@ -628,8 +628,8 @@ fn a_track_shorter_than_the_rings_low_water_still_joins_when_the_next_is_queued_
 #[test]
 fn every_format_the_player_reads_plays_through_the_pipeline_to_its_length() {
     // In their own containers, and ALAC in MP4. AAC in MP4 plays with its
-    // encoder's priming and padding, which Symphonia does not trim
-    // (decision 6 in docs/design/playback.md): 1024 frames before and 192
+    // encoder's priming and padding, which Symphonia does not trim ("Audio
+    // pipeline" in docs/internals/playback.md): 1024 frames before and 192
     // after the 8000 of the tone.
     for (name, frames) in [
         ("a.flac", 8000),

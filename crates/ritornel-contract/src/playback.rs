@@ -99,7 +99,7 @@ pub struct CopyInUse {
     pub bit_depth: Option<u32>,
 }
 
-/// How an output runs. See decision 5 in docs/design/playback.md.
+/// How an output runs. See "Audio pipeline" in docs/internals/playback.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -142,7 +142,7 @@ pub struct OutputProblem {
     pub detail: String,
 }
 
-/// Repeat. See "The queue" in docs/design/playback.md.
+/// Repeat. See "Queue and session" in docs/internals/playback.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]

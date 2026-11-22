@@ -15,7 +15,8 @@
 //! A scrobble has no ID at Last.fm. Its source key is its time, a hash of
 //! the artist, album and title it names, and its place among identical
 //! scrobbles of the same second, so two plays of one track that Last.fm
-//! dates to the same second stay two (docs/design/history.md, "Last.fm").
+//! dates to the same second stay two ("Last.fm" in
+//! docs/internals/history.md).
 //! A span is always whole seconds, so every scrobble of one second is read
 //! in the same span, and that place is the same whenever it is read. A
 //! second whose scrobbles fall on both sides of a page boundary is read

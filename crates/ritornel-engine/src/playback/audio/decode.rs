@@ -1,6 +1,6 @@
 //! The decode side of the pipeline: a file through Symphonia, then into the
-//! output's channels, then through rubato to the output's rate. See "The
-//! pipeline" in docs/design/playback.md.
+//! output's channels, then through rubato to the output's rate. See "Audio
+//! pipeline" in docs/internals/playback.md.
 //!
 //! Each step is one the pipeline can leave out: a track with no ReplayGain
 //! to apply is not scaled, one whose channels are the output's is copied,

@@ -1,8 +1,7 @@
 //! The system's default output device, through cpal, in shared mode: one
 //! stream at the device's own rate and channels, opened as 32-bit float.
 //! The stream lives on a thread of its own, which holds it until the
-//! output is dropped. See decisions 4 and 5 and "The pipeline" in
-//! docs/design/playback.md.
+//! output is dropped. See "Audio pipeline" in docs/internals/playback.md.
 //!
 //! Only the default device is used, and a stream that errors or a default
 //! that changes is not rebuilt yet: that arrives with the full player.

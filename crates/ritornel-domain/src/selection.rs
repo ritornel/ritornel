@@ -1,5 +1,5 @@
-//! Choosing which copy of a track to play. See decision 11 and "Choosing a
-//! copy" in docs/design/playback.md: selection is a pure function that
+//! Choosing which copy of a track to play. See "Copy selection" in
+//! docs/internals/playback.md: selection is a pure function that
 //! returns the candidates in order, and the player opens the first that
 //! works.
 //!

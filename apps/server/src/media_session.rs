@@ -1,6 +1,6 @@
 //! The system's media session: Now Playing and the media keys, held by the
-//! server process so they work with no window open. See decision 23 and
-//! "OS integration" in docs/design/playback.md, and spikes/now-playing.
+//! server process so they work with no window open. See "OS integration" in
+//! docs/internals/playback.md.
 //!
 //! A thread of its own owns the system's controls: it shows the player's
 //! state, and passes each key on to the player by the path a contract call

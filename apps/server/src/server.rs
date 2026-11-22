@@ -347,8 +347,8 @@ impl Server {
 }
 
 /// Derives history again if any play was judged by a rule other than the
-/// one this program has: the rule changes by rebuilding (decision 7 in
-/// docs/design/history.md).
+/// one this program has: the rule changes by rebuilding ("Incremental
+/// updates and rebuilds" in docs/internals/history.md).
 fn history_rule(library: &ritornel_engine::LibraryStore) -> Result<(), Error> {
     if !library.history_needs_rebuild().map_err(Error::Library)? {
         return Ok(());

@@ -1,6 +1,6 @@
 //! The player: one queue, one session and one listen recorder above a
-//! renderer. See decisions 1, 8, 9, 18 to 22 and 24, "The queue" and
-//! "Recording a listen" in docs/design/playback.md.
+//! renderer. See "Queue and session" and "Recording a listen" in
+//! docs/internals/playback.md.
 //!
 //! This is the control side, and it owns all state. It does nothing on its
 //! own: a command changes it, and a tick, which the server gives it a few
@@ -22,10 +22,9 @@
 //! until play opens the output again.
 //!
 //! The entry that follows is prepared as soon as a track starts, and again
-//! whenever an edit lets it go, and the renderer joins it with no gap
-//! (decisions 6 and 10). An entry queued from an album plays at its
-//! album's ReplayGain, any other at its track's (decision 7). The volume
-//! is the player's own.
+//! whenever an edit lets it go, and the renderer joins it with no gap. An
+//! entry queued from an album plays at its album's ReplayGain, any other at
+//! its track's. The volume is the player's own.
 //!
 //! The queue keeps its two orders in [`Queue`]; what edits it is in
 //! `edits`. Shuffle is a stored play order, and repeat is off, all or one;
@@ -386,8 +385,8 @@ fn resumable(reason: EndReason) -> bool {
 impl Player {
     /// The player as the last run left it: any listen left open is closed
     /// as a crash, and the queue and the place in it are back, paused.
-    /// Nothing plays until it is asked to. See decision 18 in
-    /// docs/design/playback.md.
+    /// Nothing plays until it is asked to. See "Recording a listen" in
+    /// docs/internals/playback.md.
     pub fn restore(
         setup: PlayerSetup,
         mut renderer: Box<dyn Renderer>,
@@ -1470,9 +1469,8 @@ impl Player {
 
     /// Opens the entry that follows, to be joined to the current one, as
     /// soon as there is a current one and nothing is prepared. Opened means
-    /// its copy is chosen and held from now to its end (decision 10), and
-    /// what its listen records, its start reason and the shuffle among it,
-    /// is decided now.
+    /// its copy is chosen and held from now to its end, and what its listen
+    /// records, its start reason and the shuffle among it, is decided now.
     fn prepare_next(
         &mut self,
         server: &ServerStore,
@@ -1539,8 +1537,8 @@ impl Player {
     }
 
     /// Sets the player's own volume, 0 to 1, and whether it is muted; either
-    /// left out stays as it is. See "The pipeline" in
-    /// docs/design/playback.md.
+    /// left out stays as it is. See "Queue and session" in
+    /// docs/internals/playback.md.
     pub fn set_volume(
         &mut self,
         request: Request,

@@ -6,10 +6,10 @@
 //! It counts the plays that count and are not excluded, of songs the
 //! library has bound them to. An artist's are the plays of their songs, by
 //! each song's credit; an album's are those heard from one of its versions.
-//! A play bound to no song reaches no page (docs/design/history.md,
-//! "Last.fm"), and a play bound to a song but to no record counts for its
-//! artist and for no album. Everything is read from `play_event` through
-//! its index on counted plays, with no rollup table (decision 24).
+//! A play bound to no song reaches no page ("Queries" in
+//! docs/internals/history.md), and a play bound to a song but to no record
+//! counts for its artist and for no album. Everything is read from
+//! `play_event` through its index on counted plays, with no rollup table.
 
 use std::collections::{BTreeMap, HashMap};
 

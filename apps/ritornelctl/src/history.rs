@@ -1,6 +1,6 @@
 //! `ritornelctl history`: recent listening, "on this day", and the rebuild
-//! of the derived tables. See "Queries M1 must answer" and "Rebuild" in
-//! docs/design/history.md.
+//! of the derived tables. See "Queries" and "Incremental updates and
+//! rebuilds" in docs/internals/history.md.
 //!
 //! It reads history through two direct calls, `history.recent` and
 //! `history.onThisDay`, until list views arrive with `list.open` and

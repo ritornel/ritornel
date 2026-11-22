@@ -1,7 +1,7 @@
 //! MPRIS on Linux: the player on the session bus as
 //! `org.mpris.MediaPlayer2.ritornel`, which desktop shells, `playerctl` and
 //! the media keys of every Linux desktop talk to. See "OS integration" in
-//! docs/design/playback.md and the MPRIS specification,
+//! docs/internals/playback.md and the MPRIS specification,
 //! <https://specifications.freedesktop.org/mpris-spec/latest/>.
 //!
 //! It is served with zbus on the server's own async runtime, so it adds no

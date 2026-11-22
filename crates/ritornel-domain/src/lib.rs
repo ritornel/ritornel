@@ -11,13 +11,13 @@
 //!   the policy's two release rules imply are in `discs`.
 //! - [`library`] is what those are given and what they return.
 //! - [`history`] derives plays from listens and judges them by the play
-//!   rule (docs/design/history.md).
+//!   rule (docs/internals/history.md).
 //! - [`scrobble`] matches a play another service reported by its text to
 //!   the library, or leaves it unbound.
 //! - [`selection`] orders the copies of a track for the player
-//!   (docs/design/playback.md).
+//!   (docs/internals/playback.md).
 //!
-//! See docs/design/identity.md.
+//! See docs/internals/identity.md.
 
 // Tests may unwrap and index. Everything else is held to the workspace's
 // lints, which CI denies.

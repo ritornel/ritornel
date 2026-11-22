@@ -4,8 +4,8 @@
 //! it was given, ramps the gain in and out over about 20 ms, applies the
 //! player's volume, and says what it did on another lock-free queue: when
 //! each span's first frame was handed to the output, and when and how each
-//! span ended, with its count. See "The pipeline" in
-//! docs/design/playback.md.
+//! span ended, with its count. See "Audio pipeline" in
+//! docs/internals/playback.md.
 //!
 //! A ring can carry several tracks joined with no gap. A marker says at
 //! which frame of the ring the next one begins, and there one span ends

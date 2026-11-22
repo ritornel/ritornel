@@ -285,7 +285,7 @@ impl ServerStore {
     }
 
     /// Whether the hub watches its folders for changes: on unless turned
-    /// off. See "Watching" in docs/design/identity.md.
+    /// off. See "Watching" in docs/internals/identity.md.
     pub fn watching(&self) -> Result<bool, Error> {
         self.reader.call(|connection| {
             let value: Option<String> = connection

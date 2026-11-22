@@ -1,8 +1,8 @@
 //! History at the size of a long Last.fm import: about 241,000 plays
 //! against a library of about 14,000 tracks, all invented. It
 //! measures what a wall and a page ask of history with no rollup table,
-//! the counts of every song and one artist's plays by year (history.md,
-//! "Queries M1 must answer"), and checks a small history gives the same
+//! the counts of every song and one artist's plays by year ("Queries" in
+//! docs/internals/history.md), and checks a small history gives the same
 //! answers as counting by hand.
 //!
 //! The measurement is slow to set up, so it is ignored by default. Run it

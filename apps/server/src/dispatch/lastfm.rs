@@ -268,7 +268,7 @@ mod enabled {
         }
 
         /// Starts an import if `trigger` makes one due and none is queued
-        /// or running. See "Last.fm" in docs/design/history.md.
+        /// or running. See "Last.fm" in docs/internals/history.md.
         pub(crate) fn import_if_due(&self, trigger: Trigger) -> Auto {
             self.with_stores(|stores| {
                 let session = match self.importable(stores) {
@@ -455,7 +455,8 @@ mod enabled {
             self.lastfm_or_refuse()?.client()?;
             let session = Self::session(stores)?;
             // An imported play is dated in the zone the listener was in
-            // that day, so the zones come first (history.md, "Last.fm").
+            // that day, so the zones come first ("Last.fm" in
+            // docs/internals/history.md).
             if !Self::library(stores, zones_set)? {
                 return Err(RpcError::new(
                     ErrorCode::Invalid,

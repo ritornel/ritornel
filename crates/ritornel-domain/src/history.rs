@@ -1,7 +1,6 @@
 //! From observations to plays: history derivation for listens, the play
-//! rule, and the time a play is dated at. See "From observations to
-//! plays", "Time" and decisions 6, 7, 17 to 20 and 23 in
-//! docs/design/history.md.
+//! rule, and the time a play is dated at. See "Observations and derivation"
+//! and "Time and time zones" in docs/internals/history.md.
 //!
 //! Derivation is a pure function of the observations, the corrections, the
 //! listener's zone periods, the current bindings and the policy versions.
@@ -62,9 +61,9 @@ pub const SOURCE_SECOND_PRECISION_MS: i64 = 1_000;
 /// stand, and whatever the clock was wrong by when the listen was made.
 pub const SERVER_WALL_PRECISION_MS: i64 = SKEW_TOLERANCE_MS;
 
-/// The rule that says whether a play counts. See decision 7 in
-/// docs/design/history.md: the rule is versioned, and a play stores the
-/// version that judged it, so a new rule is a rebuild.
+/// The rule that says whether a play counts. See "Observations and
+/// derivation" in docs/internals/history.md: the rule is versioned, and a
+/// play stores the version that judged it, so a new rule is a rebuild.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayRule {
     /// The version stored on each play it judges.
@@ -131,7 +130,7 @@ macro_rules! text_enum {
 
 text_enum! {
     /// Why a listen began. See "Recording a listen" in
-    /// docs/design/playback.md.
+    /// docs/internals/playback.md.
     StartReason {
         /// Someone chose it: play, a skip, or playing again after a stop.
         UserPick => "user_pick",
@@ -317,7 +316,7 @@ text_enum! {
 }
 
 /// The clocks an observation was stamped with when it was sent and taken
-/// in. See decision 20 in docs/design/history.md.
+/// in. See "Clocks and monotonic age dating" in docs/internals/history.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Received {
     /// The hub's clock when it took the observation in.
@@ -636,8 +635,8 @@ pub fn local_time(utc_ms: i64, name: &str) -> Option<LocalTime> {
     })
 }
 
-/// When a listen started, by the hub's reckoning. See decision 20 and
-/// "Time" in docs/design/history.md.
+/// When a listen started, by the hub's reckoning. See "Clocks and monotonic
+/// age dating" in docs/internals/history.md.
 ///
 /// Sent in the boot it was heard in, a listen is dated by its age: the
 /// hub's clock at receipt less the time the sender's monotonic clock says

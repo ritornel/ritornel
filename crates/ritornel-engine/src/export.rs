@@ -1,6 +1,6 @@
 //! The export of the record: what was heard, said and corrected, in files
 //! a program that knows nothing of Ritornel can read. See "Export" in
-//! docs/design/history.md.
+//! docs/internals/history.md.
 //!
 //! ```text
 //! manifest.json        what this is: its format and version, the library, and
@@ -14,8 +14,7 @@
 //! ```
 //!
 //! An observation is named by its endpoint and its source key, never by
-//! the ID of a play, which a rebuild can change (decision 4). The
-//! observations and the ratings are the record; the plays are derived
+//! the ID of a play, which a rebuild can change. The observations and the ratings are the record; the plays are derived
 //! from it, by the rule the manifest names, and are there to be used at
 //! once. The deliveries are what the record needs besides to derive again,
 //! without Ritornel, which plays there are, which observations make each,

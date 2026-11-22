@@ -1,7 +1,6 @@
-//! The identity calls of M1's first slice: the dry run of the resolver and
-//! the review listing. See "The proof" and "Resolver policy 1" in
-//! docs/design/identity.md. Scans use policy 3. A dry run can still ask
-//! about an earlier policy.
+//! Identity diagnostics: the dry run of the resolver and the review
+//! listing. See "Recording resolution" in docs/internals/identity.md. Scans
+//! use policy 3. A dry run can still ask about an earlier policy.
 //!
 //! Both name files by their path under their root, because what the owner
 //! judges is a file. That is the only path they carry, and both need a

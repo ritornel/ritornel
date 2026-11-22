@@ -3,7 +3,7 @@
 //! the middle of a track: on the next run the queue and the position are
 //! back, nothing plays, the listen is closed as a crash with at most five
 //! seconds lost, and it reaches history once, however often it is sent.
-//! See "Recording a listen" in docs/design/playback.md.
+//! See "Recording a listen" in docs/internals/playback.md.
 //!
 //! As in `scan.rs`, `ritornel-server` is taken from beside `ritornelctl`,
 //! and nothing here sleeps: each wait is for a process to print a line or

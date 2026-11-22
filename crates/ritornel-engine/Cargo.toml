@@ -29,12 +29,12 @@ getrandom = "0.4.3"
 # for every file, and without it each would be parsed again every time.
 rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled", "cache", "functions"] }
 # The ring between the decode thread and the output, which the output's
-# real-time callback reads without locking or allocating. Pinned as
-# docs/design/playback.md names it.
+# real-time callback reads without locking or allocating. See "Audio pipeline"
+# in docs/internals/playback.md.
 rtrb = "=0.4.1"
 # Resampling a track to the output's rate, with the fixed-ratio FFT
-# resampler docs/design/playback.md names. Pinned exactly: three major
-# versions came out in four months.
+# resampler ("Audio pipeline" in docs/internals/playback.md). Pinned exactly:
+# three major versions came out in four months.
 rubato = "=5.1.0"
 # A stored payload, a decision's evidence and a job's checkpoint are JSON.
 serde = { version = "1.0.229", features = ["derive"] }

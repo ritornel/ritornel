@@ -1,6 +1,6 @@
 //! What reading one file gives: the payload that is stored verbatim as a
-//! `source_item_revision`, and that claims are extracted from. See
-//! "Scanning one file" steps 3 and 4 in docs/design/identity.md.
+//! `source_item_revision`, and that claims are extracted from. See "Scanning
+//! and audio hashing" in docs/internals/identity.md.
 //!
 //! The reader is in the engine, where the files are. The types are here
 //! because the extractor, which is pure, reads them.

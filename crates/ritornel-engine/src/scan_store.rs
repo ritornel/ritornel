@@ -1,8 +1,7 @@
 //! What a scan writes to `library.db` as it records files: sources, source
-//! items, revisions, audio assets, pictures and claims. This is step 2 and
-//! steps 4 to 6 of "Scanning one file" in docs/design/identity.md, and the
-//! rows of its "Rescans" table. Which recording a file is comes after, in
-//! `resolve_store`.
+//! items, revisions, audio assets, pictures and claims. See "Scanning and
+//! audio hashing" and "Rescans and file moves" in docs/internals/identity.md.
+//! Which recording a file is comes after, in `resolve_store`.
 
 use std::collections::HashMap;
 

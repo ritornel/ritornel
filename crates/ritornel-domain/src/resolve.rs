@@ -1,5 +1,5 @@
-//! The resolver: which recording each source item is. See "Resolver policy
-//! 1" and "Merge, split and never-link" in docs/design/identity.md.
+//! The resolver: which recording each source item is. See "Recording
+//! resolution" in docs/internals/identity.md.
 //!
 //! One ladder serves every policy; a [`Policy`] is the numbers and switches
 //! it decides by. Policy 2 is policy 1 with four
@@ -1291,7 +1291,7 @@ pub struct Replacement {
 /// own assignment is consulted. If it lands on the recording the item
 /// already has, as a re-rip or a re-encode does, the item is kept. If not,
 /// a different song was saved over the old name, and the item is to be
-/// retired. See "Rescans" in docs/design/identity.md.
+/// retired. See "Rescans and file moves" in docs/internals/identity.md.
 pub fn judge_replacements(
     library: &Library,
     replacements: &[Replacement],

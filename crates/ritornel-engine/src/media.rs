@@ -1,16 +1,14 @@
 //! Reading one file: the "where the file is" half of a scan. It demuxes
 //! without decoding, hashes the audio, reads every tag verbatim and
 //! records each picture by its hash, and returns the payload that is
-//! stored as a revision. See "Scanning one file" steps 3 and 4 and decision
-//! 5 in docs/design/identity.md.
+//! stored as a revision. See "Scanning and audio hashing" in
+//! docs/internals/identity.md.
 //!
-//! Audio hash scheme 1 is the audio-hash spike's, exactly
-//! (spikes/audio-hash/README.md, "Recommended scheme 1"): BLAKE3 over
-//! `ritornel-audio`, the scheme number, our own name for the codec, the
-//! parameters and the configuration the codec's table names, and the
-//! payload bytes of every packet in order. It is that definition as
-//! Symphonia 0.6.1 delivers it, which is why the fixtures in `fixtures/`
-//! pin every hash.
+//! Audio hash scheme 1 (`HASH_SCHEME = 1`) hashes `ritornel-audio`, the
+//! scheme number, our own name for the codec, the parameters and the
+//! configuration the codec's table names, and the payload bytes of every
+//! packet in order. It is that definition as Symphonia 0.6.1 delivers it,
+//! which is why the fixtures in `fixtures/` pin every hash.
 //!
 //! Nothing here writes: a file is opened for reading and nothing else.
 

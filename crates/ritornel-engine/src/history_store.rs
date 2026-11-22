@@ -1,7 +1,7 @@
 //! History in `library.db`: the one ingest path for a listen, derivation of
-//! plays in the same transaction, the full rebuild, and the reads M1 needs.
-//! See decisions 1 to 5, 17 to 24, "From observations to plays", "Rebuild"
-//! and "Queries M1 must answer" in docs/design/history.md.
+//! plays in the same transaction, the full rebuild, and history queries. See
+//! "Observations and derivation", "Incremental updates and rebuilds", and
+//! "Queries" in docs/internals/history.md.
 //!
 //! An observation is written once and never changed. Plays are derived
 //! from observations by the pure functions in `ritornel_domain::history`,
@@ -33,7 +33,7 @@ pub const INGEST_METHOD: &str = "history.ingest";
 /// One finished listen, as the playing server sends it to the hub: every
 /// field `listen_staging` holds, with public IDs. It is stored verbatim as
 /// the observation's payload. See "Recording a listen" in
-/// docs/design/playback.md.
+/// docs/internals/playback.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListenRecord {
@@ -109,8 +109,8 @@ pub struct ListenRecord {
     pub shuffle: bool,
 }
 
-/// What the sender stamps each send with, retries included. See decision
-/// 20 in docs/design/history.md.
+/// What the sender stamps each send with, retries included. See "Clocks and
+/// monotonic age dating" in docs/internals/history.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendStamps {
     /// The sender's wall clock.
@@ -122,7 +122,7 @@ pub struct SendStamps {
 }
 
 /// What the one ingest call takes: observations of one kind, from one
-/// endpoint. See decision 5 in docs/design/history.md.
+/// endpoint. See "Observations and derivation" in docs/internals/history.md.
 #[derive(Debug, Clone, Copy)]
 pub enum Observations<'a> {
     /// One listen, as the playing server sends it, with the stamps of this
@@ -279,8 +279,8 @@ pub struct ListenRow {
 }
 
 /// A play event's ID: 16 bytes computed from its first observation's
-/// endpoint and source key, so a rebuild gives it again. See decision 4 in
-/// docs/design/history.md.
+/// endpoint and source key, so a rebuild gives it again. See "Observations
+/// and derivation" in docs/internals/history.md.
 fn play_id(endpoint: &[u8; 16], source_key: &[u8]) -> [u8; 16] {
     let mut hash = Sha256::new();
     hash.update(b"ritornel-play-event");
@@ -1416,8 +1416,8 @@ impl LibraryStore {
     /// history source. Each is stored keyed on its endpoint and its source
     /// key, with its detail, and its play is derived, in one transaction;
     /// a batch of imports moves its cursor in the same transaction. What is
-    /// sent again as it was writes nothing. See decision 5 in
-    /// docs/design/history.md.
+    /// sent again as it was writes nothing. See "Observations and derivation"
+    /// in docs/internals/history.md.
     pub fn ingest(&self, observations: Observations<'_>) -> Result<IngestOutcome, Error> {
         match observations {
             Observations::Listen { record, stamps } => Ok(IngestOutcome::Listen(
@@ -1501,8 +1501,8 @@ impl LibraryStore {
     /// Drops every play and derives them all again from the observations,
     /// in one transaction, under the rule in force, and returns what
     /// `receipt` makes of what it did. With `dry_run` nothing is kept, and
-    /// the answer says what would change. See "Rebuild" in
-    /// docs/design/history.md.
+    /// the answer says what would change. See "Incremental updates and
+    /// rebuilds" in docs/internals/history.md.
     pub fn rebuild_history(
         &self,
         request: WriteRequest,
@@ -1586,8 +1586,8 @@ impl LibraryStore {
     /// there, and derives every play again, in one transaction: a zone that
     /// was assumed is worked out at derive time, so a corrected one moves
     /// the local dates of the plays it covers. `receipt` makes the result
-    /// from how many plays changed. See decision 18 and "Time" in
-    /// docs/design/history.md.
+    /// from how many plays changed. See "Local dates and zone periods" in
+    /// docs/internals/history.md.
     pub fn set_zone_periods(
         &self,
         request: WriteRequest,
@@ -1691,7 +1691,7 @@ impl LibraryStore {
     /// pass: what the Songs view and a wall read. Only plays that count
     /// and are not excluded, dated or not, from every source. Read through
     /// the partial index on counted plays; there is no rollup table
-    /// (decision 24 in docs/design/history.md).
+    /// ("Queries" in docs/internals/history.md).
     pub fn play_counts(&self, listener: Id) -> Result<Vec<(Id, i64, Option<i64>)>, Error> {
         self.read(move |connection| {
             let mut statement = connection.prepare_cached(

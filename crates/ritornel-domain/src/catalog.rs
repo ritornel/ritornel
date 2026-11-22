@@ -1,7 +1,6 @@
 //! From bound items to a catalog: releases, track appearances, release
-//! groups, artists and credits, and what each of them shows. See "Resolver
-//! policy 1", "Displayed metadata" and "Release groups" in
-//! docs/design/identity.md.
+//! groups, artists and credits, and what each of them shows. See "Catalog
+//! projection and displayed metadata" in docs/internals/identity.md.
 //!
 //! Everything here is recomputed from the claims on every run and mapped
 //! back onto the rows that exist, so that a run over an unchanged library

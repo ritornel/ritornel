@@ -589,7 +589,8 @@ fn songs(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
     let credit_keys: Vec<i64> = found.values().filter_map(|song| song.credit).collect();
     let credits = credits(connection, &credit_keys)?;
 
-    // Plays, by the index history.md names for them.
+    // Plays, through the counted-plays index ("Queries" in
+    // docs/internals/history.md).
     let recordings: Vec<i64> = found.values().map(|song| song.recording).collect();
     let mut plays: HashMap<i64, (u64, Option<i64>)> = HashMap::new();
     let listener: Option<i64> =

@@ -1,6 +1,7 @@
 //! What changes the queue and the player's settings: shuffle and repeat,
 //! playing an entry now, and adding, taking out, moving and clearing
-//! entries by their IDs. See "The queue" in docs/design/playback.md.
+//! entries by their IDs. See "Queue and session" in
+//! docs/internals/playback.md.
 //!
 //! An edit may name the queue revision it was decided on. If the queue has
 //! moved past it, the edit changes nothing and fails with
@@ -283,7 +284,7 @@ impl Player {
     /// Sets the volume, whether it is muted, shuffle and repeat, in one
     /// transaction. Shuffle on writes a new random play order with the
     /// current entry first; off goes back to queue order at the current
-    /// entry. See "The pipeline" and "The queue" in docs/design/playback.md.
+    /// entry. See "Queue and session" in docs/internals/playback.md.
     pub fn set(
         &mut self,
         request: Request,

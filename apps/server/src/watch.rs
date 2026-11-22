@@ -1,7 +1,7 @@
 //! Watching the hub's folders, so that new, changed, moved and removed
 //! files reach the library without a scan by hand, and new or changed
 //! artist pictures without an import by hand. See "Watching" in
-//! docs/design/identity.md.
+//! docs/internals/identity.md.
 //!
 //! One thread watches every music root and picture folder through the
 //! system: FSEvents on macOS, inotify on Linux. Once a folder's changes

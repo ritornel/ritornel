@@ -1,7 +1,7 @@
 //! The scan job: walk a root, read what is new or changed, record it, mark
-//! what is gone, and resolve the library. See "Scanning one file" and
-//! "Rescans" in docs/design/identity.md, and "Jobs and outbox" in
-//! docs/internals/server.md.
+//! what is gone, and resolve the library. See "Scanning and audio hashing"
+//! and "Rescans and file moves" in docs/internals/identity.md, and "Jobs and
+//! outbox" in docs/internals/server.md.
 //!
 //! A [`ScanRun`] is one claimed job, advanced a step at a time. Each step
 //! is two halves, which is the note's seam between where the file is and
