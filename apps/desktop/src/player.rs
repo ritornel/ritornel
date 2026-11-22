@@ -918,7 +918,7 @@ mod tests {
         let event: PlaybackState = serde_json::from_value(serde_json::json!({
             "revision": 12, "status": "paused", "positionMs": 2000, "volume": 1.0,
             "muted": false, "shuffle": false, "repeat": "off", "queueRevision": 1,
-            "queueLength": 1, "output": {"mode": "shared", "sampleRateHz": 44100, "channels": 2}
+            "queueLength": 1, "output": {"name": "null", "mode": "shared", "sampleRateHz": 44100, "channels": 2}
         }))?;
         let mut kept = None;
         assert!(keep_state(&mut kept, event.clone()).is_some());
