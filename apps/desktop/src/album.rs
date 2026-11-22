@@ -318,7 +318,11 @@ impl Album {
             this.update(cx, |page, cx| {
                 match answer {
                     Ok(Ok(read)) => {
-                        page.whole_wanted = false;
+                        // The records at the foot are what a whole read adds:
+                        // until they come, one is still wanted.
+                        if read.more.is_some() {
+                            page.whole_wanted = false;
+                        }
                         page.took(read, cx);
                     }
                     Ok(Err(error)) => {
