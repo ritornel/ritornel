@@ -11,5 +11,5 @@
 -- change to the schema is a new numbered file.
 -- =============================================================================
 
--- The server that sent the scrobble to the service, set when it is taken to be sent. NULL for one not sent yet, and for one sent before this was kept, which the hub sent.
+-- The server that last took the scrobble to be sent, set when it does; a try that failed and waits for the next keeps it. NULL for one never taken, and for one taken before this was kept (attempts > 0), which the hub sent: no hub has moved yet, so library_meta.hub_server_id still names it.
 ALTER TABLE history_delivery ADD COLUMN sent_by_server_id INTEGER REFERENCES server(id);
