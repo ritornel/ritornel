@@ -385,6 +385,27 @@ mod tests {
     }
 
     #[test]
+    fn a_volume_or_a_part_is_a_record_of_its_own_and_no_disc() {
+        // Volumes and parts come out as records of their own, so neither
+        // word is a marker, in a title or a folder's name.
+        for title in [
+            "Night Drives Vol. 1",
+            "Night Drives Vol. 2",
+            "Night Drives, Vol. 2 [Remastered]",
+            "Night Drives Volume 3",
+            "Night Drives (Vol. II)",
+            "Night Drives Part 2",
+            "Night Drives, Pt. 1",
+            "Night Drives (Part II) [Deluxe]",
+        ] {
+            assert_eq!(disc_in_title(title), None, "{title}");
+        }
+        for folder in ["Vol. 1", "Vol 2", "Volume 2", "Part 1", "Pt. 2"] {
+            assert_eq!(disc_of_folder(folder), None, "{folder}");
+        }
+    }
+
+    #[test]
     fn a_folder_names_its_disc_by_a_marker() {
         assert_eq!(disc_of_folder("CD1"), Some(1));
         assert_eq!(disc_of_folder("Disc 2"), Some(2));
