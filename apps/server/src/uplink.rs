@@ -237,18 +237,15 @@ impl Uplink {
         }
         // Each route is resolved again at each dial, so a hub found by its
         // name is found wherever its address has moved, and the best way
-        // to it is chosen again: this network before a tailnet. Each
-        // address has its own time, so one that does not answer leaves the
-        // next its chance.
+        // to it is chosen again: this network before a tailnet, and the
+        // next tried soon when one does not answer (`link::first_answer`).
         let (candidates, mut tried) = link::candidates(&self.link.routes).await;
-        for (route, address) in candidates {
-            match link::within(link::CONNECT_WAIT, self.open(address)).await {
-                Ok(client) => {
-                    self.answered(Some(address));
-                    return Ok(client);
-                }
-                Err(why) => tried.push(format!("{route} ({address}): {why}")),
+        match link::first_answer(candidates, |address| self.open(address)).await {
+            Ok((address, client)) => {
+                self.answered(Some(address));
+                return Ok(client);
             }
+            Err(failed) => tried.extend(failed),
         }
         let why = if tried.is_empty() {
             "the link has no route to the hub".to_owned()

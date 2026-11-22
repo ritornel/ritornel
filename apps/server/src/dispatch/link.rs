@@ -339,14 +339,14 @@ impl Core {
         let (address, descriptor) = runtime
             .block_on(async {
                 let (candidates, mut tried) = link::candidates(&invite.routes).await;
-                for (route, address) in candidates {
-                    let reached = link::reach(address, invite.hub, &invite.key, &*self.entropy);
-                    match link::within(link::CONNECT_WAIT, reached).await {
-                        Ok(descriptor) => return Ok((address, descriptor)),
-                        Err(why) => tried.push(format!("{route} ({address}): {why}")),
-                    }
-                }
-                Err(format!("no route reached the hub. {}", tried.join("; ")))
+                let reached = link::first_answer(candidates, |address| {
+                    link::reach(address, invite.hub, &invite.key, &*self.entropy)
+                })
+                .await;
+                reached.map_err(|failed| {
+                    tried.extend(failed);
+                    format!("no route reached the hub. {}", tried.join("; "))
+                })
             })
             .map_err(|why| {
                 RpcError::new(ErrorCode::Unavailable, why).with_detail("reason", "hub_unreachable")
