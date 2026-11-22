@@ -235,7 +235,7 @@ async fn scan(
 
 /// Only a complete list may replace the saved loved tracks.
 fn loved_page_complete(read: u64, total: u64, empty: bool, last: bool) -> Result<bool, Error> {
-    if read == total && last {
+    if read == total && last && (!empty || total == 0) {
         return Ok(true);
     }
     if empty || last || read >= total {
@@ -251,7 +251,7 @@ fn loved_page_complete(read: u64, total: u64, empty: bool, last: bool) -> Result
 /// invalidates the list before it can clear any previously saved love.
 async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Vec<Love>>, Error> {
     let mut loves = Vec::new();
-    let mut first_total = None;
+    let mut first_paging = None;
     let mut page_number = 1;
     loop {
         if sink.stopping() {
@@ -271,10 +271,11 @@ async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Ve
             ));
         }
         let total = page.total();
-        let expected = *first_total.get_or_insert(total);
-        if total != expected {
+        let pages = page.total_pages();
+        let (expected_total, expected_pages) = *first_paging.get_or_insert((total, pages));
+        if (total, pages) != (expected_total, expected_pages) {
             return Err(Error::source(format!(
-                "Last.fm's loved-track total changed from {expected} to {total} on page {page_number}"
+                "Last.fm's loved-track list changed on page {page_number}: expected {expected_total} tracks in {expected_pages} pages, found {total} in {pages}"
             )));
         }
         let rows = page.len();
@@ -283,12 +284,7 @@ async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Ve
             title: row.track().name().to_owned(),
             loved_at_ms: seconds_to_ms(row.loved_at()),
         }));
-        if loved_page_complete(
-            loves.len() as u64,
-            total,
-            rows == 0,
-            page_number >= page.total_pages(),
-        )? {
+        if loved_page_complete(loves.len() as u64, total, rows == 0, page_number >= pages)? {
             return Ok(Some(loves));
         }
         page_number += 1;
