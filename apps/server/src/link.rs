@@ -259,6 +259,60 @@ pub(crate) async fn resolve(route: &str) -> Result<Vec<SocketAddr>, String> {
     Ok(usable)
 }
 
+/// Where a route's address leads, in the order a satellite tries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Way {
+    /// An address on this network, written as an address.
+    Here,
+    /// A name, such as `studio-mac.local`, that resolves to an address on
+    /// this network.
+    NamedHere,
+    /// An address on a tailnet: through a tunnel, which is slower for the
+    /// masters a satellite pulls.
+    Tailnet,
+}
+
+impl Way {
+    fn of(route: &str, address: SocketAddr) -> Self {
+        match address.ip() {
+            IpAddr::V4(v4) if crate::config::is_tailnet(v4) => Self::Tailnet,
+            _ if route.parse::<SocketAddr>().is_ok() => Self::Here,
+            _ => Self::NamedHere,
+        }
+    }
+}
+
+/// The addresses a satellite tries to reach its hub, best first, with the
+/// route each came from, and why any route gave none. Every route is
+/// resolved again, all at once, and what it gives is ordered by where it
+/// leads ([`Way`]): an address on this network, then a name that resolves
+/// to one, then a tailnet, so a satellite at home pulls masters over its
+/// own network and uses a tunnel only when that fails. Among equals, the
+/// order the invite named them holds.
+pub(crate) async fn candidates(routes: &[String]) -> (Vec<(String, SocketAddr)>, Vec<String>) {
+    let routes = routes.iter().take(MAX_ROUTES);
+    let resolved = futures_util::future::join_all(routes.clone().map(|route| resolve(route))).await;
+    let mut found = Vec::new();
+    let mut problems = Vec::new();
+    for (route, addresses) in routes.zip(resolved) {
+        match addresses {
+            Ok(addresses) => found.extend(
+                addresses
+                    .into_iter()
+                    .map(|address| (Way::of(route, address), route.clone(), address)),
+            ),
+            Err(why) => problems.push(format!("{route}: {why}")),
+        }
+    }
+    // Stable, so the invite's order holds among equals.
+    found.sort_by_key(|(way, ..)| *way);
+    let found = found
+        .into_iter()
+        .map(|(_, route, address)| (route, address))
+        .collect();
+    (found, problems)
+}
+
 /// Asks the server at `route` for its descriptor with a fresh nonce, and
 /// returns it if that server is the hub `hub`: it has that ID, proves it
 /// holds `key`, is a hub, and speaks this server's contract. Nothing but
@@ -481,6 +535,37 @@ mod tests {
         for ip in ["100.63.255.255", "100.128.0.1", "192.168.1.20"] {
             assert!(!crate::config::is_tailnet(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[tokio::test]
+    async fn this_network_is_tried_before_a_name_for_it_and_a_tailnet_last() {
+        let routes = [
+            "100.64.7.3:4747",
+            "localhost:4747",
+            "nowhere.invalid:4747",
+            "192.168.1.20:4747",
+            "10.0.0.2:4747",
+        ]
+        .map(str::to_owned);
+        let (found, problems) = candidates(&routes).await;
+        let order: Vec<_> = found
+            .iter()
+            .map(|(route, address)| (route.as_str(), address.ip().to_string()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("192.168.1.20:4747", "192.168.1.20".to_owned()),
+                ("10.0.0.2:4747", "10.0.0.2".to_owned()),
+                ("localhost:4747", "127.0.0.1".to_owned()),
+                ("100.64.7.3:4747", "100.64.7.3".to_owned()),
+            ]
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("nowhere.invalid:4747"),
+            "{problems:?}"
+        );
     }
 
     #[tokio::test]

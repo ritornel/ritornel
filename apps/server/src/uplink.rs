@@ -235,28 +235,19 @@ impl Uplink {
                 return Err(problem.clone());
             }
         }
-        let mut tried = Vec::new();
         // Each route is resolved again at each dial, so a hub found by its
-        // name is found wherever its address has moved.
-        for route in self.link.routes.iter().take(link::MAX_ROUTES) {
-            // Each address has its own time, so one that does not answer
-            // leaves the next its chance.
-            let opened = async {
-                let mut why = Vec::new();
-                for address in link::resolve(route).await? {
-                    match link::within(link::CONNECT_WAIT, self.open(address)).await {
-                        Ok(client) => return Ok((address, client)),
-                        Err(problem) => why.push(format!("{address}: {problem}")),
-                    }
-                }
-                Err(why.join(", "))
-            };
-            match opened.await {
-                Ok((address, client)) => {
+        // name is found wherever its address has moved, and the best way
+        // to it is chosen again: this network before a tailnet. Each
+        // address has its own time, so one that does not answer leaves the
+        // next its chance.
+        let (candidates, mut tried) = link::candidates(&self.link.routes).await;
+        for (route, address) in candidates {
+            match link::within(link::CONNECT_WAIT, self.open(address)).await {
+                Ok(client) => {
                     self.answered(Some(address));
                     return Ok(client);
                 }
-                Err(why) => tried.push(format!("{route}: {why}")),
+                Err(why) => tried.push(format!("{route} ({address}): {why}")),
             }
         }
         let why = if tried.is_empty() {
