@@ -22,7 +22,7 @@ pub(crate) mod store;
 pub(crate) mod tests;
 
 pub use audio::{AudioRenderer, OnDemand, Output};
-pub use catalog::TrackDisplay;
+pub use catalog::{Catalog, Copy, TrackDisplay};
 pub use outbox::{Delivered, SendStamps, deliver_listens};
 pub use player::{
     AddTracks, CHECKPOINT_EVERY_MS, Direction, Done, NowPlaying, Order, OutputFailing, Place,
@@ -30,6 +30,6 @@ pub use player::{
     Status, Summary,
 };
 pub use queue::Repeat;
-pub use renderer::{End, Event, Format, Progress, RenderError, Renderer};
+pub use renderer::{End, Event, FileFacts, Format, Progress, RenderError, Renderer};
 /// Why a track was queued, which every listen of it records.
 pub use ritornel_domain::history::ContextKind;

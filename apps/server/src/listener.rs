@@ -9,6 +9,9 @@
 //! POST /v1/ticket                trades the credential for a ticket that opens one socket
 //! GET  /v1/ws                    the socket that carries calls and events
 //! GET  /v1/art/{artId}/{size}    a cover, with the credential or a media token
+//! POST /v1/link                  a satellite joining, with an invite's secret
+//! GET  /v1/audio/{appearanceId}/{sourceItemId}
+//!                                a master, for a satellite, with its link session
 //! ```
 //!
 //! A connection is one of at most `Bounds::max_connections` being served,
@@ -279,6 +282,10 @@ fn router(core: Arc<Core>, tickets: Arc<Tickets>) -> Router {
         .route(route::LINK, post(join))
         .route(route::WS, get(socket))
         .route(&format!("{}/{{art}}/{{size}}", route::ART), get(art))
+        .route(
+            &format!("{}/{{appearance}}/{{item}}", route::AUDIO),
+            get(audio),
+        )
         // A path the server does not have is checked like any other, so
         // asking without a credential shows nothing of what exists.
         .fallback(|| async { StatusCode::NOT_FOUND })
@@ -461,6 +468,69 @@ async fn ticket(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// How much of a master is read from the disk at a time while it is sent.
+const AUDIO_CHUNK: usize = 256 * 1024;
+
+/// A master, for a satellite to play: `GET /v1/audio/{appearanceId}/
+/// {sourceItemId}`, as `link.copies` named it. Only a link session reads
+/// it. The file is sent as it is read, and refused if it is no longer what
+/// the scan read.
+async fn audio(
+    State(core): State<Arc<Core>>,
+    Extension(peer): Extension<Option<Peer>>,
+    Path((appearance, item)): Path<(String, String)>,
+) -> Response {
+    if peer.is_none() {
+        return (StatusCode::FORBIDDEN, "only a satellite reads masters\n").into_response();
+    }
+    let (Ok(appearance), Ok(item)) = (appearance.parse::<Id>(), item.parse::<Id>()) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Reading the library and opening the file wait on the disk.
+    let opened = tokio::task::spawn_blocking(move || {
+        let (path, facts) = core.master(appearance, item)?;
+        let file = std::fs::File::open(path).ok()?;
+        let size = file.metadata().ok()?.len();
+        Some((file, size, facts))
+    })
+    .await;
+    let Ok(Some((file, size, facts))) = opened else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if size != facts.size_bytes {
+        return (
+            StatusCode::CONFLICT,
+            "the file has changed since it was scanned\n",
+        )
+            .into_response();
+    }
+    let chunks = futures_util::stream::unfold(Some(file), |file| async move {
+        let mut file = file?;
+        let read = tokio::task::spawn_blocking(move || {
+            let mut chunk = vec![0; AUDIO_CHUNK];
+            let read = std::io::Read::read(&mut file, &mut chunk)?;
+            chunk.truncate(read);
+            Ok::<_, std::io::Error>((file, chunk))
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|read| read);
+        match read {
+            Ok((_, chunk)) if chunk.is_empty() => None,
+            Ok((file, chunk)) => Some((Ok(axum::body::Bytes::from(chunk)), Some(file))),
+            Err(failed) => Some((Err(failed), None)),
+        }
+    });
+    (
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_LENGTH, size.to_string()),
+        ],
+        axum::body::Body::from_stream(chunks),
+    )
+        .into_response()
 }
 
 /// The largest cover a satellite takes from its hub.

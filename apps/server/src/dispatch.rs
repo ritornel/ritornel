@@ -17,12 +17,13 @@ use ritornel_contract::methods::{
     HistoryRebuild, HistoryRecent, HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones,
     IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall,
     LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
-    LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkInvite,
-    LinkJoin, LinkStatusCall, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
-    MediaTokenCall, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume,
-    PlaybackSeek, PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove,
-    QueueRemove, QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello,
-    ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks, TracksGet,
+    LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkCopiesCall,
+    LinkInvite, LinkJoin, LinkStatusCall, LinkTracksCall, ListClose, ListLocate, ListOpen,
+    ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet, PlaybackJump,
+    PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet, PlaybackSkip,
+    PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow, RatingsSet,
+    RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList, SourcesAdd,
+    SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -866,6 +867,12 @@ impl Core {
                 run::<LinkJoin>(params, |params| self.link_join(stores, session, &params))
             }
             LinkStatusCall::NAME => run::<LinkStatusCall>(params, |_| self.link_status(stores)),
+            LinkTracksCall::NAME => {
+                run::<LinkTracksCall>(params, |params| self.link_tracks(stores, &params))
+            }
+            LinkCopiesCall::NAME => {
+                run::<LinkCopiesCall>(params, |params| self.link_copies(stores, &params))
+            }
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {
                 run::<HistorySetZones>(params, |params| self.history_set_zones(stores, &params))

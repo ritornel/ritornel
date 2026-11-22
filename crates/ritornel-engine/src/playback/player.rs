@@ -36,13 +36,13 @@ use std::sync::Arc;
 
 use ritornel_domain::history::{ContextKind, EndReason, StartReason};
 
-use crate::playback::catalog::{Copy, TrackDisplay};
+use crate::playback::catalog::{Catalog, Copy, TrackDisplay};
 use crate::playback::listen::{Recorder, Span};
 use crate::playback::queue::{Queue, Random, Repeat};
 use crate::playback::renderer::{End, Event, Format, Progress, RenderError, Renderer, ReplayGain};
 use crate::playback::store::{Change, Entry, Started, Wrote};
 use crate::timekeeping::Timekeeper;
-use crate::{Clock, Command, Entropy, Error, Id, LibraryStore, ServerStore, new_id};
+use crate::{Clock, Command, Entropy, Error, Id, ServerStore, new_id};
 
 mod edits;
 
@@ -391,7 +391,7 @@ impl Player {
         setup: PlayerSetup,
         mut renderer: Box<dyn Renderer>,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<(Self, Vec<Id>), Error> {
         let crashed = server.close_crashed_listens()?;
         let session = server.playback_session()?;
@@ -449,7 +449,7 @@ impl Player {
         Ok((player, crashed))
     }
 
-    fn read_display(&self, library: Option<&LibraryStore>) -> Option<TrackDisplay> {
+    fn read_display(&self, library: Option<&dyn Catalog>) -> Option<TrackDisplay> {
         let entry = self.entry()?;
         library?.track(entry.appearance).ok().flatten()
     }
@@ -766,7 +766,7 @@ impl Player {
     fn start(
         &mut self,
         server: &ServerStore,
-        library: &LibraryStore,
+        library: &dyn Catalog,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
         let roots = roots(server)?;
@@ -837,7 +837,7 @@ impl Player {
     fn open(
         &mut self,
         entry: &Entry,
-        library: &LibraryStore,
+        library: &dyn Catalog,
         roots: &HashMap<String, PathBuf>,
     ) -> Result<Result<Loaded, RenderError>, Error> {
         let copies = match library.copies(entry.appearance, self.setup.server_id) {
@@ -848,18 +848,13 @@ impl Player {
         let mut failure = RenderError::new("no_copy_reachable", "no file of this track is here");
         let from_ms = self.position_ms.max(0);
         for copy in copies {
-            let Some(root) = roots.get(&copy.root) else {
+            let Some(path) = copy.path(roots) else {
                 continue;
             };
             let listen = self.facts(entry, &copy, self.start_reason)?;
             let span = self.next_span();
             let start = u64::try_from(from_ms).unwrap_or(0);
-            match self.renderer.load(
-                &crate::walk::under(root, &copy.rel_path),
-                copy.facts,
-                start,
-                span,
-            ) {
+            match self.renderer.load(&path, copy.facts, start, span) {
                 Ok(format) => {
                     let duration_ms = duration_of(&copy, &format);
                     let listen = Started {
@@ -892,7 +887,7 @@ impl Player {
         index: usize,
         reason: StartReason,
         server: &ServerStore,
-        library: &LibraryStore,
+        library: &dyn Catalog,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
         let playing = self.status == Status::Playing;
@@ -937,7 +932,7 @@ impl Player {
 
     /// Takes the library's first listener as the one listening, if there
     /// is none yet: whoever plays is heard as someone.
-    fn find_listener(&mut self, server: &ServerStore, library: &LibraryStore) -> Result<(), Error> {
+    fn find_listener(&mut self, server: &ServerStore, library: &dyn Catalog) -> Result<(), Error> {
         if self.listener.is_none() {
             self.listener = library.first_listener()?;
             if let Some(listener) = self.listener {
@@ -954,7 +949,7 @@ impl Player {
         request: Request,
         what: PlayTracks,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<Done, Error> {
         let PlayTracks {
             tracks,
@@ -1050,7 +1045,7 @@ impl Player {
         &mut self,
         request: Request,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<Done, Error> {
         if let Some(done) = Self::replayed(server, &request)? {
             return Ok(done);
@@ -1110,7 +1105,7 @@ impl Player {
         entry: Id,
         position_ms: i64,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<Done, Error> {
         if let Some(done) = Self::replayed(server, &request)? {
             return Ok(done);
@@ -1135,7 +1130,7 @@ impl Player {
         position_ms: i64,
         cut: EndReason,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
         self.seeks += 1;
@@ -1189,7 +1184,7 @@ impl Player {
         from: Id,
         direction: Direction,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<Done, Error> {
         if let Some(done) = Self::replayed(server, &request)? {
             return Ok(done);
@@ -1240,7 +1235,7 @@ impl Player {
     pub fn tick(
         &mut self,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<Vec<PlayerEvent>, Error> {
         let mut events = Vec::new();
         self.sync(server, &mut events);
@@ -1357,7 +1352,7 @@ impl Player {
     fn fail_track(
         &mut self,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
         failure: &RenderError,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
@@ -1382,7 +1377,7 @@ impl Player {
         &mut self,
         finished: bool,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
         // A track that failed is not played again, whatever repeat says.
@@ -1474,7 +1469,7 @@ impl Player {
     fn prepare_next(
         &mut self,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<(), Error> {
         let (Some(_), Some(library)) = (&self.loaded, library) else {
             return Ok(());
@@ -1494,16 +1489,12 @@ impl Player {
         self.renderer.set_replay_gain(gain_for(&entry));
         let mut opened = None;
         for copy in copies {
-            let Some(root) = roots.get(&copy.root) else {
+            let Some(path) = copy.path(&roots) else {
                 continue;
             };
             let listen = self.facts(&entry, &copy, reason)?;
             let span = self.next_span();
-            match self.renderer.queue_next(
-                &crate::walk::under(root, &copy.rel_path),
-                copy.facts,
-                span,
-            ) {
+            match self.renderer.queue_next(&path, copy.facts, span) {
                 Ok(Some(format)) => {
                     let duration_ms = duration_of(&copy, &format);
                     let listen = Started {

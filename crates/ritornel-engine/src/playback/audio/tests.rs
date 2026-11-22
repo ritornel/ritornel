@@ -5,6 +5,7 @@
 //! the ffmpeg that `mise.toml` pins (`fixtures/audio/generate.sh`), so no
 //! test needs ffmpeg.
 
+use crate::playback::Catalog;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -1408,7 +1409,7 @@ impl Pipeline {
             shuffle: None,
             known: false,
         };
-        let library = Some(&self.library);
+        let library: Option<&dyn Catalog> = Some(&self.library);
         self.player
             .play(request, what, &self.server, library)
             .unwrap();
@@ -1521,7 +1522,7 @@ fn a_song_taken_out_of_up_next_in_the_last_half_second_is_never_heard_through_th
         state.position_ms
     );
     let request = rig.request("queue.remove");
-    let (server, library) = (&rig.server, Some(&rig.library));
+    let (server, library): (_, Option<&dyn Catalog>) = (&rig.server, Some(&rig.library));
     rig.player
         .remove(request, None, &[second], server, library)
         .unwrap();
@@ -1588,7 +1589,7 @@ fn an_output_that_goes_away_mid_track_saves_where_it_was_heard_and_play_goes_on_
     // Play opens an output again and carries on from there, as a listen
     // that continues the one cut off.
     let request = rig.request("playback.resume");
-    let (server, library) = (&rig.server, Some(&rig.library));
+    let (server, library): (_, Option<&dyn Catalog>) = (&rig.server, Some(&rig.library));
     rig.player.resume(request, server, library).unwrap();
     rig.until(|state| state.status == Status::Stopped);
     let [_, resumed] = rig.staged().try_into().unwrap();

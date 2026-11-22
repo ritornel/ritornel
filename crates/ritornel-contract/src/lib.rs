@@ -94,8 +94,9 @@ pub use library::{
     SourcesAddParams, SourcesList,
 };
 pub use link::{
-    HubStatus, InviteLink, LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkRequest,
-    LinkStatus, SatelliteStatus, link_request_proof,
+    HubCopy, HubStatus, InviteLink, LinkCopies, LinkCopiesParams, LinkGranted, LinkInvite,
+    LinkInviteParams, LinkJoinParams, LinkRequest, LinkStatus, LinkTracks, LinkTracksParams,
+    SatelliteStatus, link_request_proof,
 };
 pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,
@@ -187,6 +188,11 @@ pub mod route {
     /// [`LinkGranted`](crate::LinkGranted). Like the descriptor it needs no
     /// credential: the invite's secret is the credential.
     pub const LINK: &str = "/v1/link";
+
+    /// A master, for a satellite to play: `GET /v1/audio/{appearanceId}/
+    /// {sourceItemId}` under this prefix, as `link.copies` names it. Only
+    /// a link session reads it, with its token in the header.
+    pub const AUDIO: &str = "/v1/audio";
 
     /// Whether the server is up: a [`Health`]. It needs a credential.
     pub const HEALTH: &str = "/v1/health";

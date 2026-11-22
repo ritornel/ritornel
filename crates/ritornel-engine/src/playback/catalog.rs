@@ -2,8 +2,15 @@
 //! what a track shows, and the tracks of an album or of a folder in the
 //! order they are played. See "Copy selection" and "Queue and session" in
 //! docs/internals/playback.md.
+//!
+//! The player reads it through [`Catalog`]: `library.db` itself on a hub,
+//! and on a satellite the hub, through its link, with each copy pulled to
+//! a file of the satellite's own before it plays.
 
 use ritornel_domain::selection::{self, Candidate};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use rusqlite::{Connection, OptionalExtension, Row};
 
 use crate::playback::renderer::FileFacts;
@@ -40,21 +47,174 @@ pub struct TrackDisplay {
     recording_key: Option<i64>,
 }
 
-/// One copy of a track on this server: a master file, where it is and
-/// what the listen names when it plays.
+impl TrackDisplay {
+    /// An appearance that shows nothing yet: what a track read from
+    /// elsewhere than this library starts from.
+    pub fn new(appearance: Id) -> Self {
+        Self {
+            appearance,
+            recording: None,
+            release: None,
+            title: None,
+            artist: None,
+            album: None,
+            disc: None,
+            track: None,
+            duration_ms: None,
+            art: None,
+            rating: None,
+            loved: false,
+            recording_key: None,
+        }
+    }
+}
+
+/// What the player reads from the library. A hub reads `library.db`; a
+/// satellite reads the hub.
+pub trait Catalog: Send + Sync {
+    /// What an appearance shows, followed through its redirect. `None` when
+    /// there is no such appearance.
+    fn track(&self, appearance: Id) -> Result<Option<TrackDisplay>, Error>;
+
+    /// What each appearance shows, in the order given: `None` for one the
+    /// library does not have.
+    fn tracks(&self, appearances: &[Id]) -> Result<Vec<Option<TrackDisplay>>, Error>;
+
+    /// The copies of an appearance that the server `server` can open, best
+    /// first.
+    fn copies(&self, appearance: Id, server: Id) -> Result<Vec<Copy>, Error>;
+
+    /// The listener a new player plays for: the library's first.
+    fn first_listener(&self) -> Result<Option<Id>, Error>;
+
+    /// Which of `appearances` the library does not have, if any.
+    fn unknown_appearance(&self, appearances: &[Id]) -> Result<Option<Id>, Error>;
+
+    /// Reads again what is said of a track: after a rating is set.
+    fn said_again(&self, track: &mut TrackDisplay) -> Result<(), Error>;
+
+    /// The tracks of a release, in disc and track order. `None` when there
+    /// is no such release.
+    fn release_tracks(&self, release: Id) -> Result<Option<Vec<TrackDisplay>>, Error>;
+}
+
+impl Catalog for LibraryStore {
+    fn track(&self, appearance: Id) -> Result<Option<TrackDisplay>, Error> {
+        LibraryStore::track(self, appearance)
+    }
+
+    fn tracks(&self, appearances: &[Id]) -> Result<Vec<Option<TrackDisplay>>, Error> {
+        LibraryStore::tracks(self, appearances)
+    }
+
+    fn copies(&self, appearance: Id, server: Id) -> Result<Vec<Copy>, Error> {
+        LibraryStore::copies(self, appearance, server)
+    }
+
+    fn first_listener(&self) -> Result<Option<Id>, Error> {
+        LibraryStore::first_listener(self)
+    }
+
+    fn unknown_appearance(&self, appearances: &[Id]) -> Result<Option<Id>, Error> {
+        LibraryStore::unknown_appearance(self, appearances)
+    }
+
+    fn said_again(&self, track: &mut TrackDisplay) -> Result<(), Error> {
+        LibraryStore::said_again(self, track)
+    }
+
+    fn release_tracks(&self, release: Id) -> Result<Option<Vec<TrackDisplay>>, Error> {
+        LibraryStore::release_tracks(self, release)
+    }
+}
+
+/// One copy of a track this server can open: a master file, where it is
+/// and what the listen names when it plays.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Copy {
-    pub(crate) candidate: Candidate,
+pub struct Copy {
     pub(crate) source_item: Id,
     pub(crate) revision_no: i64,
     pub(crate) asset: Id,
     pub(crate) duration_ms: i64,
-    /// The root's name, which this server's `server.db` maps to a folder.
-    pub(crate) root: String,
-    /// The path under the root.
-    pub(crate) rel_path: String,
+    pub(crate) location: Location,
     /// What the scan that read this revision recorded of the file.
     pub(crate) facts: FileFacts,
+}
+
+/// Where a copy is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Location {
+    /// In one of this server's roots.
+    Root {
+        /// The root's name, which this server's `server.db` maps to a
+        /// folder.
+        root: String,
+        /// The path under the root.
+        rel_path: String,
+    },
+    /// A file of this server's own: on a satellite, a master pulled from
+    /// the hub.
+    File(PathBuf),
+}
+
+impl Copy {
+    /// The master's source item.
+    pub fn source_item(&self) -> Id {
+        self.source_item
+    }
+
+    /// The revision of it the scan last read.
+    pub fn revision_no(&self) -> i64 {
+        self.revision_no
+    }
+
+    /// The audio asset it plays as.
+    pub fn asset(&self) -> Id {
+        self.asset
+    }
+
+    /// Its length as the library knows it: 0 when it does not.
+    pub fn duration_ms(&self) -> i64 {
+        self.duration_ms
+    }
+
+    /// What the scan recorded of the file, which it must still have to be
+    /// played under that identity.
+    pub fn facts(&self) -> FileFacts {
+        self.facts
+    }
+
+    /// Where it is on this machine, given this server's roots by name:
+    /// `None` for a root this server does not have.
+    pub fn path(&self, roots: &HashMap<String, PathBuf>) -> Option<PathBuf> {
+        match &self.location {
+            Location::Root { root, rel_path } => {
+                Some(crate::walk::under(roots.get(root)?, rel_path))
+            }
+            Location::File(path) => Some(path.clone()),
+        }
+    }
+
+    /// A copy of the master `source_item` at revision `revision_no`, which
+    /// plays as the asset `asset`, kept at `path`. `facts` are the file's
+    /// there, which the player checks before it plays it.
+    pub fn fetched(
+        source_item: Id,
+        revision_no: i64,
+        asset: Id,
+        duration_ms: i64,
+        path: PathBuf,
+        facts: FileFacts,
+    ) -> Self {
+        Self {
+            source_item,
+            revision_no,
+            asset,
+            duration_ms,
+            location: Location::File(path),
+            facts,
+        }
+    }
 }
 
 const DISPLAY_COLUMNS: &str = "ta.public_id, r.public_id, rel.public_id, ta.display_title,
@@ -229,7 +389,7 @@ impl LibraryStore {
     /// every file bound to it, or to an appearance merged into it, that is
     /// in one of that server's roots and was found by the last scan.
     pub(crate) fn copies(&self, appearance: Id, server: Id) -> Result<Vec<Copy>, Error> {
-        let found: Vec<Copy> = self.read(|connection| {
+        let found: Vec<(Candidate, Copy)> = self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT si.id, si.public_id, sr.revision_no, aa.id, aa.public_id, aa.lossless,
                         aa.sample_rate_hz, aa.bit_depth, aa.bitrate_kbps, aa.duration_ms,
@@ -252,42 +412,50 @@ impl LibraryStore {
                        (SELECT canonical_id FROM track_appearance WHERE public_id = ?1))",
             )?;
             let rows = statement.query_map((appearance.as_bytes(), server.as_bytes()), |row| {
-                Ok(Copy {
-                    candidate: Candidate {
-                        source_item: row.get(0)?,
-                        asset: row.get(3)?,
-                        lossless: row.get(5)?,
-                        sample_rate_hz: row.get(6)?,
-                        bit_depth: row.get(7)?,
-                        bitrate_kbps: row.get(8)?,
-                        missing: row.get(10)?,
+                let candidate = Candidate {
+                    source_item: row.get(0)?,
+                    asset: row.get(3)?,
+                    lossless: row.get(5)?,
+                    sample_rate_hz: row.get(6)?,
+                    bit_depth: row.get(7)?,
+                    bitrate_kbps: row.get(8)?,
+                    missing: row.get(10)?,
+                };
+                Ok((
+                    candidate,
+                    Copy {
+                        source_item: Id::from_bytes(row.get(1)?),
+                        revision_no: row.get(2)?,
+                        asset: Id::from_bytes(row.get(4)?),
+                        duration_ms: row.get(9)?,
+                        location: Location::Root {
+                            root: row.get(11)?,
+                            rel_path: row.get(12)?,
+                        },
+                        // An item the scan left without them matches no file.
+                        facts: FileFacts {
+                            size_bytes: row
+                                .get::<_, Option<i64>>(13)?
+                                .and_then(|size| u64::try_from(size).ok())
+                                .unwrap_or(u64::MAX),
+                            mtime_ms: row.get::<_, Option<i64>>(14)?.unwrap_or(i64::MIN),
+                        },
                     },
-                    source_item: Id::from_bytes(row.get(1)?),
-                    revision_no: row.get(2)?,
-                    asset: Id::from_bytes(row.get(4)?),
-                    duration_ms: row.get(9)?,
-                    root: row.get(11)?,
-                    rel_path: row.get(12)?,
-                    // An item the scan left without them matches no file.
-                    facts: FileFacts {
-                        size_bytes: row
-                            .get::<_, Option<i64>>(13)?
-                            .and_then(|size| u64::try_from(size).ok())
-                            .unwrap_or(u64::MAX),
-                        mtime_ms: row.get::<_, Option<i64>>(14)?.unwrap_or(i64::MIN),
-                    },
-                })
+                ))
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
-        let candidates: Vec<Candidate> = found.iter().map(|copy| copy.candidate.clone()).collect();
+        let candidates: Vec<Candidate> = found
+            .iter()
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
         Ok(selection::select(&candidates)
             .into_iter()
             .filter_map(|chosen| {
                 found
                     .iter()
-                    .find(|copy| copy.candidate.source_item == chosen.source_item)
-                    .cloned()
+                    .find(|(candidate, _)| candidate.source_item == chosen.source_item)
+                    .map(|(_, copy)| copy.clone())
             })
             .collect())
     }

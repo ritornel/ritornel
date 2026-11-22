@@ -108,6 +108,77 @@ pub async fn post(
     .await
 }
 
+/// How long a download may go without a byte before it is given up.
+const DOWNLOAD_IDLE: Duration = Duration::from_secs(30);
+
+/// Fetches `GET <path>` from `endpoint` with the credential into the file
+/// `to`, which is made or replaced, and returns how many bytes it holds.
+/// The body is written as it comes, never held whole. It gives up when no
+/// byte has come for 30 seconds, and leaves what it wrote for the caller
+/// to remove.
+pub async fn download(
+    endpoint: SocketAddr,
+    path: &str,
+    credential: &Credential,
+    to: &std::path::Path,
+) -> Result<u64, Error> {
+    use std::io::Write;
+
+    let stream = connect(endpoint).await?;
+    let mut body = within_deadline(async {
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(transport)?;
+        tokio::spawn(connection);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header(HOST, endpoint.to_string())
+            .header(AUTHORIZATION, authorization(credential)?)
+            .body(Full::new(Bytes::new()))
+            .map_err(transport)?;
+        let response = sender.send_request(request).await.map_err(transport)?;
+        match response.status() {
+            StatusCode::OK => Ok(response.into_body()),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::Refused {
+                status: response.status().as_u16(),
+            }),
+            other => Err(Error::Protocol(format!(
+                "GET {path} was answered with HTTP {}",
+                other.as_u16()
+            ))),
+        }
+    })
+    .await?;
+    let mut file = std::fs::File::create(to).map_err(|source| Error::File {
+        doing: "write",
+        path: to.to_owned(),
+        source,
+    })?;
+    let mut written = 0_u64;
+    loop {
+        let frame = tokio::time::timeout(DOWNLOAD_IDLE, body.frame())
+            .await
+            .map_err(|_| transport("the download stalled"))?;
+        let Some(frame) = frame else { break };
+        let frame = frame.map_err(transport)?;
+        if let Ok(data) = frame.into_data() {
+            file.write_all(&data).map_err(|source| Error::File {
+                doing: "write",
+                path: to.to_owned(),
+                source,
+            })?;
+            written += data.len() as u64;
+        }
+    }
+    file.sync_all().map_err(|source| Error::File {
+        doing: "write",
+        path: to.to_owned(),
+        source,
+    })?;
+    Ok(written)
+}
+
 /// Sends one request on a connection that is already made, with the
 /// credential if there is one and a JSON body if there is one, and returns
 /// whatever came back. Nothing has been sent on the connection yet.

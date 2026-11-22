@@ -23,15 +23,37 @@ use ritornel_contract::{
     TrackSummary,
 };
 use ritornel_engine::playback::{
-    self as engine, AddTracks, Direction, Done, Order, Place, PlayTracks, Player, PlayerEvent,
-    PlayerState, Request, Settings, Status, TrackDisplay,
+    self as engine, AddTracks, Catalog, Direction, Done, Order, Place, PlayTracks, Player,
+    PlayerEvent, PlayerState, Request, Settings, Status, TrackDisplay,
 };
 use ritornel_engine::{Command, LibraryStore, ServerStore};
 use tracing::{error, warn};
 
+use crate::hub_catalog::HubCatalog;
+
 use super::lists::expired;
 use super::{Core, Stores, fingerprint, lock};
 use crate::session::Session;
+
+/// What the player reads the library through: `library.db` on a hub, and
+/// the hub on a satellite.
+fn catalog<'a>(
+    library: Option<&'a LibraryStore>,
+    hub: Option<&'a HubCatalog>,
+) -> Option<&'a dyn Catalog> {
+    match (library, hub) {
+        (Some(library), _) => Some(library),
+        (None, Some(hub)) => Some(hub),
+        (None, None) => None,
+    }
+}
+
+/// The most rows a view read from the hub to be played may have.
+const MAX_VIEW_FROM_HUB: usize = 20_000;
+
+/// The rows one window of a view read from the hub asks for: the most the
+/// contract sends at once.
+const MAX_WINDOW_ROWS: usize = crate::views::MAX_WINDOW_ROWS as usize;
 
 /// The most queue entries one `queue.window` returns.
 const MAX_WINDOW: u32 = 500;
@@ -257,16 +279,22 @@ impl Core {
         work: impl FnOnce(
             &mut Player,
             &ServerStore,
-            Option<&LibraryStore>,
+            Option<&dyn Catalog>,
         ) -> Result<(T, Vec<PlayerEvent>), ritornel_engine::Error>,
     ) -> Result<T, RpcError> {
         let library = stores
             .library
             .read()
             .unwrap_or_else(PoisonError::into_inner);
+        let hub = self.hub_catalog();
         let mut player = lock(&self.player);
         let player = player.as_mut().ok_or_else(no_player)?;
-        let (done, events) = work(player, &stores.server, library.as_ref()).map_err(refused)?;
+        let (done, events) = work(
+            player,
+            &stores.server,
+            catalog(library.as_ref(), hub.as_ref()),
+        )
+        .map_err(refused)?;
         let state = player.state();
         drop(library);
         self.publish_player(events, Some(state));
@@ -285,11 +313,12 @@ impl Core {
                 .library
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
+            let hub = self.hub_catalog();
             let mut player = lock(&self.player);
             let Some(player) = player.as_mut() else {
                 return Ok(());
             };
-            let ticked = player.tick(&stores.server, library.as_ref());
+            let ticked = player.tick(&stores.server, catalog(library.as_ref(), hub.as_ref()));
             // The record's sign follows the player's saves, and nothing
             // else a tick can fail at.
             match player.save_failing() {
@@ -303,6 +332,39 @@ impl Core {
             Ok(())
         });
         ticked.unwrap_or(Ok(()))
+    }
+
+    /// On a satellite, the hub's library as its player reads it.
+    pub(crate) fn hub_catalog(&self) -> Option<HubCatalog> {
+        self.uplink()
+            .map(|uplink| HubCatalog::new(uplink, self.dir.root().join("cache").join("audio")))
+    }
+
+    /// The songs of a view the session holds at the hub, in order: read
+    /// from the hub a window at a time, as the session's own calls are.
+    fn view_from_hub(&self, session: &Session, view: &str) -> Result<Vec<Id>, RpcError> {
+        let (Some(uplink), Some(session)) = (self.uplink(), self.shared(session)) else {
+            return Err(expired(view));
+        };
+        let mut ids = Vec::new();
+        loop {
+            let params = serde_json::json!({
+                "view": view,
+                "offset": ids.len(),
+                "limit": MAX_WINDOW_ROWS,
+            });
+            let window: ritornel_contract::ListWindow =
+                serde_json::from_value(uplink.forward(&session, "list.window", Some(params))?)
+                    .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))?;
+            let read = window.rows.len();
+            ids.extend(window.rows.into_iter().filter_map(|row| match row {
+                ritornel_contract::Row::Song(song) => Some(song.appearance_id),
+                _ => None,
+            }));
+            if read < MAX_WINDOW_ROWS || ids.len() >= MAX_VIEW_FROM_HUB {
+                return Ok(ids);
+            }
+        }
     }
 
     /// Stops the player for a clean shutdown: the open listen is closed as
@@ -399,6 +461,7 @@ impl Core {
     /// The tracks a source names. A view's rows the library no longer has
     /// are left out, and the start moves with them.
     fn source_tracks(
+        &self,
         stores: &Stores,
         session: &Session,
         source: &PlaySource,
@@ -408,17 +471,27 @@ impl Core {
         match source {
             PlaySource::Tracks { ids } => Ok((ids.clone(), (ContextKind::Manual, None), start)),
             PlaySource::Release { id } => {
-                let tracks = Self::library(stores, |library| {
-                    library
-                        .release_tracks(*id)
-                        .map_err(refused)?
-                        .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no such release"))
-                })?;
+                let library = stores
+                    .library
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let hub = self.hub_catalog();
+                let tracks = catalog(library.as_ref(), hub.as_ref())
+                    .ok_or_else(|| refused(ritornel_engine::Error::NoLibrary))?
+                    .release_tracks(*id)
+                    .map_err(refused)?
+                    .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no such release"))?;
                 Ok((
                     tracks.iter().map(|track| track.appearance).collect(),
                     (ContextKind::Album, Some(*id)),
                     start,
                 ))
+            }
+            // On a satellite the view is held at the hub, and read from it.
+            PlaySource::View { view } if self.uplink().is_some() => {
+                let ids = self.view_from_hub(session, view)?;
+                let moved = start.map(|start| start.min(ids.len()));
+                Ok((ids, (ContextKind::Query, None), moved))
             }
             PlaySource::View { view } => {
                 let resolved = session.view(view).ok_or_else(|| expired(view))?;
@@ -463,7 +536,7 @@ impl Core {
             return Ok(answer);
         }
         let (tracks, default_context, start) =
-            Self::source_tracks(stores, session, &params.source, params.start)?;
+            self.source_tracks(stores, session, &params.source, params.start)?;
         let context = params
             .context
             .map_or(default_context, |context| (context.kind, context.reference));
@@ -492,7 +565,7 @@ impl Core {
             &mut Player,
             Request,
             &ServerStore,
-            Option<&LibraryStore>,
+            Option<&dyn Catalog>,
         ) -> Result<Done, ritornel_engine::Error>,
     ) -> Result<PlaybackChanged, RpcError>
     where
@@ -601,8 +674,9 @@ impl Core {
             .library
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        let shown = match library.as_ref() {
-            Some(library) => library.tracks(&appearances).map_err(refused)?,
+        let hub = self.hub_catalog();
+        let shown = match catalog(library.as_ref(), hub.as_ref()) {
+            Some(catalog) => catalog.tracks(&appearances).map_err(refused)?,
             None => Vec::new(),
         };
         let entries = page
@@ -636,7 +710,7 @@ impl Core {
             &mut Player,
             Request,
             &ServerStore,
-            Option<&LibraryStore>,
+            Option<&dyn Catalog>,
         ) -> Result<Done, ritornel_engine::Error>,
     ) -> Result<PlaybackChanged, RpcError> {
         if !self.has_player() {
@@ -699,7 +773,7 @@ impl Core {
             return Ok(answer);
         }
         let (tracks, default_context, _) =
-            Self::source_tracks(stores, session, &params.source, None)?;
+            self.source_tracks(stores, session, &params.source, None)?;
         let context = params
             .context
             .map_or(default_context, |context| (context.kind, context.reference));
@@ -783,7 +857,8 @@ impl Core {
             .library
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        let Some(library) = library.as_ref() else {
+        let hub = self.hub_catalog();
+        let Some(library) = catalog(library.as_ref(), hub.as_ref()) else {
             return;
         };
         let mut player = lock(&self.player);

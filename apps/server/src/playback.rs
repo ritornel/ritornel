@@ -117,8 +117,13 @@ pub(crate) fn restore(
         fail_at_position_ms: run.fail_at_position_ms,
         fail_saves_after_ms: run.fail_saves_after_ms,
     };
-    let (player, crashed) =
-        Player::restore(setup, Box::new(renderer), server, library).map_err(crate::Error::Store)?;
+    let (player, crashed) = Player::restore(
+        setup,
+        Box::new(renderer),
+        server,
+        library.map(|library| library as &dyn ritornel_engine::playback::Catalog),
+    )
+    .map_err(crate::Error::Store)?;
     if !crashed.is_empty() {
         info!(
             crashed = crashed.len(),

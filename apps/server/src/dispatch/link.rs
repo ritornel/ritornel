@@ -1,15 +1,20 @@
-//! `link.invite`, `link.join` and `link.status`, and the hub's side of a
-//! satellite joining. See "Hub and satellites" in
+//! `link.invite`, `link.join` and `link.status`, the hub's side of a
+//! satellite joining, and what a hub tells a satellite's player:
+//! `link.tracks` and `link.copies`. See "Hub and satellites" in
 //! docs/internals/linking.md.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::PoisonError;
 
 use ritornel_contract::{
-    CONTRACT_VERSION, ErrorCode, HubStatus, InviteLink, LinkGranted, LinkInvite, LinkInviteParams,
-    LinkJoinParams, LinkRequest, LinkStatus, MAX_CLIENT_TEXT, RpcError, SatelliteStatus,
-    ServerRole, hex, link_request_proof,
+    CONTRACT_VERSION, ErrorCode, HubCopy, HubStatus, Id, InviteLink, LinkCopies, LinkCopiesParams,
+    LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkRequest, LinkStatus, LinkTracks,
+    LinkTracksParams, MAX_CLIENT_TEXT, RpcError, SatelliteStatus, ServerRole, hex,
+    link_request_proof,
 };
 use ritornel_engine::HubLink;
+use ritornel_engine::playback::{Catalog, FileFacts};
 use tracing::{info, warn};
 
 use super::{Core, Stores, lock};
@@ -80,6 +85,21 @@ pub(super) fn kept_from_a_link(method: &str) -> bool {
             | "link.invite"
             | "link.join"
     )
+}
+
+fn not_a_hub() -> RpcError {
+    RpcError::new(ErrorCode::Invalid, "this server is not a library's hub")
+}
+
+/// This server's roots, by name.
+fn roots(stores: &Stores) -> Result<HashMap<String, PathBuf>, RpcError> {
+    Ok(stores
+        .server
+        .roots()
+        .map_err(internal)?
+        .into_iter()
+        .map(|(name, path)| (name, PathBuf::from(path)))
+        .collect())
 }
 
 /// A link call made on a satellite's own link session is refused: a
@@ -352,6 +372,88 @@ impl Core {
             self.changed(&mut this);
         }
         self.link_status(stores)
+    }
+
+    /// `link.tracks`, on a hub.
+    pub(super) fn link_tracks(
+        &self,
+        stores: &Stores,
+        params: &LinkTracksParams,
+    ) -> Result<LinkTracks, RpcError> {
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let library = library.as_ref().ok_or_else(not_a_hub)?;
+        let tracks = library
+            .tracks(&params.appearances)
+            .map_err(internal)?
+            .iter()
+            .map(|track| track.as_ref().map(super::playback::track))
+            .collect();
+        let release = match params.release {
+            Some(release) => library
+                .release_tracks(release)
+                .map_err(internal)?
+                .map(|tracks| tracks.iter().map(super::playback::track).collect()),
+            None => None,
+        };
+        Ok(LinkTracks {
+            tracks,
+            release,
+            listener: Catalog::first_listener(library).map_err(internal)?,
+        })
+    }
+
+    /// `link.copies`, on a hub: the masters it can serve, best first.
+    pub(super) fn link_copies(
+        &self,
+        stores: &Stores,
+        params: &LinkCopiesParams,
+    ) -> Result<LinkCopies, RpcError> {
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let library = library.as_ref().ok_or_else(not_a_hub)?;
+        let roots = roots(stores)?;
+        let copies = Catalog::copies(library, params.appearance, self.server_id)
+            .map_err(internal)?
+            .into_iter()
+            .filter_map(|copy| {
+                let path = copy.path(&roots)?;
+                Some(HubCopy {
+                    source_item_id: copy.source_item(),
+                    revision: copy.revision_no(),
+                    asset_id: copy.asset(),
+                    duration_ms: copy.duration_ms(),
+                    size_bytes: copy.facts().size_bytes,
+                    extension: path
+                        .extension()
+                        .map(|extension| extension.to_string_lossy().to_lowercase())
+                        .unwrap_or_default(),
+                })
+            })
+            .collect();
+        Ok(LinkCopies { copies })
+    }
+
+    /// Where a master of `appearance` is, with what the scan recorded of
+    /// it, for `GET /v1/audio`: only one `link.copies` offers.
+    pub(crate) fn master(&self, appearance: Id, source_item: Id) -> Option<(PathBuf, FileFacts)> {
+        let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
+        let stores = stores.as_ref()?;
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let library = library.as_ref()?;
+        let roots = roots(stores).ok()?;
+        Catalog::copies(library, appearance, self.server_id)
+            .ok()?
+            .into_iter()
+            .find(|copy| copy.source_item() == source_item)
+            .and_then(|copy| Some((copy.path(&roots)?, copy.facts())))
     }
 
     /// `link.status`.

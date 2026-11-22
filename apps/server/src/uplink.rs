@@ -7,7 +7,8 @@
 //! own to the hub, opened on its first such call and closed with it. Its
 //! calls go through unchanged, with the client's own request IDs, so the
 //! views it opens are held at the hub for it, and the hub's library, list
-//! and job events come back to it alone.
+//! and job events come back to it alone. The server keeps one more
+//! connection for its own work: what its player reads, and its listens.
 //!
 //! A connection is made by walking the routes in order: on each, the
 //! satellite checks that the server there proves it holds the hub's pinned
@@ -78,6 +79,8 @@ pub(crate) struct Uplink {
     reach: Mutex<Reach>,
     /// Each client session's connection, by the session's ID.
     sessions: Mutex<HashMap<u64, Arc<Client>>>,
+    /// The server's own connection.
+    own: Mutex<Option<Arc<Client>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -100,6 +103,7 @@ impl Uplink {
             entropy,
             reach: Mutex::default(),
             sessions: Mutex::default(),
+            own: Mutex::default(),
         }
     }
 
@@ -378,6 +382,47 @@ impl Uplink {
             }
         }
         Ok(client)
+    }
+
+    /// Calls the hub on the server's own connection, opening it if it is
+    /// not open. It waits, so it runs where waiting is allowed.
+    pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        let mut result = None;
+        for _ in 0..2 {
+            let held = lock(&self.own).clone();
+            let client = match held {
+                Some(client) => client,
+                None => {
+                    let client = Arc::new(
+                        self.runtime
+                            .block_on(self.connect())
+                            .map_err(|_| self.unreachable())?,
+                    );
+                    *lock(&self.own) = Some(Arc::clone(&client));
+                    client
+                }
+            };
+            let sent = self
+                .runtime
+                .block_on(client.call_raw(method, params.clone()));
+            let lost =
+                matches!(&sent, Err(error) if !matches!(error, ritornel_client::Error::Call(_)));
+            result = Some(sent);
+            if !lost {
+                break;
+            }
+            *lock(&self.own) = None;
+        }
+        match result {
+            Some(result) => self.answer(result),
+            None => Err(self.unreachable()),
+        }
+    }
+
+    /// Runs `work` on the server's runtime and waits for it: for what goes
+    /// to the hub other than calls, such as a master pulled.
+    pub(crate) fn block_on<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        self.runtime.block_on(work)
     }
 
     /// Lets go of a session's connection: the session has closed.
