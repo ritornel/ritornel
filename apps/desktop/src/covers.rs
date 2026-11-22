@@ -390,10 +390,27 @@ pub(crate) fn decode_picture(jpeg: &[u8]) -> Option<image::RgbaImage> {
     )
 }
 
-/// Decodes a JPEG, resizes it to `px` square when it is larger, swaps it to
-/// BGRA for GPUI and reads its average colour.
+/// A picture cut square as `object-fit: cover; object-position: center
+/// 30%` shows it in a square: at the middle across, and 30% of the way down,
+/// as the artist's banner cuts their portrait, so that a tall portrait keeps
+/// its face in the wall's circle.
+fn squared(image: image::DynamicImage) -> image::DynamicImage {
+    let (w, h) = (image.width(), image.height());
+    if w > h {
+        image.crop_imm((w - h) / 2, 0, h, h)
+    } else if h > w {
+        image.crop_imm(0, ((h - w) as f32 * 0.3).round() as u32, w, w)
+    } else {
+        image
+    }
+}
+
+/// Decodes a JPEG, cuts it square as it is shown (`squared`), resizes it
+/// to `px` square when it is larger, swaps it to BGRA for GPUI and reads its
+/// average colour.
 pub(crate) fn decode_cover(jpeg: &[u8], px: u32) -> Option<(RenderImage, Rgba, usize)> {
     let decoded = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?;
+    let decoded = squared(decoded);
     let decoded = if decoded.width() > px || decoded.height() > px {
         decoded.resize_exact(px, px, image::imageops::FilterType::Triangle)
     } else {
@@ -741,5 +758,50 @@ mod tests {
             assert!(joined.is_err());
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    /// A JPEG of three bands down it, green, red and blue, each a third.
+    fn banded(w: u32, h: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_fn(w, h, |_, y| match 3 * y / h {
+            0 => image::Rgb([0, 255, 0]),
+            1 => image::Rgb([255, 0, 0]),
+            _ => image::Rgb([0, 0, 255]),
+        });
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95)
+            .encode_image(&image)
+            .unwrap_or_default();
+        bytes
+    }
+
+    #[test]
+    fn a_tall_picture_is_cut_square_30_percent_down_not_squashed() {
+        // 100 by 300, made 50 square: rows 60 to 160, green above red. Cut
+        // at the middle it would be all red; squashed, its foot blue.
+        let decoded = decode_cover(&banded(100, 300), 50);
+        assert!(decoded.is_some(), "not decoded");
+        let Some((image, _, _)) = decoded else { return };
+        let size = image.size(0);
+        assert_eq!((size.width.0, size.height.0), (50, 50));
+        let bytes = image.as_bytes(0).unwrap_or_default();
+        // In BGRA: green at the top (rows 60 to 100), red at the foot.
+        let at = |y: usize| bytes.get((y * 50 + 25) * 4..(y * 50 + 25) * 4 + 4);
+        assert!(
+            matches!(at(2), Some([b, g, r, _]) if *g > 200 && *r < 60 && *b < 60),
+            "{:?}",
+            at(2)
+        );
+        for y in [30, 47] {
+            assert!(
+                matches!(at(y), Some([b, g, r, _]) if *r > 200 && *g < 60 && *b < 60),
+                "{y}: {:?}",
+                at(y)
+            );
+        }
     }
 }
