@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ritornel_contract::methods::{
     EventsSubscribe, EventsUnsubscribe, JobsCancel, JobsGet, JobsList, LibraryCreate, LibraryStats,
@@ -39,13 +39,15 @@ fn lock(waiting: &Mutex<Waiting>) -> MutexGuard<'_, Waiting> {
 
 /// Dropping the calling future releases its reply slot even if the server never answers.
 struct Pending<'a> {
-    waiting: &'a Mutex<Waiting>,
+    waiting: &'a Weak<Mutex<Waiting>>,
     id: i64,
 }
 
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        lock(self.waiting).answers.remove(&self.id);
+        if let Some(waiting) = self.waiting.upgrade() {
+            lock(&waiting).answers.remove(&self.id);
+        }
     }
 }
 
@@ -60,7 +62,8 @@ impl Drop for Pending<'_> {
 #[derive(Debug)]
 pub struct Client {
     calls: UnboundedSender<String>,
-    waiting: Arc<Mutex<Waiting>>,
+    // The connection task owns pending senders. Its runtime may stop while callers live elsewhere.
+    waiting: Weak<Mutex<Waiting>>,
     _lifetime: oneshot::Sender<()>,
     events: UnboundedReceiver<Event>,
 }
@@ -106,7 +109,7 @@ impl Client {
         tokio::spawn(run(transport, queued, events, waiting.clone(), dropped));
         Self {
             calls,
-            waiting,
+            waiting: Arc::downgrade(&waiting),
             _lifetime: lifetime,
             events: received,
         }
@@ -118,7 +121,11 @@ impl Client {
     pub async fn call_raw(&self, method: &str, params: Value) -> Result<Value, Error> {
         let (answer, answered) = oneshot::channel();
         let id = {
-            let mut waiting = lock(&self.waiting);
+            let shared = self
+                .waiting
+                .upgrade()
+                .ok_or_else(|| transport("the connection closed"))?;
+            let mut waiting = lock(&shared);
             waiting.next += 1;
             let id = waiting.next;
             waiting.answers.insert(id, answer);
@@ -666,9 +673,9 @@ mod tests {
             _ = &mut pending => panic!("no reply was sent"),
             _ = sent(&mut requests) => {}
         }
-        assert_eq!(lock(&client.waiting).answers.len(), 1);
+        assert_eq!(lock(&client.waiting.upgrade().unwrap()).answers.len(), 1);
         drop(pending);
-        assert!(lock(&client.waiting).answers.is_empty());
+        assert!(lock(&client.waiting.upgrade().unwrap()).answers.is_empty());
     }
 
     #[tokio::test]
@@ -683,6 +690,30 @@ mod tests {
             1,
             "{err}"
         );
+    }
+
+    #[test]
+    fn stopping_the_connections_runtime_releases_calls_from_other_runtimes() {
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let connection = runtime();
+        let (client, mut requests, _replies) = connection.block_on(async { pair() });
+        let mut call = Box::pin(client.call_raw("one", json!({})));
+        connection.block_on(async {
+            tokio::select! {
+                _ = &mut call => panic!("no reply was sent"),
+                _ = sent(&mut requests) => {}
+            }
+        });
+        drop(connection);
+        runtime().block_on(async {
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(1), call).await;
+            assert!(matches!(reply, Ok(Err(Error::Transport(_)))), "{reply:?}");
+        });
     }
 
     #[tokio::test]
