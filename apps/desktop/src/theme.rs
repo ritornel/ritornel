@@ -222,6 +222,22 @@ pub(crate) fn soft_cached(name: &str, side: u32) -> std::sync::Arc<gpui::RenderI
     SOFT.with(|soft| soft.borrow_mut().get_or_insert(name, side))
 }
 
+/// Whether `image` is one of the soft-colour cache's, kept or evicted: the
+/// cache drops it from the sprite atlas itself.
+pub(crate) fn soft_holds(image: &std::sync::Arc<gpui::RenderImage>) -> bool {
+    SOFT.with(|soft| {
+        let cache = soft.borrow();
+        cache
+            .entries
+            .values()
+            .any(|(held, _)| std::sync::Arc::ptr_eq(held, image))
+            || cache
+                .evicted
+                .iter()
+                .any(|held| std::sync::Arc::ptr_eq(held, image))
+    })
+}
+
 /// Advances the soft-cache frame clock and drops any evicted soft-colour
 /// pictures from every window's sprite atlas once no view or flight holds them.
 pub(crate) fn flush_soft(window: &mut gpui::Window, cx: &mut gpui::App) {
@@ -360,6 +376,23 @@ mod tests {
         drop(held);
         assert_eq!(cache.take_unshared_evicted().len(), 1);
         assert!(cache.evicted.is_empty());
+    }
+
+    #[test]
+    fn a_soft_picture_is_known_as_the_caches_kept_or_evicted() {
+        let kept = soft_cached("known-kept", 8);
+        assert!(soft_holds(&kept));
+        let own = std::sync::Arc::new(soft_image("known-kept", 8));
+        assert!(!soft_holds(&own));
+        // Evicted, it is still the cache's to let go.
+        SOFT.with(|soft| {
+            let mut cache = soft.borrow_mut();
+            let key = ("known-kept".to_owned(), 8);
+            if let Some((image, _)) = cache.entries.remove(&key) {
+                cache.evicted.push(image);
+            }
+        });
+        assert!(soft_holds(&kept));
     }
 
     #[test]

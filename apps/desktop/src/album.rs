@@ -99,6 +99,10 @@ pub(crate) struct Album {
     /// The display's scale the large cover and the face were read for: on
     /// another display they are read again, sharp there.
     pictured_scale: f32,
+    /// The last read of the large cover and of the face asked for: an
+    /// earlier one coming late, for another display, is let go.
+    large_read: u64,
+    face_read: u64,
     /// The cover blurred for the wash, and for the banner.
     pub blur: Option<(Arc<RenderImage>, Instant)>,
     banner_blur: Option<(Arc<RenderImage>, Instant)>,
@@ -164,6 +168,8 @@ impl Album {
             large: None,
             face: None,
             pictured_scale: 0.,
+            large_read: 0,
+            face_read: 0,
             blur: None,
             banner_blur: None,
             top: 0.,
@@ -402,7 +408,7 @@ impl Album {
         let wash_radius =
             crate::blur::radius(crate::blur::WASH.0, width.max(viewport + 128.) + 180.);
         let Some(art) = self.row.art else {
-            self.soft_pictures(banner_radius, wash_radius, scale);
+            self.soft_pictures(banner_radius, wash_radius, cx);
             return;
         };
         let room = width - crate::upnext::rail(cx);
@@ -433,7 +439,7 @@ impl Album {
                     // A cover the server cannot make (one in a format it
                     // does not read) is no cover: the page takes the soft
                     // colours of a record with none, rather than no colour.
-                    None => page.soft_pictures(banner_radius, wash_radius, scale),
+                    None => page.soft_pictures(banner_radius, wash_radius, cx),
                 }
                 cx.notify();
             })
@@ -445,13 +451,16 @@ impl Album {
     /// The large cover and the face, read for the display's `scale`. Each
     /// shown is kept until the one read for it comes, without fading in again.
     fn sharp_pictures(&mut self, art: Id, side: f32, scale: f32, cx: &mut Context<Self>) {
+        self.large_read += 1;
+        let large_read = self.large_read;
         self.fetch_opt(
             art,
             (side * scale).ceil() as u32,
             cx,
             move |page, image, cx| {
-                // Read for a display the window has left since.
-                let Some(image) = image.filter(|_| page.pictured_scale == scale) else {
+                // Asked for before the last, for a display the window has
+                // left since.
+                let Some(image) = image.filter(|_| page.large_read == large_read) else {
                     return;
                 };
                 let at = page
@@ -463,12 +472,14 @@ impl Album {
                 }
             },
         );
+        self.face_read += 1;
+        let face_read = self.face_read;
         self.fetch_opt(
             art,
             (28. * scale).ceil() as u32,
             cx,
             move |page, image, cx| {
-                let Some(image) = image.filter(|_| page.pictured_scale == scale) else {
+                let Some(image) = image.filter(|_| page.face_read == face_read) else {
                     return;
                 };
                 if let Some(old) = page.face.replace(image) {
@@ -484,12 +495,17 @@ impl Album {
         self.pictured_scale = scale;
         match self.row.art {
             Some(art) => self.sharp_pictures(art, side, scale, cx),
-            None => {
-                self.face = Some(theme::soft_cached(
-                    &self.soft_name(),
-                    (28. * scale).ceil() as u32,
-                ))
-            }
+            None => self.soft_face(cx),
+        }
+    }
+
+    /// The face of a record with no cover: its soft colours. A read of a
+    /// face still to come is let go.
+    fn soft_face(&mut self, cx: &mut Context<Self>) {
+        self.face_read += 1;
+        let face = theme::soft_cached(&self.soft_name(), (28. * self.pictured_scale).ceil() as u32);
+        if let Some(old) = self.face.replace(face) {
+            crate::covers::drop_unshared(old, None, cx);
         }
     }
 
@@ -503,7 +519,7 @@ impl Album {
 
     /// For a record with no cover, the soft colours made from its title and
     /// artist: the face, and the blurs for the banner and the wash.
-    fn soft_pictures(&mut self, banner_radius: usize, wash_radius: usize, scale: f32) {
+    fn soft_pictures(&mut self, banner_radius: usize, wash_radius: usize, cx: &mut Context<Self>) {
         let name = self.soft_name();
         let soft = theme::soft_pixels(&name, crate::blur::SIDE);
         let tone = crate::blur::wash_tone(theme::dark());
@@ -520,7 +536,7 @@ impl Album {
             Arc::new(crate::blur::toned(&soft, wash_radius, tone.0, tone.1)),
             now,
         ));
-        self.face = Some(theme::soft_cached(&name, (28. * scale).ceil() as u32));
+        self.soft_face(cx);
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {

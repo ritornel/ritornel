@@ -213,6 +213,10 @@ pub(crate) struct Artist {
     /// The display's scale they were read for: on another display the face
     /// and the portrait are read again, sharp there.
     pictured_scale: f32,
+    /// The last read of the face and of the portrait asked for: an earlier
+    /// one coming late, for another display or picture, is let go.
+    face_read: u64,
+    portrait_read: u64,
     pub top: f32,
     elastic: crate::elastic::Elastic,
     /// How tall the page was when last drawn, and the column of history
@@ -277,6 +281,8 @@ impl Artist {
             banner_blur: None,
             pictured_for: None,
             pictured_scale: 0.,
+            face_read: 0,
+            portrait_read: 0,
             top: 0.,
             elastic: crate::elastic::Elastic::default(),
             height: Rc::new(Cell::new(0.)),
@@ -547,11 +553,11 @@ impl Artist {
         let wash_radius =
             crate::blur::radius(crate::blur::WASH.0, width.max(viewport + 128.) + 180.);
         let Some(art) = art else {
-            self.soft_pictures(banner_radius, wash_radius, scale);
+            self.soft_pictures(banner_radius, wash_radius, cx);
             return;
         };
         self.read_face(art, scale, cx);
-        self.read_portrait(art, scale, false, cx);
+        self.read_portrait(art, scale, cx);
         let http = Arc::clone(&self.net.art);
         let tone = crate::blur::wash_tone(theme::dark());
         let blurs = self.net.rt().spawn(async move {
@@ -577,7 +583,7 @@ impl Artist {
                     // A picture the server cannot make (one in a format it
                     // does not read) is no picture: the page takes its
                     // colour from their name, rather than no colour.
-                    None => page.soft_pictures(banner_radius, wash_radius, scale),
+                    None => page.soft_pictures(banner_radius, wash_radius, cx),
                 }
                 cx.notify();
             })
@@ -593,25 +599,38 @@ impl Artist {
         let before = self.pictured_scale;
         self.pictured_scale = scale;
         let Some(art) = art else {
-            self.face = Some(theme::soft_cached(&self.name, (28. * scale).ceil() as u32));
+            self.soft_face(cx);
             return;
         };
         self.read_face(art, scale, cx);
         let portrait_px = |scale: f32| self.net.bucket((2. * 380. * scale).ceil() as u32);
         if !self.picture_failed && portrait_px(before) != portrait_px(scale) {
-            self.read_portrait(art, scale, true, cx);
+            self.read_portrait(art, scale, cx);
+        }
+    }
+
+    /// The face that stands in for a picture: soft colour from their name.
+    /// A read of a face still to come is let go.
+    fn soft_face(&mut self, cx: &mut Context<Self>) {
+        self.face_read += 1;
+        let face = theme::soft_cached(&self.name, (28. * self.pictured_scale).ceil() as u32);
+        if let Some(old) = self.face.replace(face) {
+            crate::covers::drop_unshared(old, None, cx);
         }
     }
 
     /// The face for the strip, read for the display's `scale`.
     fn read_face(&mut self, art: Id, scale: f32, cx: &mut Context<Self>) {
+        self.face_read += 1;
+        let read = self.face_read;
         self.fetch(
             art,
             (28. * scale).ceil() as u32,
             cx,
             move |page, image, cx| {
-                // Read for a display the window has left since.
-                if page.pictured_scale != scale {
+                // Asked for before the last: for a display the window has
+                // left since, or another picture.
+                if page.face_read != read {
                     return;
                 }
                 if let Some(old) = page.face.replace(image) {
@@ -621,9 +640,12 @@ impl Artist {
         );
     }
 
-    /// Their portrait, read for the display's `scale`; `again` when it is the
-    /// same picture read sharper, the one shown kept until one is made from it.
-    fn read_portrait(&mut self, art: Id, scale: f32, again: bool, cx: &mut Context<Self>) {
+    /// Their portrait, read for the display's `scale`. Read again sharper for
+    /// another display, the one shown stays until one is made from it, and
+    /// stays if it cannot be read.
+    fn read_portrait(&mut self, art: Id, scale: f32, cx: &mut Context<Self>) {
+        self.portrait_read += 1;
+        let asked = self.portrait_read;
         // Their portrait stands at most 380 points wide at the banner's right
         // end; with none, the cover their picture is stands in for it, so that
         // every artist's circle on the wall has somewhere to fly to. It is
@@ -641,23 +663,20 @@ impl Artist {
         cx.spawn(async move |this, cx| {
             let source = read.await.ok().flatten();
             this.update(cx, |page, cx| {
-                // Too late: the page shows another picture now, or is on
-                // another display.
+                // Too late: the page shows another picture now, or a later
+                // read was asked for, for another display.
                 if page.pictured_for.map(|(at, _)| at) != Some(Some(art))
-                    || page.pictured_scale != scale
+                    || page.portrait_read != asked
                 {
                     return;
                 }
+                let again = page.portrait.is_some();
                 match source {
                     Some(source) => {
-                        if again {
-                            // Made again from this at the next render; the
-                            // one shown stays until then.
-                            if let Some(made) = &mut page.melted {
-                                made.0 = (0, 0);
-                            }
-                        } else {
-                            page.forget_portrait(None, cx);
+                        // The same picture read sharper is made again from
+                        // this at the next render; the one shown stays until then.
+                        if let Some(made) = page.melted.as_mut().filter(|_| again) {
+                            made.0 = (0, 0);
                         }
                         page.portrait = Some(Arc::new(source));
                     }
@@ -676,7 +695,7 @@ impl Artist {
 
     /// With no picture, soft colour from their name: the face, and the
     /// blurs for the banner and the wash.
-    fn soft_pictures(&mut self, banner_radius: usize, wash_radius: usize, scale: f32) {
+    fn soft_pictures(&mut self, banner_radius: usize, wash_radius: usize, cx: &mut Context<Self>) {
         let soft = theme::soft_pixels(&self.name, crate::blur::SIDE);
         let tone = crate::blur::wash_tone(theme::dark());
         let now = Instant::now();
@@ -692,7 +711,7 @@ impl Artist {
             Arc::new(crate::blur::toned(&soft, wash_radius, tone.0, tone.1)),
             now,
         ));
-        self.face = Some(theme::soft_cached(&self.name, (28. * scale).ceil() as u32));
+        self.soft_face(cx);
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
