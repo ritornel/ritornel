@@ -417,7 +417,11 @@ fn an_export_is_read_back_without_ritornel_and_holds_a_skipped_listen_with_where
         now["status"] == "playing" && now["positionMs"].as_u64() > Some(0)
     });
     assert_eq!(ritornelctl(&data_dir, &["next"]).0, Some(0));
-    until(&data_dir, &["now"], |now| now["index"] == 1);
+    // A track stopped before any of it is heard leaves no listen: the
+    // second is stopped once some of it has played.
+    until(&data_dir, &["now"], |now| {
+        now["index"] == 1 && now["positionMs"].as_u64() > Some(0)
+    });
     assert_eq!(ritornelctl(&data_dir, &["stop"]).0, Some(0));
     until(&data_dir, &["history"], |recent| {
         recent["undelivered"] == 0 && recent["plays"].as_array().unwrap().len() == 2
