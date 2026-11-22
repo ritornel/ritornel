@@ -181,7 +181,7 @@ pub(crate) struct Callback {
     gain: f32,
     target: f32,
     step: f32,
-    /// Whether the span starts a track, so `Play` needs no fade.
+    /// Whether the span starts a track, so its first frame needs no fade.
     hard_start: bool,
     volume: f32,
     volume_target: f32,
@@ -209,6 +209,9 @@ impl Callback {
         rate: u32,
         channels: usize,
     ) -> Self {
+        // The clock starts here, on the control side, so that the callback
+        // never waits for it to.
+        now();
         let ramp_frames = (rate.max(1) * RAMP_MS / 1000).max(1);
         Self {
             inbox,
@@ -321,9 +324,6 @@ impl Callback {
                 }
                 Message::Play => {
                     self.target = 1.0;
-                    if self.hard_start && self.consumed == 0 {
-                        self.gain = 1.0;
-                    }
                 }
                 Message::Pause => {
                     self.target = 0.0;
@@ -365,6 +365,23 @@ impl Callback {
         crossed
     }
 
+    /// How far the gain falls at the next frame as it fades out: by the
+    /// usual step, or faster where a track joined in the ring begins
+    /// sooner than the fade would end, so that it is out by then. A fade
+    /// the join comes too soon for, as when its marker comes late, stops
+    /// there.
+    fn fade_step(&self) -> f32 {
+        let left = (self.feed.as_ref())
+            .and_then(|feed| feed.markers.peek().ok())
+            .map(|marker| marker.at.saturating_sub(self.read));
+        match left {
+            Some(left) => self
+                .step
+                .max((self.gain - self.target) / left.saturating_add(1) as f32),
+            None => self.step,
+        }
+    }
+
     /// When the frame `frame` of this buffer is handed over, in
     /// nanoseconds on the output's clock.
     fn time_of(&self, now: u64, frame: usize) -> u64 {
@@ -390,6 +407,11 @@ impl Callback {
             if let Some(meanwhile) = self.meanwhile.take() {
                 meanwhile();
             }
+            // Paused, a span is never begun: what is left of a fade out
+            // goes no further than the span heard.
+            if self.target <= 0.0 && !self.began {
+                self.gain = 0.0;
+            }
             let silent = self.gain <= 0.0 && self.target <= 0.0;
             let feed = match &mut self.feed {
                 Some(feed) if ready && !silent && !self.cut => feed,
@@ -398,6 +420,12 @@ impl Callback {
             let Ok(chunk) = feed.ring.read_chunk(channels) else {
                 break;
             };
+            // A track played from its beginning starts at full gain, from
+            // its first frame.
+            if self.hard_start {
+                self.hard_start = false;
+                self.gain = self.target;
+            }
             let scale = self.gain * self.volume;
             let (first, second) = chunk.as_slices();
             for (at, sample) in first.iter().chain(second).enumerate() {
@@ -420,7 +448,7 @@ impl Callback {
             if self.gain < self.target {
                 self.gain = (self.gain + self.step).min(self.target);
             } else if self.gain > self.target {
-                self.gain = (self.gain - self.step).max(self.target);
+                self.gain = (self.gain - self.fade_step()).max(self.target);
             }
             if self.volume < self.volume_target {
                 self.volume = (self.volume + self.step).min(self.volume_target);
@@ -436,9 +464,6 @@ impl Callback {
         {
             rest.fill(0.0);
             self.seamless = None;
-        }
-        if written > 0 {
-            self.hard_start = false;
         }
         self.settle(at);
         self.shared.publish(self.span, self.consumed);
@@ -846,11 +871,152 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_just_before_a_join_fades_out_by_it_and_the_next_waits_for_play() {
+        let mut rig = Rig::new(1);
+        let (ring, _producer) = feed(&[0.5; 100], &[Marker { at: 40, span: 2 }]);
+        rig.install(1, ring, false);
+        rig.send(Message::Play);
+        assert_eq!(rig.render(&mut [0.0; 30]), 30);
+        // Ten frames before the join: too few for the whole fade.
+        rig.send(Message::Pause);
+        let mut out = [1.0; 20];
+        assert_eq!(rig.render(&mut out), 10);
+        // It fades all the way out over those ten, and nothing of the next
+        // track is heard.
+        assert!(out[0] > 0.45, "{out:?}");
+        assert!(
+            out[..10].windows(2).all(|pair| pair[1] < pair[0]),
+            "{out:?}"
+        );
+        assert!(out[9] <= 0.05, "{out:?}");
+        assert_eq!(out[10..], [0.0; 10]);
+        let said = rig.said();
+        assert_eq!(ended(&said), [(1, 40, End::Joined { next: 2 })]);
+        assert!(
+            !said
+                .iter()
+                .any(|event| matches!(event, Event::Began { span: 2, .. })),
+            "{said:?}"
+        );
+        assert_eq!(rig.render(&mut [0.0; 20]), 0);
+        rig.send(Message::Play);
+        assert_eq!(rig.render(&mut [0.0; 20]), 20);
+        assert!(matches!(rig.said()[..], [Event::Began { span: 2, .. }]));
+    }
+
+    #[test]
+    fn a_track_joined_after_a_pause_began_is_never_begun_while_paused() {
+        let mut rig = Rig::new(1);
+        // Its marker comes late, once the fade has half gone, as from a
+        // decoder that fell behind.
+        let (ring, mut producer, mut marks, _gate) = about_to_join(2);
+        for _ in 0..33 {
+            producer.push(0.1).unwrap();
+        }
+        rig.install(1, ring, false);
+        rig.send(Message::Play);
+        assert_eq!(rig.render(&mut [0.0; 30]), 30);
+        rig.send(Message::Pause);
+        assert_eq!(rig.render(&mut [0.0; 10]), 10);
+        marks.push(Marker { at: 40, span: 2 }).unwrap();
+        for _ in 0..20 {
+            producer.push(0.9).unwrap();
+        }
+        let mut out = [1.0; 20];
+        assert_eq!(rig.render(&mut out), 0);
+        assert_eq!(out, [0.0; 20]);
+        // Or the join is the first frame of the buffer after the pause.
+        let (ring, _producer) = feed(&[0.5; 100], &[Marker { at: 40, span: 4 }]);
+        rig.install(3, ring, false);
+        rig.send(Message::Play);
+        assert_eq!(rig.render(&mut [0.0; 40]), 40);
+        rig.send(Message::Pause);
+        assert_eq!(rig.render(&mut out), 0);
+        let said = rig.said();
+        assert!(
+            !said
+                .iter()
+                .any(|event| matches!(event, Event::Began { span: 2 | 4, .. })),
+            "{said:?}"
+        );
+        assert_eq!(
+            ended(&said),
+            [
+                (1, 40, End::Joined { next: 2 }),
+                (2, 0, End::Replaced),
+                (3, 40, End::Joined { next: 4 })
+            ]
+        );
+        // Played again, the next begins from its first frame.
+        rig.send(Message::Play);
+        assert_eq!(rig.render(&mut [0.0; 20]), 20);
+        assert!(matches!(rig.said()[..], [Event::Began { span: 4, .. }]));
+        assert_eq!(rig.shared.progress(), (4, 20));
+    }
+
+    #[test]
+    fn a_pause_before_a_track_from_its_beginning_is_heard_hands_nothing_over() {
+        let mut rig = Rig::new(1);
+        // Its decoder has nothing in the ring yet when play and pause come.
+        let (ring, mut producer) = feed(&[], &[]);
+        rig.install(1, ring, false);
+        rig.send(Message::Play);
+        assert_eq!(rig.render(&mut [0.0; 5]), 0);
+        rig.send(Message::Pause);
+        for _ in 0..50 {
+            producer.push(0.5).unwrap();
+        }
+        let mut out = [1.0; 20];
+        assert_eq!(rig.render(&mut out), 0);
+        assert_eq!(out, [0.0; 20]);
+        // Or both come before the output's next buffer.
+        let (ring, _producer) = feed(&[0.5; 50], &[]);
+        rig.install(2, ring, false);
+        rig.send(Message::Play);
+        rig.send(Message::Pause);
+        assert_eq!(rig.render(&mut out), 0);
+        assert!(
+            rig.said()
+                .iter()
+                .all(|event| !matches!(event, Event::Began { .. }))
+        );
+        // Played, each starts at full gain from its first frame.
+        rig.send(Message::Play);
+        assert_eq!(rig.render(&mut out), 20);
+        assert_eq!(out, [0.5; 20]);
+    }
+
+    #[test]
+    fn a_volume_set_after_play_and_before_the_first_frame_is_where_that_frame_starts() {
+        // Set with play, or once the output has found nothing yet to play.
+        for later in [false, true] {
+            let mut rig = Rig::new(1);
+            let (ring, mut producer) = feed(&[], &[]);
+            rig.install(1, ring, false);
+            rig.send(Message::Play);
+            if !later {
+                rig.send(Message::Volume(0.5));
+            }
+            assert_eq!(rig.render(&mut [0.0; 5]), 0);
+            if later {
+                rig.send(Message::Volume(0.5));
+            }
+            for _ in 0..20 {
+                producer.push(1.0).unwrap();
+            }
+            let mut out = [0.0; 20];
+            assert_eq!(rig.render(&mut out), 20);
+            assert_eq!(out, [0.5; 20], "later: {later}");
+        }
+    }
+
+    #[test]
     fn the_volume_ramps_to_where_it_is_set_and_scales_every_sample() {
         let mut rig = Rig::new(1);
         let (ring, _producer) = feed(&[1.0; 200], &[]);
         rig.install(1, ring, false);
         rig.send(Message::Play);
+        assert_eq!(rig.render(&mut [0.0; 5]), 5);
         rig.send(Message::Volume(0.5));
         let mut out = [0.0; 40];
         rig.render(&mut out);
