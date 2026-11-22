@@ -109,6 +109,28 @@ pub fn copy_database(from: &Path, to: &Path) -> Result<(), Error> {
     }
 }
 
+/// Holds back scrobbling in `copy`, a backup's copy of a library taken at
+/// `taken_at_ms`, for as long as it is not put back: a server that opens
+/// it sends nothing until an import has brought back what the service took
+/// after the backup. The library copied is not changed. The copy is synced
+/// and checked again, as [`copy_database`] leaves it.
+pub fn hold_sending(copy: &Path, taken_at_ms: i64) -> Result<(), Error> {
+    let connection = Location::File(copy.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    crate::delivery_store::hold_sending(&connection, taken_at_ms)?;
+    let verdict: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    drop(connection);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(copy)
+        .and_then(|file| file.sync_all())
+        .map_err(Error::Io)?;
+    if verdict == "ok" {
+        Ok(())
+    } else {
+        Err(Error::Corrupt("the copy failed SQLite's quick check"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -185,6 +207,57 @@ mod tests {
         let path = scratch.0.join("library.db");
         std::os::unix::fs::symlink(&path, &path).unwrap();
         assert!(pending_migrations(&path, Database::Library).is_err());
+    }
+
+    #[test]
+    fn a_library_put_back_from_a_backup_scrobbles_nothing_until_an_import_has_run() {
+        use crate::{Held, LibraryStore, WriteRequest};
+        let scratch = Scratch::new("held");
+        let clock = Arc::new(FixedClock::at(1_763_000_000_000));
+        let server = open(&scratch.0.join("server.db"));
+        let (identity, _) = server.ensure_identity("desk").unwrap();
+        let path = scratch.0.join("library.db");
+        let (library, _) = LibraryStore::create(
+            &path,
+            &identity,
+            WriteRequest {
+                method: "library.create",
+                command: None,
+                client: None,
+            },
+            |_| String::new(),
+            clock.clone(),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        let copy = scratch.0.join("copy.db");
+        copy_database(&path, &copy).unwrap();
+        hold_sending(&copy, 1_762_000_000_000).unwrap();
+        // The library copied is not held.
+        assert_eq!(library.held_for_import().unwrap(), None);
+        drop(library);
+
+        // Put back and opened, it is held from then on, and opened again
+        // it keeps that time.
+        let restored = LibraryStore::open(
+            &copy,
+            identity.server_id,
+            clock.clone(),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        let held = Some(Held {
+            taken_at_ms: 1_762_000_000_000,
+            since_ms: Some(1_763_000_000_000),
+        });
+        assert_eq!(restored.opened_restored().unwrap(), held);
+        clock.set(1_763_000_500_000);
+        assert_eq!(restored.opened_restored().unwrap(), held);
+        assert_eq!(restored.held_for_import().unwrap(), held);
+        // An import lifts it, once.
+        assert!(restored.release_hold().unwrap());
+        assert!(!restored.release_hold().unwrap());
+        assert_eq!(restored.opened_restored().unwrap(), None);
     }
 
     #[test]

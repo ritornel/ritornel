@@ -33,6 +33,13 @@ pub struct LastfmStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub scrobbling_since: Option<i64>,
+    /// Since when nothing is scrobbled until an import from Last.fm has
+    /// run, because the library was restored from a backup and Last.fm may
+    /// already have plays it holds waiting. The hub imports by itself; the
+    /// plays waiting go once it has. Left out when nothing waits for that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub waiting_for_import_since: Option<i64>,
     /// Scrobbles recorded, by state: `pending`, `sending`, `accepted`,
     /// `ignored`, `refused` or `unknown`.
     #[serde(default)]

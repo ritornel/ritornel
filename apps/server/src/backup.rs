@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ritornel_contract::{BackupReason, Id};
-use ritornel_engine::backup::{Database, Pending, copy_database, pending_migrations};
+use ritornel_engine::backup::{Database, Pending, copy_database, hold_sending, pending_migrations};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -47,6 +47,10 @@ A backup of a Ritornel server, taken by the server itself.
 server.db and library.db are whole SQLite databases, each a consistent copy
 of the database as it was when the backup began. backup.json says when it
 was taken, why, and what each file is.
+
+A server started on this library scrobbles nothing to Last.fm until it has
+imported from there, which it does by itself: Last.fm may already have
+plays sent after the backup was taken.
 
 To restore it, stop the server, and put server.db, library.db and, if it is
 here, config.toml into an empty data directory: on a Mac
@@ -440,6 +444,10 @@ fn fill(
         }
         let copy = into.join(name);
         copy_database(&source, &copy).map_err(|error| BackupError::Copy(name, error))?;
+        if name == "library.db" {
+            // Put back, it holds plays Last.fm may have taken since.
+            hold_sending(&copy, at_ms).map_err(|error| BackupError::Copy(name, error))?;
+        }
         // SQLite makes a file anyone may read, and server.db holds this
         // server's signing key.
         close_to_others(&copy).map_err(io("close", &copy))?;
@@ -572,6 +580,57 @@ mod tests {
         }));
         // And nothing was written in the data directory.
         assert!(!dir.backups().exists());
+    }
+
+    #[test]
+    fn the_library_in_a_backup_holds_its_scrobbles_back_and_the_library_copied_does_not() {
+        use ritornel_engine::{Held, LibraryStore, WriteRequest};
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let store = ServerStore::open(&dir.server_db(), Arc::new(SystemClock), Arc::new(OsEntropy))
+            .unwrap();
+        let (identity, _) = store.ensure_identity("desk").unwrap();
+        let open = |path: &Path| {
+            LibraryStore::open(
+                path,
+                identity.server_id,
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+            )
+            .unwrap()
+        };
+        drop(
+            LibraryStore::create(
+                &dir.library_db(),
+                &identity,
+                WriteRequest {
+                    method: "library.create",
+                    command: None,
+                    client: None,
+                },
+                |_| String::new(),
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+            )
+            .unwrap(),
+        );
+        let place = elsewhere(&scratch);
+        let taken = backup(&dir, &place, About::default()).unwrap();
+        assert_eq!(open(&dir.library_db()).held_for_import().unwrap(), None);
+        assert_eq!(
+            open(&taken.path.join("library.db"))
+                .held_for_import()
+                .unwrap(),
+            Some(Held {
+                taken_at_ms: AT,
+                since_ms: None
+            })
+        );
+        let readme = std::fs::read_to_string(taken.path.join("README.txt")).unwrap();
+        assert!(
+            readme.contains("scrobbles nothing to Last.fm until"),
+            "{readme}"
+        );
     }
 
     #[test]

@@ -1835,6 +1835,13 @@ export type LastfmStatus = {
    */
   scrobblingSince?: number,
   /**
+   * Since when nothing is scrobbled until an import from Last.fm has
+   * run, because the library was restored from a backup and Last.fm may
+   * already have plays it holds waiting. The hub imports by itself; the
+   * plays waiting go once it has. Left out when nothing waits for that.
+   */
+  waitingForImportSince?: number,
+  /**
    * Scrobbles recorded, by state: `pending`, `sending`, `accepted`,
    * `ignored`, `refused` or `unknown`.
    */

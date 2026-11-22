@@ -98,8 +98,7 @@ fn recording(record: &RecordStatus, lines: &mut Vec<(&str, String)>) {
 const WORDS: record::Words<'static> = record::Words {
     dismiss: "`ritornelctl status --dismiss`",
     restart: "restart the server",
-    sign_in: "Sign in again with `ritornelctl lastfm signin`, then turn scrobbling back on with \
-              `ritornelctl lastfm scrobbling on`.",
+    sign_in: "Sign in again with `ritornelctl lastfm signin`.",
 };
 
 /// One thing that stops the record, or a note: what, since when and why.
@@ -404,7 +403,7 @@ Record            The listen playing can’t be saved, since 2025-11-21 17:01 UT
                   Last.fm is refusing scrobbles, since 2025-11-21 17:01 UTC: Invalid API key
                   Check the API key and secret Ritornel uses, in lastfm.env in its data folder, then restart the server. It clears by itself once Last.fm takes a scrobble again. Refused scrobbles aren’t sent again; `ritornelctl status --dismiss` sets every scrobble note and warning aside.
                   Last.fm needs you to sign in again, since 2025-11-21 17:01 UTC
-                  Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. Sign in again with `ritornelctl lastfm signin`, then turn scrobbling back on with `ritornelctl lastfm scrobbling on`. Plays from before then stay in your history here.
+                  Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. Sign in again with `ritornelctl lastfm signin`. Signed in to the same account, Ritornel sends the plays waiting since; they stay in your history here either way.
                   Importing from Last.fm failed, since 2025-11-21 17:01 UTC: Last.fm did not answer
                   Ritornel tries again at the next import. If it keeps failing, check the internet connection, and the API key and secret in lastfm.env in Ritornel’s data folder, then restart the server.
 Note              1 scrobble may not have reached Last.fm, since 2025-11-21 17:01 UTC

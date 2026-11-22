@@ -14,8 +14,8 @@ pub struct Words<'a> {
     pub dismiss: &'a str,
     /// "restart the server", or "quit and reopen Ritornel".
     pub restart: &'a str,
-    /// How to sign in to Last.fm again and turn scrobbling back on, as
-    /// whole sentences: where in Settings, or the commands to run.
+    /// How to sign in to Last.fm again, as a whole sentence: where in
+    /// Settings, or the command to run.
     pub sign_in: &'a str,
 }
 
@@ -100,7 +100,8 @@ pub fn then(problem: &RecordProblem, words: Words<'_>) -> String {
         ),
         RecordProblemKind::SignInNeeded => format!(
             "Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. {sign_in} \
-             Plays from before then stay in your history here."
+             Signed in to the same account, Ritornel sends the plays waiting since; they stay \
+             in your history here either way."
         ),
         RecordProblemKind::ImportFailed => format!(
             "Ritornel tries again at the next import. If it keeps failing, check the internet \
@@ -144,7 +145,7 @@ mod tests {
     const APP: Words<'static> = Words {
         dismiss: "Dismiss",
         restart: "quit and reopen Ritornel",
-        sign_in: "Sign in again in Settings → Last.fm, then turn scrobbling back on there.",
+        sign_in: "Sign in again in Settings → Last.fm.",
     };
 
     #[test]
@@ -177,8 +178,7 @@ mod tests {
         let cli = Words {
             dismiss: "`ritornelctl status --dismiss`",
             restart: "restart the server",
-            sign_in: "Sign in again with `ritornelctl lastfm signin`, then turn scrobbling back \
-                      on with `ritornelctl lastfm scrobbling on`.",
+            sign_in: "Sign in again with `ritornelctl lastfm signin`.",
         };
         assert!(
             then(&problem(RecordProblemKind::Unreadable, 1), cli)
@@ -186,7 +186,7 @@ mod tests {
         );
         let sign_in = then(&problem(RecordProblemKind::SignInNeeded, 1), cli);
         assert!(
-            sign_in.contains("`ritornelctl lastfm scrobbling on`. Plays from before"),
+            sign_in.contains("`ritornelctl lastfm signin`. Signed in to the same account"),
             "{sign_in}"
         );
     }

@@ -80,6 +80,10 @@ pub(crate) struct Lastfm {
     /// request: the plays held back go first when it lifts.
     #[cfg(feature = "lastfm")]
     paused: std::sync::Mutex<Option<(ritornel_contract::Id, std::time::Instant)>>,
+    /// Taken by the scrobbler for each batch and by every change to the
+    /// session.
+    #[cfg(feature = "lastfm")]
+    turn: Turn,
 }
 
 /// Where a sign-in has got to.
@@ -156,6 +160,7 @@ impl Lastfm {
                 sign_ins: std::sync::Mutex::default(),
                 playing: Slot::default(),
                 paused: std::sync::Mutex::default(),
+                turn: Turn::default(),
             }
         }
         #[cfg(not(feature = "lastfm"))]
@@ -332,6 +337,12 @@ mod enabled {
     /// hold back the rest for long.
     pub(super) const REFUSED_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
+    /// How long the account sends nothing after a batch went unanswered:
+    /// the plays in it are never sent again, as they may have arrived, so
+    /// the rest wait rather than meet the same fate while Last.fm, or the
+    /// way to it, is failing.
+    pub(super) const UNANSWERED_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
     /// How long a track is heard before Last.fm is told it is playing:
     /// skipping through several tells it of the one stopped at alone.
     const SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -390,6 +401,57 @@ mod enabled {
                 return Taken::Nothing;
             }
             Taken::Show(began)
+        }
+    }
+
+    /// Whose turn it is with the session: the scrobbler's, from its read of
+    /// the session until what it sent as that session is recorded, or a
+    /// change's. A change waits for a batch on its way, and the scrobbler
+    /// stops once a change is waiting, so no batch leaves as a session
+    /// that has changed since, and a change is never kept waiting long.
+    #[derive(Debug, Default)]
+    pub(crate) struct Turn {
+        lock: std::sync::Mutex<()>,
+        changes: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A change to the session under way: while it is held, nothing is
+    /// sent.
+    #[derive(Debug)]
+    pub(crate) struct Change<'a> {
+        _held: std::sync::MutexGuard<'a, ()>,
+        changes: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    impl Drop for Change<'_> {
+        fn drop(&mut self) {
+            self.changes.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Turn {
+        /// Waits for a batch on its way to be recorded, and holds the
+        /// scrobbler back until the change is dropped.
+        pub(crate) fn change(&self) -> Change<'_> {
+            self.changes.fetch_add(1, Ordering::SeqCst);
+            Change {
+                _held: lock(&self.lock),
+                changes: &self.changes,
+            }
+        }
+
+        /// The scrobbler's turn for one batch, unless a change is waiting
+        /// or under way.
+        fn batch(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+            if self.changes.load(Ordering::SeqCst) > 0 {
+                return None;
+            }
+            Some(lock(&self.lock))
+        }
+
+        #[cfg(test)]
+        fn changing(&self) -> bool {
+            self.changes.load(Ordering::SeqCst) > 0
         }
     }
 
@@ -464,6 +526,14 @@ mod enabled {
     }
 
     impl Lastfm {
+        /// Waits for a batch the scrobbler is sending to be recorded, and
+        /// holds it back while the session changes: signed out or with
+        /// scrobbling off, the change is the cutoff, and nothing more goes
+        /// out as the session before it.
+        pub(crate) fn hold(&self) -> Change<'_> {
+            self.turn.change()
+        }
+
         /// Whether the server has an API key and secret.
         pub(crate) fn configured(&self) -> bool {
             self.client.is_some()
@@ -723,6 +793,17 @@ mod enabled {
                 });
                 match after {
                     Some(Ok((matched, stored))) => {
+                        // What Last.fm has is known now: plays a restored
+                        // library had waiting that it took are not sent.
+                        match core.with_library(|_, library| library.release_hold()) {
+                            Some(Ok(true)) => {
+                                info!("an import has run since the restore: scrobbling resumes")
+                            }
+                            Some(Err(failed)) => {
+                                error!(error = %failed, "scrobbling could not be resumed after an import")
+                            }
+                            Some(Ok(false)) | None => {}
+                        }
                         summary.matched_after = matched as u64;
                         summary.stored = u64::try_from(stored).ok();
                         info!(
@@ -781,11 +862,20 @@ mod enabled {
             }
         }
         send_due(&Sending {
+            turn: &lastfm.turn,
             session: &|| match core.with_stores(|stores| stores.server().service_session(SERVICE)) {
                 Some(Ok(session)) => session,
                 _ => None,
             },
             stopping: &|| stop.load(Ordering::SeqCst),
+            held: &|| match core.with_library(|_, library| library.held_for_import()) {
+                Some(Ok(held)) => held.is_some(),
+                Some(Err(failed)) => {
+                    error!(error = %failed, "whether scrobbling waits for an import could not be read");
+                    true
+                }
+                None => true,
+            },
             take: &|account, from| match core.with_library(|_, library| {
                 library.take_due_deliveries(account, from, ritornel_lastfm::MAX_BATCH)
             }) {
@@ -842,10 +932,17 @@ mod enabled {
     /// What sending scrobbles works through: the server's stores and
     /// Last.fm in use, and fakes in a test.
     pub(crate) struct Sending<'a> {
+        /// Taken from each read of the session until the batch sent as it
+        /// is recorded; see [`Turn`].
+        pub(crate) turn: &'a Turn,
         /// This server's session at Last.fm, as it is now.
         pub(crate) session: &'a dyn Fn() -> Option<ServiceSession>,
         /// Whether the server is stopping.
         pub(crate) stopping: &'a dyn Fn() -> bool,
+        /// Whether nothing is sent until an import has run, as in a library
+        /// restored from a backup: Last.fm may already have plays it holds
+        /// waiting, and the import brings them back first.
+        pub(crate) held: &'a dyn Fn() -> bool,
         /// Takes the next batch for an account, checked against the time
         /// scrobbling was turned on; `None` when it could not.
         pub(crate) take: &'a dyn Fn(Id, i64) -> Option<Vec<Due>>,
@@ -867,12 +964,17 @@ mod enabled {
     /// Sends what is due, a batch at a time, until nothing is due. Before
     /// each batch the session is read again: signed out, scrobbling turned
     /// off, the session refused or the server stopping, nothing more is
-    /// sent, and a new sign-in's key is the one used.
+    /// sent, and a new sign-in's key is the one used. The session cannot
+    /// change from that read until the batch is recorded, and a change
+    /// waiting ends the sending: whoever made it wakes the scrobbler.
     pub(crate) fn send_due(sending: &Sending<'_>) {
         loop {
             if (sending.stopping)() {
                 return;
             }
+            let Some(_turn) = sending.turn.batch() else {
+                return;
+            };
             let Some(session) = (sending.session)() else {
                 return;
             };
@@ -883,7 +985,7 @@ mod enabled {
             // until the wait is over, and then the plays held back go first,
             // being the oldest due. Another account signed in since is not
             // held back.
-            if (sending.paused)(session.account) {
+            if (sending.paused)(session.account) || (sending.held)() {
                 return;
             }
             let key = SessionKey::new(session.key.expose());
@@ -961,8 +1063,16 @@ mod enabled {
                             (sending.pause)(session.account, REFUSED_WAIT);
                             (Box::new(move || Settled::Refused(detail.clone())), true)
                         }
+                        // No answer: these may have arrived, and are never
+                        // sent again. The rest wait, so that an outage
+                        // does not use up every play waiting.
                         Unsent::Unknown(detail) => {
-                            (Box::new(move || Settled::Unknown(detail.clone())), false)
+                            warn!(
+                                "Last.fm did not answer a batch of scrobbles: nothing more is \
+                                 scrobbled for a while"
+                            );
+                            (sending.pause)(session.account, UNANSWERED_WAIT);
+                            (Box::new(move || Settled::Unknown(detail.clone())), true)
                         }
                     };
                     (due.iter().map(|due| (due.delivery, each())).collect(), stop)
@@ -1010,7 +1120,7 @@ mod enabled {
 
         use super::{
             Began, DAILY_LIMIT_RETRY_MS, DAILY_LIMIT_WAIT, Instant, JobSink, Lastfm, REFUSED_WAIT,
-            SETTLE, STALE, Sending, Sink, Slot, Taken, send_due,
+            SETTLE, STALE, Sending, Sink, Slot, Taken, UNANSWERED_WAIT, send_due,
         };
 
         #[test]
@@ -1133,12 +1243,15 @@ mod enabled {
             let reads = Cell::new(0);
             let taken = Cell::new(0_i64);
             let sent = RefCell::new(Vec::new());
+            let turn = super::Turn::default();
             send_due(&Sending {
+                turn: &turn,
                 session: &|| {
                     reads.set(reads.get() + 1);
                     sessions(reads.get() - 1)
                 },
                 stopping: &|| sent.borrow().len() >= stop_after,
+                held: &|| false,
                 take: &|_, _| {
                     taken.set(taken.get() + 1);
                     (taken.get() <= 3).then(|| batch(taken.get() * 100))
@@ -1169,9 +1282,12 @@ mod enabled {
             // Which account is paused, and whether its wait is over.
             let paused = Cell::new(None);
             let over = Cell::new(false);
+            let turn = super::Turn::default();
             let sending = Sending {
+                turn: &turn,
                 session: &|| Some(session("KEY_A", true)),
                 stopping: &|| false,
+                held: &|| false,
                 take: &|_, _| Some(batch(100)),
                 send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
                     sent.set(sent.get() + 1);
@@ -1220,9 +1336,12 @@ mod enabled {
         fn one_accounts_pause_does_not_hold_back_another() {
             let sent = Cell::new(0);
             let another = Id::from_bytes([8; 16]);
+            let turn = super::Turn::default();
             send_due(&Sending {
+                turn: &turn,
                 session: &|| Some(session("KEY_B", true)),
                 stopping: &|| sent.get() >= 1,
+                held: &|| false,
                 take: &|_, _| Some(batch(100)),
                 send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
                     sent.set(sent.get() + 1);
@@ -1248,9 +1367,12 @@ mod enabled {
             let sent = Cell::new(0);
             let paused = Cell::new(None);
             let refused = RefCell::new(Vec::new());
+            let turn = super::Turn::default();
             send_due(&Sending {
+                turn: &turn,
                 session: &|| Some(session("KEY_A", true)),
                 stopping: &|| false,
+                held: &|| false,
                 take: &|_, _| Some(batch(100)),
                 send: &|_: &SessionKey, _: &[ToScrobble]| -> Result<Sent, Unsent> {
                     sent.set(sent.get() + 1);
@@ -1266,6 +1388,149 @@ mod enabled {
             assert_eq!(paused.get(), Some(REFUSED_WAIT));
             // A request refused is not the session refused.
             assert!(refused.borrow().is_empty());
+        }
+
+        #[test]
+        fn a_batch_that_goes_unanswered_stops_the_sending_and_the_rest_wait() {
+            let (sent, taken) = (Cell::new(0), Cell::new(0_i64));
+            let settled = RefCell::new(Vec::new());
+            let paused = Cell::new(None);
+            let turn = super::Turn::default();
+            send_due(&Sending {
+                turn: &turn,
+                session: &|| Some(session("KEY_A", true)),
+                stopping: &|| false,
+                held: &|| false,
+                take: &|_, _| {
+                    taken.set(taken.get() + 1);
+                    (taken.get() <= 3).then(|| batch(taken.get() * 100))
+                },
+                send: &|_: &SessionKey, _: &[ToScrobble]| -> Result<Sent, Unsent> {
+                    sent.set(sent.get() + 1);
+                    Err(Unsent::Unknown("502 Bad Gateway".to_owned()))
+                },
+                settle: &|batch| {
+                    settled.borrow_mut().extend(batch);
+                    true
+                },
+                refuse: &|_| {},
+                now: &|| 1_000,
+                paused: &|_| paused.get().is_some(),
+                pause: &|_, wait| paused.set(Some(wait)),
+            });
+            // One batch may have arrived and is never sent again; the
+            // others were not taken, and wait.
+            assert_eq!((sent.get(), taken.get()), (1, 1));
+            assert_eq!(settled.borrow().len(), 50);
+            assert!(
+                settled
+                    .borrow()
+                    .iter()
+                    .all(|(_, s)| matches!(s, Settled::Unknown(_)))
+            );
+            assert_eq!(paused.get(), Some(UNANSWERED_WAIT));
+        }
+
+        #[test]
+        fn nothing_is_sent_from_a_restored_library_until_an_import_has_run() {
+            let (sent, taken) = (Cell::new(0), Cell::new(0));
+            let imported = Cell::new(false);
+            let turn = super::Turn::default();
+            let sending = Sending {
+                turn: &turn,
+                session: &|| Some(session("KEY_A", true)),
+                stopping: &|| false,
+                held: &|| !imported.get(),
+                take: &|_, _| {
+                    taken.set(taken.get() + 1);
+                    (taken.get() == 1).then(|| batch(100))
+                },
+                send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
+                    sent.set(sent.get() + 1);
+                    Ok(plays
+                        .iter()
+                        .map(|play| Outcome::Accepted {
+                            artist: play.artist.clone(),
+                            title: play.title.clone(),
+                        })
+                        .collect())
+                },
+                settle: &|_| true,
+                refuse: &|_| {},
+                now: &|| 1_000,
+                paused: &|_| false,
+                pause: &|_, _| {},
+            };
+            // Nothing is even taken, so nothing waiting is withdrawn or
+            // marked as sending.
+            send_due(&sending);
+            assert_eq!((taken.get(), sent.get()), (0, 0));
+            imported.set(true);
+            send_due(&sending);
+            assert_eq!(sent.get(), 1);
+        }
+
+        #[test]
+        fn a_sign_out_waits_for_the_batch_on_its_way_and_nothing_leaves_after_it() {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::sync::{Arc, Barrier};
+            let turn = Arc::new(super::Turn::default());
+            let signed_in = Arc::new(AtomicBool::new(true));
+            let sent = Arc::new(AtomicUsize::new(0));
+            // The first batch is held at the moment it would leave until
+            // the sign-out is waiting for it.
+            let sending = Arc::new(Barrier::new(2));
+            let scrobbler = {
+                let (turn, signed_in, sent) = (turn.clone(), signed_in.clone(), sent.clone());
+                let sending = sending.clone();
+                std::thread::spawn(move || {
+                    let taken = Cell::new(0_i64);
+                    send_due(&Sending {
+                        turn: &turn,
+                        session: &|| {
+                            signed_in
+                                .load(Ordering::SeqCst)
+                                .then(|| session("KEY_A", true))
+                        },
+                        stopping: &|| false,
+                        held: &|| false,
+                        take: &|_, _| {
+                            taken.set(taken.get() + 1);
+                            (taken.get() <= 3).then(|| batch(taken.get() * 100))
+                        },
+                        send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
+                            if sent.fetch_add(1, Ordering::SeqCst) == 0 {
+                                sending.wait();
+                                while !turn.changing() {
+                                    std::thread::yield_now();
+                                }
+                            }
+                            Ok(plays
+                                .iter()
+                                .map(|play| Outcome::Accepted {
+                                    artist: play.artist.clone(),
+                                    title: play.title.clone(),
+                                })
+                                .collect())
+                        },
+                        settle: &|_| true,
+                        refuse: &|_| {},
+                        now: &|| 0,
+                        paused: &|_| false,
+                        pause: &|_, _| {},
+                    });
+                })
+            };
+            sending.wait();
+            // The sign-out, as the call makes it: it waits for the batch on
+            // its way, and once it is done nothing more leaves.
+            {
+                let _held = turn.change();
+                assert_eq!(sent.load(Ordering::SeqCst), 1);
+                signed_in.store(false, Ordering::SeqCst);
+            }
+            scrobbler.join().unwrap();
+            assert_eq!(sent.load(Ordering::SeqCst), 1);
         }
 
         #[test]

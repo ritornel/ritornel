@@ -94,6 +94,17 @@ fn render_status(status: &LastfmStatus) -> String {
             |since| format!("on, since {}", utc(since)),
         ),
     ));
+    if let Some(since) = status.waiting_for_import_since {
+        lines.push((
+            "",
+            format!(
+                "nothing sent since {}: the library was restored from a backup, and Last.fm may \
+                 have plays sent after it was taken. The next import checks, and the plays \
+                 waiting go once it has; `ritornelctl lastfm sync` runs it now",
+                utc(since)
+            ),
+        ));
+    }
     lines.push(("Imported", status.imported.to_string()));
     lines.push((
         "Zones",

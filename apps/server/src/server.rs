@@ -154,6 +154,15 @@ impl Server {
                     "scrobbles an earlier run was sending are marked unknown"
                 );
             }
+            // A library put back from a backup: what Last.fm took after it
+            // is not known until an import has run.
+            if let Some(held) = library.opened_restored()? {
+                info!(
+                    backup_taken_at = %crate::logs::utc(held.taken_at_ms),
+                    "the library was restored from a backup: nothing is scrobbled until an \
+                     import from Last.fm has run"
+                );
+            }
         }
         let player = playback::restore(
             &store,

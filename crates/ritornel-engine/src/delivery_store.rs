@@ -115,9 +115,11 @@ pub(crate) const ALREADY_SCROBBLED: &str = "the account already has this play fr
 
 /// Whether the account already has a scrobble of this track within a
 /// second of `seconds` that is not an echo of ours: one another player
-/// sent. Matched by normalised artist and title, as an echo is. This is not
-/// grouping by a window of time, which M3 brings; it only keeps a play from
-/// being scrobbled twice.
+/// sent. Matched by normalised artist and title, as an echo is. An import
+/// that is part of a play some listen here made, as its echo or beside it,
+/// is that play's, and says nothing of another. This is not grouping by a
+/// window of time, which M3 brings; it only keeps a play from being
+/// scrobbled twice.
 fn already_scrobbled(
     connection: &Connection,
     endpoint: i64,
@@ -128,7 +130,12 @@ fn already_scrobbled(
     let mut statement = connection.prepare_cached(
         "SELECT i.artist, i.title FROM observation_import i
          JOIN history_observation o ON o.id = i.observation_id
-         WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms BETWEEN ?2 AND ?3",
+         WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms BETWEEN ?2 AND ?3
+           AND NOT EXISTS (SELECT 1 FROM play_event_observation x
+                           JOIN play_event_observation y ON y.play_event_id = x.play_event_id
+                           JOIN history_observation yo
+                             ON yo.id = y.observation_id AND yo.kind = 'listen'
+                           WHERE x.observation_id = i.observation_id)",
     )?;
     let found: Vec<(String, String)> = statement
         .query_map(
@@ -298,7 +305,12 @@ type Eligible = (
 );
 
 /// The plays eligible to be sent to the account's endpoint that have no
-/// delivery there yet, played from `from_ms` on.
+/// delivery there yet, played from `from_ms` on. A play that comes to be
+/// led by another of its listens, such as a resumed listen's predecessor
+/// arriving late, has a delivery already if any of its listens was sent,
+/// or answered, or refused. One only waiting or withdrawn does not count:
+/// it is withdrawn when its turn comes, as its listen no longer leads the
+/// play, and the play is sent once, from the listen that does.
 fn eligible(
     connection: &Connection,
     endpoint: i64,
@@ -320,7 +332,10 @@ fn eligible(
                            JOIN history_observation xo ON xo.id = x.observation_id
                            WHERE x.play_event_id = pe.id AND xo.endpoint_id = ?2)
            AND NOT EXISTS (SELECT 1 FROM history_delivery d
-                           WHERE d.observation_id = peo.observation_id AND d.endpoint_id = ?2)
+                           JOIN play_event_observation y ON y.observation_id = d.observation_id
+                           WHERE y.play_event_id = pe.id AND d.endpoint_id = ?2
+                             AND (d.observation_id = peo.observation_id
+                                  OR d.state NOT IN ('pending', 'withdrawn')))
          ORDER BY pe.event_at_utc_ms"
     ))?;
     let rows = statement.query_map((listener, endpoint, from_ms), |row| {
@@ -657,6 +672,111 @@ impl LibraryStore {
             let rows = statement.query_map([endpoint], |row| Ok((row.get(0)?, row.get(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
+    }
+}
+
+/// The setting that holds back every scrobble of a library restored from
+/// a backup until an import has run. The service may have taken plays
+/// after the backup was taken, which the library restored still has
+/// waiting; an import brings them back, and they are then not sent again.
+/// It is written into the backup's copy, never into the library copied,
+/// so it is there only once that copy is put back. See [`hold_sending`].
+pub(crate) const HELD_SETTING: &str = "scrobbling.held_until_import";
+
+/// Writes [`HELD_SETTING`] into the library at `connection`, a backup's
+/// copy, taken at `taken_at_ms`. Its revision is the copy's last, since
+/// the copy is not a write of the library's own.
+pub(crate) fn hold_sending(connection: &Connection, taken_at_ms: i64) -> Result<(), Error> {
+    connection.execute(
+        "INSERT INTO library_setting (key, value_json, rev)
+         VALUES (?1, json_object('takenAtMs', ?2),
+                 (SELECT coalesce(max(rev), 0) FROM library_revision))
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+        (HELD_SETTING, taken_at_ms),
+    )?;
+    Ok(())
+}
+
+/// Scrobbling held back after a restore, until an import has run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Held {
+    /// When the backup restored was taken.
+    pub taken_at_ms: i64,
+    /// When this server first opened the library restored: since then,
+    /// nothing is sent. `None` until it has.
+    pub since_ms: Option<i64>,
+}
+
+fn held(connection: &Connection) -> Result<Option<Held>, Error> {
+    Ok(connection
+        .query_row(
+            "SELECT json_extract(value_json, '$.takenAtMs'),
+                    json_extract(value_json, '$.sinceMs')
+             FROM library_setting WHERE key = ?1",
+            [HELD_SETTING],
+            |row| {
+                Ok(Held {
+                    taken_at_ms: row.get(0)?,
+                    since_ms: row.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+impl LibraryStore {
+    /// Whether scrobbling is held back until an import has run, as it is
+    /// in a library restored from a backup.
+    pub fn held_for_import(&self) -> Result<Option<Held>, Error> {
+        self.read(held)
+    }
+
+    /// At start: a library restored from a backup is held from now on, if
+    /// it was not already. Returns the hold, if there is one.
+    pub fn opened_restored(&self) -> Result<Option<Held>, Error> {
+        match self.held_for_import()? {
+            Some(Held { since_ms: None, .. }) => {}
+            other => return Ok(other),
+        }
+        self.write(
+            WriteRequest {
+                method: DELIVERY_METHOD,
+                command: None,
+                client: None,
+            },
+            |write| {
+                write.connection().execute(
+                    "UPDATE library_setting
+                     SET value_json = json_set(value_json, '$.sinceMs', ?2), rev = ?3
+                     WHERE key = ?1 AND json_extract(value_json, '$.sinceMs') IS NULL",
+                    (HELD_SETTING, write.now_ms(), write.rev()),
+                )?;
+                Ok(String::new())
+            },
+        )?;
+        self.held_for_import()
+    }
+
+    /// An import has run and brought back what the service has: scrobbling
+    /// is held back no longer. Whether it was.
+    pub fn release_hold(&self) -> Result<bool, Error> {
+        if self.held_for_import()?.is_none() {
+            return Ok(false);
+        }
+        self.write(
+            WriteRequest {
+                method: DELIVERY_METHOD,
+                command: None,
+                client: None,
+            },
+            |write| {
+                write
+                    .connection()
+                    .execute("DELETE FROM library_setting WHERE key = ?1", [HELD_SETTING])?;
+                Ok(String::new())
+            },
+        )?;
+        Ok(true)
     }
 }
 
