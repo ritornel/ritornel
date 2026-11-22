@@ -72,7 +72,7 @@ WantedBy=default.target
     )
 }
 
-/// The data directory a unit written by [`unit`] serves.
+/// The data directory a unit written by [`unit()`] serves.
 pub(crate) fn served_dir(unit: &str) -> Option<String> {
     let exec = unit
         .lines()
