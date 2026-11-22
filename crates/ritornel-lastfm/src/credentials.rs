@@ -9,6 +9,7 @@
 //! environment of a shell, so the two can also be in a file in the data
 //! directory, which must be readable by its owner alone.
 
+use std::io::Read;
 use std::path::Path;
 
 use scrobl::{ApiKey, ApiSecret};
@@ -53,18 +54,26 @@ impl ApiCredentials {
             return Ok(Some(Self::new(key.trim(), secret.trim())));
         }
         let path = data_dir.join(CREDENTIALS_FILE);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        let unreadable =
+            |error: std::io::Error| format!("cannot read {}: {}", path.display(), error.kind());
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("cannot read {}: {}", path.display(), error.kind())),
+            Err(error) => return Err(unreadable(error)),
         };
-        if !crate::platform::private(&path) {
+        let metadata = file.metadata().map_err(unreadable)?;
+        if !metadata.is_file() {
+            return Err(format!("{} must be a regular file", path.display()));
+        }
+        if !crate::platform::private(&metadata) {
             return Err(format!(
                 "{} can be read by other users; make it readable by its owner alone \
                  (chmod 600) and start the server again",
                 path.display()
             ));
         }
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(unreadable)?;
         let (mut key, mut secret) = (None, None);
         for line in text.lines() {
             let line = line.trim();
@@ -74,7 +83,12 @@ impl ApiCredentials {
             let Some((name, value)) = line.split_once('=') else {
                 continue;
             };
-            let value = value.trim().trim_matches('"').to_owned();
+            let value = value.trim();
+            let value = ['"', '\'']
+                .into_iter()
+                .find_map(|quote| value.strip_prefix(quote)?.strip_suffix(quote))
+                .unwrap_or(value)
+                .to_owned();
             match name.trim().trim_start_matches("export ").trim() {
                 KEY_VARIABLE => key = Some(value),
                 SECRET_VARIABLE => secret = Some(value),
@@ -120,7 +134,7 @@ pub(crate) mod tests {
         let path = dir.join(CREDENTIALS_FILE);
         std::fs::write(
             &path,
-            "# Last.fm\nSCROBL_API_KEY=SENTINEL_KEY\nexport SCROBL_API_SECRET=\"SENTINEL_SECRET\"\n",
+            "# Last.fm\nSCROBL_API_KEY='SENTINEL_KEY'\nexport SCROBL_API_SECRET=\"SENTINEL_SECRET\"\n",
         )
         .unwrap();
         crate::platform::close_to_others(&path);
