@@ -154,8 +154,8 @@ impl FakeLastfm {
     }
 
     #[cfg(test)]
-    pub(crate) fn change_reply_timestamp(&self, index: usize, timestamp: u64) {
-        lock(&self.state).reply_timestamps.insert(index, timestamp);
+    pub(crate) fn set_reply_timestamps(&self, changes: &[(usize, u64)]) {
+        lock(&self.state).reply_timestamps = changes.iter().copied().collect();
     }
 
     #[cfg(test)]

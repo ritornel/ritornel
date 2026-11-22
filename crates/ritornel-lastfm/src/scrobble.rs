@@ -39,7 +39,7 @@ pub const DAILY_LIMIT: u32 = scrobl::model::IgnoredCode::DAILY_LIMIT.get();
 /// What Last.fm did with one play.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// The reply did not identify a unique outcome for this timestamp.
+    /// The reply did not identify a unique outcome for this play.
     Unknown,
     /// It is recorded, under these names, which are those sent unless
     /// Last.fm corrected them.
@@ -124,6 +124,21 @@ fn play(scrobble: &ToScrobble) -> Play {
     play
 }
 
+fn matches_play(outcome: &scrobl::model::Outcome, play: &ToScrobble) -> bool {
+    let agrees = |name: &scrobl::model::Corrected, requested: &str| {
+        name.corrected() || name.name() == requested
+    };
+    let optional_agrees = |reply: Option<&scrobl::model::Corrected>, requested: Option<&str>| {
+        reply
+            .zip(requested)
+            .is_none_or(|(name, sent)| name.name().is_empty() || agrees(name, sent))
+    };
+    agrees(outcome.artist(), &play.artist)
+        && agrees(outcome.track(), &play.title)
+        && optional_agrees(outcome.album(), play.album.as_deref())
+        && optional_agrees(outcome.album_artist(), play.album_artist.as_deref())
+}
+
 impl Lastfm {
     /// Tells Last.fm that the account whose session this is is playing
     /// `playing` now, once.
@@ -198,20 +213,7 @@ impl Lastfm {
                 sent.push(Outcome::Unknown);
                 continue;
             };
-            let agrees = |name: &scrobl::model::Corrected, requested: &str| {
-                name.corrected() || name.name() == requested
-            };
-            let optional_agrees = |reply: Option<&scrobl::model::Corrected>,
-                                   requested: Option<&str>| {
-                reply
-                    .zip(requested)
-                    .is_none_or(|(name, sent)| name.name().is_empty() || agrees(name, sent))
-            };
-            if !agrees(outcome.artist(), &scrobble.artist)
-                || !agrees(outcome.track(), &scrobble.title)
-                || !optional_agrees(outcome.album(), scrobble.album.as_deref())
-                || !optional_agrees(outcome.album_artist(), scrobble.album_artist.as_deref())
-            {
+            if !matches_play(outcome, scrobble) {
                 sent.push(Outcome::Unknown);
                 continue;
             }

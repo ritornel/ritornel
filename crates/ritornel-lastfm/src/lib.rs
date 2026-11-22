@@ -322,18 +322,18 @@ mod tests {
             .unwrap_err();
         assert!(matches!(refused, Unsent::SignInAgain(_)), "{refused:?}");
         assert_eq!(fake.scrobbled().len(), 2);
-        fake.change_reply_timestamp(0, 42);
+        fake.set_reply_timestamps(&[(0, 42)]);
         let partial = lastfm
             .scrobble(&SessionKey::new(SESSION_KEY), &plays)
             .unwrap();
         assert!(matches!(&partial[1], Outcome::Accepted { title, .. } if title == "Second"));
         assert!(matches!(partial[0], Outcome::Unknown));
-        fake.change_reply_timestamp(0, plays[1].timestamp_s);
+        fake.set_reply_timestamps(&[(0, plays[1].timestamp_s)]);
         let ambiguous = lastfm
             .scrobble(&SessionKey::new(SESSION_KEY), &plays)
             .unwrap();
         assert_eq!(ambiguous, [Outcome::Unknown, Outcome::Unknown]);
-        fake.change_reply_timestamp(1, 42);
+        fake.set_reply_timestamps(&[(0, plays[1].timestamp_s), (1, 42)]);
         let shifted = lastfm
             .scrobble(&SessionKey::new(SESSION_KEY), &plays)
             .unwrap();
@@ -367,8 +367,7 @@ mod tests {
                 timestamp_s: play.timestamp_s + 300,
                 ..second
             };
-            fake.change_reply_timestamp(0, second.timestamp_s);
-            fake.change_reply_timestamp(1, play.timestamp_s);
+            fake.set_reply_timestamps(&[(0, second.timestamp_s), (1, play.timestamp_s)]);
             let sent = lastfm
                 .scrobble(&SessionKey::new(SESSION_KEY), &[play.clone(), second])
                 .unwrap();
