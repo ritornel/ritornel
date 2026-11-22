@@ -352,10 +352,11 @@ fn a_first_scan_records_every_file_and_resolves_the_ones_it_can_read() {
     assert_eq!(
         rig.one("SELECT value_json FROM library_setting"),
         format!(
-            r#"{{"extractor":{},"resolver":{},"normalizer":{}}}"#,
+            r#"{{"extractor":{},"resolver":{},"normalizer":{},"catalog":{}}}"#,
             ritornel_domain::EXTRACTOR_VERSION,
             ritornel_domain::RESOLVER_VERSION,
-            ritornel_domain::NORMALIZER_VERSION
+            ritornel_domain::NORMALIZER_VERSION,
+            ritornel_domain::CATALOG_VERSION
         )
     );
     // Every row a scan wrote is stamped with the revision that wrote it.

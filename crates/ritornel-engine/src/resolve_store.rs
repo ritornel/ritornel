@@ -15,7 +15,8 @@ use ritornel_domain::library::{
 };
 use ritornel_domain::normalize::normalize;
 use ritornel_domain::{
-    Claim, EXTRACTOR_VERSION, Facts, NORMALIZER_VERSION, Policy, RESOLVER_VERSION, Scope, Source,
+    CATALOG_VERSION, Claim, EXTRACTOR_VERSION, Facts, NORMALIZER_VERSION, Policy, RESOLVER_VERSION,
+    Scope, Source,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
@@ -60,7 +61,7 @@ pub(crate) struct Shown {
 /// next resolution after any of them changes is owed.
 fn versions(resolver: i64) -> String {
     format!(
-        "{{\"extractor\":{EXTRACTOR_VERSION},\"resolver\":{resolver},\"normalizer\":{NORMALIZER_VERSION}}}"
+        "{{\"extractor\":{EXTRACTOR_VERSION},\"resolver\":{resolver},\"normalizer\":{NORMALIZER_VERSION},\"catalog\":{CATALOG_VERSION}}}"
     )
 }
 
@@ -1226,7 +1227,7 @@ impl LibraryStore {
 
     /// Whether anything is waiting on the resolver: a readable file with
     /// no binding, or a library last resolved by another version of the
-    /// extractor, the resolver or the normaliser. A new resolver version
+    /// extractor, the resolver, the normaliser or the catalog. A new resolver version
     /// makes the next scan resolve every item again by the policy in force,
     /// and write a decision of that version for each whose result differs.
     pub(crate) fn needs_resolving(&self) -> Result<bool, Error> {
