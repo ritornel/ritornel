@@ -242,7 +242,15 @@ fn squash(key: &str) -> String {
         _ => key.as_str(),
     };
     let squashed: String = key.split(' ').filter(|word| *word != "and").collect();
-    if squashed.is_empty() {
+    // A symbol a key keeps at either end, as "⇄" or "+", is passed over
+    // too, unless the key is nothing else.
+    let letters: String = squashed
+        .chars()
+        .filter(|c| c.is_alphanumeric() || unicode_normalization::char::is_combining_mark(*c))
+        .collect();
+    if letters.chars().any(char::is_alphanumeric) {
+        letters
+    } else if squashed.is_empty() {
         key.split(' ').collect()
     } else {
         squashed
@@ -924,6 +932,31 @@ mod tests {
             judge("The Quiet Harbour", None, "Lanterns"),
             Verdict::Bind { recording: 1, .. }
         ));
+    }
+
+    #[test]
+    fn a_symbol_at_either_end_of_a_title_is_passed_over_by_the_loose_rule() {
+        let catalog = Catalog::new(vec![
+            recording(8, "Mira Vale", "\u{21c4} (Lock and Key)", &[(81, "Glass")]),
+            recording(9, "Mira Vale", "--->", &[(91, "Glass")]),
+        ]);
+        let bound = |title| match catalog.judge(Scrobbled {
+            artist: "Mira Vale",
+            album: Some("Glass"),
+            title,
+        }) {
+            Verdict::Bind {
+                recording, rule, ..
+            } => Some((recording, rule)),
+            _ => None,
+        };
+        assert_eq!(bound("\u{21c4} (Lock and Key)"), Some((8, Rule::Exact)));
+        // The symbol written another way, or left out, is passed over.
+        assert_eq!(bound("<===> (Lock and Key)"), Some((8, Rule::Loose)));
+        assert_eq!(bound("(Lock and Key)"), Some((8, Rule::Loose)));
+        // A title of symbols alone is still its symbols.
+        assert_eq!(bound("--->"), Some((9, Rule::Exact)));
+        assert_eq!(bound("<---"), None);
     }
 
     #[test]
