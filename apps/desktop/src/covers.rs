@@ -410,8 +410,11 @@ fn squared(image: image::DynamicImage) -> image::DynamicImage {
 /// average colour.
 pub(crate) fn decode_cover(jpeg: &[u8], px: u32) -> Option<(RenderImage, Rgba, usize)> {
     let decoded = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?;
+    // A picture larger than `px` either way is made `px` square, as it was
+    // before it was cut, so that a thin one is not left a few pixels wide.
+    let larger = decoded.width() > px || decoded.height() > px;
     let decoded = squared(decoded);
-    let decoded = if decoded.width() > px || decoded.height() > px {
+    let decoded = if larger {
         decoded.resize_exact(px, px, image::imageops::FilterType::Triangle)
     } else {
         decoded
@@ -779,29 +782,84 @@ mod shape_tests {
         bytes
     }
 
+    /// The pixel at `(x, y)` of a decoded picture `side` square, in BGRA.
+    fn at(image: &RenderImage, side: usize, x: usize, y: usize) -> Option<[u8; 4]> {
+        let bytes = image.as_bytes(0)?;
+        let at = (y * side + x) * 4;
+        bytes.get(at..at + 4)?.try_into().ok()
+    }
+
+    fn red(pixel: Option<[u8; 4]>) -> bool {
+        matches!(pixel, Some([b, g, r, _]) if r > 200 && g < 60 && b < 60)
+    }
+
+    fn green(pixel: Option<[u8; 4]>) -> bool {
+        matches!(pixel, Some([b, g, r, _]) if g > 200 && r < 60 && b < 60)
+    }
+
     #[test]
     fn a_tall_picture_is_cut_square_30_percent_down_not_squashed() {
-        // 100 by 300, made 50 square: rows 60 to 160, green above red. Cut
-        // at the middle it would be all red; squashed, its foot blue.
+        // 100 by 300, made 50 square: rows 60 to 160, green above red, the
+        // edge at row 20 of 50. Cut at the middle it would be all red; at
+        // 25% or 35% the edge would be at 25 or 15; squashed, its foot blue.
         let decoded = decode_cover(&banded(100, 300), 50);
         assert!(decoded.is_some(), "not decoded");
         let Some((image, _, _)) = decoded else { return };
         let size = image.size(0);
         assert_eq!((size.width.0, size.height.0), (50, 50));
-        let bytes = image.as_bytes(0).unwrap_or_default();
-        // In BGRA: green at the top (rows 60 to 100), red at the foot.
-        let at = |y: usize| bytes.get((y * 50 + 25) * 4..(y * 50 + 25) * 4 + 4);
-        assert!(
-            matches!(at(2), Some([b, g, r, _]) if *g > 200 && *r < 60 && *b < 60),
-            "{:?}",
-            at(2)
-        );
-        for y in [30, 47] {
+        for y in [2, 17] {
             assert!(
-                matches!(at(y), Some([b, g, r, _]) if *r > 200 && *g < 60 && *b < 60),
+                green(at(&image, 50, 25, y)),
                 "{y}: {:?}",
-                at(y)
+                at(&image, 50, 25, y)
             );
+        }
+        for y in [23, 47] {
+            assert!(
+                red(at(&image, 50, 25, y)),
+                "{y}: {:?}",
+                at(&image, 50, 25, y)
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_picture_is_cut_square_at_its_middle() {
+        // Three bands across, 300 by 100, made 50 square: the middle band.
+        let image = image::RgbImage::from_fn(300, 100, |x, _| match x / 100 {
+            0 => image::Rgb([0, 255, 0]),
+            1 => image::Rgb([255, 0, 0]),
+            _ => image::Rgb([0, 0, 255]),
+        });
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95)
+            .encode_image(&image)
+            .unwrap_or_default();
+        let decoded = decode_cover(&bytes, 50);
+        assert!(decoded.is_some(), "not decoded");
+        let Some((image, _, _)) = decoded else { return };
+        for x in [3, 25, 46] {
+            assert!(
+                red(at(&image, 50, x, 25)),
+                "{x}: {:?}",
+                at(&image, 50, x, 25)
+            );
+        }
+    }
+
+    #[test]
+    fn a_thin_picture_is_still_made_its_slots_size() {
+        for (w, h) in [(1, 300), (300, 1), (40, 40)] {
+            let decoded = decode_cover(&banded(w, h), 50);
+            assert!(decoded.is_some(), "{w}x{h} not decoded");
+            let Some((image, _, _)) = decoded else { return };
+            let size = image.size(0);
+            let side = if w > 50 || h > 50 {
+                50
+            } else {
+                w.min(h) as i32
+            };
+            assert_eq!((size.width.0, size.height.0), (side, side), "{w}x{h}");
         }
     }
 }
