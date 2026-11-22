@@ -37,6 +37,10 @@ pub const STOP_WAIT: Duration = Duration::from_secs(15);
 /// lock and has not said where it listens, before the caller is told so.
 const STARTING_WAIT: Duration = Duration::from_secs(2);
 
+/// How long a caller waits for readiness. A pre-migration backup may take
+/// longer, so the child keeps running when the wait ends.
+const READY_WAIT: Duration = Duration::from_secs(120);
+
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(25);
 
@@ -133,8 +137,19 @@ impl Launcher {
                     },
                     Some(program),
                 ) if races < RACES => {
+                    // A cancelled or timed-out caller may have left its
+                    // server starting up, even before it acquired the lock.
+                    if let Some(owned) = self.owned().as_mut()
+                        && owned
+                            .child
+                            .try_wait()
+                            .map_err(|error| Error::Start(error.to_string()))?
+                            .is_none()
+                    {
+                        return Err(self.still_starting());
+                    }
                     races += 1;
-                    self.start(program, Duration::from_secs(120)).await?;
+                    self.start(program, READY_WAIT).await?;
                 }
                 // Another program's server is on its way up.
                 (
@@ -151,6 +166,13 @@ impl Launcher {
         }
     }
 
+    fn still_starting(&self) -> Error {
+        Error::NotRunning {
+            data_dir: self.data_dir.clone(),
+            why: NotRunning::Starting,
+        }
+    }
+
     /// Spawns a server and waits for it to be ready. `Ok` when it is, and
     /// when it found the directory in use: either way there is a server to
     /// find now.
@@ -160,16 +182,15 @@ impl Launcher {
         drop(self.owned().replace(owned));
         let deadline = tokio::time::Instant::now() + wait;
         let ready_line = tokio::time::timeout_at(deadline, ready.said_ready).await;
-        if matches!(ready_line, Ok(Ok(()))) {
-            return Ok(());
+        match ready_line {
+            Ok(Ok(())) => return Ok(()),
+            Err(_) => return Err(self.still_starting()),
+            Ok(Err(_)) => {}
         }
         let owned = self.owned().take();
         let stopped = if let Some(owned) = owned {
-            let remaining = deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .min(STOP_WAIT);
             Some(
-                tokio::task::spawn_blocking(move || owned.stop(remaining))
+                tokio::task::spawn_blocking(move || owned.stop(STOP_WAIT))
                     .await
                     .map_err(|error| Error::Start(error.to_string()))?,
             )
@@ -179,11 +200,6 @@ impl Launcher {
         if matches!(stopped, Some(Stopped::Exited(status)) if status.code() == Some(i32::from(agreed::EXIT_IN_USE)))
         {
             return Ok(());
-        }
-        if ready_line.is_err() {
-            return Err(Error::Start(
-                "timed out waiting for the server to be ready".to_owned(),
-            ));
         }
         let said = tokio::time::timeout_at(deadline, ready.stderr)
             .await
@@ -421,20 +437,41 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn startup_cannot_wait_indefinitely_for_a_ready_line() {
+    async fn a_slow_start_can_outlive_the_wait_and_keeps_the_same_child() {
         let scratch = Scratch::new("no-ready");
-        let program = scratch.program("exec sleep 1", "");
-        let launcher = Launcher::new(scratch.0.clone(), None);
-        let started = Instant::now();
-        let failed = launcher
-            .start(&program, Duration::from_millis(100))
+        let program = scratch.program("cat >/dev/null", "findstr \"^\" >nul\nexit /b 0");
+        let launcher = Launcher::new(scratch.0.clone(), Some(program.clone()));
+        let result = launcher.start(&program, Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::NotRunning {
+                    why: NotRunning::Starting,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        let pid = launcher.owned_pid().unwrap();
+        let retry = tokio::time::timeout(Duration::from_secs(5), launcher.find_or_start())
             .await
-            .unwrap_err();
-        assert!(matches!(failed, Error::Start(_)));
-        assert!(started.elapsed() < Duration::from_millis(750));
-        assert!(launcher.owned_pid().is_none());
+            .unwrap();
+        assert!(
+            matches!(
+                retry,
+                Err(Error::NotRunning {
+                    why: NotRunning::Starting,
+                    ..
+                })
+            ),
+            "{retry:?}"
+        );
+        assert_eq!(launcher.owned_pid(), Some(pid));
+        assert!(matches!(
+            launcher.stop_owned(STOP_WAIT),
+            Some(Stopped::Exited(_))
+        ));
     }
 
     #[test]
