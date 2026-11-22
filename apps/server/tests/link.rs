@@ -1144,7 +1144,7 @@ async fn a_server_takes_its_computers_name_and_keeps_one_chosen() {
     bounded(async {
         let scratch = Scratch::new();
         let named = |name: &str| Run {
-            name: Some(name.to_owned()),
+            computer_name: Some(name.to_owned()),
             ..Run::default()
         };
         let start_named = async |name: &str| {

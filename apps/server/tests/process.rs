@@ -433,6 +433,33 @@ fn a_restart_keeps_the_identity_and_the_credential() {
 }
 
 #[test]
+fn a_name_given_in_the_settings_wins_over_the_stored_one_and_is_kept_after() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    Server::start(&data_dir, &[]).stop(&data_dir);
+    Server::start(&data_dir, &["--name", "Workbench Speakers"]).stop(&data_dir);
+    Server::start(&data_dir, &[]).stop(&data_dir);
+    std::fs::write(data_dir.join("config.toml"), "name = \"Porch\"\n").unwrap();
+    Server::start(&data_dir, &[]).stop(&data_dir);
+
+    let lines = log_lines(&data_dir);
+    let names: Vec<_> = lines
+        .iter()
+        .filter(|line| line["message"] == "ready")
+        .map(|line| line["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Invented Desk",
+            "Workbench Speakers",
+            "Workbench Speakers",
+            "Porch"
+        ]
+    );
+}
+
+#[test]
 fn a_lost_credential_file_is_replaced_at_the_next_start() {
     let scratch = Scratch::new();
     let data_dir = scratch.data_dir();

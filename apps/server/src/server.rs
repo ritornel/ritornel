@@ -137,11 +137,21 @@ impl Server {
         if issued.is_some() {
             info!(server_id = %identity.server_id, "first start: created this server's identity");
         }
-        // Named after its computer, so that a hub's satellites and a
-        // satellite's hub say which machine each is. A name someone chose
-        // is kept.
-        if identity.name == DEFAULT_NAME
-            && let Some(name) = run.name.as_deref()
+        // A name given in the settings wins over the stored one at every
+        // start, so a machine nobody sits at is called what its settings
+        // say. Without one, a server still called by the default name is
+        // named after its computer, so that a hub's satellites and a
+        // satellite's hub say which machine each is, and a name someone
+        // chose is kept.
+        if let Some(name) = run.name.as_deref() {
+            if name != identity.name
+                && let Some(renamed) = store.rename(name)?
+            {
+                info!(name, "renamed by the name setting");
+                identity = renamed;
+            }
+        } else if identity.name == DEFAULT_NAME
+            && let Some(name) = run.computer_name.as_deref()
             && let Some(renamed) = store.rename(name)?
         {
             info!(name = %renamed.name, "this server is named after its computer");

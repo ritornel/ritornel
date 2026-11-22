@@ -70,6 +70,10 @@ pub struct Run {
     pub backup_dir: Option<std::path::PathBuf>,
     /// The computer's name, which a server still called by the default
     /// name takes. `serve` reads it; a server in a test keeps the default.
+    pub computer_name: Option<String>,
+    /// What the server is called by its settings, which replaces the stored
+    /// name at every start. With none, the stored name stands, or the
+    /// computer's in place of the default.
     pub name: Option<String>,
     /// Whether this run asks the system to keep the machine awake when its
     /// wake setting says to. `serve` does. A server in a test does not, so

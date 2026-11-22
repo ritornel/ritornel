@@ -3,7 +3,7 @@
 //! ```text
 //! ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
 //!                       [--log-level <level>] [--output <output>]
-//!                       [--backup-dir <dir>]
+//!                       [--backup-dir <dir>] [--name <name>]
 //! ritornel-server service install [--data-dir <dir>]
 //! ritornel-server service uninstall | status
 //! ```
@@ -27,7 +27,7 @@ The Ritornel server. It owns a data directory and the databases in it.
 Usage:
   ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
                         [--log-level <level>] [--output <output>]
-                        [--backup-dir <dir>]
+                        [--backup-dir <dir>] [--name <name>]
   ritornel-server service install [--data-dir <dir>]
   ritornel-server service uninstall | status
 
@@ -73,6 +73,10 @@ Options:
                         own in it, taken by `ritornelctl backup` and before
                         a database is migrated. With none named there is no
                         backup, and `ritornelctl status` says so
+  --name <name>         What this server is called where it is listed, such
+                        as the room its speakers are in. Given, it replaces
+                        the name the server has stored at every start; the
+                        stored name is kept when none is given
   -h, --help            Show this help
   -V, --version         Show the version
 
@@ -85,6 +89,7 @@ Environment:
   RITORNEL_LISTEN       The listen address, when --listen is not given
   RITORNEL_LOG_LEVEL    The log level, when --log-level is not given
   RITORNEL_BACKUP_DIR   The backup folder, when --backup-dir is not given
+  RITORNEL_NAME         The server's name, when --name is not given
 
 A setting is read from its flag, then its environment variable, then
 config.toml in the data directory, then its default.
@@ -140,6 +145,8 @@ pub(crate) struct ServeArgs {
     pub(crate) output: Option<String>,
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub(crate) backup_dir: Option<String>,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub(crate) name: Option<String>,
 }
 
 /// What a wrong command line is answered with. The messages are fixed and
@@ -178,6 +185,9 @@ fn usage(error: &clap::Error) -> Error {
             if option.starts_with("--backup-dir") =>
         {
             "--backup-dir needs a folder"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation if option.starts_with("--name") => {
+            "--name needs a name"
         }
         _ => "the command line is wrong; try `ritornel-server --help`",
     })
@@ -275,6 +285,7 @@ mod tests {
             invent_churn: None,
             output: None,
             backup_dir: None,
+            name: Some("Workbench Speakers".to_owned()),
         });
         for line in [
             &[
@@ -286,6 +297,8 @@ mod tests {
                 "127.0.0.1:5000",
                 "--log-level",
                 "debug",
+                "--name",
+                "Workbench Speakers",
             ][..],
             &[
                 "serve",
@@ -294,6 +307,8 @@ mod tests {
                 "--owned",
                 "--data-dir",
                 "/srv/ritornel",
+                "--name",
+                "Workbench Speakers",
                 "--listen",
                 "127.0.0.1:5000",
             ],
@@ -303,6 +318,7 @@ mod tests {
                 "--owned",
                 "--data-dir=/srv/ritornel",
                 "--listen=127.0.0.1:5000",
+                "--name=Workbench Speakers",
             ],
         ] {
             assert_eq!(parse(args(line)).unwrap().command, expected, "{line:?}");
@@ -362,6 +378,8 @@ mod tests {
             ),
             (&["serve", "--listen"], "--listen needs an address"),
             (&["serve", "--listen", ""], "--listen needs an address"),
+            (&["serve", "--name", ""], "--name needs a name"),
+            (&["serve", "--name", "--owned"], "--name needs a name"),
             (
                 &["serve", "--log-level", "--owned"],
                 "--log-level needs a level",
