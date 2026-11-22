@@ -78,7 +78,7 @@ fn a_song_with_no_history_has_no_facts() {
     let once = Gathered {
         song: Song {
             plays: 1,
-            last: Some(20240101),
+            last: Some((NOW - 1_000 * DAY, Some(20240101))),
             five_stars: false,
         },
         ..Gathered::default()
@@ -91,7 +91,7 @@ fn the_song_says_how_often_and_when_last() {
     let mut gathered = Gathered {
         song: Song {
             plays: 1_234,
-            last: Some(20250310),
+            last: Some((NOW - 600 * DAY, Some(20250310))),
             five_stars: true,
         },
         ..Gathered::default()
@@ -103,11 +103,17 @@ fn the_song_says_how_often_and_when_last() {
             "One of your five-star songs. The last time was in March 2025.".to_owned()
         )
     );
-    gathered.song.last = Some(TODAY.date);
+    gathered.song.last = Some((NOW - 60_000, Some(TODAY.date)));
     gathered.song.five_stars = false;
     assert_eq!(
         of(&facts(&gathered, TODAY), FactKind::SongPlays).unwrap().1,
         "The last time was earlier today."
+    );
+    // With no local date: the month of its instant in UTC.
+    gathered.song.last = Some((NOW - 500 * DAY, None));
+    assert_eq!(
+        of(&facts(&gathered, TODAY), FactKind::SongPlays).unwrap().1,
+        "The last time was in July 2025."
     );
 }
 
@@ -332,22 +338,49 @@ fn a_record_unplayed_for_a_year_before_today_says_since_when() {
     };
     assert_eq!(of(&facts(&lately, TODAY), FactKind::NotSince), None);
 
-    // Played since with no local date, so maybe before today: nothing is
-    // said.
-    let undated = Gathered {
+    // Played since with no local date: lately, so nothing is said, or over
+    // a year ago, so the month of its instant in UTC.
+    let undated = |days: i64| Gathered {
         record: Some(record(vec![
             heard(900, 20240530, 1, 12, 0),
-            Heard {
-                at_ms: Some(NOW - 30 * DAY),
-                date: None,
-                song: 1,
-                hour: None,
-                offset: None,
-            },
+            self::undated(days, 1),
         ])),
         ..Gathered::default()
     };
-    assert_eq!(of(&facts(&undated, TODAY), FactKind::NotSince), None);
+    assert_eq!(of(&facts(&undated(30), TODAY), FactKind::NotSince), None);
+    // At the same instant as one with a local date, that one is taken.
+    let at = |date| Heard {
+        // 23:30 UTC on 31 January 2024.
+        at_ms: Some(1_706_743_800_000),
+        ..heard(0, date, 1, 0, 0)
+    };
+    for plays in [
+        vec![at(20240201), undated_at(&at)],
+        vec![undated_at(&at), at(20240201)],
+    ] {
+        let gathered = Gathered {
+            record: Some(record(plays)),
+            ..Gathered::default()
+        };
+        assert_eq!(
+            of(&facts(&gathered, TODAY), FactKind::NotSince).unwrap().0,
+            "Before today, you had not played it *since February 2024*."
+        );
+    }
+    assert_eq!(
+        of(&facts(&undated(500), TODAY), FactKind::NotSince)
+            .unwrap()
+            .0,
+        "Before today, you had not played it *since July 2025*."
+    );
+}
+
+/// The play `at` gives, with no local date.
+fn undated_at(at: &impl Fn(i64) -> Heard) -> Heard {
+    Heard {
+        date: None,
+        ..at(0)
+    }
 }
 
 /// A play `days` before now with an instant and no local date.
@@ -530,7 +563,8 @@ fn a_songs_last_time_is_the_day_of_its_latest_play() {
         ),
     );
     assert_eq!(last_time(), "The last time was earlier today.");
-    // With no local date, the day of the latest play is not known.
+    // With no local date, the day of the latest play is not known, but
+    // its month is that of its instant in UTC.
     tamper(
         store,
         &format!(
@@ -538,5 +572,21 @@ fn a_songs_last_time_is_the_day_of_its_latest_play() {
             nth_play(1)
         ),
     );
-    assert_eq!(last_time(), "");
+    assert_eq!(last_time(), "The last time was in November 2026.");
+    // With no instants, its plays are still counted, and when the last
+    // was is not said.
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET event_at_utc_ms = NULL
+             WHERE recording_id = (SELECT recording_id FROM play_event WHERE id = {})",
+            nth_play(0)
+        ),
+    );
+    let history = store
+        .track_history(listener, appearance, TODAY)
+        .unwrap()
+        .unwrap();
+    let (head, more) = of(&history.facts, FactKind::SongPlays).unwrap();
+    assert!(head.starts_with("You have played this song *") && more.is_empty());
 }

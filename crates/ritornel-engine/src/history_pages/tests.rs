@@ -294,7 +294,7 @@ fn a_page_counts_the_bound_plays_of_its_artist_and_its_album_as_counting_by_hand
 }
 
 #[test]
-fn a_play_with_no_local_date_after_the_last_dated_one_is_not_taken_for_none() {
+fn the_first_and_last_months_are_those_of_the_first_and_last_plays_dated_or_not() {
     let since = Some(NOW - 6_000 * DAY);
     // A dated play in 2023, and one five days ago whose source gave no
     // zone, so it has an instant and no local date.
@@ -306,13 +306,14 @@ fn a_play_with_no_local_date_after_the_last_dated_one_is_not_taken_for_none() {
         "With you since *June 2023*. *1 play* in the last year."
     );
 
-    // Over two years ago, after the last dated play: its month is not known.
+    // Over two years ago, after the last dated play: the month of its
+    // instant in UTC.
     let mut gone = Facts::default();
     play(&mut gone, 3_000, 20180610);
     gone.add(Some(NOW - 1_000 * DAY), None, None, TODAY);
     assert_eq!(
         said(&sentence(&gone, since, TODAY)),
-        "With you since *June 2018*. Not played for over two years."
+        "With you since *June 2018*. Not played since *February 2024*."
     );
 
     // Most of all in one year, unless the undated plays might outdo it.
@@ -329,23 +330,60 @@ fn a_play_with_no_local_date_after_the_last_dated_one_is_not_taken_for_none() {
     }
     assert!(!said(&sentence(&mostly, since, TODAY)).contains("most of all"));
 
-    // Between one and two years ago: nor is it here.
+    // Between one and two years ago: so it is here.
     let mut quiet = Facts::default();
     play(&mut quiet, 1_000, 20240219);
     quiet.add(Some(NOW - 500 * DAY), None, None, TODAY);
     assert_eq!(
         said(&sentence(&quiet, since, TODAY)),
-        "With you since *February 2024*."
+        "With you since *February 2024*. Last played in *July 2025*."
     );
 
-    // An undated play before the last dated one changes nothing.
+    // An undated play years before the first dated one: its month, not
+    // the dated one's.
     let mut before = Facts::default();
     play(&mut before, 900, 20240530);
     before.add(Some(NOW - 2_000 * DAY), None, None, TODAY);
     assert_eq!(
         said(&sentence(&before, since, TODAY)),
-        "With you since *May 2024*. Not played since *May 2024*."
+        "With you since *May 2021*. Not played since *May 2024*."
     );
+
+    // No play with a local date at all.
+    let mut none = Facts::default();
+    none.add(Some(NOW - 500 * DAY), None, None, TODAY);
+    none.add(Some(NOW - 2_000 * DAY), None, None, TODAY);
+    assert_eq!(
+        said(&sentence(&none, since, TODAY)),
+        "With you since *May 2021*. Last played in *July 2025*."
+    );
+}
+
+#[test]
+fn a_months_day_with_no_local_date_is_its_day_in_utc() {
+    // 23:30 UTC on 31 January 2024.
+    let at = 1_706_743_800_000;
+    assert_eq!(super::month_of((at, None)), "January 2024");
+    // Heard where it was already February, the local date says so.
+    assert_eq!(super::month_of((at, Some(20240201))), "February 2024");
+}
+
+#[test]
+fn of_plays_at_the_same_instant_one_with_a_local_date_is_first_and_last() {
+    let at = 1_706_743_800_000;
+    for dated_first in [true, false] {
+        let mut facts = Facts::default();
+        let mut add = |date| facts.add(Some(at), date, None, TODAY);
+        if dated_first {
+            add(Some(20240201));
+            add(None);
+        } else {
+            add(None);
+            add(Some(20240201));
+        }
+        let played = (at, Some(20240201));
+        assert_eq!((facts.first, facts.last), (Some(played), Some(played)));
+    }
 }
 
 #[test]
@@ -447,7 +485,7 @@ fn the_span_holds_every_local_year_played_across_the_date_line() {
 }
 
 #[test]
-fn the_last_play_with_no_local_date_has_no_last_played_day() {
+fn a_first_or_last_play_with_no_local_date_has_no_day_but_keeps_its_month() {
     let (invented, listener, artist) = played(600);
     let store = &invented.store;
     let before = store
@@ -468,8 +506,51 @@ fn the_last_play_with_no_local_date_has_no_last_played_day() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        (after.first_played, after.last_played),
-        (before.first_played, None)
+        (&after.first_played, &after.last_played, &after.sentence),
+        (&before.first_played, &None, &before.sentence)
+    );
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET local_date = NULL
+             WHERE id = ({} ORDER BY pe.event_at_utc_ms LIMIT 1)",
+            plays_of(artist)
+        ),
+    );
+    let after = store
+        .artist_history(listener, artist, TODAY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (&after.first_played, &after.last_played, &after.sentence),
+        (&None, &None, &before.sentence)
+    );
+
+    // With no local date anywhere, the chart has no years, but where the
+    // listener's history begins is still known: with the artist.
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET event_at_utc_ms =
+               (SELECT min(event_at_utc_ms) FROM play_event) - {DAY}
+             WHERE id = ({} ORDER BY pe.event_at_utc_ms LIMIT 1)",
+            plays_of(artist)
+        ),
+    );
+    let before = store
+        .artist_history(listener, artist, TODAY)
+        .unwrap()
+        .unwrap();
+    assert!(said(&before.sentence).contains("your first weeks"));
+    tamper(store, "UPDATE play_event SET local_date = NULL");
+    let after = store
+        .artist_history(listener, artist, TODAY)
+        .unwrap()
+        .unwrap();
+    // What it says after since when needs years, which there are not now.
+    assert_eq!(
+        (after.span, after.years.len(), &after.sentence[..2]),
+        (None, 0, &before.sentence[..2])
     );
 }
 
