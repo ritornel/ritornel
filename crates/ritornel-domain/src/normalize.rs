@@ -251,14 +251,15 @@ pub fn core(text: &str) -> String {
     // A bracket of symbols alone, as "(+)", is kept: it is no note.
     let mut inside = String::new();
     let mut depth = 0_u32;
-    for c in text.nfkc() {
+    for c in text.chars() {
         match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => {
+            '(' | '[' | '{' | '（' | '［' | '｛' => depth += 1,
+            ')' | ']' | '}' | '）' | '］' | '｝' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    let words = inside.chars().any(|c| c.is_alphanumeric() || c == '&');
-                    if !words && inside.chars().any(is_symbol) {
+                    let folded: String = inside.nfkc().collect();
+                    let words = folded.chars().any(|c| c.is_alphanumeric() || c == '&');
+                    if !words && folded.chars().any(is_symbol) {
                         outside.push(' ');
                         outside.push_str(&inside);
                         outside.push(' ');
@@ -528,6 +529,7 @@ mod tests {
         assert_eq!(core("Lantern（Remastered）"), "lantern");
         assert_eq!(core("Lantern［＋］"), core("Lantern [+]"));
         assert_eq!(core("（Untitled）"), "untitled");
+        assert_eq!(core("Lantern ⑴"), "lantern 1");
     }
 
     #[test]
