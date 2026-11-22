@@ -357,7 +357,7 @@ mod enabled {
                 .start_job(command, LastfmSync::NAME, new)
                 .map_err(refused)?;
             if created {
-                self.publish_job(&started);
+                self.publish_stored_job(stores, &started);
             }
             self.jobs.wake();
             Ok((started, created))

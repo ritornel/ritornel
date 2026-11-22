@@ -180,13 +180,22 @@ impl Core {
 
     /// Sends a job, whole, to every session subscribed to the `jobs` topic.
     pub(crate) fn publish_job(&self, changed: &ritornel_engine::Job) {
-        // Held while it is sent, so that a copy that is not the end is
-        // either sent before the end or not at all.
-        let mut ended = lock(&self.ended_jobs);
-        if changed.state.ended() {
-            ended.insert(changed.public_id);
-        } else if ended.contains(&changed.public_id) {
-            return;
+        self.with_stores(|stores| self.publish_stored_job(stores, changed));
+    }
+
+    pub(super) fn publish_stored_job(&self, stores: &Stores, changed: &ritornel_engine::Job) {
+        let _sending = lock(&self.job_events);
+        // Finished jobs cannot change again. For an earlier snapshot the
+        // durable row tells us whether another publisher has overtaken it.
+        if !changed.state.ended() {
+            match stores.server.job(changed.public_id) {
+                Ok(current) if current.as_ref() == Some(changed) => {}
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "could not check job progress");
+                    return;
+                }
+            }
         }
         self.publish(&Event::Jobs(Box::new(JobsEvent { job: job(changed) })));
     }
@@ -477,7 +486,7 @@ impl Core {
             .start_job(command, ScanStart::NAME, new)
             .map_err(stored)?;
         if created {
-            self.publish_job(&started);
+            self.publish_stored_job(stores, &started);
         }
         self.jobs.wake();
         Ok(ScanStarted {
@@ -540,7 +549,7 @@ impl Core {
             .cancel_job(command, JobsCancel::NAME, params.job_id)
             .map_err(stored)?
             .ok_or_else(Self::no_job)?;
-        self.publish_job(&asked);
+        self.publish_stored_job(stores, &asked);
         Ok(JobCancelled {
             receipt: Receipt {
                 command_id: params.idempotency_key,

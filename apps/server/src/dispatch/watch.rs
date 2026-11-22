@@ -216,7 +216,7 @@ impl Core {
         match stores.server().start_job(command, "scan.auto", new) {
             Ok((job, created)) => {
                 if created {
-                    self.publish_job(&job);
+                    self.publish_stored_job(stores, &job);
                 }
                 self.jobs.wake();
                 if created {
