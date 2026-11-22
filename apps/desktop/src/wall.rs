@@ -263,6 +263,43 @@ pub(crate) struct OpenArtist {
 
 impl EventEmitter<OpenArtist> for Wall {}
 
+struct HeldView {
+    id: String,
+    client: Arc<ritornel_client::Client>,
+}
+
+impl HeldView {
+    async fn open(
+        client: &Arc<ritornel_client::Client>,
+        params: &ListOpenParams,
+    ) -> Result<
+        (
+            Self,
+            ritornel_contract::ListOpened,
+            ritornel_contract::ListSections,
+        ),
+        ritornel_client::Error,
+    > {
+        let opened = client.list_open(params).await?;
+        let held = Self {
+            id: opened.view.clone(),
+            client: Arc::clone(client),
+        };
+        let sections = client.list_sections(&held.id).await?;
+        Ok((held, opened, sections))
+    }
+}
+
+impl Drop for HeldView {
+    fn drop(&mut self) {
+        let id = std::mem::take(&mut self.id);
+        let client = Arc::clone(&self.client);
+        crate::net::rt().spawn(async move {
+            let _ = client.list_close(&id).await;
+        });
+    }
+}
+
 pub(crate) struct Wall {
     link: gpui::Entity<Link>,
     /// The session the wall reads through, while there is one.
@@ -276,7 +313,7 @@ pub(crate) struct Wall {
     keeping: Option<gpui::Task<()>>,
     /// Whether the view could not be opened.
     failed: bool,
-    view: Option<String>,
+    view: Option<HeldView>,
     total: usize,
     sections: Vec<(String, usize)>,
     pages: HashMap<usize, Page>,
@@ -535,6 +572,8 @@ impl Wall {
         self.opening += 1;
         self.lost = false;
         self.replacing = None;
+        self.selected = None;
+        self.reveal_at = None;
         self.replace_again = false;
         self.pending_anchor = None;
     }
@@ -568,8 +607,9 @@ impl Wall {
         if (kind, order) == (self.kind, self.order) {
             return;
         }
-        if let Some(view) = self.view.take() {
-            self.close_view(view);
+        self.view = None;
+        if kind != WallKind::Artists {
+            self.reveal = None;
         }
         self.forget_asks();
         self.kind = kind;
@@ -653,10 +693,11 @@ impl Wall {
     /// Finds where an artist is on the wall, and scrolls there.
     fn locate(&mut self, artist: Id, cx: &mut Context<Self>) {
         self.mark(artist, cx);
-        let (Some(net), Some(view)) = (self.net.clone(), self.view.clone()) else {
+        let (Some(net), Some(view)) = (self.net.clone(), self.view_id().map(str::to_owned)) else {
             return;
         };
         let client = Arc::clone(&net.client);
+        let asked_of = view.clone();
         let located = net.rt().spawn(async move {
             client
                 .list_locate(&ritornel_contract::ListLocateParams {
@@ -673,6 +714,9 @@ impl Wall {
                 && let Some(index) = located.index
             {
                 wall.update(cx, |wall, cx| {
+                    if wall.view_id() != Some(&asked_of) {
+                        return;
+                    }
                     wall.reveal_at = Some(index as usize);
                     cx.notify();
                 })
@@ -936,7 +980,7 @@ impl Wall {
                 cx.notify();
             });
         }));
-        let (Some(net), Some(view)) = (self.net.clone(), self.view.clone()) else {
+        let (Some(net), Some(view)) = (self.net.clone(), self.view_id().map(str::to_owned)) else {
             return;
         };
         self.asked += 1;
@@ -963,7 +1007,7 @@ impl Wall {
         cx.spawn(async move |wall, cx| {
             let answer = located.await;
             let _ = wall.update(cx, |wall, cx| {
-                if asked != wall.asked || wall.view.as_deref() != Some(view.as_str()) {
+                if asked != wall.asked || wall.view_id() != Some(view.as_str()) {
                     return;
                 }
                 // A view that has just been replaced: the next key finds it.
@@ -1014,7 +1058,8 @@ impl Wall {
     /// Moves the selection a step, or selects the first tile in view when
     /// there is none, scrolling only as far as keeps it in view.
     fn step(&mut self, step: layout::Step, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(layout), Some(view)) = (self.layout.clone(), self.view.clone()) else {
+        let (Some(layout), Some(view)) = (self.layout.clone(), self.view_id().map(str::to_owned))
+        else {
             return;
         };
         let viewport = viewport_of(window).1;
@@ -1028,16 +1073,16 @@ impl Wall {
                 None => return,
             },
         };
-        if self.selected.as_ref().map(|selected| selected.index) != Some(index) {
-            // A row not read yet, just scrolled to: the next press takes it.
-            let Some(row) = self.row(index) else { return };
+        self.keep_in_view(index, viewport);
+        if self.selected.as_ref().map(|selected| selected.index) != Some(index)
+            && let Some(row) = self.row(index)
+        {
             self.selected = Some(Selected {
                 id: row.id,
                 index,
                 view,
             });
         }
-        self.keep_in_view(index, viewport);
         cx.notify();
     }
 
@@ -1060,7 +1105,7 @@ impl Wall {
     /// The selection, brought into view: its row, and where its art is.
     fn reach(&mut self, viewport: f32) -> Option<(Arc<TileRow>, usize, Bounds<Pixels>)> {
         let selected = self.selected.clone()?;
-        if self.view.as_deref() != Some(selected.view.as_str()) {
+        if self.view_id() != Some(selected.view.as_str()) {
             return None;
         }
         let row = self
@@ -1097,9 +1142,7 @@ impl Wall {
     /// keeping the row at the top where it was on screen.
     fn heard(&mut self, event: &ritornel_contract::ListEvent, cx: &mut Context<Self>) {
         self.heard_revision = self.heard_revision.max(event.library_revision);
-        if self.view.as_deref() != Some(event.view.as_str())
-            || event.library_revision <= self.revision
-        {
+        if self.view_id() != Some(event.view.as_str()) || event.library_revision <= self.revision {
             return;
         }
         crate::debug(format_args!(
@@ -1127,7 +1170,7 @@ impl Wall {
 
     /// Reads a page again in place: what is on screen stays until it comes.
     fn read_again(&mut self, page: usize, cx: &mut Context<Self>) {
-        let (Some(view), Some(net)) = (self.view.clone(), self.net.clone()) else {
+        let (Some(view), Some(net)) = (self.view_id().map(str::to_owned), self.net.clone()) else {
             return;
         };
         let client = Arc::clone(&net.client);
@@ -1140,7 +1183,7 @@ impl Wall {
         cx.spawn(async move |this, cx| {
             let Ok(Ok(window)) = read.await else { return };
             let _ = this.update(cx, |wall, cx| {
-                if wall.view.as_deref() == Some(asked_of.as_str()) {
+                if wall.view_id() == Some(asked_of.as_str()) {
                     let frame = wall.frame;
                     wall.pages.insert(
                         page,
@@ -1174,7 +1217,7 @@ impl Wall {
     /// keep in place; everything changes at once when its rows are in.
     fn replace(&mut self, cx: &mut Context<Self>) {
         self.last_replace = Some(Instant::now());
-        let (Some(net), Some(old)) = (self.net.clone(), self.view.clone()) else {
+        let (Some(net), Some(old)) = (self.net.clone(), self.view_id().map(str::to_owned)) else {
             self.replacing = None;
             return;
         };
@@ -1184,7 +1227,6 @@ impl Wall {
             self.forget_asks();
             self.selected = None;
             self.view = None;
-            self.close_view(old);
             self.pages.clear();
             self.pages_in_flight = 0;
             self.open(cx);
@@ -1206,8 +1248,9 @@ impl Wall {
         let selected_id = selected.as_ref().map(|selected| selected.id);
         let offset = (index / PAGE * PAGE) as u64;
         let replaced = net.rt().spawn(async move {
-            let opened = client
-                .list_open(&ListOpenParams {
+            let (held, opened, sections) = HeldView::open(
+                &client,
+                &ListOpenParams {
                     kind,
                     query: Query {
                         sort: Some(vec![Sort { key }]),
@@ -1221,29 +1264,17 @@ impl Wall {
                         view: old,
                         anchor: anchor.as_ref().map(|row| row.id.to_string()),
                     }),
-                })
-                .await?;
-            let read = async {
-                let sections = client.list_sections(&opened.view).await?;
-                // The rows around the anchor, so that what replaces the old ones is there at once.
-                let near = match opened.anchor_index {
-                    Some(at) if at / PAGE as u64 * PAGE as u64 != offset => Some(
-                        client
-                            .list_window(&opened.view, at / PAGE as u64 * PAGE as u64, PAGE as u64)
-                            .await?,
-                    ),
-                    _ => None,
-                };
-                Ok::<_, ritornel_client::Error>((sections, near))
-            };
-            // The old view has ended with the open: a new one that cannot be
-            // read is closed too, and the replacement is asked for again.
-            let (sections, near) = match read.await {
-                Ok(read) => read,
-                Err(error) => {
-                    let _ = client.list_close(&opened.view).await;
-                    return Err(error);
-                }
+                },
+            )
+            .await?;
+            // The rows around the anchor, so that what replaces the old ones is there at once.
+            let near = match opened.anchor_index {
+                Some(at) if at / PAGE as u64 * PAGE as u64 != offset => Some(
+                    client
+                        .list_window(&opened.view, at / PAGE as u64 * PAGE as u64, PAGE as u64)
+                        .await?,
+                ),
+                _ => None,
             };
             // The selection, found again in the new view.
             let found = match &selected {
@@ -1260,20 +1291,17 @@ impl Wall {
                     .and_then(|located| located.index),
                 None => None,
             };
-            Ok::<_, ritornel_client::Error>((opened, sections, near, found))
+            Ok::<_, ritornel_client::Error>((held, opened, sections, near, found))
         });
         cx.spawn(async move |wall, cx| {
             let answer = replaced.await;
             let _ = wall.update(cx, |wall, cx| {
                 // Asked for a wall, an order or a session since left.
                 if wall.opening != asked {
-                    if let Ok(Ok((opened, ..))) = &answer {
-                        wall.close_view(opened.view.clone());
-                    }
                     return;
                 }
                 wall.replacing = None;
-                if let Ok(Ok((opened, sections, near, found))) = answer {
+                if let Ok(Ok((held, opened, sections, near, found))) = answer {
                     wall.total = opened.total as usize;
                     wall.sections = sections
                         .sections
@@ -1322,7 +1350,8 @@ impl Wall {
                         opened.anchor_index
                     ));
                     wall.revision = opened.library_revision;
-                    wall.view = Some(opened.view);
+                    wall.reveal_at = None;
+                    wall.view = Some(held);
                     wall.lost = false;
                     wall.layout = None;
                     // The library changed while it was opening.
@@ -1345,7 +1374,7 @@ impl Wall {
     /// Uses the view, reading its first row, so that the server keeps it; one
     /// the server has let go already is opened again in its place.
     fn keep_view(&mut self, cx: &mut Context<Self>) {
-        let (Some(view), Some(net)) = (self.view.clone(), self.net.clone()) else {
+        let (Some(view), Some(net)) = (self.view_id().map(str::to_owned), self.net.clone()) else {
             return;
         };
         let asked_of = view.clone();
@@ -1356,7 +1385,7 @@ impl Wall {
         cx.spawn(async move |wall, cx| {
             let answer = read.await;
             wall.update(cx, |wall, cx| {
-                if wall.view.as_deref() == Some(asked_of.as_str()) && expired(&answer) {
+                if wall.view_id() == Some(asked_of.as_str()) && expired(&answer) {
                     wall.lost = true;
                     if wall.replacing.is_none() {
                         wall.schedule_replace(cx);
@@ -1368,14 +1397,8 @@ impl Wall {
         .detach();
     }
 
-    /// Ends a view on the server.
-    fn close_view(&self, view: String) {
-        if let Some(net) = &self.net {
-            let client = Arc::clone(&net.client);
-            net.rt().spawn(async move {
-                let _ = client.list_close(&view).await;
-            });
-        }
+    fn view_id(&self) -> Option<&str> {
+        self.view.as_ref().map(|held| held.id.as_str())
     }
 
     /// Opens the view again, as "Try again" does.
@@ -1396,8 +1419,9 @@ impl Wall {
         self.opening += 1;
         let asked = self.opening;
         let opened = net.rt().spawn(async move {
-            let opened = client
-                .list_open(&ListOpenParams {
+            HeldView::open(
+                &client,
+                &ListOpenParams {
                     kind,
                     query: Query {
                         sort: Some(vec![Sort { key }]),
@@ -1408,10 +1432,9 @@ impl Wall {
                         limit: PAGE as u64,
                     }),
                     replaces: None,
-                })
-                .await?;
-            let sections = client.list_sections(&opened.view).await?;
-            Ok::<_, ritornel_client::Error>((opened, sections))
+                },
+            )
+            .await
         });
         cx.spawn(async move |this, cx| {
             let answer = opened.await;
@@ -1419,13 +1442,10 @@ impl Wall {
                 // Opened for a wall, an order or a session since left, or
                 // overtaken by another open.
                 if wall.opening != asked {
-                    if let Ok(Ok((opened, _))) = &answer {
-                        wall.close_view(opened.view.clone());
-                    }
                     return;
                 }
                 match answer {
-                    Ok(Ok((opened, sections))) => {
+                    Ok(Ok((held, opened, sections))) => {
                         wall.total = opened.total as usize;
                         wall.sections = sections
                             .sections
@@ -1440,7 +1460,8 @@ impl Wall {
                             },
                         );
                         wall.revision = opened.library_revision;
-                        wall.view = Some(opened.view);
+                        wall.reveal_at = None;
+                        wall.view = Some(held);
                         wall.lost = false;
                         wall.layout = None;
                         // The library changed while it was opening.
@@ -1471,7 +1492,7 @@ impl Wall {
     }
 
     fn fetch_page(&mut self, page: usize, cx: &mut Context<Self>) {
-        let (Some(view), Some(net)) = (self.view.clone(), self.net.clone()) else {
+        let (Some(view), Some(net)) = (self.view_id().map(str::to_owned), self.net.clone()) else {
             return;
         };
         if self.lost {
@@ -1490,7 +1511,7 @@ impl Wall {
             let answer = read.await;
             this.update(cx, |wall, cx| {
                 // An answer for a view since closed, with its session.
-                if wall.view.as_deref() != Some(asked_of.as_str()) {
+                if wall.view_id() != Some(asked_of.as_str()) {
                     return;
                 }
                 wall.pages_in_flight = wall.pages_in_flight.saturating_sub(1);
@@ -2712,5 +2733,64 @@ impl Wall {
             ),
             size(px(TILE), px(TILE)),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn opened_views_close_when_sections_fail_or_the_wall_lets_go()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for fail_sections in [true, false] {
+            let (send, mut calls) = mpsc::channel(4);
+            let (answers, receive) = mpsc::channel(4);
+            let client = Arc::new(ritornel_client::Client::over_memory(send, receive));
+            let server = tokio::spawn(async move {
+                for method in ["list.open", "list.sections", "list.close"] {
+                    let call: Value =
+                        serde_json::from_str(&calls.recv().await.ok_or("missing call")?)?;
+                    assert_eq!(call.get("method").and_then(Value::as_str), Some(method));
+                    let result = match method {
+                        "list.open" => {
+                            json!({"view":"first","total":0,"libraryRevision":1,"offset":0,"rows":[]})
+                        }
+                        "list.sections" if fail_sections => Value::Null, // A malformed reply.
+                        "list.sections" => json!({"sections":[]}),
+                        _ => {
+                            assert_eq!(
+                                call.pointer("/params/view").and_then(Value::as_str),
+                                Some("first")
+                            );
+                            json!({"closed":true})
+                        }
+                    };
+                    answers
+                        .send(
+                            json!({"jsonrpc":"2.0","id":call.get("id"),"result":result})
+                                .to_string(),
+                        )
+                        .await?;
+                }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            });
+            let opened = HeldView::open(
+                &client,
+                &ListOpenParams {
+                    kind: ListKind::Artists,
+                    query: Query::default(),
+                    window: None,
+                    replaces: None,
+                },
+            )
+            .await;
+            assert_eq!(opened.is_err(), fail_sections);
+            drop(opened);
+            tokio::time::timeout(Duration::from_secs(5), server).await???;
+        }
+        Ok(())
     }
 }
