@@ -672,6 +672,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_errors_only_report_the_transport_context_once() {
+        let (client, requests, _replies) = pair();
+        drop(requests);
+        let err = client.call_raw("test", json!({})).await.unwrap_err();
+        assert_eq!(
+            err.to_string()
+                .matches("no connection to the server")
+                .count(),
+            1,
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn dropping_the_client_closes_its_end() {
         let (client, mut from_client, _to_client) = pair();
         drop(client);
