@@ -1247,3 +1247,924 @@ fn rebuild_display_preserves_retired_rows_and_migrates_stale_keys_safely() {
         "Moss Arcade"
     );
 }
+
+#[test]
+fn metadata_edits_keep_the_named_entity_across_merge_competing_edits_withdraw_and_undo() {
+    use ritornel_domain::library::Kind;
+
+    let mut rig = Rig::new();
+    rig.put(FLAC, "a.flac");
+    rig.put("Other/track.ogg", "a.retagged.ogg");
+    rig.scan();
+
+    let recs: Vec<(i64, crate::Id)> = rig
+        .library
+        .read(|connection| {
+            let mut stmt = connection.prepare("SELECT id, public_id FROM recording ORDER BY id")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, crate::Id::from_bytes(row.get(1)?)))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(recs.len(), 2);
+    let ((rec_a, pid_a), (rec_b, pid_b)) = (recs[0], recs[1]);
+
+    // Edit recording A, then merge B into A, then edit B while B redirects to A.
+    rig.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "edit.set",
+                command: None,
+                client: None,
+            },
+            Kind::Recording,
+            pid_a,
+            "title",
+            "Title On A",
+        )
+        .unwrap();
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.mergeRec",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE recording SET redirect_to_id = ?2, canonical_id = ?2 WHERE id = ?1",
+                    (rec_b, rec_a),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "edit.set",
+                command: None,
+                client: None,
+            },
+            Kind::Recording,
+            pid_b,
+            "title",
+            "Title On B",
+        )
+        .unwrap();
+
+    // The stored edit row named B (never rewritten to A), and while merged
+    // the newest active edit (B's) wins on A's display_title.
+    assert_eq!(
+        rig.one("SELECT entity_id FROM metadata_edit WHERE value = 'Title On B'"),
+        rec_b.to_string()
+    );
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_title FROM recording WHERE id = {rec_a}"
+        )),
+        "Title On B"
+    );
+
+    // Undoing the merge leaves each edit on the recording it named.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.unmergeRec",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE recording SET redirect_to_id = NULL, canonical_id = id WHERE id = ?1",
+                    [rec_b],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolve",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_title FROM recording WHERE id = {rec_a}"
+        )),
+        "Title On A"
+    );
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_title FROM recording WHERE id = {rec_b}"
+        )),
+        "Title On B"
+    );
+
+    // Re-merge B into A, then withdraw B's edit: A's earlier active edit stands.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.remergeRec",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE recording SET redirect_to_id = ?2, canonical_id = ?2 WHERE id = ?1",
+                    (rec_b, rec_a),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.library
+        .withdraw_metadata_edit(
+            WriteRequest {
+                method: "edit.withdraw",
+                command: None,
+                client: None,
+            },
+            Kind::Recording,
+            pid_b,
+            "title",
+        )
+        .unwrap();
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_title FROM recording WHERE id = {rec_a}"
+        )),
+        "Title On A"
+    );
+
+    // Invalid edits (unsupported field, unparseable date) are refused, and
+    // withdrawing when no edit is active returns Ok(None) without taking a rev.
+    assert!(matches!(
+        rig.library.set_metadata_edit(
+            WriteRequest {
+                method: "edit.set",
+                command: None,
+                client: None,
+            },
+            Kind::Recording,
+            pid_a,
+            "bogus_field",
+            "x",
+        ),
+        Err(Error::Invalid(_))
+    ));
+    let rel_pid: crate::Id = rig
+        .library
+        .read(|connection| {
+            Ok(
+                connection.query_row("SELECT public_id FROM release LIMIT 1", [], |row| {
+                    Ok(crate::Id::from_bytes(row.get(0)?))
+                })?,
+            )
+        })
+        .unwrap();
+    assert!(matches!(
+        rig.library.set_metadata_edit(
+            WriteRequest {
+                method: "edit.set",
+                command: None,
+                client: None,
+            },
+            Kind::Release,
+            rel_pid,
+            "date",
+            "unknown",
+        ),
+        Err(Error::Invalid(_))
+    ));
+    let rev_before = rig.revision();
+    assert!(
+        rig.library
+            .withdraw_metadata_edit(
+                WriteRequest {
+                    method: "edit.withdraw",
+                    command: None,
+                    client: None,
+                },
+                Kind::Recording,
+                pid_b,
+                "title",
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(rig.revision(), rev_before);
+
+    // Redirected track appearance edit updates the canonical appearance's
+    // display_title even when live assignments still point at the redirected row.
+    let apps: Vec<(i64, crate::Id)> = rig
+        .library
+        .read(|connection| {
+            let mut stmt =
+                connection.prepare("SELECT id, public_id FROM track_appearance ORDER BY id")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, crate::Id::from_bytes(row.get(1)?)))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(apps.len(), 2);
+    let ((ta_a, ta_pid_a), (ta_b, ta_pid_b)) = (apps[0], apps[1]);
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.mergeApp",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE track_appearance SET redirect_to_id = ?2, canonical_id = ?2 WHERE id = ?1",
+                    (ta_b, ta_a),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "edit.set",
+                command: None,
+                client: None,
+            },
+            Kind::TrackAppearance,
+            ta_pid_b,
+            "title",
+            "Merged Appearance Title",
+        )
+        .unwrap();
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_title FROM track_appearance WHERE id = {ta_a}"
+        )),
+        "Merged Appearance Title"
+    );
+    let _ = ta_pid_a;
+}
+
+#[test]
+fn where_edit_rating_and_play_land_after_recording_split() {
+    use ritornel_domain::library::Kind;
+
+    let mut rig = Rig::new();
+    // Two files sharing recording R1 (`a.flac` and `copy.mp3`).
+    rig.put(FLAC, "a.flac");
+    rig.put(COPY, "a.mp3");
+    rig.scan();
+    let (r1, r1_pid): (i64, crate::Id) = rig
+        .library
+        .read(|connection| {
+            Ok(
+                connection.query_row("SELECT id, public_id FROM recording", [], |row| {
+                    Ok((row.get(0)?, crate::Id::from_bytes(row.get(1)?)))
+                })?,
+            )
+        })
+        .unwrap();
+
+    // Put an edit and a native star rating on R1, plus a source-item love on
+    // COPY, and record two scrobbles/plays of COPY (one left unpinned, one
+    // explicitly pinned to R1 by an observation recording correction).
+    rig.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "edit.set",
+                command: None,
+                client: None,
+            },
+            Kind::Recording,
+            r1_pid,
+            "title",
+            "Edited Original",
+        )
+        .unwrap();
+    rig.library
+        .set_rating(
+            WriteRequest {
+                method: "ratings.set",
+                command: None,
+                client: None,
+            },
+            r1_pid,
+            Some(80),
+            |rev, _| rev.to_string(),
+        )
+        .unwrap();
+    let listener = rig.library.default_listener().unwrap().unwrap();
+    let (copy_item, copy_item_pid, copy_asset_pid, copy_app_pid): (
+        i64,
+        crate::Id,
+        crate::Id,
+        crate::Id,
+    ) = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT si.id, si.public_id, aa.public_id, ta.public_id
+                     FROM source_item si
+                     JOIN source_item_revision sr ON sr.id = si.current_revision_id
+                     JOIN audio_asset aa ON aa.id = sr.audio_asset_id
+                     JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+                     JOIN track_appearance ta ON ta.id = a.appearance_id
+                     WHERE si.provider_key = ?1",
+                [COPY],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        crate::Id::from_bytes(row.get(1)?),
+                        crate::Id::from_bytes(row.get(2)?),
+                        crate::Id::from_bytes(row.get(3)?),
+                    ))
+                },
+            )?)
+        })
+        .unwrap();
+    // Source-item love on COPY (from an external endpoint).
+    let account = rig
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.love",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let c = write.connection();
+                let l_id: i64 =
+                    c.query_row("SELECT min(id) FROM listener", [], |row| row.get(0))?;
+                let ep_id: i64 = c.query_row(
+                    "SELECT endpoint_id FROM service_account WHERE public_id = ?1",
+                    [account.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )?;
+                c.execute(
+                    "INSERT INTO listener_rating
+                       (listener_id, source_item_id, endpoint_id, kind, cleared, rated_at_ms, rev)
+                     VALUES (?1, ?2, ?3, 'love', 0, ?4, ?5)",
+                    (l_id, copy_item, ep_id, write.now_ms(), write.rev()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    // Two native listens of COPY; pin the first listen to R1 explicitly.
+    let t0 = 1_794_776_400_000_i64;
+    let boot = crate::Id::from_bytes([0xb0; 16]);
+    let server_id: crate::Id = rig
+        .library
+        .read(|connection| {
+            Ok(
+                connection.query_row("SELECT public_id FROM server LIMIT 1", [], |row| {
+                    Ok(crate::Id::from_bytes(row.get(0)?))
+                })?,
+            )
+        })
+        .unwrap();
+    for (idx, key_byte) in [(0_i64, 0x71_u8), (1_i64, 0x72_u8)] {
+        let start = t0 + idx * 600_000;
+        let sent_delay = (2 - idx) * 600_000;
+        let record = crate::ListenRecord {
+            v: crate::LISTEN_RECORD_VERSION,
+            listen_id: crate::Id::from_bytes([key_byte; 16]),
+            listener,
+            actor_session: None,
+            played_on_server: server_id,
+            appearance: copy_app_pid,
+            asset: copy_asset_pid,
+            copy_kind: "master".to_owned(),
+            source_item: copy_item_pid,
+            source_revision: 1,
+            started_at_ms: start,
+            zone: Some("UTC".to_owned()),
+            started_mono_ms: 1_000_000 + idx * 600_000,
+            boot,
+            start_reason: "user_pick".to_owned(),
+            continues: None,
+            start_position_ms: 0,
+            track_duration_ms: 180_000,
+            ms_played: 180_000,
+            heard_ranges: vec![[0, 180_000]],
+            heard_ranges_approximate: false,
+            max_position_ms: 180_000,
+            seek_count: 0,
+            pause_count: 0,
+            end_position_ms: 180_000,
+            end_reason: "finished".to_owned(),
+            ended_at_ms: start + 180_000,
+            ended_mono_ms: Some(1_180_000 + idx * 600_000),
+            context_kind: "album".to_owned(),
+            context_ref: None,
+            shuffle: false,
+        };
+        rig.library
+            .ingest_listen_by(
+                &record,
+                crate::SendStamps {
+                    sent_at_ms: start + sent_delay,
+                    sent_mono_ms: 1_000_000 + idx * 600_000 + sent_delay,
+                    sent_boot: boot,
+                },
+                ritornel_domain::history::PlayRule::V1,
+            )
+            .unwrap();
+    }
+    let first_obs: (crate::Id, Vec<u8>) = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT e.public_id, o.source_key FROM history_observation o
+                 JOIN history_endpoint e ON e.id = o.endpoint_id
+                 WHERE o.kind = 'listen'
+                 ORDER BY o.id LIMIT 1",
+                [],
+                |row| Ok((crate::Id::from_bytes(row.get(0)?), row.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    rig.library
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            crate::CorrectionTargets::Observations(vec![first_obs]),
+            Some(r1_pid),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Split: retag COPY to a completely different song -> moves COPY to new R2.
+    rig.put(COPY, "a.retagged.mp3");
+    rig.scan();
+
+    let (r2, r2_pid): (i64, crate::Id) = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT r.id, r.public_id FROM source_item si
+                 JOIN recording r ON r.id = si.current_recording_id
+                 WHERE si.provider_key = ?1",
+                [COPY],
+                |row| Ok((row.get(0)?, crate::Id::from_bytes(row.get(1)?))),
+            )?)
+        })
+        .unwrap();
+    assert_ne!(r2, r1);
+
+    // 1. Edit: stays on R1; R2 starts unedited with its own tag title.
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_title FROM recording WHERE id = {r1}"
+        )),
+        "Edited Original"
+    );
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_title FROM recording WHERE id = {r2}"
+        )),
+        "Another Name Entirely"
+    );
+
+    // 2. Rating: native star rating stays on R1; source-item love followed COPY to R2.
+    let said = rig.library.said_of(vec![r1, r2]).unwrap();
+    assert_eq!(said[&r1].rating, Some(80));
+    assert!(!said[&r1].loved);
+    assert_eq!(said[&r2].rating, None);
+    assert!(said[&r2].loved);
+
+    // 3. Plays: the unpinned listen followed COPY to R2; the pinned listen
+    //    stayed on R1, and history rebuild agrees.
+    let plays = rig.library.recent_plays(listener, 10, None).unwrap();
+    assert_eq!(plays.len(), 2);
+    // Newest first: second listen (unpinned -> R2), first listen (pinned -> R1).
+    assert_eq!(plays[0].recording, Some(r2_pid));
+    assert_eq!(plays[1].recording, Some(r1_pid));
+    let dry: i64 = rig
+        .library
+        .rebuild_history(
+            WriteRequest {
+                method: "history.rebuild",
+                command: None,
+                client: None,
+            },
+            true,
+            |rebuilt| rebuilt.changed.to_string(),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(dry, 0);
+}
+
+#[test]
+fn where_edit_rating_and_play_land_after_release_split_and_regrouping() {
+    use ritornel_domain::library::Kind;
+
+    let mut rig = Rig::new();
+    // Put two distinct tracks in the same folder/album so they start on ONE
+    // release L1.
+    rig.put(FLAC, "a.flac");
+    rig.put(
+        "Moss Arcade/Tin Weather/03 Second Track.ogg",
+        "a.retagged.ogg",
+    );
+    rig.scan();
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.joinOneRelease",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let c = write.connection();
+                let second: i64 = c.query_row(
+                    "SELECT id FROM source_item
+                     WHERE provider_key = 'Moss Arcade/Tin Weather/03 Second Track.ogg'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let second_rev: i64 = c.query_row(
+                    "SELECT current_revision_id FROM source_item WHERE id = ?1",
+                    [second],
+                    |row| row.get(0),
+                )?;
+                let src_id: i64 = c.query_row(
+                    "SELECT id FROM metadata_source WHERE kind = 'file_tags'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let rel_mbid: String = c.query_row(
+                    "SELECT value FROM identifier_claim WHERE namespace = 'mb_release' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                c.execute(
+                    "DELETE FROM metadata_claim WHERE source_item_id = ?1 AND field = 'album'",
+                    [second],
+                )?;
+                c.execute(
+                    "INSERT INTO metadata_claim
+                       (source_item_id, revision_id, extractor_version, scope, field, value,
+                        ordinal, metadata_source_id, rev)
+                     VALUES (?1, ?2, 1, 'release', 'album', 'Tin Weather', 0, ?3, ?4)",
+                    (second, second_rev, src_id, write.rev()),
+                )?;
+                c.execute(
+                    "INSERT INTO identifier_claim
+                       (source_item_id, revision_id, extractor_version, scope, namespace, value,
+                        ordinal, metadata_source_id, rev)
+                     VALUES (?1, ?2, 1, 'release', 'mb_release', ?3, 0, ?4, ?5)",
+                    (second, second_rev, &rel_mbid, src_id, write.rev()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolveInitial",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    assert_eq!(
+        rig.one(
+            "SELECT count(DISTINCT ta.release_id) FROM assignment a
+             JOIN track_appearance ta ON ta.id = a.appearance_id
+             WHERE a.superseded_at_ms IS NULL"
+        ),
+        "1"
+    );
+
+    let (rel1, rel1_pid, grp1, grp1_pid, rec2, rec2_pid, item2_pid, asset2_pid, app2_pid): (
+        i64,
+        crate::Id,
+        i64,
+        crate::Id,
+        i64,
+        crate::Id,
+        crate::Id,
+        crate::Id,
+        crate::Id,
+    ) = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT rel.id, rel.public_id, rg.id, rg.public_id, r.id, r.public_id,
+                        si.public_id, aa.public_id, ta.public_id
+                 FROM source_item si
+                 JOIN source_item_revision sr ON sr.id = si.current_revision_id
+                 JOIN audio_asset aa ON aa.id = sr.audio_asset_id
+                 JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+                 JOIN recording r ON r.id = a.recording_id
+                 JOIN track_appearance ta ON ta.id = a.appearance_id
+                 JOIN release rel ON rel.id = ta.release_id
+                 JOIN release_group rg ON rg.id = rel.release_group_id
+                 WHERE si.provider_key = 'Moss Arcade/Tin Weather/03 Second Track.ogg'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        crate::Id::from_bytes(row.get(1)?),
+                        row.get(2)?,
+                        crate::Id::from_bytes(row.get(3)?),
+                        row.get(4)?,
+                        crate::Id::from_bytes(row.get(5)?),
+                        crate::Id::from_bytes(row.get(6)?),
+                        crate::Id::from_bytes(row.get(7)?),
+                        crate::Id::from_bytes(row.get(8)?),
+                    ))
+                },
+            )?)
+        })
+        .unwrap();
+
+    // Put an edit on L1, an edit on G1, a rating on track 2's recording, and a
+    // listen/play on track 2.
+    rig.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "edit.set",
+                command: None,
+                client: None,
+            },
+            Kind::Release,
+            rel1_pid,
+            "date",
+            "2019",
+        )
+        .unwrap();
+    rig.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "edit.set",
+                command: None,
+                client: None,
+            },
+            Kind::ReleaseGroup,
+            grp1_pid,
+            "primary_type",
+            "ep",
+        )
+        .unwrap();
+    rig.library
+        .set_rating(
+            WriteRequest {
+                method: "ratings.set",
+                command: None,
+                client: None,
+            },
+            rec2_pid,
+            Some(100),
+            |rev, _| rev.to_string(),
+        )
+        .unwrap();
+    let listener = rig.library.default_listener().unwrap().unwrap();
+    let server_id: crate::Id = rig
+        .library
+        .read(|connection| {
+            Ok(
+                connection.query_row("SELECT public_id FROM server LIMIT 1", [], |row| {
+                    Ok(crate::Id::from_bytes(row.get(0)?))
+                })?,
+            )
+        })
+        .unwrap();
+    let boot = crate::Id::from_bytes([0xb1; 16]);
+    let start = 1_794_776_400_000_i64;
+    let listen = crate::ListenRecord {
+        v: crate::LISTEN_RECORD_VERSION,
+        listen_id: crate::Id::from_bytes([0x81; 16]),
+        listener,
+        actor_session: None,
+        played_on_server: server_id,
+        appearance: app2_pid,
+        asset: asset2_pid,
+        copy_kind: "master".to_owned(),
+        source_item: item2_pid,
+        source_revision: 1,
+        started_at_ms: start,
+        zone: Some("UTC".to_owned()),
+        started_mono_ms: 1_000_000,
+        boot,
+        start_reason: "user_pick".to_owned(),
+        continues: None,
+        start_position_ms: 0,
+        track_duration_ms: 180_000,
+        ms_played: 180_000,
+        heard_ranges: vec![[0, 180_000]],
+        heard_ranges_approximate: false,
+        max_position_ms: 180_000,
+        seek_count: 0,
+        pause_count: 0,
+        end_position_ms: 180_000,
+        end_reason: "finished".to_owned(),
+        ended_at_ms: start + 180_000,
+        ended_mono_ms: Some(1_180_000),
+        context_kind: "album".to_owned(),
+        context_ref: None,
+        shuffle: false,
+    };
+    rig.library
+        .ingest_listen_by(
+            &listen,
+            crate::SendStamps {
+                sent_at_ms: start + 240_000,
+                sent_mono_ms: 1_240_000,
+                sent_boot: boot,
+            },
+            ritornel_domain::history::PlayRule::V1,
+        )
+        .unwrap();
+
+    // 1. Release split: change track 2's release MBID and album so it splits
+    //    onto a new release L2 (in a separate group G2).
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.splitRelease",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let c = write.connection();
+                let second: i64 = c.query_row(
+                    "SELECT id FROM source_item
+                     WHERE provider_key = 'Moss Arcade/Tin Weather/03 Second Track.ogg'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                c.execute(
+                    "UPDATE identifier_claim SET value = 'rel-split-l2'
+                     WHERE source_item_id = ?1 AND namespace = 'mb_release'",
+                    [second],
+                )?;
+                c.execute(
+                    "UPDATE metadata_claim SET value = 'Other Album'
+                     WHERE source_item_id = ?1 AND field = 'album'",
+                    [second],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolveAfterSplit",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+
+    let (rel2, grp2, new_app2_pid): (i64, i64, crate::Id) = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT rel.id, rel.release_group_id, ta.public_id
+                 FROM source_item si
+                 JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+                 JOIN track_appearance ta ON ta.id = a.appearance_id
+                 JOIN release rel ON rel.id = ta.release_id
+                 WHERE si.provider_key = 'Moss Arcade/Tin Weather/03 Second Track.ogg'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, crate::Id::from_bytes(row.get(2)?))),
+            )?)
+        })
+        .unwrap();
+    assert_ne!(rel2, rel1, "track 2 must have split onto a new release L2");
+    assert_ne!(grp2, grp1, "L2 must start in a separate release group G2");
+    assert_ne!(
+        new_app2_pid, app2_pid,
+        "L2 must give track 2 a new appearance"
+    );
+
+    // L1 kept its date edit, G1 kept its primary_type edit, rec2 kept its
+    // rating, and track 2's play moved to L2's appearance while keeping rec2.
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_date FROM release WHERE id = {rel1}"
+        )),
+        "2019"
+    );
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_primary_type FROM release_group WHERE id = {grp1}"
+        )),
+        "ep"
+    );
+    assert_eq!(
+        rig.library.said_of(vec![rec2]).unwrap()[&rec2].rating,
+        Some(100)
+    );
+    let plays = rig.library.recent_plays(listener, 10, None).unwrap();
+    assert_eq!(plays.len(), 1);
+    assert_eq!(plays[0].recording, Some(rec2_pid));
+    assert_eq!(plays[0].appearance, Some(new_app2_pid));
+    let dry: i64 = rig
+        .library
+        .rebuild_history(
+            WriteRequest {
+                method: "history.rebuild",
+                command: None,
+                client: None,
+            },
+            true,
+            |rebuilt| rebuilt.changed.to_string(),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(dry, 0);
+
+    // 2. Release regrouping: give L2 the same release_group_mbid as L1 so L2
+    //    regroups automatically into edited G1. G1 survives with its edit, and
+    //    rec2's rating and play stay intact.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.regroupIntoG1",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let c = write.connection();
+                let second: i64 = c.query_row(
+                    "SELECT id FROM source_item
+                     WHERE provider_key = 'Moss Arcade/Tin Weather/03 Second Track.ogg'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let second_rev: i64 = c.query_row(
+                    "SELECT current_revision_id FROM source_item WHERE id = ?1",
+                    [second],
+                    |row| row.get(0),
+                )?;
+                let src_id: i64 = c.query_row(
+                    "SELECT id FROM metadata_source WHERE kind = 'file_tags'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let rg_mbid: String = c.query_row(
+                    "SELECT value FROM identifier_claim WHERE namespace = 'mb_release_group' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                c.execute(
+                    "INSERT INTO identifier_claim
+                       (source_item_id, revision_id, extractor_version, scope, namespace, value,
+                        ordinal, metadata_source_id, rev)
+                     VALUES (?1, ?2, 1, 'release_group', 'mb_release_group', ?3, 0, ?4, ?5)",
+                    (second, second_rev, &rg_mbid, src_id, write.rev()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolveAfterRegroup",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    let regrouped_grp: i64 = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT release_group_id FROM release WHERE id = ?1",
+                [rel2],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(regrouped_grp, grp1, "L2 must regroup into edited G1");
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_primary_type FROM release_group WHERE id = {grp1}"
+        )),
+        "ep"
+    );
+    assert_eq!(
+        rig.library.said_of(vec![rec2]).unwrap()[&rec2].rating,
+        Some(100)
+    );
+    let plays_after = rig.library.recent_plays(listener, 10, None).unwrap();
+    assert_eq!(plays_after.len(), 1);
+    assert_eq!(plays_after[0].recording, Some(rec2_pid));
+    assert_eq!(plays_after[0].appearance, Some(new_app2_pid));
+}

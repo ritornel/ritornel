@@ -122,6 +122,16 @@ pub struct ExistingRelease {
     pub group: i64,
 }
 
+/// A release group that exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExistingGroup {
+    /// The owner's preferred release for a collapsed tile.
+    pub preferred_release: Option<i64>,
+    /// Whether the owner explicitly set a presentation ('collapsed' or
+    /// 'expanded') on this group.
+    pub has_presentation: bool,
+}
+
 /// What kind of durable key an artist row owns (`artist_key.key_kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ArtistKeyKind {
@@ -202,10 +212,12 @@ pub struct Library {
     pub recording_canonical: HashMap<i64, i64>,
     /// Each appearance: its recording and its release.
     pub appearances: HashMap<i64, (i64, Option<i64>)>,
+    /// Each merged track appearance and the end of its redirect chain.
+    pub appearance_canonical: HashMap<i64, i64>,
     /// Each release.
     pub releases: HashMap<i64, ExistingRelease>,
-    /// Each release group, with the owner's preferred release.
-    pub groups: HashMap<i64, Option<i64>>,
+    /// Each release group, with its owner-set presentation and preferred release.
+    pub groups: HashMap<i64, ExistingGroup>,
     /// Each durable artist key and the artist row that owns it, in row order.
     pub artist_keys: Vec<ExistingArtistKey>,
     /// Each merged artist and the end of its redirect chain.
