@@ -1672,6 +1672,20 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
         "{ended:?}, stopped by {stopped_by}"
     );
     assert!(failing.since_ms >= ended.ended_at_ms, "{failing:?}");
+    // Played straight through, it ended as long after it began as it was
+    // heard for, on both clocks.
+    let started = &lost.started;
+    let mono = ended.ended_mono_ms.unwrap();
+    for (ended_at, started_at) in [
+        (ended.ended_at_ms, started.started_at_ms),
+        (mono, started.started_mono_ms),
+    ] {
+        let span = ended_at - started_at;
+        assert!(
+            (span - heard).abs() <= 2,
+            "{span} against {heard}: {lost:?}"
+        );
+    }
 
     // The device takes frames again: nothing more is heard, because the
     // output was let go.

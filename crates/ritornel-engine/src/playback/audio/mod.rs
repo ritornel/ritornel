@@ -467,19 +467,23 @@ impl AudioRenderer {
         if !self.playing {
             return false;
         }
-        let asked = self.shared.asked_until.load(Ordering::Relaxed);
+        // Now first: a callback that runs between the two reads then counts.
+        let now = output::now();
+        let asked = self.shared.asked_until.load(Ordering::SeqCst);
         let since = asked.max(self.played_at);
-        Duration::from_nanos(output::now().saturating_sub(since)) >= self.stall_after
+        Duration::from_nanos(now.saturating_sub(since)) >= self.stall_after
     }
 
     /// When the output last took frames, on its clock: when the last it
     /// asked for were done, or now if it never asked or they are not done
-    /// yet.
-    fn last_taken(&self) -> u64 {
+    /// yet. `heard` is when the last frame of a span was done, where that is
+    /// known, which leaves out any silence the output took after it.
+    fn last_taken(&self, heard: u64) -> u64 {
         let now = output::now();
-        match self.shared.asked_until.load(Ordering::Relaxed) {
-            0 => now,
-            asked => asked.min(now),
+        let asked = self.shared.asked_until.load(Ordering::SeqCst);
+        match (heard, asked) {
+            (0, 0) => now,
+            (0, at) | (at, _) => at.min(now),
         }
     }
 
@@ -533,12 +537,16 @@ impl AudioRenderer {
         }
         self.running = None;
         self.collect();
-        let (installed, consumed) = self.shared.progress();
-        // Its spans end when it last took frames: for one that stalled,
-        // seconds before it was let go.
-        let at = self.last_taken();
+        let (installed, consumed, heard) = self.shared.heard();
+        // Its spans end when it last took frames, as its own ends do: for
+        // one that stalled, seconds before it was let go.
         for span in self.given.clone() {
-            self.ended_at(span, if span == installed { consumed } else { 0 }, at);
+            let (frames, at) = if span == installed {
+                (consumed, self.last_taken(heard))
+            } else {
+                (0, self.last_taken(0))
+            };
+            self.ended_at(span, frames, at);
         }
     }
 

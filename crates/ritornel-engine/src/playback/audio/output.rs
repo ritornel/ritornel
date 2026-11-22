@@ -116,6 +116,8 @@ pub(crate) struct Shared {
     installed: AtomicU64,
     /// Frames of that span handed to the output.
     consumed: AtomicU64,
+    /// When the last of them is done, on the output's clock: 0 for none.
+    heard_until: AtomicU64,
     /// Callbacks run, so that the control side can tell the output is
     /// alive.
     pub(crate) callbacks: AtomicU64,
@@ -134,20 +136,30 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    fn publish(&self, span: u64, frames: u64) {
+    fn publish(&self, span: u64, frames: u64, last: u64) {
         self.written.fetch_add(1, Ordering::SeqCst);
         self.installed.store(span, Ordering::SeqCst);
         self.consumed.store(frames, Ordering::SeqCst);
+        let last = if last == NOT_YET { 0 } else { last };
+        self.heard_until.store(last, Ordering::SeqCst);
         self.written.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The span the callback plays and its frames so far, read together.
     pub(crate) fn progress(&self) -> (u64, u64) {
+        let (span, frames, _) = self.heard();
+        (span, frames)
+    }
+
+    /// The span the callback plays, its frames so far, and when the last
+    /// of them is done (0 for none yet), read together.
+    pub(crate) fn heard(&self) -> (u64, u64, u64) {
         loop {
             let before = self.written.load(Ordering::SeqCst);
             let read = (
                 self.installed.load(Ordering::SeqCst),
                 self.consumed.load(Ordering::SeqCst),
+                self.heard_until.load(Ordering::SeqCst),
             );
             if before.is_multiple_of(2) && self.written.load(Ordering::SeqCst) == before {
                 return read;
@@ -483,7 +495,7 @@ impl Callback {
             self.seamless = None;
         }
         self.settle(at);
-        self.shared.publish(self.span, self.consumed);
+        self.shared.publish(self.span, self.consumed, self.last);
         written
     }
 
