@@ -178,6 +178,11 @@ pub(super) fn render(
         .as_ref()
         .and_then(|status| status.watch.as_ref());
     let watch_on = watch.is_some_and(|watch| watch.on);
+    // Before the first folder there is no library, and nothing to watch.
+    let holds = model
+        .status
+        .as_ref()
+        .is_some_and(|status| status.library.is_some());
     let watched = |name: &str, kind: WatchedKind| {
         watch.and_then(|watch| {
             watch
@@ -302,7 +307,7 @@ pub(super) fn render(
         .child(heading("Music folders"))
         .child(boxed(rows))
         .when_some(
-            watch.filter(|watch| watch.enabled && !watch.on),
+            watch.filter(|watch| holds && watch.enabled && !watch.on),
             |group, watch| {
                 group.children(
                     watch

@@ -18,8 +18,8 @@ use hyper_util::rt::TokioIo;
 use ritornel_client::Client;
 use ritornel_client::local::LocalServer;
 use ritornel_contract::{
-    CONTRACT_VERSION, ClientKind, Event, HelloParams, Id, MEDIA_TOKEN_PARAM, ServerRole, Topic,
-    Versions, route,
+    CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, Id, MEDIA_TOKEN_PARAM, ServerRole,
+    ServerStatus, Topic, Versions, route,
 };
 use tokio::net::TcpStream;
 use tokio::runtime::{Handle, Runtime};
@@ -126,6 +126,19 @@ impl Net {
         ))
     }
 
+    /// The same session, with what the server now says of itself.
+    pub(crate) fn restated(&self, status: &ServerStatus) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            art: Arc::clone(&self.art),
+            art_sizes: self.art_sizes.clone(),
+            name: status.name.clone(),
+            role: status.role,
+            versions: Some(status.versions.clone()),
+            holds: status.library.is_some(),
+        }
+    }
+
     pub(crate) fn rt(&self) -> &'static Handle {
         rt()
     }
@@ -134,6 +147,17 @@ impl Net {
     pub(crate) fn bucket(&self, px: u32) -> u32 {
         bucket_in(&self.art_sizes, px)
     }
+}
+
+/// Whether a call was refused because the server holds no library yet.
+pub(crate) fn no_library(error: &ritornel_client::Error) -> bool {
+    matches!(
+        error,
+        ritornel_client::Error::Call(rpc)
+            if rpc.data.code == ErrorCode::Unavailable
+                && rpc.data.details.get("reason").and_then(|reason| reason.as_str())
+                    == Some("no_library")
+    )
 }
 
 /// A few HTTP/1.1 connections to the server, kept alive between covers.

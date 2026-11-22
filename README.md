@@ -39,7 +39,7 @@ mise run install       # a release build, installed for everyday use
 
 `mise run desktop:run` touches no music or library of yours: it makes a library of invented artists and albums in `apps/desktop/.invented` and serves it silently on a port of its own. It does share the installed app's remembered view settings, such as which wall is open. The invented library has no audio. `scripts/desktop.sh tones` runs the app on a small one that plays.
 
-`mise run install` puts `ritornel-server` and `ritornelctl` in `~/.local/bin` and `Ritornel.app` in `/Applications`. The app starts its own server and keeps its data in `~/Library/Application Support/Ritornel`. To add music, open Settings in the app, or run `ritornelctl library create` and then `ritornelctl scan <folder>`.
+`mise run install` puts `ritornel-server` and `ritornelctl` in `~/.local/bin` and `Ritornel.app` in `/Applications`. The app starts its own server and keeps its data in `~/Library/Application Support/Ritornel`. To add music, open Settings › Library in the app and add the folder your music is in: the first folder makes the library, in that data folder, and the music folder is only ever read. Or run `ritornelctl library create` and then `ritornelctl scan <folder>`.
 
 ## Last.fm
 

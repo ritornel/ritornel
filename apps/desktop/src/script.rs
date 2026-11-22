@@ -25,6 +25,7 @@
 //! - `settings <section>`: open Settings (as ⌘, does) on that section, `library`,
 //!   `appearance`, `lastfm` or `about`; `settings shot <path>`: a picture of it;
 //!   `settings letters on|off`, `settings watching on|off`: as its switches do;
+//!   `settings add <path>`: add that music folder, as the folder chooser does;
 //!   `settings zone`: open the form for a zone; `settings choose <n>`: choose the
 //!   nth zone of the list; `settings focus`: make it the key window, as a
 //!   click on it would; `settings close`: as ⌘W does
@@ -615,6 +616,12 @@ fn settings(rest: &str, cx: &mut AsyncApp) {
             }
         }
         Some("letters") => cx.update(|cx| crate::remember::set_letters(on, cx)),
+        Some("add") => {
+            let path = rest.trim_start()["add".len()..].trim().to_owned();
+            if let Some(model) = model {
+                model.update(cx, |model, cx| model.add_folder(path, cx).detach());
+            }
+        }
         Some("watching") => {
             if let Some(model) = model {
                 model.update(cx, |model, cx| model.set_watching(on, cx));

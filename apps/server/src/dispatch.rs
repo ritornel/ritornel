@@ -1460,6 +1460,38 @@ mod tests {
         assert_eq!(roots.len(), 1, "{roots:?}");
     }
 
+    /// What an app does with the first folder on a server with no library:
+    /// refused as having none, with nothing written, it makes the library
+    /// and sends the same command again.
+    #[test]
+    fn a_folder_refused_for_want_of_a_library_is_added_once_there_is_one() {
+        let (core, scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        let music = scratch.path().join("music");
+        std::fs::create_dir(&music).unwrap();
+        let mut params = key(0xc1);
+        params["name"] = json!("music");
+        params["path"] = json!(music.to_str().unwrap());
+        let refused = call(&core, &session, "sources.add", Some(params.clone())).unwrap_err();
+        assert_eq!(
+            refused,
+            (ErrorCode::Unavailable, json!({ "reason": "no_library" }))
+        );
+        let roots = core
+            .with_stores(|stores| stores.server().roots().unwrap())
+            .unwrap();
+        assert!(roots.is_empty(), "{roots:?}");
+
+        call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
+        let added = call(&core, &session, "sources.add", Some(params)).unwrap();
+        assert_eq!(added["source"]["name"], "music");
+        assert_eq!(added["source"]["path"], music.to_str().unwrap());
+        // The library is in the server's data folder, and nothing was
+        // written in the music folder, which is only read.
+        assert!(scratch.path().join("data/library.db").exists());
+        assert_eq!(std::fs::read_dir(&music).unwrap().count(), 0);
+    }
+
     #[test]
     fn becoming_a_hub_is_sent_to_the_sessions_that_subscribed() {
         let (core, _scratch) = core();

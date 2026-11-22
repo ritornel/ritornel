@@ -18,18 +18,19 @@ use ritornel_client::{Error, idempotency_key};
 use ritornel_contract::methods::{
     ArtistsImportPictures, ArtistsPictureFolders, HistorySetZones, HistoryZones, JobsCancel,
     JobsList, LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut,
-    LastfmStatusCall, LastfmSync, LibrarySetWatching, RecordDismiss, ScanStart,
+    LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySetWatching, RecordDismiss, ScanStart,
     ServerStatus as StatusCall, SourcesAdd, SourcesList,
 };
 use ritornel_contract::{
     DismissParams, ErrorCode, Event, Id, ImportPicturesParams, Job, JobCancelParams, JobState,
-    JobTarget, KeyParams, LastfmStatus, LastfmSyncParams, Method, NoParams, PictureFolders,
-    ReceiptStatus, ScanStartParams, ScrobblingParams, ServerStatus, SetZonesParams,
-    SignInFinishParams, Source, SourcesAddParams, WatchingParams, ZonePeriod,
+    JobTarget, KeyParams, LastfmStatus, LastfmSyncParams, LibraryCreateParams, LibraryCreated,
+    Method, NoParams, PictureFolders, ReceiptStatus, ScanStartParams, ScrobblingParams, ServerRole,
+    ServerStatus, SetZonesParams, SignInFinishParams, Source, SourceAdded, SourcesAddParams,
+    WatchingParams, ZonePeriod,
 };
 
 use crate::link::{Link, LinkEvent};
-use crate::net::Net;
+use crate::net::{Net, no_library};
 use crate::settings::words::{self, folder_name, is_ended};
 
 /// The kind of job a Last.fm import is (apps/server/src/lastfm.rs).
@@ -111,9 +112,13 @@ pub(crate) struct Model {
     _link: Subscription,
 }
 
+/// What a group says when it is used before there is a library.
+const NO_LIBRARY_YET: &str = "There is no library yet. Add a music folder first.";
+
 /// The words of what went wrong, for a line under the group it went wrong in.
 fn trouble(error: &Error) -> String {
     match error {
+        _ if no_library(error) => NO_LIBRARY_YET.to_owned(),
         Error::Call(rpc) => rpc.message.clone(),
         other => other.to_string(),
     }
@@ -136,6 +141,53 @@ fn conflict(error: &Error) -> bool {
 /// A new command's key.
 fn key() -> Result<Id, Error> {
     idempotency_key()
+}
+
+/// Makes this server's library, in its own data folder, unless another
+/// client has just made one.
+async fn make_library(net: &Arc<Net>) -> Result<(), Error> {
+    let params = LibraryCreateParams {
+        idempotency_key: key()?,
+    };
+    made_or_found(ask::<LibraryCreate>(net, params).await)
+}
+
+/// Whether there is a library now: the one asked for, or one another
+/// client made meanwhile, which the folder goes into instead.
+fn made_or_found(created: Result<LibraryCreated, Error>) -> Result<(), Error> {
+    match created {
+        // Refused as a library is there already: one made meanwhile, which
+        // the conflict names. Any other conflict stands.
+        Err(Error::Call(rpc))
+            if rpc.data.code == ErrorCode::Conflict
+                && rpc.data.details.contains_key("libraryId") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Adds a folder with `add`. On a server that holds no library, `make`,
+/// when there is one, makes it first: the refusal wrote nothing, so the
+/// same command is sent again.
+async fn add_making_library<Added, Made>(
+    params: SourcesAddParams,
+    add: impl Fn(SourcesAddParams) -> Added,
+    make: Option<impl FnOnce() -> Made>,
+) -> Result<SourceAdded, Error>
+where
+    Added: Future<Output = Result<SourceAdded, Error>>,
+    Made: Future<Output = Result<(), Error>>,
+{
+    match (add(params.clone()).await, make) {
+        (Err(error), Some(make)) if no_library(&error) => {
+            make().await?;
+            add(params).await
+        }
+        (added, _) => added,
+    }
 }
 
 /// Calls `M` on the connection's runtime.
@@ -209,6 +261,12 @@ impl Model {
                 model.busy.clear();
                 model.read_all(cx);
                 cx.notify();
+            }
+            // A library made since it connected can now be read, and what
+            // was refused for want of one no longer stands.
+            LinkEvent::Restated(_) => {
+                model.problems.retain(|_, said| said != NO_LIBRARY_YET);
+                model.read_all(cx);
             }
             LinkEvent::Server(Event::Jobs(event)) => model.heard_job(event.job.clone(), cx),
             LinkEvent::Away | LinkEvent::Server(_) => cx.notify(),
@@ -307,6 +365,8 @@ impl Model {
                     return;
                 }
                 match found {
+                    // Nothing to read until the first folder makes the library.
+                    Err(error) if no_library(&error) => model.sources = Some(Vec::new()),
                     Ok((sources, jobs)) => {
                         model.sources = Some(sources.sources);
                         let mut seen = HashSet::new();
@@ -332,6 +392,13 @@ impl Model {
             |net| ask::<ArtistsPictureFolders>(&net, NoParams {}),
             |model, found, _| match found {
                 Ok(pictures) => model.pictures = Some(pictures),
+                Err(error) if no_library(&error) => {
+                    model.pictures = Some(PictureFolders {
+                        folders: Vec::new(),
+                        last_import_at: None,
+                        last_import: None,
+                    });
+                }
                 Err(error) => {
                     model.problems.insert(Group::Pictures, trouble(&error));
                 }
@@ -358,6 +425,7 @@ impl Model {
             |net| ask::<HistoryZones>(&net, NoParams {}),
             |model, found, _| match found {
                 Ok(zones) => model.zones = Some(zones.periods),
+                Err(error) if no_library(&error) => model.zones = Some(Vec::new()),
                 Err(error) => {
                     model.problems.insert(Group::Zones, trouble(&error));
                 }
@@ -531,7 +599,10 @@ impl Model {
         .detach();
     }
 
-    /// Adds a folder as a source and scans it. A name the library has is given a number.
+    /// Adds a folder as a source and scans it. A name the library has is
+    /// given a number. On a server with no library, the first folder makes
+    /// it: in the server's data folder, never in the music folder, which is
+    /// only read.
     pub(crate) fn add_folder(&mut self, path: String, cx: &mut Context<Self>) -> Task<bool> {
         let known = self
             .sources
@@ -559,7 +630,15 @@ impl Model {
                         name,
                         path: path.clone(),
                     };
-                    match ask::<SourcesAdd>(&net, params).await {
+                    // Only a server that is linked to none makes a library of
+                    // its own.
+                    let makes = net.role == ServerRole::Unassigned;
+                    let added = add_making_library(
+                        params,
+                        |params| ask::<SourcesAdd>(&net, params),
+                        makes.then_some(|| make_library(&net)),
+                    );
+                    match added.await {
                         Ok(added) => break added.source,
                         Err(error) if conflict(&error) && n < 20 => n += 1,
                         Err(error) => return Err(error.into()),
@@ -935,7 +1014,153 @@ pub(crate) fn new(link: Entity<Link>, quiet: bool, cx: &mut gpui::App) -> Entity
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::future::ready;
+
+    use futures::executor::block_on;
+    use ritornel_contract::RpcError;
+    use serde_json::json;
+
     use super::*;
+
+    fn params() -> SourcesAddParams {
+        SourcesAddParams {
+            idempotency_key: Id::from_bytes([0xa1; 16]),
+            name: "Music".to_owned(),
+            path: "/Volumes/Records/Music".to_owned(),
+        }
+    }
+
+    fn refused(code: ErrorCode, reason: Option<&str>) -> Error {
+        let error = RpcError::new(code, "refused");
+        Error::Call(match reason {
+            Some(reason) => error.with_detail("reason", reason),
+            None => error,
+        })
+    }
+
+    fn no_library_yet() -> Error {
+        refused(ErrorCode::Unavailable, Some("no_library"))
+    }
+
+    fn added(params: &SourcesAddParams) -> Result<SourceAdded, Error> {
+        serde_json::from_value(json!({
+            "commandId": params.idempotency_key,
+            "status": "done",
+            "revision": 2,
+            "source": {
+                "sourceId": Id::from_bytes([0xb2; 16]),
+                "name": params.name,
+                "kind": "folder",
+                "path": params.path,
+            },
+        }))
+        .map_err(|error| Error::Protocol(error.to_string()))
+    }
+
+    #[test]
+    fn the_first_folder_makes_the_library_and_is_sent_again_as_it_was() -> Result<(), Error> {
+        let library = Cell::new(false);
+        let sent = RefCell::new(Vec::new());
+        let answer = block_on(add_making_library(
+            params(),
+            |params| {
+                sent.borrow_mut().push(params.clone());
+                ready(if library.get() {
+                    added(&params)
+                } else {
+                    Err(no_library_yet())
+                })
+            },
+            Some(|| {
+                library.set(true);
+                ready(Ok(()))
+            }),
+        ))?;
+        assert_eq!(
+            answer.source.path.as_deref(),
+            Some("/Volumes/Records/Music")
+        );
+        assert_eq!(*sent.borrow(), [params(), params()]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_folder_refused_for_another_reason_makes_no_library() {
+        let made = Cell::new(false);
+        let make = || {
+            made.set(true);
+            ready(Ok(()))
+        };
+        // Unavailable, but not for want of a library.
+        let busy = || refused(ErrorCode::Unavailable, None);
+        let answer = block_on(add_making_library(
+            params(),
+            |_| ready(Err(busy())),
+            Some(make),
+        ));
+        assert!(matches!(answer, Err(Error::Call(rpc)) if rpc.data.code == ErrorCode::Unavailable));
+        assert!(!made.get());
+    }
+
+    #[test]
+    fn a_library_that_cannot_be_made_is_said_and_the_folder_not_sent_again() {
+        let sent = Cell::new(0);
+        let answer = block_on(add_making_library(
+            params(),
+            |_| {
+                sent.set(sent.get() + 1);
+                ready(Err(no_library_yet()))
+            },
+            Some(|| ready(Err(refused(ErrorCode::Internal, None)))),
+        ));
+        assert!(matches!(answer, Err(Error::Call(rpc)) if rpc.data.code == ErrorCode::Internal));
+        assert_eq!(sent.get(), 1);
+    }
+
+    #[test]
+    fn a_server_linked_to_another_makes_no_library_of_its_own() {
+        let sent = Cell::new(0);
+        let answer = block_on(add_making_library(
+            params(),
+            |_| {
+                sent.set(sent.get() + 1);
+                ready(Err(no_library_yet()))
+            },
+            None::<fn() -> std::future::Ready<Result<(), Error>>>,
+        ));
+        assert!(matches!(&answer, Err(error) if no_library(error)));
+        assert_eq!(sent.get(), 1);
+    }
+
+    #[test]
+    fn only_a_library_another_client_made_meanwhile_will_do() {
+        let theirs = Error::Call(
+            RpcError::new(
+                ErrorCode::Conflict,
+                "there is a library on this server already",
+            )
+            .with_detail("libraryId", Id::from_bytes([0xc3; 16]).to_string()),
+        );
+        assert!(made_or_found(Err(theirs)).is_ok());
+        // One in the data folder that another server holds is not this one's.
+        assert!(made_or_found(Err(refused(ErrorCode::Conflict, None))).is_err());
+        assert!(made_or_found(Err(refused(ErrorCode::Forbidden, None))).is_err());
+    }
+
+    #[test]
+    fn only_wanting_a_library_reads_as_having_none() {
+        assert!(no_library(&no_library_yet()));
+        assert!(!no_library(&refused(ErrorCode::Unavailable, None)));
+        assert!(!no_library(&refused(
+            ErrorCode::Invalid,
+            Some("no_library")
+        )));
+        assert_eq!(
+            trouble(&no_library_yet()),
+            "There is no library yet. Add a music folder first."
+        );
+    }
 
     #[test]
     fn a_start_reply_after_completion_leaves_the_scan_finished() -> Result<(), serde_json::Error> {

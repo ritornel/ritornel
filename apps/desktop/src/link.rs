@@ -113,6 +113,9 @@ pub(crate) enum LinkEvent {
     Away,
     /// Something the server sent.
     Server(Event),
+    /// The same session, with what the server now says of itself: its
+    /// name, its role, and whether it holds a library.
+    Restated(Arc<Net>),
 }
 
 pub(crate) struct Link {
@@ -124,6 +127,9 @@ pub(crate) struct Link {
     /// Whether a look is under way, for "Looking…".
     pub(crate) looking: bool,
     attempt: Option<Task<()>>,
+    /// Counts the reads of what the server says of itself, so that only
+    /// the latest is kept.
+    restating: u64,
 }
 
 impl EventEmitter<LinkEvent> for Link {}
@@ -166,6 +172,7 @@ impl Link {
             pending: Arc::default(),
             looking: false,
             attempt: None,
+            restating: 0,
         };
         link.look(cx);
         link
@@ -300,6 +307,39 @@ impl Link {
         }));
     }
 
+    /// Reads again what the server says of itself, once it has said that
+    /// changed, and hands on the session with it: a library made since it
+    /// connected opens without connecting again.
+    fn restate(&mut self, cx: &mut Context<Self>) {
+        let State::Connected(net) = &self.state else {
+            return;
+        };
+        let client = Arc::clone(&net.client);
+        self.restating += 1;
+        let asked = self.restating;
+        let read = {
+            let client = Arc::clone(&client);
+            rt().spawn(async move { client.status().await })
+        };
+        cx.spawn(async move |link, cx| {
+            let Ok(Ok(status)) = read.await else { return };
+            let _ = link.update(cx, |link, cx| {
+                // Overtaken by a later read, or by another session.
+                let State::Connected(net) = &link.state else {
+                    return;
+                };
+                if link.restating != asked || !Arc::ptr_eq(&net.client, &client) {
+                    return;
+                }
+                let net = Arc::new(net.restated(&status));
+                link.state = State::Connected(Arc::clone(&net));
+                cx.emit(LinkEvent::Restated(net));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn connected(
         &mut self,
         net: Arc<Net>,
@@ -323,7 +363,13 @@ impl Link {
         self.attempt = Some(cx.spawn(async move |link, cx| {
             while let Some(event) = arrived.next().await {
                 if link
-                    .update(cx, |_, cx| cx.emit(LinkEvent::Server(event)))
+                    .update(cx, |link, cx| {
+                        let restated = matches!(&event, Event::Servers(changed) if changed.server.is_this_server);
+                        cx.emit(LinkEvent::Server(event));
+                        if restated {
+                            link.restate(cx);
+                        }
+                    })
                     .is_err()
                 {
                     return;

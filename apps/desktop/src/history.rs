@@ -31,7 +31,7 @@ use ritornel_contract::methods::{HistoryOnThisDay, HistoryStreamCall};
 use ritornel_contract::{Event, HistoryStream, LibraryChange, NoParams, OnThisDayParams, Phrase};
 
 use crate::link::{Link, LinkEvent};
-use crate::net::Net;
+use crate::net::{Net, no_library};
 use crate::stream::{self, Drawn, Pointed};
 use crate::theme;
 use crate::thisday::{self, Remembered};
@@ -101,6 +101,8 @@ pub(crate) struct HistoryPage {
     net: Option<Arc<Net>>,
     read: Option<Read>,
     failed: bool,
+    /// The server holds no library yet, so there is no history to read.
+    unheld: bool,
     revision: u64,
     /// Whether it is behind another page, and whether plays came meanwhile.
     freshness: crate::stage::Freshness,
@@ -137,7 +139,8 @@ impl HistoryPage {
         let followed = cx.subscribe(
             link,
             |page: &mut Self, _, event: &LinkEvent, cx| match event {
-                LinkEvent::Connected(net) => {
+                // A library made since it connected can now be read.
+                LinkEvent::Connected(net) | LinkEvent::Restated(net) => {
                     page.net = Some(Arc::clone(net));
                     if page.freshness.heard(false).is_some() {
                         page.load(cx);
@@ -166,6 +169,7 @@ impl HistoryPage {
             net: link.read(cx).net(),
             read: None,
             failed: false,
+            unheld: false,
             revision: 0,
             freshness: crate::stage::Freshness::default(),
             reading: None,
@@ -215,6 +219,12 @@ impl HistoryPage {
                         };
                         page.read = Some(Read { stream, remembered });
                         page.failed = false;
+                        page.unheld = false;
+                    }
+                    Ok((Err(error), _)) if no_library(&error) => {
+                        page.read = None;
+                        page.failed = false;
+                        page.unheld = true;
                     }
                     _ => page.failed = page.read.is_none(),
                 }
@@ -226,7 +236,7 @@ impl HistoryPage {
 
     /// Whether it is ready to be seen: read, or known not to be readable.
     pub(crate) fn ready(&self) -> bool {
-        self.read.is_some() || self.failed
+        self.read.is_some() || self.failed || self.unheld
     }
 
     /// Scrolls the page by `dy` at once, as a script's jump does.
@@ -763,10 +773,11 @@ impl Render for HistoryPage {
             });
 
         let mut body = div().w(px(width)).flex().flex_col().child(heading);
-        let empty = self
-            .read
-            .as_ref()
-            .is_some_and(|read| read.stream.months == 0);
+        let empty = self.unheld
+            || self
+                .read
+                .as_ref()
+                .is_some_and(|read| read.stream.months == 0);
         if self.failed {
             body = body.child(
                 div()

@@ -171,7 +171,10 @@ methods! {
 
     /// `sources.add`: adds a folder on this server as a named root. The
     /// server only ever reads it. A name the library has already is
-    /// refused with `conflict`.
+    /// refused with `conflict`. A server that holds no library refuses with
+    /// `unavailable` and the detail `reason: "no_library"`, having written
+    /// nothing: a client that means to make one calls `library.create` and
+    /// sends the same command again.
     SourcesAdd: "sources.add", Command, needs_full: true,
     SourcesAddParams => SourceAdded;
 
