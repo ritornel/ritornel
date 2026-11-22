@@ -162,6 +162,23 @@ struct View {
     /// Whether `hits` answer `text`.
     settled: bool,
     failed: bool,
+    waiting: bool,
+}
+
+impl View {
+    fn fail(&mut self) {
+        self.settled = true;
+        self.failed = true;
+        self.waiting = false;
+    }
+
+    fn asking(text: String) -> Self {
+        Self {
+            text,
+            open: true,
+            ..Self::default()
+        }
+    }
 }
 
 pub(crate) struct SearchBox {
@@ -170,8 +187,6 @@ pub(crate) struct SearchBox {
     view: View,
     /// Bumped by every keystroke: an answer for an older one is dropped.
     asked: u64,
-    /// Return was pressed before the answer for what was typed came.
-    waiting: bool,
     asking: Option<Task<()>>,
     /// When the dropdown came down, for it to rise into place.
     dropped: Option<Instant>,
@@ -212,7 +227,6 @@ impl SearchBox {
                 ..View::default()
             },
             asked: 0,
-            waiting: false,
             asking: None,
             dropped: None,
             pictures: Pictures::default(),
@@ -237,7 +251,6 @@ impl SearchBox {
 
     /// The field's text changed.
     fn typed(&mut self, text: String, cx: &mut Context<Self>) {
-        self.waiting = false;
         self.asked += 1;
         if text.trim().is_empty() {
             self.asking = None;
@@ -252,9 +265,8 @@ impl SearchBox {
         if !self.view.open {
             self.dropped = Some(Instant::now());
         }
-        self.view.text = text.clone();
-        self.view.open = true;
-        self.view.settled = false;
+        self.view = View::asking(text.clone());
+        self.hovered_song = None;
         let asked = self.asked;
         self.asking = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SETTLE).await;
@@ -266,8 +278,7 @@ impl SearchBox {
 
     fn ask(&mut self, text: String, asked: u64, cx: &mut Context<Self>) {
         let Some(net) = self.link.read(cx).net() else {
-            self.view.settled = true;
-            self.view.failed = true;
+            self.view.fail();
             cx.notify();
             return;
         };
@@ -291,6 +302,7 @@ impl SearchBox {
                     Ok(Ok(results)) => {
                         let hits = hits_of(&results);
                         let selected = top_of(&hits, &results);
+                        let waiting = search.view.waiting;
                         search.view = View {
                             text,
                             open: true,
@@ -298,16 +310,15 @@ impl SearchBox {
                             selected,
                             settled: true,
                             failed: false,
+                            waiting: false,
                         };
                         search.pictures_wanted(cx);
-                        if search.waiting {
-                            search.waiting = false;
+                        if waiting {
                             search.pick(selected, cx);
                         }
                     }
                     _ => {
-                        search.view.settled = true;
-                        search.view.failed = true;
+                        search.view.fail();
                     }
                 }
                 cx.notify();
@@ -388,7 +399,7 @@ impl SearchBox {
             self.pick(self.view.selected, cx);
             return;
         }
-        self.waiting = true;
+        self.view.waiting = true;
         let (text, asked) = (self.view.text.clone(), self.asked);
         self.ask(text, asked, cx);
     }
@@ -440,7 +451,6 @@ impl SearchBox {
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.asked += 1;
         self.asking = None;
-        self.waiting = false;
         self.view = View {
             settled: true,
             ..View::default()
@@ -837,6 +847,19 @@ impl Render for SearchBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_query_starts_without_a_selection_or_hits() {
+        let mut view = View::asking("North".to_owned());
+        assert!(view.hits.is_empty());
+        assert_eq!(view.selected, 0);
+        assert!(!view.settled);
+        view.waiting = true;
+        view.fail();
+        assert!(view.failed && view.settled);
+        assert!(!view.waiting);
+        assert!(view.hits.get(view.selected).is_none());
+    }
 
     fn tiny_image() -> Arc<RenderImage> {
         Arc::new(RenderImage::new(vec![image::Frame::new(

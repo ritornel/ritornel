@@ -70,6 +70,41 @@ struct Read {
     more: Option<Vec<AlbumTile>>,
 }
 
+/// One of the page's pictures. A reply belongs to the size and cover it was asked for.
+#[derive(Default)]
+struct PictureRead {
+    asked: bool,
+    request: u64,
+    retries: crate::covers::Retries,
+}
+
+impl PictureRead {
+    fn reset(&mut self) {
+        self.asked = false;
+        self.request += 1;
+        self.retries = Default::default();
+    }
+
+    fn ask(&mut self, art: Id, now: Instant) -> Option<u64> {
+        if self.asked || self.retries.waits(art, now) {
+            return None;
+        }
+        self.asked = true;
+        self.request += 1;
+        Some(self.request)
+    }
+
+    fn finish<T>(&mut self, art: Id, result: &Result<T, NoArt>, now: Instant) -> Option<Duration> {
+        if matches!(result, Err(NoArt::Failed)) {
+            self.asked = false;
+            Some(self.retries.failed(art, now))
+        } else {
+            self.retries.read(art);
+            None
+        }
+    }
+}
+
 pub(crate) struct Album {
     net: Arc<Net>,
     player: Entity<Player>,
@@ -104,8 +139,9 @@ pub(crate) struct Album {
     pictured_scale: f32,
     /// The last read of the large cover and of the face asked for: an
     /// earlier one coming late, for another display, is let go.
-    large_read: u64,
-    face_read: u64,
+    large_read: PictureRead,
+    face_read: PictureRead,
+    blur_read: PictureRead,
     /// The cover blurred for the wash, and for the banner.
     pub blur: crate::blur::Shown,
     banner_blur: crate::blur::Shown,
@@ -132,7 +168,7 @@ impl Album {
         album: AlbumRef,
         row: Arc<TileRow>,
         small: Option<Arc<RenderImage>>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         // When the library changes, what the page shows is read again, and
@@ -140,7 +176,10 @@ impl Album {
         let followed = cx.subscribe(link, |page: &mut Self, _, event: &LinkEvent, cx| {
             let plays_only = match event {
                 LinkEvent::Connected(net) => {
+                    page.reading = None;
+                    page.revision = 0;
                     page.net = Arc::clone(net);
+                    page.reset_picture_reads();
                     page.more_covers.again();
                     false
                 }
@@ -182,8 +221,9 @@ impl Album {
             large: None,
             face: None,
             pictured_scale: 0.,
-            large_read: 0,
-            face_read: 0,
+            large_read: Default::default(),
+            face_read: Default::default(),
+            blur_read: Default::default(),
             blur: None,
             banner_blur: None,
             top: 0.,
@@ -202,32 +242,32 @@ impl Album {
         page
     }
 
+    fn reset_picture_reads(&mut self) {
+        self.large_read.reset();
+        self.face_read.reset();
+        self.blur_read.reset();
+    }
+
     /// Drops every picture this page owns from the sprite atlas when the page
     /// is released. `small` is left alone because it belongs to the wall or a
     /// shared soft-colour cache.
     fn release_images(&mut self, cx: &mut gpui::App) {
-        let mut released = false;
-        let mut drop_one = |image: Arc<RenderImage>| {
-            released = true;
-            crate::covers::drop_unshared(image, None, cx);
-        };
-        if let Some((image, _)) = self.large.take() {
-            drop_one(image);
-        }
-        if let Some(image) = self.face.take() {
-            drop_one(image);
-        }
-        if let Some((image, _)) = self.blur.take() {
-            drop_one(image);
-        }
-        if let Some((image, _)) = self.banner_blur.take() {
-            drop_one(image);
-        }
+        self.release_cover(cx);
         for image in self.more_covers.drain() {
-            drop_one(image);
+            crate::covers::drop_unshared(image, None, cx);
         }
-        if released {
-            crate::platform::give_back();
+        crate::platform::give_back();
+    }
+
+    fn release_cover(&mut self, cx: &mut gpui::App) {
+        let images = [
+            self.large.take().map(|pair| pair.0),
+            self.face.take(),
+            self.blur.take().map(|pair| pair.0),
+            self.banner_blur.take().map(|pair| pair.0),
+        ];
+        for image in images.into_iter().flatten() {
+            crate::covers::drop_unshared(image, None, cx);
         }
     }
 
@@ -365,6 +405,12 @@ impl Album {
         self.tracks.update(cx, |tracks, cx| {
             tracks.set(songs, read.page.library_revision, credit, context, cx)
         });
+        if self.row.art != read.page.tile.art_id {
+            self.reset_picture_reads();
+            self.release_cover(cx);
+            self.small = None;
+            self.row = Arc::new(TileRow::of_album(read.page.tile.clone()));
+        }
         self.page = Some(read.page);
         self.problem = None;
     }
@@ -433,24 +479,39 @@ impl Album {
 
     /// The large cover, the face for the strip, and the blurs for the
     /// banner and the wash; for a record with no cover, its soft colours.
-    fn pictures(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn pictures(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let scale = window.scale_factor();
+        let scale_changed = self.pictured_scale != scale;
         self.pictured_scale = scale;
         let (width, viewport) = viewport_of(window);
         let banner_radius = crate::blur::radius(crate::blur::BANNER.0, width + 120.);
         let wash_radius =
             crate::blur::radius(crate::blur::WASH.0, width.max(viewport + 128.) + 180.);
         let Some(art) = self.row.art else {
-            self.soft_pictures(banner_radius, wash_radius, None, cx);
+            if self.blur.is_none() {
+                self.soft_pictures(banner_radius, wash_radius, Some(window), cx);
+            } else if scale_changed {
+                self.soft_face(Some(window), cx);
+            }
             return;
         };
+        if scale_changed {
+            self.large_read.reset();
+            self.face_read.reset();
+            if self.face.as_ref().is_some_and(theme::soft_holds) {
+                self.soft_face(Some(window), cx);
+            }
+        }
         let room = width - crate::upnext::rail(cx);
         let side = album_columns(content_width(room)).cover as f32;
         self.sharp_pictures(art, side, scale, cx);
+        let Some(request) = self.blur_read.ask(art, Instant::now()) else {
+            return;
+        };
         let http = Arc::clone(&self.net.art);
         let tone = crate::blur::wash_tone(theme::dark());
         let blurs = self.net.rt().spawn(async move {
-            let bytes = http.get(art, crate::blur::SIDE).await.ok()?;
+            let bytes = http.get(art, crate::blur::SIDE).await?;
             crate::covers::decode(move || {
                 Some((
                     crate::blur::jpeg(&bytes, banner_radius, crate::blur::BANNER.1)?,
@@ -458,13 +519,20 @@ impl Album {
                 ))
             })
             .await
+            .ok_or(NoArt::Missing)
         });
         self.fetches.push(blurs.abort_handle());
         cx.spawn(async move |this, cx| {
-            let blurs = blurs.await.ok().flatten();
+            let blurs = blurs.await.unwrap_or(Err(NoArt::Failed));
             this.update(cx, |page, cx| {
+                if page.blur_read.request != request {
+                    return;
+                }
+                if let Some(wait) = page.blur_read.finish(art, &blurs, Instant::now()) {
+                    crate::covers::notify_after(wait, cx);
+                }
                 match blurs {
-                    Some((banner, wash)) => {
+                    Ok((banner, wash)) => {
                         let now = Instant::now();
                         let gone = [
                             crate::blur::replace(&mut page.banner_blur, Arc::new(banner), now),
@@ -477,7 +545,11 @@ impl Album {
                     // A cover the server cannot make (one in a format it
                     // does not read) is no cover: the page takes the soft
                     // colours of a record with none, rather than no colour.
-                    None => page.soft_pictures(banner_radius, wash_radius, None, cx),
+                    Err(_) => {
+                        if page.blur.is_none() {
+                            page.soft_pictures(banner_radius, wash_radius, None, cx);
+                        }
+                    }
                 }
                 cx.notify();
             })
@@ -489,62 +561,47 @@ impl Album {
     /// The large cover and the face, read for the display's `scale`. Each
     /// shown is kept until the one read for it comes, without fading in again.
     fn sharp_pictures(&mut self, art: Id, side: f32, scale: f32, cx: &mut Context<Self>) {
-        self.large_read += 1;
-        let large_read = self.large_read;
-        self.fetch_opt(
-            art,
-            (side * scale).ceil() as u32,
-            cx,
-            move |page, image, cx| {
-                // Asked for before the last, for a display the window has
-                // left since.
-                let Some(image) = image.ok().filter(|_| page.large_read == large_read) else {
+        let px = (side * scale).ceil() as u32;
+        if let Some(request) = self.large_read.ask(art, Instant::now()) {
+            self.fetch_opt(art, px, cx, move |page, image, cx| {
+                if page.large_read.request != request {
                     return;
-                };
-                let at = page
-                    .large
-                    .as_ref()
-                    .map_or_else(Instant::now, |large| large.1);
-                if let Some((old, _)) = page.large.replace((image, at)) {
-                    crate::covers::drop_unshared(old, None, cx);
                 }
-            },
-        );
-        self.face_read += 1;
-        let face_read = self.face_read;
-        self.fetch_opt(
-            art,
-            (28. * scale).ceil() as u32,
-            cx,
-            move |page, image, cx| {
-                let Some(image) = image.ok().filter(|_| page.face_read == face_read) else {
-                    return;
-                };
-                if let Some(old) = page.face.replace(image) {
-                    crate::covers::drop_unshared(old, None, cx);
+                if let Some(wait) = page.large_read.finish(art, &image, Instant::now()) {
+                    crate::covers::notify_after(wait, cx);
                 }
-            },
-        );
-    }
-
-    /// Moved to a display of another scale: the large cover and the face read
-    /// again for it. The blurs do not depend on the scale.
-    fn sharpen(&mut self, side: f32, scale: f32, window: &mut Window, cx: &mut Context<Self>) {
-        self.pictured_scale = scale;
-        // A soft face, as with no cover or one that cannot be read, is made
-        // again for it; a cover's is read again, and replaces it.
-        if self.face.as_ref().is_some_and(theme::soft_holds) {
-            self.soft_face(Some(window), cx);
+                if let Ok(image) = image {
+                    let at = page
+                        .large
+                        .as_ref()
+                        .map_or_else(Instant::now, |large| large.1);
+                    if let Some((old, _)) = page.large.replace((image, at)) {
+                        crate::covers::drop_unshared(old, None, cx);
+                    }
+                }
+            });
         }
-        if let Some(art) = self.row.art {
-            self.sharp_pictures(art, side, scale, cx);
+        let px = (28. * scale).ceil() as u32;
+        if let Some(request) = self.face_read.ask(art, Instant::now()) {
+            self.fetch_opt(art, px, cx, move |page, image, cx| {
+                if page.face_read.request != request {
+                    return;
+                }
+                if let Some(wait) = page.face_read.finish(art, &image, Instant::now()) {
+                    crate::covers::notify_after(wait, cx);
+                }
+                if let Ok(image) = image
+                    && let Some(old) = page.face.replace(image)
+                {
+                    crate::covers::drop_unshared(old, None, cx);
+                }
+            });
         }
     }
 
     /// The face of a record with no cover: its soft colours. A read of a
     /// face still to come is let go.
     fn soft_face(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        self.face_read += 1;
         let face = theme::soft_cached(&self.soft_name(), (28. * self.pictured_scale).ceil() as u32);
         if let Some(old) = self.face.replace(face) {
             crate::covers::drop_unshared(old, window, cx);
@@ -584,7 +641,9 @@ impl Album {
         for old in gone.into_iter().flatten() {
             crate::covers::drop_unshared(old, window.as_deref_mut(), cx);
         }
-        self.soft_face(window, cx);
+        if self.face.is_none() {
+            self.soft_face(window, cx);
+        }
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -975,9 +1034,7 @@ impl Render for Album {
         let content = content_width(width - rail);
         let AlbumColumns { beside, cover } = album_columns(content);
         let side = cover as f32;
-        if self.pictured_scale != window.scale_factor() {
-            self.sharpen(side, window.scale_factor(), window, cx);
-        }
+        self.pictures(window, cx);
         let max = (self.height.get() - viewport).max(0.);
         self.menued = crate::menu::marked(window, cx);
         if self.bring
@@ -1325,6 +1382,29 @@ mod tests {
         Arc::new(RenderImage::new(vec![image::Frame::new(
             image::RgbaImage::new(1, 1),
         )]))
+    }
+
+    #[test]
+    fn a_picture_failure_retries_and_a_new_cover_invalidates_old_replies() {
+        let art = Id::from_bytes([1; 16]);
+        let now = Instant::now();
+        let mut read = PictureRead::default();
+        let first = read.ask(art, now);
+        assert!(first.is_some());
+        assert!(read.ask(art, now).is_none());
+        let Some(wait) = read.finish::<()>(art, &Err(NoArt::Failed), now) else {
+            unreachable!()
+        };
+        assert!(read.ask(art, now).is_none());
+        assert!(read.ask(art, now + wait).is_some());
+        assert!(
+            read.finish::<()>(art, &Err(NoArt::Missing), now + wait)
+                .is_none()
+        );
+        assert!(read.ask(art, now + wait * 2).is_none());
+        read.reset();
+        assert_ne!(first, Some(read.request));
+        assert!(read.ask(art, now).is_some());
     }
 
     #[test]

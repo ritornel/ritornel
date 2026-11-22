@@ -22,10 +22,10 @@ use ritornel_contract::methods::{
     ServerStatus as StatusCall, SourcesAdd, SourcesList,
 };
 use ritornel_contract::{
-    DismissParams, ErrorCode, Event, Id, ImportPicturesParams, Job, JobCancelParams, JobTarget,
-    KeyParams, LastfmStatus, LastfmSyncParams, Method, NoParams, PictureFolders, ReceiptStatus,
-    ScanStartParams, ScrobblingParams, ServerStatus, SetZonesParams, SignInFinishParams, Source,
-    SourcesAddParams, WatchingParams, ZonePeriod,
+    DismissParams, ErrorCode, Event, Id, ImportPicturesParams, Job, JobCancelParams, JobState,
+    JobTarget, KeyParams, LastfmStatus, LastfmSyncParams, Method, NoParams, PictureFolders,
+    ReceiptStatus, ScanStartParams, ScrobblingParams, ServerStatus, SetZonesParams,
+    SignInFinishParams, Source, SourcesAddParams, WatchingParams, ZonePeriod,
 };
 
 use crate::link::{Link, LinkEvent};
@@ -165,6 +165,25 @@ fn scanned(job: &Job) -> Option<Id> {
     }
 }
 
+/// A start reply and a jobs list can both arrive after a newer event.
+fn keep_scan(scans: &mut HashMap<Id, Job>, source: Id, job: Job) {
+    let progress = |job: &Job| {
+        let phase = match job.state {
+            JobState::Queued => 0,
+            JobState::Running => 1,
+            JobState::Cancelling => 2,
+            _ => 3,
+        };
+        (job.created_at, job.job_id, phase, job.done, job.bytes)
+    };
+    if scans
+        .get(&source)
+        .is_none_or(|kept| progress(&job) >= progress(kept))
+    {
+        scans.insert(source, job);
+    }
+}
+
 impl Model {
     /// Starts reading from the app's connection, now and each time it connects again.
     pub(crate) fn new(link: Entity<Link>, quiet: bool, cx: &mut Context<Self>) -> Self {
@@ -260,7 +279,7 @@ impl Model {
                     // Newest first: the first scan of each source is its last.
                     for job in jobs.jobs.into_iter().rev() {
                         if let Some(source) = scanned(&job) {
-                            model.scans.insert(source, job);
+                            keep_scan(&mut model.scans, source, job);
                         }
                     }
                 }
@@ -327,7 +346,7 @@ impl Model {
         if let Some(source) = scanned(&job) {
             let was_running = self.scans.get(&source).is_some_and(|was| !is_ended(was));
             let ended = is_ended(&job);
-            self.scans.insert(source, job);
+            keep_scan(&mut self.scans, source, job);
             if ended && was_running {
                 self.read_sources(cx);
             }
@@ -413,7 +432,7 @@ impl Model {
                 },
                 move |model, started, _| match started {
                     Ok(started) => {
-                        model.scans.insert(source_id, started.job);
+                        keep_scan(&mut model.scans, source_id, started.job);
                     }
                     Err(error) => {
                         model.problems.insert(Group::Library, trouble(&error));
@@ -508,7 +527,7 @@ impl Model {
                 Ok((added, started.job))
             },
             |model, (source, job), _| {
-                model.scans.insert(source.source_id, job);
+                keep_scan(&mut model.scans, source.source_id, job);
                 model.sources.get_or_insert_with(Vec::new).push(source);
             },
         )
@@ -857,4 +876,30 @@ impl Model {
 /// A model for a window, on the app's connection.
 pub(crate) fn new(link: Entity<Link>, quiet: bool, cx: &mut gpui::App) -> Entity<Model> {
     cx.new(|cx| Model::new(link, quiet, cx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_reply_after_completion_leaves_the_scan_finished() -> Result<(), serde_json::Error> {
+        let id = Id::from_bytes([1; 16]);
+        let queued: Job = serde_json::from_value(serde_json::json!({
+            "jobId": id, "kind": "scan", "state": "queued", "createdAt": 1,
+            "done": 0, "failed": 0, "skipped": 0, "bytes": 0
+        }))?;
+        let mut scans = HashMap::new();
+        let mut done = queued.clone();
+        done.state = JobState::Succeeded;
+        keep_scan(&mut scans, id, done);
+        keep_scan(&mut scans, id, queued.clone());
+        assert!(scans.get(&id).is_some_and(is_ended));
+        let mut next = queued;
+        next.job_id = Id::from_bytes([2; 16]);
+        next.created_at += 1;
+        keep_scan(&mut scans, id, next);
+        assert!(scans.get(&id).is_some_and(|job| !is_ended(job)));
+        Ok(())
+    }
 }
