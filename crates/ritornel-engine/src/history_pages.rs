@@ -1,7 +1,7 @@
 //! What a page says of the listener's history with an artist or an album:
 //! one sentence for its banner, the plays by year for its picture and, for
-//! an artist, the records played most (docs/design/ui.md, "History in the
-//! interface"; the prototype's `historyLine` and `artistPicture`).
+//! an artist, the records played most ("Album and artist pages" in
+//! docs/internals/desktop.md).
 //!
 //! It counts the plays that count and are not excluded, of songs the
 //! library has bound them to. An artist's are the plays of their songs, by

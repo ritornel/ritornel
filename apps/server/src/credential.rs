@@ -1,7 +1,7 @@
 //! The credential file: the local owner's session token, in a file in the
 //! data directory that only the OS user can read. A program on this machine
 //! that can read it, such as `ritornelctl`, holds a `full` session. See
-//! "Pairing a client" in docs/design/linking.md.
+//! "Local credentials, sessions, and tokens" in docs/internals/linking.md.
 //!
 //! `server.db` keeps only the token's hash, so the file is the one place the
 //! token is. If the file is lost, is not the token the database expects, or

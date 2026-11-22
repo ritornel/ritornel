@@ -1,6 +1,6 @@
 //! `ritornelctl artists pictures <folder>`: takes each artist's portrait
-//! from a picture folder, as `scan` takes music from a folder. See "Artist
-//! pictures" in docs/plan.md.
+//! from a picture folder, as `scan` takes music from a folder. See "Catalog
+//! projection and displayed metadata" in docs/internals/identity.md.
 //!
 //! The folder becomes a named root on the server, which only ever reads
 //! it. Running it again takes what the folder chooses now, and drops what

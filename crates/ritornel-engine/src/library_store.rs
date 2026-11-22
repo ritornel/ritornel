@@ -1,7 +1,8 @@
 //! `library.db`: the library, which follows the hub role from machine to
 //! machine. One server may write it, the one its hub pointer names. See
 //! "Storage split" and "Commands, receipts, and revisions" in
-//! docs/internals/server.md, and decision 2 in docs/design/linking.md.
+//! docs/internals/server.md, and "Server identity and hub role" in
+//! docs/internals/linking.md.
 //!
 //! There is one way to change a library: [`LibraryStore::write`]. A write
 //! is a closure that runs in one transaction. The transaction takes the

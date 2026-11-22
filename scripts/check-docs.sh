@@ -6,9 +6,8 @@
 #   3. Every `docs/internals/*.md` follows the structural rules (no frontmatter,
 #      no `## To do` section, no draft review markers).
 #   4. No local user home paths appear in `ARCHITECTURE.md` or `docs/`.
-#
-# Once the remaining legacy `docs/design/` citations finish migrating into
-# `docs/internals/`, this script will also reject `docs/design/` citations.
+#   5. No legacy `docs/design/` or `docs/plan.md` citations remain outside
+#      frozen migration SQL.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -112,16 +111,24 @@ for doc_path in [ROOT / "ARCHITECTURE.md", *sorted((ROOT / "docs").rglob("*.md")
         if m:
             errors.append(f"{doc_path}: contains local user path {m.group(0)!r}")
 
-# 2. Validate every `docs/internals/<file>.md` citation and paired heading
+# 2. Validate every `docs/internals/<file>.md` citation and paired heading,
+#    and reject legacy `docs/design/` or `docs/plan.md` citations outside
+#    frozen migration SQL.
 path_re = re.compile(r"docs/internals/([A-Za-z0-9._-]+\.md)")
+legacy_doc_re = re.compile(r"docs/(?:design/[A-Za-z0-9._-]+|plan\.md)")
 after_heading_re = re.compile(r'docs/internals/([A-Za-z0-9._-]+\.md),\s*"([^"]+)"')
 before_heading_re = re.compile(r'"([^"]+)"\s+in\s+docs/internals/([A-Za-z0-9._-]+\.md)')
 
 for p in repo_files():
-    if p.as_posix() == "scripts/check-docs.sh":
+    posix = p.as_posix()
+    if posix == "scripts/check-docs.sh":
         continue
     raw = p.read_text(encoding="utf-8", errors="replace")
     collapsed = collapse_comment_lines(raw, p.suffix)
+
+    if not posix.startswith("crates/ritornel-engine/migrations/"):
+        for m in legacy_doc_re.finditer(raw):
+            errors.append(f"{p}: cites legacy doc {m.group(0)!r} (use docs/internals/)")
 
     for m in path_re.finditer(raw):
         target = internals_dir / m.group(1)

@@ -91,5 +91,5 @@ Detailed guides for shipped subsystems live under `docs/internals/`:
 - [`docs/internals/playback.md`](docs/internals/playback.md) — audio pipeline, gapless transitions, copy selection, persisted queue, frame-counted listen recording, and OS media sessions.
 - [`docs/internals/history.md`](docs/internals/history.md) — immutable observations, play derivation, monotonic timekeeping, indexed queries, Last.fm sync/scrobbling, and portable export.
 - [`docs/internals/identity.md`](docs/internals/identity.md) — read-only scanning, audio-only hashing, folder watching, normalization, recording resolution, catalog projection, and scrobble matching.
-
-Additional subsystem guides (`linking`, `desktop`) are being moved into `docs/internals/` as each is verified against the current code.
+- [`docs/internals/linking.md`](docs/internals/linking.md) — server identity, hub write guard, local owner credentials, sessions, tickets, media tokens, and listener transport bounds.
+- [`docs/internals/desktop.md`](docs/internals/desktop.md) — GPUI desktop workspace, server discovery, frame and whole-page navigation, virtualized walls and cover loading, History/Lean back views, queue, Settings, and offscreen testing.

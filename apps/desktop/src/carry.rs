@@ -1,7 +1,7 @@
-//! Something carried to Up next (`lib/carry.svelte.ts`): songs, a record,
-//! or entries of Up next itself. Where it is dropped says where it goes:
-//! straight after an entry, at the top to play next, or at the end
-//! (docs/design/ui.md, "Up next").
+//! Something carried to Up next: songs, a record, or entries of Up next
+//! itself. Where it is dropped says where it goes: straight after an entry,
+//! at the top to play next, or at the end ("Queue, context menus, and
+//! Settings" in docs/internals/desktop.md).
 //!
 //! The carrying is GPUI's own drag and drop, all within the window: a
 //! source starts it with `on_drag`, handing over a `Carried` and the chip

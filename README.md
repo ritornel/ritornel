@@ -72,9 +72,9 @@ The server reads the file when it starts, so start it again: quit and reopen the
 
 ## Architecture docs and history
 
-Subsystem guides live under `docs/internals/` and are indexed in [`ARCHITECTURE.md`](ARCHITECTURE.md). Some comments throughout the code still cite earlier `docs/design/` paths, numbered decisions, or early prototypes and spikes from when Ritornel was worked out in private; those citations are being updated as each subsystem guide is verified against the code and added under `docs/internals/`. (Comments inside shipped migration SQL files remain frozen because migrations are checksummed and never edited.)
+Subsystem guides live under `docs/internals/` and are indexed in [`ARCHITECTURE.md`](ARCHITECTURE.md). Comments inside shipped migration SQL files remain frozen because migrations are checksummed and never edited, so a few migration comments still name earlier `docs/design/` paths.
 
-For the same reason this repository's history begins as a few large commits, one for each milestone of that private work. An earlier desktop app, built with Tauri and Svelte, came before the GPUI one. Some comments mention it as `apps/desktop-tauri`, and it is not here either.
+The history begins with a few large commits made before the repository was public. An earlier desktop client was built with Tauri and Svelte before the GPUI app replaced it; some comments in `apps/desktop/` and the `tauri://localhost` socket origin in `apps/server/` still reflect that earlier client and early prototypes.
 
 ## Contributing
 

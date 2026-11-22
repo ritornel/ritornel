@@ -731,7 +731,7 @@ export type CopyInUse = {
    */
   serverId: string,
   /**
-   * What it is to the track: `master` in M1.
+   * What it is to the track: currently `master`.
    */
   role: string,
   /**
@@ -1396,8 +1396,8 @@ export type HistoryRecentParams = {
 /**
  * The result of `history.stream`: the listener's whole history as the
  * History tab draws it, a stream across the months in layers by the year
- * each artist was first heard (docs/design/ui.md, "History in the
- * interface").
+ * each artist was first heard ("History tab and Lean back" in
+ * docs/internals/desktop.md).
  *
  * It counts every dated play that counts and is not excluded, bound to the
  * library or not: History is the record of all of it. A play is the
@@ -3971,7 +3971,8 @@ export type ServerInfo = {
 
 /**
  * A server's own record of its role. The library's hub pointer decides
- * which server is the hub (docs/design/linking.md, decision 2).
+ * which server is the hub ("Server identity and hub role" in
+ * docs/internals/linking.md).
  */
 export type ServerRole = "unassigned" | "hub" | "satellite";
 
@@ -4049,7 +4050,8 @@ export type ServersList = {
 };
 
 /**
- * What a session may do (docs/design/linking.md, decision 6).
+ * What a session may do ("Local credentials, sessions, and tokens" in
+ * docs/internals/linking.md).
  */
 export type SessionKind = "full" | "limited";
 
@@ -4608,8 +4610,8 @@ export type TrackGetParams = {
 
 /**
  * The result of `history.track`: what Lean back says about the song that
- * is playing and its record, one fact at a time (docs/design/ui.md, "Lean
- * back"; the prototype's `leanFacts`).
+ * is playing and its record, one fact at a time ("History tab and Lean
+ * back" in docs/internals/desktop.md).
  *
  * It counts as a page does: the plays that count and are not excluded, of
  * songs the library has bound them to. The song's are the plays of its

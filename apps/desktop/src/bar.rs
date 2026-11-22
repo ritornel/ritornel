@@ -1,6 +1,6 @@
-//! The player bar (`frame/PlayerBar.svelte`): what is playing and its
-//! rating, the transport and the seek bar, Up next and Lean back. There is
-//! no volume control, by design (docs/design/ui.md, "The frame").
+//! The player bar: what is playing and its rating, the transport and the
+//! seek bar, Up next and Lean back. There is no volume control, by design
+//! ("Frame and navigation" in docs/internals/desktop.md).
 //!
 //! A new song's cover settles into place. The seek bar follows the pointer
 //! while it is held, anywhere in the window, and the song moves when it is

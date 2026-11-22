@@ -1,6 +1,4 @@
-//! A GPUI client for Ritornel, as a spike: the Albums wall, an album's
-//! page, the travelling cover and the system's menus, on the real server.
-//! See NOTES.md.
+//! The GPUI desktop client for Ritornel. See docs/internals/desktop.md.
 
 // A release build on Windows is a windowed program, so starting it from the
 // Start menu opens no console beside it, as a Mac app opens no terminal. A

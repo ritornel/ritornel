@@ -66,7 +66,8 @@ pub(crate) use calls::job_state;
 use lists::Fanout;
 
 /// The largest frame the server reads, in bytes: 1 MiB, which keeps bulk
-/// out of the control channel (docs/design/linking.md, decision 11).
+/// out of the control channel ("Listener and transport boundaries" in
+/// docs/internals/linking.md).
 pub(crate) const MAX_MESSAGE_BYTES: usize = 1 << 20;
 
 /// What became of a frame a transport handed over.
@@ -837,7 +838,7 @@ impl Core {
     }
 
     /// `library.create`: makes this server a hub with a library of its own.
-    /// See "Identity and the hub role" in docs/design/linking.md.
+    /// See "Server identity and hub role" in docs/internals/linking.md.
     ///
     /// Two files are written, the library first. `library.db` gets the
     /// library, with its hub pointer naming this server and the command's

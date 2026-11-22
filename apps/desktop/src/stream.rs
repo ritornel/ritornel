@@ -1,12 +1,11 @@
-//! History as one picture of your listening life, with the real client's
-//! numbers (`pages/stream.ts`, as the prototype draws it in
-//! prototypes/history/stream.js, "When you found it"): time runs left to
-//! right, the stream is as tall as you listened, and each layer is the
-//! artists you first heard in one year, the oldest at the bottom and the
-//! newest on top, in one hue shaded from one to the other. The line is
-//! smoothed over about half a year, and its height is the square root of
-//! the plays, so that the quiet years still read: it is a picture, not a
-//! measure. Its tests come with it.
+//! History as one picture of your listening life ("History tab and Lean
+//! back" in docs/internals/desktop.md): time runs left to right, the stream
+//! is as tall as you listened, and each layer is the artists you first
+//! heard in one year, the oldest at the bottom and the newest on top, in
+//! one hue shaded from one to the other. The line is smoothed over about
+//! half a year, and its height is the square root of the plays, so that the
+//! quiet years still read: it is a picture, not a measure. Its tests come
+//! with it.
 
 use ritornel_contract::{HistoryStream, Phrase};
 

@@ -30,9 +30,9 @@ pub(crate) const BACKUP_DIR_VAR: &str = "RITORNEL_BACKUP_DIR";
 /// The port a server listens on when nobody has said and it is free.
 pub(crate) const DEFAULT_PORT: u16 = 4747;
 
-/// Where the server listens. It is always the loopback address 127.0.0.1:
-/// listening beyond it arrives with pairing (docs/design/linking.md,
-/// decision 8), and until then this type cannot name anything else.
+/// Where the server listens. It is always the loopback address 127.0.0.1;
+/// this type cannot name anything else ("Listener and transport boundaries"
+/// in docs/internals/linking.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Listen(Option<u16>);
 

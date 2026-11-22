@@ -85,7 +85,7 @@ pub struct TrackSummary {
 pub struct CopyInUse {
     /// The server the copy is on.
     pub server_id: Id,
-    /// What it is to the track: `master` in M1.
+    /// What it is to the track: currently `master`.
     pub role: String,
     /// Its codec.
     pub codec: String,

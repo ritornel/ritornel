@@ -1,7 +1,7 @@
-//! The system's own context menu on a tile (docs/design/ui.md, "Context
-//! menus"): a record's, Play Next, Play Last | Play, Shuffle | Go to
-//! Artist, each played through the player as the real `lib/menus.ts` plays
-//! it. While it is open the tile wears its ring.
+//! The system's own context menu on a tile ("Queue, context menus, and
+//! Settings" in docs/internals/desktop.md): a record's, Play Next, Play
+//! Last | Play, Shuffle | Go to Artist, each played through the player.
+//! While it is open the tile wears its ring.
 //!
 //! GPUI has no context menu of the system's (Zed draws its own); the
 //! system's is `platform::pop_up_menu`.

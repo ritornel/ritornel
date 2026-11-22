@@ -28,11 +28,10 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 // THE POSSIBILITY OF SUCH DAMAGE.
 
-//! Lean back (`frame/LeanBack.svelte` and `lib/lean.svelte.ts`): the whole
-//! window for what is playing, over a blur of its cover, and one thing about
-//! it at a time (docs/design/ui.md, "Lean back"; the prototype's
-//! `renderLean`). The facts are the server's (`history.track`), and turn
-//! every fourteen seconds, or by ← and →.
+//! Lean back: the whole window for what is playing, over a blur of its
+//! cover, and one thing about it at a time ("History tab and Lean back" in
+//! docs/internals/desktop.md). The facts are the server's (`history.track`),
+//! and turn every fourteen seconds, or by ← and →.
 //!
 //! It opens from the player bar's button or View › Lean Back (⇧⌘F), and
 //! closes with Esc, ⇧⌘F, Back or its own button; the shell holds it while

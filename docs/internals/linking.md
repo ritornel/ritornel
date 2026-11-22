@@ -1,0 +1,35 @@
+# Linking
+
+Every `ritornel-server` creates a durable cryptographic identity on first start, enforces a single-writer hub boundary on `library.db`, and authenticates clients with owner-only session credentials, single-use socket tickets, and session-scoped media tokens. Identity and session storage live in `crates/ritornel-engine/src/{server_store,library_store,secret}.rs`; credential management, library opening, listener limits, tickets, and media tokens live in `apps/server/src/{credential,library,config,listener,ticket,media,dispatch}.rs`; contract types live in `crates/ritornel-contract/src/{server,ticket}.rs`.
+
+See [`docs/internals/server.md`](server.md) for the data directory and storage split, [`docs/internals/contract.md`](contract.md) for HTTP routes and origin checks, and [`docs/internals/schema.md`](schema.md) for the `server.db` and `library.db` table definitions.
+
+## Server identity and hub role
+
+- **Durable identity (`server_store.rs`, `secret.rs`):** On first start, `ServerStore::ensure_identity` creates the singleton `server_identity` row in `server.db` and the local owner's session in one transaction: an immutable UUIDv7 `server_id`, an Ed25519 signing keypair (`SigningKey` 32-byte seed kept in `server.db`, 32-byte `public_key` for pinning), a display `name`, `role` (`Role::Unassigned` initially), and `library_id` (`None`).
+- **Authoritative hub pointer (`library_store.rs`, `apps/server/src/library.rs`):** `server_identity.role` is only the server's own claim. Which server may write `library.db` is decided solely by `library_meta.hub_server_id` inside `library.db` (`hub_epoch` is initialized to `1` and logged at startup, reserved for future hub moves). Before opening `library.db` for writing, a hub checks `LibraryStore::check` (read-only, so a refused database is never migrated or touched) and verifies that `library_meta.library_id` matches `server_identity.library_id` and `hub_server_id` names this server. Every `LibraryStore::write` transaction re-checks `hub_server_id` and fails with `Error::NotTheHub` if ownership changed.
+- **Crash-safe library creation (`library.create` in `dispatch.rs`, `apps/ritornelctl/src/library.rs`):** Creating a library writes `library.db` first (setting `hub_server_id` to this server, `hub_epoch = 1`, and recording the command receipt in one transaction) and then updates `server.db` (`role = 'hub'`, `library_id`). If the process stops between the two files, startup sees an `unassigned` server whose `library.db` already names it as hub and finishes claiming it in `server.db`; if `library.db` names a different server, an `unassigned` server leaves it untouched and runs without a library.
+
+## Local credentials, sessions, and tokens
+
+- **Local owner credential (`apps/server/src/credential.rs`):** On first start, the server issues a 32-byte random `SessionToken` (64 hex digits) for the local owner (`SessionKind::Full`, `SubjectKind::Person`), stores only its SHA-256 hash in `server.db`'s `session` table, and writes the token atomically (`create_private_file` + `sync_all` + rename) to an owner-only file in the data directory. On subsequent starts, `credential::ensure` verifies the file via `platform::is_private` and matches it against the stored hash; if missing, readable by other users, or mismatched, the previous local session is revoked and a fresh token is issued.
+- **Constant-time verification and audit attribution:** `Verifier` holds only the SHA-256 hash in memory and checks presented `Authorization: Bearer` tokens with `subtle::ConstantTimeEq`. Every library write stamps `library_revision` with the handling session's `public_id` and `SubjectKind` (`person`, `agent`, or `server`).
+- **Session capabilities (`SessionKind`):** Sessions are `Full` or `Limited` (see ["Session and frames" in `docs/internals/contract.md`](contract.md#session-and-frames) for the calls restricted to `Full`). Sessions end only by revocation (`revoked_at_ms`), never by age.
+- **Single-use socket tickets (`apps/server/src/ticket.rs`, `crates/ritornel-contract/src/ticket.rs`):** Browser or WebView clients that cannot attach `Authorization` headers to WebSocket upgrades exchange their bearer credential at `POST /v1/ticket` for a 64-hex `SocketTicket` stored in memory only (`MAX_WAITING = 64`, 10-second lifetime, constant-time lookup, consumed on first presentation).
+- **Session-scoped media tokens (`apps/server/src/media.rs`):** `media.token` issues one 64-hex token per active WebSocket session, held in memory only (`MediaTokens`), valid exclusively for `GET /v1/art/{artId}/{size}?token=`, and revoked automatically when the session closes.
+
+## Listener and transport boundaries
+
+- **Loopback-only binding (`apps/server/src/config.rs`):** `Listen` currently accepts only IPv4 loopback (`127.0.0.1`), defaulting to `DEFAULT_PORT` (`4747`) with fallback to an OS-chosen port (`0`) when unspecified and already in use. Clients discover the active port from `server.json` rather than assuming `4747`.
+- **Authenticated routes and bounds (`apps/server/src/listener.rs`, `dispatch.rs`):** Every HTTP route except `GET /v1/descriptor` requires authentication (bearer header, one-time ticket on `GET /v1/ws`, or media token on `GET /v1/art/…`), even on loopback, to block cross-origin browser requests to `127.0.0.1` (see ["Query-string credentials and origin checks" in `docs/internals/contract.md`](contract.md#query-string-credentials-and-origin-checks)). Connection admission is bounded by `Bounds::max_connections` and `Bounds::header_wait` before auth, HTTP request heads are capped at `MAX_HEAD_BYTES` (`16 KiB`), and WebSocket control frames are capped at `MAX_MESSAGE_BYTES` (`1 MiB`) so bulk transfers stay off the control channel.
+
+## Decisions
+
+- **Authoritative hub pointer in `library.db`.** Storing `hub_server_id` inside the library itself prevents accidental split-brain writes when a database file is copied or moved between machines.
+- **Hash-only token storage and owner-only credential file.** Keeping only SHA-256 hashes in `server.db` and validating file permissions on every startup means a compromised or misconfigured file fails closed and rotates automatically.
+- **Authenticated loopback and short-lived tickets.** Requiring credentials even on `127.0.0.1` protects local servers from hostile browser pages while keeping tickets and media tokens memory-only and narrowly scoped.
+- **1 MiB control-frame ceiling.** Bounding JSON-RPC WebSocket frames keeps control traffic responsive and forces artwork and bulk transfers onto HTTP routes.
+
+## Later
+
+- The schema and engine already include hooks for multi-server linking: `server_identity.role` (`Role::Satellite`), `session.subject_kind` (`SubjectKind::Server`), `session.media_token_hash`, `library_meta.hub_epoch`, and `library.db`'s `server` table, so peer pairing, LAN listeners, and hub/satellite forwarding build on this foundation without migrating existing single-machine libraries.

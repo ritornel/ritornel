@@ -1,0 +1,60 @@
+# Desktop
+
+The desktop app (`apps/desktop`, package `ritornel-desktop-gpui`, binary `ritornel-gpui`) is a GPUI client over `ritornel-client` and `ritornel-contract`. It never links `ritornel-engine` or `rusqlite` directly; every read, playback action, and cover fetch crosses the local server contract.
+
+See [`docs/internals/contract.md`](contract.md) for the wire protocol and list views, [`docs/internals/platforms.md`](platforms.md) for per-OS support and bundling, and [`docs/internals/history.md`](history.md) for the server queries behind the History tab and Lean back.
+
+## Workspace and server connection
+
+- **Separate Cargo workspace:** `apps/desktop/Cargo.toml` declares its own `[workspace]` and is excluded from the root Cargo workspace so `ritornel-server`, `ritornelctl`, and headless hub builds never pull in GPUI or desktop libraries. It pins `gpui-pre` / `gpui-pre-platform` (`=0.3.13`) with `runtime-shaders` enabled by default so macOS builds only need Command Line Tools.
+- **Discovery and launch (`link.rs`):** Resolves the data directory from `--data-dir`, `RITORNEL_DATA_DIR`, or the OS default. When a `ritornel-server` binary sits beside the app bundle, `Link` starts it if none is running (passing `--output` from `RITORNEL_TEST_OUTPUT` when set). Where `platform::SERVER_APART` is true (Linux and Windows), the server is launched detached so closing the window keeps music playing and Quit stops it; where false (macOS), closing the window keeps the app running in the Dock and Quit stops a server the app started. While disconnected, `Link` retries with backoff up to 2 seconds and reports the reason (`Why::{NotRunning, Starting, Unreachable, Incompatible, Lost, Failed}`).
+- **Network runtime (`net.rs`):** Runs `ritornel-client` and a kept-alive HTTP/1.1 cover fetcher (`ArtHttp` using `hyper`, reading `GET /v1/art/{artId}/{size}?token=`) on a dedicated 2-worker Tokio runtime (`"net"`, falling back to a single-thread runtime if needed). GPUI's foreground executor awaits Tokio handles directly.
+
+## Frame and navigation
+
+- **Window chrome (`frame.rs`, `shell.rs`):** The title bar holds five tabs (`Tab::{Today, Library, Playlists, History, Devices}`), a global search box (`search.rs` calling `library.search` as you type), and either system window buttons or drawn controls per `platform::CHROME`. Menus live in the OS menu bar where `platform::CHROME.menu_bar` is true (macOS) and open from a title-bar button via `drawn.rs` elsewhere, driven from one menu definition.
+- **Player bar (`bar.rs`):** Shows the current track's cover, title/artist, star rating, transport controls, draggable seek bar, Up next toggle, and Lean back trigger. Volume is intentionally omitted from the player bar (use system volume or `playback.set`'s `volume`).
+- **Whole-page history stack (`stage.rs`):** Navigating deeper pushes the previous `Page` entity onto `History<P>` (up to `DEPTH = 100` entries) rather than tearing it down, so Back restores exact scroll position and state immediately. Off-screen pages track missed server updates via `Freshness` and refresh once when shown again instead of re-reading on every play event.
+- **Transitions (`shell.rs`, `moves.rs`):** Page changes stage the outgoing page beneath the incoming one and animate shared artwork (`Carry`) between wall tiles, album covers, artist portraits, and the player bar.
+- **Appearance and local state (`theme.rs`, `remember.rs`):** Follows OS light/dark appearance automatically (`Mist` light, `Graphite` dark; overridden for testing by `RITORNEL_GPUI_APPEARANCE=light|dark`). Machine-local UI preferences (`wall`, `albumsSort`, `letters`, `settingsSection`) persist in `dev.ritornel.desktop-gpui/remembered.json` under `platform::settings_dir()`, and `Looks` is shared globally across windows.
+
+## Walls, pages, and history views
+
+### Library walls and cover loading
+
+- **Virtualized walls (`wall.rs`, `layout.rs`):** `Wall` switches between `WallKind::Artists` and `WallKind::Albums` (sorted by `artist`, `title`, `year`, or `added`), drawing only visible rows on a `150` pt tile grid (`MIN_COLUMNS = 3`, `MAX_COLUMNS = 16`, `GAP_X = 18`, `GAP_Y = 22`) in one of three section shapes (`Shape::{Lettered, Headed, Dated}`). Rows stream in pages of `100` (`PAGE = 100`, up to `KEEP_PAGES = 200` cached, `PAGES_IN_FLIGHT = 4`) through a server `list.open` view kept alive every `KEEP_VIEW` (4 minutes).
+- **Ordering and type-to-find (`wall.rs`, `find.rs`, `crates/ritornel-engine/src/list/fold.rs`):** Both server-side list ordering/search and client-side type-to-find (`TYPING = 1000` ms timeout in `wall.rs`, query folding in `find.rs`) fold case, accents, and word-separating punctuation so typing jumps directly to matching titles or artists.
+- **Momentum-predicted cover loader (`covers.rs`, `wall.rs`):** Each frame the wall reports `Wants { ids, px }` ordered by predicted scroll rest point first, then visible tiles, then look-ahead in the direction of travel. Up to `MAX_FETCHES = 8` concurrent HTTP fetches run at once; stale requests are aborted (letting the server drop unstarted jobs from `CoverPool`). Decoding and blurring share a global semaphore (`decoders()` clamped to `2..=4` blocking threads). Memory is bounded by `COMPRESSED_BUDGET` (`32 MiB` in `covers.rs`) and a decoded pixel budget defaulting to `96 MiB` (`cover_budget()` in `wall.rs`, overridden by `RITORNEL_GPUI_COVER_MB`), evicting least-recently-drawn images from both RAM and GPUI's sprite atlas while keeping each cover's average color (`ground`) so tiles never flash blank. Per-page image tasks register in `FetchBag` and abort on drop.
+
+### Album and artist pages
+
+- **Discography shelves (`artist.rs`, `album.rs`, `crates/ritornel-engine/src/list/discography.rs`):** An artist's records are ordered server-side (`SortKey::Discography`) into shelves—albums and EPs (including untyped releases), singles, live recordings, collections and rarities, and appearances—newest first by original release year, with undated records last.
+- **History on pages (`history.artist`, `history.album`):** Artist and album pages display a banner summary sentence (`Phrase`), yearly play counts (`YearPlays`), and (for artists) top played records, re-reading when plays change.
+
+### History tab and Lean back
+
+- **History tab (`history.rs`, `stream.rs`, `thisday.rs`):** Calls `history.stream` and `history.onThisDay` to render a full-bleed, smoothed monthly listening stream layered by the year each artist was first heard (square-root height scale so quieter years remain legible, with catch-up sync days above `SYNC_DAY = 300` plays excluded server-side in `history_stream.rs`), with hover/click inspection and an "On this day" column (up to `AT_MOST = 3` years, applying the same `SYNC_DAY = 300` exclusion in `thisday.rs`).
+- **Lean back (`lean.rs`):** Full-window Now Playing overlay (`⇧⌘F` / player bar button) over blurred album artwork. Cycles `history.track` facts every `FACT_MS` (14 seconds) or via `←`/`→`, using letter-spacing tracking (`tracked.rs`) and a Rust port of WebKit's `InlineContentBalancer` for balanced multi-line headings.
+
+## Queue, context menus, and Settings
+
+- **Up next and drag-and-drop (`upnext.rs`, `carry.rs`, `player.rs`):** Up next is a `320` pt floating card showing the current entry plus up to `UP_NEXT = 150` upcoming entries. At window widths `>= ROOM_FOR_CARD` (`1180` pt) it shifts the page over (`RAIL = 328` pt); below that it overlays the page and closes on navigation. `carry.rs` implements in-window drag-and-drop for songs, albums, and queue rows into `QueuePlace::{Next, After, End}`. `Player` tracks `playback` and `progress` events, applies optimistic star ratings (rolling back on error), and surfaces transient errors for `TOAST_MS` (`2600` ms).
+- **Context menus (`menu.rs`):** Uses native OS pop-up menus (`platform::pop_up_menu`, `NSMenu` on macOS) or drawn menus (`drawn.rs`) for tiles, tracks, queue entries, artists, and the playing track, visually marking the target item while open.
+- **Settings window (`settings/`):** Single secondary window (`WIDTH = 640` pt, height fitted to content within `SHOW_WITHIN = 1000` ms before display) sharing the main `Link`, with four sections: `Library`, `Appearance`, `Last.fm`, and `About`.
+
+## Platform layer and testing
+
+- **OS isolation (`platform/`):** All OS-specific code (`mac.rs`, `mac_menu.rs`, `mac_window.rs`, `linux.rs`, `windows.rs`) sits behind `platform/mod.rs` exposing `CHROME`, `FEEL`, `KEYS`, native file choosers, menus, server lifecycle, memory footprint reporting, and window screenshots. Overscroll elasticity on macOS (`elastic.rs`) ports WebKit/AppKit physics directly. No OS `cfg` appears outside `platform/`.
+- **Scripted verification and benchmarks (`script.rs`, `measure.rs`, `scripts/desktop.sh`, `scripts/desktop.ps1`):** `ritornel-gpui` accepts `--script "<steps>"` (driving waits, screenshots, scrolling, navigation, menus, drag/drop, Settings, and memory logging) and `--measure <seconds> --out <path>` for scroll benchmarks. `scripts/desktop.sh` (`check`, `app`, `run`, `tones`) and `scripts/desktop.ps1` (`run`, `tones`, `app`) run against invented libraries (`apps/desktop/.invented`, `apps/desktop/.tones`) and never touch a user's real data directory.
+- **Offscreen runs (`scripts/hidden-display.sh`):** Setting `RITORNEL_OFFSCREEN=1` on macOS resolves a hidden display via `RITORNEL_TEST_DISPLAY` or `hidden-display ensure` (left running for reuse), opens the window on that display out of the Dock (`keep_out_of_the_dock`), and refuses to start if no hidden display is available.
+
+## Decisions
+
+- **GPUI in an isolated Cargo workspace.** Keeping `apps/desktop` out of the main workspace prevents desktop/GUI dependencies from touching server and headless hub builds while letting the app compile directly against `ritornel-client` and `ritornel-contract`.
+- **Whole-page history stack with deferred `Freshness`.** Retaining visited page entities gives instant Back navigation without losing scroll position, while coalescing background library updates avoids wasting work on off-screen pages.
+- **Momentum-predicted, bounded cover loading.** Prioritizing predicted scroll rest points, aborting stale fetches, bounding both compressed and decoded caches, and caching average tile colors keep fast scrolling smooth and memory bounded without blank tiles.
+- **Contract-only client.** Keeping all library, discography ordering, history, and playback logic in `ritornel-server` ensures desktop and CLI share one source of truth and playback survives window closes.
+
+## Later
+
+- `Tab::{Today, Playlists, Devices}` are already wired in the title bar and render `Page::NotBuilt(Tab)` until those views are implemented; `WallKind` currently ships `Artists` and `Albums`, while `ListKind::Songs` is already defined in the contract.
