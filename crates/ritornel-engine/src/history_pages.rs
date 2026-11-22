@@ -29,6 +29,11 @@ const LONG_AGO_MS: i64 = 2 * YEAR_MS + DAY_MS / 2;
 const FIRST_WEEKS_MS: i64 = 30 * DAY_MS;
 /// How many of an artist's records stand under their picture.
 const RECORDS: usize = 6;
+/// How far apart two zones' clocks can be: from UTC−12 to UTC+14. The
+/// first local date of a history is among its plays within this long of
+/// the first in time, and its last among those within this long of the
+/// last.
+const ZONES_APART_MS: i64 = 26 * 3_600_000;
 
 pub(crate) const MONTHS: [&str; 12] = [
     "January",
@@ -67,13 +72,24 @@ pub(crate) struct Facts {
     pub(crate) first: Option<(i64, i64)>,
     /// The last.
     pub(crate) last: Option<(i64, i64)>,
+    /// The instant of the last play that has one, dated or not.
+    pub(crate) latest_ms: Option<i64>,
     /// The plays in the last year.
     pub(crate) last_year: u64,
     /// The dated plays by year.
     pub(crate) years: BTreeMap<i32, u64>,
-    /// The dated plays of each record they were heard from, by year, keyed
-    /// by the record's release group.
-    pub(crate) records: HashMap<i64, BTreeMap<i32, u64>>,
+    /// The plays of each record they were heard from, keyed by the record's
+    /// release group.
+    pub(crate) records: HashMap<i64, RecordFacts>,
+}
+
+/// The plays of one record.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RecordFacts {
+    /// Its plays, dated or not.
+    pub(crate) plays: u64,
+    /// Its dated plays by year.
+    pub(crate) years: BTreeMap<i32, u64>,
 }
 
 impl Facts {
@@ -81,8 +97,16 @@ impl Facts {
     /// heard from, each where known.
     fn add(&mut self, at_ms: Option<i64>, date: Option<i64>, record: Option<i64>, today: Today) {
         self.plays += 1;
-        if at_ms.is_some_and(|at| at > today.now_ms - YEAR_MS && at <= today.now_ms) {
-            self.last_year += 1;
+        if let Some(record) = record {
+            self.records.entry(record).or_default().plays += 1;
+        }
+        if let Some(at) = at_ms {
+            if at > today.now_ms - YEAR_MS && at <= today.now_ms {
+                self.last_year += 1;
+            }
+            if self.latest_ms.is_none_or(|latest| at > latest) {
+                self.latest_ms = Some(at);
+            }
         }
         let (Some(at), Some(date)) = (at_ms, date) else {
             return;
@@ -100,6 +124,7 @@ impl Facts {
                 .records
                 .entry(record)
                 .or_default()
+                .years
                 .entry(year)
                 .or_default() += 1;
         }
@@ -181,6 +206,9 @@ impl Said {
 /// last year, how much; otherwise when last. `began_ms` is when the
 /// listener's history begins. Nothing at all with no plays.
 ///
+/// When a play with no local date came after the last dated one, the month
+/// of the last play is not known, and is not said.
+///
 /// What waits on sessions is left out: "played start to finish".
 pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Vec<Phrase> {
     if facts.plays == 0 {
@@ -199,12 +227,17 @@ pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Ve
         said = said.plain("your first weeks, ");
     }
     said = said.strong(&month(first));
-    if last_at < today.now_ms - LONG_AGO_MS {
-        return said
-            .plain(". Not played since ")
-            .strong(&month(last))
-            .plain(".")
-            .0;
+    let latest = facts.latest_ms.unwrap_or(last_at);
+    let last = (latest == last_at).then_some(last);
+    if latest < today.now_ms - LONG_AGO_MS {
+        return match last {
+            Some(last) => said
+                .plain(". Not played since ")
+                .strong(&month(last))
+                .plain("."),
+            None => said.plain(". Not played for over two years."),
+        }
+        .0;
     }
     let dated: u64 = facts.years.values().sum();
     let mostly = peak(&facts.years).filter(|&(year, most)| {
@@ -224,10 +257,14 @@ pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Ve
             .plain(" in the last year.")
             .0;
     }
-    said.plain(". Last played in ")
-        .strong(&month(last))
-        .plain(".")
-        .0
+    match last {
+        Some(last) => said
+            .plain(". Last played in ")
+            .strong(&month(last))
+            .plain("."),
+        None => said.plain("."),
+    }
+    .0
 }
 
 /// A local date as `YYYY-MM-DD`.
@@ -286,6 +323,9 @@ fn history_of(
         )?
         .query_row([listener], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?;
+    let span = began
+        .map(|(at, _)| span(connection, listener, at, today))
+        .transpose()?;
     let records = if records {
         played_most(connection, &facts)?
     } else {
@@ -301,42 +341,75 @@ fn history_of(
             .iter()
             .map(|(&year, &plays)| YearPlays { year, plays })
             .collect(),
-        span: began.map(|(_, day)| YearSpan {
-            from: year_of(day).min(today.year),
-            to: today.year,
-        }),
+        span,
         records,
         sentence: sentence(&facts, began.map(|(at, _)| at), today),
         library_revision: u64::try_from(revision).unwrap_or(0),
     })
 }
 
-/// The records played most, most first, each with the year it was most
-/// played, as Albums tiles. A record the Albums list no longer has is left
-/// out.
+/// The years the listener's whole history runs over: from the local year
+/// of their first dated play to this year, or to a later one a play was
+/// heard in. The first play in time, which began at `began_ms`, is not
+/// always the first by local date: one heard just after midnight on New
+/// Year's Day in a zone far ahead can come before one heard late on New
+/// Year's Eve in a zone far behind. So each end is the earliest or latest
+/// local date among the plays near it in time.
+fn span(
+    connection: &Connection,
+    listener: i64,
+    began_ms: i64,
+    today: Today,
+) -> Result<YearSpan, Error> {
+    let (first, last): (Option<i64>, Option<i64>) = connection
+        .prepare_cached(
+            "SELECT
+               (SELECT min(local_date) FROM play_event
+                WHERE listener_id = ?1 AND counts = 1 AND excluded = 0
+                  AND local_date IS NOT NULL
+                  AND event_at_utc_ms BETWEEN ?2 AND ?2 + ?3),
+               (SELECT max(pe.local_date) FROM play_event pe,
+                  (SELECT event_at_utc_ms AS at FROM play_event
+                   WHERE listener_id = ?1 AND counts = 1 AND excluded = 0
+                     AND local_date IS NOT NULL AND event_at_utc_ms IS NOT NULL
+                   ORDER BY event_at_utc_ms DESC LIMIT 1) latest
+                WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
+                  AND pe.local_date IS NOT NULL
+                  AND pe.event_at_utc_ms BETWEEN latest.at - ?3 AND latest.at)",
+        )?
+        .query_row(params![listener, began_ms, ZONES_APART_MS], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    Ok(YearSpan {
+        from: first.map_or(today.year, year_of).min(today.year),
+        to: last.map_or(today.year, year_of).max(today.year),
+    })
+}
+
+/// The records played most, most first, each with its plays and the year
+/// it was most played, as Albums tiles. A record the Albums list no longer
+/// has is left out, and the next one takes its place.
 fn played_most(connection: &Connection, facts: &Facts) -> Result<Vec<RecordPlayed>, Error> {
-    let mut ranked: Vec<(i64, u64, i32)> = facts
+    let mut ranked: Vec<(i64, &RecordFacts)> = facts
         .records
         .iter()
-        .filter_map(|(&group, years)| {
-            peak(years).map(|(year, _)| (group, years.values().sum(), year))
-        })
+        .map(|(&group, record)| (group, record))
         .collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    ranked.truncate(RECORDS);
-    let keys: Vec<i64> = ranked.iter().map(|(group, ..)| *group).collect();
+    ranked.sort_by(|a, b| b.1.plays.cmp(&a.1.plays).then(a.0.cmp(&b.0)));
+    let keys: Vec<i64> = ranked.iter().map(|(group, _)| *group).collect();
     let tiles = crate::list::album_tiles(connection, &keys)?;
     Ok(ranked
         .into_iter()
         .zip(tiles)
-        .filter_map(|((_, plays, peak_year), row)| match row {
+        .filter_map(|((_, record), row)| match row {
             Row::Album(tile) => Some(RecordPlayed {
                 tile,
-                plays,
-                peak_year,
+                plays: record.plays,
+                peak_year: peak(&record.years).map(|(year, _)| year),
             }),
             _ => None,
         })
+        .take(RECORDS)
         .collect())
 }
 

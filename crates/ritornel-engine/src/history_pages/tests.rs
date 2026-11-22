@@ -2,7 +2,7 @@ use ritornel_contract::{AlbumRef, Phrase};
 
 use super::{Facts, Today, sentence};
 use crate::Id;
-use crate::invent::testing::{NOW, library_drawing};
+use crate::invent::testing::{NOW, library_drawing, tamper};
 use crate::invent::{PlaysPlan, invent_plays};
 
 const DAY: i64 = 86_400_000;
@@ -265,7 +265,7 @@ fn a_page_counts_the_bound_plays_of_its_artist_and_its_album_as_counting_by_hand
             .max_by_key(|year| (year.plays, -year.year))
             .unwrap();
         if album.plays == record.plays {
-            assert_eq!(peak.year, record.peak_year);
+            assert_eq!(Some(peak.year), record.peak_year);
         }
         // Asked for by one of its releases, an album is its whole record.
         let group = store.album_page(record.tile.album).unwrap().unwrap();
@@ -290,5 +290,208 @@ fn a_page_counts_the_bound_plays_of_its_artist_and_its_album_as_counting_by_hand
             .album_history(listener, AlbumRef::ReleaseGroup { id: nobody }, TODAY)
             .unwrap(),
         None
+    );
+}
+
+#[test]
+fn a_play_with_no_local_date_after_the_last_dated_one_is_not_taken_for_none() {
+    let since = Some(NOW - 6_000 * DAY);
+    // A dated play in 2023, and one five days ago whose source gave no
+    // zone, so it has an instant and no local date.
+    let mut recent = Facts::default();
+    play(&mut recent, 1_250, 20230619);
+    recent.add(Some(NOW - 5 * DAY), None, None, TODAY);
+    assert_eq!(
+        said(&sentence(&recent, since, TODAY)),
+        "With you since *June 2023*. *1 play* in the last year."
+    );
+
+    // Over two years ago, after the last dated play: its month is not known.
+    let mut gone = Facts::default();
+    play(&mut gone, 3_000, 20180610);
+    gone.add(Some(NOW - 1_000 * DAY), None, None, TODAY);
+    assert_eq!(
+        said(&sentence(&gone, since, TODAY)),
+        "With you since *June 2018*. Not played for over two years."
+    );
+
+    // Between one and two years ago: nor is it here.
+    let mut quiet = Facts::default();
+    play(&mut quiet, 1_000, 20240219);
+    quiet.add(Some(NOW - 500 * DAY), None, None, TODAY);
+    assert_eq!(
+        said(&sentence(&quiet, since, TODAY)),
+        "With you since *February 2024*."
+    );
+
+    // An undated play before the last dated one changes nothing.
+    let mut before = Facts::default();
+    play(&mut before, 900, 20240530);
+    before.add(Some(NOW - 2_000 * DAY), None, None, TODAY);
+    assert_eq!(
+        said(&sentence(&before, since, TODAY)),
+        "With you since *May 2024*. Not played since *May 2024*."
+    );
+}
+
+#[test]
+fn a_records_plays_count_its_undated_ones_and_only_dated_ones_have_a_year() {
+    let mut facts = Facts::default();
+    for _ in 0..3 {
+        facts.add(Some(NOW - 5 * DAY), None, Some(7), TODAY);
+    }
+    facts.add(Some(NOW - 900 * DAY), Some(20240530), Some(7), TODAY);
+    facts.add(None, None, Some(8), TODAY);
+    let seven = &facts.records[&7];
+    assert_eq!(seven.plays, 4);
+    assert_eq!(seven.years, [(2024, 1)].into());
+    let eight = &facts.records[&8];
+    assert_eq!((eight.plays, eight.years.len()), (1, 0));
+}
+
+/// An invented library with `plays` plays over the three years before
+/// [`NOW`], its listener, and the artist played most.
+fn played(plays: usize) -> (crate::invent::testing::Library, Id, Id) {
+    let invented = library_drawing(40);
+    let plan = PlaysPlan {
+        plays,
+        seed: 3,
+        now_ms: NOW,
+        years: 3,
+        zone: "Europe/London".to_owned(),
+    };
+    invent_plays(&invented.store, &plan, |_, _| {}).unwrap();
+    let listener = invented.store.default_listener().unwrap().unwrap();
+    let artist = favourite(&invented.store);
+    (invented, listener, artist)
+}
+
+/// An ID as an SQL blob literal.
+fn blob(id: Id) -> String {
+    let hex: String = id
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("x'{hex}'")
+}
+
+/// The counted plays of the artist whose public ID is `artist`, as SQL.
+fn plays_of(artist: Id) -> String {
+    let artist = blob(artist);
+    format!(
+        "SELECT pe.id FROM play_event pe
+         JOIN recording r ON r.id = pe.recording_id
+         JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
+         WHERE acn.artist_id = (SELECT id FROM artist WHERE public_id = {artist})
+           AND pe.counts = 1 AND pe.excluded = 0"
+    )
+}
+
+#[test]
+fn the_span_holds_every_local_year_played_across_the_date_line() {
+    let (invented, listener, artist) = played(600);
+    let store = &invented.store;
+    let of_artist = plays_of(artist);
+    // 00:30 on New Year's Day 2020 in Kiritimati (UTC+14) is 10:30 UTC on
+    // New Year's Eve, before 23:00 on New Year's Eve in Honolulu (UTC−10),
+    // which is 09:00 UTC on New Year's Day: the first play in time is in
+    // 2020, and the next, by local date, in 2019. And 00:30 on New Year's
+    // Day 2027 in Kiritimati is still 2026 where the server is.
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET event_at_utc_ms = 1577788200000, local_date = 20200101
+             WHERE id = ({of_artist} ORDER BY pe.id LIMIT 1);
+             UPDATE play_event SET event_at_utc_ms = 1577869200000, local_date = 20191231
+             WHERE id = ({of_artist} ORDER BY pe.id LIMIT 1 OFFSET 1);
+             UPDATE play_event SET event_at_utc_ms = 1798713000000, local_date = 20270101
+             WHERE id = ({of_artist} ORDER BY pe.id DESC LIMIT 1);"
+        ),
+    );
+    // Noon UTC on New Year's Eve 2026.
+    let today = Today {
+        now_ms: 1_798_718_400_000,
+        year: 2026,
+        month: 12,
+        date: 20261231,
+    };
+    let history = store
+        .artist_history(listener, artist, today)
+        .unwrap()
+        .unwrap();
+    let years: Vec<i32> = history.years.iter().map(|year| year.year).collect();
+    assert_eq!((years.first(), years.last()), (Some(&2019), Some(&2027)));
+    let span = history.span.unwrap();
+    assert_eq!((span.from, span.to), (2019, 2027));
+
+    // The History tab's stream runs from that December to that January.
+    let stream = store.history_stream(listener, today).unwrap();
+    assert_eq!(stream.from.as_deref(), Some("2019-12"));
+    assert_eq!(stream.months, 7 * 12 + 2);
+    assert!(stream.total.last().is_some_and(|&plays| plays > 0));
+}
+
+#[test]
+fn played_most_skips_a_record_the_albums_list_no_longer_has() {
+    let (invented, listener, artist) = played(4_000);
+    let store = &invented.store;
+    let artist_blob = blob(artist);
+    // Credit the artist with a played song from each of eight records.
+    tamper(
+        store,
+        &format!(
+            "UPDATE recording SET display_artist_credit_id = (
+               SELECT acn.artist_credit_id FROM artist_credit_name acn
+               JOIN artist a ON a.id = acn.artist_id WHERE a.public_id = {artist_blob} LIMIT 1)
+             WHERE id IN (
+               SELECT min(pe.recording_id) FROM play_event pe
+               JOIN track_appearance ta ON ta.id = pe.appearance_id
+               JOIN release rel ON rel.id = ta.release_id
+               WHERE pe.counts = 1
+               GROUP BY rel.release_group_id LIMIT 8)"
+        ),
+    );
+    let before = store
+        .artist_history(listener, artist, TODAY)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.records.len(), 6);
+    let albums: Vec<AlbumRef> = before
+        .records
+        .iter()
+        .map(|record| record.tile.album)
+        .collect();
+    // Every file of the six played most is gone from the library.
+    let groups: Vec<String> = albums
+        .iter()
+        .map(|album| match album {
+            AlbumRef::ReleaseGroup { id } => blob(*id),
+            AlbumRef::Release { .. } => panic!("a tile is of a record"),
+        })
+        .collect();
+    tamper(
+        store,
+        &format!(
+            "UPDATE source_item SET retired_at_ms = 1 WHERE id IN (
+               SELECT a.source_item_id FROM assignment a
+               JOIN track_appearance ta ON ta.id = a.appearance_id
+               JOIN release rel ON rel.id = ta.release_id
+               JOIN release_group rg ON rg.id = rel.release_group_id
+               WHERE rg.public_id IN ({}))",
+            groups.join(", ")
+        ),
+    );
+    let after = store
+        .artist_history(listener, artist, TODAY)
+        .unwrap()
+        .unwrap();
+    // The records after them take their places.
+    assert!(!after.records.is_empty());
+    assert!(
+        after
+            .records
+            .iter()
+            .all(|record| !albums.contains(&record.tile.album) && record.plays > 0)
     );
 }

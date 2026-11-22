@@ -203,11 +203,14 @@ fn render_of(of: &HistoryOf) -> String {
     if !of.records.is_empty() {
         text.push_str("\nPlayed most\n");
         for record in &of.records {
+            let peak = record
+                .peak_year
+                .map(|year| format!("  most in {year}"))
+                .unwrap_or_default();
             text.push_str(&format!(
-                "  {:<40} {:>6}  most in {}\n",
+                "  {:<40} {:>6}{peak}\n",
                 record.tile.title.as_deref().unwrap_or("(untitled)"),
                 record.plays,
-                record.peak_year
             ));
         }
     }
