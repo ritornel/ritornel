@@ -36,6 +36,9 @@ fn is_symbol(c: char) -> bool {
             | '\u{a2}'..='\u{a6}' | '\u{a9}' | '\u{ac}' | '\u{ae}' | '\u{b0}' | '\u{b1}'
             | '\u{d7}' | '\u{f7}'
             | '\u{20a0}'..='\u{20cf}' | '\u{2100}'..='\u{2bff}' | '\u{1f000}'..='\u{1faff}')
+        // A mark that parts words, as a dash, a slash or a tilde does, is
+        // punctuation however it is written, but for a plus and a times.
+        && !(parts_words(c) && !matches!(c, '+' | '\u{d7}'))
         // The brackets among them, ornamental and mathematical, are
         // punctuation.
         && !matches!(c,
@@ -54,9 +57,38 @@ fn is_presentation(c: char) -> bool {
 /// after its last.
 fn edge_symbols(marks: impl Iterator<Item = char>) -> String {
     marks
-        .take_while(|c| !c.is_alphanumeric())
+        // "&" is the word "and" in a name with letters.
+        .take_while(|c| !c.is_alphanumeric() && *c != '&')
         .filter(|c| is_symbol(*c))
         .collect()
+}
+
+/// A name without the bracketed notes at its end: "Night Drives +" of
+/// "Night Drives + (Deluxe) [2024]".
+fn without_trailing_notes(text: &str) -> &str {
+    let mut end = text.trim_end();
+    while end.ends_with([')', ']', '}']) {
+        let mut depth = 0_u32;
+        let mut open = None;
+        for (at, c) in end.char_indices().rev() {
+            match c {
+                ')' | ']' | '}' => depth += 1,
+                '(' | '[' | '{' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        open = Some(at);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match open {
+            Some(at) => end = end[..at].trim_end(),
+            None => break,
+        }
+    }
+    end
 }
 
 /// The key of a name: NFKC, lower case, "&" as "and", punctuation that
@@ -133,6 +165,21 @@ fn normalize_with(text: &str, edges: bool) -> String {
         if !last.is_empty() {
             key.push(' ');
             key.extend(last.chars().rev());
+        } else {
+            // A symbol just before the notes at the end keeps its place.
+            let head = without_trailing_notes(&folded);
+            let before = edge_symbols(head.chars().rev());
+            if !before.is_empty()
+                && head.len() < folded.trim_end().len()
+                && head.chars().any(char::is_alphanumeric)
+            {
+                let at =
+                    normalize_with(head, false).split(' ').count() + usize::from(!first.is_empty());
+                let mut words: Vec<&str> = key.split(' ').collect();
+                let before: String = before.chars().rev().collect();
+                words.insert(at.min(words.len()), &before);
+                key = words.join(" ");
+            }
         }
     }
     // Taking punctuation out can bring a letter and its mark together.
@@ -399,6 +446,23 @@ mod tests {
         assert_eq!(core("Night Drives (Live)"), "night drives");
         assert_eq!(normalize("Mira\u{2764}\u{fe0f}"), "mira \u{2764}");
         assert_eq!(normalize("Mira \u{2764}\u{fe0f}"), "mira \u{2764}");
+        // A symbol before the notes at the end is kept where it is.
+        assert_eq!(
+            normalize("Night Drives + (Deluxe)"),
+            "night drives + deluxe"
+        );
+        assert_ne!(
+            normalize("Night Drives + (Deluxe)"),
+            normalize("Night Drives (Deluxe)")
+        );
+        assert_eq!(core("Night Drives + (Deluxe)"), "night drives +");
+        // "&" is "and" wherever it is.
+        assert_eq!(normalize("Night Drives + &"), "night drives and");
+        // Marks that part words are not symbols, however they are written.
+        assert_eq!(normalize("\u{ff5e}Night Drives\u{ff5e}"), "night drives");
+        assert_eq!(normalize("\u{301c}Night Drives\u{301c}"), "night drives");
+        assert_eq!(normalize("Night Drives \u{2212}"), "night drives");
+        assert_eq!(normalize("Night Drives |"), "night drives");
         // Ornamental brackets are brackets, not symbols.
         assert_eq!(normalize("\u{2768}Night Drives\u{2769}"), "night drives");
         // Version 2 dropped it, and its keys can be made again.

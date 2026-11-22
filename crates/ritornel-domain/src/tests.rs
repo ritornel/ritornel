@@ -2790,3 +2790,42 @@ proptest! {
         prop_assert_eq!(shape(&at_once), shape(&in_parts));
     }
 }
+
+#[test]
+fn an_artist_named_with_a_symbol_keeps_its_row_from_normaliser_2_or_1() {
+    for (version, old) in [(2, "harbour lights"), (1, "harbour lights")] {
+        let mut world = World::default();
+        world.add(file("A/1.flac", 1).song("Lanterns", "Harbour Lights +", 200));
+        // The row the earlier normaliser keyed the name to.
+        world.library.artists = vec![(7, old.to_owned())];
+        world.next = 10;
+        world.library.artist_keys_by = Some(version);
+        let resolution = world.settle();
+        assert_eq!(resolution.artists[0].r, Ref::Row(7), "from {version}");
+        assert_eq!(resolution.artists[0].match_name, "harbour lights +");
+    }
+    // Two names normaliser 2 made one artist part, and the row stays with
+    // the spelling whose key did not change.
+    let mut world = World::default();
+    world.add(file("A/1.flac", 1).song("One", "Harbour Lights", 200));
+    world.add(file("B/2.flac", 2).song("Two", "Harbour Lights +", 200));
+    world.library.artists = vec![(7, "harbour lights".to_owned())];
+    world.next = 10;
+    world.library.artist_keys_by = Some(2);
+    let resolution = world.settle();
+    let found: Vec<(Ref, &str)> = resolution
+        .artists
+        .iter()
+        .map(|out| (out.r, out.match_name.as_str()))
+        .collect();
+    assert!(
+        found.contains(&(Ref::Row(7), "harbour lights")),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|(r, key)| *key == "harbour lights +" && *r != Ref::Row(7)),
+        "{found:?}"
+    );
+}
