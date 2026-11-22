@@ -153,16 +153,10 @@ impl LibraryStore {
     pub fn list_open(&self, kind: ListKind, query: &Query) -> Result<View, ListError> {
         let plan = open::Plan::of(kind, query)?;
         let now_ms = self.now_ms();
-        self.read(move |connection| {
-            // One read transaction, so the revision is the one the rows
-            // were read at.
-            connection.execute_batch("BEGIN")?;
-            let resolved = open::resolve(connection, &plan, now_ms);
-            // A read changes nothing, so ending it cannot lose anything.
-            let _ = connection.execute_batch("COMMIT");
-            resolved
-        })
-        .map_err(ListError::Engine)
+        // One read transaction, so the revision is the one the rows were
+        // read at.
+        self.read_snapshot(move |connection| open::resolve(connection, &plan, now_ms))
+            .map_err(ListError::Engine)
     }
 
     /// The rows of a list of `kind` with these keys, in the same order, as
@@ -172,12 +166,7 @@ impl LibraryStore {
             return Ok(Vec::new());
         }
         let ids = ids.to_vec();
-        self.read(move |connection| {
-            connection.execute_batch("BEGIN")?;
-            let rows = rows::read(connection, kind, &ids);
-            let _ = connection.execute_batch("COMMIT");
-            rows
-        })
+        self.read_snapshot(move |connection| rows::read(connection, kind, &ids))
     }
 
     /// The key a row of a list of `kind` is held by, from the ID a client
@@ -247,24 +236,14 @@ impl LibraryStore {
     /// versions of its group. `None` if the library has no such record.
     /// Its colour is the cover cache's to say, and is left `None`.
     pub fn album_page(&self, album: AlbumRef) -> Result<Option<AlbumPage>, Error> {
-        self.read(move |connection| {
-            connection.execute_batch("BEGIN")?;
-            let page = pages::album(connection, album);
-            let _ = connection.execute_batch("COMMIT");
-            page
-        })
+        self.read_snapshot(move |connection| pages::album(connection, album))
     }
 
     /// The artist with this ID, as the Artists list has them, and the
     /// library revision they were read at. `None` if the library has no
     /// such artist.
     pub fn artist_row(&self, artist: Id) -> Result<Option<(ArtistRow, u64)>, Error> {
-        self.read(move |connection| {
-            connection.execute_batch("BEGIN")?;
-            let found = pages::artist(connection, artist);
-            let _ = connection.execute_batch("COMMIT");
-            found
-        })
+        self.read_snapshot(move |connection| pages::artist(connection, artist))
     }
 }
 

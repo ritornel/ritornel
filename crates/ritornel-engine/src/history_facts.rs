@@ -538,13 +538,7 @@ impl LibraryStore {
         appearance: Id,
         today: Today,
     ) -> Result<Option<TrackHistory>, Error> {
-        self.read(move |connection| {
-            connection.execute_batch("BEGIN")?;
-            let read = read_track(connection, listener, appearance, today);
-            // A read changes nothing, so ending it cannot lose anything.
-            let _ = connection.execute_batch("COMMIT");
-            read
-        })
+        self.read_snapshot(move |connection| read_track(connection, listener, appearance, today))
     }
 }
 
