@@ -302,7 +302,7 @@ fn respond(state: &Mutex<State>, params: HashMap<String, String>) -> (u16, Value
                     "artist": {"corrected": "0", "#text": artist},
                     "album": {"corrected": "0", "#text": scrobble.album},
                     "track": {"corrected": "0", "#text": title},
-                    "albumArtist": {"corrected": "0", "#text": ""},
+                    "albumArtist": {"corrected": "0", "#text": get("albumArtist").unwrap_or_default()},
                     "ignoredMessage": {"code": "0", "#text": ""},
                     "timestamp": state.reply_timestamps.get(&i).map_or(at, u64::to_string),
                 }));

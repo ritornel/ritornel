@@ -201,8 +201,16 @@ impl Lastfm {
             let agrees = |name: &scrobl::model::Corrected, requested: &str| {
                 name.corrected() || name.name() == requested
             };
+            let optional_agrees = |reply: Option<&scrobl::model::Corrected>,
+                                   requested: Option<&str>| {
+                reply
+                    .zip(requested)
+                    .is_none_or(|(name, sent)| name.name().is_empty() || agrees(name, sent))
+            };
             if !agrees(outcome.artist(), &scrobble.artist)
                 || !agrees(outcome.track(), &scrobble.title)
+                || !optional_agrees(outcome.album(), scrobble.album.as_deref())
+                || !optional_agrees(outcome.album_artist(), scrobble.album_artist.as_deref())
             {
                 sent.push(Outcome::Unknown);
                 continue;

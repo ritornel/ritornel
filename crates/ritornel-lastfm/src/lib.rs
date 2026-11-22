@@ -341,6 +341,42 @@ mod tests {
     }
 
     #[test]
+    fn album_details_distinguish_two_plays_of_the_same_song() {
+        let fake = FakeLastfm::start("someone", Vec::new());
+        let lastfm = lastfm(&fake);
+        let play = ToScrobble {
+            artist: "Invented Artist".into(),
+            title: "Invented Song".into(),
+            album: Some("First Record".into()),
+            album_artist: Some("First Ensemble".into()),
+            track_number: None,
+            duration_ms: None,
+            timestamp_s: 1_800_000_000,
+        };
+        for second in [
+            ToScrobble {
+                album: Some("Second Record".into()),
+                ..play.clone()
+            },
+            ToScrobble {
+                album_artist: Some("Second Ensemble".into()),
+                ..play.clone()
+            },
+        ] {
+            let second = ToScrobble {
+                timestamp_s: play.timestamp_s + 300,
+                ..second
+            };
+            fake.change_reply_timestamp(0, second.timestamp_s);
+            fake.change_reply_timestamp(1, play.timestamp_s);
+            let sent = lastfm
+                .scrobble(&SessionKey::new(SESSION_KEY), &[play.clone(), second])
+                .unwrap();
+            assert_eq!(sent, [Outcome::Unknown, Outcome::Unknown]);
+        }
+    }
+
+    #[test]
     fn a_batch_rejected_before_sending_is_not_retried() {
         let fake = FakeLastfm::start("someone", Vec::new());
         let result = lastfm(&fake).scrobble(&SessionKey::new(SESSION_KEY), &[]);
