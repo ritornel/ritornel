@@ -707,16 +707,23 @@ fn our_own_scrobble_coming_back_joins_its_listen_and_counts_once() {
 }
 
 #[test]
-fn dating_a_listen_uses_the_whole_clock_difference() {
+fn hub_age_uses_the_whole_monotonic_clock_difference() {
     let mut heard = listen(1, 1, 1);
     heard.started_mono_ms = -1;
     heard.received.sent_mono_ms = Some(i64::MAX);
     heard.received.received_at_ms = i64::MAX;
-    assert_eq!(date_listen(&heard).0, -1);
+    let (at, basis, _) = date_listen(&heard);
+    assert_eq!((at, basis), (-1, ClockBasis::HubAge));
+}
+
+#[test]
+fn wall_clock_dating_applies_the_largest_negative_skew() {
+    let mut heard = listen(1, 1, 1);
     heard.received.sent_boot = None;
     heard.started_at_ms = -1;
     heard.received.clock_skew_ms = Some(i64::MIN);
-    assert_eq!(date_listen(&heard).0, i64::MAX);
+    let (at, basis, _) = date_listen(&heard);
+    assert_eq!((at, basis), (i64::MAX, ClockBasis::ServerWall));
 }
 
 #[test]

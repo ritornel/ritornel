@@ -981,7 +981,9 @@ pub(super) fn key_of(
 
 enum Filed {
     Name(String),
+    /// A song without an album sorts after all named albums.
     Loose,
+    /// The row was removed after the view opened.
     Gone,
 }
 
@@ -1095,28 +1097,26 @@ pub(super) fn locate_prefix(
     let mut found = None;
     while low < high {
         let middle = low + (high - low) / 2;
-        // Look past a row that disappeared since the view opened. A loose
-        // song still exists, and follows every album in this order.
-        let mut at = middle;
-        loop {
-            let Some(key) = resolved.ids.get(at).filter(|_| at < high) else {
-                high = middle;
-                break;
-            };
-            match filed_under(connection, resolved, *key)? {
-                Filed::Gone => {
-                    at += 1;
-                    continue;
+        let mut next_name = None;
+        for (at, &key) in resolved.ids.iter().enumerate().take(high).skip(middle) {
+            match filed_under(connection, resolved, key)? {
+                Filed::Gone => {}
+                Filed::Name(name) => {
+                    next_name = Some((at, name));
+                    break;
                 }
-                Filed::Loose => high = middle,
-                Filed::Name(filed) if by_name(&filed, &target) == Ordering::Less => low = at + 1,
-                Filed::Name(_) => {
-                    found = Some(at as u64);
-                    high = middle;
-                }
+                Filed::Loose => break,
             }
-            break;
         }
+
+        if let Some((at, name)) = next_name {
+            if by_name(&name, &target) == Ordering::Less {
+                low = at + 1;
+                continue;
+            }
+            found = Some(at as u64);
+        }
+        high = middle;
     }
     Ok(found)
 }
