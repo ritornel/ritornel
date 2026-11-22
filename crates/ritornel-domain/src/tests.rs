@@ -1385,6 +1385,61 @@ fn replaced_audio_keeps_its_item_only_if_it_lands_on_the_same_recording() {
 }
 
 #[test]
+fn a_rerip_can_gain_or_lose_a_disc_marker_in_its_album_title() {
+    for (before, after) in [
+        ("Long Field - Disc 2", "Long Field"),
+        ("Long Field", "Long Field - Disc 2"),
+    ] {
+        let mut world = World::default();
+        let song = |album, seconds| {
+            file("A/1.flac", 1)
+                .song("Glass Pier", "Ninefold", seconds)
+                .on(album, None, 1)
+        };
+        world.add(song(before, 200));
+        world.settle();
+        let replacement = Replacement {
+            index: 0,
+            audio: None,
+            facts: song(after, 201).facts,
+        };
+        assert_eq!(
+            judge_replacements(&world.library, &[replacement], &world.policy),
+            [true]
+        );
+    }
+}
+
+#[test]
+fn a_contradictory_disc_on_one_rerip_does_not_decide_another() {
+    let mut world = World::default();
+    let file_at = |index, title, album, disc, seconds| Replacement {
+        index,
+        audio: None,
+        facts: file("A/1.flac", 0)
+            .song(title, "Ninefold", seconds)
+            .on(album, disc, 1)
+            .facts,
+    };
+    for (path, audio, title) in [("A/1.flac", 1, "Glass Pier"), ("B/1.flac", 2, "Tin Field")] {
+        world.add(
+            file(path, audio)
+                .song(title, "Ninefold", 200)
+                .on("Long Field", None, 1),
+        );
+    }
+    world.settle();
+    let probes = [
+        file_at(0, "Glass Pier", "Long Field - Disc 2", None, 201),
+        file_at(1, "Tin Field", "Long Field - Disc 2", Some(3), 201),
+    ];
+    assert_eq!(
+        judge_replacements(&world.library, &probes, &world.policy),
+        [true, false]
+    );
+}
+
+#[test]
 fn a_retag_moves_the_appearance_and_keeps_the_recording_made_for_the_file() {
     let mut world = World::default();
     let id = world.add(file("A/1.flac", 1).song("Glass Pier", "Ninefold", 200).on(

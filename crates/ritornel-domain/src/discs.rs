@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::extract::parse_date;
+use crate::extract::{Facts, parse_date};
 use crate::library::Library;
 use crate::normalize::{core, normalize};
 use crate::resolve::Policy;
@@ -163,41 +163,57 @@ fn disc_of_folder(name: &str) -> Option<i64> {
 /// The library with the disc numbers the switches imply, or `None` when
 /// neither is on.
 pub(crate) fn apply(library: &Library, policy: &Policy) -> Option<Library> {
+    apply_with_probes(library, policy, &mut [])
+}
+
+/// Return a library with implied discs, or `None` when both disc rules are off.
+/// Apply the title rule to each replacement in place. Replacements have no
+/// release assignment or folder position of their own.
+pub(crate) fn apply_with_probes(
+    library: &Library,
+    policy: &Policy,
+    probes: &mut [Facts],
+) -> Option<Library> {
     if !policy.disc_from_album_title && !policy.discs_from_folders {
         return None;
     }
-    let mut library = library.clone();
+    let mut implied = library.clone();
     if policy.disc_from_album_title {
-        // A title one file's disc tag contradicts is a title for every file
-        // that carries it, or the discs of one set would part.
-        let contradicted: BTreeSet<String> = library
+        let conflicts = |claim: Option<i64>, disc| claim.is_some_and(|n| n != 1 && n != disc);
+        // A conflicting disc tag anywhere in the library keeps the album
+        // title intact for every file that shares it.
+        let contradicted: BTreeSet<&str> = library
             .items
             .iter()
             .filter_map(|item| {
                 let album = item.facts.album.as_deref()?;
                 let (_, disc) = disc_in_title(album)?;
-                let claimed = item.facts.disc?;
-                (claimed != 1 && claimed != disc).then(|| album.to_owned())
+                conflicts(item.facts.disc, disc).then_some(album)
             })
             .collect();
-        for item in &mut library.items {
-            let facts = &mut item.facts;
-            let Some(album) = facts.album.as_deref() else {
-                continue;
-            };
-            if contradicted.contains(album) {
-                continue;
-            }
-            if let Some((title, disc)) = disc_in_title(album) {
+        let apply_title = |facts: &mut Facts| {
+            if let Some(album) = facts.album.as_deref()
+                && !contradicted.contains(album)
+                && let Some((title, disc)) = disc_in_title(album)
+                && !conflicts(facts.disc, disc)
+            {
                 facts.album = Some(title);
                 facts.disc = Some(disc);
             }
+        };
+        for item in &mut implied.items {
+            apply_title(&mut item.facts);
+        }
+        // A replacement's disc tag affects only its own title. It cannot
+        // veto a different replacement being judged in the same scan.
+        for facts in probes {
+            apply_title(facts);
         }
     }
     if policy.discs_from_folders {
-        folder_discs(&mut library);
+        folder_discs(&mut implied);
     }
-    Some(library)
+    Some(implied)
 }
 
 /// One folder of an album: its items, the track numbers they take and the
