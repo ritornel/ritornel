@@ -186,7 +186,7 @@ pub(crate) fn apply_with_probes(
             let claimed = facts.disc?;
             (claimed != 1 && claimed != disc).then(|| album.to_owned())
         };
-        let mut contradicted: BTreeSet<String> = library
+        let contradicted: BTreeSet<String> = library
             .items
             .iter()
             .filter_map(|item| contradiction(&item.facts))
@@ -203,9 +203,10 @@ pub(crate) fn apply_with_probes(
         for item in &mut library.items {
             apply_title(&mut item.facts, &contradicted);
         }
-        contradicted.extend(probes.iter().filter_map(contradiction));
         for facts in probes {
-            apply_title(facts, &contradicted);
+            if contradiction(facts).is_none() {
+                apply_title(facts, &contradicted);
+            }
         }
     }
     if policy.discs_from_folders {
