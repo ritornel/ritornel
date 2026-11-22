@@ -392,7 +392,7 @@ SELECT count(*),
        (SELECT local_date FROM play_event
         WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0
           AND event_at_utc_ms IS NOT NULL
-        ORDER BY event_at_utc_ms DESC LIMIT 1)
+        ORDER BY event_at_utc_ms DESC, id DESC LIMIT 1)
 FROM play_event
 WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0";
 

@@ -349,8 +349,10 @@ fn history_of(
 }
 
 /// The years the listener's whole history runs over: from the local year
-/// of their first dated play to this year, or to a later one a play was
-/// heard in. The first play in time, which began at `began_ms`, is not
+/// of their first dated play to this year, or to the next, where a play
+/// already heard in a zone ahead of the server's has reached it. A play
+/// dated after now, by a clock that was wrong, does not stretch it. The
+/// first play in time, which began at `began_ms`, is not
 /// always the first by local date: one heard just after midnight on New
 /// Year's Day in a zone far ahead can come before one heard late on New
 /// Year's Eve in a zone far behind. So each end is the earliest or latest
@@ -371,15 +373,16 @@ fn span(
                (SELECT max(pe.local_date) FROM play_event pe,
                   (SELECT event_at_utc_ms AS at FROM play_event
                    WHERE listener_id = ?1 AND counts = 1 AND excluded = 0
-                     AND local_date IS NOT NULL AND event_at_utc_ms IS NOT NULL
+                     AND local_date IS NOT NULL AND event_at_utc_ms <= ?4
                    ORDER BY event_at_utc_ms DESC LIMIT 1) latest
                 WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
                   AND pe.local_date IS NOT NULL
                   AND pe.event_at_utc_ms BETWEEN latest.at - ?3 AND latest.at)",
         )?
-        .query_row(params![listener, began_ms, ZONES_APART_MS], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        .query_row(
+            params![listener, began_ms, ZONES_APART_MS, today.now_ms],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
     Ok(YearSpan {
         from: first.map_or(today.year, year_of).min(today.year),
         to: last.map_or(today.year, year_of).max(today.year),
@@ -396,21 +399,25 @@ fn played_most(connection: &Connection, facts: &Facts) -> Result<Vec<RecordPlaye
         .map(|(&group, record)| (group, record))
         .collect();
     ranked.sort_by(|a, b| b.1.plays.cmp(&a.1.plays).then(a.0.cmp(&b.0)));
-    let keys: Vec<i64> = ranked.iter().map(|(group, _)| *group).collect();
-    let tiles = crate::list::album_tiles(connection, &keys)?;
-    Ok(ranked
-        .into_iter()
-        .zip(tiles)
-        .filter_map(|((_, record), row)| match row {
-            Row::Album(tile) => Some(RecordPlayed {
-                tile,
-                plays: record.plays,
-                peak_year: peak(&record.years).map(|(year, _)| year),
-            }),
-            _ => None,
-        })
-        .take(RECORDS)
-        .collect())
+    // Read six at a time: almost always the first six are all there.
+    let mut records = Vec::with_capacity(RECORDS);
+    for chunk in ranked.chunks(RECORDS) {
+        let keys: Vec<i64> = chunk.iter().map(|(group, _)| *group).collect();
+        let tiles = crate::list::album_tiles(connection, &keys)?;
+        for ((_, record), row) in chunk.iter().zip(tiles) {
+            if let Row::Album(tile) = row {
+                records.push(RecordPlayed {
+                    tile,
+                    plays: record.plays,
+                    peak_year: peak(&record.years).map(|(year, _)| year),
+                });
+            }
+            if records.len() == RECORDS {
+                return Ok(records);
+            }
+        }
+    }
+    Ok(records)
 }
 
 /// An artist's plays: of every recording whose credit names them, or the

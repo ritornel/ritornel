@@ -165,16 +165,7 @@ fn stream(connection: &Connection, listener: Id, today: Today) -> Result<History
             library_revision,
         });
     };
-    // Up to this month, or a later one a play was heard in: in a zone ahead
-    // of the server's, the next month can begin before the server's does.
-    let latest = played
-        .keys()
-        .map(|&(_, month)| month)
-        .max()
-        .unwrap_or(start);
-    let end = (i64::from(today.year) * 12 + i64::from(today.month) - 1)
-        .max(latest)
-        .max(start);
+    let end = (i64::from(today.year) * 12 + i64::from(today.month) - 1).max(start);
     let months = usize::try_from(end - start + 1).unwrap_or(0);
     let at = |month: i64| {
         usize::try_from(month - start)
@@ -244,7 +235,7 @@ fn stream(connection: &Connection, listener: Id, today: Today) -> Result<History
 
 impl LibraryStore {
     /// `listener`'s whole history as the History tab draws it, up to the
-    /// month of `today`, or of a later play.
+    /// month of `today`.
     pub fn history_stream(&self, listener: Id, today: Today) -> Result<HistoryStream, Error> {
         self.read_snapshot(move |connection| stream(connection, listener, today))
     }
