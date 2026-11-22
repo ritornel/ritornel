@@ -17,7 +17,8 @@ use ritornel_contract::{Fact, FactKind, TrackHistory};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::history_pages::{
-    ALBUM_PLAYS, MONTHS, Said, Today, YEAR_MS, counted, grouped, listener_key, month, peak, year_of,
+    ALBUM_PLAYS, MONTHS, Said, Today, YEAR_MS, counted, grouped, listener_key, month_of, peak,
+    year_of,
 };
 use crate::{Error, Id, LibraryStore};
 
@@ -35,9 +36,9 @@ const MOST_PLAYS: u64 = 10;
 pub(crate) struct Song {
     /// Its plays, wherever it was heard.
     pub(crate) plays: u64,
-    /// The local date of the last, YYYYMMDD: of the play with the latest
-    /// instant, and `None` if that play has no local date.
-    pub(crate) last: Option<i64>,
+    /// The play of it with the latest instant: that instant, and its local
+    /// date, YYYYMMDD, where it has one.
+    pub(crate) last: Option<(i64, Option<i64>)>,
     /// Whether the listener gave it five stars.
     pub(crate) five_stars: bool,
 }
@@ -179,11 +180,11 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
         } else {
             ""
         };
-        let last = song.last.map(|date| {
-            if date == today.date {
+        let last = song.last.map(|last| {
+            if last.1 == Some(today.date) {
                 "The last time was earlier today.".to_owned()
             } else {
-                format!("The last time was in {}.", month(date))
+                format!("The last time was in {}.", month_of(last))
             }
         });
         let more = last
@@ -357,23 +358,22 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
     }
 
     // Unplayed for over a year before today, whatever was played today. A
-    // later play with no local date may be from before today or not, so
-    // nothing is said.
-    if let Some(&(at, last, _)) = dated
+    // play with no local date may have been today, and is counted as before
+    // it: if it is the last, it was lately, and nothing is said. Of plays
+    // at the same instant, one with a local date is taken.
+    if let Some(last) = record
+        .plays
         .iter()
-        .filter(|&&(_, date, _)| date < today.date)
-        .max_by_key(|(at, ..)| *at)
-        && at < today.now_ms - YEAR_MS
-        && !record
-            .plays
-            .iter()
-            .any(|heard| heard.date.is_none() && heard.at_ms.is_some_and(|later| later > at))
+        .filter(|heard| heard.date.is_none_or(|date| date < today.date))
+        .filter_map(|heard| Some((heard.at_ms?, heard.date)))
+        .max()
+        && last.0 < today.now_ms - YEAR_MS
     {
         out.push(fact(
             FactKind::NotSince,
             Said::default()
                 .plain("Before today, you had not played it ")
-                .strong(&format!("since {}", month(last)))
+                .strong(&format!("since {}", month_of(last)))
                 .plain("."),
             None,
         ));
@@ -392,16 +392,18 @@ LEFT JOIN release heard ON heard.id = cta.release_id
 LEFT JOIN release rel ON rel.id = heard.canonical_id
 WHERE ta.public_id = ?1";
 
-/// A song's plays, wherever heard, and the local date of the last: of the
-/// play with the latest instant, which is not always the one with the
-/// latest local date when plays were heard in zones far apart.
+/// A song's plays, wherever heard, and the last of them: the play with the
+/// latest instant, which is not always the one with the latest local date
+/// when plays were heard in zones far apart, and one with a local date of
+/// those at the same instant. Its instant and its local date.
 const SONG_PLAYS: &str = "
-SELECT count(*),
-       (SELECT local_date FROM play_event
-        WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0
-          AND event_at_utc_ms IS NOT NULL
-        ORDER BY event_at_utc_ms DESC, id DESC LIMIT 1)
+SELECT count(*), last.event_at_utc_ms, last.local_date
 FROM play_event
+LEFT JOIN (SELECT event_at_utc_ms, local_date FROM play_event
+           WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0
+             AND event_at_utc_ms IS NOT NULL
+           ORDER BY event_at_utc_ms DESC, local_date IS NULL, id DESC LIMIT 1) last
+  ON true
 WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0";
 
 /// The songs of a record's versions, each with its title on the record and
@@ -503,10 +505,10 @@ fn read_track(
     let Some((recording, release, group)) = found else {
         return Ok(None);
     };
-    let (plays, last): (i64, Option<i64>) = connection
+    let (plays, last_at, last_date): (i64, Option<i64>, Option<i64>) = connection
         .prepare_cached(SONG_PLAYS)?
         .query_row(params![listener, recording], |row| {
-            Ok((row.get(0)?, row.get(1)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
     let five_stars = crate::ratings::said(connection, &[recording])?
         .get(&recording)
@@ -538,7 +540,7 @@ fn read_track(
     let gathered = Gathered {
         song: Song {
             plays: count(plays),
-            last,
+            last: last_at.map(|at| (at, last_date)),
             five_stars,
         },
         record,

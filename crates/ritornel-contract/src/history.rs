@@ -349,7 +349,8 @@ pub struct RecordPlayed {
 pub struct HistoryOf {
     /// The plays, dated or not.
     pub plays: u64,
-    /// The local date of the first dated play, as `YYYY-MM-DD`.
+    /// The local date of the first play, as `YYYY-MM-DD`. Left out when the
+    /// first play has no local date, though a later one has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub first_played: Option<String>,

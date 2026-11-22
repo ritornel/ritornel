@@ -68,12 +68,11 @@ pub struct Today {
 pub(crate) struct Facts {
     /// The plays, dated or not.
     pub(crate) plays: u64,
-    /// The first dated play: its instant and its local date, YYYYMMDD.
-    pub(crate) first: Option<(i64, i64)>,
+    /// The first play in time, dated or not: its instant and its local
+    /// date, YYYYMMDD, where it has one.
+    pub(crate) first: Option<(i64, Option<i64>)>,
     /// The last.
-    pub(crate) last: Option<(i64, i64)>,
-    /// The instant of the last play that has one, dated or not.
-    pub(crate) latest_ms: Option<i64>,
+    pub(crate) last: Option<(i64, Option<i64>)>,
     /// The plays in the last year.
     pub(crate) last_year: u64,
     /// The dated plays by year.
@@ -100,23 +99,25 @@ impl Facts {
         if let Some(record) = record {
             self.records.entry(record).or_default().plays += 1;
         }
-        if let Some(at) = at_ms {
-            if at > today.now_ms - YEAR_MS && at <= today.now_ms {
-                self.last_year += 1;
-            }
-            if self.latest_ms.is_none_or(|latest| at > latest) {
-                self.latest_ms = Some(at);
-            }
-        }
-        let (Some(at), Some(date)) = (at_ms, date) else {
+        let Some(at) = at_ms else {
             return;
         };
-        if self.first.is_none_or(|(first, _)| at < first) {
+        if at > today.now_ms - YEAR_MS && at <= today.now_ms {
+            self.last_year += 1;
+        }
+        // Of plays at the same instant, one with a local date is taken.
+        if self
+            .first
+            .is_none_or(|(first, day)| (at, date.is_none(), date) < (first, day.is_none(), day))
+        {
             self.first = Some((at, date));
         }
-        if self.last.is_none_or(|(last, _)| at > last) {
+        if self.last.is_none_or(|last| (at, date) > last) {
             self.last = Some((at, date));
         }
+        let Some(date) = date else {
+            return;
+        };
         let year = year_of(date);
         *self.years.entry(year).or_default() += 1;
         if let Some(record) = record {
@@ -147,13 +148,26 @@ pub(crate) fn peak(years: &BTreeMap<i32, u64>) -> Option<(i32, u64)> {
 }
 
 /// "June 2009", from a local date.
-pub(crate) fn month(date: i64) -> String {
+fn month(date: i64) -> String {
     let name = usize::try_from(date / 100 % 100 - 1)
         .ok()
         .and_then(|index| MONTHS.get(index))
         .copied()
         .unwrap_or("");
     format!("{name} {}", date / 10_000)
+}
+
+/// The month a play was heard in, as [`month`] says it: that of its local
+/// date, or where it has none, that of its instant in UTC. That is a day
+/// out at most, and only at a month's edge.
+pub(crate) fn month_of((at_ms, date): (i64, Option<i64>)) -> String {
+    month(date.unwrap_or_else(|| {
+        let day = jiff::Timestamp::from_millisecond(at_ms)
+            .unwrap_or(jiff::Timestamp::MAX)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .date();
+        i64::from(day.year()) * 10_000 + i64::from(day.month()) * 100 + i64::from(day.day())
+    }))
 }
 
 /// A count as it is read, in thousands: "1,234".
@@ -206,16 +220,16 @@ impl Said {
 /// last year, how much; otherwise when last. `began_ms` is when the
 /// listener's history begins. Nothing at all with no plays.
 ///
-/// When a play with no local date came after the last dated one, the month
-/// of the last play is not known, and is not said.
+/// The first and last months are those of the first and last plays in
+/// time, whether they have a local date or not ([`month_of`]).
 ///
 /// What waits on sessions is left out: "played start to finish".
 pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Vec<Phrase> {
     if facts.plays == 0 {
         return Vec::new();
     }
-    let (Some((first_at, first)), Some((last_at, last))) = (facts.first, facts.last) else {
-        // Plays with no day: how many is all there is to say.
+    let (Some(first), Some(last)) = (facts.first, facts.last) else {
+        // Plays with no instant: how many is all there is to say.
         return Said::default()
             .plain("Played ")
             .strong(&counted(facts.plays, "time", "times"))
@@ -223,21 +237,16 @@ pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Ve
             .0;
     };
     let mut said = Said::default().plain("With you since ");
-    if began_ms.is_some_and(|began| first_at - began < FIRST_WEEKS_MS) {
+    if began_ms.is_some_and(|began| first.0 - began < FIRST_WEEKS_MS) {
         said = said.plain("your first weeks, ");
     }
-    said = said.strong(&month(first));
-    let latest = facts.latest_ms.unwrap_or(last_at);
-    let last = (latest == last_at).then_some(last);
-    if latest < today.now_ms - LONG_AGO_MS {
-        return match last {
-            Some(last) => said
-                .plain(". Not played since ")
-                .strong(&month(last))
-                .plain("."),
-            None => said.plain(". Not played for over two years."),
-        }
-        .0;
+    said = said.strong(&month_of(first));
+    if last.0 < today.now_ms - LONG_AGO_MS {
+        return said
+            .plain(". Not played since ")
+            .strong(&month_of(last))
+            .plain(".")
+            .0;
     }
     let dated: u64 = facts.years.values().sum();
     // Never a year the undated plays might have outdone.
@@ -262,14 +271,10 @@ pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Ve
             .plain(" in the last year.")
             .0;
     }
-    match last {
-        Some(last) => said
-            .plain(". Last played in ")
-            .strong(&month(last))
-            .plain("."),
-        None => said.plain("."),
-    }
-    .0
+    said.plain(". Last played in ")
+        .strong(&month_of(last))
+        .plain(".")
+        .0
 }
 
 /// A local date as `YYYY-MM-DD`.
@@ -323,14 +328,12 @@ fn history_of(
         .prepare_cached(
             "SELECT event_at_utc_ms FROM play_event
              WHERE listener_id = ?1 AND event_at_utc_ms IS NOT NULL
-               AND counts = 1 AND excluded = 0 AND local_date IS NOT NULL
+               AND counts = 1 AND excluded = 0
              ORDER BY event_at_utc_ms LIMIT 1",
         )?
         .query_row([listener], |row| row.get(0))
         .optional()?;
-    let span = began
-        .map(|at| span(connection, listener, at, today))
-        .transpose()?;
+    let span = span(connection, listener, today)?;
     let records = if records {
         played_most(connection, &facts)?
     } else {
@@ -338,11 +341,8 @@ fn history_of(
     };
     Ok(HistoryOf {
         plays: facts.plays,
-        first_played: facts.first.map(|(_, day)| date(day)),
-        last_played: facts
-            .last
-            .filter(|&(at, _)| facts.latest_ms.is_none_or(|latest| latest <= at))
-            .map(|(_, day)| date(day)),
+        first_played: facts.first.and_then(|(_, day)| day).map(date),
+        last_played: facts.last.and_then(|(_, day)| day).map(date),
         last_year: facts.last_year,
         years: facts
             .years
@@ -356,45 +356,43 @@ fn history_of(
     })
 }
 
-/// The years the listener's whole history runs over: from the local year
-/// of their first dated play to this year, or to the next, where a play
-/// already heard in a zone ahead of the server's has reached it. A play
-/// dated after now, by a clock that was wrong, does not stretch it. The
-/// first play in time, which began at `began_ms`, is not
-/// always the first by local date: one heard just after midnight on New
+/// The years the listener's whole history runs over, if any play has a
+/// local date: from the local year of their first dated play to this year,
+/// or to the next, where a play already heard in a zone ahead of the
+/// server's has reached it. A play dated after now, by a clock that was
+/// wrong, does not stretch it. The first dated play in time is not always
+/// the first by local date: one heard just after midnight on New
 /// Year's Day in a zone far ahead can come before one heard late on New
 /// Year's Eve in a zone far behind. So each end is the earliest or latest
 /// local date among the plays near it in time.
-fn span(
-    connection: &Connection,
-    listener: i64,
-    began_ms: i64,
-    today: Today,
-) -> Result<YearSpan, Error> {
+fn span(connection: &Connection, listener: i64, today: Today) -> Result<Option<YearSpan>, Error> {
     let (first, last): (Option<i64>, Option<i64>) = connection
         .prepare_cached(
             "SELECT
-               (SELECT min(local_date) FROM play_event
-                WHERE listener_id = ?1 AND counts = 1 AND excluded = 0
-                  AND local_date IS NOT NULL
-                  AND event_at_utc_ms BETWEEN ?2 AND ?2 + ?3),
+               (SELECT min(pe.local_date) FROM play_event pe,
+                  (SELECT event_at_utc_ms AS at FROM play_event
+                   WHERE listener_id = ?1 AND counts = 1 AND excluded = 0
+                     AND local_date IS NOT NULL AND event_at_utc_ms IS NOT NULL
+                   ORDER BY event_at_utc_ms LIMIT 1) began
+                WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
+                  AND pe.local_date IS NOT NULL
+                  AND pe.event_at_utc_ms BETWEEN began.at AND began.at + ?2),
                (SELECT max(pe.local_date) FROM play_event pe,
                   (SELECT event_at_utc_ms AS at FROM play_event
                    WHERE listener_id = ?1 AND counts = 1 AND excluded = 0
-                     AND local_date IS NOT NULL AND event_at_utc_ms <= ?4
+                     AND local_date IS NOT NULL AND event_at_utc_ms <= ?3
                    ORDER BY event_at_utc_ms DESC LIMIT 1) latest
                 WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
                   AND pe.local_date IS NOT NULL
-                  AND pe.event_at_utc_ms BETWEEN latest.at - ?3 AND latest.at)",
+                  AND pe.event_at_utc_ms BETWEEN latest.at - ?2 AND latest.at)",
         )?
-        .query_row(
-            params![listener, began_ms, ZONES_APART_MS, today.now_ms],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-    Ok(YearSpan {
-        from: first.map_or(today.year, year_of).min(today.year),
+        .query_row(params![listener, ZONES_APART_MS, today.now_ms], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    Ok(first.map(|first| YearSpan {
+        from: year_of(first).min(today.year),
         to: last.map_or(today.year, year_of).max(today.year),
-    })
+    }))
 }
 
 /// The records played most, most first, each with its plays and the year
