@@ -180,6 +180,14 @@ impl Core {
 
     /// Sends a job, whole, to every session subscribed to the `jobs` topic.
     pub(crate) fn publish_job(&self, changed: &ritornel_engine::Job) {
+        // Held while it is sent, so that a copy that is not the end is
+        // either sent before the end or not at all.
+        let mut ended = lock(&self.ended_jobs);
+        if changed.state.ended() {
+            ended.insert(changed.public_id);
+        } else if ended.contains(&changed.public_id) {
+            return;
+        }
         self.publish(&Event::Jobs(Box::new(JobsEvent { job: job(changed) })));
     }
 
