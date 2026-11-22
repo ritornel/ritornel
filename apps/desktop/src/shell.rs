@@ -202,6 +202,16 @@ impl Shown {
         }
     }
 
+    /// Tells the page whether it is the one on screen or behind another,
+    /// kept for Back.
+    fn seen(&self, seen: bool, cx: &mut gpui::App) {
+        match self {
+            Self::Album(album) => album.update(cx, |album, cx| album.seen(seen, cx)),
+            Self::History(history) => history.update(cx, |history, cx| history.seen(seen, cx)),
+            _ => {}
+        }
+    }
+
     /// Sets how its parts show, for a page with a banner.
     fn look(&self, look: moves::Look, cx: &mut gpui::App) {
         match self {
@@ -456,6 +466,8 @@ impl Shell {
         }
         let still = crate::platform::reduce_motion();
         let now = self.shown();
+        left.seen(false, cx);
+        now.seen(true, cx);
         let hold = left.bannered() && now.bannered() && left_top < 8. && now.top(cx) < 8. && !still;
         let entrance = matches!(now, Shown::Artist(_)) && !hold;
         if let Some((gone, _)) = self.leaving.take() {

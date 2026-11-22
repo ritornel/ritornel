@@ -102,6 +102,8 @@ pub(crate) struct HistoryPage {
     read: Option<Read>,
     failed: bool,
     revision: u64,
+    /// Whether it is behind another page, and whether plays came meanwhile.
+    freshness: crate::stage::Freshness,
     reading: Option<Task<()>>,
     /// Waiting for plays to settle before reading again.
     quiet: Option<Task<()>>,
@@ -137,11 +139,14 @@ impl HistoryPage {
             |page: &mut Self, _, event: &LinkEvent, cx| match event {
                 LinkEvent::Connected(net) => {
                     page.net = Some(Arc::clone(net));
-                    page.load(cx);
+                    if page.freshness.heard(false).is_some() {
+                        page.load(cx);
+                    }
                 }
                 LinkEvent::Server(Event::Library(event))
                     if event.library_revision > page.revision
-                        && event.changed.contains(&LibraryChange::Stats) =>
+                        && event.changed.contains(&LibraryChange::Stats)
+                        && page.freshness.heard(true).is_some() =>
                 {
                     page.quiet = Some(cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(SETTLE).await;
@@ -156,6 +161,7 @@ impl HistoryPage {
             read: None,
             failed: false,
             revision: 0,
+            freshness: crate::stage::Freshness::default(),
             reading: None,
             quiet: None,
             drawn: None,
@@ -170,6 +176,14 @@ impl HistoryPage {
         };
         page.load(cx);
         page
+    }
+
+    /// The page shown again, or put behind another: plays that came while
+    /// it was behind are read.
+    pub(crate) fn seen(&mut self, seen: bool, cx: &mut Context<Self>) {
+        if self.freshness.shown(seen).is_some() {
+            self.load(cx);
+        }
     }
 
     /// Reads the picture and this day in other years.
