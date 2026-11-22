@@ -544,8 +544,9 @@ pub(crate) struct Plan {
     /// Appearances in the search index that no file is bound to any more.
     unsearchable: Vec<i64>,
     /// Artist rows no file credits now, keyed again after the normaliser
-    /// changed, so that their key is today's when their files return.
-    rekeyed: Vec<(i64, String)>,
+    /// changed, so that their key is today's when their files return, or
+    /// given none.
+    rekeyed: Vec<(i64, Option<String>)>,
     versions: bool,
     /// The version of the policy that made the resolution, which its
     /// decisions record.
@@ -699,12 +700,13 @@ impl Plan {
             .copied()
             .collect();
         unsearchable.sort_unstable();
-        // After the normaliser changed, a row the resolution does not reach
-        // is keyed again from its name, unless that name is the owner's
-        // edit, which its files never gave, or the new key is an artist's
-        // the resolution has: then the change joined the two, and the row
-        // would take that artist's place at the next resolution.
-        let mut rekeyed = Vec::new();
+        // After the normaliser changed, a row with no ID that the
+        // resolution does not reach is keyed again from its name, so its
+        // files find it when they return. It is given no key, and is never
+        // found again, when that is not safe: its name is the owner's edit,
+        // which its files never gave, or the key is one an artist of the
+        // resolution holds, or another such row would take it too.
+        let mut rekeyed: Vec<(i64, Option<String>)> = Vec::new();
         if library.artist_keys_by.is_some() {
             let reached: HashSet<i64> = resolution
                 .artists
@@ -716,42 +718,38 @@ impl Plan {
                 .iter()
                 .map(|out| out.match_name.as_str())
                 .collect();
-            for (row, stored) in &library.artists {
-                let edited = library
-                    .edits
-                    .contains_key(&(Kind::Artist, *row, "name".to_owned()));
-                let name = shown
-                    .artists
-                    .get(row)
-                    .and_then(|(name, _, _)| name.as_deref());
-                if let (false, false, Some(name)) = (reached.contains(row), edited, name) {
-                    let key = normalize(name);
-                    if key != *stored && !held.contains(key.as_str()) {
-                        rekeyed.push((*row, key));
-                    }
-                }
-            }
-            // Two rows no file credits that would share a key, or one that
-            // would take a key another row holds, keep theirs: which
-            // artist a returning file is cannot be told.
-            let moving: HashSet<i64> = rekeyed.iter().map(|(row, _)| *row).collect();
-            let mut taken: HashMap<&str, usize> = HashMap::new();
-            for (_, key) in library
+            let left: Vec<(i64, &String, Option<String>)> = library
                 .artists
                 .iter()
-                .filter(|(row, _)| !moving.contains(row))
-            {
-                *taken.entry(key.as_str()).or_default() += 1;
-            }
-            for (_, key) in &rekeyed {
-                *taken.entry(key.as_str()).or_default() += 1;
-            }
-            let shared: HashSet<String> = taken
-                .into_iter()
-                .filter(|(_, count)| *count > 1)
-                .map(|(key, _)| key.to_owned())
+                .filter(|(row, _)| {
+                    !reached.contains(row) && !library.artist_mbids.contains_key(row)
+                })
+                .map(|(row, stored)| {
+                    let edited =
+                        library
+                            .edits
+                            .contains_key(&(Kind::Artist, *row, "name".to_owned()));
+                    let name = shown
+                        .artists
+                        .get(row)
+                        .and_then(|(name, _, _)| name.as_deref());
+                    (*row, stored, name.filter(|_| !edited).map(normalize))
+                })
                 .collect();
-            rekeyed.retain(|(_, key)| !shared.contains(key));
+            let mut wanted: HashMap<&str, usize> = HashMap::new();
+            for (_, _, key) in &left {
+                if let Some(key) = key {
+                    *wanted.entry(key.as_str()).or_default() += 1;
+                }
+            }
+            for (row, stored, key) in &left {
+                let key = key.as_ref().filter(|key| {
+                    !held.contains(key.as_str()) && wanted.get(key.as_str()) == Some(&1)
+                });
+                if key != Some(*stored) {
+                    rekeyed.push((*row, key.cloned()));
+                }
+            }
         }
         let mut plan = Self {
             unsearchable,
@@ -1182,7 +1180,8 @@ impl Plan {
                 connection.prepare_cached(
                     "INSERT INTO alias_observation (scope, name_a, name_b, normalizer_version, decision_id, observed_at_ms, rev)
                      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-                     WHERE NOT EXISTS (SELECT 1 FROM alias_observation WHERE scope = ?1 AND name_a = ?2 AND name_b = ?3)",
+                     WHERE NOT EXISTS (SELECT 1 FROM alias_observation
+                                       WHERE scope = ?1 AND name_a = ?2 AND name_b = ?3 AND normalizer_version = ?4)",
                 )?
                 .execute((scope, a, b, NORMALIZER_VERSION, decided, now_ms, rev))?;
             }

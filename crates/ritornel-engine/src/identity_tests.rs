@@ -715,18 +715,15 @@ fn an_artist_no_file_credits_is_keyed_again_when_the_normaliser_changes() {
             client: None,
         })
         .unwrap();
-    // The first has today's key, so its files find it when they return;
-    // the renamed one keeps the key its files gave, and the library is
-    // marked as keyed by today's normaliser.
+    // The first has today's key, so its files find it when they return.
+    // The others have none, and are never found: the renamed one, whose
+    // files' names are not known; the one whose key today is the scanned
+    // artist's; and the two that would share a key.
     assert_eq!(
-        rig.rows("SELECT id || '|' || match_name FROM artist WHERE id > 900 ORDER BY id"),
-        [
-            "901|lanterns 42",
-            "902|tinharbour",
-            "903|mossarcade",
-            "904|saltroad",
-            "905|saltroad"
-        ]
+        rig.rows(
+            "SELECT id || '|' || coalesce(match_name, '-') FROM artist WHERE id > 900 ORDER BY id"
+        ),
+        ["901|lanterns 42", "902|-", "903|-", "904|-", "905|-"]
     );
     // A second resolution changes nothing.
     assert!(

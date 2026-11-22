@@ -44,7 +44,16 @@ fn parts_words(c: char) -> bool {
 /// white space made one space. A name that is nothing but punctuation
 /// keeps it, so that `!!!` and `???` stay two names.
 pub fn normalize(text: &str) -> String {
-    let folded: String = text.nfkc().flat_map(char::to_lowercase).collect();
+    // Lower case can leave a letter and a mark that compose: composed
+    // again, and the dot that a capital dotted I leaves on its small i
+    // taken off, as Turkish reads it.
+    let folded: String = text
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+        .nfc()
+        .collect::<String>()
+        .replace("i\u{0307}", "i");
     // "&" alone is a name of punctuation, not the word "and".
     if !folded.chars().any(char::is_alphanumeric) {
         return folded.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -219,6 +228,9 @@ mod tests {
         assert_eq!(normalize("Ne$ta"), "neta");
         assert_eq!(normalize("Song - Part 2"), "song part 2");
         assert_eq!(normalize("ÉTÉ"), "été");
+        // A capital dotted I is a small i, as in Turkish.
+        assert_eq!(normalize("İzmir"), normalize("izmir"));
+        assert_eq!(normalize("H\u{0331}"), normalize("\u{1E96}"));
     }
 
     #[test]

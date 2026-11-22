@@ -985,6 +985,35 @@ fn after_a_change_of_normaliser_an_artist_takes_its_own_row_before_another_s() {
 }
 
 #[test]
+fn after_a_change_of_normaliser_no_artist_takes_a_row_by_today_s_key() {
+    let mut world = World::default();
+    world.add(file("A/1.flac", 1).song("One", "Tin'Harbour", 200));
+    world.add(file("A/2.flac", 2).song("Two", "Tin-Harbour", 200));
+    world.add(file("A/3.flac", 3).song("Three", "Tin & Harbour", 200));
+    // As normaliser 1 left them: the first two one artist, "tinharbour",
+    // and the third another, "tin harbour".
+    world.library.artists = vec![(1, "tinharbour".to_owned()), (2, "tin harbour".to_owned())];
+    world.next = 10;
+    world.library.artist_keys_by = Some(1);
+    let resolution = world.settle();
+    let found: Vec<(Ref, &str)> = resolution
+        .artists
+        .iter()
+        .map(|out| (out.r, out.name.as_str()))
+        .collect();
+    // Today the first two are two artists; the second takes a row of its
+    // own, not the third's, whose today's key is the third's old one.
+    assert_eq!(
+        found,
+        [
+            (Ref::Row(1), "Tin'Harbour"),
+            (Ref::New(1), "Tin-Harbour"),
+            (Ref::Row(2), "Tin & Harbour")
+        ]
+    );
+}
+
+#[test]
 fn an_artist_with_no_id_keeps_its_row_across_a_change_of_normaliser() {
     for edited in [false, true] {
         let mut world = World::default();
