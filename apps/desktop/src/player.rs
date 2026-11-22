@@ -682,6 +682,19 @@ impl Player {
         self.rated.get(&recording).copied().unwrap_or(said)
     }
 
+    /// A click on star `star` of `recording`, whose stars the server last
+    /// said were `said`: that many, or none when it has exactly that many.
+    pub(crate) fn click_star(
+        &mut self,
+        recording: Id,
+        said: Option<u32>,
+        star: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let to = clicked(star, self.own(recording, said));
+        self.rate(recording, to, cx);
+    }
+
     /// Sets a recording's stars, or takes them away with `None`.
     pub(crate) fn rate(&mut self, recording: Id, rating: Option<u32>, cx: &mut Context<Self>) {
         let Some(key) = self.key(cx) else { return };

@@ -21,7 +21,7 @@ use ritornel_contract::{Id, Repeat, SkipDirection};
 
 use crate::icons::icon;
 use crate::link::Link;
-use crate::player::{Player, clicked, stars_of};
+use crate::player::{Player, stars_of};
 use crate::theme;
 use crate::wall::PLAYER_BAR;
 
@@ -382,6 +382,7 @@ impl Render for PlayerBar {
                         );
                 }
                 let recording = track.recording_id;
+                let said = track.rating;
                 let stars = crate::marks::stars(
                     "bar".into(),
                     stars_of(own.flatten(), track.loved),
@@ -399,8 +400,7 @@ impl Render for PlayerBar {
                     move |bar: &mut Self, star, cx| {
                         let Some(recording) = recording else { return };
                         bar.player.update(cx, |player, cx| {
-                            let own = player.own(recording, None);
-                            player.rate(recording, clicked(star, own), cx);
+                            player.click_star(recording, said, star, cx);
                         });
                     },
                 );
