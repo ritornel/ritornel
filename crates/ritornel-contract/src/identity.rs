@@ -1,7 +1,7 @@
 //! The identity calls of M1's first slice: the dry run of the resolver and
 //! the review listing. See "The proof" and "Resolver policy 1" in
-//! docs/design/identity.md. Policy 2 is policy 1 with four values changed;
-//! scans resolve by it, and a dry run can still ask about policy 1.
+//! docs/design/identity.md. Scans use policy 3. A dry run can still ask
+//! about an earlier policy.
 //!
 //! Both name files by their path under their root, because what the owner
 //! judges is a file. That is the only path they carry, and both need a
@@ -17,7 +17,7 @@ use crate::{Count, Id};
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyOverrides {
-    /// The named policy, 1 or 2. Left out, it is the one scans resolve by.
+    /// The named policy, 1, 2 or 3. Left out, it is the one scans resolve by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub version: Option<u64>,

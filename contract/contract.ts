@@ -2960,7 +2960,7 @@ export type PlayedTrack = {
  */
 export type PolicyOverrides = {
   /**
-   * The named policy, 1 or 2. Left out, it is the one scans resolve by.
+   * The named policy, 1, 2 or 3. Left out, it is the one scans resolve by.
    */
   version?: number,
   /**

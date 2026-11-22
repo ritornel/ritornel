@@ -2,7 +2,7 @@
 //! 1" and "Merge, split and never-link" in docs/design/identity.md.
 //!
 //! One ladder serves every policy; a [`Policy`] is the numbers and switches
-//! it decides by. Policy 2, which scans resolve by, is policy 1 with four
+//! it decides by. Policy 2 is policy 1 with four
 //! values changed after it was tuned on a real library: accents folded,
 //! both disc rules on, and a match on tags alone bound across two albums
 //! only when the lengths agree almost exactly
@@ -29,7 +29,7 @@ use crate::normalize::{core, difference, fold_accents, normalize};
 
 /// The version of the policy scans resolve by, [`Policy::current`]: what
 /// `identity_decision.resolver_version` records for a decision it makes.
-pub const RESOLVER_VERSION: i64 = 2;
+pub const RESOLVER_VERSION: i64 = 3;
 
 /// Words that mark a different version of a song. One that is in a title
 /// and not in the other can only stop a match. "Remaster" is not here: a
@@ -175,9 +175,13 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// The policy scans resolve by: policy 2.
+    /// Policy 3 keeps a recording's eligible runner-up evidence and treats
+    /// a numbered album as context, not a version marker on every song.
     pub fn current() -> Self {
-        Self::v2()
+        Self {
+            version: RESOLVER_VERSION,
+            ..Self::v2()
+        }
     }
 
     /// The named policy of this number, if there is one.
@@ -185,6 +189,7 @@ impl Policy {
         match version {
             1 => Some(Self::v1()),
             2 => Some(Self::v2()),
+            RESOLVER_VERSION => Some(Self::current()),
             _ => None,
         }
     }
@@ -438,7 +443,7 @@ impl Ev {
                 facts.album.as_deref(),
                 ALBUM_MARKERS,
                 policy.marker_list,
-                false,
+                policy.version < 3,
             ),
             on_release: on_release.cloned(),
             position: facts.track.map(|track| (facts.disc, track)),
@@ -945,13 +950,17 @@ impl<'a> Fold<'a> {
                 }
             }
             for (mut nearest, eligible) in best.into_values() {
+                if let Some(close) = eligible.filter(|e| e.distance <= policy.bind_max) {
+                    nearest = close;
+                }
                 if let Some(&item) = clashes.get(&nearest.rec) {
                     nearest.clash = Some(item);
-                } else if let Some(eligible) = eligible {
-                    bindable.push(eligible);
-                    if eligible.distance <= policy.bind_max {
-                        nearest = eligible;
-                    }
+                } else if policy.version >= 3 {
+                    bindable.extend(eligible);
+                } else if nearest.may_bind(policy) {
+                    // Earlier policies took the runner-up from the one
+                    // piece of evidence chosen to represent each recording.
+                    bindable.push(nearest);
                 }
                 candidates.push(nearest);
             }

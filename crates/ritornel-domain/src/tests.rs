@@ -1902,15 +1902,22 @@ fn sibling_folders_that_collide_and_share_no_title_can_be_discs_of_one_release()
 }
 
 #[test]
-fn policy_2_is_policy_1_with_four_choices_changed_and_is_what_scans_use() {
+fn the_named_policies_keep_their_versions_and_settings() {
     let (one, two) = (Policy::v1(), Policy::v2());
     assert_eq!((one.version, two.version), (1, 2));
-    assert_eq!(Policy::current(), two);
-    assert_eq!(Policy::default(), two);
-    assert_eq!(crate::RESOLVER_VERSION, two.version);
+    assert_eq!(
+        Policy::current(),
+        Policy {
+            version: 3,
+            ..two.clone()
+        }
+    );
+    assert_eq!(Policy::default(), Policy::current());
+    assert_eq!(crate::RESOLVER_VERSION, Policy::current().version);
     assert_eq!(Policy::of_version(1), Some(one.clone()));
     assert_eq!(Policy::of_version(2), Some(two.clone()));
-    assert_eq!(Policy::of_version(3), None);
+    assert_eq!(Policy::of_version(3), Some(Policy::current()));
+    assert_eq!(Policy::of_version(4), None);
     // The free band stays at two seconds, and every number is policy 1's.
     assert_eq!(two.duration_grace_ms, 2_000);
     assert_eq!(
@@ -2898,6 +2905,8 @@ fn an_ineligible_copy_cannot_hide_a_recordings_eligible_runner_up() {
     world.add(song("B/1.flac", 2, "Long Field", 207, Some("rec-b")));
     world.add(song("C/1.flac", 3, "Other Shores", 201, Some("rec-b")));
     let probe = world.add(song("D/1.flac", 4, "Long Field", 200, None));
+    let old = catalog::resolve(&world.library, &Policy::v2());
+    assert_eq!(decision(&old, probe).method, Method::TagsDuration);
     let r = world.settle();
     assert_eq!(decision(&r, probe).method, Method::New);
     assert!(decision(&r, probe).needs_review);
@@ -2910,7 +2919,7 @@ fn an_album_part_number_does_not_make_its_songs_different_versions() {
             .song("Glass Pier", "Ninefold", 200)
             .on("Long Field Part II", None, 1),
         file("B/1.flac", 2).song("Glass Pier", "Ninefold", 200),
-        Policy::v2(),
+        Policy::current(),
     );
     assert_eq!(decision.method, Method::TagsDuration);
     assert_eq!(world.recording(original), world.recording(loose));
