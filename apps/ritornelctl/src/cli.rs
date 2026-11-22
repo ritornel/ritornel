@@ -1035,6 +1035,26 @@ mod tests {
     }
 
     #[test]
+    fn status_takes_dismiss_before_or_after_its_other_options() {
+        for line in [
+            &["status", "--dismiss", "--json"][..],
+            &["status", "--json", "--dismiss"],
+        ] {
+            assert_eq!(
+                parse(args(line)).unwrap().command,
+                Command::Status(StatusArgs {
+                    dismiss: true,
+                    server: ServerArgs {
+                        data_dir: None,
+                        json: true
+                    },
+                }),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_wrong_command_line_is_refused_with_the_usage_exit_code() {
         for line in [
             &[][..],

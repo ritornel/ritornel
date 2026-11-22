@@ -132,9 +132,11 @@ fn record(
         .child(boxed(rows))
         .children(model.problems.get(&Group::Record).cloned().map(problem))
         .when(!record.problems.is_empty(), |group| {
-            group.child(note(
-                "Music plays on while the record has stopped. Dismiss sets these scrobbles aside; a new one shows here again.",
-            ))
+            group.child(note(if dismiss_at.is_some() {
+                "Music plays on while the record has stopped. Dismiss sets these scrobbles aside; a new one shows here again."
+            } else {
+                "Music plays on while the record has stopped."
+            }))
         })
 }
 

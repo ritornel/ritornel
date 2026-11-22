@@ -137,8 +137,8 @@ pub(crate) struct Core {
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// Where backups go, once the server has started.
     backups: std::sync::OnceLock<crate::backup::Backups>,
-    /// A listen the player could not save, while it cannot.
-    unsaved: Mutex<record::Unsaved>,
+    /// What the record's sign knows only while the server runs.
+    signs: Mutex<record::Signs>,
     /// The system's media session, once `serve` has started one.
     #[cfg(feature = "media-session")]
     media_session: std::sync::OnceLock<crate::media_session::MediaSession>,
@@ -232,7 +232,7 @@ impl Core {
             lastfm: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
-            unsaved: Mutex::default(),
+            signs: Mutex::default(),
             #[cfg(feature = "media-session")]
             media_session: std::sync::OnceLock::new(),
         })
@@ -1323,6 +1323,17 @@ mod tests {
         // Removed since: there is no backup.
         std::fs::remove_dir_all(taken["backup"]["path"].as_str().unwrap()).unwrap();
         assert_eq!(status()["backup"]["last"]["present"], false);
+    }
+
+    #[test]
+    fn dismissing_with_a_library_answers_the_record_and_again_changes_nothing() {
+        let (core, _scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        call(&core, &session, "library.create", Some(key(0xc1))).unwrap();
+        for _ in 0..2 {
+            let dismissed = call(&core, &session, "record.dismiss", Some(key(0xd2))).unwrap();
+            assert_eq!(dismissed["record"], json!({ "problems": [] }));
+        }
     }
 
     #[test]

@@ -16,22 +16,27 @@ use tracing::{info, warn};
 
 use super::{Core, Stores, lock};
 
-/// A listen the player could not save: since when, and what the last
-/// attempt said.
+/// What the record's sign knows only while the server runs.
 #[derive(Debug, Default)]
-pub(crate) struct Unsaved(Option<(i64, String)>);
+pub(crate) struct Signs {
+    /// A listen the player cannot save: since when, and why.
+    unsaved: Option<(i64, String)>,
+    /// Since when what would say whether the record advances has failed
+    /// to read, while it does.
+    unreadable_since: Option<i64>,
+}
 
 /// The service whose imports and scrobbles are looked at.
 const SERVICE: &str = "lastfm";
 
-/// Adds what one source says to the problems: what is wrong, or that it
-/// could not be read, as of `now_ms`.
+/// What one source says: what is wrong, which is added to the problems,
+/// or why it could not be read, which is added to `unread`.
 fn add(
     problems: &mut Vec<RecordProblem>,
+    unread: &mut Vec<String>,
     kind: RecordProblemKind,
     found: Result<Option<Failing>, String>,
     dismissable: bool,
-    now_ms: i64,
 ) {
     match found {
         Ok(Some(failing)) => problems.push(RecordProblem {
@@ -44,21 +49,29 @@ fn add(
         Ok(None) => {}
         Err(error) => {
             warn!(%error, kind = kind.as_str(), "what stops the record could not be read");
-            problems.push(RecordProblem {
-                kind: RecordProblemKind::Unreadable,
-                since: now_ms,
-                count: 1,
-                detail: Some(error),
-                dismissable: false,
-            });
+            if !unread.contains(&error) {
+                unread.push(error);
+            }
         }
     }
+}
+
+/// One problem for all that could not be read: whether the record
+/// advances is not known. None when everything was read.
+fn unreadable(unread: &[String], since: i64) -> Option<RecordProblem> {
+    (!unread.is_empty()).then(|| RecordProblem {
+        kind: RecordProblemKind::Unreadable,
+        since,
+        count: 1,
+        detail: Some(unread.join("; ")),
+        dismissable: false,
+    })
 }
 
 impl Core {
     /// The player saved what it had to, or had nothing to save.
     pub(crate) fn listen_saved(&self) {
-        if lock(&self.unsaved).0.take().is_some() {
+        if lock(&self.signs).unsaved.take().is_some() {
             info!("the player saves its listens again");
         }
     }
@@ -67,18 +80,19 @@ impl Core {
     /// again at its next tick; until one works, the record has stopped.
     pub(crate) fn listen_unsaved(&self, detail: String) {
         let now_ms = self.clock.now_ms();
-        let mut unsaved = lock(&self.unsaved);
-        let since = unsaved.0.as_ref().map_or(now_ms, |(since, _)| *since);
-        unsaved.0 = Some((since, detail));
+        let mut signs = lock(&self.signs);
+        let since = signs.unsaved.as_ref().map_or(now_ms, |(since, _)| *since);
+        signs.unsaved = Some((since, detail));
     }
 
     /// What stops the record now, oldest first.
     pub(super) fn record_status(&self, stores: &Stores) -> RecordStatus {
         let now_ms = self.clock.now_ms();
-        let mut problems = Vec::new();
-        let unsaved = lock(&self.unsaved).0.clone();
+        let (mut problems, mut unread) = (Vec::new(), Vec::new());
+        let unsaved = lock(&self.signs).unsaved.clone();
         add(
             &mut problems,
+            &mut unread,
             RecordProblemKind::ListenUnsaved,
             Ok(unsaved.map(|(since_ms, detail)| Failing {
                 since_ms,
@@ -86,16 +100,15 @@ impl Core {
                 detail: Some(detail),
             })),
             false,
-            now_ms,
         );
         let server = stores.server();
         let text = |error: ritornel_engine::Error| error.to_string();
         add(
             &mut problems,
+            &mut unread,
             RecordProblemKind::ListensUndelivered,
             server.failing_deliveries().map_err(text),
             false,
-            now_ms,
         );
         // The imports of the account signed in now: one signed out of is
         // not this server's to import.
@@ -114,10 +127,10 @@ impl Core {
             });
         add(
             &mut problems,
+            &mut unread,
             RecordProblemKind::ImportFailed,
             imports,
             false,
-            now_ms,
         );
         let library = stores
             .library
@@ -133,28 +146,39 @@ impl Core {
                 Ok(lost) => {
                     add(
                         &mut problems,
+                        &mut unread,
                         RecordProblemKind::ScrobblesUnknown,
                         Ok(lost.unknown),
                         true,
-                        now_ms,
                     );
                     add(
                         &mut problems,
+                        &mut unread,
                         RecordProblemKind::ScrobblesWithdrawn,
                         Ok(lost.withdrawn),
                         true,
-                        now_ms,
                     );
                 }
                 Err(error) => add(
                     &mut problems,
+                    &mut unread,
                     RecordProblemKind::ScrobblesUnknown,
                     Err(error),
                     true,
-                    now_ms,
                 ),
             }
         }
+        // Since when, held from the first read that failed until one works.
+        let since = {
+            let mut signs = lock(&self.signs);
+            signs.unreadable_since = if unread.is_empty() {
+                None
+            } else {
+                Some(signs.unreadable_since.unwrap_or(now_ms))
+            };
+            signs.unreadable_since.unwrap_or(now_ms)
+        };
+        problems.extend(unreadable(&unread, since));
         problems.sort_by_key(|problem| problem.since);
         RecordStatus { problems }
     }
@@ -209,32 +233,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn what_cannot_be_read_is_said_and_never_taken_for_a_record_that_advances() {
-        let mut problems = Vec::new();
+    fn what_cannot_be_read_is_said_once_and_never_taken_for_a_record_that_advances() {
+        let (mut problems, mut unread) = (Vec::new(), Vec::new());
         add(
             &mut problems,
+            &mut unread,
             RecordProblemKind::ImportFailed,
             Ok(None),
             false,
-            5,
         );
+        assert!(unreadable(&unread, 5).is_none());
+        for kind in [
+            RecordProblemKind::ListensUndelivered,
+            RecordProblemKind::ImportFailed,
+        ] {
+            add(
+                &mut problems,
+                &mut unread,
+                kind,
+                Err("disk I/O error".to_owned()),
+                false,
+            );
+        }
         assert!(problems.is_empty());
-        add(
-            &mut problems,
-            RecordProblemKind::ScrobblesUnknown,
-            Err("no such table: history_delivery".to_owned()),
-            true,
-            5,
-        );
         assert_eq!(
-            problems,
-            [RecordProblem {
+            unreadable(&unread, 5),
+            Some(RecordProblem {
                 kind: RecordProblemKind::Unreadable,
                 since: 5,
                 count: 1,
-                detail: Some("no such table: history_delivery".to_owned()),
+                detail: Some("disk I/O error".to_owned()),
                 dismissable: false,
-            }]
+            })
         );
     }
 }

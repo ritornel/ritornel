@@ -305,6 +305,12 @@ impl Settings {
                 model.adding = None;
             });
         }
+        // What the server says of the library and the record is read
+        // again on the way in, not only on the timer: a sign out in the
+        // Last.fm section changes it.
+        if to == Section::Library && self.section != to {
+            self.model.update(cx, |model, cx| model.read_status(cx));
+        }
         self.section = to;
         let mut remembered = remember::load();
         remembered.settings_section = to.id().to_owned();

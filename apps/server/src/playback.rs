@@ -229,17 +229,14 @@ fn stamps(clock: &dyn Clock, run_id: Id) -> SendStamps {
 fn tick(core: &Core, stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         match core.tick_player() {
-            Ok(()) => core.listen_saved(),
+            Ok(()) => {}
             Err(EngineError::FailPoint) => {
                 // The crash test asked for the server to die here, with the
                 // listen open and its last checkpoint saved.
                 warn!("stopping at a fail point, as a crash would");
                 std::process::abort();
             }
-            Err(failed) => {
-                error!(error = %failed, "the player's tick failed");
-                core.listen_unsaved(failed.to_string());
-            }
+            Err(failed) => error!(error = %failed, "the player's tick failed"),
         }
         std::thread::sleep(TICK);
     }

@@ -307,6 +307,10 @@ pub struct Player {
     span: u64,
     /// Why the last save failed, for the tick to say. The next tries again.
     unsaved: Option<Error>,
+    /// Why saving fails, from the first save that failed until one works:
+    /// what the record's sign says. Unlike `unsaved`, a tick does not take
+    /// it.
+    save_failing: Option<String>,
     /// The listen a resume of the current entry continues.
     resume_listen: Option<Id>,
     /// Why the next track loaded starts.
@@ -413,6 +417,7 @@ impl Player {
             ran_out: None,
             span: 0,
             unsaved: None,
+            save_failing: None,
             resume_listen: session.resume_listen,
             start_reason: StartReason::UserPick,
             listener,
@@ -643,12 +648,23 @@ impl Player {
         match saved {
             Ok(()) => {
                 self.unsaved = None;
+                self.save_failing = None;
                 if self.recorder.saved(live) {
                     events.push(PlayerEvent::ListenClosed);
                 }
             }
-            Err(error) => self.unsaved = Some(error),
+            Err(error) => {
+                self.save_failing = Some(error.to_string());
+                self.unsaved = Some(error);
+            }
         }
+    }
+
+    /// Why the player's saves are failing, while they are: from the first
+    /// that failed until one works. Nothing else that goes wrong in a tick
+    /// is said here.
+    pub fn save_failing(&self) -> Option<&str> {
+        self.save_failing.as_deref()
     }
 
     /// What a listen of `copy` for `entry` records, all but when it starts:

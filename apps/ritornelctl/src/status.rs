@@ -412,6 +412,41 @@ Record            the listen playing cannot be saved, since 2025-11-21 17:01 UTC
     }
 
     #[test]
+    fn the_record_says_when_it_cannot_tell_and_how_often_an_import_failed() {
+        let mut status = example();
+        status.record = Some(RecordStatus {
+            problems: vec![
+                RecordProblem {
+                    kind: RecordProblemKind::ImportFailed,
+                    since: 1_763_744_462_000,
+                    count: 3,
+                    detail: None,
+                    dismissable: false,
+                },
+                RecordProblem {
+                    kind: RecordProblemKind::Unreadable,
+                    since: 1_763_744_462_000,
+                    count: 1,
+                    detail: Some("disk I/O error".to_owned()),
+                    dismissable: false,
+                },
+            ],
+        });
+        let shown = render(&status);
+        let record = shown
+            .split_once("Log path          /srv/ritornel/logs\n")
+            .unwrap()
+            .1;
+        assert_eq!(
+            record,
+            "\
+Record            importing from Last.fm failed 3 times in a row, since 2025-11-21 17:01 UTC
+                  whether every listen is recorded cannot be read, since 2025-11-21 17:01 UTC: disk I/O error
+"
+        );
+    }
+
+    #[test]
     fn a_hub_shows_the_library_it_holds() {
         let mut status = example();
         status.role = ServerRole::Hub;

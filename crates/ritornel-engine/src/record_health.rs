@@ -65,7 +65,8 @@ impl ServerStore {
     pub fn failing_deliveries(&self) -> Result<Option<Failing>, Error> {
         self.read(|connection| {
             let (n, since): (i64, Option<i64>) = connection.query_row(
-                "SELECT count(*), min(created_at_ms) FROM outbox WHERE last_error IS NOT NULL",
+                "SELECT count(*), min(created_at_ms) FROM outbox
+                 WHERE kind = 'history.ingest' AND last_error IS NOT NULL",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
@@ -74,7 +75,8 @@ impl ServerStore {
             };
             let detail = connection
                 .query_row(
-                    "SELECT last_error FROM outbox WHERE last_error IS NOT NULL
+                    "SELECT last_error FROM outbox
+                     WHERE kind = 'history.ingest' AND last_error IS NOT NULL
                      ORDER BY id DESC LIMIT 1",
                     [],
                     |row| row.get(0),
@@ -93,31 +95,27 @@ impl ServerStore {
     pub fn failing_jobs(&self, kind: &str, key: &str) -> Result<Option<Failing>, Error> {
         let (kind, key) = (kind.to_owned(), key.to_owned());
         self.read(move |connection| {
-            let (n, since): (i64, Option<i64>) = connection.query_row(
-                "SELECT count(*), min(finished_at_ms) FROM job
-                 WHERE kind = ?1 AND dedupe_key = ?2 AND state = 'failed'
-                   AND finished_at_ms > coalesce(
-                     (SELECT max(finished_at_ms) FROM job
-                      WHERE kind = ?1 AND dedupe_key = ?2 AND state = 'succeeded'),
-                     -1)",
+            // In the order the jobs were made, which no clock can change:
+            // one job of a kind and key runs at a time.
+            let (n, since, detail): (i64, Option<i64>, Option<String>) = connection.query_row(
+                "WITH last AS (
+                   SELECT coalesce(max(id), 0) AS id FROM job
+                   WHERE kind = ?1 AND dedupe_key = ?2 AND state = 'succeeded'),
+                 failed AS (
+                   SELECT job.id, finished_at_ms, error_json FROM job, last
+                   WHERE kind = ?1 AND dedupe_key = ?2 AND state = 'failed' AND job.id > last.id)
+                 SELECT count(*),
+                        (SELECT finished_at_ms FROM failed ORDER BY id LIMIT 1),
+                        (SELECT error_json FROM failed ORDER BY id DESC LIMIT 1)
+                 FROM failed",
                 [&kind, &key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-            let Some(since_ms) = since else {
+            if n == 0 {
                 return Ok(None);
-            };
-            let detail: Option<String> = connection
-                .query_row(
-                    "SELECT error_json FROM job WHERE kind = ?1 AND dedupe_key = ?2
-                       AND state = 'failed'
-                     ORDER BY finished_at_ms DESC, id DESC LIMIT 1",
-                    [&kind, &key],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
+            }
             Ok(Some(Failing {
-                since_ms,
+                since_ms: since.unwrap_or(0),
                 count: count(n),
                 // The error is stored as JSON text; a plain string is shown
                 // as itself.
@@ -141,19 +139,28 @@ impl ServerStore {
         self.transact(move |transaction, _, _| {
             let held = held_dismissal(transaction)?;
             if let Some(held) = &held
-                && (held.command == dismissal.command
-                    || held.commands.contains(&dismissal.command)
-                    || held.through_revision >= dismissal.through_revision)
+                && (held.command == dismissal.command || held.commands.contains(&dismissal.command))
             {
                 return Ok(held.dismissal());
             }
+            // A command not seen before is kept even when it moves nothing,
+            // so that it moves nothing when it is sent again later either.
+            let kept_revision = held.as_ref().map_or(i64::MIN, |held| held.through_revision);
+            let (through_revision, command) = if kept_revision >= dismissal.through_revision {
+                held.as_ref()
+                    .map_or((dismissal.through_revision, dismissal.command), |held| {
+                        (held.through_revision, held.command)
+                    })
+            } else {
+                (dismissal.through_revision, dismissal.command)
+            };
             let mut commands = held.map(|held| held.commands).unwrap_or_default();
             commands.push(dismissal.command);
             let excess = commands.len().saturating_sub(COMMANDS_KEPT);
             commands.drain(..excess);
             let kept = Held {
-                through_revision: dismissal.through_revision,
-                command: dismissal.command,
+                through_revision,
+                command,
                 commands,
             };
             transaction.execute(
@@ -161,7 +168,7 @@ impl ServerStore {
                  ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
                 (DISMISSED, serde_json::to_string(&kept)?),
             )?;
-            Ok(dismissal)
+            Ok(kept.dismissal())
         })
     }
 }
@@ -338,6 +345,24 @@ mod tests {
     }
 
     #[test]
+    fn imports_are_taken_in_the_order_they_were_made_whatever_the_clock_said() {
+        let store = store();
+        // The clock went back between a failure and the success after it.
+        job(&store, 1, "failed", 5_000, Some("refused"));
+        job(&store, 2, "succeeded", 4_000, None);
+        assert_eq!(store.failing_jobs("lastfm.sync", "someone").unwrap(), None);
+        // A failure in the same millisecond as the success before it.
+        job(&store, 3, "failed", 4_000, Some("refused again"));
+        assert_eq!(
+            store
+                .failing_jobs("lastfm.sync", "someone")
+                .unwrap()
+                .map(|failing| (failing.since_ms, failing.count)),
+            Some((4_000, 1))
+        );
+    }
+
+    #[test]
     fn one_accounts_imports_are_not_put_right_by_anothers() {
         let store = store();
         account_job(&store, 1, "alice", "failed", 1_000, Some("refused"));
@@ -373,6 +398,18 @@ mod tests {
             command: crate::Id::from_bytes([2; 16]),
         };
         assert_eq!(store.dismiss_record(earlier).unwrap(), first);
+        // Another, through the same revision: it moves nothing, and sent
+        // again later it moves nothing either.
+        let idle = Dismissal {
+            through_revision: 10,
+            command: crate::Id::from_bytes([4; 16]),
+        };
+        assert_eq!(store.dismiss_record(idle).unwrap(), first);
+        let idle_again = Dismissal {
+            through_revision: 25,
+            ..idle
+        };
+        assert_eq!(store.dismiss_record(idle_again).unwrap(), first);
         let later = Dismissal {
             through_revision: 30,
             command: crate::Id::from_bytes([3; 16]),
