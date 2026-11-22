@@ -16,7 +16,9 @@ use unicode_normalization::char::is_combining_mark;
 /// 3: a symbol at either end of a name, such as the plus of "Night Drives
 /// +", is a word of its key, so a record named apart by one is not the
 /// same record.
-pub const NORMALIZER_VERSION: i64 = 3;
+///
+/// 4: a compatibility bracket delimits the same title note as its ASCII form.
+pub const NORMALIZER_VERSION: i64 = 4;
 
 /// Whether a mark between two words parts them as a space does: dashes,
 /// slashes and the like. Everything else that is not a letter, a digit or a
@@ -208,7 +210,7 @@ pub fn normalize_by(version: i64, text: &str) -> Option<String> {
     match version {
         1 => Some(normalize_v1(text)),
         2 => Some(normalize_with(text, false)),
-        NORMALIZER_VERSION => Some(normalize(text)),
+        3 | NORMALIZER_VERSION => Some(normalize(text)),
         _ => None,
     }
 }
@@ -251,15 +253,14 @@ pub fn core(text: &str) -> String {
     // A bracket of symbols alone, as "(+)", is kept: it is no note.
     let mut inside = String::new();
     let mut depth = 0_u32;
-    for c in text.chars() {
+    for c in text.nfkc() {
         match c {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    let folded: String = inside.nfkc().collect();
-                    let words = folded.chars().any(|c| c.is_alphanumeric() || c == '&');
-                    if !words && folded.chars().any(is_symbol) {
+                    let words = inside.chars().any(|c| c.is_alphanumeric() || c == '&');
+                    if !words && inside.chars().any(is_symbol) {
                         outside.push(' ');
                         outside.push_str(&inside);
                         outside.push(' ');
@@ -526,6 +527,9 @@ mod tests {
         assert_eq!(core("Lantern [Live] (Radio Edit)"), "lantern");
         assert_eq!(core("(Untitled)"), "untitled");
         assert_eq!(core("Lantern"), "lantern");
+        assert_eq!(core("Lantern（Remastered）"), "lantern");
+        assert_eq!(core("Lantern［＋］"), core("Lantern [+]"));
+        assert_eq!(core("（Untitled）"), "untitled");
     }
 
     #[test]
