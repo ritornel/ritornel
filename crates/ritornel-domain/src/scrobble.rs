@@ -292,8 +292,15 @@ fn near_key(artist: &str, title: &str) -> (String, String) {
 fn album_words(album: &str) -> Vec<String> {
     let album = disc_in_title(album).map_or_else(|| album.to_owned(), |(title, _)| title);
     let key = fold_accents(&core(&album));
+    // "And" and a leading "The" are passed over only while a word is left
+    // beside them: "The +" is not "+".
+    let worded = |words: &[&str]| {
+        words
+            .iter()
+            .any(|word| word.chars().any(char::is_alphanumeric))
+    };
     let mut words: Vec<&str> = key.split(' ').filter(|word| *word != "and").collect();
-    if words.is_empty() {
+    if !worded(&words) {
         words = key.split(' ').collect();
     }
     while words.len() > 1 && matches!(words.last(), Some(&("ep" | "the"))) {
@@ -305,7 +312,7 @@ fn album_words(album: &str) -> Vec<String> {
         .position(|word| word.chars().any(char::is_alphanumeric));
     if let Some(at) = first
         && words.get(at) == Some(&"the")
-        && words.len() > at + 1
+        && worded(words.get(at + 1..).unwrap_or_default())
     {
         words.remove(at);
     }
@@ -504,7 +511,13 @@ impl Album {
                 })
                 .collect()
         };
-        let by_artist = letters(&album_words(&rest.join(" ")).concat()) == letters(&self.artist);
+        let rest = album_words(&rest.join(" ")).concat();
+        // An artist of symbols alone is matched as written.
+        let by_artist = if letters(&self.artist).is_empty() {
+            rest == self.artist
+        } else {
+            letters(&rest) == letters(&self.artist)
+        };
         // Set off: the longer title, outside its notes, is the shorter one
         // and then a colon, a dash or a full stop; or both have the same
         // title before such a mark, and one subtitle runs on from the
@@ -529,7 +542,8 @@ impl Album {
 /// echo by, beside its exact time.
 pub fn same_track(artist: &str, title: &str, other_artist: &str, other_title: &str) -> bool {
     // A symbol at either end may come back or not.
-    let key = |text: &str| crate::normalize::words_key(text);
+    // Nor whether it is drawn as an emoji.
+    let key = |text: &str| crate::normalize::words_key(&text.replace(['\u{fe0e}', '\u{fe0f}'], ""));
     (key(artist), key(title)) == (key(other_artist), key(other_title))
 }
 
@@ -1012,6 +1026,30 @@ mod tests {
     }
 
     #[test]
+    fn an_album_of_a_symbol_is_not_another_of_the_symbol_and_a_word() {
+        let catalog = Catalog::new(vec![
+            recording(17, "Mira Vale", "Undertow", &[(171, "The +")]),
+            recording(18, "=", "Lanterns", &[(181, "Blue Water")]),
+        ]);
+        let judge = |artist, album, title| {
+            catalog.judge(Scrobbled {
+                artist,
+                album: Some(album),
+                title,
+            })
+        };
+        assert!(matches!(
+            judge("Mira Vale", "+", "Undertow"),
+            Verdict::Doubtful { .. }
+        ));
+        // An artist of symbols alone is no subtitle of symbols.
+        assert!(matches!(
+            judge("=", "Blue Water +", "Lanterns"),
+            Verdict::Doubtful { .. }
+        ));
+    }
+
+    #[test]
     fn an_album_whose_subtitle_is_an_artist_named_with_a_symbol_fits() {
         let catalog = Catalog::new(vec![recording(
             12,
@@ -1073,6 +1111,12 @@ mod tests {
         // An echo of a play this library sent is the same track whether
         // the symbol came back or not.
         assert!(same_track("Mira Vale", "Lock +", "Mira Vale", "Lock"));
+        assert!(same_track(
+            "Mira Vale",
+            "Lock\u{2764}\u{fe0f}",
+            "Mira Vale",
+            "Lock"
+        ));
         // A title of symbols alone is still its symbols.
         assert_eq!(bound("--->"), Some((9, Rule::Exact)));
         assert_eq!(bound("<---"), None);

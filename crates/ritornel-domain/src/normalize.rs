@@ -32,7 +32,7 @@ fn parts_words(c: char) -> bool {
 fn is_symbol(c: char) -> bool {
     !c.is_alphanumeric()
         && matches!(c,
-            '+' | '<' | '=' | '>' | '|' | '~' | '$'
+            '+' | '<' | '=' | '>' | '$'
             | '\u{a2}'..='\u{a6}' | '\u{a9}' | '\u{ac}' | '\u{ae}' | '\u{b0}' | '\u{b1}'
             | '\u{d7}' | '\u{f7}'
             | '\u{20a0}'..='\u{20cf}' | '\u{2100}'..='\u{2bff}' | '\u{1f000}'..='\u{1faff}')
@@ -87,7 +87,7 @@ fn without_trailing_notes(text: &str) -> &str {
         match open {
             // A bracket of symbols alone is no note: "Night Drives (+)".
             Some(at)
-                if end[at..].chars().any(char::is_alphanumeric)
+                if end[at..].chars().any(|c| c.is_alphanumeric() || c == '&')
                     || !end[at..].chars().any(is_symbol) =>
             {
                 end = end[..at].trim_end();
@@ -131,7 +131,16 @@ fn normalize_with(text: &str, edges: bool) -> String {
         .collect();
     // "&" alone is a name of punctuation, not the word "and".
     if !folded.chars().any(char::is_alphanumeric) {
-        return folded.split_whitespace().collect::<Vec<_>>().join(" ");
+        let drawn: String = folded
+            .chars()
+            .filter(|c| !(edges && is_presentation(*c)))
+            .collect();
+        let kept = if drawn.trim().is_empty() {
+            folded.as_str()
+        } else {
+            drawn.as_str()
+        };
+        return kept.split_whitespace().collect::<Vec<_>>().join(" ");
     }
     let mut spaced = String::with_capacity(folded.len());
     for c in folded.chars() {
@@ -249,7 +258,8 @@ pub fn core(text: &str) -> String {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     let folded: String = inside.nfkc().collect();
-                    if !folded.chars().any(char::is_alphanumeric) && folded.chars().any(is_symbol) {
+                    let words = folded.chars().any(|c| c.is_alphanumeric() || c == '&');
+                    if !words && folded.chars().any(is_symbol) {
                         outside.push(' ');
                         outside.push_str(&inside);
                         outside.push(' ');
@@ -475,6 +485,14 @@ mod tests {
         assert_ne!(
             normalize("\u{845b}\u{e0100}"),
             normalize("\u{845b}\u{e0101}")
+        );
+        assert_eq!(normalize("\u{2764}\u{fe0f}"), normalize("\u{2764}"));
+        // A bracket with "&" in it is a note, as one with "and" is.
+        assert_eq!(core("Night Drives (& +)"), core("Night Drives (and +)"));
+        // With a leading symbol too, and several notes.
+        assert_eq!(
+            normalize("\u{2605} Night Drives + (Deluxe) [2024]"),
+            "\u{2605} night drives + deluxe 2024"
         );
         // "&" is "and" wherever it is.
         assert_eq!(normalize("Night Drives + &"), "night drives and");
