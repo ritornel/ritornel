@@ -1,13 +1,15 @@
-//! The library (`settings/Library.svelte`): the music folders it reads and
-//! their scans, the folder of artist pictures, and whether the server
-//! watches them for changes. Removing a folder waits on the server: it has
+//! The library (`settings/Library.svelte`): whether the listening record
+//! advances, the music folders it reads and their scans, the folder of
+//! artist pictures, and whether the server watches them for changes. Removing a folder waits on the server: it has
 //! no call that forgets one yet.
 
 use gpui::{
     App, Entity, InteractiveElement, IntoElement, ParentElement, Styled, div,
     prelude::FluentBuilder, px,
 };
-use ritornel_contract::{WatchState, WatchedFolder, WatchedKind};
+use ritornel_contract::{
+    RecordProblem, RecordProblemKind, RecordStatus, WatchState, WatchedFolder, WatchedKind,
+};
 
 use super::act;
 use super::controls::{
@@ -39,6 +41,103 @@ fn watching(folder: Option<&WatchedFolder>, on: bool, clock: &Clock) -> Option<i
             )
             .children(last_auto(folder, clock).map(sub)),
     )
+}
+
+/// What stops the record, in a sentence: what, and how many.
+fn stopped(problem: &RecordProblem) -> String {
+    let n = problem.count;
+    let many = |one: &str, more: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{} {more}", thousands(n))
+        }
+    };
+    match problem.kind {
+        RecordProblemKind::ListenUnsaved => "The listen playing can’t be saved".to_owned(),
+        RecordProblemKind::ListensUndelivered => {
+            format!("{} not reached history", many("listen has", "listens have"))
+        }
+        RecordProblemKind::ScrobblesUnknown => format!(
+            "{} not have reached Last.fm",
+            many("scrobble may", "scrobbles may")
+        ),
+        RecordProblemKind::ScrobblesWithdrawn => format!(
+            "{} not sent to Last.fm",
+            many("scrobble was", "scrobbles were")
+        ),
+        RecordProblemKind::Unreadable => {
+            "Can’t tell whether every listen is being recorded".to_owned()
+        }
+        RecordProblemKind::ImportFailed if n == 1 => "Importing from Last.fm failed".to_owned(),
+        RecordProblemKind::ImportFailed => format!(
+            "Importing from Last.fm failed {} times in a row",
+            thousands(n)
+        ),
+    }
+}
+
+/// Whether the listening record advances: a quiet line while it does, and
+/// a row for each thing that stops it, with since when, while it does not.
+/// Music can go on playing all the while, which is why this is said.
+fn record(
+    record: &RecordStatus,
+    model: &Model,
+    entity: &Entity<Model>,
+    clock: &Clock,
+) -> impl IntoElement {
+    let mut rows = Vec::new();
+    if record.problems.is_empty() {
+        rows.push(
+            row()
+                .text_color(theme::dim())
+                .child("Every listen is being recorded"),
+        );
+    }
+    let dismissing = model.busy.contains(&Busy::Dismissing);
+    // One button sets every such scrobble aside, so one is shown.
+    let dismiss_at = record
+        .problems
+        .iter()
+        .position(|problem| problem.dismissable);
+    for (n, problem) in record.problems.iter().enumerate() {
+        let since = format!("Since {}", when(problem.since, clock));
+        let said = match &problem.detail {
+            Some(detail) => format!("{since}: {detail}"),
+            None => since,
+        };
+        rows.push(
+            row()
+                .child(
+                    grow()
+                        .child(
+                            div()
+                                .text_color(super::controls::warn())
+                                .child(stopped(problem)),
+                        )
+                        .child(sub_wraps(said)),
+                )
+                .when(dismiss_at == Some(n), |row| {
+                    row.child(actions().child(push(
+                        "dismiss-record",
+                        "Dismiss",
+                        !dismissing,
+                        act(entity, |model, _, cx| model.dismiss_record(cx)),
+                    )))
+                }),
+        );
+    }
+    group(true)
+        .child(heading("Listening record"))
+        .child(boxed(rows))
+        .children(model.problems.get(&Group::Record).cloned().map(problem))
+        .when(!record.problems.is_empty(), |group| {
+            group.child(note(if dismiss_at.is_some() {
+                "Music plays on while the record has stopped. Dismiss sets these scrobbles aside; a new one shows here again."
+            } else {
+                "Music plays on while the record has stopped."
+            }))
+        })
 }
 
 pub(super) fn render(
@@ -195,7 +294,12 @@ pub(super) fn render(
             toggle,
         ));
     }
-    let music = group(true)
+    let record = model
+        .status
+        .as_ref()
+        .and_then(|status| status.record.as_ref())
+        .map(|found| record(found, model, entity, clock));
+    let music = group(record.is_none())
         .child(heading("Music folders"))
         .child(boxed(rows))
         .when_some(
@@ -291,6 +395,7 @@ pub(super) fn render(
         .id("library")
         .flex()
         .flex_col()
+        .children(record)
         .child(music)
         .child(artists)
 }

@@ -62,6 +62,7 @@ mod migrate;
 mod platform;
 pub mod playback;
 mod ratings;
+mod record_health;
 mod resolve_store;
 mod scan;
 mod scan_store;
@@ -107,6 +108,7 @@ pub use library_store::{
 };
 pub use list::{ListError, View};
 pub use ratings::Said;
+pub use record_health::{Dismissal, Failing, LostScrobbles};
 pub use resolve_store::Resolved;
 /// What a server, a session and every stored entity is named by. The type
 /// is the contract's.

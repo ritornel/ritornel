@@ -3,7 +3,9 @@
 //! into another data directory, where the history it holds is the history
 //! a rebuild makes; with no backup folder named there is no backup,
 //! nothing is written beside the data in its place, and the status says
-//! so. An export is read back as plain JSON Lines and CSV. See "The data
+//! so. An export is read back as plain JSON Lines and CSV. A listen that
+//! cannot be saved stops the record, and the status says so while the
+//! music goes on. See "The data
 //! directory" in docs/design/server.md and "Export" in
 //! docs/design/history.md.
 //!
@@ -471,4 +473,59 @@ fn an_export_is_read_back_without_ritornel_and_holds_a_skipped_listen_with_where
             .starts_with("play,listener,played_at_utc,")
     );
     assert_eq!(rows.count(), 2);
+}
+
+#[test]
+fn while_a_listen_cannot_be_saved_playback_goes_on_and_the_status_says_so_and_since_when() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let album = scratch.album("Long Album", [600, 600]);
+    // Twenty times real time; past ten seconds into a track, every save of
+    // its listen fails, as a full disk's would.
+    let server = Server::start(
+        &data_dir,
+        &[
+            ("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20"),
+            ("RITORNEL_TEST_FAIL_SAVES_AFTER_MS", "10000"),
+        ],
+    );
+    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    let folder = album.to_str().unwrap();
+    assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
+    let status = json(&data_dir, &["status"]);
+    assert_eq!(status["record"]["problems"], serde_json::json!([]));
+    let (_, stdout, _) = ritornelctl(&data_dir, &["status"]);
+    assert!(stdout.contains("Record            advancing"), "{stdout}");
+
+    assert_eq!(ritornelctl(&data_dir, &["play", folder]).0, Some(0));
+    let status = until(&data_dir, &["status"], |status| {
+        !status["record"]["problems"].as_array().unwrap().is_empty()
+    });
+    let problem = &status["record"]["problems"][0];
+    assert_eq!(problem["kind"], "listen_unsaved", "{status}");
+    assert_eq!(problem["dismissable"], false);
+    assert!(problem["since"].as_i64() > Some(0));
+    // The music goes on.
+    let before = json(&data_dir, &["now"])["positionMs"].as_u64().unwrap();
+    let now = until(&data_dir, &["now"], |now| {
+        now["positionMs"].as_u64().unwrap() > before
+    });
+    assert_eq!(now["status"], "playing");
+    let (_, stdout, _) = ritornelctl(&data_dir, &["status"]);
+    assert!(
+        stdout.contains("Record            the listen playing cannot be saved, since "),
+        "{stdout}"
+    );
+    // Dismissing sets aside only scrobbles: this stays until put right.
+    assert_eq!(ritornelctl(&data_dir, &["status", "--dismiss"]).0, Some(0));
+    let status = json(&data_dir, &["status"]);
+    assert_eq!(status["record"]["problems"][0]["kind"], "listen_unsaved");
+
+    // Stopped, the next track's first seconds save again, and the sign
+    // goes.
+    assert_eq!(ritornelctl(&data_dir, &["next"]).0, Some(0));
+    until(&data_dir, &["status"], |status| {
+        status["record"]["problems"] == serde_json::json!([])
+    });
+    server.stop();
 }

@@ -1169,6 +1169,7 @@ impl Pipeline {
             entropy,
             checkpoint_every_ms: crate::playback::CHECKPOINT_EVERY_MS,
             fail_at_position_ms: None,
+            fail_saves_after_ms: None,
         };
         let (player, _) = Player::restore(setup, renderer, &server, Some(&library)).unwrap();
         Self {

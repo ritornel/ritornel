@@ -18,12 +18,12 @@ use ritornel_client::{Error, idempotency_key};
 use ritornel_contract::methods::{
     ArtistsImportPictures, ArtistsPictureFolders, HistorySetZones, HistoryZones, JobsCancel,
     JobsList, LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut,
-    LastfmStatusCall, LastfmSync, LibrarySetWatching, ScanStart, ServerStatus as StatusCall,
-    SourcesAdd, SourcesList,
+    LastfmStatusCall, LastfmSync, LibrarySetWatching, RecordDismiss, ScanStart,
+    ServerStatus as StatusCall, SourcesAdd, SourcesList,
 };
 use ritornel_contract::{
-    ErrorCode, Event, Id, ImportPicturesParams, Job, JobCancelParams, JobTarget, KeyParams,
-    LastfmStatus, LastfmSyncParams, Method, NoParams, PictureFolders, ReceiptStatus,
+    DismissParams, ErrorCode, Event, Id, ImportPicturesParams, Job, JobCancelParams, JobTarget,
+    KeyParams, LastfmStatus, LastfmSyncParams, Method, NoParams, PictureFolders, ReceiptStatus,
     ScanStartParams, ScrobblingParams, ServerStatus, SetZonesParams, SignInFinishParams, Source,
     SourcesAddParams, WatchingParams, ZonePeriod,
 };
@@ -51,6 +51,7 @@ pub(crate) enum SigningIn {
 /// A group of the window, which says what went wrong in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Group {
+    Record,
     Library,
     Pictures,
     Account,
@@ -69,6 +70,7 @@ pub(crate) enum Busy {
     Zones,
     Syncing,
     Watching,
+    Dismissing,
 }
 
 /// The zone being added, while its form is open.
@@ -335,6 +337,8 @@ impl Model {
             }
         } else if job.kind == SYNC_JOB && is_ended(&job) {
             self.read_lastfm(cx);
+            // A failed import stops the record, and one that works starts it.
+            self.read_status(cx);
         } else if job.kind == SYNC_JOB
             && let Some(lastfm) = &mut self.lastfm
             && !lastfm.import.running
@@ -526,6 +530,27 @@ impl Model {
             |model, set, _| {
                 if let Some(status) = &mut model.status {
                     status.watch = Some(set.watch);
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// Sets aside the scrobbles that ended unknown or withdrawn so far.
+    pub(crate) fn dismiss_record(&mut self, cx: &mut Context<Self>) {
+        self.doing(
+            Busy::Dismissing,
+            Group::Record,
+            cx,
+            move |net| async move {
+                let params = DismissParams {
+                    idempotency_key: key()?,
+                };
+                Ok(ask::<RecordDismiss>(&net, params).await?)
+            },
+            |model, dismissed, _| {
+                if let Some(status) = &mut model.status {
+                    status.record = Some(dismissed.record);
                 }
             },
         )

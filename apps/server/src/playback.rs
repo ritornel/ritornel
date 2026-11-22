@@ -37,6 +37,9 @@ pub struct PlaybackRun {
     /// For the crash test alone: the server aborts once the playing track
     /// passes this position, without saving anything.
     pub fail_at_position_ms: Option<i64>,
+    /// For the record's tests alone: once the playing track passes this
+    /// position, saving its listen fails, and playback goes on.
+    pub fail_saves_after_ms: Option<i64>,
     /// For the crash test alone: the server aborts once the library has
     /// taken a listen in and before `server.db` lets it go.
     pub fail_after_ingest: bool,
@@ -112,6 +115,7 @@ pub(crate) fn restore(
         entropy: Arc::clone(entropy),
         checkpoint_every_ms: CHECKPOINT_EVERY_MS,
         fail_at_position_ms: run.fail_at_position_ms,
+        fail_saves_after_ms: run.fail_saves_after_ms,
     };
     let (player, crashed) =
         Player::restore(setup, Box::new(renderer), server, library).map_err(crate::Error::Store)?;

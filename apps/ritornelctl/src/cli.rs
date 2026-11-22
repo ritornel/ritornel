@@ -1,7 +1,7 @@
 //! The command line.
 //!
 //! ```text
-//! ritornelctl status [--data-dir <dir>] [--json]
+//! ritornelctl status [--dismiss] [--data-dir <dir>] [--json]
 //! ritornelctl backup [--data-dir <dir>] [--json]
 //! ritornelctl export <folder> [--data-dir <dir>] [--json]
 //! ritornelctl library create [--data-dir <dir>] [--json]
@@ -53,7 +53,7 @@ The command-line client of a Ritornel server. It talks to the server that is
 running on a data directory, and never starts one.
 
 Usage:
-  ritornelctl status [--data-dir <dir>] [--json]
+  ritornelctl status [--dismiss] [--data-dir <dir>] [--json]
   ritornelctl backup [--data-dir <dir>] [--json]
   ritornelctl export <folder> [--data-dir <dir>] [--json]
   ritornelctl library create [--data-dir <dir>] [--json]
@@ -87,7 +87,11 @@ Usage:
 Commands:
   status           Show the running server's ID, name and role, the versions
                    it is built from, the library it holds, the free disk
-                   space, where its logs are and its last backup
+                   space, where its logs are, its last backup, and whether
+                   the listening record advances: each listen saved and
+                   in history, each scrobble answered, each import done.
+                   Scrobbles that ended unanswered or were not sent are
+                   said until --dismiss sets them aside
   backup           Copy the server's databases, with the listening history,
                    into a new folder in the server's backup folder, while
                    it goes on playing. The backup folder is named when the
@@ -338,7 +342,7 @@ struct Cli {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum Command {
-    Status(ServerArgs),
+    Status(StatusArgs),
     Backup(ServerArgs),
     Export(ExportArgs),
     #[command(subcommand)]
@@ -363,6 +367,16 @@ enum Command {
     Show(ShowArgs),
     #[command(subcommand)]
     Lastfm(LastfmCommand),
+}
+
+/// What `status` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct StatusArgs {
+    /// Set aside the scrobbles that ended unknown or withdrawn, first.
+    #[arg(long)]
+    pub(crate) dismiss: bool,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `export` takes.
@@ -770,7 +784,7 @@ mod tests {
     fn a_command_is_parsed_with_its_options_in_any_order() {
         assert_eq!(
             parse(args(&["status"])).unwrap().command,
-            Command::Status(ServerArgs::default())
+            Command::Status(StatusArgs::default())
         );
         let given = || ServerArgs {
             data_dir: Some(PathBuf::from("/srv/ritornel")),
@@ -783,7 +797,10 @@ mod tests {
         ] {
             assert_eq!(
                 parse(args(line)).unwrap().command,
-                Command::Status(given()),
+                Command::Status(StatusArgs {
+                    dismiss: false,
+                    server: given()
+                }),
                 "{line:?}"
             );
         }
@@ -1015,6 +1032,26 @@ mod tests {
                 server: given,
             })
         );
+    }
+
+    #[test]
+    fn status_takes_dismiss_before_or_after_its_other_options() {
+        for line in [
+            &["status", "--dismiss", "--json"][..],
+            &["status", "--json", "--dismiss"],
+        ] {
+            assert_eq!(
+                parse(args(line)).unwrap().command,
+                Command::Status(StatusArgs {
+                    dismiss: true,
+                    server: ServerArgs {
+                        data_dir: None,
+                        json: true
+                    },
+                }),
+                "{line:?}"
+            );
+        }
     }
 
     #[test]

@@ -20,8 +20,8 @@ use ritornel_contract::methods::{
     ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
     PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
     PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
-    RatingsSet, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList, SourcesAdd,
-    SourcesList, SourcesTracks, TracksGet,
+    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList,
+    SourcesAdd, SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -57,6 +57,7 @@ mod media_keys;
 mod pages;
 mod playback;
 mod ratings;
+mod record;
 mod watch;
 
 pub(crate) use backup::record_backup;
@@ -136,6 +137,8 @@ pub(crate) struct Core {
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// Where backups go, once the server has started.
     backups: std::sync::OnceLock<crate::backup::Backups>,
+    /// What the record's sign knows only while the server runs.
+    signs: Mutex<record::Signs>,
     /// The system's media session, once `serve` has started one.
     #[cfg(feature = "media-session")]
     media_session: std::sync::OnceLock<crate::media_session::MediaSession>,
@@ -229,6 +232,7 @@ impl Core {
             lastfm: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
+            signs: Mutex::default(),
             #[cfg(feature = "media-session")]
             media_session: std::sync::OnceLock::new(),
         })
@@ -702,6 +706,9 @@ impl Core {
             HistoryExport::NAME => {
                 run::<HistoryExport>(params, |params| self.history_export(stores, &params))
             }
+            RecordDismiss::NAME => {
+                run::<RecordDismiss>(params, |params| self.record_dismiss(stores, &params))
+            }
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {
                 run::<HistorySetZones>(params, |params| self.history_set_zones(stores, &params))
@@ -811,6 +818,7 @@ impl Core {
             log_path: self.dir.logs().to_string_lossy().into_owned(),
             watch: Some(watch),
             backup: Some(self.backup_status(stores)),
+            record: Some(self.record_status(stores)),
         })
     }
 
@@ -1268,6 +1276,8 @@ mod tests {
                 },
                 // No backup folder is named, so there is no backup.
                 "backup": {},
+                // Nothing has stopped the record.
+                "record": { "problems": [] },
             })
         );
     }
@@ -1313,6 +1323,25 @@ mod tests {
         // Removed since: there is no backup.
         std::fs::remove_dir_all(taken["backup"]["path"].as_str().unwrap()).unwrap();
         assert_eq!(status()["backup"]["last"]["present"], false);
+    }
+
+    #[test]
+    fn dismissing_with_a_library_answers_the_record_and_again_changes_nothing() {
+        let (core, _scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        call(&core, &session, "library.create", Some(key(0xc1))).unwrap();
+        for _ in 0..2 {
+            let dismissed = call(&core, &session, "record.dismiss", Some(key(0xd2))).unwrap();
+            assert_eq!(dismissed["record"], json!({ "problems": [] }));
+        }
+    }
+
+    #[test]
+    fn dismissing_with_no_library_changes_nothing_and_answers_the_record() {
+        let (core, _scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        let dismissed = call(&core, &session, "record.dismiss", Some(key(0xd1))).unwrap();
+        assert_eq!(dismissed["record"], json!({ "problems": [] }));
     }
 
     /// The params of a command with this byte for every byte of its key.
@@ -1495,6 +1524,7 @@ mod tests {
                     entropy: Arc::new(OsEntropy),
                     checkpoint_every_ms: ritornel_engine::playback::CHECKPOINT_EVERY_MS,
                     fail_at_position_ms: None,
+                    fail_saves_after_ms: None,
                 };
                 let renderer = Box::new(OnDemand::new(Output::Null { speed: 1 }));
                 Player::restore(setup, renderer, stores.server(), None)

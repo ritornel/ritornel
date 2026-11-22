@@ -448,6 +448,13 @@ methods! {
     /// writes another, so the receipt is made and not stored.
     HistoryExport: "history.export", Command, needs_full: true,
     HistoryExportParams => HistoryExported;
+
+    /// `record.dismiss`: sets aside the scrobbles that ended unknown or
+    /// withdrawn until now, so that the status stops saying the record has
+    /// stopped for them. A new one says it again. What else stops the
+    /// record ends only when it is put right.
+    RecordDismiss: "record.dismiss", Command, needs_full: true,
+    DismissParams => Dismissed;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -526,7 +533,8 @@ mod tests {
                 "artists.pictureFolders",
                 "library.setWatching",
                 "server.backup",
-                "history.export"
+                "history.export",
+                "record.dismiss"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -568,7 +576,8 @@ mod tests {
                 "artists.pictureFolders",
                 "library.setWatching",
                 "server.backup",
-                "history.export"
+                "history.export",
+                "record.dismiss"
             ]
         );
         // Everything but reading the library and controlling playback

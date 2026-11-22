@@ -281,7 +281,14 @@ impl Core {
             let Some(player) = player.as_mut() else {
                 return Ok((Vec::new(), None));
             };
-            let events = player.tick(&stores.server, library.as_ref())?;
+            let ticked = player.tick(&stores.server, library.as_ref());
+            // The record's sign follows the player's saves, and nothing
+            // else a tick can fail at.
+            match player.save_failing() {
+                Some(why) => self.listen_unsaved(why.to_owned()),
+                None => self.listen_saved(),
+            }
+            let events = ticked?;
             let state = (!events.is_empty()).then(|| player.state());
             Ok((events, state))
         });

@@ -124,6 +124,7 @@ export const METHODS = {
   "library.setWatching": { kind: "command", needsFull: true },
   "server.backup": { kind: "command", needsFull: true },
   "history.export": { kind: "command", needsFull: true },
+  "record.dismiss": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -193,6 +194,7 @@ export type MethodMap = {
   "library.setWatching": { params: WatchingParams; result: WatchingSet };
   "server.backup": { params: BackupParams; result: BackedUp };
   "history.export": { params: HistoryExportParams; result: HistoryExported };
+  "record.dismiss": { params: DismissParams; result: Dismissed };
 };
 
 /** The name of a method. */
@@ -844,6 +846,36 @@ export type Descriptor = {
    * that serves no covers.
    */
   artSizes: Array<number>,
+};
+
+/**
+ * The params of `record.dismiss`.
+ */
+export type DismissParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+};
+
+/**
+ * The result of `record.dismiss`: the receipt, and the record as the
+ * status now says it.
+ */
+export type Dismissed = { record: RecordStatus,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
 };
 
 /**
@@ -3492,6 +3524,47 @@ export type RecordPlayed = {
 };
 
 /**
+ * One thing that has stopped the record advancing, and since when.
+ */
+export type RecordProblem = { kind: RecordProblemKind,
+  /**
+   * When it began, as Unix milliseconds.
+   */
+  since: number,
+  /**
+   * How many listens, scrobbles or imports.
+   */
+  count: number,
+  /**
+   * What the newest said went wrong, as the server or the service put
+   * it. Display text only.
+   */
+  detail?: string,
+  /**
+   * Whether it lasts until `record.dismiss` sets it aside. The others
+   * end when what is wrong is put right.
+   */
+  dismissable: boolean,
+};
+
+/**
+ * What has stopped the record advancing.
+ */
+export type RecordProblemKind = "listen_unsaved" | "listens_undelivered" | "scrobbles_unknown" | "scrobbles_withdrawn" | "import_failed" | "unreadable";
+
+/**
+ * Whether the listening record is advancing: each listen saved and taken
+ * into history, each scrobble answered, each import done. Music can go on
+ * playing while it does not, so this is said wherever the status is.
+ */
+export type RecordStatus = {
+  /**
+   * What is wrong now, oldest first. Empty when the record advances.
+   */
+  problems: Array<RecordProblem>,
+};
+
+/**
  * What kind of record a release group is, as a release-type tag writes it
  * (MusicBrainz's primary type).
  */
@@ -3894,6 +3967,11 @@ export type ServerStatus = {
    * by a server that does not say.
    */
   backup?: BackupStatus,
+  /**
+   * Whether the listening record is advancing, and what has stopped it
+   * if not. Left out by a server that does not say.
+   */
+  record?: RecordStatus,
 };
 
 /**
