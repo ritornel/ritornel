@@ -95,6 +95,34 @@ impl<P: Place> History<P> {
     }
 }
 
+/// When a page kept whole reads the library again. On screen it reads each
+/// change as it comes; behind another, kept for Back, it notes the change
+/// and reads once when it is shown again, so that a long way back does not
+/// read every page in it on every play.
+#[derive(Debug, Default)]
+pub(crate) struct Freshness {
+    behind: bool,
+    /// What changed while behind: `Some(true)` for plays alone.
+    missed: Option<bool>,
+}
+
+impl Freshness {
+    /// A change heard, of plays alone or not: what to read now, if anything.
+    pub(crate) fn heard(&mut self, plays_only: bool) -> Option<bool> {
+        if !self.behind {
+            return Some(plays_only);
+        }
+        self.missed = Some(self.missed.map_or(plays_only, |was| was && plays_only));
+        None
+    }
+
+    /// The page shown again, or put behind another: what to read now.
+    pub(crate) fn shown(&mut self, shown: bool) -> Option<bool> {
+        self.behind = !shown;
+        if shown { self.missed.take() } else { None }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +166,23 @@ mod tests {
         assert!(history.go(Test::Tab(Tab::History)));
         assert!(!history.go(Test::Tab(Tab::History)));
         assert_eq!(history.previous(), Some(&Test::Tab(Tab::Library)));
+    }
+
+    #[test]
+    fn a_page_behind_reads_once_when_it_is_shown_again() {
+        let mut page = Freshness::default();
+        assert_eq!(page.heard(true), Some(true));
+        assert_eq!(page.shown(false), None);
+        assert_eq!(page.heard(true), None);
+        assert_eq!(page.heard(true), None);
+        assert_eq!(page.shown(true), Some(true));
+        assert_eq!(page.shown(true), None);
+        assert_eq!(page.shown(false), None);
+        assert_eq!(page.heard(true), None);
+        assert_eq!(page.heard(false), None);
+        assert_eq!(page.heard(true), None);
+        assert_eq!(page.shown(true), Some(false));
+        assert_eq!(page.heard(false), Some(false));
     }
 
     #[test]

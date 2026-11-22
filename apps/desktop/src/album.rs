@@ -88,6 +88,11 @@ pub(crate) struct Album {
     more_covers: MoreCovers,
     fetches: crate::covers::FetchBag,
     revision: u64,
+    /// Whether it is behind another page, and what it missed there.
+    freshness: crate::stage::Freshness,
+    /// A read of the whole page asked for and not yet in: a read of plays
+    /// alone that overtakes it reads the whole page.
+    whole_wanted: bool,
     reading: Option<Task<()>>,
     problem: Option<String>,
     /// The wall's cover, drawn until the large one comes.
@@ -130,17 +135,27 @@ impl Album {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // When the library changes, what the page shows is read again.
+        // When the library changes, what the page shows is read again, and
+        // through a new session when the server is found again.
         let followed = cx.subscribe(link, |page: &mut Self, _, event: &LinkEvent, cx| {
-            if let LinkEvent::Server(Event::Library(event)) = event
-                && event.library_revision > page.revision
-            {
-                let plays = !event.changed.is_empty()
-                    && event
-                        .changed
-                        .iter()
-                        .all(|change| *change == LibraryChange::Stats);
-                page.read(plays, cx);
+            let plays_only = match event {
+                LinkEvent::Connected(net) => {
+                    page.net = Arc::clone(net);
+                    false
+                }
+                LinkEvent::Server(Event::Library(event))
+                    if event.library_revision > page.revision =>
+                {
+                    !event.changed.is_empty()
+                        && event
+                            .changed
+                            .iter()
+                            .all(|change| *change == LibraryChange::Stats)
+                }
+                _ => return,
+            };
+            if let Some(plays_only) = page.freshness.heard(plays_only) {
+                page.read(plays_only, cx);
             }
         });
         let mut page = Self {
@@ -158,6 +173,8 @@ impl Album {
             more_covers: MoreCovers::default(),
             fetches: crate::covers::FetchBag::default(),
             revision: 0,
+            freshness: crate::stage::Freshness::default(),
+            whole_wanted: false,
             reading: None,
             problem: None,
             small,
@@ -213,9 +230,19 @@ impl Album {
         }
     }
 
+    /// The page shown again, or put behind another: what changed while it
+    /// was behind is read.
+    pub(crate) fn seen(&mut self, seen: bool, cx: &mut Context<Self>) {
+        if let Some(plays_only) = self.freshness.shown(seen) {
+            self.read(plays_only, cx);
+        }
+    }
+
     /// Reads the page, or after a change of plays alone only the album and
     /// your history with it, keeping the row at the foot as it was.
     fn read(&mut self, plays_only: bool, cx: &mut Context<Self>) {
+        let plays_only = plays_only && !self.whole_wanted;
+        self.whole_wanted = !plays_only;
         let client = Arc::clone(&self.net.client);
         let album = self.album;
         let read = self.net.rt().spawn(async move {
@@ -290,7 +317,14 @@ impl Album {
             let answer = read.await;
             this.update(cx, |page, cx| {
                 match answer {
-                    Ok(Ok(read)) => page.took(read, cx),
+                    Ok(Ok(read)) => {
+                        // The records at the foot are what a whole read adds:
+                        // until they come, one is still wanted.
+                        if read.more.is_some() {
+                            page.whole_wanted = false;
+                        }
+                        page.took(read, cx);
+                    }
                     Ok(Err(error)) => {
                         if page.page.is_none() {
                             page.problem = Some(error.to_string());
