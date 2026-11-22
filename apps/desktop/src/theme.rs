@@ -131,34 +131,129 @@ fn hsl(h: f32, s: f32, l: f32) -> [f32; 3] {
     [r + m, g + m, b + m]
 }
 
-/// Painted soft colours, by name and side, and the order they were made in.
-type SoftCache = (
-    std::collections::HashMap<(String, u32), std::sync::Arc<gpui::RenderImage>>,
-    std::collections::VecDeque<(String, u32)>,
-);
+/// Most soft-colour pictures kept while scrolling (never evicting entries
+/// drawn in the current or previous frame).
+const SOFT_CAPACITY: usize = 64;
+/// Soft-colour pictures kept at rest beyond what is still on screen.
+const SOFT_REST_KEEP: usize = 16;
+/// Number of frame ticks an entry is protected after its last use, so calling
+/// `flush_soft` from both the wall and the player bar in the same frame still
+/// shields every visible tile across repaints.
+const SOFT_FRAME_GUARD: u64 = 3;
+
+/// Painted soft colours, by name and side, least recently used first out, and
+/// evicted pictures waiting to be dropped from the sprite atlas.
+#[derive(Default)]
+struct SoftCache {
+    entries: std::collections::HashMap<(String, u32), (std::sync::Arc<gpui::RenderImage>, u64)>,
+    frame: u64,
+    evicted: Vec<std::sync::Arc<gpui::RenderImage>>,
+}
+
+impl SoftCache {
+    fn advance_frame(&mut self) {
+        self.frame += 1;
+    }
+
+    fn get_or_insert(&mut self, name: &str, side: u32) -> std::sync::Arc<gpui::RenderImage> {
+        let key = (name.to_owned(), side);
+        if let Some((image, used)) = self.entries.get_mut(&key) {
+            *used = self.frame;
+            return std::sync::Arc::clone(image);
+        }
+        let image = std::sync::Arc::new(soft_image(name, side));
+        self.entries
+            .insert(key, (std::sync::Arc::clone(&image), self.frame));
+        self.shrink(SOFT_CAPACITY);
+        image
+    }
+
+    /// Evicts the oldest entries that have not been drawn in recent frames
+    /// until at most `keep` entries remain (or only recently drawn entries are left).
+    fn shrink(&mut self, keep: usize) -> usize {
+        if self.entries.len() <= keep {
+            return 0;
+        }
+        let mut order: Vec<(u64, (String, u32))> = self
+            .entries
+            .iter()
+            .filter(|(_, (_, used))| used.saturating_add(SOFT_FRAME_GUARD) < self.frame)
+            .map(|(key, (_, used))| (*used, key.clone()))
+            .collect();
+        order.sort_unstable_by_key(|(used, _)| *used);
+        let remove = self.entries.len() - keep;
+        let mut removed = 0;
+        for (_, key) in order.into_iter().take(remove) {
+            if let Some((image, _)) = self.entries.remove(&key) {
+                self.evicted.push(image);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Takes evicted pictures that nothing else still holds, so they can be
+    /// removed from the sprite atlas without disturbing a copy still in flight.
+    fn take_unshared_evicted(&mut self) -> Vec<std::sync::Arc<gpui::RenderImage>> {
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < self.evicted.len() {
+            let unshared = self
+                .evicted
+                .get(i)
+                .is_some_and(|image| std::sync::Arc::strong_count(image) == 1);
+            if unshared {
+                ready.push(self.evicted.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    }
+}
 
 thread_local! {
     static SOFT: std::cell::RefCell<SoftCache> = Default::default();
 }
 
-/// `soft_image`, kept for the last 160 asked for (a few screens of tiles).
+/// `soft_image`, kept for the most recently used tiles and dropped from the
+/// sprite atlas when evicted (`flush_soft`).
 pub(crate) fn soft_cached(name: &str, side: u32) -> std::sync::Arc<gpui::RenderImage> {
-    SOFT.with(|soft| {
-        let (map, order) = &mut *soft.borrow_mut();
-        let key = (name.to_owned(), side);
-        if let Some(image) = map.get(&key) {
-            return std::sync::Arc::clone(image);
+    SOFT.with(|soft| soft.borrow_mut().get_or_insert(name, side))
+}
+
+/// Advances the soft-cache frame clock and drops any evicted soft-colour
+/// pictures from every window's sprite atlas once no view or flight holds them.
+pub(crate) fn flush_soft(window: &mut gpui::Window, cx: &mut gpui::App) {
+    let gone = SOFT.with(|soft| {
+        let mut cache = soft.borrow_mut();
+        cache.advance_frame();
+        if cache.evicted.is_empty() {
+            return Vec::new();
         }
-        let image = std::sync::Arc::new(soft_image(name, side));
-        map.insert(key.clone(), std::sync::Arc::clone(&image));
-        order.push_back(key);
-        if order.len() > 160
-            && let Some(old) = order.pop_front()
-        {
-            map.remove(&old);
-        }
-        image
-    })
+        cache.take_unshared_evicted()
+    });
+    for image in gone {
+        cx.drop_image(image, Some(window));
+    }
+}
+
+/// At rest, trims cached soft-colour pictures not drawn in recent frames down
+/// to `SOFT_REST_KEEP` and drops evicted ones from every window's sprite atlas.
+pub(crate) fn trim_soft(window: &mut gpui::Window, cx: &mut gpui::App) {
+    let (removed, gone) = SOFT.with(|soft| {
+        let mut cache = soft.borrow_mut();
+        let removed = cache.shrink(SOFT_REST_KEEP);
+        let gone = cache.take_unshared_evicted();
+        (removed, gone)
+    });
+    let dropped = !gone.is_empty();
+    for image in gone {
+        cx.drop_image(image, Some(window));
+    }
+    if removed > 0 || dropped {
+        crate::platform::give_back();
+    }
 }
 
 /// The real client's `soft()` for a record with no cover, drawn: two glows
@@ -241,4 +336,90 @@ pub(crate) fn tinted(hue: u16, saturation: u8) -> Rgba {
 /// deviation itself (`sigma` in its shaders), so CSS's number is halved.
 pub(crate) fn css_shadow(y: f32, blur: f32, color: impl Into<gpui::Hsla>) -> gpui::BoxShadow {
     gpui::BoxShadow::new(gpui::px(0.), gpui::px(y), color.into()).blur_radius(gpui::px(blur / 2.))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn soft_cache_queues_evicted_images_until_unshared() {
+        let mut cache = SoftCache::default();
+        let held = cache.get_or_insert("held", 8);
+        // Move past the frame guard so `held` becomes eligible for eviction.
+        for _ in 0..=SOFT_FRAME_GUARD {
+            cache.advance_frame();
+        }
+        for i in 0..SOFT_CAPACITY {
+            let _ = cache.get_or_insert(&format!("item-{i}"), 8);
+        }
+        assert_eq!(cache.entries.len(), SOFT_CAPACITY);
+        assert_eq!(cache.evicted.len(), 1);
+        // Still held outside the cache, so not ready to drop from the atlas yet.
+        assert!(cache.take_unshared_evicted().is_empty());
+        drop(held);
+        assert_eq!(cache.take_unshared_evicted().len(), 1);
+        assert!(cache.evicted.is_empty());
+    }
+
+    #[test]
+    fn soft_cache_protects_visible_tiles_across_rest_trim_and_wide_frames() {
+        let mut cache = SoftCache::default();
+        // Even more than SOFT_CAPACITY tiles drawn in one frame stay cached
+        // without thrashing within the frame.
+        let wide_count = SOFT_CAPACITY + 10;
+        let ids: Vec<_> = (0..wide_count)
+            .map(|i| cache.get_or_insert(&format!("visible-{i}"), 8).id)
+            .collect();
+        assert_eq!(cache.entries.len(), wide_count);
+        assert!(cache.evicted.is_empty());
+
+        // Simulate stationary repaints (wall + player bar flushing each frame)
+        // with 30 visible soft tiles (> SOFT_REST_KEEP). Trimming before the
+        // wall looks up its tiles must not evict or regenerate any of them.
+        for _ in 0..3 {
+            cache.advance_frame(); // wall flush
+            let _ = cache.shrink(SOFT_REST_KEEP);
+            for (i, expected_id) in ids.iter().enumerate().take(30) {
+                let got = cache.get_or_insert(&format!("visible-{i}"), 8);
+                assert_eq!(got.id, *expected_id);
+            }
+            cache.advance_frame(); // player bar flush
+        }
+
+        // Once off-screen tiles age past the frame guard, trimming evicts them
+        // while keeping the 30 visible tiles intact.
+        for _ in 0..=SOFT_FRAME_GUARD {
+            cache.advance_frame();
+        }
+        // Touch the 30 visible tiles on the current frame, then trim.
+        for (i, expected_id) in ids.iter().enumerate().take(30) {
+            let got = cache.get_or_insert(&format!("visible-{i}"), 8);
+            assert_eq!(got.id, *expected_id);
+        }
+        cache.advance_frame();
+        let _ = cache.shrink(SOFT_REST_KEEP);
+        assert_eq!(cache.entries.len(), 30);
+        assert_eq!(cache.take_unshared_evicted().len(), wide_count - 30);
+    }
+
+    #[test]
+    fn soft_cache_keeps_recently_used_entries_when_trimmed() {
+        let mut cache = SoftCache::default();
+        for i in 0..32 {
+            let _ = cache.get_or_insert(&format!("item-{i}"), 8);
+        }
+        cache.advance_frame();
+        // Touch item-0 on a later frame so it is newer than item-1..31.
+        let kept = cache.get_or_insert("item-0", 8);
+        for _ in 0..=SOFT_FRAME_GUARD {
+            cache.advance_frame();
+        }
+        let removed = cache.shrink(SOFT_REST_KEEP);
+        assert_eq!(removed, 32 - SOFT_REST_KEEP);
+        assert_eq!(cache.entries.len(), SOFT_REST_KEEP);
+        assert!(cache.entries.contains_key(&("item-0".to_owned(), 8)));
+        drop(kept);
+        assert_eq!(cache.take_unshared_evicted().len(), removed);
+    }
 }

@@ -209,6 +209,7 @@ impl PlayerBar {
 
 impl Render for PlayerBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        theme::flush_soft(window, cx);
         let player = self.player.read(cx);
         let state = player.state.clone();
         let track = state.as_ref().and_then(|state| state.track.clone());

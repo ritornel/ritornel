@@ -1711,12 +1711,14 @@ impl Wall {
         self.top = self.top.clamp(0., max);
 
         self.plan(viewport, px_size, started, cx);
+        theme::flush_soft(window, cx);
         // Three seconds at rest, the covers held come down to about two screens.
         if !self.motion.moving(started, Duration::from_secs(3)) && self.fling.is_none() {
             let screen = (viewport / 219. + 1.) * (width / 168.);
             let keep = (screen * 2.) as usize * (px_size as usize).pow(2) * 4;
             let frame = self.frame;
             self.covers.trim(frame, keep, window, cx);
+            theme::trim_soft(window, cx);
         } else if self.trim_wake.is_none() {
             // A frame once the rest has begun, to trim then.
             self.trim_wake = Some(cx.spawn(async move |wall, cx| {

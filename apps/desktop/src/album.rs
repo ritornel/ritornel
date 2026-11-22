@@ -669,15 +669,10 @@ impl Album {
                     .as_ref()
                     .map_or("", |credit| credit.text.as_str())
             );
-            let cover = tile
-                .art_id
-                .and_then(|art| self.more_covers.get(&art).cloned());
-            let soft = theme::soft_cached(&name, (MORE_CARD * scale).ceil() as u32);
             let opened = Arc::new(TileRow::of_album(tile.clone()));
-            let picture = if tile.art_id.is_some() {
-                cover
-            } else {
-                Some(soft)
+            let picture = match tile.art_id {
+                Some(art) => self.more_covers.get(&art).cloned(),
+                None => Some(theme::soft_cached(&name, (MORE_CARD * scale).ceil() as u32)),
             };
             let landings = Rc::clone(&self.landings);
             let lifted = picture.clone();
