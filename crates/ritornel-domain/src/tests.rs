@@ -1404,7 +1404,7 @@ fn a_rerip_can_gain_or_lose_a_disc_marker_in_its_album_title() {
             facts: song(after, 201).facts,
         };
         assert_eq!(
-            judge_replacements(&world.library, &[replacement], &Policy::v2()),
+            judge_replacements(&world.library, &[replacement], &world.policy),
             [true]
         );
     }
@@ -1434,7 +1434,7 @@ fn a_contradictory_disc_on_one_rerip_does_not_decide_another() {
         file_at(1, "Tin Field", "Long Field - Disc 2", Some(3), 201),
     ];
     assert_eq!(
-        judge_replacements(&world.library, &probes, &Policy::v2()),
+        judge_replacements(&world.library, &probes, &world.policy),
         [true, false]
     );
 }
