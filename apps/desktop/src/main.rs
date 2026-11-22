@@ -65,7 +65,7 @@ use crate::shell::Shell;
 use crate::wall::Wall;
 
 struct Args {
-    /// `None`: the data directory `RITORNEL_DATA_DIR` or the system's default names, as the Tauri app's.
+    /// `None`: use `RITORNEL_DATA_DIR` or the system default data directory.
     data_dir: Option<PathBuf>,
     width: f32,
     height: f32,
@@ -322,7 +322,7 @@ fn open_main(
         ..Default::default()
     };
     cx.open_window(options, move |window, cx| {
-        // Light and dark follow the system, as the real app's do.
+        // Light and dark follow the system appearance.
         theme::follow(window.appearance());
         window
             .observe_window_appearance(|window, _| {

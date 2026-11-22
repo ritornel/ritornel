@@ -69,8 +69,7 @@ pub(crate) fn carried(cx: &App) -> Option<&Carried> {
     cx.try_global::<Carrying>().map(|carrying| &carrying.0)
 }
 
-/// A record on a page, carried to Up next as `Record.svelte`'s is: its
-/// songs are read when it lands.
+/// A record on a page, carried to Up next: its songs are read when it lands.
 pub(crate) fn record<E: gpui::StatefulInteractiveElement>(
     element: E,
     tile: &ritornel_contract::AlbumTile,
@@ -157,10 +156,9 @@ fn add_record(
     .detach();
 }
 
-/// The image a carried thing is drawn as under the pointer: its cover, its
-/// name, and how many songs when there are several, as the prototype draws
-/// it (`.dragchip`). The pointer holds it 20 points in from its corner, as
-/// `setDragImage(image, 20, 20)` does.
+/// The drag chip drawn under the pointer: its cover, its name, and how many
+/// songs when there are several. The pointer holds it 20 points in from its
+/// corner.
 pub(crate) struct Chip {
     carried: Carried,
     /// Where the pointer picked up the source, from its corner: the chip is

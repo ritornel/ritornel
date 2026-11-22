@@ -45,7 +45,9 @@ pub struct Payload {
 /// The audio of a file: its hash and what the stream is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Audio {
-    /// The scheme of `hash`. Scheme 1 is the audio-hash spike's.
+    /// The scheme of `hash`. Scheme 1 hashes codec parameters and packet
+    /// payloads with BLAKE3 ("Scanning and audio hashing" in
+    /// docs/internals/identity.md).
     pub hash_scheme: u32,
     /// The audio hash, as 64 hex digits.
     pub hash: String,

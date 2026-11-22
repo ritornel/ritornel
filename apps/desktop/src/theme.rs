@@ -89,7 +89,7 @@ pub(crate) fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
     }
 }
 
-/// A number from a string, the same every time (the real client's `soft`).
+/// Deterministic FNV-1a 32-bit hash over UTF-16 code units.
 pub(crate) fn hash(text: &str) -> u32 {
     let mut value: u32 = 2166136261;
     for unit in text.encode_utf16() {
@@ -99,8 +99,8 @@ pub(crate) fn hash(text: &str) -> u32 {
     value
 }
 
-/// Soft colour from a name, for a tile whose cover has not been seen: the
-/// two hues of the real client's `soft()`, as a top-to-bottom pair.
+/// Soft colour pair (top-to-bottom) derived from a name for a tile whose
+/// cover has not been seen.
 pub(crate) fn soft(name: &str) -> (Hsla, Hsla) {
     let h = hash(name);
     let h1 = (h % 360) as f32;
@@ -276,12 +276,11 @@ pub(crate) fn trim_soft(window: &mut gpui::Window, cx: &mut gpui::App) {
     }
 }
 
-/// The real client's `soft()` for a record with no cover, drawn: two glows
-/// of related hues over a dark ground, as CSS draws its two
-/// `radial-gradient(circle at …)` layers. GPUI has only linear gradients,
-/// so it is painted here, `side` pixels square: the pixels it is drawn at,
-/// since GPUI's atlas has no padding and an image drawn larger than its
-/// pixels takes in its neighbours' along its edges.
+/// Soft placeholder artwork for a record with no cover: two glows of
+/// related hues over a dark ground, approximating two radial gradient
+/// layers. GPUI has only linear gradients, so it is painted here, `side`
+/// pixels square—the exact pixels it is drawn at, since GPUI's atlas has no
+/// padding and an image drawn larger than its pixels bleeds its neighbours.
 pub(crate) fn soft_image(name: &str, side: u32) -> gpui::RenderImage {
     let mut pixels = soft_pixels(name, side);
     // BGRA for GPUI.
@@ -294,8 +293,8 @@ pub(crate) fn soft_image(name: &str, side: u32) -> gpui::RenderImage {
 /// The same soft colour, as RGBA pixels, for blurring as a picture is.
 pub(crate) fn soft_pixels(name: &str, side: u32) -> image::RgbaImage {
     let h = hash(name);
-    // JavaScript's `>>` is a signed shift of the 32 bits, and its `%` keeps
-    // the sign, so these can be negative, as they are in the real client.
+    // Shifted and divided as signed 32-bit values, so these can be negative;
+    // changing that would change every placeholder colour.
     let signed = h as i32;
     let h1 = (h % 360) as f32;
     let h2 = (h1 as i32 + 40 + (signed >> 9) % 80).rem_euclid(360) as f32;
@@ -333,8 +332,8 @@ pub(crate) fn soft_pixels(name: &str, side: u32) -> image::RgbaImage {
     pixels
 }
 
-/// A hue as the deep colour the real client paints a banner with while
-/// its picture loads (`wash.svelte.ts`, `deep`): whatever the palette.
+/// A hue as the deep colour used to paint a banner while its picture loads,
+/// independent of palette.
 pub(crate) fn deep(color: Option<ritornel_contract::ArtColor>) -> Option<Rgba> {
     let color = color?;
     let saturation = f32::from(color.saturation.clamp(18, 58)) / 100.;

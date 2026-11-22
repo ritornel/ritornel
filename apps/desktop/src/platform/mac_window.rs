@@ -1,7 +1,6 @@
-//! What the Settings window asks of AppKit, as the Tauri shell does it
-//! (`src-tauri/src/settings.rs`): its height fitted to the section shown,
-//! keeping its top where it is, and the system's folder picker as a sheet
-//! on it. Also the language a page's `Intl` would write in, and an
+//! AppKit helpers for the Settings window: fitting its height to the
+//! section shown while keeping its top in place, presenting the system's
+//! folder picker as a sheet on it, reading the user's locale, and opening an
 //! appearance held for a developer's pictures.
 //!
 //! Each is run from the run loop rather than inside GPUI's call: a frame

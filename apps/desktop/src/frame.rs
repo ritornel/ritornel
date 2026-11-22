@@ -135,7 +135,7 @@ pub(crate) fn menus(cx: &mut App) {
     };
     cx.set_menus([
         app,
-        // Up Next and Lean Back at Music's keys, as the real app's View menu has them.
+        // Up Next and Lean Back in the View menu.
         Menu::new("View").items([
             MenuItem::action("Up Next", ToggleUpNext),
             MenuItem::action("Lean Back", LeanBack),
@@ -153,11 +153,6 @@ pub(crate) fn menus(cx: &mut App) {
     ]);
 }
 
-/// The title bar, as the real `TitleBar.svelte` has it: a 52-point row in
-/// three columns, the window's buttons and Back and the tabs at the left,
-/// the server's name at the right of the middle, and the search field in a
-/// column of its own, 320 points wide and giving way to 180 in a narrow
-/// window.
 /// Goes to a tab, as clicking it does.
 pub(crate) type OnTab = std::rc::Rc<dyn Fn(Tab, &mut gpui::Window, &mut App)>;
 

@@ -13,7 +13,7 @@ ritornel-domain.workspace = true
 # What a history source hands over: import records, a cursor and loves.
 ritornel-source.workspace = true
 # The audio hash, and the hash a payload and a picture are known by. Pinned
-# exactly, as the audio-hash spike pinned it: the hash is a stored key.
+# exactly because the hash is a stored key.
 blake3 = "=1.8.7"
 # The zone this server is in, by its IANA name, captured on every listen.
 # The domain reads local dates with the same crate; this side only asks the
@@ -42,9 +42,9 @@ serde_json = "1.0.154"
 # SHA-256, for migration checksums and for the hash kept of a session token.
 sha2 = "0.11.1"
 # Demuxes a file without decoding it and reads its tags and pictures. Pinned
-# exactly, with the features the audio-hash spike used: scheme 1 is defined
-# as what this version's demuxers deliver, and a fixture test fails if an
-# upgrade moves any hash. The decoders it brings are what the player needs.
+# exactly: scheme 1 is defined as what this version's demuxers deliver, and
+# a fixture test fails if an upgrade moves any hash. The decoders it brings
+# are what the player needs.
 symphonia = { version = "=0.6.1", features = ["all"] }
 # Covers: decodes the JPEG or PNG a picture is stored as, scales it to a
 # served size and writes it as a JPEG. Only the two formats covers come in.

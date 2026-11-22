@@ -1,5 +1,4 @@
-//! A two-finger swipe to the right is Back, as in the system's own apps:
-//! the Tauri shell's `swipe.rs`, whose rule this is.
+//! A two-finger swipe to the right is Back, as in native macOS apps.
 //!
 //! Each scroll event carries the phase of the fingers' gesture, and
 //! momentum has no phase of its own, so where one swipe ends and the next

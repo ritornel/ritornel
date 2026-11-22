@@ -4,7 +4,7 @@
 //!
 //! Derivation is a pure function of the observations, the corrections, the
 //! listener's zone periods, the current bindings and the policy versions.
-//! M1 builds four of its six steps:
+//! It currently runs four of the six derivation stages:
 //!
 //! 1. **Bind.** Each chain takes the recording and appearance of its first
 //!    listen's source item, through the item's current assignment. No

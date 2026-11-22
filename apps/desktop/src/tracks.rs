@@ -1,7 +1,7 @@
-//! A list of songs (`parts/Tracks.svelte`): an album's tracks, in disc and
-//! track order under a disc's heading when there is more than one, or an
-//! artist's songs on no record, in as many columns as fit. A song by
-//! someone other than the record's artist says whose it is.
+//! A list of songs: an album's tracks, in disc and track order under a
+//! disc's heading when there is more than one, or an artist's songs on no
+//! record, in as many columns as fit. A song by someone other than the
+//! record's artist says whose it is.
 //!
 //! A double-click plays from that row, and the rest of the list follows.
 //! The + plays the song next, and a row can be carried to Up next. The song playing is marked where its number
@@ -420,7 +420,7 @@ impl Tracks {
                     .text_color(theme::ink())
                     .when(current, |title| title.font_weight(FontWeight(650.)))
                     // A song credited otherwise runs on in the same line,
-                    // its credit dim (`.by`), the whole cut short as one.
+                    // its credit dim, the whole cut short as one.
                     .child({
                         let title = song.title.clone().unwrap_or_else(|| "Untitled".to_owned());
                         match by {

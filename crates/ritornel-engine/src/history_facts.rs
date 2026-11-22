@@ -22,7 +22,7 @@ use crate::history_pages::{
 };
 use crate::{Error, Id, LibraryStore};
 
-/// The parts of a day, six hours each from midnight, as the prototype names them.
+/// The parts of a day, six hours each from midnight.
 const PARTS: [&str; 4] = ["late-night", "morning", "afternoon", "evening"];
 /// Fewer plays than this, and a record has no year of its own.
 const YEAR_PLAYS: u64 = 20;
@@ -141,9 +141,8 @@ fn leaning(plays: &[Heard]) -> Option<(usize, u64, u64)> {
     (timed >= PART_PLAYS && 100 * most >= 45 * timed).then_some((part, most, timed))
 }
 
-/// How long before `today` a local date was, as the prototype says it:
-/// "today", "yesterday", "12 days ago", "3 months ago", "a year ago",
-/// "19 years ago".
+/// How long before `today` a local date was: "today", "yesterday", "12 days
+/// ago", "3 months ago", "a year ago", "19 years ago".
 fn ago(date: i64, today: i64) -> Option<String> {
     let (from, to) = (civil(date)?, civil(today)?);
     let years = from.until((Unit::Year, to)).ok()?.get_years();
@@ -169,8 +168,8 @@ fn ago(date: i64, today: i64) -> Option<String> {
 /// The facts about a song and its record, in the order Lean back shows
 /// them: how often the song was played, when the record was first heard,
 /// its year, its time of day, this day in an earlier year, its song played
-/// most, and how long it had gone unplayed. Each is said only where it is
-/// true and worth saying, by the prototype's thresholds.
+/// most, and how long it had gone unplayed. Each is included only where it
+/// meets the relevance thresholds.
 pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
     let mut out = Vec::new();
     let song = &gathered.song;

@@ -1,12 +1,11 @@
-//! A record on a page (`parts/Record.svelte`): its cover, its title on up
-//! to two lines, and a quiet line under it. A click opens its page. A
-//! record with no cover gets soft colour from its name, as a tile does.
+//! A record on a page: its cover, its title on up to two lines, and a quiet
+//! line under it. A click opens its page. A record with no cover gets soft
+//! colour from its name, as a tile does.
 //!
-//! Also your years with an artist or an album as one picture
-//! (`parts/Years.svelte`): one bar a year across your whole history, as tall
-//! as you listened, in one hue borrowed from the artwork, with the year you
-//! played most in full. It is a picture, not a chart: no counts, and
-//! nothing changes under the pointer.
+//! Also your years with an artist or an album as one picture: one bar a year
+//! across your whole history, as tall as you listened, in one hue borrowed
+//! from the artwork, with the year you played most in full. It is a picture,
+//! not a chart: no counts, and nothing changes under the pointer.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -33,9 +32,9 @@ pub(crate) struct Words {
 }
 
 /// Where a page's record covers are, by their record, as last drawn: a
-/// cover clicked travels from there to its page, and back to it on Back
-/// (the real page's `data-land`). The one travelling home is hidden
-/// meanwhile, so that it lands rather than doubles.
+/// cover clicked travels from there to its page, and back to it on Back.
+/// The one travelling home is hidden meanwhile, so that it lands rather
+/// than doubles.
 ///
 /// A record may show twice on a page: on an artist's page, as its cover on
 /// its shelf and small among the records played most. Only the first is
@@ -169,7 +168,7 @@ pub(crate) fn card(id: impl Into<ElementId>, card: Card, window: &Window) -> Sta
                 .size(px(side))
                 .rounded(px(10.))
                 // While its cover travels, nothing of it is left here: not
-                // its ground nor its hairline (the real one is hidden whole).
+                // its ground nor its hairline (the slot is hidden whole).
                 .when(!away, |art| art.bg(theme::fill()))
                 .group_hover(group, |style| style.top(px(-2.)))
                 .when(!away, |art| {

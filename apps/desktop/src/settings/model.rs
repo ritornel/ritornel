@@ -1,7 +1,6 @@
 //! What the Settings window shows, read from the server, and what it asks
-//! the server to do (`settings/model.svelte.ts`). Every change is a command
-//! of the contract, with a key of its own; nothing is kept here that the
-//! server does not hold.
+//! the server to do. Every change is a command of the contract, with a key
+//! of its own; nothing is kept here that the server does not hold.
 //!
 //! It reads everything again each time a connection is ready, and follows
 //! the `jobs` topic for scans and imports as they run. It talks through the
@@ -106,8 +105,8 @@ pub(crate) struct Model {
     pub adding: Option<Adding>,
     /// The sign-in being waited for: dropping it stops the waiting.
     sign_in: Option<Task<()>>,
-    /// Whether nothing is opened outside the app: while a script poses the
-    /// window, as the real app opens no browser while it is measured.
+    /// Suppresses opening external apps (such as a browser) during scripted
+    /// runs.
     pub quiet: bool,
     _link: Subscription,
 }

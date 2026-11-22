@@ -1,7 +1,6 @@
-//! A page with nothing on it yet says so, in the middle and quietly (the
-//! real app's `.blank`, `app.css`): a heading, a sentence, perhaps a button
-//! and a quiet line of facts, 520 points wide at most, 14% of the window
-//! down.
+//! A page with nothing on it yet says so, in the middle and quietly: a
+//! heading, a sentence, perhaps a button and a quiet line of facts, 520
+//! points wide at most, 14% of the window down.
 
 use gpui::{
     AnyElement, App, ClickEvent, FontWeight, HighlightStyle, InteractiveElement, IntoElement,
@@ -14,8 +13,8 @@ use crate::theme;
 /// What a button on a blank page does.
 pub(crate) type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
-/// What a blank page says. `bold` is a part of `text` set in the ink, as
-/// the real page's `<b>` is (a server's name).
+/// What a blank page says. `bold` is a part of `text` set in the ink (for
+/// example a server's name).
 pub(crate) struct Blank {
     pub title: SharedString,
     pub text: SharedString,
@@ -113,8 +112,7 @@ impl Blank {
     }
 }
 
-/// A tab whose page is not built yet: its name, and what will be there
-/// (the real app's `NotBuilt.svelte`).
+/// A tab whose page is not built yet: its name, and what will be there.
 pub(crate) fn not_built(tab: crate::stage::Tab, height: f32) -> AnyElement {
     use crate::stage::Tab;
     let (title, text) = match tab {

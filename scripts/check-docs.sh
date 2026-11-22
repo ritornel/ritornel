@@ -113,7 +113,13 @@ for doc_path in [ROOT / "ARCHITECTURE.md", *sorted((ROOT / "docs").rglob("*.md")
 
 # 2. Validate every `docs/internals/<file>.md` citation and paired heading,
 #    and reject legacy `docs/design/` or `docs/plan.md` citations outside
-#    frozen migration SQL.
+#    already-frozen migration SQL.
+FROZEN_MIGRATIONS = {
+    "crates/ritornel-engine/migrations/library/0001_library.sql",
+    "crates/ritornel-engine/migrations/library/0004_observation_recording_correction.sql",
+    "crates/ritornel-engine/migrations/server/0001_server.sql",
+    "crates/ritornel-engine/migrations/server/0002_hub_link.sql",
+}
 path_re = re.compile(r"docs/internals/([A-Za-z0-9._-]+\.md)")
 legacy_doc_re = re.compile(r"docs/(?:design/[A-Za-z0-9._-]+|plan\.md)")
 after_heading_re = re.compile(r'docs/internals/([A-Za-z0-9._-]+\.md),\s*"([^"]+)"')
@@ -126,7 +132,7 @@ for p in repo_files():
     raw = p.read_text(encoding="utf-8", errors="replace")
     collapsed = collapse_comment_lines(raw, p.suffix)
 
-    if not posix.startswith("crates/ritornel-engine/migrations/"):
+    if posix not in FROZEN_MIGRATIONS:
         for m in legacy_doc_re.finditer(raw):
             errors.append(f"{p}: cites legacy doc {m.group(0)!r} (use docs/internals/)")
 

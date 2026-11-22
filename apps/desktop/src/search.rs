@@ -1,7 +1,6 @@
-//! Search in the title bar (`lib/search.ts`, `frame/TitleBar.svelte`,
-//! `frame/SearchResults.svelte`): what was typed, the results that drop down
-//! under the field, which of them is chosen, and what choosing one does.
-//! The server ranks each kind (`library.search`); this keeps the answers in
+//! Search in the title bar: what was typed, the results that drop down under
+//! the field, which of them is chosen, and what choosing one does. The
+//! server ranks each kind (`library.search`); this keeps the answers in
 //! step with the typing and the keys.
 //!
 //! The results are artists, then records, then songs, a few of each. The
@@ -36,7 +35,7 @@ use crate::wall::TileRow;
 
 /// How long typing pauses before the library is asked.
 const SETTLE: Duration = Duration::from_millis(60);
-/// How many of each kind drop down, as the prototype has it.
+/// How many results of each kind appear in the dropdown.
 const ARTISTS: usize = 3;
 const ALBUMS: usize = 4;
 const SONGS: usize = 5;
@@ -776,7 +775,7 @@ fn empty(text: &'static str) -> impl IntoElement {
         .child(text)
 }
 
-/// The real card's `--shadow`, in each palette.
+/// The dropdown card shadow, in each palette.
 pub(crate) fn shadow() -> Vec<BoxShadow> {
     if theme::dark() {
         vec![

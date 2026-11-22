@@ -1,6 +1,5 @@
-//! Now Playing and the media keys on macOS, through souvlaki, as the Now
-//! Playing spike used it. Handlers run on the main thread's run loop, so
-//! they only forward.
+//! Now Playing and the media keys on macOS, through souvlaki. Handlers run
+//! on the main thread's run loop, so they only forward.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

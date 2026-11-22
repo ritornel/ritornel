@@ -27,7 +27,7 @@ use crate::settings::words::{Clock, Style, when};
 use crate::theme;
 use crate::wall::PLAYER_BAR;
 
-/// The real `clock`: minutes and seconds, the seconds rounded.
+/// Minutes and seconds, with seconds rounded.
 pub(crate) fn clock(ms: u64) -> String {
     let seconds = (ms + 500) / 1000;
     format!("{}:{:02}", seconds / 60, seconds % 60)
@@ -778,9 +778,8 @@ impl Render for PlayerBar {
             .pl(px(14.))
             .pr(px(22.))
             // Over a colour the page borrows, the colour runs on behind the bar.
-            // The real bar blurs it (`blur(30px)`), but nothing scrolls under
-            // the bar: the wash and its veil, already blurred, are all there
-            // is, so seen through they are the same.
+            // Nothing scrolls under the bar: the wash and its veil, already
+            // blurred, are all there is, so no extra backdrop blur is needed.
             .bg(if self.washed {
                 gpui::Rgba {
                     a: 0.72,
@@ -909,7 +908,7 @@ fn now_ms() -> i64 {
 }
 
 /// The notice over the player bar: a pill in the page's ink, centred, that
-/// comes up a short hop and goes by itself (`frame/Toast.svelte`).
+/// comes up a short hop and fades out by itself.
 pub(crate) fn toast(
     text: SharedString,
     since: Instant,

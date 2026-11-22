@@ -78,11 +78,10 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 /// of this contract are a line, a credential and a few headers.
 const MAX_HEAD_BYTES: usize = 16 * 1024;
 
-/// The `Origin` the desktop app's page presents on macOS. Every Tauri app
-/// presents it, so it keeps web pages out and does not say the page is
-/// Ritornel's: the ticket does that ("Query-string credentials and origin
-/// checks" in docs/internals/contract.md). This string is all the server
-/// knows of the desktop's shell.
+/// The legacy webview `Origin` allowed on `/v1/ws` when paired with a
+/// ticket. Keeping this narrow allowlist blocks browser pages while still
+/// requiring a one-time ticket ("Query-string credentials and origin
+/// checks" in docs/internals/contract.md). Native clients send no `Origin`.
 const DESKTOP_ORIGIN: &str = "tauri://localhost";
 
 /// The shortest and the longest nonce the descriptor signs, in bytes.

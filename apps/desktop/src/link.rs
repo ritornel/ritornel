@@ -1,18 +1,16 @@
-//! Finding the server, and finding it again: the GPUI app's part of what
-//! the Tauri shell (`src-tauri/src/lib.rs`, `open_connection`) and the page
-//! (`lib/link.ts`, `lib/client.ts`) do together.
+//! Finding the server, and finding it again ("Workspace and server
+//! connection" in docs/internals/desktop.md).
 //!
-//! The data directory is the one `--data-dir`, `RITORNEL_DATA_DIR` or the
-//! system's default names, as the Tauri app's is. A `ritornel-server` beside
-//! the program is started when none is running, as the app bundle's is
-//! (with `--output` from `RITORNEL_TEST_OUTPUT`); with none beside it, the
-//! app only finds one. Where the server outlives the app
+//! The data directory comes from `--data-dir`, `RITORNEL_DATA_DIR`, or the
+//! system's default. A `ritornel-server` beside the program is started when
+//! none is running (with `--output` from `RITORNEL_TEST_OUTPUT`); with none
+//! beside it, the app only finds one. Where the server outlives the app
 //! (`platform::SERVER_APART`), it is started apart from it, and Quit stops
 //! it, on this run or a later one; elsewhere the launcher holds it, and it
-//! stops when the app ends. While there is no server it keeps looking, a little
-//! less often each time up to every two seconds, and says why in the words
-//! the Tauri app uses; "Look again" looks at once. A session that ends is
-//! "lost", and looked for again.
+//! stops when the app ends. While there is no server it keeps looking, a
+//! little less often each time up to every two seconds, and explains why;
+//! "Look again" looks at once. A session that ends is "lost", and looked
+//! for again.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -29,7 +27,7 @@ use ritornel_contract::Event;
 
 use crate::net::{Net, rt};
 
-/// Why there is no server to talk to: the Tauri page's reasons.
+/// Why there is no server to talk to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Why {
     NotRunning,
@@ -286,9 +284,8 @@ impl Link {
                     let why = Why::of(&failed);
                     link.state = State::Away {
                         why,
-                        // The page says what went wrong only when it is
-                        // none of the known reasons, as the real page does;
-                        // otherwise where it looked.
+                        // Show the error detail only when it is none of the
+                        // known reasons; otherwise show where we looked.
                         message: (why == Why::Failed).then(|| failed.to_string()),
                         data_dir: Some(data_dir),
                     };

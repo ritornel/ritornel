@@ -30,8 +30,8 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 // THE POSSIBILITY OF SUCH DAMAGE.
 
-//! The stretch at either end of a page, as the Tauri app's WebKit page has
-//! it on a Mac: WebKit's `ScrollingEffectsController` (its Mac half) and
+//! The stretch at either end of a page on macOS: WebKit's
+//! `ScrollingEffectsController` (its Mac half) and
 //! `ScrollAnimationRubberBand`, ported for the vertical axis, with the
 //! AppKit functions they call written out from what they return here.
 //!

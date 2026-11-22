@@ -1,11 +1,11 @@
-//! How things move between pages, as the real client settled it
-//! (`lib/motion.ts`, `lib/stage.svelte.ts`): one page leaves before the next
-//! arrives with a short hop; a cover that was clicked travels to its place
-//! on the page it opens, in a fifth of a second and without changing shape;
-//! between an artist and an album the banner holds still and only what it
-//! says changes; arriving at an artist, the banner makes a small entrance
-//! of its own; back among the walls, the artist you were with settles into
-//! place. With the system's Reduce motion on, nothing moves: pages change.
+//! Page transitions ("Frame and navigation" in docs/internals/desktop.md):
+//! one page leaves before the next arrives with a short hop; a cover that
+//! was clicked travels to its place on the page it opens, in a fifth of a
+//! second and without changing shape; between an artist and an album the
+//! banner holds still and only what it says changes; arriving at an artist,
+//! the banner makes a small entrance of its own; back among the walls, the
+//! artist you were with settles into place. With the system's Reduce motion
+//! on, nothing moves: pages change.
 //!
 //! The page that arrives waits, unseen, until it is ready (what it shows
 //! read, and its picture), for a quarter of a second at most; only then does
@@ -18,7 +18,7 @@ use gpui::{Bounds, Pixels};
 
 use crate::shell::bezier;
 
-/// The real client's durations, in milliseconds (`MOTION`).
+/// Transition durations, in milliseconds.
 pub(crate) const LEAVE_MS: f32 = 100.;
 pub(crate) const ARRIVE_MS: f32 = 300.;
 pub(crate) const ARRIVE_DELAY_MS: f32 = 70.;
@@ -60,12 +60,12 @@ pub(crate) fn ease(t: f32) -> f32 {
     bezier(0.25, 0.1, 0.25, 1., t)
 }
 
-/// The prototype's arrival and picture curve.
+/// Arrival and picture easing curve.
 pub(crate) fn arrive_curve(t: f32) -> f32 {
     bezier(0.2, 0.7, 0.2, 1., t)
 }
 
-/// The prototype's flight curve.
+/// Cover flight easing curve.
 pub(crate) fn fly_curve(t: f32) -> f32 {
     bezier(0.3, 0., 0.2, 1., t)
 }

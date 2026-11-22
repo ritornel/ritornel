@@ -1,15 +1,12 @@
-//! What the app remembers on this computer between runs, as the real app
-//! keeps it in its page's local storage (`ritornel.library`,
-//! `ritornel.appearance`, `ritornel.settings.section`): which wall and which
-//! order the Library shows, whether the large letters stand beside the
+//! What the app remembers on this computer between runs: which wall and
+//! which order the Library shows, whether the large letters stand beside the
 //! walls, and the section Settings was last left on. It is the app's own,
 //! not the server's, and lives in the system's place for an app's settings.
 //! Remembering is a convenience: a file that cannot be read or written is
 //! the defaults.
 //!
-//! How the app looks (`Looks`, the real `lib/appearance.svelte.ts`) is also
-//! held for the app's life as a global, so that a change made in Settings
-//! is followed at once in the main window.
+//! How the app looks (`Looks`) is also held for the app's life as a global,
+//! so that a change made in Settings is followed at once in the main window.
 
 use std::path::PathBuf;
 

@@ -1,7 +1,7 @@
-//! The Settings window (`settings/Settings.svelte` and the shell's
-//! `src-tauri/src/settings.rs`): Ritornel › Settings… (⌘,) opens it, a
-//! second window on the app's one connection. There is only ever one;
-//! opening it again brings it forward, and ⌘W closes it for good.
+//! The Settings window ("Queue, context menus, and Settings" in
+//! docs/internals/desktop.md): Ritornel › Settings… (⌘,) opens it, a second
+//! window on the app's one connection. There is only ever one; opening it
+//! again brings it forward, and ⌘W closes it for good.
 //!
 //! It has its title, a toolbar of sections, and the section chosen, as a
 //! Mac settings window has them. It is 640 points wide and as tall as its
@@ -303,8 +303,7 @@ impl Settings {
     /// Shows a section, and remembers it.
     pub(crate) fn go(&mut self, to: Section, cx: &mut Context<Self>) {
         if self.section != to {
-            // The zones' list starts afresh, as the real section does when
-            // it is shown again.
+            // Reset the zones list state whenever the section is revisited.
             self.model.update(cx, |model, _| {
                 model.chosen = None;
                 model.adding = None;

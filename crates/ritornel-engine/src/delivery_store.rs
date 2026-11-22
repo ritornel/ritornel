@@ -116,9 +116,9 @@ pub(crate) const ALREADY_SCROBBLED: &str = "the account already has this play fr
 /// second of `seconds` that is not an echo of ours: one another player
 /// sent. Matched by normalised artist and title, as an echo is. An import
 /// that is part of a play some listen here made, as its echo or beside it,
-/// is that play's, and says nothing of another. This is not grouping by a
-/// window of time, which M3 brings; it only keeps a play from being
-/// scrobbled twice.
+/// is that play's, and says nothing of another. This is not cross-source
+/// grouping by a window of time; it only keeps a play from being scrobbled
+/// twice.
 fn already_scrobbled(
     connection: &Connection,
     endpoint: i64,

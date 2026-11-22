@@ -271,8 +271,8 @@ impl HistoryPage {
         self.hover = self.pointed(at);
     }
 
-    /// A click on the `n`th layer, the newest first, as the real app's
-    /// measure mode dispatches one: with no place, so at the first month.
+    /// Holds the `n`th layer (newest first) as if clicked with no pointer
+    /// position, anchoring the caption at the first month.
     pub(crate) fn hold(&mut self, n: usize) {
         self.held = self
             .drawn
@@ -503,10 +503,9 @@ impl HistoryPage {
     }
 }
 
-/// Words with some set apart, as the real page's `<b>` sets them: in the
-/// ink and at 600. `italic` is a part of them set in italic, as its `<i>`
-/// is. With `pretty`, their size and the room they have, they break across
-/// lines as the real page's `text-wrap: pretty` breaks them (`pretty.rs`).
+/// Words with emphasised spans set in the ink at weight 600, and optional
+/// `italic` spans. With `pretty`, line breaks are chosen across the whole
+/// paragraph (`pretty.rs`).
 fn rich(
     phrases: &[Phrase],
     italic: Option<std::ops::Range<usize>>,
@@ -713,9 +712,8 @@ fn this_day(remembered: &[Remembered], room: f32, window: &Window) -> gpui::Div 
     day
 }
 
-/// A line `ratio` times as tall as its type, as WebKit sets it: it
-/// truncates a computed line height to whole points, so the real page's
-/// lines of 17 points at 1.4 are 23 tall, not 23.8.
+/// A line `ratio` times as tall as its type, truncated to whole points
+/// (17 points at 1.4 is 23 tall, not 23.8).
 fn line(size: f32, ratio: f32) -> Pixels {
     px((size * ratio).floor())
 }

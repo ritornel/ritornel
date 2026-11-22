@@ -21,8 +21,7 @@ use crate::{Error, Id, LibraryStore};
 const DAY_MS: i64 = 86_400_000;
 /// "The last year": the 365 days before now.
 pub(crate) const YEAR_MS: i64 = 365 * DAY_MS;
-/// Not played for this long, a page says so first: two years, as the
-/// prototype has it.
+/// Not played for this long (two years), a page says so first.
 const LONG_AGO_MS: i64 = 2 * YEAR_MS + DAY_MS / 2;
 /// Found this soon after the history begins, an artist was there from your
 /// first weeks.
@@ -214,11 +213,11 @@ impl Said {
 }
 
 /// The one thing worth saying of a listener's history with an artist or
-/// an album, in the prototype's words (`historyLine`): since when, and
-/// then the first of these that is true. Not played for two years, since
-/// when; played mostly in one year that is over, that year; played in the
-/// last year, how much; otherwise when last. `began_ms` is when the
-/// listener's history begins. Nothing at all with no plays.
+/// an album: since when, and then the first of these that is true. Not
+/// played for two years, since when; played mostly in one year that is
+/// over, that year; played in the last year, how much; otherwise when last.
+/// `began_ms` is when the listener's history begins. Nothing at all with no
+/// plays.
 ///
 /// The first and last months are those of the first and last plays in
 /// time, whether they have a local date or not ([`month_of`]).

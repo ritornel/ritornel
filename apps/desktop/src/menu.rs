@@ -6,11 +6,9 @@
 //! GPUI has no context menu of the system's (Zed draws its own); the
 //! system's is `platform::pop_up_menu`.
 //!
-//! The other menus are `lib/menus.ts`'s, built as `lib/menu.ts` builds
-//! them: a song's, an entry of Up next's, the song playing's, a record's
-//! and an artist's. Each
-//! place opens its own with `popup`, and the thing it is on is marked while
-//! it is open, the mark fading in and out (`Marked`).
+//! Context menus cover songs, Up next entries, the playing track, records,
+//! and artists. Each place opens its own with `popup`, and the thing it is
+//! on is marked while it is open, the mark fading in and out (`Marked`).
 
 use std::sync::Arc;
 
@@ -32,7 +30,7 @@ pub(crate) const RECORD: &[Option<&str>] = &[
     Some("Go to Artist"),
 ];
 
-/// An artist's menu (`lib/menus.ts`, `artistMenu`).
+/// An artist's context menu.
 pub(crate) const ARTIST: &[Option<&str>] = &[
     Some("Play Next"),
     Some("Play Last"),

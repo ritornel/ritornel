@@ -50,7 +50,7 @@ define_class!(
     // does not implement Drop.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[name = "RitornelSpikeMenu"]
+    #[name = "RitornelMenu"]
     #[ivars = Ivars]
     struct Target;
 

@@ -1,22 +1,21 @@
-//! An album's page (`pages/Album.svelte`): a reading page of 1,400 points,
-//! centred, that stays about the album. The banner is the artist's banner
-//! to the point (`banner.rs`), with the way back to the artist. The cover
-//! is large and hangs out of the banner at the head of the column at the
-//! right of the tracks: it is drawn twice, the part in the banner by the
-//! banner and the rest by the page, so that the banner can collapse to its
+//! An album's page: a reading page of 1,400 points, centred, that stays
+//! about the album. The banner is the artist's banner to the point
+//! (`banner.rs`), with the way back to the artist. The cover is large and
+//! hangs out of the banner at the head of the column at the right of the
+//! tracks: it is drawn twice, the part in the banner by the banner and the rest by the page, so that the banner can collapse to its
 //! strip and the cover scroll away under it. Under the cover, one picture
 //! of your years with it; the tracks are at the left, by disc when there is
 //! more than one, with the other versions of the record under them. Last,
 //! under a rule, one quiet row of the artist's other records.
 //!
-//! What it reads (`pages/read.ts`): `album.get` and `history.album`, and
-//! the artist's records for the row at the foot, read through a view that
-//! is closed at once. When the library changes it is read again; after a
-//! change of plays alone, only the album and your history with it.
+//! What it reads: `album.get` and `history.album`, and the artist's records
+//! for the row at the foot, read through a view that is closed at once. When
+//! the library changes it is read again; after a change of plays alone, only
+//! the album and your history with it.
 //!
 //! GPUI has no blur for an image, so the banner's and the wash's are made
 //! from the 128-pixel cover (`blur.rs`); a record with no cover has its
-//! soft colours blurred instead, as the real page blurs them.
+//! soft colours blurred instead.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -663,8 +662,7 @@ impl Album {
 
     /// Scrolls the page by `dy` at once, as a script's jump does.
     /// Marks the song search found, to be brought to the middle of the page
-    /// once it is drawn, when it is not in sight already
-    /// (`Tracks.svelte`'s `marked`).
+    /// once it is drawn, when it is not in sight already.
     pub(crate) fn mark(&mut self, song: Id, cx: &mut Context<Self>) {
         self.bring = true;
         self.tracks.update(cx, |tracks, _| tracks.mark = Some(song));

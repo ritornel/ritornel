@@ -10,10 +10,8 @@
 //! at its top they play next, between two songs after the one above, below
 //! them at the end.
 //!
-//! The real card is frosted glass (`backdrop-filter: blur(40px)
-//! saturate(1.5)`). There is no painted imitation of glass, only the
-//! system's own material or a GPUI primitive, and GPUI has no backdrop
-//! blur, so this one has the real card's translucent fill alone.
+//! GPUI has no native backdrop blur, so the card uses a translucent fill
+//! over the simulated frost layer (`frost.rs`).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -49,7 +47,7 @@ pub(crate) const RAIL: f32 = 328.;
 /// over it.
 pub(crate) const ROOM_FOR_CARD: f32 = 1180.;
 /// Its flight in and out: 24 points from the right, fading, in 260 ms and
-/// out in 160 (Svelte's `fly`, eased by `cubicOut`).
+/// out in 160 ms, eased by `cubicOut`.
 pub(crate) const FLY_X: f32 = 24.;
 pub(crate) const FLY_IN_MS: f32 = 260.;
 pub(crate) const FLY_OUT_MS: f32 = 160.;
@@ -71,7 +69,7 @@ pub(crate) fn rail(cx: &gpui::App) -> f32 {
     cx.try_global::<Rail>().map_or(0., |rail| rail.0)
 }
 
-/// Svelte's `cubicOut`.
+/// Cubic ease-out curve.
 pub(crate) fn cubic_out(t: f32) -> f32 {
     1. - (1. - t).powi(3)
 }

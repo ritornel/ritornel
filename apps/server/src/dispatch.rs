@@ -635,9 +635,8 @@ impl Core {
     /// Renames the server, and sends its new status to every session that
     /// subscribed to the `servers` topic.
     ///
-    /// No call of the contract reaches this yet. It is the one thing in this
-    /// milestone that changes a server's status, so it is what the `servers`
-    /// topic is tested with.
+    /// No call of the contract reaches this yet; it is used by tests to
+    /// change a server's status and exercise the `servers` topic.
     pub(crate) fn rename(&self, name: &str) -> Result<(), Error> {
         // The database before the name, as a call takes them: the other
         // order could wait on a call while that call waits on this.

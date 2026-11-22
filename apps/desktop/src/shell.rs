@@ -1,14 +1,13 @@
 //! The window: the frame, the wall or a page in it, the wash borrowed from
 //! the page's cover behind everything, and the cover that travels between
-//! pages. Moving between pages is staged as the real client's
-//! `stage.svelte.ts` stages it (`moves.rs`): the page left fades out under
-//! the one that arrives, which waits to be ready before it hops into place.
-//! Lean back lies over all of it while it is open (`lean.rs`).
+//! pages. Page transitions are staged through `moves.rs`: the page left
+//! fades out under the one that arrives, which waits to be ready before it
+//! hops into place. Lean back lies over all of it while it is open
+//! (`lean.rs`).
 //!
 //! Up next is a card at the right (`upnext.rs`). With room it moves the
 //! page over, and stays as you go about; in a window narrower than 1180
-//! points it lies over the page and closes when you go somewhere
-//! (`App.svelte`).
+//! points it lies over the page and closes when you go somewhere.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -241,7 +240,7 @@ struct Card {
     closing: Option<Instant>,
 }
 
-/// One colour borrowed, as it came up (`frame/Wash.svelte`).
+/// One colour borrowed for the background wash, as it came up.
 struct Tint {
     key: String,
     image: Arc<RenderImage>,
@@ -468,7 +467,7 @@ impl Shell {
 
     /// A page has replaced `left`: it fades out under the one that arrives,
     /// which waits to be ready; between an artist and an album, at their
-    /// tops, the banner holds still (`stage.svelte.ts`, `#move`).
+    /// tops, the banner holds still.
     fn moved(&mut self, left: Shown, left_top: f32, cx: &mut Context<Self>) {
         self.move_frames = vec![Instant::now()];
         // Lying over the page, Up next's card closes when you go somewhere.
@@ -1243,8 +1242,7 @@ fn wash_layer(image: Arc<RenderImage>, opacity: f32, width: f32, height: f32) ->
     // The picture a little larger than the window, so its edges are never seen.
     let side = width.max(height) + 180.;
     let (left, top) = ((width - side) / 2., (height - side) / 2.);
-    // In the light palette the real wash is a little lighter and fainter
-    // (`opacity: 0.8`).
+    // In the light palette the wash is a little lighter and fainter (0.8×).
     let opacity = if theme::dark() {
         opacity
     } else {
@@ -1279,12 +1277,11 @@ const WASH_SIGMA: f32 = 64.;
 const FADE_BANDS: usize = 6;
 const FADE_BAND: f32 = 32.;
 
-/// How much of the wash is missing `d` points in from the window's edge.
-/// WebKit blurs the real wash within the window, so the blur draws in
-/// nothing from beyond each edge: half the wash at the edge itself, nearly
-/// all of it three deviations in. GPUI's picture is blurred with its edges
-/// carried outward, so the fade is laid over it in the window's colour,
-/// which is what shows where the real wash thins.
+/// How much of a bounded Gaussian blur is missing `d` points in from the
+/// window's edge: half the wash at the edge itself, nearly all of it three
+/// deviations in. Because the wash image is blurred with its edges carried
+/// outward, the fade is laid over it in the window's colour to reproduce
+/// the edge falloff.
 fn missing(d: f32) -> f32 {
     // 1 − Φ(d/σ), by Abramowitz and Stegun's 7.1.26 for erf.
     let x = d / (WASH_SIGMA * std::f32::consts::SQRT_2);
@@ -1298,7 +1295,8 @@ fn missing(d: f32) -> f32 {
 
 /// The wash's fade at the window's four edges (`missing`), in bands of the
 /// window's colour: where two edges meet, two bands laid over each other
-/// leave the product of what each lets through, as the real blur does.
+/// leave the product of what each lets through, as a Gaussian blur fades at
+/// a corner.
 fn edge_fade(width: f32, height: f32, bg: gpui::Rgba) -> Vec<AnyElement> {
     let with = |alpha: f32| gpui::Rgba { a: alpha, ..bg };
     let mut bands = Vec::new();
@@ -1383,10 +1381,10 @@ fn edge_fade(width: f32, height: f32, bg: gpui::Rgba) -> Vec<AnyElement> {
     bands
 }
 
-/// The veil the wash is seen through (`frame/Wash.svelte`): the window's
-/// colour, thinnest at the top, its four stops as three bands, as GPUI's
-/// gradients have two. Each band's top and bottom as shares of the window's
-/// height, and its alpha at each.
+/// The veil the wash is seen through: the window's colour, thinnest at the
+/// top, its four stops as three bands, as GPUI's gradients have two. Each
+/// band's top and bottom are shares of the window's height, paired with its
+/// alpha at each.
 const VEIL: [(f32, f32, f32, f32); 3] = [
     (0., 0.38, 0.58, 0.74),
     (0.38, 0.72, 0.74, 0.90),
@@ -1395,9 +1393,9 @@ const VEIL: [(f32, f32, f32, f32); 3] = [
 
 impl Shell {
     /// Up next's card in its place, flying in as it opens and out once it
-    /// closes (Svelte's `fly`: 24 points from the right, fading, eased by
-    /// `cubicOut`); with reduced motion it simply comes and goes. Whether
-    /// it is still flying.
+    /// closes (24 points from the right, fading, eased by `cubicOut`); with
+    /// reduced motion it simply comes and goes. Returns whether it is still
+    /// flying.
     fn card(
         &mut self,
         height: f32,
@@ -1860,7 +1858,7 @@ impl Render for Shell {
             .track_focus(&self.focus)
             .key_context("Ritornel")
             .on_action(cx.listener(|shell, _: &Back, window, cx| shell.back(window, cx)))
-            // Not under Lean back, on its way out included (`App.svelte`).
+            // Disabled while Lean back is open or closing.
             .on_action(cx.listener(|shell, _: &crate::frame::ToggleUpNext, _, cx| {
                 if shell.lean.is_none() {
                     shell.toggle_card(None, cx);
@@ -1879,7 +1877,7 @@ impl Render for Shell {
                 }),
             )
             // Keys for the page on screen: the Library's wall takes letters,
-            // the arrows, Return and Esc (`lib/keys.ts`).
+            // the arrows, Return and Esc.
             .on_key_down(
                 cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
                     // Typing in the search field is the field's.
@@ -1953,7 +1951,7 @@ impl Render for Shell {
                     shell.back(window, cx);
                 }
             }))
-            // The mouse's back button, as in the real app.
+            // The mouse's back button.
             .on_mouse_down(
                 gpui::MouseButton::Navigate(gpui::NavigationDirection::Back),
                 cx.listener(|shell, _, window, cx| shell.back(window, cx)),
@@ -1962,7 +1960,7 @@ impl Render for Shell {
             .size_full()
             .bg(theme::bg())
             .font_family(".SystemUIFont")
-            // The real page's body: 14 points on a line of 1.4. GPUI's own
+            // Base body text: 14 points on a 1.4 line height. GPUI's default
             // line height is taller, and every block of text grows with it.
             .text_size(px(14.))
             .line_height(gpui::relative(1.4))

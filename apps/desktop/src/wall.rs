@@ -1,9 +1,10 @@
-//! The Albums wall, sorted by artist, on the real server.
+//! The Library walls ("Library walls and cover loading" in
+//! docs/internals/desktop.md).
 //!
 //! The wall keeps its own scroll position and draws only the lines of
-//! tiles in view, from scratch each frame, at the real wall's geometry
-//! (`layout.rs`). Rows are read a page of 100 at a time through a view, as
-//! the real client reads them; covers come through `covers.rs`.
+//! tiles in view, from scratch each frame (`layout.rs`). Rows are read a
+//! page of 100 at a time through a server view; covers come through
+//! `covers.rs`.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -34,13 +35,12 @@ use crate::motion::Motion;
 use crate::net::Net;
 use crate::theme;
 
-/// The page's top margin, the name, and the row of controls under it, as
-/// the real Library page has them, scrolling away with the wall.
-/// The 30-point name is set on the body's line of 1.4, so its row is 42.
+/// The page's top margin, heading, and controls row, scrolling away with
+/// the wall. The 30-point heading is set on a 1.4 line height (42 pt).
 pub(crate) const HEADER: f32 = 20. + 42. + 6. + 52. + 14.;
 const FOOT: f32 = 48.;
 const PAGE: usize = 100;
-/// Pages of rows kept: 20,000 rows. The real client keeps 40.
+/// Pages of rows kept in memory (20,000 rows).
 const KEEP_PAGES: usize = 200;
 /// How often the wall's view is used while nothing else reads it. The
 /// server lets a view go once it has gone ten minutes unused, and tells the
@@ -118,7 +118,7 @@ pub(crate) struct Order {
     pub id: &'static str,
 }
 
-/// Each wall's orders, the first being the one it opens in (`walls/library.svelte.ts`).
+/// Each wall's sort orders, the first being the default it opens in.
 /// The Artists wall's one order, and the order a wall opens in when none was chosen.
 const BY_NAME: Order = Order {
     key: SortKey::Name,
@@ -344,7 +344,7 @@ pub(crate) struct Wall {
     pub origin_y: f32,
     /// The tile selected, by typing its name or with the arrow keys: a row
     /// of the view, not the focus, so it outlasts scrolling and a visit to
-    /// its page (`walls/finder.svelte.ts`).
+    /// its page.
     pub selected: Option<Selected>,
     /// The tile whose context menu is open, which wears the ring meanwhile.
     pub menu_open: Option<usize>,
@@ -628,8 +628,8 @@ impl Wall {
         }
     }
 
-    /// Shows another wall, or another order, from its top, as the real
-    /// Library page's controls do; the choice is remembered.
+    /// Shows another wall or sort order from its top; the choice is
+    /// remembered.
     pub(crate) fn choose(&mut self, kind: WallKind, order: Option<Order>, cx: &mut Context<Self>) {
         let order = order.unwrap_or(if kind == self.kind {
             self.order
@@ -682,8 +682,8 @@ impl Wall {
         self.elastic.reset();
     }
 
-    /// Up from an artist's page: the Artists wall, at that artist, who is
-    /// marked for a moment (`pages/Library.svelte`, `reveal`).
+    /// Up from an artist's page: returns to the Artists wall at that artist,
+    /// highlighting their tile briefly.
     pub(crate) fn reveal(&mut self, artist: Id, cx: &mut Context<Self>) {
         if self.kind != WallKind::Artists {
             self.reveal = Some(artist);
@@ -696,7 +696,7 @@ impl Wall {
     /// Marks an artist's tile for a moment: the one you came up from.
     pub(crate) fn mark(&mut self, artist: Id, cx: &mut Context<Self>) {
         crate::debug(format_args!("wall: marking {artist}"));
-        // With Reduce motion, the real ring is not drawn at all.
+        // With Reduce motion, the highlight ring is not drawn at all.
         if crate::platform::reduce_motion() {
             return;
         }
@@ -763,8 +763,8 @@ impl Wall {
     }
 
     /// The index of letters, open under the letter that opened it: quiet,
-    /// small and faint, as the real wall's is; a letter with nothing filed
-    /// under it is faded. Anywhere else puts it away.
+    /// small and faint; a letter with nothing filed under it is faded.
+    /// Clicking anywhere else dismisses it.
     fn index(&self, at: gpui::Point<Pixels>, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let groups: Vec<(String, usize)> = self
             .layout
@@ -837,11 +837,10 @@ impl Wall {
         vec![veil, panel]
     }
 
-    /// A key pressed while the Library is on screen, as the real app routes
-    /// it (`lib/keys.ts`): letters and digits find a name, Backspace takes
-    /// one back, the arrows move the selection, Return or ⌘↓ opens it, the
-    /// menu key opens its menu, and Esc puts the name away, then the
-    /// selection. Whether it was the wall's.
+    /// A key pressed while the Library is on screen: letters and digits find
+    /// a name, Backspace takes one back, the arrows move the selection,
+    /// Return or ⌘↓ opens it, the menu key opens its menu, and Esc puts the
+    /// name away, then the selection. Returns whether the wall consumed it.
     pub(crate) fn key(
         &mut self,
         event: &gpui::KeyDownEvent,
@@ -923,8 +922,7 @@ impl Wall {
     }
 
     /// What has been typed, at the foot of the wall: the name found, the
-    /// part typed in the ink and the rest quieter, or "No match"
-    /// (`pages/Library.svelte`, `.lozenge`).
+    /// part typed in the ink and the rest quieter, or "No match".
     fn lozenge(&self, viewport: f32, rail: f32) -> Option<AnyElement> {
         let (typed, found) = self.shown.as_ref()?;
         let (text, highlights) = match found {
@@ -1171,11 +1169,11 @@ impl Wall {
         }
     }
 
-    /// The server says the view may be out of date (`walls/view.ts`): a
-    /// change that leaves the order as it was is read again in place, the
-    /// old rows staying until the new ones come; one that may reorder it is
-    /// answered by a view that replaces this one, at most once a second,
-    /// keeping the row at the top where it was on screen.
+    /// Called when the server says the view may be out of date: a change
+    /// that leaves the order as it was is read again in place, the old rows
+    /// staying until the new ones come; one that may reorder it is answered
+    /// by a view that replaces this one, at most once a second, keeping the
+    /// row at the top where it was on screen.
     fn heard(&mut self, event: &ritornel_contract::ListEvent, cx: &mut Context<Self>) {
         self.heard_revision = self.heard_revision.max(event.library_revision);
         if self.view_id() != Some(event.view.as_str()) || event.library_revision <= self.revision {
@@ -1949,8 +1947,7 @@ impl Wall {
                 self.top = (HEADER + layout.y_of(index) - screen).max(0.);
             }
         }
-        // Up from an artist's page, their tile in the middle of the screen
-        // (the real wall's `reveal`).
+        // Up from an artist's page, centre their tile on screen.
         if let (Some(index), Some(layout)) = (self.reveal_at, &self.layout) {
             self.reveal_at = None;
             crate::debug(format_args!("wall: revealing row {index}"));
@@ -2261,8 +2258,8 @@ impl Wall {
             .size_full()
             .overflow_hidden()
             .on_scroll(cx.listener(Self::on_scroll))
-            // A press anywhere on the page lets the selection go, but on the
-            // tile selected (which stops it), as the real wall does.
+            // A press anywhere on the page clears the selection unless the
+            // selected tile stops propagation.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|wall, _, _, cx| {
@@ -2378,8 +2375,7 @@ fn name_row(gutter: f32, right: f32, y: f32, count: Option<String>) -> impl Into
 }
 
 impl Wall {
-    /// What the page says instead of the wall, if anything: the Tauri
-    /// app's Library page, word for word.
+    /// What the page says instead of the wall when disconnected or empty.
     fn blank(&self, cx: &mut Context<Self>) -> Option<Blank> {
         let Some(net) = &self.net else {
             let link = self.link.read(cx);
@@ -2490,7 +2486,7 @@ impl Wall {
 impl Wall {
     /// The page's name and how many there are, and one row of controls
     /// under it, which wall at the left and the order at the right, scrolling
-    /// away with the wall (`pages/Library.svelte`).
+    /// away with the wall.
     fn header(&self, gutter: f32, right: f32, y: f32, cx: &mut Context<Self>) -> AnyElement {
         let segment = |kind: WallKind, label: &'static str, on: bool, cx: &mut Context<Self>| {
             let base = div()
@@ -2528,8 +2524,8 @@ impl Wall {
                 .text_color(theme::dim())
                 .child("Sort by")
                 .child(
-                    // A pop-up as wide as its longest order, "Recently added":
-                    // the system's own menu, as the real page's `<select>` is.
+                    // A native pop-up menu as wide as its longest order,
+                    // "Recently added".
                     div()
                         .id("sort")
                         .relative()
@@ -2682,7 +2678,7 @@ fn tile(
         .size(px(side))
         .m(px(-spill))
         .rounded(px(radius))
-        // Under the pointer the art rises 2 points, as the real tile's does.
+        // Under the pointer the art rises 2 points.
         .group_hover(group.clone(), |style| style.top(px(-2.)));
     if !away {
         art = art

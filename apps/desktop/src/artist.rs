@@ -1,7 +1,6 @@
-//! An artist's page (`pages/Artist.svelte`): the banner from edge to edge
-//! made of their picture (`banner.rs`), with their portrait standing clear
-//! at the right, or with none the cover their picture is, and under it
-//! everything of theirs,
+//! An artist's page: the banner from edge to edge made of their picture
+//! (`banner.rs`), with their portrait standing clear at the right (or, with
+//! none, the cover their picture is), and under it everything of theirs,
 //! filed as a discography the way a person who knows the records would:
 //! albums first, then singles, live recordings, collections and rarities,
 //! the records they appear on, and last their songs that are on no record.
@@ -14,10 +13,10 @@
 //! stays as they scroll; otherwise it goes under them. With no plays of
 //! theirs there is none.
 //!
-//! What it reads (`pages/read.ts`): `artist.get`, their records and their
-//! songs on no record as whole lists read through views closed at once,
-//! and `history.artist`; again when the library changes, and after a change
-//! of plays alone only their songs and your history with them.
+//! What it reads: `artist.get`, their records and their songs on no record
+//! as whole lists read through views closed at once, and `history.artist`;
+//! again when the library changes, and after a change of plays alone only
+//! their songs and your history with them.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};

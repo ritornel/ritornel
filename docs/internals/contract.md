@@ -14,7 +14,7 @@ Every RPC call is defined once in `crates/ritornel-contract/src/methods.rs` as a
 
 ## Transport, routes, and authentication
 
-The server exposes a single HTTP/1.1 listener (`apps/server/src/listener.rs`), on loopback or, with `--listen private:<port>`, on the private network (see "Process lifecycle" in docs/internals/server.md), with bounded concurrent connections (`Bounds::max_connections`), header read timeout (`Bounds::header_wait`), and a 16 KiB request header cap (`MAX_HEAD_BYTES`).
+The server exposes a single HTTP/1.1 listener (`apps/server/src/listener.rs`), on loopback or, with `--listen private:<port>`, on the private network (see ["Process lifecycle" in `docs/internals/server.md`](server.md#process-lifecycle)), with bounded concurrent connections (`Bounds::max_connections`), header read timeout (`Bounds::header_wait`), and a 16 KiB request header cap (`MAX_HEAD_BYTES`).
 
 | Route | Method | Auth | Purpose |
 |---|---|---|---|
@@ -33,7 +33,7 @@ All routes except `GET /v1/descriptor` and `POST /v1/link` require authenticatio
 Native clients (`ritornel-desktop-gpui`, `ritornelctl`) authenticate with `Authorization: Bearer <token>`. Clients that cannot attach headers to WebSocket upgrades or `<img>` requests use scoped, memory-only query-string credentials instead of ever placing the session token in a URL:
 
 - **Socket tickets (`apps/server/src/ticket.rs`):** `POST /v1/ticket` issues 32 random bytes (64 lowercase hex digits) valid for one `GET /v1/ws?ticket=<ticket>` upgrade within `Bounds::ticket_life` (default 10 s), capped at 64 waiting tickets (oldest evicted when full). Redeeming a ticket consumes it immediately regardless of whether the upgrade succeeds. `POST /v1/ticket` rejects any request carrying an `Origin` header (`403 Forbidden`), and no route answers CORS preflight (`OPTIONS`), so arbitrary web pages cannot obtain tickets.
-- **Origin check on `/v1/ws`:** A WebSocket upgrade with no `Origin` header (native clients) is allowed. A request carrying an `Origin` header is rejected (`403 Forbidden`) unless it authenticated with a ticket and every `Origin` equals the known desktop webview origin (`tauri://localhost`).
+- **Origin check on `/v1/ws`:** A WebSocket upgrade with no `Origin` header (native clients) is allowed. A request carrying an `Origin` header is rejected (`403 Forbidden`) unless it authenticated with a ticket and every `Origin` equals the legacy webview origin (`tauri://localhost`).
 - **Media tokens (`apps/server/src/media.rs`):** `media.token` returns a session-scoped 64-hex-digit token valid only on `GET /v1/art/...?token=<token>` for the lifetime of that WebSocket session, revoked when the session closes.
 
 ### Link sessions
@@ -152,7 +152,7 @@ Clients gate optional behavior on `PublicDescriptor.capabilities` rather than ve
 
 ## Method summary
 
-All 69 methods are registered in `crates/ritornel-contract/src/methods.rs` (see `contract/contract.ts` for exact field types):
+The methods registered in `crates/ritornel-contract/src/methods.rs`, by area (see `contract/contract.ts` for exact field types):
 
 | Area | Methods |
 |---|---|
