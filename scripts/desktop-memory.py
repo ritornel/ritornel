@@ -20,7 +20,7 @@ import argparse
 import json
 import os
 import platform
-import select
+import re
 import shutil
 import subprocess
 import sys
@@ -274,45 +274,39 @@ def ensure_built_and_invented(root: Path, skip_build: bool) -> tuple[Path, Path,
     return server_bin, gpui_bin, data_dir
 
 
-def start_offscreen_display(root: Path) -> tuple[subprocess.Popen | None, dict[str, str]]:
-    if os.environ.get("RITORNEL_OFFSCREEN") != "1":
-        return None, {}
-    proc = subprocess.Popen(
-        [str(root / "scripts" / "desktop.sh"), "offscreen"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    assert proc.stdout is not None
-    fd = proc.stdout.fileno()
-    deadline = time.monotonic() + 10.0
-    buf = ""
-    while time.monotonic() < deadline:
-        remaining = max(0.0, deadline - time.monotonic())
-        ready, _, _ = select.select([fd], [], [], min(0.25, remaining))
-        if not ready:
-            if proc.poll() is not None:
-                break
-            continue
-        chunk = os.read(fd, 1024).decode("utf-8", errors="replace")
-        if not chunk:
-            break
-        buf += chunk
-        while "\n" in buf:
-            line, buf = buf.split("\n", 1)
-            if line.startswith("offscreen "):
-                parts = line.strip().split()
-                if len(parts) == 4:
-                    return proc, {
-                        "RITORNEL_TEST_DISPLAY": parts[1],
-                        "RITORNEL_TEST_DISPLAY_AT": f"{parts[2]},{parts[3]}",
-                    }
-    proc.terminate()
+def resolve_offscreen_display(
+    root: Path, env: dict[str, str] | None = None
+) -> dict[str, str]:
+    environ = os.environ if env is None else env
+    if environ.get("RITORNEL_TEST_DISPLAY"):
+        return {}
+    if environ.get("RITORNEL_OFFSCREEN") != "1":
+        return {}
     try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    raise RuntimeError("Failed to start offscreen display for RITORNEL_OFFSCREEN=1")
+        res = subprocess.run(
+            [str(root / "scripts" / "desktop.sh"), "offscreen"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=environ,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "Timed out preparing offscreen display for RITORNEL_OFFSCREEN=1"
+        ) from exc
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout).strip()
+        raise RuntimeError(
+            f"Failed to prepare offscreen display for RITORNEL_OFFSCREEN=1: {detail}"
+        )
+    for line in res.stdout.splitlines():
+        match = re.fullmatch(r"offscreen (\d+) (-?\d+) (-?\d+)", line.strip())
+        if match:
+            return {
+                "RITORNEL_TEST_DISPLAY": match.group(1),
+                "RITORNEL_TEST_DISPLAY_AT": f"{match.group(2)},{match.group(3)}",
+            }
+    raise RuntimeError("Failed to parse offscreen display output for RITORNEL_OFFSCREEN=1")
 
 
 def print_summary(result: dict) -> None:
@@ -404,12 +398,11 @@ def main() -> int:
                 )
 
     isolated_home = tempfile.mkdtemp(prefix="ritornel-mem-home-")
-    offscreen_proc = None
     gpui = None
     server = None
     server_log = None
     try:
-        offscreen_proc, display_env = start_offscreen_display(repo_root)
+        display_env = resolve_offscreen_display(repo_root)
 
         server_env = os.environ.copy()
         server_env["RITORNEL_TEST_NO_MEDIA_SESSION"] = "1"
@@ -460,7 +453,7 @@ def main() -> int:
         gpui_env["HOME"] = isolated_home
         if display_env:
             gpui_env.update(display_env)
-        else:
+        elif not os.environ.get("RITORNEL_TEST_DISPLAY"):
             gpui_env.pop("RITORNEL_OFFSCREEN", None)
             gpui_env.pop("RITORNEL_TEST_DISPLAY", None)
             gpui_env.pop("RITORNEL_TEST_DISPLAY_AT", None)
@@ -615,12 +608,6 @@ def main() -> int:
                 server.terminate()
         if server_log is not None:
             server_log.close()
-        if offscreen_proc is not None and offscreen_proc.poll() is None:
-            offscreen_proc.terminate()
-            try:
-                offscreen_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                offscreen_proc.kill()
         shutil.rmtree(isolated_home, ignore_errors=True)
 
 

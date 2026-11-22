@@ -28,15 +28,20 @@
 #                                          with the pinned ffmpeg in
 #                                          apps/desktop/.tones, played
 #                                          into nothing
-#   scripts/desktop.sh offscreen      a display no one sees, for test
-#                                          windows, while it runs: prints
-#                                          `offscreen <id> <x> <y>`
+#   scripts/desktop.sh offscreen      ensure a shared display no one sees
+#                                          is running and print
+#                                          `offscreen <id> <x> <y>`;
+#                                          `offscreen status` checks it and
+#                                          `offscreen stop` removes it
 #
 # With RITORNEL_OFFSCREEN=1, `run` and `tones` open their windows
-# on a display no one sees (`tools/offscreen.m`), out of the Dock and never
+# on that shared display (`tools/offscreen.m`), out of the Dock and never
 # taking the keyboard, so that someone can go on using the Mac meanwhile:
-# an agent's runs always set it. A run that cannot be hidden does not start,
-# so on Linux, which has no such display yet, nothing starts with it.
+# an agent's runs always set it. The display stays up between runs so macOS
+# does not reconfigure screens on every run; `offscreen stop` removes it.
+# A caller that already sets RITORNEL_TEST_DISPLAY keeps its own. A run that
+# cannot be hidden does not start, so on Linux, which has no such display
+# yet, nothing starts with it.
 #
 # It is a Cargo workspace of its own, so that GPUI reaches neither the main
 # workspace's build nor its lock file. It is checked on macOS and Linux; it
@@ -85,35 +90,34 @@ gpui() {
     cargo "$1" --manifest-path "$app/Cargo.toml" "${@:2}"
 }
 
-# The tool that makes a display no one sees, built when it changes.
+# The tool that manages the shared display no one sees, built when it changes.
 offscreen_tool() {
     mkdir -p "$app/target/tools"
     tool=$app/target/tools/offscreen
-    [[ $tool -nt $app/tools/offscreen.m ]] ||
-        clang -fobjc-arc -framework Foundation -framework CoreGraphics \
-            "$app/tools/offscreen.m" -o "$tool"
+    if [[ ! $tool -nt $app/tools/offscreen.m ]]; then
+        local tmp="$tool.$$"
+        clang -Wall -Wextra -fobjc-arc -framework Foundation -framework CoreGraphics \
+            "$app/tools/offscreen.m" -o "$tmp"
+        mv -f "$tmp" "$tool"
+    fi
 }
 
-# hide: with RITORNEL_OFFSCREEN=1, makes that display for as long as this
-# script runs, and tells the app to open its windows on it.
+# hide: with RITORNEL_OFFSCREEN=1, ensures the shared hidden display is running
+# and tells the app to open its windows on it. Leaves a caller-supplied
+# RITORNEL_TEST_DISPLAY untouched.
 hide() {
     [[ ${RITORNEL_OFFSCREEN:-} == 1 ]] || return 0
     mac_only RITORNEL_OFFSCREEN
+    [[ -z ${RITORNEL_TEST_DISPLAY:-} ]] || return 0
     offscreen_tool
-    local said line
-    said=$(mktemp)
-    "$tool" >"$said" &
-    hidden=$!
-    for _ in $(seq 50); do
-        line=$(grep -m1 '^offscreen [0-9]' "$said" || true)
-        [[ -n $line ]] && break
-        kill -0 $hidden 2>/dev/null || break
-        sleep 0.1
-    done
-    rm -f "$said"
-    [[ -n $line ]] || { echo "no display to hide the windows on" >&2; exit 1; }
-    read -r _ id x y <<<"$line"
-    export RITORNEL_TEST_DISPLAY=$id RITORNEL_TEST_DISPLAY_AT=$x,$y
+    local line
+    line=$("$tool")
+    if [[ ! $line =~ ^offscreen\ ([0-9]+)\ (-?[0-9]+)\ (-?[0-9]+)$ ]]; then
+        echo "no display to hide the windows on" >&2
+        exit 1
+    fi
+    export RITORNEL_TEST_DISPLAY=${BASH_REMATCH[1]} \
+        RITORNEL_TEST_DISPLAY_AT=${BASH_REMATCH[2]},${BASH_REMATCH[3]}
 }
 
 # serve: starts a silent server on the invented library, stopped when this
@@ -133,13 +137,14 @@ serve() {
     RITORNEL_TEST_NO_MEDIA_SESSION=1 "$server" serve --owned --data-dir "$data" \
         --listen 127.0.0.1:0 --output null --log-level warn ${RITORNEL_GPUI_SERVE_ARGS:-} <&3 >>"$log" 2> >(tee -a "$log" >&2) &
     served=$!
-    trap 'kill $served ${hidden:-} 2>/dev/null; rm -f "$log"' EXIT
+    trap 'kill $served 2>/dev/null; rm -f "$log"' EXIT
     wait_for_server "$served" "$log" 100
 }
 
 case "${1:-}" in
     check)
         bash "$root/scripts/tests/wait-for-server.sh"
+        bash "$root/scripts/tests/offscreen.sh"
         gpui fmt --check
         gpui clippy --locked --all-targets -- -D warnings
         gpui test --locked
@@ -181,7 +186,8 @@ case "${1:-}" in
     offscreen)
         mac_only "scripts/desktop.sh offscreen"
         offscreen_tool
-        exec "$tool"
+        shift
+        exec "$tool" "$@"
         ;;
     app)
         # The app and the server it starts, side by side in one bundle, as
@@ -212,7 +218,7 @@ case "${1:-}" in
         echo "built $bundle"
         ;;
     *)
-        echo "usage: $0 check | app | run [args] | tones [args] | offscreen" >&2
+        echo "usage: $0 check | app | run [args] | tones [args] | offscreen [status|stop]" >&2
         exit 2
         ;;
 esac
