@@ -123,6 +123,23 @@ pub struct OutputInfo {
     pub sample_rate_hz: u32,
     /// Its channels.
     pub channels: u32,
+    /// What is wrong with it, while something is: it went away, or cannot
+    /// be opened. The player waits, paused where it was, blaming no track,
+    /// and Play tries the output again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub problem: Option<OutputProblem>,
+}
+
+/// What is wrong with the output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct OutputProblem {
+    /// When it first failed, as Unix milliseconds.
+    pub since: i64,
+    /// What it said the last time. Display text only.
+    pub detail: String,
 }
 
 /// Repeat. See "The queue" in docs/design/playback.md.
@@ -448,6 +465,13 @@ pub struct QueueAddParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub expected_revision: Option<u64>,
+    /// Whether to play what was added, from the entry that plays first,
+    /// if the queue was empty when the server made the edit. Left out, or
+    /// with anything in the queue, the player stays as it is, and with
+    /// nothing current waits, stopped, on that entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub play_if_empty: Option<bool>,
 }
 
 /// The params of `queue.remove`.

@@ -25,8 +25,9 @@ pub use audio::{AudioRenderer, OnDemand, Output};
 pub use catalog::TrackDisplay;
 pub use outbox::{Delivered, SendStamps, deliver_listens};
 pub use player::{
-    AddTracks, CHECKPOINT_EVERY_MS, Direction, Done, NowPlaying, Order, Place, PlayTracks, Player,
-    PlayerEvent, PlayerSetup, PlayerState, QueuePage, Request, Settings, Status, Summary,
+    AddTracks, CHECKPOINT_EVERY_MS, Direction, Done, NowPlaying, Order, OutputFailing, Place,
+    PlayTracks, Player, PlayerEvent, PlayerSetup, PlayerState, QueuePage, Request, Settings,
+    Status, Summary,
 };
 pub use queue::Repeat;
 pub use renderer::{End, Event, Format, Progress, RenderError, Renderer};

@@ -1021,6 +1021,9 @@ fn run<M: Method>(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::time::Instant;
+
     use ritornel_contract::{METHODS, Request, RequestId, Topic};
     use ritornel_engine::{OsEntropy, SystemClock};
     use serde_json::json;
@@ -1656,6 +1659,181 @@ mod tests {
         );
         let paused = call(&core, &session, "playback.pause", Some(key(0xc5))).unwrap();
         assert_eq!(paused["commandId"], key(0xc5)["idempotencyKey"]);
+    }
+
+    /// Gives the core a library of these fixtures, scanned, and a player
+    /// playing them. Their entries, in queue order.
+    fn playing(core: &Core, session: &Session, scratch: &Path, files: &[&str]) -> Vec<Id> {
+        call(core, session, "library.create", Some(key(0xd0))).unwrap();
+        let music = scratch.join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio");
+        for file in files {
+            std::fs::copy(fixtures.join(file), music.join(file)).unwrap();
+        }
+        let added = call(
+            core,
+            session,
+            "sources.add",
+            Some(json!({
+                "idempotencyKey": Id::from_bytes([0xd1; 16]).to_string(),
+                "name": "Music",
+                "path": music.display().to_string(),
+            })),
+        )
+        .unwrap();
+        let source = added["source"]["sourceId"].as_str().unwrap();
+        let scan = json!({
+            "idempotencyKey": Id::from_bytes([0xd2; 16]).to_string(),
+            "sourceId": source,
+        });
+        call(core, session, "scan.start", Some(scan)).unwrap();
+        core.with_library(|server, library| {
+            let job = server
+                .claim_job(Id::from_bytes([0xd3; 16]))
+                .unwrap()
+                .unwrap();
+            let row = job.id;
+            ritornel_engine::run_scan(
+                job,
+                server,
+                library,
+                ritornel_engine::ScanSettings::default(),
+            )
+            .unwrap();
+            server
+                .finish_job(row, ritornel_engine::JobState::Succeeded, None)
+                .unwrap();
+        });
+        with_player(core);
+        let path = json!({ "path": music.display().to_string() });
+        let found = call(core, session, "sources.tracks", Some(path)).unwrap();
+        let ids: Vec<Value> = found["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|track| track["appearanceId"].clone())
+            .collect();
+        assert_eq!(ids.len(), files.len(), "{found}");
+        let play = json!({
+            "idempotencyKey": Id::from_bytes([0xd4; 16]).to_string(),
+            "source": { "type": "tracks", "ids": ids },
+        });
+        call(core, session, "playback.play", Some(play)).unwrap();
+        let window = json!({ "limit": 10 });
+        let queue = call(core, session, "queue.window", Some(window)).unwrap();
+        queue["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["entryId"].as_str().unwrap().parse().unwrap())
+            .collect()
+    }
+
+    /// A next that names the entry it was asked from does nothing once the
+    /// player has moved on from it, so a late one cannot skip two.
+    #[cfg(feature = "media-session")]
+    #[test]
+    fn a_media_next_from_an_entry_the_player_has_left_skips_nothing() {
+        let (core, scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        let entries = playing(&core, &session, scratch.path(), &["a.flac", "b.flac"]);
+        let on = || {
+            let state = call(&core, &session, "playback.get", None).unwrap();
+            state["entryId"].as_str().unwrap().parse::<Id>().unwrap()
+        };
+        assert_eq!(on(), entries[0]);
+        core.media_key(crate::media_session::Key::NextFrom(entries[0]));
+        assert_eq!(on(), entries[1]);
+        core.media_key(crate::media_session::Key::NextFrom(entries[0]));
+        assert_eq!(on(), entries[1]);
+    }
+
+    /// `playIfEmpty` plays an empty queue, decided as the server adds, and
+    /// never replaces one that has anything in it.
+    #[test]
+    fn an_add_that_plays_if_empty_plays_an_empty_queue_and_adds_to_any_other() {
+        let (core, scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        playing(&core, &session, scratch.path(), &["a.flac", "b.flac"]);
+        let queue = call(&core, &session, "queue.window", None).unwrap();
+        let tracks: Vec<Value> = queue["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["track"]["appearanceId"].clone())
+            .collect();
+        call(&core, &session, "queue.clear", Some(key(0xe0))).unwrap();
+        let add = |byte: u8, track: &Value| {
+            let params = json!({
+                "idempotencyKey": Id::from_bytes([byte; 16]).to_string(),
+                "source": { "type": "tracks", "ids": [track] },
+                "place": { "type": "next" },
+                "playIfEmpty": true,
+            });
+            call(&core, &session, "queue.add", Some(params)).unwrap();
+            call(&core, &session, "playback.get", None).unwrap()
+        };
+        let first = add(0xe1, &tracks[0]);
+        assert_eq!(
+            (&first["status"], &first["queueLength"]),
+            (&json!("playing"), &json!(1))
+        );
+        let second = add(0xe2, &tracks[1]);
+        assert_eq!(
+            (
+                &second["status"],
+                &second["queueLength"],
+                &second["entryId"]
+            ),
+            (&json!("playing"), &json!(2), &first["entryId"])
+        );
+    }
+
+    /// A tick sends what it did while it still holds the player, so that
+    /// a command carried out just after it cannot be sent first and then be
+    /// overtaken by the tick's older state.
+    #[test]
+    fn a_tick_sends_what_it_did_before_a_command_can_change_the_player() {
+        let (core, scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        playing(&core, &session, scratch.path(), &["a.flac"]);
+        let topics = json!({ "topics": ["playback", "progress"] });
+        call(&core, &session, "events.subscribe", Some(topics)).unwrap();
+        // Long enough for the tick to have something to say.
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        std::thread::scope(|threads| {
+            // Nothing can be sent while this is held: the tick waits to send.
+            let sending = lock(&core.sessions);
+            let ticking = threads.spawn(|| core.tick_player().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while core.player.try_lock().is_ok() {
+                assert!(Instant::now() < deadline, "the tick never took the player");
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            // It holds the player while it waits, so no command comes between.
+            assert!(core.player.try_lock().is_err());
+            let pausing = threads.spawn(|| {
+                call(&core, &session, "playback.pause", Some(key(0xd5))).unwrap();
+            });
+            drop(sending);
+            ticking.join().unwrap();
+            pausing.join().unwrap();
+        });
+        // The newest state is the last one sent.
+        let newest = call(&core, &session, "playback.get", None).unwrap();
+        let last = session
+            .drain()
+            .into_iter()
+            .filter_map(|frame| match frame {
+                Frame::Notification(note) => note.params,
+                _ => None,
+            })
+            .rfind(|event| event["topic"] == "playback")
+            .unwrap();
+        assert_eq!(last["state"], newest);
     }
 
     #[test]

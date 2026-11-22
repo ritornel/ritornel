@@ -14,7 +14,12 @@
 //! registered with the listen it opens or carries on, as it is decided, and
 //! the listens are folded from the output's events alone ([`Recorder`]).
 //! Saving them is a step of its own, and one that fails only puts off the
-//! next.
+//! next: what the player did is still said, and why saving fails is read
+//! with [`Player::save_failing`].
+//!
+//! An output that cannot be opened, or that goes away, is no track's
+//! fault: the player waits, paused where it is, and says why in its state
+//! until play opens the output again.
 //!
 //! The entry that follows is prepared as soon as a track starts, and again
 //! whenever an edit lets it go, and the renderer joins it with no gap
@@ -151,6 +156,8 @@ pub struct PlayerState {
     pub repeat: Repeat,
     /// The output: its name, rate and channels.
     pub output: (String, u32, u32),
+    /// What is wrong with the output, while something is.
+    pub output_failing: Option<OutputFailing>,
     /// The player's own volume, 0 to 1.
     pub volume: f64,
     /// Whether it is muted.
@@ -158,6 +165,16 @@ pub struct PlayerState {
     /// Counts the jumps within an entry that were asked for: a seek, or a
     /// previous that starts the track again. Not kept across a restart.
     pub seeks: u64,
+}
+
+/// The output could not be opened, or went away: since when, and what it
+/// said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputFailing {
+    /// When it first failed, as Unix milliseconds.
+    pub since_ms: i64,
+    /// What it said the last time, for display.
+    pub detail: String,
 }
 
 /// What a command answers with once it has been carried out.
@@ -305,12 +322,12 @@ pub struct Player {
     ran_out: Option<(End, bool)>,
     /// The last span handed down, by its number.
     span: u64,
-    /// Why the last save failed, for the tick to say. The next tries again.
-    unsaved: Option<Error>,
     /// Why saving fails, from the first save that failed until one works:
-    /// what the record's sign says. Unlike `unsaved`, a tick does not take
-    /// it.
+    /// what the record's sign says. The next save tries again.
     save_failing: Option<String>,
+    /// What is wrong with the output, from when it first went or could
+    /// not be opened until a track is opened on it.
+    output_failing: Option<OutputFailing>,
     /// The listen a resume of the current entry continues.
     resume_listen: Option<Id>,
     /// Why the next track loaded starts.
@@ -416,8 +433,8 @@ impl Player {
             progress: Progress::default(),
             ran_out: None,
             span: 0,
-            unsaved: None,
             save_failing: None,
+            output_failing: None,
             resume_listen: session.resume_listen,
             start_reason: StartReason::UserPick,
             listener,
@@ -494,6 +511,7 @@ impl Player {
                 self.renderer.rate(),
                 self.renderer.channels(),
             ),
+            output_failing: self.output_failing.clone(),
             volume: self.volume,
             muted: self.muted,
             seeks: self.seeks,
@@ -647,16 +665,12 @@ impl Player {
         };
         match saved {
             Ok(()) => {
-                self.unsaved = None;
                 self.save_failing = None;
                 if self.recorder.saved(live) {
                     events.push(PlayerEvent::ListenClosed);
                 }
             }
-            Err(error) => {
-                self.save_failing = Some(error.to_string());
-                self.unsaved = Some(error);
-            }
+            Err(error) => self.save_failing = Some(error.to_string()),
         }
     }
 
@@ -743,7 +757,9 @@ impl Player {
 
     /// Opens the current entry at the current position and plays it. An
     /// entry none of whose copies opens is marked failed and the next is
-    /// tried, and the player stops after three such entries in a row.
+    /// tried, and the player stops after three such entries in a row. An
+    /// output that cannot be opened leaves the entry as it is, and the
+    /// player paused on it where it was.
     fn start(
         &mut self,
         server: &ServerStore,
@@ -761,6 +777,7 @@ impl Player {
             match opened {
                 Ok(loaded) => {
                     self.loaded = Some(loaded);
+                    self.output_failing = None;
                     // Before it plays, so that its decoder has the next
                     // before it can reach its end, however short it is.
                     self.prepare_next(server, Some(library))?;
@@ -770,16 +787,16 @@ impl Player {
                     self.last_progress_mono = self.setup.timekeeper.mono_ms();
                     return Ok(());
                 }
+                Err(failure) if failure.is_output() => {
+                    self.output_failed(&failure, events);
+                    return Ok(());
+                }
                 Err(failure) => {
                     events.push(PlayerEvent::Failed {
                         entry: entry.entry_id,
                         reason: failure.to_string(),
                     });
-                    server.mark_failed(entry.row, failure.reason.to_owned())?;
-                    if let Some(failed) = self.current.and_then(|index| self.queue.get_mut(index)) {
-                        failed.failed_reason = Some(failure.reason.to_owned());
-                    }
-                    events.push(PlayerEvent::Queue(self.queue_revision));
+                    self.mark_failed(server, failure.reason, events)?;
                     self.failures_in_a_row += 1;
                     let next = self.current.and_then(|index| self.queue.after(index));
                     // With repeat all the last goes round to the first, as at
@@ -852,6 +869,8 @@ impl Player {
                         rate: self.renderer.rate().max(1),
                     }));
                 }
+                // No other copy opens on an output that does not.
+                Err(error) if error.is_output() => return Ok(Err(error)),
                 Err(error) => failure = error,
             }
         }
@@ -908,6 +927,18 @@ impl Player {
         })
     }
 
+    /// Takes the library's first listener as the one listening, if there
+    /// is none yet: whoever plays is heard as someone.
+    fn find_listener(&mut self, server: &ServerStore, library: &LibraryStore) -> Result<(), Error> {
+        if self.listener.is_none() {
+            self.listener = library.first_listener()?;
+            if let Some(listener) = self.listener {
+                server.set_listener(listener)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Replaces the queue with these tracks and plays the one at `start`.
     /// A listen that was open ends as `replaced`.
     pub fn play(
@@ -940,12 +971,7 @@ impl Player {
         if !known && library.unknown_appearance(&tracks)?.is_some() {
             return Err(Error::NotFound("no such track"));
         }
-        if self.listener.is_none() {
-            self.listener = library.first_listener()?;
-            if let Some(listener) = self.listener {
-                server.set_listener(listener)?;
-            }
-        }
+        self.find_listener(server, library)?;
         let shuffled = shuffle.unwrap_or(self.queue.shuffled());
         let mut random = Random::new(&*self.setup.entropy);
         let start = match start {
@@ -1106,7 +1132,14 @@ impl Player {
     ) -> Result<(), Error> {
         self.seeks += 1;
         let Some(loaded) = self.loaded.clone() else {
-            self.position_ms = position_ms.max(0);
+            // Nothing is open to say how long it is, but the library may
+            // know.
+            let end = self
+                .display
+                .as_ref()
+                .and_then(|track| track.duration_ms)
+                .unwrap_or(i64::MAX);
+            self.position_ms = position_ms.clamp(0, end.max(0));
             return Ok(());
         };
         let target = position_ms.clamp(0, loaded.duration_ms);
@@ -1194,8 +1227,8 @@ impl Player {
 
     /// Takes in what the output did and saves the listens when a save is
     /// due; moves on from a track whose audio ran out, or that went with
-    /// the output; and prepares what follows. A save that failed is said
-    /// here, once all else is done.
+    /// the output; and prepares what follows. A save that fails does not
+    /// stop it, and is not said here: see [`save_failing`](Self::save_failing).
     pub fn tick(
         &mut self,
         server: &ServerStore,
@@ -1210,30 +1243,20 @@ impl Player {
             return Err(Error::FailPoint);
         }
         if self.progress.lost && self.loaded.is_some() {
-            // The output went away: the listen ends there, and the player
-            // waits, paused at that place. Play opens the output again and
-            // continues the listen, as a resume after a restart does.
-            self.leave(server, EndReason::OutputLost, &mut events);
-            self.status = Status::Paused;
-            server.save_place(self.entry_row(), self.position_ms, self.resume_listen)?;
-            if let Some(entry) = self.entry().map(|entry| entry.entry_id) {
-                events.push(PlayerEvent::Failed {
-                    entry,
-                    reason: "output_lost: the output went away".to_owned(),
-                });
-            }
+            let lost = RenderError::new("output", "the output went away");
+            self.lose_output(server, &lost, &mut events)?;
             self.changed(&mut events);
-            return self.ticked(events);
+            return Ok(events);
         }
         match self.ran_out.take() {
             Some((End::Failed(failed), heard)) => {
                 self.leave(server, EndReason::Error, &mut events);
-                if let Some(entry) = self.entry().cloned() {
+                if let Some(entry) = self.entry().map(|entry| entry.entry_id) {
                     if !heard {
-                        server.mark_failed(entry.row, "unreadable".to_owned())?;
+                        self.mark_failed(server, "unreadable", &mut events)?;
                     }
                     events.push(PlayerEvent::Failed {
-                        entry: entry.entry_id,
+                        entry,
                         reason: failed,
                     });
                 }
@@ -1263,20 +1286,66 @@ impl Player {
                 playing: true,
             });
         }
-        self.ticked(events)
+        Ok(events)
     }
 
-    /// The tick's events, or why the last save failed.
-    fn ticked(&mut self, events: Vec<PlayerEvent>) -> Result<Vec<PlayerEvent>, Error> {
-        match self.unsaved.take() {
-            Some(failed) => Err(failed),
-            None => Ok(events),
+    /// Marks the current entry with why it could not be played, here and
+    /// in the store, and says the queue changed.
+    fn mark_failed(
+        &mut self,
+        server: &ServerStore,
+        reason: &str,
+        events: &mut Vec<PlayerEvent>,
+    ) -> Result<(), Error> {
+        let Some(entry) = self.current.and_then(|index| self.queue.get_mut(index)) else {
+            return Ok(());
+        };
+        server.mark_failed(entry.row, reason.to_owned())?;
+        entry.failed_reason = Some(reason.to_owned());
+        events.push(PlayerEvent::Queue(self.queue_revision));
+        Ok(())
+    }
+
+    /// The output went away or could not be opened: no track is to blame,
+    /// so none is marked and the player does not move on. It waits, paused where it
+    /// is, and says why until a track opens on the output again.
+    fn output_failed(&mut self, failure: &RenderError, events: &mut Vec<PlayerEvent>) {
+        self.status = Status::Paused;
+        let since_ms = self
+            .output_failing
+            .as_ref()
+            .map_or_else(|| self.setup.clock.now_ms(), |failing| failing.since_ms);
+        self.output_failing = Some(OutputFailing {
+            since_ms,
+            detail: failure.message.clone(),
+        });
+        if let Some(entry) = self.entry().map(|entry| entry.entry_id) {
+            events.push(PlayerEvent::Failed {
+                entry,
+                reason: failure.to_string(),
+            });
         }
+    }
+
+    /// The output went away, or stopped answering, with a track in hand:
+    /// the listen ends there, and the player waits, paused at that place.
+    /// Play opens the output again and continues the listen, as a resume
+    /// after a restart does.
+    fn lose_output(
+        &mut self,
+        server: &ServerStore,
+        failure: &RenderError,
+        events: &mut Vec<PlayerEvent>,
+    ) -> Result<(), Error> {
+        self.leave(server, EndReason::OutputLost, events);
+        self.output_failed(failure, events);
+        server.save_place(self.entry_row(), self.position_ms, self.resume_listen)
     }
 
     /// The track in hand cannot be played on: what it played is counted
     /// and its listen ends as an error, the entry is marked with why, and
-    /// the player moves on.
+    /// the player moves on. Where the output is what failed, the track is
+    /// not to blame, and the player waits on it instead.
     fn fail_track(
         &mut self,
         server: &ServerStore,
@@ -1284,17 +1353,16 @@ impl Player {
         failure: &RenderError,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
+        if failure.is_output() {
+            return self.lose_output(server, failure, events);
+        }
         self.leave(server, EndReason::Error, events);
-        if let Some(entry) = self.entry().cloned() {
-            server.mark_failed(entry.row, failure.reason.to_owned())?;
-            if let Some(failed) = self.current.and_then(|index| self.queue.get_mut(index)) {
-                failed.failed_reason = Some(failure.reason.to_owned());
-            }
+        if let Some(entry) = self.entry().map(|entry| entry.entry_id) {
             events.push(PlayerEvent::Failed {
-                entry: entry.entry_id,
+                entry,
                 reason: failure.to_string(),
             });
-            events.push(PlayerEvent::Queue(self.queue_revision));
+            self.mark_failed(server, failure.reason, events)?;
         }
         self.advance(false, server, library, events)
     }
@@ -1481,7 +1549,8 @@ impl Player {
 
     /// Stops for a clean shutdown: the open listen ends as `shutdown` and is
     /// what a resume after the restart continues, and the position is
-    /// saved. The output is let go.
+    /// saved. The output is let go. Whether the listens were saved is
+    /// [`save_failing`](Self::save_failing).
     pub fn shutdown(&mut self, server: &ServerStore) -> Result<Vec<PlayerEvent>, Error> {
         let mut events = Vec::new();
         self.sync(server, &mut events);
@@ -1491,6 +1560,6 @@ impl Player {
             self.status = Status::Paused;
             server.save_place(self.entry_row(), self.position_ms, self.resume_listen)?;
         }
-        self.ticked(events)
+        Ok(events)
     }
 }

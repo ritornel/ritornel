@@ -68,6 +68,8 @@ pub(crate) struct Source {
     pub(crate) info: Format,
     /// Packets that would not decode and were passed over.
     pub(crate) bad_packets: u64,
+    /// Whether any packet decoded.
+    decoded: bool,
     samples: Vec<f32>,
     /// Where in `samples` the frames to hand on begin.
     skip: usize,
@@ -445,6 +447,7 @@ impl Source {
                 duration_ms,
             },
             bad_packets: 0,
+            decoded: false,
             #[cfg(test)]
             fails: opened
                 .path
@@ -524,7 +527,8 @@ impl Source {
     }
 
     /// Decodes the next frames. `false` at the end. A packet that will not
-    /// decode is passed over.
+    /// decode is passed over, but a file none of whose packets decodes is
+    /// unreadable, not over.
     pub(crate) fn next(&mut self) -> Result<bool, RenderError> {
         #[cfg(test)]
         if self.fails {
@@ -536,12 +540,12 @@ impl Source {
         loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(packet)) => packet,
-                Ok(None) => return Ok(false),
+                Ok(None) => return self.over(),
                 // A file cut short ends where it is cut.
                 Err(Symphonia::IoError(error))
                     if error.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
-                    return Ok(false);
+                    return self.over();
                 }
                 Err(error) => return Err(RenderError::new("unreadable", error.to_string())),
             };
@@ -554,7 +558,10 @@ impl Source {
             }
             let first = self.frame_of(packet.pts.saturating_add(packet.trim_start));
             let decoded = match self.decoder.decode(&packet) {
-                Ok(decoded) => decoded,
+                Ok(decoded) => {
+                    self.decoded = true;
+                    decoded
+                }
                 Err(Symphonia::DecodeError(_) | Symphonia::IoError(_)) => {
                     self.bad_packets += 1;
                     continue;
@@ -588,6 +595,17 @@ impl Source {
             self.skip = skip * channels;
             return Ok(true);
         }
+    }
+
+    /// The end of the file, once its packets have run out.
+    fn over(&self) -> Result<bool, RenderError> {
+        if self.bad_packets > 0 && !self.decoded {
+            return Err(RenderError::new(
+                "unreadable",
+                format!("none of its {} packets would decode", self.bad_packets),
+            ));
+        }
+        Ok(false)
     }
 }
 
@@ -638,7 +656,8 @@ impl Convert {
                 to.channels,
                 FixedSync::Input,
             )
-            .map_err(|error| RenderError::new("output", error.to_string()))?;
+            // A rate it cannot convert is the track's, not the output's.
+            .map_err(|error| RenderError::new("unsupported_format", error.to_string()))?;
             Some(Box::new(fft))
         };
         let delay = resampler.as_ref().map_or(0, |fft| fft.output_delay());

@@ -1156,13 +1156,14 @@ fn a_close_that_cannot_be_saved_is_kept_whole_and_the_next_save_closes_it_as_it_
     );
 }
 
-/// A second of time on every clock, and a tick, whose error is returned.
-fn second(rig: &mut Rig) -> Result<Vec<super::PlayerEvent>, crate::Error> {
+/// A second of time on every clock, and a tick. Whether its save failed.
+fn second(rig: &mut Rig) -> bool {
     rig.fake.advance(1000);
     rig.clock.set(rig.clock.now_ms() + 1000);
     rig.hub_clock.set(rig.hub_clock.now_ms() + 1000);
     rig.keeper.advance(1000);
-    rig.player.tick(&rig.server, Some(&rig.library))
+    rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    rig.player.save_failing().is_some()
 }
 
 #[test]
@@ -1171,9 +1172,9 @@ fn frames_heard_while_the_listen_cannot_be_written_are_kept_with_its_start() {
     rig.break_writes("BEFORE INSERT ON listen_staging");
     rig.play(0);
     // A second is heard and the listen cannot be written; then it can.
-    assert!(second(&mut rig).is_err());
+    assert!(second(&mut rig));
     rig.heal();
-    second(&mut rig).unwrap();
+    assert!(!second(&mut rig));
     let request = rig.request("playback.stop");
     rig.player.stop(request, &rig.server).unwrap();
     // Two seconds were heard, from when the track began.
@@ -1190,7 +1191,7 @@ fn a_track_left_while_its_listen_cannot_be_written_keeps_what_it_played() {
     let mut rig = Rig::new();
     rig.break_writes("BEFORE INSERT ON listen_staging");
     rig.play(0);
-    assert!(second(&mut rig).is_err());
+    assert!(second(&mut rig));
     // Stopped before the listen could be written: what was heard is kept
     // for the next save.
     let request = rig.request("playback.stop");
@@ -1700,6 +1701,7 @@ impl Rig {
             place,
             context: (ContextKind::Manual, None),
             actor: None,
+            play_if_empty: false,
         };
         self.player
             .add(request, expected, what, &self.server, Some(&self.library))
@@ -2001,6 +2003,7 @@ fn a_replayed_edit_is_answered_from_its_receipt_and_adds_nothing_twice() {
         place: super::Place::Next,
         context: (ContextKind::Manual, None),
         actor: None,
+        play_if_empty: false,
     };
     let first = rig
         .player
@@ -2126,6 +2129,7 @@ fn adding_to_an_empty_queue_selects_the_first_entry_in_the_same_write_as_its_rec
         place: super::Place::Next,
         context: (ContextKind::Manual, None),
         actor: None,
+        play_if_empty: false,
     };
     // Choosing the entry fails, as a crash there would leave it.
     rig.break_writes(
@@ -2685,4 +2689,177 @@ fn no_schedule_of_play_commands_and_ticks_parts_the_player_from_the_output_or_a_
         }));
         assert!(held.is_ok(), "seed {seed}: {steps:?}");
     }
+}
+
+#[test]
+fn an_output_that_cannot_be_opened_pauses_in_place_and_blames_no_song() {
+    let mut rig = Rig::new();
+    rig.play(1);
+    rig.pass(30_000);
+    rig.fake.lose_output();
+    rig.wait(1_000);
+    let lost_at = rig.clock.now_ms();
+    rig.fake.refuse_output(true);
+    // Play tries the output, again and again: the player stays on the
+    // song, where it was, and no song is marked.
+    for _ in 0..4 {
+        rig.resume();
+        rig.wait(60_000);
+    }
+    let state = rig.player.state();
+    assert_eq!(
+        (
+            state.status,
+            state.current.unwrap().index,
+            state.position_ms
+        ),
+        (Status::Paused, 1, 30_000)
+    );
+    assert_eq!(rig.session_position(), 30_000);
+    assert!(rig.queue().iter().all(|(_, _, failed)| failed.is_none()));
+    // It says why, since the output first went.
+    let failing = state.output_failing.unwrap();
+    assert_eq!(failing.since_ms, lost_at);
+    assert_eq!(failing.detail, "no output device is there");
+    // A queue played anew waits on its first song, from its start.
+    rig.play(2);
+    let state = rig.player.state();
+    assert_eq!(
+        (
+            state.status,
+            state.current.unwrap().index,
+            state.position_ms
+        ),
+        (Status::Paused, 2, 0)
+    );
+    assert!(rig.queue().iter().all(|(_, _, failed)| failed.is_none()));
+    // Once it opens, the song plays from where it waited, and the sign goes.
+    rig.fake.refuse_output(false);
+    rig.resume();
+    let state = rig.player.state();
+    assert_eq!(
+        (state.status, state.current.unwrap().index),
+        (Status::Playing, 2)
+    );
+    assert_eq!(state.output_failing, None);
+    assert_eq!(rig.fake.loads().last().unwrap().0, file(2));
+}
+
+#[test]
+fn an_add_to_an_empty_queue_can_play_it_and_one_to_a_queue_never_replaces_it() {
+    let mut rig = Rig::new();
+    let add = |rig: &mut Rig, track: usize, play_if_empty: bool| {
+        let request = rig.request("queue.add");
+        let what = super::AddTracks {
+            tracks: vec![rig.tracks[track]],
+            place: super::Place::Next,
+            context: (ContextKind::Manual, None),
+            actor: None,
+            play_if_empty,
+        };
+        let done = rig
+            .player
+            .add(request, None, what, &rig.server, Some(&rig.library))
+            .unwrap();
+        rig.note(&done.events);
+    };
+    // Left out, the player waits on what was added, as before.
+    add(&mut rig, 0, false);
+    assert_eq!(rig.player.state().status, Status::Stopped);
+    let clear = rig.request("queue.clear");
+    rig.player.clear(clear, None, &rig.server).unwrap();
+    // Asked, an empty queue plays.
+    add(&mut rig, 1, true);
+    rig.tick();
+    let state = rig.player.state();
+    assert_eq!((state.status, state.queue_length), (Status::Playing, 1));
+    assert_eq!(rig.fake.in_hand(), Some(file(1)));
+    assert!(rig.fake.playing());
+    // A second add asking the same, made before its window heard of the
+    // first, goes in after it and changes nothing else.
+    add(&mut rig, 2, true);
+    rig.pass(1_000);
+    let state = rig.player.state();
+    assert_eq!(
+        (
+            state.status,
+            state.current.unwrap().index,
+            state.queue_length
+        ),
+        (Status::Playing, 0, 2)
+    );
+    assert_eq!(rig.fake.in_hand(), Some(file(1)));
+    assert_eq!(
+        rig.queue().iter().map(|entry| entry.1).collect::<Vec<_>>(),
+        [rig.tracks[1], rig.tracks[2]]
+    );
+}
+
+#[test]
+fn a_tick_says_what_it_did_while_saves_fail() {
+    let mut rig = Rig::new();
+    rig.player = Player::restore(
+        PlayerSetup {
+            fail_saves_after_ms: Some(10_000),
+            ..setup(
+                &rig.identity,
+                rig.run,
+                &rig.clock,
+                &rig.keeper,
+                &rig.entropy,
+            )
+        },
+        rig.fake.renderer(),
+        &rig.server,
+        Some(&rig.library),
+    )
+    .unwrap()
+    .0;
+    rig.play(2);
+    // The 25 seconds of the interlude, and on into the next song.
+    let mut moved = None;
+    for _ in 0..30 {
+        rig.fake.advance(1_000);
+        rig.clock.set(rig.clock.now_ms() + 1_000);
+        rig.keeper.advance(1_000);
+        let events = rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+        let index = rig.player.state().current.unwrap().index;
+        if index == 3 && moved.is_none() {
+            moved = Some((
+                events.contains(&super::PlayerEvent::State),
+                rig.player.save_failing().is_some(),
+            ));
+        }
+    }
+    // The tick that moved on said so, though its save failed.
+    assert_eq!(moved, Some((true, true)));
+}
+
+#[test]
+fn a_seek_with_nothing_open_stays_inside_the_song() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    let stop = rig.request("playback.stop");
+    rig.player.stop(stop, &rig.server).unwrap();
+    let (seek, entry) = (rig.request("playback.seek"), rig.entry());
+    rig.player
+        .seek(seek, entry, 600_000, &rig.server, Some(&rig.library))
+        .unwrap();
+    assert_eq!(rig.player.state().position_ms, ALBUM[0].length_ms);
+    assert_eq!(rig.session_position(), ALBUM[0].length_ms);
+}
+
+#[test]
+fn a_song_none_of_which_is_heard_is_marked_at_once_in_the_live_queue() {
+    let mut rig = Rig::new();
+    rig.fake.cut(file(0), 0);
+    rig.play(0);
+    rig.fake.advance(10);
+    let events = rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, super::PlayerEvent::Queue(_)))
+    );
+    assert_eq!(rig.queue()[0].2.as_deref(), Some("unreadable"));
 }

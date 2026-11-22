@@ -40,6 +40,10 @@ pub struct AddTracks {
     pub context: (ContextKind, Option<Id>),
     /// The session that queued them.
     pub actor: Option<Id>,
+    /// Whether to play what plays first of them, if the queue was empty.
+    /// The queue is read as the edit is made, so two adds at once cannot
+    /// both find it empty.
+    pub play_if_empty: bool,
 }
 
 /// The player's settings, each an absolute value; one left out stays as
@@ -380,7 +384,8 @@ impl Player {
     }
 
     /// Adds tracks to the queue. With nothing current, the player waits,
-    /// stopped, on the entry that plays first.
+    /// stopped, on the entry that plays first, or plays it if the queue was
+    /// empty and `play_if_empty` asks.
     pub fn add(
         &mut self,
         request: Request,
@@ -402,6 +407,10 @@ impl Player {
         }
         let mut events = Vec::new();
         self.sync(server, &mut events);
+        let plays = what.play_if_empty && self.queue.len() == 0;
+        if plays {
+            self.find_listener(server, library)?;
+        }
         let at = match what.place {
             Place::Next => Where::After(self.current),
             Place::End => Where::End(self.current),
@@ -448,6 +457,11 @@ impl Player {
             self.display = self.read_display(Some(library));
         }
         events.push(PlayerEvent::Queue(self.queue_revision));
+        if plays {
+            self.start_reason = StartReason::UserPick;
+            self.failures_in_a_row = 0;
+            self.start(server, library, &mut events)?;
+        }
         self.changed(&mut events);
         Ok(Done {
             answer,

@@ -2402,12 +2402,32 @@ export type OutputInfo = {
    * Its channels.
    */
   channels: number,
+  /**
+   * What is wrong with it, while something is: it went away, or cannot
+   * be opened. The player waits, paused where it was, blaming no track,
+   * and Play tries the output again.
+   */
+  problem?: OutputProblem,
 };
 
 /**
  * How an output runs. See decision 5 in docs/design/playback.md.
  */
 export type OutputMode = "shared";
+
+/**
+ * What is wrong with the output.
+ */
+export type OutputProblem = {
+  /**
+   * When it first failed, as Unix milliseconds.
+   */
+  since: number,
+  /**
+   * What it said the last time. Display text only.
+   */
+  detail: string,
+};
 
 /**
  * What made a tags-and-duration distance, each from 0 to 1.
@@ -3249,6 +3269,13 @@ export type QueueAddParams = {
    * past it, the edit is refused with `conflict` and changes nothing.
    */
   expectedRevision?: number,
+  /**
+   * Whether to play what was added, from the entry that plays first,
+   * if the queue was empty when the server made the edit. Left out, or
+   * with anything in the queue, the player stays as it is, and with
+   * nothing current waits, stopped, on that entry.
+   */
+  playIfEmpty?: boolean,
 };
 
 /**

@@ -81,6 +81,9 @@ impl Core {
     pub(crate) fn listen_unsaved(&self, detail: String) {
         let now_ms = self.clock.now_ms();
         let mut signs = lock(&self.signs);
+        if signs.unsaved.is_none() {
+            warn!(error = %detail, "the player cannot save its listens; it tries again");
+        }
         let since = signs.unsaved.as_ref().map_or(now_ms, |(since, _)| *since);
         signs.unsaved = Some((since, detail));
     }

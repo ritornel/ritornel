@@ -128,7 +128,8 @@ pub enum ReplayGain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderError {
     /// What the queue entry is marked with: `unsupported_format`,
-    /// `unreadable`, `missing`, `file_changed` or `output`.
+    /// `unreadable`, `missing` or `file_changed`; or `output`, where the
+    /// output failed and no track is to blame, which marks nothing.
     pub reason: &'static str,
     /// What happened, for the log.
     pub message: String,
@@ -140,6 +141,11 @@ impl RenderError {
             reason,
             message: message.into(),
         }
+    }
+
+    /// Whether the output failed, rather than the track.
+    pub(crate) fn is_output(&self) -> bool {
+        self.reason == "output"
     }
 }
 
@@ -293,6 +299,8 @@ pub(crate) mod fake {
         cuts: HashMap<PathBuf, u64>,
         /// Whether the output went away.
         lost: bool,
+        /// Whether the output cannot be opened.
+        refused: bool,
         /// Files that are no longer what the catalog says, by path.
         replaced: HashMap<PathBuf, FileFacts>,
         /// Whether the file loaded was written to where it is.
@@ -476,6 +484,12 @@ pub(crate) mod fake {
             state.playing = false;
         }
 
+        /// The output cannot be opened while `refused`: every load fails
+        /// as the output's fault.
+        pub(crate) fn refuse_output(&self, refused: bool) {
+            self.state().refused = refused;
+        }
+
         /// The file loaded is written to where it is.
         pub(crate) fn rewrite_loaded(&self) {
             self.state().rewritten = true;
@@ -628,6 +642,9 @@ pub(crate) mod fake {
         ) -> Result<Format, RenderError> {
             self.plays_on();
             let mut state = self.state();
+            if state.refused {
+                return Err(RenderError::new("output", "no output device is there"));
+            }
             let length = Self::length_of(&state, path, facts)?;
             let now = stamp(state.now_ms());
             state.let_go(now);
