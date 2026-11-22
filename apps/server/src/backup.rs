@@ -583,8 +583,8 @@ mod tests {
     }
 
     #[test]
-    fn the_library_in_a_backup_holds_its_scrobbles_back_and_the_library_copied_does_not() {
-        use ritornel_engine::{Held, LibraryStore, WriteRequest};
+    fn a_backup_of_a_library_with_nothing_waiting_to_be_sent_holds_nothing_back() {
+        use ritornel_engine::{LibraryStore, WriteRequest};
         let scratch = Scratch::new();
         let dir = data(&scratch);
         let store = ServerStore::open(&dir.server_db(), Arc::new(SystemClock), Arc::new(OsEntropy))
@@ -616,15 +616,14 @@ mod tests {
         );
         let place = elsewhere(&scratch);
         let taken = backup(&dir, &place, About::default()).unwrap();
+        // With nothing waiting to be sent there is nothing to hold back:
+        // which copy is held, when something waits, is the engine's to test.
         assert_eq!(open(&dir.library_db()).held_for_import().unwrap(), None);
         assert_eq!(
             open(&taken.path.join("library.db"))
                 .held_for_import()
                 .unwrap(),
-            Some(Held {
-                taken_at_ms: AT,
-                since_ms: None
-            })
+            None
         );
         let readme = std::fs::read_to_string(taken.path.join("README.txt")).unwrap();
         assert!(

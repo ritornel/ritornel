@@ -76,8 +76,9 @@ pub(crate) struct Lastfm {
     #[cfg(feature = "lastfm")]
     playing: Slot,
     /// The account nothing is scrobbled for until then, on the monotonic
-    /// clock, because Last.fm said its daily limit was reached or refused a
-    /// request: the plays held back go first when it lifts.
+    /// clock, because Last.fm said its daily limit was reached, refused a
+    /// request or left a batch unanswered: the plays held back go first
+    /// when it lifts.
     #[cfg(feature = "lastfm")]
     paused: std::sync::Mutex<Option<(ritornel_contract::Id, std::time::Instant)>>,
     /// Taken by the scrobbler for each batch and by every change to the
@@ -409,6 +410,11 @@ mod enabled {
     /// change's. A change waits for a batch on its way, and the scrobbler
     /// stops once a change is waiting, so no batch leaves as a session
     /// that has changed since, and a change is never kept waiting long.
+    ///
+    /// A change takes its turn inside a call, which holds the stores for
+    /// reading, and the scrobbler reads the stores during its turn. That is
+    /// safe because nothing waits to write the stores while the scrobbler
+    /// runs: the server stops the scrobbler before it closes them.
     #[derive(Debug, Default)]
     pub(crate) struct Turn {
         lock: std::sync::Mutex<()>,
@@ -443,10 +449,13 @@ mod enabled {
         /// The scrobbler's turn for one batch, unless a change is waiting
         /// or under way.
         fn batch(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
-            if self.changes.load(Ordering::SeqCst) > 0 {
+            let waiting = || self.changes.load(Ordering::SeqCst) > 0;
+            if waiting() {
                 return None;
             }
-            Some(lock(&self.lock))
+            let held = lock(&self.lock);
+            // A change may have begun to wait meanwhile.
+            (!waiting()).then_some(held)
         }
 
         #[cfg(test)]
@@ -806,7 +815,8 @@ mod enabled {
                         // library had waiting that it took are not sent.
                         match core.with_library(|_, library| library.release_hold(account)) {
                             Some(Ok(true)) => {
-                                info!("an import has run since the restore: scrobbling resumes")
+                                info!("an import has run since the restore: scrobbling resumes");
+                                core.wake_scrobbler();
                             }
                             Some(Err(failed)) => {
                                 error!(error = %failed, "scrobbling could not be resumed after an import")
@@ -964,7 +974,8 @@ mod enabled {
         /// The time now.
         pub(crate) now: &'a dyn Fn() -> i64,
         /// Whether nothing is sent for this account for now, after its
-        /// daily limit was met or a request was refused.
+        /// daily limit was met, a request was refused or a batch went
+        /// unanswered.
         pub(crate) paused: &'a dyn Fn(Id) -> bool,
         /// Sends nothing for this account for this long.
         pub(crate) pause: &'a dyn Fn(Id, std::time::Duration),
@@ -990,7 +1001,8 @@ mod enabled {
             let Some(from) = session.scrobble_from_ms.filter(|_| !session.sign_in_again) else {
                 return;
             };
-            // This account met its daily limit or was refused: nothing goes
+            // This account met its daily limit, was refused or went
+            // unanswered: nothing goes
             // until the wait is over, and then the plays held back go first,
             // being the oldest due. Another account signed in since is not
             // held back.

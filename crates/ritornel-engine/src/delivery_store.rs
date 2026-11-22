@@ -693,17 +693,28 @@ impl LibraryStore {
 pub(crate) const HELD_SETTING: &str = "scrobbling.held_until_import";
 
 /// Writes [`HELD_SETTING`] into the library at `connection`, a backup's
-/// copy, taken at `taken_at_ms`. Its revision is the copy's last, since
-/// the copy is not a write of the library's own.
-pub(crate) fn hold_sending(connection: &Connection, taken_at_ms: i64) -> Result<(), Error> {
-    connection.execute(
-        "INSERT INTO library_setting (key, value_json, rev)
-         VALUES (?1, json_object('takenAtMs', ?2),
-                 (SELECT coalesce(max(rev), 0) FROM library_revision))
-         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
-        (HELD_SETTING, taken_at_ms),
+/// copy, taken at `taken_at_ms`, if it has plays waiting to be sent: with
+/// none, there is nothing to send twice. Its revision is the copy's last,
+/// since the copy is not a write of the library's own. Whether it did.
+pub(crate) fn hold_sending(connection: &Connection, taken_at_ms: i64) -> Result<bool, Error> {
+    // A file the server would not open as a library is copied as it is.
+    let is_library: bool = connection.query_row(
+        "SELECT count(*) = 2 FROM sqlite_schema
+         WHERE type = 'table' AND name IN ('library_setting', 'history_delivery')",
+        [],
+        |row| row.get(0),
     )?;
-    Ok(())
+    if !is_library {
+        return Ok(false);
+    }
+    Ok(connection.execute(
+        "INSERT INTO library_setting (key, value_json, rev)
+         SELECT ?1, json_object('takenAtMs', ?2),
+                (SELECT coalesce(max(rev), 0) FROM library_revision)
+         WHERE EXISTS (SELECT 1 FROM history_delivery WHERE state = 'pending')
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev",
+        (HELD_SETTING, taken_at_ms),
+    )? > 0)
 }
 
 /// Scrobbling held back after a restore, until an import has run.

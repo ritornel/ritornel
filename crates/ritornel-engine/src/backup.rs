@@ -110,25 +110,20 @@ pub fn copy_database(from: &Path, to: &Path) -> Result<(), Error> {
 }
 
 /// Holds back scrobbling in `copy`, a backup's copy of a library taken at
-/// `taken_at_ms`, for as long as it is not put back: a server that opens
+/// `taken_at_ms`, if it has plays waiting to be sent: a server that opens
 /// it sends nothing until an import has brought back what the service took
 /// after the backup. The library copied is not changed. The copy is synced
-/// and checked again, as [`copy_database`] leaves it.
-pub fn hold_sending(copy: &Path, taken_at_ms: i64) -> Result<(), Error> {
+/// again, as [`copy_database`] leaves it. Whether it was held.
+pub fn hold_sending(copy: &Path, taken_at_ms: i64) -> Result<bool, Error> {
     let connection = Location::File(copy.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    crate::delivery_store::hold_sending(&connection, taken_at_ms)?;
-    let verdict: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    let held = crate::delivery_store::hold_sending(&connection, taken_at_ms)?;
     drop(connection);
     std::fs::OpenOptions::new()
         .write(true)
         .open(copy)
         .and_then(|file| file.sync_all())
         .map_err(Error::Io)?;
-    if verdict == "ok" {
-        Ok(())
-    } else {
-        Err(Error::Corrupt("the copy failed SQLite's quick check"))
-    }
+    Ok(held)
 }
 
 #[cfg(test)]
@@ -230,9 +225,25 @@ mod tests {
             Arc::new(OsEntropy),
         )
         .unwrap();
+        // With nothing waiting to be sent, a copy is not held.
+        let idle = scratch.0.join("idle.db");
+        copy_database(&path, &idle).unwrap();
+        assert!(!hold_sending(&idle, 1_762_000_000_000).unwrap());
+        // A play waiting to be sent, written straight into the file: what
+        // made it does not matter here.
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.pragma_update(None, "foreign_keys", false).unwrap();
+        raw.execute(
+            "INSERT INTO history_delivery (observation_id, endpoint_id, state, sent_timestamp_s,
+                                           artist, title, created_at_ms, updated_at_ms, rev)
+             VALUES (1, 1, 'pending', 1762000000, 'Invented Artist', 'Invented Song', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(raw);
         let copy = scratch.0.join("copy.db");
         copy_database(&path, &copy).unwrap();
-        hold_sending(&copy, 1_762_000_000_000).unwrap();
+        assert!(hold_sending(&copy, 1_762_000_000_000).unwrap());
         // The library copied is not held.
         assert_eq!(library.held_for_import().unwrap(), None);
         drop(library);

@@ -224,9 +224,13 @@ mod enabled {
                 account: session.as_ref().map(|s| s.account_name.clone()),
                 sign_in_again: session.as_ref().is_some_and(|s| s.sign_in_again),
                 scrobbling_since,
-                // Said only while it holds something back.
+                // Said only while it holds something back: not while a new
+                // sign-in holds everything back anyway.
                 waiting_for_import_since: held
-                    .filter(|_| scrobbling_since.is_some())
+                    .filter(|_| {
+                        scrobbling_since.is_some()
+                            && !session.as_ref().is_some_and(|s| s.sign_in_again)
+                    })
                     .and_then(|held| held.since_ms),
                 deliveries,
                 imported,

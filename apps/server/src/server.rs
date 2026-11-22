@@ -332,6 +332,7 @@ impl Server {
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
         // The scrobbler ends after the batch it is sending.
         let scrobbler = self.scrobbler;
+        // Before the stores close: see `lastfm::Turn`.
         tokio::task::spawn_blocking(move || scrobbler.stop())
             .await
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;

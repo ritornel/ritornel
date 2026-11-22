@@ -100,8 +100,8 @@ pub fn then(problem: &RecordProblem, words: Words<'_>) -> String {
         ),
         RecordProblemKind::SignInNeeded => format!(
             "Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. {sign_in} \
-             Signed in to the same account, Ritornel sends the plays waiting since; they stay \
-             in your history here either way."
+             If you sign in to the same account, Ritornel sends the plays waiting since then; \
+             they stay in your history here either way."
         ),
         RecordProblemKind::ImportFailed => format!(
             "Ritornel tries again at the next import. If it keeps failing, check the internet \
@@ -186,7 +186,7 @@ mod tests {
         );
         let sign_in = then(&problem(RecordProblemKind::SignInNeeded, 1), cli);
         assert!(
-            sign_in.contains("`ritornelctl lastfm signin`. Signed in to the same account"),
+            sign_in.contains("`ritornelctl lastfm signin`. If you sign in to the same account"),
             "{sign_in}"
         );
     }
