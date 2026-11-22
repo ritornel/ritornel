@@ -233,35 +233,37 @@ async fn scan(
     Ok(Some(scrobbles))
 }
 
-/// Only a complete list may replace the saved loved tracks.
-fn loved_page_complete(
-    read: u64,
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LovedPaging {
     total: u64,
-    empty: bool,
-    last: bool,
-    number: u32,
+    pages: u32,
     per_page: u32,
-) -> Result<bool, Error> {
-    let expected = total.min(u64::from(number) * u64::from(per_page));
-    if read != expected {
-        return Err(Error::source(format!(
-            "Last.fm's loved-track page {number} accounts for {read} tracks, expected {expected}"
-        )));
-    }
-    if read == total && last && (!empty || total == 0) {
-        return Ok(true);
-    }
-    if empty || last || read >= total {
-        return Err(Error::source(
-            "Last.fm's loved-track pages disagree with their total",
-        ));
-    }
-    Ok(false)
 }
 
-/// Every track `user` has loved, as the list stands now, a page at a time.
-/// Changes during pagination can shift page boundaries. A changed total
-/// invalidates the list before it can clear any previously saved love.
+impl LovedPaging {
+    /// Can the rows collected through this page replace the saved list?
+    fn complete(self, page: u32, rows: usize, read: u64) -> Result<bool, Error> {
+        let expected = self.total.min(u64::from(page) * u64::from(self.per_page));
+        if read != expected {
+            return Err(Error::source(format!(
+                "Last.fm's loved-track page {page} accounts for {read} tracks, expected {expected}"
+            )));
+        }
+        let last = page >= self.pages;
+        if read == self.total && last && (rows != 0 || self.total == 0) {
+            return Ok(true);
+        }
+        if rows == 0 || last || read >= self.total {
+            return Err(Error::source(
+                "Last.fm's loved-track pages disagree with their total",
+            ));
+        }
+        Ok(false)
+    }
+}
+
+/// Read the loved list before replacing it. Inconsistent paging or a
+/// repeated track can mean another track slipped across a page boundary.
 async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Vec<Love>>, Error> {
     let mut loves = Vec::new();
     let mut first_paging = None;
@@ -283,9 +285,11 @@ async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Ve
                 "Last.fm returned a different loved-track page than requested",
             ));
         }
-        let total = page.total();
-        let pages = page.total_pages();
-        let paging = (total, pages, page.per_page());
+        let paging = LovedPaging {
+            total: page.total(),
+            pages: page.total_pages(),
+            per_page: page.per_page(),
+        };
         let expected = *first_paging.get_or_insert(paging);
         if paging != expected {
             return Err(Error::source(format!(
@@ -298,14 +302,7 @@ async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Ve
             title: row.track().name().to_owned(),
             loved_at_ms: seconds_to_ms(row.loved_at()),
         }));
-        if loved_page_complete(
-            loves.len() as u64,
-            total,
-            rows == 0,
-            page_number >= pages,
-            page_number,
-            page.per_page(),
-        )? {
+        if paging.complete(page_number, rows, loves.len() as u64)? {
             let mut seen = HashSet::new();
             if !loves
                 .iter()
@@ -346,13 +343,13 @@ impl LastfmSource<'_> {
             source_total: Some(count(client, user, 0, now).await.map_err(|e| failed(&e))?),
             ..Synced::default()
         };
-        if sink.stopping() {
-            synced.stopped = true;
-            return Ok(synced);
-        }
         let to_read = if start == 0 {
             synced.source_total
         } else {
+            if sink.stopping() {
+                synced.stopped = true;
+                return Ok(synced);
+            }
             Some(
                 count(client, user, start, now)
                     .await

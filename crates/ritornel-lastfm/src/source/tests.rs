@@ -361,14 +361,23 @@ fn cancelling_between_pages_discards_the_incomplete_span_or_loved_list() {
 
 #[test]
 fn a_partial_last_page_cannot_replace_loved_tracks() {
-    assert!(loved_page_complete(1, 4, false, false, 1, 2).is_err());
-    assert!(loved_page_complete(1, 2, false, true, 1, 1).is_err());
-    assert!(loved_page_complete(1, 2, true, false, 1, 1).is_err());
-    assert!(loved_page_complete(2, 2, true, true, 2, 1).is_err());
-    assert!(loved_page_complete(2, 1, false, true, 2, 1).is_err());
-    assert!(loved_page_complete(0, 0, true, true, 1, 1).unwrap());
-    assert!(!loved_page_complete(1, 2, false, false, 1, 1).unwrap());
-    assert!(loved_page_complete(2, 2, false, true, 2, 1).unwrap());
+    let two_pages = LovedPaging {
+        total: 4,
+        pages: 2,
+        per_page: 2,
+    };
+    assert!(!two_pages.complete(1, 2, 2).unwrap());
+    assert!(two_pages.complete(2, 2, 4).unwrap());
+    assert!(two_pages.complete(1, 1, 1).is_err());
+    assert!(two_pages.complete(2, 1, 3).is_err());
+    assert!(two_pages.complete(2, 0, 4).is_err());
+    assert!(two_pages.complete(2, 3, 5).is_err());
+    let empty = LovedPaging {
+        total: 0,
+        pages: 1,
+        per_page: 2,
+    };
+    assert!(empty.complete(1, 0, 0).unwrap());
 }
 
 #[test]
@@ -397,6 +406,7 @@ fn a_change_between_pages_cannot_clear_a_different_track() {
                         .iter()
                         .any(|req| req.method == "user.getLovedTracks")
                     {
+                        // Shift the list after the first page has been read.
                         let mut updated: Vec<_> = loved
                             .iter()
                             .map(|t| ("Invented Artist", t.as_str(), NOW))
