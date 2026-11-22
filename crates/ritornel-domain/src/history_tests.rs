@@ -470,16 +470,22 @@ fn an_exclude_marks_its_play_excluded_and_a_revoke_undoes_it_and_can_be_undone()
         observation: 10,
         verb: Verb::Exclude,
         targets: vec![2],
+        window: None,
+        recording: None,
     };
     let revoke = Correction {
         observation: 11,
         verb: Verb::Revoke,
         targets: vec![10],
+        window: None,
+        recording: None,
     };
     let revoke_the_revoke = Correction {
         observation: 12,
         verb: Verb::Revoke,
         targets: vec![11],
+        window: None,
+        recording: None,
     };
     let flags = |corrections: &[Correction]| -> Vec<bool> {
         derive_with(&listens, corrections, &[])
@@ -600,6 +606,7 @@ proptest! {
 fn import(observation: i64, at_ms: i64) -> Import {
     Import {
         observation,
+        endpoint: 2,
         listener: 1,
         source_item: 9,
         played_at_ms: at_ms,
@@ -701,6 +708,8 @@ fn our_own_scrobble_coming_back_joins_its_listen_and_counts_once() {
         observation: 20,
         verb: Verb::Exclude,
         targets: vec![7],
+        window: None,
+        recording: None,
     };
     let plays = derive_all(&[heard], &[echo], &[exclude], &[]);
     assert!(plays[0].excluded);
@@ -759,4 +768,215 @@ fn an_unrecognised_captured_zone_leaves_room_for_the_listeners_zone() {
             ZoneBasis::None
         );
     }
+}
+
+#[test]
+fn a_recording_correction_moves_one_observation_above_its_items_binding_and_can_be_revoked() {
+    // Two scrobbles share source item 100, which is bound to recording 7.
+    let mut first = import(1, T0);
+    first.source_item = 100;
+    let mut second = import(2, T0 + 10 * MINUTE);
+    second.source_item = 100;
+
+    let move_first = Correction {
+        observation: 10,
+        verb: Verb::SetRecording,
+        targets: vec![1],
+        window: None,
+        recording: Some(RecordingOverride {
+            binding: Some(Binding {
+                recording: 9,
+                appearance: Some(90),
+            }),
+        }),
+    };
+    let plays = derive_all(
+        &[],
+        &[first.clone(), second.clone()],
+        std::slice::from_ref(&move_first),
+        &[],
+    );
+    assert_eq!(plays.len(), 2);
+    assert_eq!(
+        (plays[0].recording, plays[0].appearance),
+        (Some(9), Some(90))
+    );
+    assert_eq!(
+        (plays[1].recording, plays[1].appearance),
+        (Some(7), Some(70))
+    );
+
+    // A newer correction on the same observation unbinds it; revoking that
+    // restores the first correction; revoking both restores the item's binding.
+    let unbind_first = Correction {
+        observation: 11,
+        verb: Verb::SetRecording,
+        targets: vec![1],
+        window: None,
+        recording: Some(RecordingOverride { binding: None }),
+    };
+    let plays = derive_all(
+        &[],
+        &[first.clone(), second.clone()],
+        &[move_first.clone(), unbind_first.clone()],
+        &[],
+    );
+    assert_eq!((plays[0].recording, plays[0].appearance), (None, None));
+    assert_eq!(
+        (plays[1].recording, plays[1].appearance),
+        (Some(7), Some(70))
+    );
+
+    let revoke_unbind = Correction {
+        observation: 12,
+        verb: Verb::Revoke,
+        targets: vec![11],
+        window: None,
+        recording: None,
+    };
+    let plays = derive_all(
+        &[],
+        &[first.clone(), second.clone()],
+        &[
+            move_first.clone(),
+            unbind_first.clone(),
+            revoke_unbind.clone(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        (plays[0].recording, plays[0].appearance),
+        (Some(9), Some(90))
+    );
+
+    let revoke_move = Correction {
+        observation: 13,
+        verb: Verb::Revoke,
+        targets: vec![10],
+        window: None,
+        recording: None,
+    };
+    let plays = derive_all(
+        &[],
+        &[first, second],
+        &[move_first, unbind_first, revoke_unbind, revoke_move],
+        &[],
+    );
+    assert_eq!(
+        (plays[0].recording, plays[0].appearance),
+        (Some(7), Some(70))
+    );
+    assert_eq!(
+        (plays[1].recording, plays[1].appearance),
+        (Some(7), Some(70))
+    );
+}
+
+#[test]
+fn a_recording_correction_by_date_range_moves_only_matching_observations() {
+    let mut early = import(1, T0);
+    early.source_item = 100;
+    let mut in_range = import(2, T0 + 10 * MINUTE);
+    in_range.source_item = 100;
+    let mut other_item = import(3, T0 + 15 * MINUTE);
+    other_item.source_item = 101;
+    let mut at_end = import(4, T0 + 20 * MINUTE);
+    at_end.source_item = 100;
+
+    let mut bindings = bound();
+    bindings.insert(
+        101,
+        Binding {
+            recording: 8,
+            appearance: Some(80),
+        },
+    );
+    let range = Correction {
+        observation: 20,
+        verb: Verb::SetRecording,
+        targets: Vec::new(),
+        window: Some(Window {
+            endpoint: 2,
+            from_ms: Some(T0 + 10 * MINUTE),
+            to_ms: Some(T0 + 20 * MINUTE),
+            source_item: Some(100),
+        }),
+        recording: Some(RecordingOverride {
+            binding: Some(Binding {
+                recording: 9,
+                appearance: None,
+            }),
+        }),
+    };
+    let plays = derive(&Inputs {
+        listens: &[],
+        imports: &[early, in_range, other_item, at_end],
+        bindings: &bindings,
+        corrections: &[range],
+        zone_periods: &[],
+        rule: PlayRule::V1,
+    });
+    assert_eq!(
+        plays
+            .iter()
+            .map(|play| (play.recording, play.appearance))
+            .collect::<Vec<_>>(),
+        [
+            (Some(7), Some(70)),
+            (Some(9), None),
+            (Some(8), Some(80)),
+            (Some(7), Some(70)),
+        ]
+    );
+}
+
+#[test]
+fn a_recording_correction_moves_a_listen_chain_and_its_echo() {
+    let mut first = listen(1, 1, 100_000);
+    first.end_reason = EndReason::Crash;
+    let mut second = listen(2, 2, 100_000);
+    second.continues = Some(first.source_key.clone());
+    let mut echo = import(3, first.started_at_ms);
+    echo.echo_of = Some(1);
+
+    let on_chain = Correction {
+        observation: 30,
+        verb: Verb::SetRecording,
+        targets: vec![2],
+        window: None,
+        recording: Some(RecordingOverride {
+            binding: Some(Binding {
+                recording: 12,
+                appearance: Some(120),
+            }),
+        }),
+    };
+    let plays = derive_all(
+        &[first.clone(), second.clone()],
+        std::slice::from_ref(&echo),
+        std::slice::from_ref(&on_chain),
+        &[],
+    );
+    assert_eq!(plays.len(), 1);
+    assert_eq!(
+        (plays[0].recording, plays[0].appearance),
+        (Some(12), Some(120))
+    );
+
+    // A newer correction targeting the corroborating echo overrides the earlier one.
+    let on_echo = Correction {
+        observation: 31,
+        verb: Verb::SetRecording,
+        targets: vec![3],
+        window: None,
+        recording: Some(RecordingOverride {
+            binding: Some(Binding {
+                recording: 15,
+                appearance: None,
+            }),
+        }),
+    };
+    let plays = derive_all(&[first, second], &[echo], &[on_chain, on_echo], &[]);
+    assert_eq!(plays.len(), 1);
+    assert_eq!((plays[0].recording, plays[0].appearance), (Some(15), None));
 }

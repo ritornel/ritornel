@@ -375,16 +375,27 @@ fn import(connection: &Connection, observation: i64) -> Result<Value, Error> {
 fn correction(connection: &Connection, observation: i64) -> Result<Value, Error> {
     let mut statement = connection.prepare_cached(
         "SELECT c.verb, l.public_id, e.public_id, c.target_from_utc_ms, c.target_to_utc_ms,
-                c.clock_offset_ms, c.note, c.actor_session_pid
+                c.clock_offset_ms, c.note, c.actor_session_pid,
+                cr.correction_id IS NOT NULL, rec.public_id, now.public_id, ta.public_id,
+                si.public_id,
+                CASE WHEN r_ta.canonical_id = rec.canonical_id THEN ta_now.public_id ELSE NULL END
          FROM observation_correction c
          LEFT JOIN listener l ON l.id = c.set_listener_id
          LEFT JOIN history_endpoint e ON e.id = c.target_endpoint_id
+         LEFT JOIN correction_recording cr ON cr.correction_id = c.observation_id
+         LEFT JOIN recording rec ON rec.id = cr.recording_id
+         LEFT JOIN recording now ON now.id = rec.canonical_id
+         LEFT JOIN track_appearance ta ON ta.id = cr.appearance_id
+         LEFT JOIN track_appearance ta_now ON ta_now.id = ta.canonical_id
+         LEFT JOIN recording r_ta ON r_ta.id = ta_now.recording_id
+         LEFT JOIN source_item si ON si.id = cr.source_item_id
          WHERE c.observation_id = ?1",
     )?;
     let mut value = statement.query_row([observation], |row| {
         let (endpoint, from, to): (Option<Vec<u8>>, Option<i64>, Option<i64>) =
             (row.get(2)?, row.get(3)?, row.get(4)?);
-        Ok(json!({
+        let has_recording: bool = row.get(8)?;
+        let mut object = json!({
             "verb": row.get::<_, String>(0)?,
             "setListener": key(row.get(1)?),
             "window": endpoint.map(|endpoint| json!({
@@ -395,7 +406,23 @@ fn correction(connection: &Connection, observation: i64) -> Result<Value, Error>
             "clockOffsetMs": row.get::<_, Option<i64>>(5)?,
             "note": row.get::<_, Option<String>>(6)?,
             "session": key(row.get(7)?),
-        }))
+        });
+        if has_recording {
+            put(
+                &mut object,
+                "setRecording",
+                json!({
+                    "recording": key(row.get(9)?),
+                    "appearance": key(row.get(11)?),
+                    "sourceItem": key(row.get(12)?),
+                    "now": {
+                        "recording": key(row.get(10)?),
+                        "appearance": key(row.get(13)?),
+                    },
+                }),
+            );
+        }
+        Ok(object)
     })?;
     let mut targets = connection.prepare_cached(
         "SELECT e.public_id, o.source_key FROM correction_target t
@@ -529,7 +556,8 @@ fn plays(connection: &Connection, path: &Path) -> Result<u64, Error> {
          -- or for one not bound, the appearance its listen queued, before
          -- the recording's own title and credit.
          LEFT JOIN observation_listen heard ON heard.observation_id = o.id
-         LEFT JOIN track_appearance queued ON queued.id = heard.queued_appearance_id
+         LEFT JOIN track_appearance queued
+           ON p.recording_id IS NULL AND queued.id = heard.queued_appearance_id
          LEFT JOIN release queued_release ON queued_release.id = queued.release_id
          LEFT JOIN recording rec ON rec.id = p.recording_id
          LEFT JOIN track_appearance ta ON ta.id = p.appearance_id

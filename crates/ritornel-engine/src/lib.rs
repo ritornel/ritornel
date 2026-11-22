@@ -80,6 +80,12 @@ mod testing;
 mod timekeeping;
 mod walk;
 
+/// The schema version of a freshly migrated `library.db`.
+pub const LIBRARY_SCHEMA_VERSION: i64 = migrate::LIBRARY.len() as i64;
+
+/// The schema version of a freshly migrated `server.db`.
+pub const SERVER_SCHEMA_VERSION: i64 = migrate::SERVER.len() as i64;
+
 pub use artist_pictures::{
     KnownPictureFolder, LastPictureImport, PictureFolder, PicturesImported, check_picture_folder,
 };
@@ -92,8 +98,8 @@ pub use error::Error;
 pub use export::{EXPORT_FORMAT, EXPORT_VERSION, Exported};
 pub use history_pages::Today;
 pub use history_store::{
-    INGEST_METHOD, IngestOutcome, Ingested, LISTEN_RECORD_VERSION, ListenRecord, ListenRow,
-    Observations, PlayCursor, PlayRow, Rebuilt, SendStamps, ZonePeriodRow,
+    CorrectionTargets, INGEST_METHOD, IngestOutcome, Ingested, LISTEN_RECORD_VERSION, ListenRecord,
+    ListenRow, Observations, PlayCursor, PlayRow, Rebuilt, SendStamps, ZonePeriodRow,
 };
 pub use id::new_id;
 pub use identity_store::is_policy;

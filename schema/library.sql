@@ -7,6 +7,7 @@
 --   0001_library  62cec2a19a590384d34a42a3b8b3bb1c4cabdcc21f7f7371bcd49f848bebee56
 --   0002_fold_search_text  6c46673f3d3da76a0115cc787be0537d9f2ec2660002ca9f579514ff617b498e
 --   0003_claim_and_love_indexes  4247daecea906f0640d8aec80e338886d707b933201711d07a6ad210e0b9efb1
+--   0004_observation_recording_correction  f500fbf7eb27851be43e1fc97395fa05818b4bd0186480758c6161fafd92059a
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -598,24 +599,6 @@ CREATE TABLE observation_import (
 
 CREATE INDEX observation_import_played_at ON observation_import (played_at_utc_ms);
 
-CREATE TABLE observation_correction (
-  observation_id      INTEGER PRIMARY KEY REFERENCES history_observation(id),
-  verb                TEXT NOT NULL CHECK (verb IN ('exclude', 'set_listener', 'split', 'join', 'set_clock_offset', 'revoke')),
-  set_listener_id     INTEGER REFERENCES listener(id),           -- set_listener: who the plays move to
-  target_endpoint_id  INTEGER REFERENCES history_endpoint(id),   -- a target by window: this endpoint's observations in the range. NULL when the targets are listed
-  target_from_utc_ms  INTEGER,                                   -- NULL is open
-  target_to_utc_ms    INTEGER,
-  clock_offset_ms     INTEGER,                                   -- set_clock_offset: added to times dated by that endpoint's wall clock
-  note                TEXT,
-  actor_session_pid   BLOB CHECK (length(actor_session_pid) = 16),   -- the client session that made the correction
-  rev                 INTEGER NOT NULL,
-  CHECK ((verb = 'set_listener') = (set_listener_id IS NOT NULL)),
-  CHECK ((verb = 'set_clock_offset') = (clock_offset_ms IS NOT NULL)),
-  CHECK (verb <> 'set_clock_offset' OR target_endpoint_id IS NOT NULL),
-  CHECK (verb NOT IN ('split', 'join', 'revoke') OR target_endpoint_id IS NULL),
-  CHECK (target_endpoint_id IS NOT NULL OR (target_from_utc_ms IS NULL AND target_to_utc_ms IS NULL))
-) STRICT;
-
 CREATE TABLE correction_target (
   id                     INTEGER PRIMARY KEY,
   correction_id          INTEGER NOT NULL REFERENCES observation_correction(observation_id),
@@ -638,13 +621,6 @@ BEFORE INSERT ON observation_import
 WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'import'
 BEGIN
   SELECT RAISE(ABORT, 'observation_import holds the detail of an import record and of nothing else');
-END;
-
-CREATE TRIGGER observation_correction_kind
-BEFORE INSERT ON observation_correction
-WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'correction'
-BEGIN
-  SELECT RAISE(ABORT, 'observation_correction holds the detail of a correction and of nothing else');
 END;
 
 CREATE TRIGGER history_observation_no_update
@@ -681,18 +657,6 @@ CREATE TRIGGER observation_import_no_delete
 BEFORE DELETE ON observation_import
 BEGIN
   SELECT RAISE(ABORT, 'observation_import is immutable: nothing is deleted');
-END;
-
-CREATE TRIGGER observation_correction_no_update
-BEFORE UPDATE ON observation_correction
-BEGIN
-  SELECT RAISE(ABORT, 'observation_correction is immutable: revoke it instead');
-END;
-
-CREATE TRIGGER observation_correction_no_delete
-BEFORE DELETE ON observation_correction
-BEGIN
-  SELECT RAISE(ABORT, 'observation_correction is immutable: nothing is deleted');
 END;
 
 CREATE TRIGGER correction_target_no_update
@@ -868,3 +832,82 @@ WHERE counts = 1 AND excluded = 0 AND event_at_utc_ms IS NOT NULL;
 CREATE INDEX metadata_claim_item ON metadata_claim (source_item_id, field);
 
 CREATE INDEX listener_rating_reported ON listener_rating (endpoint_id, kind, source_item_id);
+
+CREATE TABLE "observation_correction" (
+  observation_id      INTEGER PRIMARY KEY REFERENCES history_observation(id),
+  verb                TEXT NOT NULL CHECK (verb IN ('exclude', 'set_listener', 'split', 'join', 'set_clock_offset', 'set_recording', 'revoke')),
+  set_listener_id     INTEGER REFERENCES listener(id),           -- set_listener: who the plays move to
+  target_endpoint_id  INTEGER REFERENCES history_endpoint(id),   -- a target by window: this endpoint's observations in the range. NULL when the targets are listed
+  target_from_utc_ms  INTEGER,                                   -- NULL is open
+  target_to_utc_ms    INTEGER,
+  clock_offset_ms     INTEGER,                                   -- set_clock_offset: added to times dated by that endpoint's wall clock
+  note                TEXT,
+  actor_session_pid   BLOB CHECK (length(actor_session_pid) = 16),   -- the client session that made the correction
+  rev                 INTEGER NOT NULL,
+  CHECK ((verb = 'set_listener') = (set_listener_id IS NOT NULL)),
+  CHECK ((verb = 'set_clock_offset') = (clock_offset_ms IS NOT NULL)),
+  CHECK (verb <> 'set_clock_offset' OR target_endpoint_id IS NOT NULL),
+  CHECK (verb NOT IN ('split', 'join', 'revoke') OR target_endpoint_id IS NULL),
+  CHECK (target_endpoint_id IS NOT NULL OR (target_from_utc_ms IS NULL AND target_to_utc_ms IS NULL)),
+  CHECK (verb <> 'set_recording' OR target_from_utc_ms IS NULL OR target_to_utc_ms IS NULL OR target_from_utc_ms < target_to_utc_ms)
+) STRICT;
+
+CREATE TRIGGER observation_correction_kind
+BEFORE INSERT ON observation_correction
+WHEN (SELECT kind FROM history_observation WHERE id = NEW.observation_id) IS NOT 'correction'
+BEGIN
+  SELECT RAISE(ABORT, 'observation_correction holds the detail of a correction and of nothing else');
+END;
+
+CREATE TRIGGER observation_correction_no_update
+BEFORE UPDATE ON observation_correction
+BEGIN
+  SELECT RAISE(ABORT, 'observation_correction is immutable: revoke it instead');
+END;
+
+CREATE TRIGGER observation_correction_no_delete
+BEFORE DELETE ON observation_correction
+BEGIN
+  SELECT RAISE(ABORT, 'observation_correction is immutable: nothing is deleted');
+END;
+
+CREATE TABLE correction_recording (
+  correction_id   INTEGER PRIMARY KEY REFERENCES observation_correction(observation_id),
+  recording_id    INTEGER REFERENCES recording(id),             -- stored as named; read through recording.canonical_id. NULL means unbound
+  appearance_id   INTEGER,                                      -- optional appearance on recording_id; read through track_appearance.canonical_id
+  source_item_id  INTEGER REFERENCES source_item(id),           -- optional filter for a window target: only observations of this source item
+  rev             INTEGER NOT NULL,
+  FOREIGN KEY (appearance_id, recording_id) REFERENCES track_appearance (id, recording_id),
+  CHECK (appearance_id IS NULL OR recording_id IS NOT NULL)
+) STRICT;
+
+CREATE INDEX correction_recording_recording
+  ON correction_recording (recording_id)
+  WHERE recording_id IS NOT NULL;
+
+CREATE TRIGGER correction_recording_verb
+BEFORE INSERT ON correction_recording
+WHEN (SELECT verb FROM observation_correction WHERE observation_id = NEW.correction_id) IS NOT 'set_recording'
+BEGIN
+  SELECT RAISE(ABORT, 'correction_recording holds the detail of a set_recording correction and of nothing else');
+END;
+
+CREATE TRIGGER correction_recording_source_item_window
+BEFORE INSERT ON correction_recording
+WHEN NEW.source_item_id IS NOT NULL
+ AND (SELECT target_endpoint_id FROM observation_correction WHERE observation_id = NEW.correction_id) IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'correction_recording.source_item_id requires a window target');
+END;
+
+CREATE TRIGGER correction_recording_no_update
+BEFORE UPDATE ON correction_recording
+BEGIN
+  SELECT RAISE(ABORT, 'correction_recording is immutable: revoke the correction instead');
+END;
+
+CREATE TRIGGER correction_recording_no_delete
+BEFORE DELETE ON correction_recording
+BEGIN
+  SELECT RAISE(ABORT, 'correction_recording is immutable: nothing is deleted');
+END;

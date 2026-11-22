@@ -1865,3 +1865,836 @@ fn scrobbles_refused_with_their_request_count_until_the_account_takes_one_again(
         None
     );
 }
+
+fn recording_of_track(at: &Library, index: usize) -> Id {
+    let item = at.tracks[index].1;
+    at.library
+        .read(move |connection| {
+            Ok(connection.query_row(
+                "SELECT r.public_id FROM source_item si
+                 JOIN recording r ON r.id = si.current_recording_id
+                 WHERE si.public_id = ?1",
+                [item.as_bytes()],
+                |row| Ok(Id::from_bytes(row.get(0)?)),
+            )?)
+        })
+        .unwrap()
+}
+
+fn import_keys_oldest_first(at: &Library, endpoint: Id) -> Vec<Vec<u8>> {
+    at.library
+        .read(move |connection| {
+            let mut stmt = connection.prepare(
+                "SELECT o.source_key FROM history_observation o
+                 JOIN history_endpoint e ON e.id = o.endpoint_id
+                 JOIN observation_import i ON i.observation_id = o.id
+                 WHERE e.public_id = ?1
+                 ORDER BY i.played_at_utc_ms, o.id",
+            )?;
+            let rows = stmt.query_map([endpoint.as_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap()
+}
+
+#[test]
+fn of_two_plays_sharing_one_scrobbled_text_one_moves_to_another_recording_and_survives_rebuild() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let endpoint = at
+        .library
+        .service_account(account)
+        .unwrap()
+        .unwrap()
+        .endpoint;
+    let rec_a = recording_of_track(&at, 0);
+    let rec_b = recording_of_track(&at, 1);
+    let rec_c = recording_of_track(&at, 2);
+    let app_b = at.tracks[1].0;
+
+    // Two imported plays share one scrobbled text, matching track 0 (rec_a).
+    scrobble_of(&at, account, 1_500_000_000, "Moss Arcade", ALBUM[0].title);
+    scrobble_of(&at, account, 1_500_003_600, "Moss Arcade", ALBUM[0].title);
+    let keys = import_keys_oldest_first(&at, endpoint);
+    assert_eq!(keys.len(), 2);
+
+    let before = at.library.recent_plays(at.listener, 10, None).unwrap();
+    assert_eq!(before.len(), 2);
+    assert!(before.iter().all(|play| play.recording == Some(rec_a)));
+    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+
+    // Move ONLY the first observation to rec_b (with app_b).
+    let (_, corr_id) = at
+        .library
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            CorrectionTargets::Observations(vec![(endpoint, keys[0].clone())]),
+            Some(rec_b),
+            Some(app_b),
+            Some("live cut".to_owned()),
+        )
+        .unwrap();
+
+    // Incremental derive moved the older play and left the newer one on rec_a.
+    let after = at.library.recent_plays(at.listener, 10, None).unwrap();
+    assert_eq!(
+        after
+            .iter()
+            .map(|play| (play.recording, play.appearance))
+            .collect::<Vec<_>>(),
+        [
+            (Some(rec_a), Some(at.tracks[0].0)),
+            (Some(rec_b), Some(app_b))
+        ]
+    );
+
+    // history rebuild --dry-run agrees with incremental derive, and a full
+    // rebuild keeps the first play on rec_b.
+    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::V1, false).changed, 0);
+
+    // Running rebind (as after a rescan) leaves the overridden play alone.
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.rebind",
+                command: None,
+                client: None,
+            },
+            |write| {
+                rebind(write)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+
+    // Merging rec_b into rec_c moves the corrected play through the redirect
+    // while keeping rec_b stored on correction_recording, so undoing the merge
+    // returns it to rec_b.
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.merge",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let conn = write.connection();
+                conn.execute(
+                    "UPDATE recording SET
+                       redirect_to_id = (SELECT id FROM recording WHERE public_id = ?2),
+                       canonical_id = (SELECT id FROM recording WHERE public_id = ?2),
+                       rev = ?3
+                     WHERE public_id = ?1",
+                    (rec_b.as_bytes(), rec_c.as_bytes(), write.rev()),
+                )?;
+                rebind(write)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    let merged = at.library.recent_plays(at.listener, 10, None).unwrap();
+    assert_eq!(merged[1].recording, Some(rec_c));
+    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+
+    // Export records the set_recording correction with its named recording and
+    // current canonical recording.
+    let scratch = crate::testing::Scratch::new();
+    at.library
+        .export_record(scratch.path(), T0 + 10 * MINUTE)
+        .unwrap();
+    let exported_obs = reading_an_export::lines(&scratch.path().join("observations.jsonl"));
+    let exported_corr = exported_obs
+        .iter()
+        .find(|line| line["kind"] == "correction")
+        .unwrap();
+    assert_eq!(exported_corr["correction"]["verb"], "set_recording");
+    assert_eq!(
+        exported_corr["correction"]["setRecording"]["recording"],
+        rec_b.to_string()
+    );
+    assert_eq!(
+        exported_corr["correction"]["setRecording"]["now"]["recording"],
+        rec_c.to_string()
+    );
+
+    // Undo the merge: play returns to rec_b.
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.unmerge",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let conn = write.connection();
+                conn.execute(
+                    "UPDATE recording SET redirect_to_id = NULL, canonical_id = id, rev = ?2
+                     WHERE public_id = ?1",
+                    (rec_b.as_bytes(), write.rev()),
+                )?;
+                rebind(write)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    let unmerged = at.library.recent_plays(at.listener, 10, None).unwrap();
+    assert_eq!(unmerged[1].recording, Some(rec_b));
+    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+
+    // Revoking the correction returns the first play to rec_a immediately and
+    // after a rebuild.
+    at.library
+        .revoke_correction(
+            WriteRequest {
+                method: "history.revoke",
+                command: None,
+                client: None,
+            },
+            corr_id,
+            Some("actually studio".to_owned()),
+        )
+        .unwrap();
+    let revoked = at.library.recent_plays(at.listener, 10, None).unwrap();
+    assert!(revoked.iter().all(|play| play.recording == Some(rec_a)));
+    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+}
+
+#[test]
+fn a_recording_correction_by_date_range_or_to_unbound_survives_rebuild() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let endpoint = at
+        .library
+        .service_account(account)
+        .unwrap()
+        .unwrap()
+        .endpoint;
+    let rec_a = recording_of_track(&at, 0);
+    let rec_b = recording_of_track(&at, 1);
+    let rec_c = recording_of_track(&at, 2);
+
+    // Three plays of track 0 at t=1000s, t=2000s, t=3000s, plus one play of
+    // track 1 inside the middle window at t=2500s.
+    scrobble_of(&at, account, 1_500_001_000, "Moss Arcade", ALBUM[0].title);
+    scrobble_of(&at, account, 1_500_002_000, "Moss Arcade", ALBUM[0].title);
+    scrobble_of(&at, account, 1_500_002_500, "Moss Arcade", ALBUM[1].title);
+    scrobble_of(&at, account, 1_500_003_000, "Moss Arcade", ALBUM[0].title);
+
+    let subject_a: Id = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT public_id FROM source_item
+                 WHERE item_kind = 'scrobble_subject' AND provider_key LIKE '%\"' || ?1 || '\"%'",
+                [ALBUM[0].title],
+                |row| Ok(Id::from_bytes(row.get(0)?)),
+            )?)
+        })
+        .unwrap();
+
+    // Move plays of subject_a in [1_500_001_500_000, 1_500_002_800_000) to rec_c.
+    at.library
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            CorrectionTargets::Window {
+                endpoint,
+                from_ms: Some(1_500_001_500_000),
+                to_ms: Some(1_500_002_800_000),
+                source_item: Some(subject_a),
+            },
+            Some(rec_c),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Unbind the newest play (at t=3000s) explicitly.
+    let keys = import_keys_oldest_first(&at, endpoint);
+    at.library
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            CorrectionTargets::Observations(vec![(endpoint, keys[3].clone())]),
+            None,
+            None,
+            Some("not owned".to_owned()),
+        )
+        .unwrap();
+
+    let plays = at.library.recent_plays(at.listener, 10, None).unwrap();
+    // Newest first: t=3000 (unbound), t=2500 (track 1 untouched: rec_b),
+    // t=2000 (window override: rec_c), t=1000 (track 0 untouched: rec_a).
+    assert_eq!(
+        plays.iter().map(|play| play.recording).collect::<Vec<_>>(),
+        [None, Some(rec_b), Some(rec_c), Some(rec_a)]
+    );
+    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::V1, false).changed, 0);
+}
+
+#[test]
+fn invalid_recording_correction_inputs_are_refused() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let endpoint = at
+        .library
+        .service_account(account)
+        .unwrap()
+        .unwrap()
+        .endpoint;
+    scrobble_of(&at, account, 1_500_000_000, "Moss Arcade", ALBUM[0].title);
+    let keys = import_keys_oldest_first(&at, endpoint);
+    let rec_a = recording_of_track(&at, 0);
+    let app_b = at.tracks[1].0;
+    let req = || WriteRequest {
+        method: "history.setRecording",
+        command: None,
+        client: None,
+    };
+
+    // Empty observation list.
+    assert!(matches!(
+        at.library.set_observation_recording(
+            req(),
+            CorrectionTargets::Observations(Vec::new()),
+            Some(rec_a),
+            None,
+            None,
+        ),
+        Err(Error::Invalid(_))
+    ));
+    // Appearance without recording.
+    assert!(matches!(
+        at.library.set_observation_recording(
+            req(),
+            CorrectionTargets::Observations(vec![(endpoint, keys[0].clone())]),
+            None,
+            Some(app_b),
+            None,
+        ),
+        Err(Error::Invalid(_))
+    ));
+    // Appearance belonging to another recording.
+    assert!(matches!(
+        at.library.set_observation_recording(
+            req(),
+            CorrectionTargets::Observations(vec![(endpoint, keys[0].clone())]),
+            Some(rec_a),
+            Some(app_b),
+            None,
+        ),
+        Err(Error::Invalid(_))
+    ));
+    // Window ending before it begins.
+    assert!(matches!(
+        at.library.set_observation_recording(
+            req(),
+            CorrectionTargets::Window {
+                endpoint,
+                from_ms: Some(2000),
+                to_ms: Some(1000),
+                source_item: None,
+            },
+            Some(rec_a),
+            None,
+            None,
+        ),
+        Err(Error::Invalid(_))
+    ));
+    // Out-of-range window timestamps that cannot be exported as ISO-8601.
+    assert!(matches!(
+        at.library.set_observation_recording(
+            req(),
+            CorrectionTargets::Window {
+                endpoint,
+                from_ms: Some(i64::MAX),
+                to_ms: None,
+                source_item: None,
+            },
+            Some(rec_a),
+            None,
+            None,
+        ),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        at.library.set_observation_recording(
+            req(),
+            CorrectionTargets::Window {
+                endpoint,
+                from_ms: None,
+                to_ms: Some(i64::MIN),
+                source_item: None,
+            },
+            Some(rec_a),
+            None,
+            None,
+        ),
+        Err(Error::Invalid(_))
+    ));
+}
+
+#[test]
+fn recording_only_correction_on_a_listen_shows_and_exports_the_new_recording() {
+    let at = library();
+    let listen = at.listen(0x31, 0, T0 - 5 * MINUTE, 180_000);
+    at.send(&listen, PlayRule::V1);
+
+    // Find the listen's observation endpoint and key.
+    let (endpoint, source_key): (Id, Vec<u8>) = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT e.public_id, o.source_key FROM history_observation o
+                 JOIN history_endpoint e ON e.id = o.endpoint_id
+                 WHERE o.kind = 'listen'",
+                [],
+                |row| Ok((Id::from_bytes(row.get(0)?), row.get(1)?)),
+            )?)
+        })
+        .unwrap();
+
+    let rec_b = recording_of_track(&at, 1);
+    at.library
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            CorrectionTargets::Observations(vec![(endpoint, source_key)]),
+            Some(rec_b),
+            None,
+            None,
+        )
+        .unwrap();
+
+    let plays = at.library.recent_plays(at.listener, 10, None).unwrap();
+    assert_eq!(plays.len(), 1);
+    assert_eq!(plays[0].recording, Some(rec_b));
+    assert_eq!(plays[0].title.as_deref(), Some(ALBUM[1].title));
+    assert_eq!(plays[0].album, None);
+
+    let out = crate::testing::Scratch::new();
+    at.library.export_record(out.path(), T0).unwrap();
+    let csv = std::fs::read_to_string(out.path().join("plays.csv")).unwrap();
+    assert!(csv.contains(ALBUM[1].title), "plays.csv was:\n{csv}");
+    assert!(!csv.contains(ALBUM[0].title), "plays.csv was:\n{csv}");
+}
+
+#[test]
+fn recording_correction_accepts_merged_recording_appearance_and_exports_now_appearance() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let endpoint = at
+        .library
+        .service_account(account)
+        .unwrap()
+        .unwrap()
+        .endpoint;
+    scrobble_of(&at, account, 1_500_000_000, "Moss Arcade", ALBUM[0].title);
+    let keys = import_keys_oldest_first(&at, endpoint);
+
+    // Redirect recording 1 into recording 2; track 1's appearance still has
+    // recording_id = rec_1 while its recording's canonical_id is rec_2.
+    let rec_1 = recording_of_track(&at, 1);
+    let rec_2 = recording_of_track(&at, 2);
+    let app_1 = at.tracks[1].0;
+    let app_2 = at.tracks[2].0;
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.merge",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE recording
+                     SET redirect_to_id = (SELECT id FROM recording WHERE public_id = ?2),
+                         canonical_id = (SELECT id FROM recording WHERE public_id = ?2)
+                     WHERE public_id = ?1",
+                    (rec_1.as_bytes().as_slice(), rec_2.as_bytes().as_slice()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // Naming canonical rec_2 with app_1 (whose row belongs to merged rec_1)
+    // succeeds, and exporting includes now.appearance.
+    at.library
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            CorrectionTargets::Observations(vec![(endpoint, keys[0].clone())]),
+            Some(rec_2),
+            Some(app_1),
+            None,
+        )
+        .unwrap();
+
+    let plays = at.library.recent_plays(at.listener, 10, None).unwrap();
+    assert_eq!(plays[0].recording, Some(rec_2));
+
+    // Also redirect app_1 -> app_2 and check export's now.appearance follows it.
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.mergeApp",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE track_appearance
+                     SET redirect_to_id = (SELECT id FROM track_appearance WHERE public_id = ?2),
+                         canonical_id = (SELECT id FROM track_appearance WHERE public_id = ?2)
+                     WHERE public_id = ?1",
+                    (app_1.as_bytes().as_slice(), app_2.as_bytes().as_slice()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    let out = crate::testing::Scratch::new();
+    at.library.export_record(out.path(), T0).unwrap();
+    let jsonl = std::fs::read_to_string(out.path().join("observations.jsonl")).unwrap();
+    let corr_line = jsonl
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|row| row["kind"] == "correction")
+        .unwrap();
+    assert_eq!(
+        corr_line["correction"]["setRecording"]["now"]["recording"],
+        serde_json::Value::String(rec_2.to_string())
+    );
+    assert_eq!(
+        corr_line["correction"]["setRecording"]["now"]["appearance"],
+        serde_json::Value::String(app_2.to_string())
+    );
+}
+
+#[test]
+fn pending_delivery_is_withdrawn_when_its_listen_is_corrected_or_unbound() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 - 5 * MINUTE;
+    let listen1 = at.listen(0x41, 0, start, 180_000);
+    let listen2 = at.listen(0x42, 0, start + 10_000, 180_000);
+    at.send(&listen1, PlayRule::V1);
+    at.send(&listen2, PlayRule::V1);
+    let queued = at.library.plan_deliveries(account, start - MINUTE).unwrap();
+    assert_eq!(queued, 2);
+
+    let listen_obs: Vec<(Id, Vec<u8>)> = at
+        .library
+        .read(|connection| {
+            let mut stmt = connection.prepare(
+                "SELECT e.public_id, o.source_key FROM history_observation o
+                 JOIN history_endpoint e ON e.id = o.endpoint_id
+                 WHERE o.kind = 'listen'
+                 ORDER BY o.id",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((Id::from_bytes(row.get(0)?), row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+
+    // Unbind listen1, and move listen2 to track 1's recording.
+    let rec_b = recording_of_track(&at, 1);
+    at.library
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            CorrectionTargets::Observations(vec![listen_obs[0].clone()]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    at.library
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            CorrectionTargets::Observations(vec![listen_obs[1].clone()]),
+            Some(rec_b),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Neither stale delivery may be sent.
+    let due = at
+        .library
+        .take_due_deliveries(account, start - MINUTE, 10)
+        .unwrap();
+    assert!(due.is_empty());
+    let states: Vec<String> = at
+        .library
+        .read(|connection| {
+            let mut stmt = connection.prepare("SELECT state FROM history_delivery ORDER BY id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(states, ["withdrawn", "withdrawn"]);
+}
+
+#[test]
+fn moving_an_echo_between_two_listens_keeps_both_plays_after_incremental_rederive() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    // Two listens starting in the same second, for track 0 (listen A, earlier
+    // observation_id, and listen B, later observation_id).
+    let start_s = (T0 - 5 * MINUTE) / 1000;
+    let start_ms = start_s * 1000;
+    let listen_a = at.listen(0x51, 0, start_ms, 180_000);
+    let listen_b = at.listen(0x52, 0, start_ms + 200, 180_000);
+    at.send(&listen_a, PlayRule::V1);
+    at.send(&listen_b, PlayRule::V1);
+
+    let (obs_a, obs_b): (i64, i64) = at
+        .library
+        .read(|connection| {
+            let a: i64 = connection.query_row(
+                "SELECT o.id FROM history_observation o
+                 JOIN observation_listen l ON l.observation_id = o.id
+                 WHERE l.started_at_utc_ms = ?1",
+                [start_ms],
+                |row| row.get(0),
+            )?;
+            let b: i64 = connection.query_row(
+                "SELECT o.id FROM history_observation o
+                 JOIN observation_listen l ON l.observation_id = o.id
+                 WHERE l.started_at_utc_ms = ?1",
+                [start_ms + 200],
+                |row| row.get(0),
+            )?;
+            Ok((a, b))
+        })
+        .unwrap();
+    let endpoint_row: i64 = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT endpoint_id FROM service_account WHERE public_id = ?1",
+                [account.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+
+    // First, an accepted delivery on listen B matches the imported scrobble so
+    // the import corroborates listen B's play.
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.acceptedB",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "INSERT INTO history_delivery
+                       (observation_id, endpoint_id, state, sent_timestamp_s, artist, title,
+                        accepted_artist, accepted_title, created_at_ms, updated_at_ms, rev)
+                     VALUES (?1, ?2, 'accepted', ?3, 'Moss Arcade', ?4, 'Moss Arcade', ?4, ?5, ?5, ?6)",
+                    rusqlite::params![
+                        obs_b,
+                        endpoint_row,
+                        start_s,
+                        ALBUM[0].title,
+                        write.now_ms(),
+                        write.rev(),
+                    ],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    scrobble_of(&at, account, start_s, "Moss Arcade", ALBUM[0].title);
+    assert_eq!(
+        at.library
+            .recent_plays(at.listener, 10, None)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Now an accepted delivery for listen A (earlier observation_id) settles at
+    // the same second, moving the echo's preferred owner from listen B to A.
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.acceptedA",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "INSERT INTO history_delivery
+                       (observation_id, endpoint_id, state, sent_timestamp_s, artist, title,
+                        accepted_artist, accepted_title, created_at_ms, updated_at_ms, rev)
+                     VALUES (?1, ?2, 'accepted', ?3, 'Moss Arcade', ?4, 'Moss Arcade', ?4, ?5, ?5, ?6)",
+                    rusqlite::params![
+                        obs_a,
+                        endpoint_row,
+                        start_s,
+                        ALBUM[0].title,
+                        write.now_ms(),
+                        write.rev(),
+                    ],
+                )?;
+                let delivery_id = write.connection().last_insert_rowid();
+                rederive_delivery(write, delivery_id)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // Both listens must still have plays, matching a full rebuild.
+    assert_eq!(
+        at.library
+            .recent_plays(at.listener, 10, None)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+}
+
+#[test]
+fn migrating_a_saved_schema_1_library_preserves_rows_and_enables_recording_corrections() {
+    let scratch = crate::testing::Scratch::new();
+    let path = scratch.path().join("library.db");
+    {
+        let mut connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        crate::migrate::run(
+            &mut connection,
+            &crate::migrate::LIBRARY[..2],
+            &FixedClock::at(T0),
+        )
+        .unwrap();
+        connection
+            .execute_batch(include_str!("../../saved/library/0002.sql"))
+            .unwrap();
+    }
+    let clock = Arc::new(FixedClock::at(T0 + 60 * MINUTE));
+    let entropy = Arc::new(CountingEntropy::default());
+    let store = LibraryStore::open(&path, Id::from_bytes([0x01; 16]), clock, entropy).unwrap();
+
+    // Schema migrated cleanly, pre-existing exclude correction and rating kept.
+    let (version, excludes, ratings): (i64, i64, i64) = store
+        .read(|connection| {
+            Ok((
+                connection.query_row("SELECT max(version) FROM schema_migration", [], |row| {
+                    row.get(0)
+                })?,
+                connection.query_row(
+                    "SELECT count(*) FROM observation_correction WHERE verb = 'exclude'",
+                    [],
+                    |row| row.get(0),
+                )?,
+                connection
+                    .query_row("SELECT count(*) FROM listener_rating", [], |row| row.get(0))?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(version, crate::migrate::LIBRARY.len() as i64);
+    assert_eq!((excludes, ratings), (1, 1));
+
+    // Derive the migrated plays, then move observation 1 to recording 2 and
+    // check rebuild agrees.
+    store
+        .rebuild_history(
+            WriteRequest {
+                method: "history.rebuild",
+                command: None,
+                client: None,
+            },
+            false,
+            |_| String::new(),
+        )
+        .unwrap();
+    let endpoint = Id::from_bytes([0xb3; 16]);
+    let rec2 = Id::from_bytes([0x42; 16]);
+    store
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            CorrectionTargets::Observations(vec![(endpoint, vec![0xd1; 8])]),
+            Some(rec2),
+            None,
+            None,
+        )
+        .unwrap();
+    let listener = Id::from_bytes([0xa1; 16]);
+    let plays = store.recent_plays(listener, 10, None).unwrap();
+    assert_eq!(plays.len(), 2);
+    // Observation 2 (newer) is excluded and on recording 1; observation 1 is
+    // moved to recording 2.
+    assert!(plays[0].excluded);
+    assert_eq!(plays[1].recording, Some(rec2));
+    let dry: i64 = store
+        .rebuild_history(
+            WriteRequest {
+                method: "history.rebuild",
+                command: None,
+                client: None,
+            },
+            true,
+            |rebuilt| rebuilt.changed.to_string(),
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(dry, 0);
+}

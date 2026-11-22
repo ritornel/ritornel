@@ -437,19 +437,21 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
     let shown = facts(&printed);
     assert_eq!(shown.len(), 15, "{}", printed.stdout);
     assert_eq!(shown[12], ("Watching", "on"));
+    let json: Value = serde_json::from_str(&status(&data_dir, &["--json"]).stdout).unwrap();
+    let library_schema = json["versions"]["librarySchema"].as_i64().unwrap();
+    assert!(library_schema >= 2);
+    let library_schema_text = library_schema.to_string();
     assert_eq!(shown[2], ("Role", "hub"));
     assert_eq!(
         shown[6..10],
         [
             ("Server schema", "1"),
-            ("Library schema", "3"),
+            ("Library schema", library_schema_text.as_str()),
             ("Library ID", library_id),
             ("Library revision", "1"),
         ]
     );
-    let json: Value = serde_json::from_str(&status(&data_dir, &["--json"]).stdout).unwrap();
     assert_eq!(json["role"], "hub");
-    assert_eq!(json["versions"]["librarySchema"], 3);
     assert_eq!(
         json["library"],
         serde_json::json!({ "libraryId": library_id, "revision": 1 })

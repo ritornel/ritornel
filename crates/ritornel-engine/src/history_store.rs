@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ritornel_domain::history::{
     self as derive, Binding, ContextKind, Correction, EndReason, Import, Inputs, Listen, Play,
-    PlayRule, Received, StartReason, Verb, ZonePeriod,
+    PlayRule, Received, RecordingOverride, StartReason, Verb, Window, ZonePeriod,
 };
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -355,6 +355,27 @@ fn listens(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<
     Ok(found)
 }
 
+/// Which observations a `set_recording` correction targets: explicit
+/// observations named by `(endpoint, source_key)`, or a half-open UTC time
+/// window on one endpoint, optionally narrowed to one source item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CorrectionTargets {
+    /// Specific observations, named by `(endpoint public ID, source key)`.
+    Observations(Vec<(Id, Vec<u8>)>),
+    /// Observations on `endpoint` whose source-reported time falls in
+    /// `[from_ms, to_ms)`, optionally narrowed to `source_item`.
+    Window {
+        /// The endpoint whose observations the window covers.
+        endpoint: Id,
+        /// Earliest reported instant, inclusive. `None` is open.
+        from_ms: Option<i64>,
+        /// Latest reported instant, exclusive. `None` is open.
+        to_ms: Option<i64>,
+        /// Narrow to observations of this source item, when set.
+        source_item: Option<Id>,
+    },
+}
+
 /// The current binding of each of these source items that has one, or of
 /// every source item, the recording read through its redirects.
 fn bindings(
@@ -388,11 +409,19 @@ fn bindings(
     Ok(found)
 }
 
-/// Every correction, with its targets.
+/// Every correction, with its targets, window and recording override.
 fn corrections(connection: &Connection) -> Result<Vec<Correction>, Error> {
     let mut statement = connection.prepare_cached(
-        "SELECT c.observation_id, c.verb, t.target_observation_id
+        "SELECT c.observation_id, c.verb, c.target_endpoint_id, c.target_from_utc_ms,
+                c.target_to_utc_ms, cr.correction_id IS NOT NULL, r.canonical_id,
+                CASE WHEN r_ta.canonical_id = r.canonical_id THEN ta_canon.id ELSE NULL END,
+                cr.source_item_id, t.target_observation_id
          FROM observation_correction c
+         LEFT JOIN correction_recording cr ON cr.correction_id = c.observation_id
+         LEFT JOIN recording r ON r.id = cr.recording_id
+         LEFT JOIN track_appearance ta ON ta.id = cr.appearance_id
+         LEFT JOIN track_appearance ta_canon ON ta_canon.id = ta.canonical_id
+         LEFT JOIN recording r_ta ON r_ta.id = ta_canon.recording_id
          LEFT JOIN correction_target t ON t.correction_id = c.observation_id
          ORDER BY c.observation_id, t.target_observation_id",
     )?;
@@ -401,16 +430,48 @@ fn corrections(connection: &Connection) -> Result<Vec<Correction>, Error> {
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+            row.get::<_, bool>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, Option<i64>>(8)?,
+            row.get::<_, Option<i64>>(9)?,
         ))
     })?;
     let mut by_id: BTreeMap<i64, Correction> = BTreeMap::new();
     for row in rows {
-        let (observation, verb, target) = row?;
+        let (
+            observation,
+            verb,
+            endpoint,
+            from_ms,
+            to_ms,
+            has_recording,
+            recording,
+            appearance,
+            source_item,
+            target,
+        ) = row?;
         let verb = Verb::parse(&verb).ok_or(Error::Corrupt("a correction's verb"))?;
+        let window = endpoint.map(|endpoint| Window {
+            endpoint,
+            from_ms,
+            to_ms,
+            source_item,
+        });
+        let recording = has_recording.then(|| RecordingOverride {
+            binding: recording.map(|recording| Binding {
+                recording,
+                appearance,
+            }),
+        });
         let correction = by_id.entry(observation).or_insert_with(|| Correction {
             observation,
             verb,
             targets: Vec::new(),
+            window,
+            recording,
         });
         correction.targets.extend(target);
     }
@@ -554,6 +615,7 @@ fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<
             |(observation, endpoint, listener, source_item, played_at_ms, artist, title)| {
                 Ok(Import {
                     observation,
+                    endpoint,
                     listener,
                     source_item,
                     played_at_ms,
@@ -760,7 +822,7 @@ pub(crate) fn rederive_delivery(write: &Write<'_>, delivery: i64) -> Result<(), 
 }
 
 /// Derives again the plays of these observations, and of everything chained
-/// to them.
+/// to them or sharing an existing play with them.
 pub(crate) fn rederive(
     write: &Write<'_>,
     observations: &BTreeSet<i64>,
@@ -768,9 +830,30 @@ pub(crate) fn rederive(
 ) -> Result<(), Error> {
     let connection = write.connection();
     let mut around = BTreeSet::new();
-    for observation in observations {
-        if !around.contains(observation) {
-            around.extend(neighbourhood(connection, *observation)?);
+    let mut todo: Vec<i64> = observations.iter().copied().collect();
+    // Widen to every observation currently sharing a derived play with any
+    // affected observation so moving an echo or breaking a chain can never
+    // drop a sibling observation's play.
+    let mut siblings = connection.prepare_cached(
+        "SELECT other.observation_id
+         FROM play_event_observation mine
+         JOIN play_event_observation other ON other.play_event_id = mine.play_event_id
+         WHERE mine.observation_id = ?1",
+    )?;
+    while let Some(observation) = todo.pop() {
+        if !around.insert(observation) {
+            continue;
+        }
+        for near in neighbourhood(connection, observation)? {
+            if !around.contains(&near) {
+                todo.push(near);
+            }
+        }
+        for sibling in siblings.query_map([observation], |row| row.get::<_, i64>(0))? {
+            let sibling = sibling?;
+            if !around.contains(&sibling) {
+                todo.push(sibling);
+            }
         }
     }
     drop_plays_of(connection, &around)?;
@@ -846,18 +929,195 @@ fn derived(connection: &Connection) -> Result<Vec<String>, Error> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// The plays whose binding is not the one their source item has now: a
-/// scan or a merge has moved the item since they were derived.
+/// Builds a SQL `WHERE` predicate and parameter list for a window target on
+/// one observation table, omitting unconstrained clauses so SQLite can use
+/// indexes on `(endpoint_id, ...)`, `source_item_id`, and timestamps.
+fn window_where(window: Window, time_column: &str) -> (String, Vec<rusqlite::types::Value>) {
+    use rusqlite::types::Value;
+    let mut clauses = vec!["o.endpoint_id = ?".to_owned()];
+    let mut params = vec![Value::Integer(window.endpoint)];
+    if let Some(item) = window.source_item {
+        clauses.push("o.source_item_id = ?".to_owned());
+        params.push(Value::Integer(item));
+    }
+    if let Some(from) = window.from_ms {
+        clauses.push(format!("{time_column} >= ?"));
+        params.push(Value::Integer(from));
+    }
+    if let Some(to) = window.to_ms {
+        clauses.push(format!("{time_column} < ?"));
+        params.push(Value::Integer(to));
+    }
+    (clauses.join(" AND "), params)
+}
+
+/// The observations matched by a window target on one endpoint.
+fn window_observations(connection: &Connection, window: Window) -> Result<Vec<i64>, Error> {
+    let mut found = Vec::new();
+    let (import_where, import_params) = window_where(window, "i.played_at_utc_ms");
+    let mut imports = connection.prepare(&format!(
+        "SELECT o.id FROM history_observation o
+         JOIN observation_import i ON i.observation_id = o.id
+         WHERE {import_where}"
+    ))?;
+    for id in imports.query_map(rusqlite::params_from_iter(import_params), |row| {
+        row.get::<_, i64>(0)
+    })? {
+        found.push(id?);
+    }
+    let (listen_where, listen_params) = window_where(window, "l.started_at_utc_ms");
+    let mut listens = connection.prepare(&format!(
+        "SELECT o.id FROM history_observation o
+         JOIN observation_listen l ON l.observation_id = o.id
+         WHERE {listen_where}"
+    ))?;
+    for id in listens.query_map(rusqlite::params_from_iter(listen_params), |row| {
+        row.get::<_, i64>(0)
+    })? {
+        found.push(id?);
+    }
+    Ok(found)
+}
+
+/// The non-correction observations affected by a correction, following
+/// `revoke` targets down to the corrections they undo.
+fn correction_affected_observations(
+    connection: &Connection,
+    correction: i64,
+) -> Result<BTreeSet<i64>, Error> {
+    let all = corrections(connection)?;
+    let by_id: HashMap<i64, &Correction> =
+        all.iter().map(|entry| (entry.observation, entry)).collect();
+    let mut seen_corrections = BTreeSet::new();
+    let mut todo = vec![correction];
+    let mut affected = BTreeSet::new();
+    while let Some(id) = todo.pop() {
+        if !seen_corrections.insert(id) {
+            continue;
+        }
+        let Some(entry) = by_id.get(&id) else {
+            continue;
+        };
+        if entry.verb == Verb::Revoke {
+            todo.extend(entry.targets.iter().copied());
+            continue;
+        }
+        affected.extend(entry.targets.iter().copied());
+        if let Some(window) = entry.window {
+            affected.extend(window_observations(connection, window)?);
+        }
+    }
+    Ok(affected)
+}
+
+/// The plays whose binding is not what derivation would give them now: a
+/// scan, a merge or an observation correction has moved what they point to
+/// since they were derived.
 fn stale_bindings(connection: &Connection) -> Result<BTreeSet<i64>, Error> {
+    let has_overrides: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM correction_recording)",
+        [],
+        |row| row.get(0),
+    )?;
+    let active: Vec<(i64, Option<i64>, Option<i64>)> = if has_overrides {
+        let all = corrections(connection)?;
+        derive::active_recording_overrides(&all)
+            .into_iter()
+            .filter_map(|entry| {
+                let chosen = entry.recording?;
+                Some((
+                    entry.observation,
+                    chosen.binding.map(|binding| binding.recording),
+                    chosen.binding.and_then(|binding| binding.appearance),
+                ))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if active.is_empty() {
+        let mut statement = connection.prepare(
+            "SELECT peo.observation_id FROM play_event pe
+             JOIN play_event_observation peo ON peo.play_event_id = pe.id
+             LEFT JOIN assignment a ON a.source_item_id = pe.source_item_id
+                                   AND a.superseded_at_ms IS NULL
+             LEFT JOIN recording r ON r.id = a.recording_id
+             LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
+             WHERE pe.recording_id IS NOT r.canonical_id OR pe.appearance_id IS NOT ta.canonical_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        return Ok(rows.collect::<Result<_, _>>()?);
+    }
+
+    // With active `set_recording` corrections, compute the winning override
+    // per play set-wise in SQL and compare each play against its winner (or
+    // against its source item's assignment when no override matches it).
+    let encoded = serde_json::to_string(&active)?;
     let mut statement = connection.prepare(
-        "SELECT peo.observation_id FROM play_event pe
-         JOIN play_event_observation peo ON peo.play_event_id = pe.id
+        "WITH active(corr_id, want_rec, want_app) AS (
+             SELECT CAST(json_extract(value, '$[0]') AS INTEGER),
+                    CAST(json_extract(value, '$[1]') AS INTEGER),
+                    CAST(json_extract(value, '$[2]') AS INTEGER)
+             FROM json_each(?1)
+         ),
+         active_win AS (
+             SELECT a.corr_id, a.want_rec, a.want_app,
+                    oc.target_endpoint_id AS endpoint_id,
+                    cr.source_item_id,
+                    oc.target_from_utc_ms AS from_ms,
+                    oc.target_to_utc_ms AS to_ms
+             FROM active a
+             JOIN observation_correction oc ON oc.observation_id = a.corr_id
+             JOIN correction_recording cr ON cr.correction_id = a.corr_id
+             WHERE oc.target_endpoint_id IS NOT NULL
+         ),
+         matched(play_event_id, corr_id, want_rec, want_app) AS (
+             SELECT peo.play_event_id, a.corr_id, a.want_rec, a.want_app
+             FROM active a
+             JOIN correction_target ct ON ct.correction_id = a.corr_id
+             JOIN play_event_observation peo ON peo.observation_id = ct.target_observation_id
+             UNION ALL
+             SELECT peo.play_event_id, w.corr_id, w.want_rec, w.want_app
+             FROM active_win w
+             JOIN history_observation o
+               ON o.endpoint_id = w.endpoint_id
+              AND (w.source_item_id IS NULL OR o.source_item_id = w.source_item_id)
+             JOIN observation_import i
+               ON i.observation_id = o.id
+              AND (w.from_ms IS NULL OR i.played_at_utc_ms >= w.from_ms)
+              AND (w.to_ms IS NULL OR i.played_at_utc_ms < w.to_ms)
+             JOIN play_event_observation peo ON peo.observation_id = o.id
+             UNION ALL
+             SELECT peo.play_event_id, w.corr_id, w.want_rec, w.want_app
+             FROM active_win w
+             JOIN history_observation o
+               ON o.endpoint_id = w.endpoint_id
+              AND (w.source_item_id IS NULL OR o.source_item_id = w.source_item_id)
+             JOIN observation_listen l
+               ON l.observation_id = o.id
+              AND (w.from_ms IS NULL OR l.started_at_utc_ms >= w.from_ms)
+              AND (w.to_ms IS NULL OR l.started_at_utc_ms < w.to_ms)
+             JOIN play_event_observation peo ON peo.observation_id = o.id
+         ),
+         winner AS (
+             SELECT play_event_id, want_rec, want_app,
+                    ROW_NUMBER() OVER (PARTITION BY play_event_id ORDER BY corr_id DESC) AS rn
+             FROM matched
+         )
+         SELECT peo.observation_id
+         FROM play_event pe
+         LEFT JOIN winner w ON w.play_event_id = pe.id AND w.rn = 1
          LEFT JOIN assignment a ON a.source_item_id = pe.source_item_id
                                AND a.superseded_at_ms IS NULL
          LEFT JOIN recording r ON r.id = a.recording_id
-         WHERE pe.recording_id IS NOT r.canonical_id OR pe.appearance_id IS NOT a.appearance_id",
+         LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
+         JOIN play_event_observation peo ON peo.play_event_id = pe.id
+         WHERE (w.play_event_id IS NOT NULL
+                AND (pe.recording_id IS NOT w.want_rec OR pe.appearance_id IS NOT w.want_app))
+            OR (w.play_event_id IS NULL
+                AND (pe.recording_id IS NOT r.canonical_id OR pe.appearance_id IS NOT ta.canonical_id))",
     )?;
-    let rows = statement.query_map([], |row| row.get(0))?;
+    let rows = statement.query_map([encoded], |row| row.get(0))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -1071,9 +1331,11 @@ fn play_rows(
          LEFT JOIN recording r ON r.id = pe.recording_id
          LEFT JOIN track_appearance shown ON shown.id = coalesce(
            pe.appearance_id,
-           (SELECT l.queued_appearance_id FROM play_event_observation peo
-            JOIN observation_listen l ON l.observation_id = peo.observation_id
-            WHERE peo.play_event_id = pe.id AND peo.role = 'primary'))
+           CASE WHEN pe.recording_id IS NULL THEN
+             (SELECT l.queued_appearance_id FROM play_event_observation peo
+              JOIN observation_listen l ON l.observation_id = peo.observation_id
+              WHERE peo.play_event_id = pe.id AND peo.role = 'primary')
+           END)
          LEFT JOIN artist_credit ac
            ON ac.id = coalesce(shown.display_artist_credit_id, r.display_artist_credit_id)
          LEFT JOIN release rel ON rel.id = shown.release_id
@@ -1489,6 +1751,331 @@ impl LibraryStore {
     /// The library's listener the player plays for: its first.
     pub fn default_listener(&self) -> Result<Option<Id>, Error> {
         self.first_listener()
+    }
+
+    /// Records a `set_recording` correction on the manual endpoint, moving
+    /// the targeted observations to `recording` (and optional `appearance`),
+    /// or leaving them unbound when `recording` is `None`, above their source
+    /// item's assignment. Re-derives the affected plays in the same
+    /// transaction and returns the write receipt and the correction's key.
+    ///
+    /// `recording` and `appearance` are stored as named (never rewritten to
+    /// their canonical rows), and reads follow redirects at derivation time.
+    pub fn set_observation_recording(
+        &self,
+        request: WriteRequest,
+        targets: CorrectionTargets,
+        recording: Option<Id>,
+        appearance: Option<Id>,
+        note: Option<String>,
+    ) -> Result<(crate::Written, Id), Error> {
+        if recording.is_none() && appearance.is_some() {
+            return Err(Error::Invalid("an appearance requires a recording"));
+        }
+        match &targets {
+            CorrectionTargets::Observations(list) if list.is_empty() => {
+                return Err(Error::Invalid(
+                    "a correction must target at least one observation",
+                ));
+            }
+            CorrectionTargets::Window { from_ms, to_ms, .. } => {
+                for bound in [from_ms, to_ms].into_iter().flatten() {
+                    if jiff::Timestamp::from_millisecond(*bound).is_err() {
+                        return Err(Error::Invalid("a window bound is out of timestamp range"));
+                    }
+                }
+                if let (Some(from), Some(to)) = (from_ms, to_ms)
+                    && from >= to
+                {
+                    return Err(Error::Invalid("a window that ends before it begins"));
+                }
+            }
+            _ => {}
+        }
+        let session = request.client.map(|client| client.session);
+        let written = self.write(request, move |write| {
+            let connection = write.connection();
+            let manual: i64 = connection
+                .query_row(
+                    "SELECT id FROM history_endpoint WHERE kind = 'manual'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or(Error::Corrupt("a library with no manual endpoint"))?;
+            let listener: i64 = connection
+                .query_row("SELECT min(id) FROM listener", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })?
+                .ok_or(Error::Invalid("the library has no listener"))?;
+
+            let named_recording: Option<(i64, i64)> = match recording {
+                Some(id) => Some(
+                    connection
+                        .query_row(
+                            "SELECT id, canonical_id FROM recording WHERE public_id = ?1",
+                            [id.as_bytes()],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?
+                        .ok_or(Error::NotFound("no such recording"))?,
+                ),
+                None => None,
+            };
+            let (recording_row, appearance_row): (Option<i64>, Option<i64>) =
+                match (named_recording, appearance) {
+                    (Some((_, rec_canonical)), Some(app_id)) => {
+                        let found: Option<(i64, i64, i64)> = connection
+                            .query_row(
+                                "SELECT ta.id, ta.recording_id, r.canonical_id
+                                 FROM track_appearance ta
+                                 JOIN recording r ON r.id = ta.recording_id
+                                 WHERE ta.public_id = ?1",
+                                [app_id.as_bytes()],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .optional()?;
+                        let Some((app_row, app_rec, app_rec_canonical)) = found else {
+                            return Err(Error::NotFound("no such track appearance"));
+                        };
+                        if app_rec_canonical != rec_canonical {
+                            return Err(Error::Invalid(
+                                "that track appearance does not belong to that recording",
+                            ));
+                        }
+                        // Like an assignment, an appearance keeps its own
+                        // recording_id (satisfying the composite FK), and reads
+                        // follow recording.canonical_id.
+                        (Some(app_rec), Some(app_row))
+                    }
+                    (Some((rec_row, _)), None) => (Some(rec_row), None),
+                    (None, _) => (None, None),
+                };
+
+            let (target_rows, window_row): (Vec<i64>, Option<Window>) = match targets {
+                CorrectionTargets::Observations(list) => {
+                    let mut rows = Vec::with_capacity(list.len());
+                    let mut seen = BTreeSet::new();
+                    let mut find = connection.prepare_cached(
+                        "SELECT o.id, o.kind FROM history_observation o
+                         JOIN history_endpoint e ON e.id = o.endpoint_id
+                         WHERE e.public_id = ?1 AND o.source_key = ?2",
+                    )?;
+                    for (endpoint_id, source_key) in list {
+                        let found: Option<(i64, String)> = find
+                            .query_row((endpoint_id.as_bytes(), source_key.as_slice()), |row| {
+                                Ok((row.get(0)?, row.get(1)?))
+                            })
+                            .optional()?;
+                        let Some((obs_id, kind)) = found else {
+                            return Err(Error::NotFound("no such observation"));
+                        };
+                        if kind == "correction" {
+                            return Err(Error::Invalid(
+                                "a recording correction cannot target another correction",
+                            ));
+                        }
+                        if seen.insert(obs_id) {
+                            rows.push(obs_id);
+                        }
+                    }
+                    (rows, None)
+                }
+                CorrectionTargets::Window {
+                    endpoint,
+                    from_ms,
+                    to_ms,
+                    source_item,
+                } => {
+                    let endpoint_row: i64 = connection
+                        .query_row(
+                            "SELECT id FROM history_endpoint WHERE public_id = ?1",
+                            [endpoint.as_bytes()],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .ok_or(Error::NotFound("no such history endpoint"))?;
+                    let source_item_row: Option<i64> = match source_item {
+                        Some(item_id) => Some(
+                            connection
+                                .query_row(
+                                    "SELECT id FROM source_item WHERE public_id = ?1",
+                                    [item_id.as_bytes()],
+                                    |row| row.get(0),
+                                )
+                                .optional()?
+                                .ok_or(Error::NotFound("no such source item"))?,
+                        ),
+                        None => None,
+                    };
+                    (
+                        Vec::new(),
+                        Some(Window {
+                            endpoint: endpoint_row,
+                            from_ms,
+                            to_ms,
+                            source_item: source_item_row,
+                        }),
+                    )
+                }
+            };
+
+            let correction_key = write.new_id()?;
+            let payload = serde_json::json!({
+                "verb": "set_recording",
+                "recording": recording.map(|id| id.to_string()),
+                "appearance": appearance.map(|id| id.to_string()),
+                "note": note,
+            })
+            .to_string();
+            connection.execute(
+                "INSERT INTO history_observation
+                   (endpoint_id, source_key, kind, listener_id, captured_at_utc_ms,
+                    received_at_utc_ms, zone_basis, payload_json, rev)
+                 VALUES (?1, ?2, 'correction', ?3, ?4, ?4, 'none', ?5, ?6)",
+                rusqlite::params![
+                    manual,
+                    correction_key.as_bytes(),
+                    listener,
+                    write.now_ms(),
+                    payload,
+                    write.rev(),
+                ],
+            )?;
+            let correction_obs = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO observation_correction
+                   (observation_id, verb, target_endpoint_id, target_from_utc_ms,
+                    target_to_utc_ms, note, actor_session_pid, rev)
+                 VALUES (?1, 'set_recording', ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    correction_obs,
+                    window_row.map(|window| window.endpoint),
+                    window_row.and_then(|window| window.from_ms),
+                    window_row.and_then(|window| window.to_ms),
+                    note,
+                    session.as_ref().map(Id::as_bytes),
+                    write.rev(),
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO correction_recording
+                   (correction_id, recording_id, appearance_id, source_item_id, rev)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    correction_obs,
+                    recording_row,
+                    appearance_row,
+                    window_row.and_then(|window| window.source_item),
+                    write.rev(),
+                ],
+            )?;
+            let mut affected = BTreeSet::new();
+            for target in &target_rows {
+                connection.execute(
+                    "INSERT INTO correction_target (correction_id, target_observation_id, rev)
+                     VALUES (?1, ?2, ?3)",
+                    (correction_obs, target, write.rev()),
+                )?;
+                affected.insert(*target);
+            }
+            if let Some(window) = window_row {
+                affected.extend(window_observations(connection, window)?);
+            }
+            if !affected.is_empty() {
+                rederive(write, &affected, PlayRule::CURRENT)?;
+            }
+            Ok(serde_json::to_string(&correction_key.to_string())?)
+        })?;
+        let key: String = serde_json::from_str(&written.result_json)?;
+        let key = key
+            .parse()
+            .map_err(|_| Error::Corrupt("a correction's ID"))?;
+        Ok((written, key))
+    }
+
+    /// Records a `revoke` correction targeting an existing correction on the
+    /// manual endpoint, and re-derives every play it touched.
+    pub fn revoke_correction(
+        &self,
+        request: WriteRequest,
+        correction: Id,
+        note: Option<String>,
+    ) -> Result<(crate::Written, Id), Error> {
+        let session = request.client.map(|client| client.session);
+        let written = self.write(request, move |write| {
+            let connection = write.connection();
+            let manual: i64 = connection
+                .query_row(
+                    "SELECT id FROM history_endpoint WHERE kind = 'manual'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or(Error::Corrupt("a library with no manual endpoint"))?;
+            let listener: i64 = connection
+                .query_row("SELECT min(id) FROM listener", [], |row| {
+                    row.get::<_, Option<i64>>(0)
+                })?
+                .ok_or(Error::Invalid("the library has no listener"))?;
+            let target: i64 = connection
+                .query_row(
+                    "SELECT id FROM history_observation
+                     WHERE endpoint_id = ?1 AND source_key = ?2 AND kind = 'correction'",
+                    (manual, correction.as_bytes()),
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or(Error::NotFound("no such correction"))?;
+            let revoke_key = write.new_id()?;
+            let payload = serde_json::json!({
+                "verb": "revoke",
+                "target": correction.to_string(),
+                "note": note,
+            })
+            .to_string();
+            connection.execute(
+                "INSERT INTO history_observation
+                   (endpoint_id, source_key, kind, listener_id, captured_at_utc_ms,
+                    received_at_utc_ms, zone_basis, payload_json, rev)
+                 VALUES (?1, ?2, 'correction', ?3, ?4, ?4, 'none', ?5, ?6)",
+                rusqlite::params![
+                    manual,
+                    revoke_key.as_bytes(),
+                    listener,
+                    write.now_ms(),
+                    payload,
+                    write.rev(),
+                ],
+            )?;
+            let revoke_obs = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO observation_correction
+                   (observation_id, verb, note, actor_session_pid, rev)
+                 VALUES (?1, 'revoke', ?2, ?3, ?4)",
+                rusqlite::params![
+                    revoke_obs,
+                    note,
+                    session.as_ref().map(Id::as_bytes),
+                    write.rev(),
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO correction_target (correction_id, target_observation_id, rev)
+                 VALUES (?1, ?2, ?3)",
+                (revoke_obs, target, write.rev()),
+            )?;
+            let affected = correction_affected_observations(connection, target)?;
+            if !affected.is_empty() {
+                rederive(write, &affected, PlayRule::CURRENT)?;
+            }
+            Ok(serde_json::to_string(&revoke_key.to_string())?)
+        })?;
+        let key: String = serde_json::from_str(&written.result_json)?;
+        let key = key
+            .parse()
+            .map_err(|_| Error::Corrupt("a correction's ID"))?;
+        Ok((written, key))
     }
 }
 

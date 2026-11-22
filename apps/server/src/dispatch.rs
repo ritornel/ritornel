@@ -1356,8 +1356,8 @@ mod tests {
                 "server": env!("CARGO_PKG_VERSION"),
                 "contract": CONTRACT_VERSION,
                 "sqlite": "3.54.1",
-                "serverSchema": 1,
-                "librarySchema": 3,
+                "serverSchema": ritornel_engine::SERVER_SCHEMA_VERSION,
+                "librarySchema": ritornel_engine::LIBRARY_SCHEMA_VERSION,
             })
         );
         assert_eq!(
