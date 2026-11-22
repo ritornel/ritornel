@@ -1262,6 +1262,53 @@ fn a_disk_that_goes_away_mid_scan_leaves_every_file_as_it_was_and_the_next_scan_
 }
 
 #[test]
+fn another_disk_mounted_at_the_root_after_the_walk_is_not_judged_against_it() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    let (root, away) = (rig.root(), rig.scratch.path().join("unmounted"));
+    for nothing_to_read in [false, true] {
+        if nothing_to_read {
+            // The walk sees only a file gone, and the scan goes straight to
+            // judging what is missing.
+            rig.scan();
+            rig.put("Tin Weather/03.mp3", "a.mp3");
+            rig.scan();
+            std::fs::remove_file(root.join("Tin Weather/03.mp3")).unwrap();
+        } else {
+            // The walk sees 01 changed and 02 gone.
+            rig.put("Tin Weather/01.flac", "a.retagged.flac");
+            std::fs::remove_file(root.join("Tin Weather/02.flac")).unwrap();
+        }
+        let (revision, before) = (rig.revision(), rig.dump());
+        let (mut run, row) = walked(&mut rig);
+        // Then the disk is swapped for another whose files all read, with
+        // other audio at 01.
+        std::fs::rename(&root, &away).unwrap();
+        rig.put("Tin Weather/01.flac", "b.flac");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let refused = loop {
+            match run.prepare(&stop, &mut |_| {}) {
+                Ok(_) => assert_eq!(run.commit(&rig.library).unwrap(), None),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(&refused, Error::RootOffline { path } if *path == root),
+            "{refused:?}"
+        );
+        rig.server
+            .finish_job(row, JobState::Failed, Some("offline".to_owned()))
+            .unwrap();
+        // Nothing is replaced, retired, missing or changed.
+        assert_eq!((rig.revision(), rig.dump()), (revision, before));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::rename(&away, &root).unwrap();
+    }
+}
+
+#[test]
 fn a_file_that_cannot_be_reached_when_it_is_read_keeps_what_was_last_read_of_it() {
     let mut rig = Rig::new();
     rig.put("Tin Weather/01.flac", "a.flac");

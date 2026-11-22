@@ -282,25 +282,21 @@ impl ScanRun {
                 let Some(batch) = batch else {
                     return Ok(false);
                 };
-                // A file the system would not let be read, in a root that
-                // is no longer the folder that was walked: the disk went
-                // away. The scan ends, and nothing it could not read is
-                // recorded or taken for gone.
-                let unavailable = batch.iter().any(|payload| {
-                    payload
-                        .error
-                        .as_ref()
-                        .is_some_and(|error| error.kind == UNAVAILABLE)
-                });
-                let walked_id = self.walked.as_ref().and_then(|walked| walked.root_id);
-                if unavailable && folder_id(&self.root) != walked_id {
-                    return Err(Error::RootOffline {
-                        path: self.root.clone(),
-                    });
-                }
                 self.batch = batch;
             }
             _ => {}
+        }
+        // What a batch read, and which files the walk found gone or other
+        // audio at, are of the folder that was walked. A root that is no
+        // longer that folder, as when its disk went away or another was
+        // mounted at its path, ends the scan: nothing more is recorded, and
+        // nothing is taken for gone or replaced.
+        let judged = matches!(self.phase, Phase::Read | Phase::Missing | Phase::Replaced);
+        let walked_id = self.walked.as_ref().and_then(|walked| walked.root_id);
+        if judged && folder_id(&self.root) != walked_id {
+            return Err(Error::RootOffline {
+                path: self.root.clone(),
+            });
         }
         Ok(!stop.load(Ordering::Relaxed))
     }
