@@ -457,19 +457,19 @@ impl Artist {
         self.melting = true;
         let source = Arc::clone(source);
         let from = Arc::clone(&source);
-        let made = self
-            .net
-            .rt()
-            .spawn_blocking(move || crate::banner::melted(&source, size.0, size.1));
+        let made = self.net.rt().spawn(crate::covers::decode(move || {
+            Some(crate::banner::melted(&source, size.0, size.1))
+        }));
+        self.fetches.push(made.abort_handle());
         cx.spawn(async move |this, cx| {
-            let made = made.await;
+            let made = made.await.ok().flatten();
             this.update(cx, |page, cx| {
                 page.melting = false;
                 let current = page
                     .portrait
                     .as_ref()
                     .is_some_and(|portrait| Arc::ptr_eq(portrait, &from));
-                if let Ok(image) = made
+                if let Some(image) = made
                     && current
                     && page.wanted == Some(size)
                 {
@@ -478,7 +478,7 @@ impl Artist {
                         .as_ref()
                         .map_or_else(Instant::now, |made| made.2);
                     if let Some((_, old, _)) = page.melted.replace((size, Arc::new(image), since)) {
-                        cx.drop_image(old, None);
+                        crate::covers::drop_unshared(old, None, cx);
                     }
                 }
                 // The next render makes the one wanted now, if this was not it.
@@ -495,7 +495,7 @@ impl Artist {
     fn forget_portrait(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.portrait = None;
         if let Some((_, old, _)) = self.melted.take() {
-            cx.drop_image(old, window);
+            crate::covers::drop_unshared(old, window, cx);
         }
     }
 
@@ -532,11 +532,9 @@ impl Artist {
             let bucket = self.net.bucket((2. * 380. * scale).ceil() as u32);
             let read = self.net.rt().spawn(async move {
                 let bytes = http.get(art, bucket).await?;
-                tokio::task::spawn_blocking(move || crate::covers::decode_picture(&bytes))
-                    .await
-                    .ok()
-                    .flatten()
+                crate::covers::decode(move || crate::covers::decode_picture(&bytes)).await
             });
+            self.fetches.push(read.abort_handle());
             cx.spawn(async move |this, cx| {
                 if let Ok(Some(source)) = read.await {
                     this.update(cx, |page, cx| {
@@ -557,16 +555,15 @@ impl Artist {
         let tone = crate::blur::wash_tone(theme::dark());
         let blurs = self.net.rt().spawn(async move {
             let bytes = http.get(art, crate::blur::SIDE).await?;
-            tokio::task::spawn_blocking(move || {
+            crate::covers::decode(move || {
                 Some((
                     crate::blur::jpeg(&bytes, banner_radius, crate::blur::BANNER.1)?,
                     crate::blur::jpeg_toned(&bytes, wash_radius, tone.0, tone.1)?,
                 ))
             })
             .await
-            .ok()
-            .flatten()
         });
+        self.fetches.push(blurs.abort_handle());
         cx.spawn(async move |this, cx| {
             let blurs = blurs.await.ok().flatten();
             this.update(cx, |page, cx| {
