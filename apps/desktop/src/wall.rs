@@ -337,6 +337,9 @@ pub(crate) struct Wall {
     /// The newest library revision a list event has named, of any view: one
     /// newer than a view just opened says it changed while it was opening.
     heard_revision: u64,
+    /// The server has let the view go: nothing is read through it until
+    /// another takes its place.
+    lost: bool,
     /// Which wall, in which order, and whether the large letters stand beside it.
     pub kind: WallKind,
     pub order: Order,
@@ -443,6 +446,7 @@ impl Wall {
             pending_anchor: None,
             opening: 0,
             heard_revision: 0,
+            lost: false,
             kind: WallKind::Artists,
             order: BY_NAME,
             letters: true,
@@ -529,6 +533,7 @@ impl Wall {
     /// for a wall, an order or a session since left.
     fn forget_asks(&mut self) {
         self.opening += 1;
+        self.lost = false;
         self.replacing = None;
         self.replace_again = false;
         self.pending_anchor = None;
@@ -1176,7 +1181,8 @@ impl Wall {
         // Not laid out yet, empty or never drawn, there is no row to keep in
         // place: the view is opened afresh.
         let Some(layout) = self.layout.clone() else {
-            self.replacing = None;
+            self.forget_asks();
+            self.selected = None;
             self.view = None;
             self.close_view(old);
             self.pages.clear();
@@ -1217,15 +1223,27 @@ impl Wall {
                     }),
                 })
                 .await?;
-            let sections = client.list_sections(&opened.view).await?;
-            // The rows around the anchor, so that what replaces the old ones is there at once.
-            let near = match opened.anchor_index {
-                Some(at) if at / PAGE as u64 * PAGE as u64 != offset => Some(
-                    client
-                        .list_window(&opened.view, at / PAGE as u64 * PAGE as u64, PAGE as u64)
-                        .await?,
-                ),
-                _ => None,
+            let read = async {
+                let sections = client.list_sections(&opened.view).await?;
+                // The rows around the anchor, so that what replaces the old ones is there at once.
+                let near = match opened.anchor_index {
+                    Some(at) if at / PAGE as u64 * PAGE as u64 != offset => Some(
+                        client
+                            .list_window(&opened.view, at / PAGE as u64 * PAGE as u64, PAGE as u64)
+                            .await?,
+                    ),
+                    _ => None,
+                };
+                Ok::<_, ritornel_client::Error>((sections, near))
+            };
+            // The old view has ended with the open: a new one that cannot be
+            // read is closed too, and the replacement is asked for again.
+            let (sections, near) = match read.await {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = client.list_close(&opened.view).await;
+                    return Err(error);
+                }
             };
             // The selection, found again in the new view.
             let found = match &selected {
@@ -1305,11 +1323,15 @@ impl Wall {
                     ));
                     wall.revision = opened.library_revision;
                     wall.view = Some(opened.view);
+                    wall.lost = false;
                     wall.layout = None;
                     // The library changed while it was opening.
                     if wall.heard_revision > wall.revision {
                         wall.replace_again = true;
                     }
+                } else {
+                    // Not opened or not read: asked again, a second on at the soonest.
+                    wall.replace_again = true;
                 }
                 if std::mem::take(&mut wall.replace_again) {
                     wall.schedule_replace(cx);
@@ -1334,11 +1356,11 @@ impl Wall {
         cx.spawn(async move |wall, cx| {
             let answer = read.await;
             wall.update(cx, |wall, cx| {
-                if wall.view.as_deref() == Some(asked_of.as_str())
-                    && expired(&answer)
-                    && wall.replacing.is_none()
-                {
-                    wall.schedule_replace(cx);
+                if wall.view.as_deref() == Some(asked_of.as_str()) && expired(&answer) {
+                    wall.lost = true;
+                    if wall.replacing.is_none() {
+                        wall.schedule_replace(cx);
+                    }
                 }
             })
             .ok();
@@ -1419,6 +1441,7 @@ impl Wall {
                         );
                         wall.revision = opened.library_revision;
                         wall.view = Some(opened.view);
+                        wall.lost = false;
                         wall.layout = None;
                         // The library changed while it was opening.
                         if wall.heard_revision > wall.revision {
@@ -1451,6 +1474,9 @@ impl Wall {
         let (Some(view), Some(net)) = (self.view.clone(), self.net.clone()) else {
             return;
         };
+        if self.lost {
+            return;
+        }
         self.pages.insert(page, Page::Loading);
         self.pages_in_flight += 1;
         let asked_of = view.clone();
@@ -1484,8 +1510,11 @@ impl Wall {
                     // opened in its place keeps the row at the top where it is.
                     answer => {
                         wall.pages.remove(&page);
-                        if expired(&answer) && wall.replacing.is_none() {
-                            wall.schedule_replace(cx);
+                        if expired(&answer) {
+                            wall.lost = true;
+                            if wall.replacing.is_none() {
+                                wall.schedule_replace(cx);
+                            }
                         }
                     }
                 }
