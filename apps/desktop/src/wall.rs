@@ -369,6 +369,20 @@ impl Wall {
             LinkEvent::Connected(net) => wall.start(Arc::clone(net), cx),
             LinkEvent::Away => wall.end(cx),
             LinkEvent::Server(ritornel_contract::Event::List(event)) => wall.heard(event, cx),
+            // A change made while no view was held names no view, but its
+            // revision says whether a view that opens meanwhile is older.
+            LinkEvent::Server(ritornel_contract::Event::Library(event))
+                if event.changed.is_empty()
+                    || !event.changed.iter().all(|change| {
+                        matches!(
+                            change,
+                            ritornel_contract::LibraryChange::Stats
+                                | ritornel_contract::LibraryChange::Ratings
+                        )
+                    }) =>
+            {
+                wall.heard_revision = wall.heard_revision.max(event.library_revision);
+            }
             LinkEvent::Server(_) => {}
         });
         // The large letters follow Settings › Appearance at once.
@@ -478,6 +492,8 @@ impl Wall {
         self.wants = Some(wants);
         self.loader = loader;
         self.net = Some(net);
+        // Revisions are the server's: another may count from elsewhere.
+        self.heard_revision = 0;
         self.keeping = Some(cx.spawn(async move |wall, cx| {
             loop {
                 cx.background_executor().timer(KEEP_VIEW).await;
@@ -1153,10 +1169,19 @@ impl Wall {
     /// keep in place; everything changes at once when its rows are in.
     fn replace(&mut self, cx: &mut Context<Self>) {
         self.last_replace = Some(Instant::now());
-        let (Some(net), Some(old), Some(layout)) =
-            (self.net.clone(), self.view.clone(), self.layout.clone())
-        else {
+        let (Some(net), Some(old)) = (self.net.clone(), self.view.clone()) else {
             self.replacing = None;
+            return;
+        };
+        // Not laid out yet, empty or never drawn, there is no row to keep in
+        // place: the view is opened afresh.
+        let Some(layout) = self.layout.clone() else {
+            self.replacing = None;
+            self.view = None;
+            self.close_view(old);
+            self.pages.clear();
+            self.pages_in_flight = 0;
+            self.open(cx);
             return;
         };
         let wall_top = (self.top - HEADER).max(0.);
@@ -1239,13 +1264,17 @@ impl Wall {
                         .collect();
                     wall.pages.clear();
                     wall.pages_in_flight = 0;
-                    wall.pages.insert(
-                        opened.offset as usize / PAGE,
-                        Page::Ready {
-                            rows: rows_of(opened.rows),
-                            used: wall.frame,
-                        },
-                    );
+                    // A list grown shorter than the rows asked for answers from
+                    // its end, not from the start of a page: those are read anew.
+                    if opened.offset == offset {
+                        wall.pages.insert(
+                            opened.offset as usize / PAGE,
+                            Page::Ready {
+                                rows: rows_of(opened.rows),
+                                used: wall.frame,
+                            },
+                        );
+                    }
                     if let Some(near) = near {
                         wall.pages.insert(
                             near.offset as usize / PAGE,
