@@ -2325,9 +2325,10 @@ export type LinkInvite = {
  */
 export type LinkInviteParams = {
   /**
-   * Where the satellite may reach the hub, as `address:port`, in the
-   * order to try. Left empty, the hub offers the addresses it finds it
-   * has on the private network and a tailnet.
+   * Where the satellite may reach the hub, as `host:port`, in the order
+   * to try: an address on a private network or a tailnet, or a name the
+   * satellite resolves at each dial. Left empty, the hub offers its
+   * multicast DNS name and the addresses it finds it has.
    */
   routes: Array<string>,
 };

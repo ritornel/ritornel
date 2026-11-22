@@ -27,7 +27,7 @@
 //! ritornelctl lastfm sync [--full] [--no-wait]
 //! ritornelctl lastfm report [--limit <n>]
 //! ritornelctl lastfm scrobbling <on | off>
-//! ritornelctl link invite [--route <address:port>]...
+//! ritornelctl link invite [--route <host:port>]...
 //! ritornelctl link join <link>
 //! ritornelctl link status
 //! ritornelctl link awake <while-active [<minutes>] | always | never>
@@ -87,7 +87,7 @@ Usage:
   ritornelctl lastfm sync [--full] [--no-wait] [--data-dir <dir>] [--json]
   ritornelctl lastfm report [--limit <n>] [--data-dir <dir>] [--json]
   ritornelctl lastfm scrobbling <on | off> [--data-dir <dir>] [--json]
-  ritornelctl link invite [--route <address:port>]... [--data-dir <dir>] [--json]
+  ritornelctl link invite [--route <host:port>]... [--data-dir <dir>] [--json]
   ritornelctl link join <link> [--data-dir <dir>] [--json]
   ritornelctl link status [--data-dir <dir>] [--json]
   ritornelctl link awake <while-active [<minutes>] | always | never>
@@ -201,7 +201,8 @@ Commands:
                    it browses this library, plays its music and sends its
                    listens here. The link works once, for ten minutes, and
                    holds a secret. --route names where the hub is reached,
-                   if not at the addresses it finds it has
+                   an address or a name such as a tailnet's, in place of
+                   the routes it finds: its .local name and its addresses
   link join <link> Make this server, which holds no library, the satellite
                    of the hub that made the link
   link status      Show this server's hub, or its satellites, and when it

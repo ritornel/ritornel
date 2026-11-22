@@ -74,6 +74,19 @@ pub(crate) fn computer_name() -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
+/// The name this machine answers to on the local network by multicast DNS
+/// (Bonjour), such as `studio-mac.local`, when it answers to one: what an
+/// invite offers first, so that a hub whose address changes is still
+/// found.
+pub(crate) fn mdns_name() -> Option<String> {
+    let host = system::mdns_host()?.trim().to_ascii_lowercase();
+    let host = host.strip_suffix(".local").unwrap_or(&host);
+    let valid = !host.is_empty()
+        && host.len() <= 63
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    valid.then(|| format!("{host}.local"))
+}
+
 /// The machine kept from sleeping when idle, its screen still free to, for
 /// as long as this is held. It is a helper process the system already has,
 /// asked to hold the system's own assertion; dropping this ends it, and so
@@ -107,7 +120,8 @@ mod other_unix {
     #[cfg(feature = "media-session")]
     pub(crate) use super::fallback::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
     pub(crate) use super::fallback::{
-        computer_name, install_service, service_status, stay_awake, uninstall_service, wait,
+        computer_name, install_service, mdns_host, service_status, stay_awake, uninstall_service,
+        wait,
     };
     pub(crate) use super::unix::*;
 }
@@ -151,6 +165,12 @@ mod fallback {
 
     /// The computer's name is not read here yet.
     pub(crate) fn computer_name() -> Option<String> {
+        None
+    }
+
+    /// Whether this machine answers to a name by multicast DNS is not
+    /// known here yet.
+    pub(crate) fn mdns_host() -> Option<String> {
         None
     }
 

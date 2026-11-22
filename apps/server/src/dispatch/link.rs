@@ -328,8 +328,7 @@ impl Core {
                  holds none",
             ));
         }
-        let routes =
-            link::routes_of(&invite).map_err(|why| RpcError::new(ErrorCode::Invalid, why))?;
+        link::check_routes(&invite.routes).map_err(|why| RpcError::new(ErrorCode::Invalid, why))?;
         let runtime = self.runtime.as_ref().ok_or_else(|| {
             RpcError::new(
                 ErrorCode::Unavailable,
@@ -337,13 +336,22 @@ impl Core {
             )
         })?;
         let name = self.name();
-        let (route, descriptor) = runtime
+        let (route, address, descriptor) = runtime
             .block_on(async {
                 let mut tried = Vec::new();
-                for route in routes {
-                    match link::reach(route, invite.hub, &invite.key, &*self.entropy).await {
-                        Ok(descriptor) => return Ok((route, descriptor)),
-                        Err(why) => tried.push(format!("{route}: {why}")),
+                for route in invite.routes.iter().take(crate::uplink::MAX_ROUTES) {
+                    let addresses = match link::resolve(route).await {
+                        Ok(addresses) => addresses,
+                        Err(why) => {
+                            tried.push(format!("{route}: {why}"));
+                            continue;
+                        }
+                    };
+                    for address in addresses {
+                        match link::reach(address, invite.hub, &invite.key, &*self.entropy).await {
+                            Ok(descriptor) => return Ok((route.clone(), address, descriptor)),
+                            Err(why) => tried.push(format!("{route} ({address}): {why}")),
+                        }
                     }
                 }
                 Err(format!("no route reached the hub. {}", tried.join("; ")))
@@ -355,7 +363,7 @@ impl Core {
         // the network's.
         let granted = runtime
             .block_on(link::request(
-                route,
+                address,
                 &invite,
                 self.server_id,
                 &name,
@@ -364,14 +372,14 @@ impl Core {
             .map_err(|why| {
                 RpcError::new(ErrorCode::Conflict, why).with_detail("reason", "refused")
             })?;
-        // The route that worked goes first.
-        let first = route.to_string();
-        let mut routes = vec![first.clone()];
+        // The route that worked goes first, as the invite named it: a name
+        // is resolved again at each dial.
+        let mut routes = vec![route.clone()];
         routes.extend(
             invite
                 .routes
                 .iter()
-                .filter(|other| **other != first)
+                .filter(|other| **other != route)
                 .cloned(),
         );
         let identity = stores

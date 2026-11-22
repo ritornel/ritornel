@@ -46,6 +46,19 @@ impl Agent {
     }
 }
 
+/// The host name macOS answers to by Bonjour, which it always does: the
+/// `studio-mac` of `studio-mac.local`.
+pub(crate) fn mdns_host() -> Option<String> {
+    let found = Command::new("/usr/sbin/scutil")
+        .args(["--get", "LocalHostName"])
+        .output()
+        .ok()?;
+    found
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&found.stdout).into_owned())
+}
+
 /// The name in System Settings › General › Sharing, as the person wrote
 /// it: "Studio Mac", not the network's `studio-mac.local`.
 pub(crate) fn computer_name() -> Option<String> {

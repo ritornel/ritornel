@@ -306,6 +306,49 @@ async fn a_server_joins_a_hub_with_an_invite_and_becomes_its_satellite() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_route_may_be_a_name_resolved_at_each_dial_and_a_name_for_another_server_is_refused() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, _desk, desk_client) = two(&scratch).await;
+        let link = invite(&hub, &hub_client).await;
+        let by_name = |port: u16| {
+            let mut named = InviteLink::parse(&link).unwrap();
+            named.routes = vec![format!("localhost:{port}")];
+            named.to_string()
+        };
+
+        // A name that answers with another server is harmless: that server
+        // cannot prove it holds the hub's key, and is sent nothing else.
+        let other = start(&scratch, "other").await;
+        let refused = join(&desk_client, &by_name(other.endpoint().port()))
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("not the hub the link names"),
+            "{refused}"
+        );
+
+        // A name that answers with the hub links, and is kept as a name,
+        // to be resolved again each time the satellite dials.
+        let status = join(&desk_client, &by_name(hub.endpoint().port()))
+            .await
+            .unwrap();
+        let hub_status = status.hub.unwrap();
+        assert_eq!(hub_status.server_id, hub.server_id());
+        assert_eq!(
+            hub_status.routes[0],
+            format!("localhost:{}", hub.endpoint().port())
+        );
+        let stats = desk_client
+            .call::<LibraryStats>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(stats.artists, 0);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_invite_works_once_and_only_for_the_hub_it_names() {
     bounded(async {
         let scratch = Scratch::new();

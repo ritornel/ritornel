@@ -22,6 +22,12 @@ pub(crate) use super::fallback::{
     install_service, service_status, stay_awake, uninstall_service, wait,
 };
 
+/// The host name Windows answers to by multicast DNS, which it does for its
+/// own name since Windows 10.
+pub(crate) fn mdns_host() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
 /// The computer's name, as Windows gives it to every program.
 pub(crate) fn computer_name() -> Option<String> {
     std::env::var("COMPUTERNAME").ok()

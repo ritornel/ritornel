@@ -19,9 +19,10 @@ use crate::{Id, ServerRole, TrackSummary, hex};
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct LinkInviteParams {
-    /// Where the satellite may reach the hub, as `address:port`, in the
-    /// order to try. Left empty, the hub offers the addresses it finds it
-    /// has on the private network and a tailnet.
+    /// Where the satellite may reach the hub, as `host:port`, in the order
+    /// to try: an address on a private network or a tailnet, or a name the
+    /// satellite resolves at each dial. Left empty, the hub offers its
+    /// multicast DNS name and the addresses it finds it has.
     #[serde(default)]
     pub routes: Vec<String>,
 }
@@ -366,7 +367,7 @@ pub fn link_request_proof(hub: Id, secret: &[u8]) -> Vec<u8> {
 const SCHEME: &str = "ritornel://link/";
 
 /// An invite, as its link writes it:
-/// `ritornel://link/<hub ID>?key=<public key>&route=<address:port>…#<secret>`.
+/// `ritornel://link/<hub ID>?key=<public key>&route=<host:port>…#<secret>`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct InviteLink {
     /// The hub's server ID.
