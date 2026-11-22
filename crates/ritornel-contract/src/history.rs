@@ -244,6 +244,9 @@ pub struct HistoryExported {
     pub observations: u64,
     /// How many ratings and loves, each one said or cleared.
     pub ratings: u64,
+    /// How many plays sent, or to be sent, to a service such as Last.fm.
+    #[serde(default)]
+    pub deliveries: u64,
     /// How many plays in the table derived from them.
     pub plays: u64,
 }

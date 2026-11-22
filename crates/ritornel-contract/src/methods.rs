@@ -24,8 +24,11 @@ pub enum MethodKind {
     /// It reads and changes nothing.
     Query,
     /// It changes something lasting. Its params carry an `idempotencyKey`
-    /// and its result is a [`Receipt`](crate::Receipt), so sending it again
-    /// is safe.
+    /// and its result is a [`Receipt`](crate::Receipt). Sent again with the
+    /// same key, as a client does when it lost the reply, it is not carried
+    /// out twice, and never undoes a command that came after it; the same
+    /// key with other params is refused. A method that says otherwise is
+    /// carried out again: a backup and an export each write another folder.
     Command,
 }
 
@@ -391,7 +394,9 @@ methods! {
 
     /// `lastfm.signInFinish`: once the listener has approved the sign-in,
     /// exchanges it for a session and keeps it. Before that it answers
-    /// `accepted`, and is called again.
+    /// `accepted`, and is called again. The sign-in it names, not its key,
+    /// is what makes sending it again safe: once finished, it answers with
+    /// the same account, and its receipt is made and not stored.
     LastfmSignInFinish: "lastfm.signInFinish", Command, needs_full: true,
     SignInFinishParams => SignInFinished;
 
@@ -436,16 +441,21 @@ methods! {
     /// `server.backup`: copies this server's databases into a new folder in
     /// the place its backups go, and answers when the copy is whole. It
     /// fails with `invalid` when no place is named, and with `unavailable`
-    /// when the place cannot be written to now. Taking one again takes
-    /// another, so the receipt is made and not stored.
+    /// when the place cannot be written to now. Sent again, even with the
+    /// same key, it takes another backup: the receipt is made and not
+    /// stored.
     ServerBackup: "server.backup", Command, needs_full: true,
     BackupParams => BackedUp;
 
     /// `history.export`: writes the record into a new folder of its own in
-    /// the folder named: every observation and every rating as JSON Lines,
-    /// and the plays derived from them as a table, readable without
-    /// Ritornel. It answers when the folder is whole. Exporting again
-    /// writes another, so the receipt is made and not stored.
+    /// the folder named, readable without Ritornel: every observation,
+    /// every rating and what became of every play sent to a service, as
+    /// JSON Lines, and the plays derived from them as a table. Which plays
+    /// there are, what makes each and whether it counts can be derived
+    /// again from the other files alone, by the rule the manifest names. It
+    /// answers when the folder is whole. Sent again, even
+    /// with the same key, it writes another: the receipt is made and not
+    /// stored.
     HistoryExport: "history.export", Command, needs_full: true,
     HistoryExportParams => HistoryExported;
 

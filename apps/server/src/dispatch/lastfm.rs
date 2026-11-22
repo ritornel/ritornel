@@ -117,12 +117,12 @@ impl Core {
 
 #[cfg(feature = "lastfm")]
 mod enabled {
-    use ritornel_contract::methods::{LastfmSync, Method};
+    use ritornel_contract::methods::{LastfmSetScrobbling, LastfmSignOut, LastfmSync, Method};
     use ritornel_contract::{
         DeliveryCount, DoubtfulTrack, ImportSchedule, LastImport, NearlyMatched, Receipt,
         ReceiptStatus,
     };
-    use ritornel_engine::{Command, LibraryStore, NewJob, ServiceSession};
+    use ritornel_engine::{Command, LibraryStore, NewJob, ServiceSession, SettingChange};
 
     use super::*;
     use crate::dispatch::calls::job;
@@ -140,6 +140,14 @@ mod enabled {
             ErrorCode::Unavailable,
             "Last.fm is not set up on this server",
         )
+    }
+
+    fn not_signed_in() -> RpcError {
+        RpcError::new(
+            ErrorCode::Unavailable,
+            "not signed in to Last.fm: sign in with `ritornelctl lastfm signin`",
+        )
+        .with_detail("reason", "not_signed_in")
     }
 
     fn unsigned(number: i64) -> u64 {
@@ -181,13 +189,7 @@ mod enabled {
                 .server()
                 .service_session(SERVICE)
                 .map_err(refused)?
-                .ok_or_else(|| {
-                    RpcError::new(
-                        ErrorCode::Unavailable,
-                        "not signed in to Last.fm: sign in with `ritornelctl lastfm signin`",
-                    )
-                    .with_detail("reason", "not_signed_in")
-                })
+                .ok_or_else(not_signed_in)
         }
 
         pub(in crate::dispatch) fn lastfm_status(
@@ -420,12 +422,24 @@ mod enabled {
             stores: &Stores,
             params: &KeyParams,
         ) -> Result<SignedOut, RpcError> {
+            let command = Command {
+                id: params.idempotency_key,
+                fingerprint: fingerprint::<LastfmSignOut>(params)?,
+            };
             // Once this answers, nothing more is sent as the session ended.
+            // Sent again after a newer sign-in, it signs nothing out.
             let change = self.lastfm().map(Lastfm::hold);
             let was_signed_in = stores
                 .server()
-                .remove_service_session(SERVICE)
-                .map_err(refused)?;
+                .change_once(
+                    command,
+                    LastfmSignOut::NAME,
+                    SettingChange::SignOut {
+                        service: SERVICE.to_owned(),
+                    },
+                )
+                .map_err(refused)?
+                .found;
             drop(change);
             Ok(SignedOut {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Done),
@@ -462,15 +476,33 @@ mod enabled {
             stores: &Stores,
             params: &ScrobblingParams,
         ) -> Result<ScrobblingSet, RpcError> {
-            Self::session(stores)?;
-            // Turned off, nothing more is sent once this answers.
+            let command = Command {
+                id: params.idempotency_key,
+                fingerprint: fingerprint::<LastfmSetScrobbling>(params)?,
+            };
+            // Turned off, nothing more is sent once this answers. Sent again
+            // after a newer change, a sign-out included, it changes nothing,
+            // and answers with scrobbling as it is.
             let change = self.lastfm().map(Lastfm::hold);
-            let session = stores
+            let changed = stores
                 .server()
-                .set_scrobbling(SERVICE, params.on)
-                .map_err(refused)?;
+                .change_once(
+                    command,
+                    LastfmSetScrobbling::NAME,
+                    SettingChange::Scrobbling {
+                        service: SERVICE.to_owned(),
+                        on: params.on,
+                    },
+                )
+                .map_err(|error| match error {
+                    ritornel_engine::Error::NotFound(_) => not_signed_in(),
+                    other => refused(other),
+                })?;
             drop(change);
-            self.wake_scrobbler();
+            if changed.now {
+                self.wake_scrobbler();
+            }
+            let session = stores.server().service_session(SERVICE).map_err(refused)?;
             Ok(ScrobblingSet {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Done),
                 scrobbling_since: session.and_then(|s| s.scrobble_from_ms),
@@ -667,6 +699,63 @@ mod tests {
 
     fn schedule(core: &Core, session: &Session) -> Value {
         call(core, session, "lastfm.status", json!({})).unwrap()["import"].clone()
+    }
+
+    #[test]
+    fn a_settings_command_sent_again_never_undoes_a_newer_one() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, cli) = hub(&clock);
+        let scrobbling = |byte: u8, on: bool| {
+            let mut params = key(byte);
+            params["on"] = json!(on);
+            call(&core, &cli, "lastfm.setScrobbling", params)
+        };
+        let on = || {
+            call(&core, &cli, "lastfm.status", json!({})).unwrap()["scrobblingSince"].is_number()
+        };
+        // On with A, off with B, then A again, as a client retrying a reply
+        // it lost would: it stays off.
+        scrobbling(0xa1, true).unwrap();
+        scrobbling(0xb1, false).unwrap();
+        let again = scrobbling(0xa1, true).unwrap();
+        assert!(!on());
+        assert_eq!(again["scrobblingSince"], Value::Null);
+        // The same key with other params is refused.
+        assert_eq!(scrobbling(0xb1, true), Err(ErrorCode::IdempotencyMismatch));
+        assert!(!on());
+
+        // Sent again once signed out, it answers as it is, and a new one is
+        // refused, with nothing kept of it.
+        call(&core, &cli, "lastfm.signOut", key(0xa4)).unwrap();
+        assert!(scrobbling(0xa1, true).is_ok());
+        assert_eq!(scrobbling(0xc1, true), Err(ErrorCode::Unavailable));
+        sign_in(&core);
+        scrobbling(0xc1, true).unwrap();
+        assert!(on());
+        scrobbling(0xc2, false).unwrap();
+
+        // A sign-out sent again after a new sign-in signs nothing out.
+        let signed_out = call(&core, &cli, "lastfm.signOut", key(0xa2)).unwrap();
+        assert_eq!(signed_out["wasSignedIn"], true);
+        sign_in(&core);
+        let again = call(&core, &cli, "lastfm.signOut", key(0xa2)).unwrap();
+        assert_eq!(again["wasSignedIn"], true);
+        let status = call(&core, &cli, "lastfm.status", json!({})).unwrap();
+        assert_eq!(status["account"], "someone");
+
+        // Watching: off with A, on with B, then A again stays on.
+        let watching = |byte: u8, on: bool| {
+            let mut params = key(byte);
+            params["on"] = json!(on);
+            call(&core, &cli, "library.setWatching", params).unwrap()
+        };
+        watching(0xa3, false);
+        watching(0xb3, true);
+        watching(0xa3, false);
+        assert!(
+            core.with_stores(|stores| stores.server().watching().unwrap())
+                .unwrap()
+        );
     }
 
     #[test]

@@ -64,6 +64,13 @@ struct State {
     user: String,
     history: Vec<FakeScrobble>,
     loved: Vec<(String, String, u64)>,
+    /// The account loved tracks are answered as, when not the one asked
+    /// for.
+    loved_as: Option<String>,
+    /// Scrobbles of one second come in the other order on every other
+    /// read of the recent tracks, as Last.fm's order is not stable.
+    unstable_order: bool,
+    recent_reads: u32,
     /// How many times `auth.getSession` answers "not approved yet" before
     /// it hands out the session.
     unapproved: u32,
@@ -131,6 +138,19 @@ impl FakeLastfm {
             .into_iter()
             .map(|(a, t, at)| (a.to_owned(), t.to_owned(), at))
             .collect();
+    }
+
+    /// Answers for loved tracks as `user`, whoever was asked for.
+    #[cfg(test)]
+    pub(crate) fn answer_loved_as(&self, user: &str) {
+        lock(&self.state).loved_as = Some(user.to_owned());
+    }
+
+    /// Gives the scrobbles of one second in the other order on every other
+    /// read of the recent tracks.
+    #[cfg(test)]
+    pub(crate) fn unstable_order(&self) {
+        lock(&self.state).unstable_order = true;
     }
 
     /// Makes `auth.getSession` say "not approved yet" this many times.
@@ -258,7 +278,10 @@ fn respond(state: &Mutex<State>, params: HashMap<String, String>) -> (u16, Value
         return (403, json!({"error": 10, "message": "Invalid API key"}));
     }
     match method.to_ascii_lowercase().as_str() {
-        "user.getrecenttracks" => recent(&state, &params),
+        "user.getrecenttracks" => {
+            state.recent_reads += 1;
+            recent(&state, &params)
+        }
         "user.getlovedtracks" => loved(&state, &params),
         "auth.gettoken" => (200, json!({"token": TOKEN})),
         "auth.getsession" => {
@@ -349,8 +372,13 @@ fn recent(state: &State, params: &HashMap<String, String>) -> (u16, Value) {
         .iter()
         .filter(|s| s.at_s >= from && s.at_s < to)
         .collect();
-    // Newest first; a stable order among scrobbles of one second.
+    // Newest first; a stable order among scrobbles of one second, unless
+    // asked to turn it over on every other read.
     rows.sort_by_key(|s| std::cmp::Reverse(s.at_s));
+    if state.unstable_order && state.recent_reads.is_multiple_of(2) {
+        rows.reverse();
+        rows.sort_by_key(|s| std::cmp::Reverse(s.at_s));
+    }
     let total = rows.len() as u64;
     let pages = total.div_ceil(limit);
     let start = usize::try_from((page - 1) * limit).unwrap_or(usize::MAX);
@@ -405,7 +433,7 @@ fn loved(state: &State, params: &HashMap<String, String>) -> (u16, Value) {
     (
         200,
         json!({"lovedtracks": {"track": tracks, "@attr": {
-            "user": state.user, "page": page.to_string(), "perPage": limit.to_string(),
+            "user": state.loved_as.as_ref().unwrap_or(&state.user), "page": page.to_string(), "perPage": limit.to_string(),
             "totalPages": total.div_ceil(limit).max(1).to_string(), "total": total.to_string(),
         }}}),
     )

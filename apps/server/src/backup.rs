@@ -19,9 +19,13 @@
 //!
 //! Each database is copied whole with `VACUUM INTO` on a connection of its
 //! own, beside the writer, so the server goes on playing and recording
-//! while it is taken. The folder is written under a name that begins with
-//! a dot and is renamed once everything in it is whole, so a folder with
-//! the plain name is a backup that finished.
+//! while it is taken. The two are copied one after the other, not at one
+//! moment: a listen open in the copy of `server.db` may already be in the
+//! copy of `library.db`, which keeps its own and records the other as a
+//! conflict when the listen is delivered after a restore. The folder is
+//! written under a name that begins with a dot and is renamed once
+//! everything in it is whole, so a folder with the plain name is a backup
+//! that finished.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -40,23 +44,36 @@ use crate::platform::{
 /// The version of `backup.json`.
 const MANIFEST_VERSION: u32 = 1;
 
-/// What a backup's folder says about restoring it.
-const README: &str = "\
+/// What a backup's folder says about restoring it, taken from the data
+/// directory `from`.
+fn readme(from: &Path) -> String {
+    format!(
+        "\
 A backup of a Ritornel server, taken by the server itself.
 
 server.db and library.db are whole SQLite databases, each a consistent copy
-of the database as it was when the backup began. backup.json says when it
-was taken, why, and what each file is.
+of that database as it was when its own copy began: server.db first, then
+library.db. The two can differ by what happened in between: a listen still
+being heard in server.db may have ended, and reached your history, by the
+time library.db was copied. Restored, the history in library.db is kept as
+it is, and the copy of that listen in server.db is set aside. backup.json
+says when the backup was taken, why, and what each file is.
 
 To restore it, stop the server, and put server.db, library.db and, if it is
-here, config.toml into an empty data directory: on a Mac
-~/Library/Application Support/Ritornel unless you chose another. Then start
-the server on that directory. Keep server.db and library.db together: the
-library names the server that may write it, and that server is the one in
-server.db.
+here, config.toml into an empty data directory, such as the one this backup
+was taken from:
+
+  {}
+
+Then start the server on that directory. Keep server.db and library.db
+together: the library names the server that may write it, and that server
+is the one in server.db.
 
 To look inside without changing anything: sqlite3 -readonly library.db
-";
+",
+        from.display()
+    )
+}
 
 /// What the README adds when the library copied had plays waiting to be
 /// sent to Last.fm.
@@ -482,11 +499,10 @@ fn fill(
     });
     let text = serde_json::to_string_pretty(&manifest).unwrap_or_default();
     write_synced(&into.join("backup.json"), text.as_bytes())?;
-    let readme = if held {
-        format!("{README}{HELD}")
-    } else {
-        README.to_owned()
-    };
+    let mut readme = readme(dir.root());
+    if held {
+        readme.push_str(HELD);
+    }
     write_synced(&into.join("README.txt"), readme.as_bytes())
 }
 
@@ -571,6 +587,17 @@ mod tests {
             serde_json::from_slice(&std::fs::read(first.path.join("backup.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest["reason"], "on_demand");
+        // The two databases are copied one after the other, and the README
+        // says what that means for a listen heard meanwhile.
+        let readme = std::fs::read_to_string(first.path.join("README.txt")).unwrap();
+        assert!(readme.contains("server.db first, then"), "{readme}");
+        // It names the data directory it was taken from, whatever the
+        // system.
+        assert!(
+            readme.contains(&format!("\n  {}\n", dir.root().display())),
+            "{readme}"
+        );
+        assert!(!readme.contains("Application Support"), "{readme}");
         assert_eq!(manifest["takenAt"], "2025-11-21T17:01:02.123Z");
 
         // A second in the same second is told apart, and nothing is left

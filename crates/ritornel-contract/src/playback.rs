@@ -356,8 +356,8 @@ pub struct PlaybackSetParams {
     pub repeat: Option<Repeat>,
 }
 
-/// What a playback command returns: the receipt, and where the player is
-/// after it. The whole state is read with `playback.get` or sent on the
+/// What a playback command returns: the receipt, and where the command put
+/// the player. The whole state is read with `playback.get` or sent on the
 /// `playback` topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -368,7 +368,9 @@ pub struct PlaybackChanged {
     pub receipt: Receipt,
     /// The queue's revision after the command.
     pub queue_revision: u64,
-    /// The entry the player is on after it.
+    /// The entry the command put the player on. One that cannot be played
+    /// is moved past at once, so the player may already be on a later
+    /// entry: `playback.get` and the `playback` topic say where it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub entry_id: Option<Id>,

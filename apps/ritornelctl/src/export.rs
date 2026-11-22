@@ -44,7 +44,7 @@ pub(crate) fn export(
 
 fn render(exported: &HistoryExported) -> String {
     format!(
-        "Exported {} observations, {} ratings and {} plays to {}\n",
-        exported.observations, exported.ratings, exported.plays, exported.path
+        "Exported {} observations, {} ratings, {} scrobbles and {} plays to {}\n",
+        exported.observations, exported.ratings, exported.deliveries, exported.plays, exported.path
     )
 }

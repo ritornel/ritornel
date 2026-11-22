@@ -17,7 +17,11 @@
 //! scrobbles of the same second, so two plays of one track that Last.fm
 //! dates to the same second stay two (docs/design/history.md, "Last.fm").
 //! A span is always whole seconds, so every scrobble of one second is read
-//! in the same span, and that place is the same whenever it is read.
+//! in the same span, and that place is the same whenever it is read. A
+//! second whose scrobbles fall on both sides of a page boundary is read
+//! again on its own, in one page, and that read is the one kept: Last.fm's
+//! order among scrobbles of one second can change between two pages, which
+//! would show one of them twice and another not at all.
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,6 +42,10 @@ const ATTEMPTS: u32 = 3;
 
 /// The rows asked for on each page of loved tracks: the most Last.fm gives.
 const LOVED_PAGE: u32 = 1_000;
+
+/// The rows asked for when one second is read again on its own: the most
+/// Last.fm gives of recent tracks.
+const SECOND_PAGE: u32 = 200;
 
 /// The version of a cursor's shape.
 const CURSOR_VERSION: u32 = 1;
@@ -183,7 +191,10 @@ async fn count(client: &Client, user: &str, from: u64, to: u64) -> Result<u64, s
 }
 
 /// Reads `[from, to)` whole, as one scan, again while its pages disagree,
-/// [`ATTEMPTS`] times in all.
+/// [`ATTEMPTS`] times in all. Each second that falls across a page boundary
+/// is then read again on its own and put in place of what the pages gave
+/// of it; the two reads must count the same scrobbles in it, or the span
+/// changed between them and is read again.
 async fn read(
     client: &Client,
     user: &str,
@@ -191,20 +202,95 @@ async fn read(
     to: u64,
     page_size: u32,
     sink: &dyn Sink,
-) -> Result<Option<Vec<Scrobble>>, scrobl::Error> {
+) -> Result<Option<Vec<Scrobble>>, Error> {
     let mut attempt = 1;
     loop {
-        match scan(client, user, from, to, page_size, sink).await {
-            Err(error) if error.kind() == ErrorKind::Inconsistent && attempt < ATTEMPTS => {
-                attempt += 1;
+        let reading = scan(client, user, from, to, page_size, sink).await;
+        let reading = match reading {
+            Ok(Some((scrobbles, split))) => mend(client, user, scrobbles, split, sink).await,
+            Ok(None) => return Ok(None),
+            Err(error) => Err(Unread::Scrobl(error)),
+        };
+        match reading {
+            Ok(read) => return Ok(read),
+            Err(unread) if unread.inconsistent() && attempt < ATTEMPTS => attempt += 1,
+            Err(Unread::Scrobl(error)) => return Err(failed(&error)),
+            Err(Unread::Changed(second)) => {
+                return Err(Error::source(format!(
+                    "Last.fm's scrobbles at {second} changed while they were read, {ATTEMPTS} \
+                     times"
+                )));
             }
-            reading => return reading,
+            Err(Unread::TooMany(second)) => {
+                return Err(Error::source(format!(
+                    "Last.fm has more scrobbles at {second} than one page holds"
+                )));
+            }
         }
     }
 }
 
-/// One scan of `[from, to)`. Its pages are provisional until it has
-/// finished, so nothing of it leaves here before that.
+/// Why one read of a span was not kept.
+enum Unread {
+    Scrobl(scrobl::Error),
+    /// A second read on its own counted other scrobbles than the span's
+    /// pages did.
+    Changed(u64),
+    /// A second holds more scrobbles than one page.
+    TooMany(u64),
+}
+
+impl Unread {
+    /// Whether reading the span again may well come out whole.
+    fn inconsistent(&self) -> bool {
+        match self {
+            Self::Scrobl(error) => error.kind() == ErrorKind::Inconsistent,
+            Self::Changed(_) => true,
+            Self::TooMany(_) => false,
+        }
+    }
+}
+
+/// Puts each second in `split` read again on its own in place of what a
+/// span's pages gave of it.
+async fn mend(
+    client: &Client,
+    user: &str,
+    mut scrobbles: Vec<Scrobble>,
+    split: Vec<u64>,
+    sink: &dyn Sink,
+) -> Result<Option<Vec<Scrobble>>, Unread> {
+    for second in split {
+        let Some((again, still_split)) = scan(client, user, second, second + 1, SECOND_PAGE, sink)
+            .await
+            .map_err(Unread::Scrobl)?
+        else {
+            return Ok(None);
+        };
+        if !still_split.is_empty() {
+            return Err(Unread::TooMany(second));
+        }
+        let paged = scrobbles
+            .iter()
+            .filter(|scrobble| scrobble.timestamp() == second)
+            .count();
+        if again.len() != paged {
+            return Err(Unread::Changed(second));
+        }
+        // Newest first: the second's scrobbles go where they were.
+        scrobbles.retain(|scrobble| scrobble.timestamp() != second);
+        let at = scrobbles
+            .iter()
+            .position(|scrobble| scrobble.timestamp() < second)
+            .unwrap_or(scrobbles.len());
+        scrobbles.splice(at..at, again);
+    }
+    Ok(Some(scrobbles))
+}
+
+/// One scan of `[from, to)`, and the seconds whose scrobbles fall on both
+/// sides of a boundary between its pages. Its pages are provisional until
+/// it has finished, so nothing of it leaves here before that.
 async fn scan(
     client: &Client,
     user: &str,
@@ -212,14 +298,15 @@ async fn scan(
     to: u64,
     page_size: u32,
     sink: &dyn Sink,
-) -> Result<Option<Vec<Scrobble>>, scrobl::Error> {
+) -> Result<Option<(Vec<Scrobble>, Vec<u64>)>, scrobl::Error> {
     let mut scan = client
         .user(user)
         .recent_tracks()
         .window(window(from, to)?)
         .limit(page_size)
         .scan()?;
-    let mut scrobbles = Vec::new();
+    let mut scrobbles: Vec<Scrobble> = Vec::new();
+    let mut split = Vec::new();
     loop {
         if sink.stopping() {
             return Ok(None);
@@ -227,10 +314,17 @@ async fn scan(
         let Some(page) = scan.next_page().await? else {
             break;
         };
-        scrobbles.extend(page.into_value().into_scrobbles());
+        let page = page.into_value().into_scrobbles();
+        if let (Some(last), Some(first)) = (scrobbles.last(), page.first())
+            && last.timestamp() == first.timestamp()
+            && split.last() != Some(&first.timestamp())
+        {
+            split.push(first.timestamp());
+        }
+        scrobbles.extend(page);
     }
     scan.finish()?;
-    Ok(Some(scrobbles))
+    Ok(Some((scrobbles, split)))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -283,6 +377,15 @@ async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Ve
         if page.number() != page_number {
             return Err(Error::source(
                 "Last.fm returned a different loved-track page than requested",
+            ));
+        }
+        // Another account's list would replace this one's.
+        if page
+            .subject()
+            .is_some_and(|subject| !subject.eq_ignore_ascii_case(user))
+        {
+            return Err(Error::source(
+                "Last.fm returned another account's loved tracks than the one asked for",
             ));
         }
         let paging = LovedPaging {
@@ -388,9 +491,7 @@ impl LastfmSource<'_> {
                 spans.push((from, middle, None));
                 continue;
             }
-            let Some(scrobbles) = read(client, user, from, to, settings.page_size, sink)
-                .await
-                .map_err(|e| failed(&e))?
+            let Some(scrobbles) = read(client, user, from, to, settings.page_size, sink).await?
             else {
                 synced.stopped = true;
                 return Ok(synced);
