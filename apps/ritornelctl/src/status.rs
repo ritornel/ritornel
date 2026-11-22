@@ -59,7 +59,11 @@ fn render(status: &ServerStatus) -> String {
     match &status.library {
         Some(library) => {
             lines.push(("Library ID", library.library_id.to_string()));
-            lines.push(("Library revision", library.revision.to_string()));
+            // A satellite's library is its hub's, and so is its revision,
+            // which a status does not wait on the hub to say.
+            if status.hub.is_none() {
+                lines.push(("Library revision", library.revision.to_string()));
+            }
         }
         None => lines.push(("Library", "none".to_owned())),
     }
@@ -242,6 +246,34 @@ mod tests {
             record: None,
             hub: None,
         }
+    }
+
+    #[test]
+    fn a_satellite_does_not_say_a_library_revision_it_does_not_hold() {
+        let mut status = example();
+        status.role = ServerRole::Satellite;
+        status.library = Some(ritornel_client::contract::LibraryStatus {
+            library_id: Id::from_bytes([0x22; 16]),
+            revision: 0,
+        });
+        status.hub = Some(ritornel_client::contract::HubStatus {
+            server_id: Id::from_bytes([0x33; 16]),
+            name: "Studio Mac".to_owned(),
+            library_id: Id::from_bytes([0x22; 16]),
+            epoch: 1,
+            routes: vec!["studio-mac.local:4747".to_owned()],
+            linked_at_ms: 0,
+            answers: Some(true),
+            since_ms: None,
+            route: None,
+            problem: None,
+        });
+        let text = render(&status);
+        assert!(
+            text.contains("Library ID        22222222-2222-2222-2222-222222222222"),
+            "{text}"
+        );
+        assert!(!text.contains("Library revision"), "{text}");
     }
 
     #[test]
