@@ -247,6 +247,7 @@ impl Core {
         stores: &Stores,
         params: &SourcesAddParams,
     ) -> Result<SourceAdded, RpcError> {
+        let _adding = lock(&stores.adding_source);
         let command = Command {
             id: params.idempotency_key,
             fingerprint: fingerprint::<SourcesAdd>(params)?,
@@ -263,6 +264,54 @@ impl Core {
             return stored_result(SourcesAdd::NAME, &written);
         }
         let name = root(&params.name, &params.path)?;
+        let folder = Path::new(&params.path);
+        let resolved = std::fs::canonicalize(folder).map_err(|_| {
+            RpcError::new(
+                ErrorCode::Invalid,
+                "Cannot open that folder. Choose it again.",
+            )
+            .with_detail("field", "path")
+        })?;
+        let sources = self.sources_list(stores)?.sources;
+        if let Some(source) = sources
+            .iter()
+            .find(|source| source.name == name && source.path.as_deref() == Some(&params.path))
+        {
+            return Err(in_library(ritornel_engine::Error::SourceExists {
+                source: source.source_id,
+            }));
+        }
+        for source in sources {
+            let Some(path) = source.path else { continue };
+            let existing = Path::new(&path);
+            let physical = std::fs::canonicalize(existing).ok();
+            let (folder, existing) = match &physical {
+                Some(path) => (resolved.as_path(), path.as_path()),
+                None => (folder, existing),
+            };
+            let relation = if folder == existing {
+                if source.name == name {
+                    return Err(in_library(ritornel_engine::Error::SourceExists {
+                        source: source.source_id,
+                    }));
+                }
+                "is already registered as"
+            } else if folder.starts_with(existing) {
+                "is inside"
+            } else if existing.starts_with(folder) {
+                "contains"
+            } else {
+                continue;
+            };
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!(
+                    "This folder {relation} {} ({}). Choose a separate music folder.",
+                    source.name, path
+                ),
+            )
+            .with_detail("field", "path"));
+        }
         let request = WriteRequest {
             method: SourcesAdd::NAME,
             command: Some(command),

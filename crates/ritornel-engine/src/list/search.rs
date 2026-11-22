@@ -48,15 +48,6 @@ impl Typed {
         self.bare.is_empty()
     }
 
-    /// The longest word typed, which the text index can look up when it is
-    /// three characters or more.
-    fn longest_word(&self) -> Option<&str> {
-        self.spaced
-            .split(' ')
-            .max_by_key(|word| word.chars().count())
-            .filter(|word| word.chars().count() >= 3)
-    }
-
     /// How well `name` matches: it is what was typed, it starts with it, or
     /// it has a word that starts with it. `None` when it does none of these.
     fn tier(&self, name: &str) -> Option<Tier> {
@@ -354,10 +345,6 @@ fn albums(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked
     Ok(rank(found, limit))
 }
 
-/// A song whose title matched: its key, how well, its title, and its
-/// recording and whether it is loose, when they were read with it.
-type Titled = (i64, Tier, String, Option<(i64, bool)>);
-
 /// A song kept for its recording.
 struct Kept {
     tier: Tier,
@@ -375,44 +362,19 @@ fn text(value: rusqlite::types::ValueRef<'_>) -> &str {
 }
 
 fn songs(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked, Error> {
-    // The titles that match, through the text index when a word typed is
-    // long enough for it to look up, and otherwise from every live song,
-    // with its recording and whether it is loose, on no record.
-    let mut titled: Vec<Titled> = Vec::new();
-    match typed.longest_word() {
-        Some(word) => {
-            let phrase = format!("{{title}} : \"{}\"", word.replace('"', "\"\""));
-            let mut statement = connection.prepare(
-                "SELECT ta.id, ta.display_title FROM search_text
-                 JOIN track_appearance ta ON ta.id = search_text.rowid
-                 WHERE search_text MATCH ?1",
-            )?;
-            let mut rows = statement.query([phrase])?;
-            while let Some(row) = rows.next()? {
-                let title = text(row.get_ref(1)?);
-                if let Some(tier) = typed.tier(title) {
-                    titled.push((row.get(0)?, tier, title.to_owned(), None));
-                }
-            }
-        }
-        None => {
-            let mut statement = connection.prepare(concat!(
-                "SELECT ta.id, ta.display_title, rc.canonical_id, ta.release_id IS NULL
-                 FROM track_appearance ta JOIN recording rc ON rc.id = ta.recording_id
-                 WHERE ta.redirect_to_id IS NULL AND ",
-                reached!("ta")
-            ))?;
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
-                let title = text(row.get_ref(1)?);
-                if let Some(tier) = typed.tier(title) {
-                    let live = (row.get(2)?, row.get(3)?);
-                    titled.push((row.get(0)?, tier, title.to_owned(), Some(live)));
-                }
-            }
+    // Match the display title: punctuation or spaces can split a typed word
+    // anywhere in the stored title. Check liveness only for matching tiers.
+    let mut titled = Vec::new();
+    let mut statement = connection
+        .prepare("SELECT id, display_title FROM track_appearance WHERE redirect_to_id IS NULL")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let title = text(row.get_ref(1)?);
+        if let Some(tier) = typed.tier(title) {
+            titled.push((row.get::<_, i64>(0)?, tier, title.to_owned()));
         }
     }
-    titled.sort_by_key(|(_, tier, _, _)| *tier);
+    titled.sort_by_key(|(_, tier, _)| *tier);
 
     // A tier at a time, until there are enough: the live appearances, by
     // their recording. A song on several records is listed once: on a
@@ -420,18 +382,14 @@ fn songs(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked,
     // library.
     let mut by_recording: HashMap<i64, Kept> = HashMap::new();
     let mut rest = titled.as_slice();
-    while let Some((_, tier, _, _)) = rest.first() {
-        let end = rest.partition_point(|(_, each, _, _)| each == tier);
+    while let Some((_, tier, _)) = rest.first() {
+        let end = rest.partition_point(|(_, each, _)| each == tier);
         let (these, after) = rest.split_at(end);
         rest = after;
-        let unknown: Vec<i64> = these
-            .iter()
-            .filter(|(_, _, _, live)| live.is_none())
-            .map(|(key, _, _, _)| *key)
-            .collect();
-        let looked_up = live_songs(connection, &unknown)?;
-        for (key, tier, title, live) in these {
-            let Some((recording, loose)) = live.or_else(|| looked_up.get(key).copied()) else {
+        let keys: Vec<_> = these.iter().map(|(key, _, _)| *key).collect();
+        let live = live_songs(connection, &keys)?;
+        for (key, tier, title) in these {
+            let Some(&(recording, loose)) = live.get(key) else {
                 continue;
             };
             let better = by_recording
@@ -630,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn short_and_indexed_search_return_a_merged_recording_only_once() {
+    fn searching_by_joined_words_returns_a_merged_recording_once() {
         let mut rig = crate::scan_tests::Rig::new();
         rig.put("A/1.flac", "a.flac");
         rig.put("B/1.flac", "a.retagged.flac");
@@ -638,11 +596,11 @@ mod tests {
         rig.scan();
         rig.library.write(crate::WriteRequest { method: "test.write", command: None, client: None }, |write| {
             write.connection().execute_batch("UPDATE recording SET canonical_id = (SELECT min(id) FROM recording), redirect_to_id = (SELECT min(id) FROM recording) WHERE id <> (SELECT min(id) FROM recording);
-              UPDATE track_appearance SET display_title = 'Tin Field';
-              UPDATE search_text SET title = 'tin field';")?;
+              UPDATE track_appearance SET display_title = 'Tin-Field';
+              UPDATE search_text SET title = 'tin-field';")?;
             Ok(String::new())
         }).unwrap();
-        for typed in ["ti", "tin"] {
+        for typed in ["ti", "field", "tinfield"] {
             assert_eq!(
                 rig.library.search(typed, 10).unwrap().songs.len(),
                 1,

@@ -82,6 +82,7 @@ pub(crate) enum Received {
 pub(crate) struct Stores {
     /// `server.db`.
     server: ServerStore,
+    adding_source: Mutex<()>,
     /// `library.db`, on a server that is a hub. Creating a library puts it
     /// here, and holds this for writing while it does, so that of two calls
     /// to create one the second finds the first's.
@@ -92,6 +93,7 @@ impl Stores {
     pub(crate) fn new(server: ServerStore, library: Option<LibraryStore>) -> Self {
         Self {
             server,
+            adding_source: Mutex::default(),
             library: RwLock::new(library),
         }
     }

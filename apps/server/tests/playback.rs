@@ -127,6 +127,10 @@ fn album(scratch: &Scratch) -> PathBuf {
 /// scan to end.
 async fn scanned(client: &mut Client, folder: &Path) {
     client.create_library(key()).await.unwrap();
+    scan_music(client, folder).await;
+}
+
+async fn scan_music(client: &mut Client, folder: &Path) {
     let source = client
         .add_source(key(), "music", folder.to_str().unwrap())
         .await
@@ -147,6 +151,67 @@ async fn scanned(client: &mut Client, folder: &Path) {
         }
     }
     client.unsubscribe(&[Topic::Jobs]).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_picture_folder_does_not_hide_tracks_in_a_music_folder() {
+    for pictures_first in [true, false] {
+        let scratch = Scratch::new();
+        let (_server, mut client) = server_at(&scratch, 4).await;
+        let music = album(&scratch);
+        let parent = music.parent().unwrap();
+        std::fs::write(parent.join("index.json"), r#"{"format":1,"artists":[]}"#).unwrap();
+        client.create_library(key()).await.unwrap();
+        let pictures = ritornel_contract::ImportPicturesParams {
+            idempotency_key: key(),
+            name: "portraits".into(),
+            path: parent.display().to_string(),
+        };
+        if pictures_first {
+            client
+                .call::<ritornel_contract::methods::ArtistsImportPictures>(&pictures)
+                .await
+                .unwrap();
+        }
+        scan_music(&mut client, &music).await;
+        if !pictures_first {
+            client
+                .call::<ritornel_contract::methods::ArtistsImportPictures>(&pictures)
+                .await
+                .unwrap();
+        }
+        let tracks = client
+            .call::<SourcesTracks>(&SourcesTracksParams {
+                path: music.display().to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(tracks.tracks.len(), 3);
+        for folder in [parent, &music.join("Tin Weather")] {
+            let err = client
+                .add_source(key(), "other", folder.to_str().unwrap())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ritornel_client::Error::Call(ref e) if e.data.code == ErrorCode::Invalid && e.message.contains(music.to_str().unwrap())),
+                "{err}"
+            );
+        }
+        let alias = music.join("Tin Weather").join("..");
+        let err = client
+            .add_source(key(), "music", alias.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ritornel_client::Error::Call(ref e) if e.data.code == ErrorCode::Conflict)
+        );
+        std::fs::create_dir(parent.join("sibling")).unwrap();
+        let sibling = music.join("..").join("sibling");
+        client
+            .add_source(key(), "sibling", sibling.to_str().unwrap())
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]

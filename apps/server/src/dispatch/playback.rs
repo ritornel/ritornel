@@ -797,27 +797,34 @@ impl Core {
             return Err(RpcError::new(ErrorCode::Invalid, "the path is absolute")
                 .with_detail("field", "path"));
         }
-        let roots = stores.server.roots().map_err(refused)?;
-        let found = roots.iter().find_map(|(name, root)| {
-            let rel = path.strip_prefix(root).ok()?;
-            // The library keeps a path under a root with `/` between its
-            // parts, whatever the system's separator.
-            let parts: Vec<_> = rel
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy())
-                .collect();
-            Some((name.clone(), parts.join("/")))
-        });
-        let Some((root, rel)) = found else {
+        let sources = self.sources_list(stores)?;
+        let found = sources
+            .sources
+            .iter()
+            .filter_map(|source| {
+                let root = Path::new(source.path.as_ref()?);
+                Some((
+                    root.components().count(),
+                    &source.name,
+                    path.strip_prefix(root).ok()?,
+                ))
+            })
+            .max_by_key(|(depth, _, _)| *depth);
+        let Some((_, root, relative)) = found else {
             return Err(RpcError::new(
                 ErrorCode::NotFound,
-                "that path is in none of this server's roots",
+                "This path is outside the music folders. Choose a file or folder inside one.",
             ));
         };
+        let rel = relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         let server_id = self.server_id;
         let tracks = Self::library(stores, |library| {
             library
-                .folder_tracks(&root, &rel, server_id)
+                .folder_tracks(root, &rel, server_id)
                 .map_err(refused)
         })?;
         Ok(SourceTracks {
