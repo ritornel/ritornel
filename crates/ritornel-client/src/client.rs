@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ritornel_contract::methods::{
     EventsSubscribe, EventsUnsubscribe, JobsCancel, JobsGet, JobsList, LibraryCreate, LibraryStats,
@@ -21,14 +22,35 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use crate::error::transport;
-use crate::transport::Transport;
+use crate::transport::{Lost, Transport};
 use crate::{Credential, Error};
 
-/// A call on its way to the server, and where its answer goes.
-struct Call {
-    method: String,
-    params: Value,
-    answer: oneshot::Sender<Result<Value, Error>>,
+type Answer = oneshot::Sender<Result<Value, Error>>;
+
+#[derive(Debug, Default)]
+struct Waiting {
+    next: i64,
+    answers: HashMap<i64, Answer>,
+}
+
+fn lock(waiting: &Mutex<Waiting>) -> MutexGuard<'_, Waiting> {
+    waiting.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Dropping the calling future releases its reply slot even if the server never answers.
+struct Pending<'a> {
+    waiting: &'a Weak<Mutex<Waiting>>,
+    id: Option<i64>,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id
+            && let Some(waiting) = self.waiting.upgrade()
+        {
+            lock(&waiting).answers.remove(&id);
+        }
+    }
 }
 
 /// A connection to one server.
@@ -41,17 +63,12 @@ struct Call {
 /// Dropping it closes the connection.
 #[derive(Debug)]
 pub struct Client {
-    calls: UnboundedSender<Call>,
+    calls: UnboundedSender<String>,
+    // The connection task owns pending senders. Its runtime may stop while callers live elsewhere.
+    waiting: Weak<Mutex<Waiting>>,
+    // A stalled writer cannot observe the call queue closing.
+    _close_on_drop: oneshot::Sender<()>,
     events: UnboundedReceiver<Event>,
-}
-
-impl std::fmt::Debug for Call {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Params may hold anything, so they are left out.
-        f.debug_struct("Call")
-            .field("method", &self.method)
-            .finish_non_exhaustive()
-    }
 }
 
 impl Client {
@@ -90,9 +107,13 @@ impl Client {
     fn start(transport: Transport) -> Self {
         let (calls, queued) = mpsc::unbounded_channel();
         let (events, received) = mpsc::unbounded_channel();
-        tokio::spawn(run(transport, queued, events));
+        let waiting = Arc::new(Mutex::new(Waiting::default()));
+        let (lifetime, dropped) = oneshot::channel();
+        tokio::spawn(run(transport, queued, events, waiting.clone(), dropped));
         Self {
             calls,
+            waiting: Arc::downgrade(&waiting),
+            _close_on_drop: lifetime,
             events: received,
         }
     }
@@ -102,17 +123,34 @@ impl Client {
     /// program calls a method this crate has no type for.
     pub async fn call_raw(&self, method: &str, params: Value) -> Result<Value, Error> {
         let (answer, answered) = oneshot::channel();
-        let call = Call {
-            method: method.to_owned(),
-            params,
-            answer,
+        let id = {
+            let shared = self
+                .waiting
+                .upgrade()
+                .ok_or_else(|| transport("the connection closed"))?;
+            let mut waiting = lock(&shared);
+            waiting.next += 1;
+            let id = waiting.next;
+            waiting.answers.insert(id, answer);
+            id
         };
+        let mut pending = Pending {
+            waiting: &self.waiting,
+            id: Some(id),
+        };
+        let frame = Frame::Request(Request {
+            id: RequestId::Number(id),
+            method: method.to_owned(),
+            params: Some(params),
+        });
         self.calls
-            .send(call)
+            .send(frame.encode())
             .map_err(|_| transport("the connection closed"))?;
-        answered
+        let reply = answered
             .await
-            .map_err(|_| transport("the connection closed"))?
+            .map_err(|_| transport("the connection closed"))?;
+        pending.id = None;
+        reply
     }
 
     /// Calls a method of the contract, with the params and the result the
@@ -299,65 +337,60 @@ impl Client {
 /// to whoever it is for. It ends when the client is dropped or the
 /// connection is lost.
 async fn run(
-    mut transport: Transport,
-    mut calls: UnboundedReceiver<Call>,
+    connection: Transport,
+    mut calls: UnboundedReceiver<String>,
     events: UnboundedSender<Event>,
+    waiting: Arc<Mutex<Waiting>>,
+    dropped: oneshot::Receiver<()>,
 ) {
-    let mut waiting = HashMap::new();
-    let mut last_id = 0;
-    let lost = loop {
-        tokio::select! {
-            call = calls.recv() => {
-                let Some(call) = call else {
-                    // The client was dropped.
-                    transport.close().await;
-                    return;
-                };
-                last_id += 1;
-                let frame = Frame::Request(Request {
-                    id: RequestId::Number(last_id),
-                    method: call.method,
-                    params: Some(call.params),
-                });
-                waiting.insert(last_id, call.answer);
-                if let Err(lost) = transport.send(frame.encode()).await {
-                    break lost.to_string();
-                }
-            }
-            received = transport.receive() => {
-                let text = match received {
-                    Some(Ok(text)) => text,
-                    Some(Err(lost)) => break lost.to_string(),
-                    None => break "the connection closed".to_owned(),
-                };
-                match Frame::decode(&text) {
-                    Ok(Frame::Response(Response { id: Some(RequestId::Number(id)), outcome })) => {
-                        if let Some(answer) = waiting.remove(&id) {
-                            // The caller may have stopped waiting.
-                            let _ = answer.send(outcome.map_err(Error::Call));
-                        }
+    let (mut writer, mut reader) = connection.split();
+    let write = async {
+        while let Some(text) = calls.recv().await {
+            writer.send(text).await?;
+        }
+        Ok::<(), Lost>(())
+    };
+    let read = async {
+        while let Some(text) = reader.receive().await {
+            let frame = Frame::decode(&text?).map_err(|_| {
+                Lost::Protocol("the server sent something that is not a frame".to_owned())
+            })?;
+            match frame {
+                Frame::Response(Response {
+                    id: Some(RequestId::Number(id)),
+                    outcome,
+                }) => {
+                    if let Some(answer) = lock(&waiting).answers.remove(&id) {
+                        let _ = answer.send(outcome.map_err(Error::Call));
                     }
-                    Ok(Frame::Notification(notification)) if notification.method == EVENT_METHOD => {
-                        // An event on a topic this program does not know is
-                        // not for it.
-                        if let Some(event) = notification.params.and_then(known) {
-                            // The client may have stopped reading events.
-                            let _ = events.send(event);
-                        }
-                    }
-                    // A response to no call of this client's, or a call or
-                    // a notification this program does not know: nothing
-                    // to do with it.
-                    Ok(_) => {}
-                    Err(_) => break "the server sent something that is not a frame".to_owned(),
                 }
+                Frame::Response(Response { id: None, .. }) => {
+                    return Err(Lost::Protocol(
+                        "the server answered without a request ID".to_owned(),
+                    ));
+                }
+                Frame::Notification(note) if note.method == EVENT_METHOD => {
+                    if let Some(event) = note.params.and_then(known) {
+                        let _ = events.send(event);
+                    }
+                }
+                _ => {}
             }
         }
+        Err::<(), Lost>(Lost::Transport("the connection closed".into()))
     };
-    // Whoever is still waiting learns that no answer will come. Calls made
-    // from here on find the channel closed.
-    for (_, answer) in waiting {
-        let _ = answer.send(Err(Error::Transport(lost.clone())));
+    let lost = tokio::select! {
+        result = write => result.err(),
+        result = read => result.err(),
+        _ = dropped => None,
+    };
+    calls.close();
+    if let Some(lost) = lost {
+        for (_, answer) in lock(&waiting).answers.drain() {
+            let _ = answer.send(Err(lost.clone().into()));
+        }
+    } else {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer.close()).await;
     }
 }
 
@@ -368,6 +401,7 @@ fn known(params: Value) -> Option<Event> {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
     use ritornel_contract::{ClientKind, ErrorCode, Id, RpcError};
     use serde_json::json;
     use tokio::sync::mpsc::{Receiver, Sender};
@@ -582,7 +616,108 @@ mod tests {
             to_client.send("not a frame".to_owned()).await.unwrap();
         };
         let (answer, ()) = tokio::join!(call, garble);
-        assert!(matches!(answer, Err(Error::Transport(_))), "{answer:?}");
+        assert!(matches!(answer, Err(Error::Protocol(_))), "{answer:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_arrives_while_another_request_waits_to_be_written() {
+        let (outgoing, mut requests) = mpsc::channel(1);
+        let (replies, incoming) = mpsc::channel(1);
+        let client = Client::over_memory(outgoing, incoming);
+        let mut calls = futures_util::stream::FuturesUnordered::new();
+        for _ in 0..3 {
+            calls.push(client.call_raw("one", json!({})));
+        }
+        let serve = async {
+            let (id, _, _) = sent(&mut requests).await;
+            tokio::task::yield_now().await;
+            replies.send(result(id, json!(7))).await.unwrap();
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            reply = tokio::time::timeout(std::time::Duration::from_secs(1), calls.next()) => {
+                let reply = reply.expect("the reply arrived before the deadline").expect("a call was pending");
+                assert_eq!(reply.unwrap(), json!(7));
+            }
+            () = serve => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_without_a_request_id_ends_pending_calls() {
+        let (client, mut requests, replies) = pair();
+        let peer = async {
+            sent(&mut requests).await;
+            replies
+                .send(
+                    Frame::Response(Response {
+                        id: None,
+                        outcome: Err(RpcError::parse_error()),
+                    })
+                    .encode(),
+                )
+                .await
+                .unwrap();
+        };
+        let (reply, ()) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.call_raw("one", json!({}))
+            ),
+            peer
+        );
+        assert!(matches!(reply, Ok(Err(Error::Protocol(_)))), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_call_releases_its_reply_slot() {
+        let (client, mut requests, _replies) = pair();
+        let mut pending = Box::pin(client.call_raw("one", json!({})));
+        tokio::select! {
+            _ = &mut pending => panic!("no reply was sent"),
+            _ = sent(&mut requests) => {}
+        }
+        assert_eq!(lock(&client.waiting.upgrade().unwrap()).answers.len(), 1);
+        drop(pending);
+        assert!(lock(&client.waiting.upgrade().unwrap()).answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_errors_only_report_the_transport_context_once() {
+        let (client, requests, _replies) = pair();
+        drop(requests);
+        let err = client.call_raw("test", json!({})).await.unwrap_err();
+        assert_eq!(
+            err.to_string()
+                .matches("no connection to the server")
+                .count(),
+            1,
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn stopping_the_connections_runtime_releases_calls_from_other_runtimes() {
+        let runtime = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let connection = runtime();
+        let (client, mut requests, _replies) = connection.block_on(async { pair() });
+        let mut call = Box::pin(client.call_raw("one", json!({})));
+        connection.block_on(async {
+            tokio::select! {
+                _ = &mut call => panic!("no reply was sent"),
+                _ = sent(&mut requests) => {}
+            }
+        });
+        drop(connection);
+        runtime().block_on(async {
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(1), call).await;
+            assert!(matches!(reply, Ok(Err(Error::Transport(_)))), "{reply:?}");
+        });
     }
 
     #[tokio::test]

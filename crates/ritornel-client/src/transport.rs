@@ -5,7 +5,10 @@
 
 use std::net::SocketAddr;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 use ritornel_contract::route;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -32,7 +35,7 @@ impl Transport {
         endpoint: SocketAddr,
         credential: &Credential,
     ) -> Result<Self, Error> {
-        let stream = TcpStream::connect(endpoint).await.map_err(transport)?;
+        let stream = http::connect(endpoint).await?;
         Self::upgrade(stream, endpoint, credential).await
     }
 
@@ -51,31 +54,82 @@ impl Transport {
         request
             .headers_mut()
             .insert(AUTHORIZATION, http::authorization(credential)?);
-        match tokio_tungstenite::client_async(request, stream).await {
-            Ok((socket, _)) => Ok(Self::Socket(Box::new(socket))),
-            Err(tungstenite::Error::Http(response)) => Err(Error::Refused {
-                status: response.status().as_u16(),
-            }),
-            Err(other) => Err(transport(other)),
-        }
+        http::within_deadline(async {
+            match tokio_tungstenite::client_async(request, stream).await {
+                Ok((socket, _)) => Ok(Self::Socket(Box::new(socket))),
+                Err(tungstenite::Error::Http(response)) => Err(Error::Refused {
+                    status: response.status().as_u16(),
+                }),
+                Err(other) => Err(transport(other)),
+            }
+        })
+        .await
     }
 
+    pub(crate) fn split(self) -> (Writer, Reader) {
+        match self {
+            Self::Socket(socket) => {
+                let (writer, reader) = (*socket).split();
+                (Writer::Socket(writer), Reader::Socket(reader))
+            }
+            Self::Memory { outgoing, incoming } => {
+                (Writer::Memory(outgoing), Reader::Memory(incoming))
+            }
+        }
+    }
+}
+
+/// The reason every pending call loses its reply when the connection ends.
+#[derive(Clone)]
+pub(crate) enum Lost {
+    Transport(String),
+    Protocol(String),
+}
+
+impl From<Lost> for Error {
+    fn from(lost: Lost) -> Self {
+        match lost {
+            Lost::Transport(message) => Self::Transport(message),
+            Lost::Protocol(message) => Self::Protocol(message),
+        }
+    }
+}
+
+pub(crate) enum Writer {
+    Socket(SplitSink<WebSocketStream<TcpStream>, Message>),
+    Memory(Sender<String>),
+}
+
+pub(crate) enum Reader {
+    Socket(SplitStream<WebSocketStream<TcpStream>>),
+    Memory(Receiver<String>),
+}
+
+impl Writer {
     /// Sends one frame.
-    pub(crate) async fn send(&mut self, text: String) -> Result<(), Error> {
+    pub(crate) async fn send(&mut self, text: String) -> Result<(), Lost> {
         match self {
             Self::Socket(socket) => socket
                 .send(Message::Text(text.into()))
                 .await
-                .map_err(transport),
-            Self::Memory { outgoing, .. } => outgoing
+                .map_err(|error| Lost::Transport(error.to_string())),
+            Self::Memory(outgoing) => outgoing
                 .send(text)
                 .await
-                .map_err(|_| transport("the connection closed")),
+                .map_err(|_| Lost::Transport("the connection closed".into())),
         }
     }
 
+    pub(crate) async fn close(&mut self) {
+        if let Self::Socket(socket) = self {
+            let _ = socket.close().await;
+        }
+    }
+}
+
+impl Reader {
     /// The next frame. `None` when the other side has closed.
-    pub(crate) async fn receive(&mut self) -> Option<Result<String, Error>> {
+    pub(crate) async fn receive(&mut self) -> Option<Result<String, Lost>> {
         match self {
             Self::Socket(socket) => loop {
                 return match socket.next().await? {
@@ -83,23 +137,13 @@ impl Transport {
                     // The socket answers a ping by itself.
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => continue,
                     Ok(Message::Close(_)) => None,
-                    Ok(Message::Binary(_)) => Some(Err(Error::Protocol(
+                    Ok(Message::Binary(_)) => Some(Err(Lost::Protocol(
                         "a frame is text, and the server sent bytes".to_owned(),
                     ))),
-                    Err(error) => Some(Err(transport(error))),
+                    Err(error) => Some(Err(Lost::Transport(error.to_string()))),
                 };
             },
-            Self::Memory { incoming, .. } => incoming.recv().await.map(Ok),
-        }
-    }
-
-    /// Says goodbye, if the transport has a way to.
-    pub(crate) async fn close(&mut self) {
-        if let Self::Socket(socket) = self {
-            // The other side may have gone already. Called by its full name:
-            // where futures-sink's `alloc` is on, `Box<WebSocketStream>` is a
-            // `Sink`, and `socket.close` would be `SinkExt::close`.
-            let _ = WebSocketStream::close(socket, None).await;
+            Self::Memory(incoming) => incoming.recv().await.map(Ok),
         }
     }
 }
