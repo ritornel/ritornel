@@ -95,6 +95,15 @@ impl LinkSessions {
         held.insert(token_hash, Peer { server, session });
     }
 
+    /// Whether any satellite is linked.
+    pub(crate) fn any(&self) -> bool {
+        !self
+            .0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+
     /// The satellite whose link session `token` is, if it is one.
     pub(crate) fn peer(&self, token: &SessionToken) -> Option<Peer> {
         // A map lookup is not constant time, but the key is a SHA-256 of
@@ -210,7 +219,10 @@ pub(crate) async fn reach(
         return Err("another server answered there, not the hub the link names".to_owned());
     }
     if descriptor.contract_version != CONTRACT_VERSION {
-        return Err(versions_differ(descriptor.contract_version, CONTRACT_VERSION));
+        return Err(versions_differ(
+            descriptor.contract_version,
+            CONTRACT_VERSION,
+        ));
     }
     if descriptor.role != ServerRole::Hub {
         return Err("that server is no longer a library's hub".to_owned());

@@ -1000,3 +1000,35 @@ async fn a_listen_sent_again_is_taken_once_and_only_from_its_own_player() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_takes_its_computers_name_and_keeps_one_chosen() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let named = |name: &str| Run {
+            name: Some(name.to_owned()),
+            ..Run::default()
+        };
+        let start_named = async |name: &str| {
+            Server::start_run(
+                HeldDir::take(scratch.data_dir("desk")).unwrap(),
+                Listen::on_port(0),
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+                Bounds::default(),
+                named(name),
+            )
+            .await
+            .unwrap()
+        };
+        let desk = start_named("Studio Mac").await;
+        assert_eq!(desk.name(), "Studio Mac");
+        desk.stop().await.unwrap();
+        // The computer renamed later does not rename a server that already
+        // has a name of its own.
+        let desk = start_named("Other Name").await;
+        assert_eq!(desk.name(), "Studio Mac");
+        desk.stop().await.unwrap();
+    })
+    .await;
+}

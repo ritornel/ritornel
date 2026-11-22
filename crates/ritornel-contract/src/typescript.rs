@@ -474,8 +474,14 @@ fn the_contract_version_changes_whenever_the_wire_does() {
 fn the_wire_digest_follows_the_text_and_not_the_version() {
     let text = generate();
     assert_eq!(wire_digest(&text), wire_digest(&text));
-    assert_ne!(wire_digest(&text), wire_digest(&format!("{text}export const MORE = 1;\n")));
-    assert_eq!(wire_digest(&text), wire_digest(&format!("{text}/** A comment. */\n")));
+    assert_ne!(
+        wire_digest(&text),
+        wire_digest(&format!("{text}export const MORE = 1;\n"))
+    );
+    assert_eq!(
+        wire_digest(&text),
+        wire_digest(&format!("{text}/** A comment. */\n"))
+    );
     let other = text.replace(
         &format!("export const CONTRACT_VERSION = {CONTRACT_VERSION};"),
         "export const CONTRACT_VERSION = 999999;",

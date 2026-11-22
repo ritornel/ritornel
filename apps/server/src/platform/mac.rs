@@ -48,6 +48,32 @@ impl Agent {
 
 /// Registers the agent that serves `data_dir` and starts it, replacing one
 /// registered before, and says what was done.
+/// The name in System Settings › General › Sharing, as the person wrote
+/// it: "Studio Mac", not the network's `studio-mac.local`.
+pub(crate) fn computer_name() -> Option<String> {
+    let found = Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()?;
+    found
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&found.stdout).into_owned())
+}
+
+/// Holds the system's assertion against idle sleep, which lets the display
+/// sleep, through `caffeinate`, which holds it for as long as this server's
+/// process lives and no longer.
+pub(crate) fn stay_awake(_why: &str) -> std::io::Result<super::Awake> {
+    Command::new("/usr/bin/caffeinate")
+        .args(["-i", "-w", &std::process::id().to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(super::Awake)
+}
+
 pub(crate) fn install_service(data_dir: Option<&Path>, env: Env<'_>) -> Result<String, Error> {
     let Agent { path, domain, job } = Agent::of(env)?;
     // The log directory must be there before launchd opens the log in it.

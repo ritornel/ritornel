@@ -178,6 +178,7 @@ impl Server {
             .env_remove("RITORNEL_LISTEN")
             .env_remove("RITORNEL_LOG_LEVEL")
             .env_remove("RITORNEL_BACKUP_DIR")
+            .env("RITORNEL_TEST_COMPUTER_NAME", "Invented Desk")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -305,7 +306,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
         facts[..7],
         [
             ("Server ID", server_id.as_str()),
-            ("Name", "Ritornel server"),
+            ("Name", "Invented Desk"),
             ("Role", "unassigned"),
             ("Server version", env!("CARGO_PKG_VERSION")),
             ("Contract version", "1"),
@@ -340,7 +341,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
         json,
         serde_json::json!({
             "serverId": server_id,
-            "name": "Ritornel server",
+            "name": "Invented Desk",
             "role": "unassigned",
             "versions": {
                 "server": env!("CARGO_PKG_VERSION"),

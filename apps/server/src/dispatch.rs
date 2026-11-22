@@ -131,6 +131,9 @@ pub(crate) struct Core {
     runtime: Option<tokio::runtime::Handle>,
     /// On a satellite, its link to its hub.
     uplink: RwLock<Option<Arc<crate::uplink::Uplink>>>,
+    /// On a hub with satellites linked to it, what keeps the machine from
+    /// sleeping while it serves them.
+    awake: Mutex<Option<crate::platform::Awake>>,
     /// What a library created here takes its times and its IDs from.
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
@@ -262,6 +265,7 @@ impl Core {
             routes: std::sync::OnceLock::new(),
             runtime,
             uplink: RwLock::new(uplink),
+            awake: Mutex::new(None),
             clock,
             entropy,
             bounds,
@@ -340,6 +344,28 @@ impl Core {
     /// the hub's events to.
     fn shared(&self, session: &Session) -> Option<Arc<Session>> {
         lock(&self.sessions).open.get(&session.id()).cloned()
+    }
+
+    /// Keeps the machine awake, its screen free to sleep, once a satellite
+    /// is linked to this hub: a sleeping hub is one its satellites cannot
+    /// reach. It holds until the server stops.
+    pub(crate) fn stay_awake_while_linked(&self) {
+        let mut awake = lock(&self.awake);
+        if awake.is_some() || !self.link_sessions.any() {
+            return;
+        }
+        match crate::platform::stay_awake("satellites are linked to this hub") {
+            Ok(held) => {
+                info!(
+                    "satellites are linked: the machine is kept from sleeping while this server runs"
+                );
+                *awake = Some(held);
+            }
+            Err(error) => warn!(
+                %error,
+                "satellites are linked and this machine may sleep: keep it awake by its own settings"
+            ),
+        }
     }
 
     /// Says where other machines reach this server: once, when it starts

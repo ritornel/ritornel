@@ -286,6 +286,7 @@ impl Core {
         // Whatever the satellite had open on the session it held before
         // ends with it.
         self.close_linked(asked.server_id);
+        self.stay_awake_while_linked();
         info!(satellite = %asked.server_id, name = %name, "a satellite joined");
         Ok(LinkGranted {
             token: token.expose().to_owned(),

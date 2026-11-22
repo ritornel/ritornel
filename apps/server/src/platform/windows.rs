@@ -18,7 +18,14 @@ use crate::serve::Stop;
 
 #[cfg(feature = "media-session")]
 pub(crate) use super::fallback::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
-pub(crate) use super::fallback::{install_service, service_status, uninstall_service, wait};
+pub(crate) use super::fallback::{
+    install_service, service_status, stay_awake, uninstall_service, wait,
+};
+
+/// The computer's name, as Windows gives it to every program.
+pub(crate) fn computer_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
 
 /// Creates the folder at `path`, and those above it that are missing, with
 /// an access list of the OS user alone, which what is later made inside it

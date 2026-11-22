@@ -116,9 +116,19 @@ impl Server {
             "server.db is open"
         );
 
-        let (identity, issued) = store.ensure_identity(DEFAULT_NAME)?;
+        let (mut identity, issued) = store.ensure_identity(DEFAULT_NAME)?;
         if issued.is_some() {
             info!(server_id = %identity.server_id, "first start: created this server's identity");
+        }
+        // Named after its computer, so that a hub's satellites and a
+        // satellite's hub say which machine each is. A name someone chose
+        // is kept.
+        if identity.name == DEFAULT_NAME
+            && let Some(name) = run.name.as_deref()
+            && let Some(renamed) = store.rename(name)?
+        {
+            info!(name = %renamed.name, "this server is named after its computer");
+            identity = renamed;
         }
         let (credential, verifier) = credential::ensure(&store, &dir.credential(), issued)?;
         match credential {
@@ -182,6 +192,7 @@ impl Server {
         if let Some(player) = player {
             core.set_player(player);
         }
+        core.stay_awake_while_linked();
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
         core.set_watch(run.watch);
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
