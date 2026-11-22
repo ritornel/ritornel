@@ -129,10 +129,7 @@ impl PlayerBar {
         let http = Arc::clone(&net.art);
         let read = net.rt().spawn(async move {
             let bytes = http.get(art, bucket).await?;
-            tokio::task::spawn_blocking(move || crate::covers::decode_cover(&bytes, px))
-                .await
-                .ok()
-                .flatten()
+            crate::covers::decode(move || crate::covers::decode_cover(&bytes, px)).await
         });
         let task = cx.spawn(async move |this, cx| {
             let image = read.await.ok().flatten();

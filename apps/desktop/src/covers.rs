@@ -23,7 +23,7 @@
 //!   before that.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -77,6 +77,61 @@ pub(crate) fn decoders() -> usize {
     cores.saturating_sub(2).clamp(2, 4)
 }
 
+/// Shared concurrency limit for cover decoding and blurring across the wall and
+/// every view, so bursts of covers do not spawn dozens of blocking threads or
+/// hold dozens of full-size decode buffers in memory at once.
+fn decode_semaphore() -> Arc<Semaphore> {
+    static DECODE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    Arc::clone(DECODE.get_or_init(|| Arc::new(Semaphore::new(decoders()))))
+}
+
+/// Runs participating cover decoding or blurring on the blocking pool under
+/// the shared concurrency limit. The owned permit moves into the blocking
+/// closure so aborting the async waiter cannot release a permit while the
+/// blocking thread is still running.
+pub(crate) async fn decode<T, F>(work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
+    decode_with(decode_semaphore(), work).await
+}
+
+async fn decode_with<T, F>(sem: Arc<Semaphore>, work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
+    let permit = sem.acquire_owned().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Abort handles for in-flight page art tasks; dropping the bag aborts every
+/// task still queued or running so closed pages do not stall later views.
+#[derive(Default)]
+pub(crate) struct FetchBag(Vec<tokio::task::AbortHandle>);
+
+impl FetchBag {
+    pub(crate) fn push(&mut self, handle: tokio::task::AbortHandle) {
+        self.0.retain(|existing| !existing.is_finished());
+        self.0.push(handle);
+    }
+}
+
+impl Drop for FetchBag {
+    fn drop(&mut self) {
+        for handle in self.0.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
 /// Starts the loader on the network runtime. It runs until `wants` is dropped.
 pub(crate) fn start(
     net: Arc<Net>,
@@ -92,7 +147,7 @@ pub(crate) fn start(
         net: Arc::clone(&net),
         wanted,
         arrive,
-        decode: Arc::new(Semaphore::new(decoders())),
+        decode: decode_semaphore(),
         compressed: Arc::new(std::sync::Mutex::new(Compressed::default())),
         counts: Arc::clone(&counts),
     };
@@ -216,7 +271,7 @@ impl Loader {
                     bytes
                 }
             };
-            let Ok(_permit) = decode.acquire().await else {
+            let Ok(permit) = Arc::clone(&decode).acquire_owned().await else {
                 return art;
             };
             // Waiting for a decoder, the wall may have moved on.
@@ -226,10 +281,13 @@ impl Loader {
                 }
                 return art;
             }
-            let decoded = tokio::task::spawn_blocking(move || decode_cover(&bytes, px))
-                .await
-                .ok()
-                .flatten();
+            let decoded = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                decode_cover(&bytes, px)
+            })
+            .await
+            .ok()
+            .flatten();
             match decoded {
                 Some((image, color, size)) => {
                     if let Ok(mut counts) = counts.lock() {
@@ -538,5 +596,140 @@ mod drop_tests {
         let ready = queue.take_unshared();
         assert_eq!(ready.len(), 1);
         assert!(queue.images.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn decode_bounds_concurrent_work_to_decoders() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let sem = Arc::new(Semaphore::new(decoders()));
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let mut tasks = Vec::new();
+            for i in 0..24 {
+                let sem = Arc::clone(&sem);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                tasks.push(tokio::spawn(async move {
+                    decode_with(sem, move || {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(15));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Some(i)
+                    })
+                    .await
+                }));
+            }
+            for (i, task) in tasks.into_iter().enumerate() {
+                assert_eq!(task.await?, Some(i));
+            }
+            assert!(peak.load(Ordering::SeqCst) <= decoders());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn decode_holds_permit_until_blocking_work_exits_after_abort()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let limit = decoders();
+            let sem = Arc::new(Semaphore::new(limit));
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let entered = Arc::new(tokio::sync::Barrier::new(limit + 1));
+            let release = Arc::new(std::sync::Barrier::new(limit + 1));
+
+            let mut aborted = Vec::new();
+            for _ in 0..limit {
+                let sem = Arc::clone(&sem);
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                let handle = tokio::spawn(async move {
+                    decode_with(sem, move || {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        tokio::runtime::Handle::current().block_on(entered.wait());
+                        release.wait();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Some(())
+                    })
+                    .await
+                });
+                aborted.push(handle);
+            }
+
+            // Wait until every decoder slot is occupied inside spawn_blocking,
+            // then abort all async waiters.
+            tokio::time::timeout(Duration::from_secs(5), entered.wait()).await?;
+            for handle in aborted {
+                handle.abort();
+            }
+
+            // A new decode must not enter while the aborted blocking closures
+            // still hold their owned permits.
+            let extra_entered = Arc::new(AtomicUsize::new(0));
+            let extra_flag = Arc::clone(&extra_entered);
+            let extra_active = Arc::clone(&active);
+            let extra_peak = Arc::clone(&peak);
+            let extra_sem = Arc::clone(&sem);
+            let extra = tokio::spawn(async move {
+                decode_with(extra_sem, move || {
+                    extra_flag.store(1, Ordering::SeqCst);
+                    let now = extra_active.fetch_add(1, Ordering::SeqCst) + 1;
+                    extra_peak.fetch_max(now, Ordering::SeqCst);
+                    extra_active.fetch_sub(1, Ordering::SeqCst);
+                    Some(())
+                })
+                .await
+            });
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert_eq!(extra_entered.load(Ordering::SeqCst), 0);
+
+            // Release the blocking closures; now the queued decode completes.
+            release.wait();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), extra).await??,
+                Some(())
+            );
+            assert_eq!(extra_entered.load(Ordering::SeqCst), 1);
+            assert!(peak.load(Ordering::SeqCst) <= limit);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fetch_bag_aborts_pending_tasks_on_drop() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let mut bag = FetchBag::default();
+            let task = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+            bag.push(task.abort_handle());
+            drop(bag);
+            let joined = tokio::time::timeout(Duration::from_secs(2), task).await?;
+            assert!(joined.is_err());
+            Ok(())
+        })
     }
 }
