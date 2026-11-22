@@ -308,7 +308,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             ("Name", "Ritornel server"),
             ("Role", "unassigned"),
             ("Server version", env!("CARGO_PKG_VERSION")),
-            ("Contract version", "0"),
+            ("Contract version", "1"),
             ("SQLite version", "3.54.1"),
             ("Server schema", "2"),
         ]
@@ -344,7 +344,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             "role": "unassigned",
             "versions": {
                 "server": env!("CARGO_PKG_VERSION"),
-                "contract": 0,
+                "contract": 1,
                 "sqlite": "3.54.1",
                 "serverSchema": 2,
             },

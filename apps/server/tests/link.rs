@@ -395,7 +395,7 @@ async fn a_satellite_of_another_contract_version_is_refused() {
         };
         let (status, body) = post(&hub, &asked).await;
         assert_eq!(status, 409);
-        assert!(body.contains("contract version"), "{body}");
+        assert!(body.contains("update the hub"), "{body}");
         // The invite is not spent by a refusal.
         assert_eq!(
             post(&hub, &request(&parsed, desk.server_id(), 1)).await.0,

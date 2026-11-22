@@ -224,11 +224,7 @@ impl Core {
         if asked.contract_version != CONTRACT_VERSION {
             return Err(refused(
                 409,
-                &format!(
-                    "this hub speaks contract version {CONTRACT_VERSION} and the satellite {}: \
-                     update both to the same release",
-                    asked.contract_version
-                ),
+                &link::versions_differ(CONTRACT_VERSION, asked.contract_version),
             ));
         }
         let secret = hex::decode(&asked.secret).unwrap_or_default();

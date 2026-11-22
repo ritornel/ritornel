@@ -210,16 +210,27 @@ pub(crate) async fn reach(
         return Err("another server answered there, not the hub the link names".to_owned());
     }
     if descriptor.contract_version != CONTRACT_VERSION {
-        return Err(format!(
-            "the hub speaks contract version {} and this server {CONTRACT_VERSION}: update \
-             both to the same release",
-            descriptor.contract_version
-        ));
+        return Err(versions_differ(descriptor.contract_version, CONTRACT_VERSION));
     }
     if descriptor.role != ServerRole::Hub {
         return Err("that server is no longer a library's hub".to_owned());
     }
     Ok(descriptor)
+}
+
+/// What a satellite is told when it and its hub speak different contract
+/// versions: which side is behind, and so which to update. The hub says it
+/// from the satellite's side too, since the satellite shows it.
+pub(crate) fn versions_differ(hub: u32, satellite: u32) -> String {
+    let behind = if hub < satellite {
+        "update the hub, which is the older"
+    } else {
+        "update this server, which is the older"
+    };
+    format!(
+        "this server and its hub speak different versions of the contract (the hub {hub}, this \
+         server {satellite}): {behind}, so both run the same release"
+    )
 }
 
 /// Trades the invite's secret for a link session at the hub at `route`.
@@ -292,6 +303,13 @@ mod tests {
                 .map(|peer| peer.server),
             Some(other)
         );
+    }
+
+    #[test]
+    fn a_version_mismatch_says_which_side_to_update() {
+        assert!(versions_differ(3, 2).contains("update this server"));
+        assert!(versions_differ(2, 3).contains("update the hub"));
+        assert!(versions_differ(2, 3).contains("the hub 2, this server 3"));
     }
 
     #[test]

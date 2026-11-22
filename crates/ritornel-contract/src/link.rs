@@ -233,6 +233,7 @@ pub struct LinkListened {
 /// What a satellite sends to `POST /v1/link` to join: the invite's secret
 /// and who it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct LinkRequest {
     /// The invite's secret, as hex.
@@ -253,6 +254,7 @@ pub struct LinkRequest {
 
 /// What the hub answers a satellite that joined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct LinkGranted {
     /// The link session's token, which the satellite presents from now on.

@@ -489,7 +489,12 @@ mod tests {
     }
 
     fn hello(id: u32) -> String {
-        let params = json!({ "name": "test", "kind": "cli", "version": "1", "contractVersion": 0 });
+        let params = json!({
+            "name": "test",
+            "kind": "cli",
+            "version": "1",
+            "contractVersion": ritornel_contract::CONTRACT_VERSION,
+        });
         request(id, "server.hello", &params)
     }
 

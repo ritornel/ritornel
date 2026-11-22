@@ -372,7 +372,7 @@ fn a_second_server_on_the_same_directory_is_refused_and_the_first_stops_cleanly(
             "pid": first.pid,
             "endpoint": endpoint,
             "serverId": first.server_id,
-            "contractVersion": 0,
+            "contractVersion": ritornel_contract::CONTRACT_VERSION,
         })
     );
 

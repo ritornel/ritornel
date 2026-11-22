@@ -10,15 +10,17 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 0;
+export const CONTRACT_VERSION = 1;
 
-/** The HTTP routes. Each is a `GET` but `ticket`, which is a `POST`. */
+/** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
   ws: "/v1/ws",
   ticket: "/v1/ticket",
   descriptor: "/v1/descriptor",
   health: "/v1/health",
   art: "/v1/art",
+  link: "/v1/link",
+  audio: "/v1/audio",
 } as const;
 
 /**
@@ -2233,6 +2235,24 @@ export type LinkCopiesParams = {
 };
 
 /**
+ * What the hub answers a satellite that joined.
+ */
+export type LinkGranted = {
+  /**
+   * The link session's token, which the satellite presents from now on.
+   */
+  token: string,
+  /**
+   * The library the hub holds.
+   */
+  libraryId: string,
+  /**
+   * The hub epoch.
+   */
+  epoch: number,
+};
+
+/**
  * The result of `link.invite`.
  */
 export type LinkInvite = {
@@ -2309,6 +2329,39 @@ export type LinkListened = {
    * What became of it.
    */
   taken: ListenTaken,
+};
+
+/**
+ * What a satellite sends to `POST /v1/link` to join: the invite's secret
+ * and who it is.
+ */
+export type LinkRequest = {
+  /**
+   * The invite's secret, as hex.
+   */
+  secret: string,
+  /**
+   * The satellite's server ID.
+   */
+  serverId: string,
+  /**
+   * The satellite's name.
+   */
+  name: string,
+  /**
+   * The satellite's public key, as 64 hex digits.
+   */
+  publicKey: string,
+  /**
+   * The signature, as 128 hex digits, of [`link_request_proof`] for the
+   * hub and this secret: proof that the satellite holds its key.
+   */
+  proof: string,
+  /**
+   * The [contract version](crate::CONTRACT_VERSION) the satellite
+   * speaks. A hub refuses another.
+   */
+  contractVersion: number,
 };
 
 /**

@@ -347,7 +347,7 @@ mod tests {
 
     fn server_json(pid: u32, endpoint: &str) -> String {
         format!(
-            r#"{{"pid":{pid},"endpoint":"{endpoint}","serverId":"11111111-1111-1111-1111-111111111111","contractVersion":0}}"#
+            r#"{{"pid":{pid},"endpoint":"{endpoint}","serverId":"11111111-1111-1111-1111-111111111111","contractVersion":{CONTRACT_VERSION}}}"#
         )
     }
 
