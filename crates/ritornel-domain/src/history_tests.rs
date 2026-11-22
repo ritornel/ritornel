@@ -705,3 +705,51 @@ fn our_own_scrobble_coming_back_joins_its_listen_and_counts_once() {
     let plays = derive_all(&[heard], &[echo], &[exclude], &[]);
     assert!(plays[0].excluded);
 }
+
+#[test]
+fn dating_a_listen_uses_the_whole_clock_difference() {
+    let mut heard = listen(1, 1, 1);
+    heard.started_mono_ms = -1;
+    heard.received.sent_mono_ms = Some(i64::MAX);
+    heard.received.received_at_ms = i64::MAX;
+    assert_eq!(date_listen(&heard).0, -1);
+    heard.received.sent_boot = None;
+    heard.started_at_ms = -1;
+    heard.received.clock_skew_ms = Some(i64::MIN);
+    assert_eq!(date_listen(&heard).0, i64::MAX);
+}
+
+#[test]
+fn played_time_stays_within_the_range_of_a_play() {
+    let mut first = listen(1, 1, 100);
+    first.ms_played = i64::MAX;
+    let mut second = listen(2, 2, 100);
+    second.continues = Some(first.source_key.clone());
+    let [play] = plays(&[first, second]).try_into().unwrap();
+    assert_eq!(play.ms_played, Some(i64::MAX));
+}
+
+#[test]
+fn an_unrecognised_captured_zone_leaves_room_for_the_listeners_zone() {
+    let period = ZonePeriod {
+        listener: 1,
+        zone: "Asia/Tokyo".to_owned(),
+        from_ms: None,
+        to_ms: None,
+    };
+    for name in ["", "Invented/Harbour"] {
+        let mut heard = listen(1, 1, 100);
+        heard.zone = Some(name.to_owned());
+        let plays = derive_with(
+            std::slice::from_ref(&heard),
+            &[],
+            std::slice::from_ref(&period),
+        );
+        assert_eq!(plays[0].time.zone_basis, ZoneBasis::Assumed);
+        assert_eq!(plays[0].time.local.unwrap().hour, 6);
+        assert_eq!(
+            derive_with(&[heard], &[], &[])[0].time.zone_basis,
+            ZoneBasis::None
+        );
+    }
+}
