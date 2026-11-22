@@ -158,67 +158,109 @@ pub(crate) fn is_private_route(ip: IpAddr) -> bool {
     !ip.is_unspecified() && Listen::private_on_port(0).admits(ip)
 }
 
-/// How many addresses one route's name may give a satellite to try.
-const MAX_ADDRESSES: usize = 8;
+/// The most routes an invite names, so that a connection to a hub that
+/// does not answer is bounded.
+pub(crate) const MAX_ROUTES: usize = 8;
 
-/// Checks routes as an invite names them: each a host and a port, the
-/// host an address on a private network or a tailnet, or a name, such as
-/// `studio-mac.local` or a tailnet's name for the machine. A name is
-/// resolved at each dial ([`resolve`]), so a hub whose address changes is
-/// still found.
+/// The most addresses of one route's name a satellite tries.
+const MAX_ADDRESSES: usize = 4;
+
+/// The longest a name may take to resolve.
+const RESOLVE_WAIT: Duration = Duration::from_secs(3);
+
+/// The longest a connection to the hub may take at one address, the proof
+/// and the hello included. On a home network it takes milliseconds.
+pub(crate) const CONNECT_WAIT: Duration = Duration::from_secs(4);
+
+/// Checks routes as an invite names them: at most [`MAX_ROUTES`], each a
+/// host and a port, the host an address on a private network or a
+/// tailnet, or a name, such as `studio-mac.local` or a tailnet's name for
+/// the machine. A name is resolved at each dial ([`resolve`]), so a hub
+/// whose address changes is still found.
 pub(crate) fn check_routes(routes: &[String]) -> Result<(), String> {
+    if routes.len() > MAX_ROUTES {
+        return Err(format!("a link names at most {MAX_ROUTES} routes"));
+    }
     for route in routes {
         if let Ok(address) = route.parse::<SocketAddr>() {
+            if address.port() == 0 {
+                return Err(format!("{route} is not a host and a port"));
+            }
             if !is_private_route(address.ip()) {
                 return Err(format!(
                     "{route} is not on a private network or a tailnet, and a link travels as \
                      plain HTTP"
                 ));
             }
-            continue;
-        }
-        let named = route.rsplit_once(':').is_some_and(|(host, port)| {
-            port.parse::<u16>().is_ok_and(|port| port != 0)
-                && !host.is_empty()
-                && host.len() <= 253
-                && host.split('.').all(|label| {
-                    !label.is_empty()
-                        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-                })
-        });
-        if !named {
+        } else if !is_name_and_port(route) {
             return Err(format!("{route} is not a host and a port"));
         }
     }
     Ok(())
 }
 
-/// The addresses `route` dials now: an address as it is, a name as the
-/// system resolves it at this moment, by DNS or multicast DNS. Only
-/// private and tailnet addresses are kept, since what travels is plain
-/// HTTP. A name that answers with another machine is harmless: [`reach`]
-/// asks whatever answers to prove it holds the hub's key, and nothing
-/// else is sent until it has.
-pub(crate) async fn resolve(route: &str) -> Result<Vec<SocketAddr>, String> {
-    let found: Vec<SocketAddr> = tokio::net::lookup_host(route)
+/// Whether `route` is a DNS name and a port: labels of letters, digits and
+/// inner hyphens, of at most 63 characters, and a final dot allowed.
+fn is_name_and_port(route: &str) -> bool {
+    let Some((host, port)) = route.rsplit_once(':') else {
+        return false;
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    port.parse::<u16>().is_ok_and(|port| port != 0)
+        && !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+}
+
+/// `work`, given at most `wait`.
+pub(crate) async fn within<T>(
+    wait: Duration,
+    work: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(wait, work)
         .await
-        .map_err(|error| format!("it could not be resolved: {error}"))?
-        .collect();
-    let mut private = Vec::new();
+        .unwrap_or_else(|_| Err(format!("no answer in {} seconds", wait.as_secs())))
+}
+
+/// The addresses `route` dials now: an address as it is, a name as the
+/// system resolves it at this moment, by DNS or multicast DNS. Only IPv4
+/// addresses on a private network or a tailnet are kept: the hub listens
+/// on IPv4, and what travels is plain HTTP.
+///
+/// A name that answers with another machine, by mistake or by spoofing,
+/// gets nothing from the satellite but a nonce: [`reach`] asks whatever
+/// answers to prove it holds the hub's key first. What the proof cannot
+/// stop is what plain HTTP cannot: someone able to relay traffic on the
+/// network reads what travels, by a name as by an address. That is why a
+/// route must be private, or inside a tailnet's own encryption.
+pub(crate) async fn resolve(route: &str) -> Result<Vec<SocketAddr>, String> {
+    let found: Vec<SocketAddr> = within(RESOLVE_WAIT, async {
+        tokio::net::lookup_host(route)
+            .await
+            .map(Iterator::collect)
+            .map_err(|error| format!("it could not be resolved: {error}"))
+    })
+    .await?;
+    let mut usable = Vec::new();
     for address in &found {
-        if is_private_route(address.ip()) && !private.contains(address) {
-            private.push(*address);
+        if address.is_ipv4() && is_private_route(address.ip()) && !usable.contains(address) {
+            usable.push(*address);
         }
     }
-    private.truncate(MAX_ADDRESSES);
-    if private.is_empty() {
+    usable.truncate(MAX_ADDRESSES);
+    if usable.is_empty() {
         return Err(if found.is_empty() {
             "it resolves to no address".to_owned()
         } else {
-            "it resolves to no address on a private network or a tailnet".to_owned()
+            "it resolves to no IPv4 address on a private network or a tailnet".to_owned()
         });
     }
-    Ok(private)
+    Ok(usable)
 }
 
 /// Asks the server at `route` for its descriptor with a fresh nonce, and
@@ -403,6 +445,18 @@ mod tests {
         // A name is checked when it is dialled, by what it resolves to.
         assert!(check("studio-mac.local:4747").is_ok());
         assert!(check("studio.example-overlay.net:4747").is_ok());
+        assert!(check("Studio.Example-Overlay.NET.:4747").is_ok());
+        let long = format!("{}.local:4747", "a".repeat(64));
+        for wrong in [
+            "127.0.0.1:0",
+            "-studio.local:4747",
+            "studio-.local:4747",
+            long.as_str(),
+        ] {
+            assert!(check(wrong).is_err(), "{wrong}");
+        }
+        let nine = vec!["192.168.1.20:4747".to_owned(); MAX_ROUTES + 1];
+        assert!(check_routes(&nine).is_err());
         for wrong in [
             "attic",
             "attic:",
@@ -436,7 +490,11 @@ mod tests {
     async fn a_route_resolves_to_its_private_addresses_only() {
         let resolved = resolve("localhost:4747").await.unwrap();
         assert!(!resolved.is_empty());
-        assert!(resolved.iter().all(|address| address.ip().is_loopback()));
+        assert!(
+            resolved
+                .iter()
+                .all(|address| address.is_ipv4() && address.ip().is_loopback())
+        );
         assert_eq!(
             resolve("192.168.1.20:4747").await.unwrap(),
             vec!["192.168.1.20:4747".parse().unwrap()]

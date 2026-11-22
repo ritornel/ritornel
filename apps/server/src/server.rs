@@ -215,11 +215,9 @@ impl Server {
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
         let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
-        core.set_routes(if listen.is_private() {
-            crate::link::found_routes(listening.endpoint().port())
-        } else {
-            Vec::new()
-        });
+        if listen.is_private() {
+            core.set_private_port(listening.endpoint().port());
+        }
         if listen.is_private() {
             warn!(
                 "listening on the private network: what is sent is plain HTTP, which anyone on \

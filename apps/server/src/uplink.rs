@@ -56,14 +56,6 @@ struct Reach {
 /// before its own clients give up on it: `ritornelctl` waits ten seconds.
 const CALL_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// The most routes a connection tries, so one to a hub that does not
-/// answer is bounded however many routes the invite named.
-pub(crate) const MAX_ROUTES: usize = 8;
-
-/// The longest a connection to the hub may take on one route, the proof
-/// and the hello included. On a home network it takes milliseconds.
-const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
-
 /// How long after a failed try a call is answered at once, without trying
 /// again: a client that calls ten times a second while the hub is away is
 /// not kept waiting on each.
@@ -246,22 +238,20 @@ impl Uplink {
         let mut tried = Vec::new();
         // Each route is resolved again at each dial, so a hub found by its
         // name is found wherever its address has moved.
-        for route in self.link.routes.iter().take(MAX_ROUTES) {
+        for route in self.link.routes.iter().take(link::MAX_ROUTES) {
+            // Each address has its own time, so one that does not answer
+            // leaves the next its chance.
             let opened = async {
                 let mut why = Vec::new();
                 for address in link::resolve(route).await? {
-                    match self.open(address).await {
+                    match link::within(link::CONNECT_WAIT, self.open(address)).await {
                         Ok(client) => return Ok((address, client)),
                         Err(problem) => why.push(format!("{address}: {problem}")),
                     }
                 }
                 Err(why.join(", "))
             };
-            let opened = match tokio::time::timeout(CONNECT_WAIT, opened).await {
-                Ok(opened) => opened,
-                Err(_) => Err(format!("no answer in {} seconds", CONNECT_WAIT.as_secs())),
-            };
-            match opened {
+            match opened.await {
                 Ok((address, client)) => {
                     self.answered(Some(address));
                     return Ok(client);

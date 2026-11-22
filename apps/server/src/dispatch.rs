@@ -123,9 +123,9 @@ pub(crate) struct Core {
     /// The link sessions this hub has issued, checked as the local
     /// credential is.
     link_sessions: crate::link::LinkSessions,
-    /// Where other machines reach this server, once it is listening: empty
-    /// when it listens on loopback only.
-    routes: std::sync::OnceLock<Vec<String>>,
+    /// The port other machines reach this server on, once it listens on
+    /// the private network. None when it listens on loopback only.
+    private_port: std::sync::OnceLock<u16>,
     /// The runtime the server runs on, for the calls that go out to
     /// another server. `None` in the dispatcher's own tests.
     runtime: Option<tokio::runtime::Handle>,
@@ -262,7 +262,7 @@ impl Core {
             signer,
             invites: crate::link::Invites::default(),
             link_sessions,
-            routes: std::sync::OnceLock::new(),
+            private_port: std::sync::OnceLock::new(),
             runtime,
             uplink: RwLock::new(uplink),
             awake: Mutex::default(),
@@ -426,15 +426,20 @@ impl Core {
         })
     }
 
-    /// Says where other machines reach this server: once, when it starts
-    /// listening. Listening on loopback only, nowhere.
-    pub(crate) fn set_routes(&self, routes: Vec<String>) {
-        let _ = self.routes.set(routes);
+    /// Says which port other machines reach this server on: once, when it
+    /// starts listening on the private network.
+    pub(crate) fn set_private_port(&self, port: u16) {
+        let _ = self.private_port.set(port);
     }
 
-    /// The routes an invite offers when it is not told which.
+    /// The routes an invite offers when it is not told which, found as it
+    /// is made, so that a tailnet brought up since the server started is
+    /// offered too. None when this server listens on loopback only.
     fn offered_routes(&self) -> Vec<String> {
-        self.routes.get().cloned().unwrap_or_default()
+        self.private_port
+            .get()
+            .map(|port| crate::link::found_routes(*port))
+            .unwrap_or_default()
     }
 
     /// What the server says about itself to anyone who asks. With a

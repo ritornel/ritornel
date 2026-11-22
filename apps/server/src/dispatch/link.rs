@@ -339,7 +339,7 @@ impl Core {
         let (route, address, descriptor) = runtime
             .block_on(async {
                 let mut tried = Vec::new();
-                for route in invite.routes.iter().take(crate::uplink::MAX_ROUTES) {
+                for route in &invite.routes {
                     let addresses = match link::resolve(route).await {
                         Ok(addresses) => addresses,
                         Err(why) => {
@@ -348,7 +348,8 @@ impl Core {
                         }
                     };
                     for address in addresses {
-                        match link::reach(address, invite.hub, &invite.key, &*self.entropy).await {
+                        let reached = link::reach(address, invite.hub, &invite.key, &*self.entropy);
+                        match link::within(link::CONNECT_WAIT, reached).await {
                             Ok(descriptor) => return Ok((route.clone(), address, descriptor)),
                             Err(why) => tried.push(format!("{route} ({address}): {why}")),
                         }
