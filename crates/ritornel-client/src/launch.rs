@@ -20,10 +20,9 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 use ritornel_contract::local as agreed;
 
@@ -135,7 +134,7 @@ impl Launcher {
                     Some(program),
                 ) if races < RACES => {
                     races += 1;
-                    self.start(program).await?;
+                    self.start(program, Duration::from_secs(120)).await?;
                 }
                 // Another program's server is on its way up.
                 (
@@ -155,23 +154,47 @@ impl Launcher {
     /// Spawns a server and waits for it to be ready. `Ok` when it is, and
     /// when it found the directory in use: either way there is a server to
     /// find now.
-    async fn start(&self, program: &Program) -> Result<(), Error> {
+    async fn start(&self, program: &Program, wait: Duration) -> Result<(), Error> {
         let (owned, ready) = Owned::spawn(program, &self.data_dir)?;
         // One that was started earlier and has died is let go of.
         drop(self.owned().replace(owned));
-        let ready = tokio::task::spawn_blocking(move || ready.wait())
-            .await
-            .map_err(|failed| Error::Start(failed.to_string()))?;
-        let Err(said) = ready else {
+        let deadline = tokio::time::Instant::now() + wait;
+        let ready_line = tokio::time::timeout_at(deadline, ready.said_ready).await;
+        if matches!(ready_line, Ok(Ok(()))) {
             return Ok(());
-        };
-        // It has closed its standard output, so it has ended or is ending.
-        let code = self.owned().take().and_then(Owned::exit_code);
-        if code == Some(i32::from(agreed::EXIT_IN_USE)) {
-            Ok(())
-        } else {
-            Err(Error::Start(said))
         }
+        let owned = self.owned().take();
+        let stopped = if let Some(owned) = owned {
+            let remaining = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(STOP_WAIT);
+            Some(
+                tokio::task::spawn_blocking(move || owned.stop(remaining))
+                    .await
+                    .map_err(|error| Error::Start(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        if matches!(stopped, Some(Stopped::Exited(status)) if status.code() == Some(i32::from(agreed::EXIT_IN_USE)))
+        {
+            return Ok(());
+        }
+        if ready_line.is_err() {
+            return Err(Error::Start(
+                "timed out waiting for the server to be ready".to_owned(),
+            ));
+        }
+        let said = tokio::time::timeout_at(deadline, ready.stderr)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let line = said.lines().rev().find(|line| !line.trim().is_empty());
+        Err(Error::Start(line.map_or_else(
+            || "it ended before it was ready".to_owned(),
+            |line| line.trim_start_matches("ritornel-server: ").to_owned(),
+        )))
     }
 
     /// Stops the server this launcher started, if it holds one, and waits
@@ -208,24 +231,8 @@ struct Owned {
 /// What a spawned server says before it is ready: the ready line, or the
 /// end of its output and what it wrote on standard error.
 struct Ready {
-    said_ready: Receiver<()>,
-    stderr: JoinHandle<String>,
-}
-
-impl Ready {
-    /// Blocks until the server is ready, or has ended without being ready.
-    /// The error is why, as it said it.
-    fn wait(self) -> Result<(), String> {
-        if self.said_ready.recv().is_ok() {
-            return Ok(());
-        }
-        let said = self.stderr.join().unwrap_or_default();
-        let line = said.lines().rev().find(|line| !line.trim().is_empty());
-        Err(line.map_or_else(
-            || "it ended before it was ready".to_owned(),
-            |line| line.trim_start_matches("ritornel-server: ").to_owned(),
-        ))
-    }
+    said_ready: oneshot::Receiver<()>,
+    stderr: oneshot::Receiver<String>,
 }
 
 impl Owned {
@@ -248,16 +255,21 @@ impl Owned {
         let stdin = child.stdin.take();
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let owned = Self { child, stdin };
-        let (said, said_ready) = mpsc::channel();
+        let (said, said_ready) = oneshot::channel();
+        let (diagnosis, stderr_text) = oneshot::channel();
         // Each pipe is read to its end, so the server never blocks on a
         // full one. The channel closes when standard output ends.
         let reading = std::thread::Builder::new()
             .name("server stdout".to_owned())
             .spawn(move || {
                 let Some(stdout) = stdout else { return };
-                for line in BufReader::new(stdout).lines() {
+                let mut said = Some(said);
+                for line in BufReader::new(stdout).split(b'\n') {
                     let Ok(line) = line else { break };
-                    if line.split(' ').next() == Some(agreed::READY) {
+                    if line.split(|&byte| byte == b' ' || byte == b'\r').next()
+                        == Some(agreed::READY.as_bytes())
+                        && let Some(said) = said.take()
+                    {
                         let _ = said.send(());
                     }
                 }
@@ -270,10 +282,16 @@ impl Owned {
                     let _ = (&mut stderr).take(STDERR_KEPT).read_to_string(&mut text);
                     let _ = std::io::copy(&mut stderr, &mut std::io::sink());
                 }
-                text
+                let _ = diagnosis.send(text);
             });
         match (reading, stderr) {
-            (Ok(_), Ok(stderr)) => Ok((owned, Ready { said_ready, stderr })),
+            (Ok(_), Ok(_)) => Ok((
+                owned,
+                Ready {
+                    said_ready,
+                    stderr: stderr_text,
+                },
+            )),
             (Err(error), _) | (_, Err(error)) => {
                 let _killed = owned.stop(Duration::ZERO);
                 Err(Error::Start(error.to_string()))
@@ -300,12 +318,6 @@ impl Owned {
         let _ = self.child.kill();
         let _ = self.child.wait();
         Stopped::Killed
-    }
-
-    /// Waits for a server that is ending, and returns its exit code.
-    fn exit_code(mut self) -> Option<i32> {
-        drop(self.stdin.take());
-        self.child.wait().ok()?.code()
     }
 }
 
@@ -398,6 +410,33 @@ mod tests {
         assert!(!scratch.0.join("data").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stdout_is_drained_through_non_utf8_output_before_ready() {
+        let scratch = Scratch::new("bytes-before-ready");
+        let program = scratch.program(r"printf '\377\n'; echo 'ready pid=1 server_id=x'", "");
+        let (owned, ready) = Owned::spawn(&program, &scratch.0).unwrap();
+        let result = ready.said_ready.blocking_recv();
+        owned.stop(STOP_WAIT);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_cannot_wait_indefinitely_for_a_ready_line() {
+        let scratch = Scratch::new("no-ready");
+        let program = scratch.program("exec sleep 1", "");
+        let launcher = Launcher::new(scratch.0.clone(), None);
+        let started = Instant::now();
+        let failed = launcher
+            .start(&program, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(matches!(failed, Error::Start(_)));
+        assert!(started.elapsed() < Duration::from_millis(750));
+        assert!(launcher.owned_pid().is_none());
+    }
+
     #[test]
     fn a_server_is_stopped_by_its_pipe_and_killed_if_it_ignores_it() {
         let scratch = Scratch::new("stops");
@@ -407,7 +446,7 @@ mod tests {
             "echo ready pid=1 server_id=x\nfindstr \"^\" >nul\nexit /b 0",
         );
         let (owned, ready) = Owned::spawn(&polite, &scratch.0).unwrap();
-        ready.wait().unwrap();
+        ready.said_ready.blocking_recv().unwrap();
         let stopped = owned.stop(STOP_WAIT);
         assert!(
             matches!(&stopped, Stopped::Exited(status) if status.success()),
@@ -421,7 +460,7 @@ mod tests {
             "echo ready pid=1 server_id=x\n:spin\ngoto spin",
         );
         let (owned, ready) = Owned::spawn(&deaf, &scratch.0).unwrap();
-        ready.wait().unwrap();
+        ready.said_ready.blocking_recv().unwrap();
         let begun = Instant::now();
         assert!(matches!(
             owned.stop(Duration::from_millis(200)),
