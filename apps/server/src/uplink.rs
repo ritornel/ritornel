@@ -10,9 +10,10 @@
 //! and job events come back to it alone. The server keeps one more
 //! connection for its own work: what its player reads, and its listens.
 //!
-//! A connection is made by walking the routes in order: on each, the
-//! satellite checks that the server there proves it holds the hub's pinned
-//! key before it presents its link session.
+//! A connection is made at the best address the routes give now, this
+//! network before a tailnet (`link::candidates`): at each, the satellite
+//! checks that the server there proves it holds the hub's pinned key
+//! before it presents its link session.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

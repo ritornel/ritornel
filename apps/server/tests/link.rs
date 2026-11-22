@@ -332,9 +332,17 @@ async fn a_route_may_be_a_name_resolved_at_each_dial_and_a_name_for_another_serv
         // to nothing. The routes are kept as the invite named them, the
         // name as a name, to be resolved and ordered again each time the
         // satellite dials.
+        // A tailnet's route named first is tried last, after this network.
         let mut named = InviteLink::parse(&by_name(hub.endpoint().port())).unwrap();
         named.routes.insert(0, "nowhere.invalid:4747".to_owned());
+        named.routes.insert(0, "100.64.0.1:9".to_owned());
+        let started = std::time::Instant::now();
         let status = join(&desk_client, &named.to_string()).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
         let hub_status = status.hub.unwrap();
         assert_eq!(hub_status.server_id, hub.server_id());
         assert_eq!(hub_status.routes, named.routes);
