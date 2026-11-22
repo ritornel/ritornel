@@ -20,10 +20,9 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 use ritornel_contract::local as agreed;
 
@@ -37,6 +36,13 @@ pub const STOP_WAIT: Duration = Duration::from_secs(15);
 /// How long finding keeps trying while another program's server holds the
 /// lock and has not said where it listens, before the caller is told so.
 const STARTING_WAIT: Duration = Duration::from_secs(2);
+
+/// How long a caller waits for readiness. A pre-migration backup may take
+/// longer, so the child keeps running when the wait ends.
+const READY_WAIT: Duration = Duration::from_secs(120);
+
+/// How long stderr gets to deliver the startup diagnostic after stdout closes.
+const DIAGNOSTIC_WAIT: Duration = Duration::from_secs(2);
 
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(25);
@@ -108,7 +114,7 @@ impl Launcher {
 
     /// The pid of the server this launcher started, while it holds one.
     pub fn owned_pid(&self) -> Option<u32> {
-        self.owned().as_ref().map(Owned::pid)
+        self.live_owned().as_ref().map(Owned::pid)
     }
 
     /// Finds the server running on the data directory, or starts one if
@@ -134,8 +140,13 @@ impl Launcher {
                     },
                     Some(program),
                 ) if races < RACES => {
+                    // A cancelled or timed-out caller may have left its
+                    // server starting up, even before it acquired the lock.
+                    if self.owned_pid().is_some() {
+                        return Err(self.still_starting());
+                    }
                     races += 1;
-                    self.start(program).await?;
+                    self.start(program, READY_WAIT).await?;
                 }
                 // Another program's server is on its way up.
                 (
@@ -152,26 +163,53 @@ impl Launcher {
         }
     }
 
+    fn still_starting(&self) -> Error {
+        Error::NotRunning {
+            data_dir: self.data_dir.clone(),
+            why: NotRunning::Starting,
+        }
+    }
+
     /// Spawns a server and waits for it to be ready. `Ok` when it is, and
     /// when it found the directory in use: either way there is a server to
     /// find now.
-    async fn start(&self, program: &Program) -> Result<(), Error> {
+    async fn start(&self, program: &Program, wait: Duration) -> Result<(), Error> {
         let (owned, ready) = Owned::spawn(program, &self.data_dir)?;
-        // One that was started earlier and has died is let go of.
-        drop(self.owned().replace(owned));
-        let ready = tokio::task::spawn_blocking(move || ready.wait())
-            .await
-            .map_err(|failed| Error::Start(failed.to_string()))?;
-        let Err(said) = ready else {
-            return Ok(());
-        };
-        // It has closed its standard output, so it has ended or is ending.
-        let code = self.owned().take().and_then(Owned::exit_code);
-        if code == Some(i32::from(agreed::EXIT_IN_USE)) {
-            Ok(())
-        } else {
-            Err(Error::Start(said))
+        self.owned().replace(owned);
+        self.await_ready(ready, wait).await
+    }
+
+    async fn await_ready(&self, ready: Ready, wait: Duration) -> Result<(), Error> {
+        let ready_line = tokio::time::timeout(wait, ready.said_ready).await;
+        match ready_line {
+            Ok(Ok(())) => return Ok(()),
+            Err(_) => return Err(self.still_starting()),
+            Ok(Err(_)) => {}
         }
+        let owned = self.owned().take();
+        let stopped = if let Some(owned) = owned {
+            Some(
+                tokio::task::spawn_blocking(move || owned.stop(STOP_WAIT))
+                    .await
+                    .map_err(|error| Error::Start(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        if matches!(stopped, Some(Stopped::Exited(status)) if status.code() == Some(i32::from(agreed::EXIT_IN_USE)))
+        {
+            return Ok(());
+        }
+        let said = tokio::time::timeout(DIAGNOSTIC_WAIT, ready.stderr)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        let line = said.lines().rev().find(|line| !line.trim().is_empty());
+        Err(Error::Start(line.map_or_else(
+            || "it ended before it was ready".to_owned(),
+            |line| line.trim_start_matches("ritornel-server: ").to_owned(),
+        )))
     }
 
     /// Stops the server this launcher started, if it holds one, and waits
@@ -179,8 +217,14 @@ impl Launcher {
     /// has not ended after `wait`. A server that was found is left
     /// running. It blocks.
     pub fn stop_owned(&self, wait: Duration) -> Option<Stopped> {
-        let owned = self.owned().take()?;
+        let owned = self.live_owned().take()?;
         Some(owned.stop(wait))
+    }
+
+    fn live_owned(&self) -> MutexGuard<'_, Option<Owned>> {
+        let mut slot = self.owned();
+        slot.take_if(Owned::has_exited);
+        slot
     }
 
     fn owned(&self) -> MutexGuard<'_, Option<Owned>> {
@@ -208,24 +252,8 @@ struct Owned {
 /// What a spawned server says before it is ready: the ready line, or the
 /// end of its output and what it wrote on standard error.
 struct Ready {
-    said_ready: Receiver<()>,
-    stderr: JoinHandle<String>,
-}
-
-impl Ready {
-    /// Blocks until the server is ready, or has ended without being ready.
-    /// The error is why, as it said it.
-    fn wait(self) -> Result<(), String> {
-        if self.said_ready.recv().is_ok() {
-            return Ok(());
-        }
-        let said = self.stderr.join().unwrap_or_default();
-        let line = said.lines().rev().find(|line| !line.trim().is_empty());
-        Err(line.map_or_else(
-            || "it ended before it was ready".to_owned(),
-            |line| line.trim_start_matches("ritornel-server: ").to_owned(),
-        ))
-    }
+    said_ready: oneshot::Receiver<()>,
+    stderr: oneshot::Receiver<String>,
 }
 
 impl Owned {
@@ -248,18 +276,27 @@ impl Owned {
         let stdin = child.stdin.take();
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let owned = Self { child, stdin };
-        let (said, said_ready) = mpsc::channel();
+        let (said, said_ready) = oneshot::channel();
+        let (diagnosis, stderr_text) = oneshot::channel();
         // Each pipe is read to its end, so the server never blocks on a
         // full one. The channel closes when standard output ends.
         let reading = std::thread::Builder::new()
             .name("server stdout".to_owned())
             .spawn(move || {
                 let Some(stdout) = stdout else { return };
-                for line in BufReader::new(stdout).lines() {
-                    let Ok(line) = line else { break };
-                    if line.split(' ').next() == Some(agreed::READY) {
+                let mut reader = BufReader::new(stdout);
+                let mut line = Vec::new();
+                while let Ok(1..) = reader.read_until(b'\n', &mut line) {
+                    if line
+                        .split(|&byte| matches!(byte, b' ' | b'\r' | b'\n'))
+                        .next()
+                        == Some(agreed::READY.as_bytes())
+                    {
                         let _ = said.send(());
+                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                        break;
                     }
+                    line.clear();
                 }
             });
         let stderr = std::thread::Builder::new()
@@ -270,15 +307,25 @@ impl Owned {
                     let _ = (&mut stderr).take(STDERR_KEPT).read_to_string(&mut text);
                     let _ = std::io::copy(&mut stderr, &mut std::io::sink());
                 }
-                text
+                let _ = diagnosis.send(text);
             });
         match (reading, stderr) {
-            (Ok(_), Ok(stderr)) => Ok((owned, Ready { said_ready, stderr })),
+            (Ok(_), Ok(_)) => Ok((
+                owned,
+                Ready {
+                    said_ready,
+                    stderr: stderr_text,
+                },
+            )),
             (Err(error), _) | (_, Err(error)) => {
                 let _killed = owned.stop(Duration::ZERO);
                 Err(Error::Start(error.to_string()))
             }
         }
+    }
+
+    fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     fn pid(&self) -> u32 {
@@ -300,12 +347,6 @@ impl Owned {
         let _ = self.child.kill();
         let _ = self.child.wait();
         Stopped::Killed
-    }
-
-    /// Waits for a server that is ending, and returns its exit code.
-    fn exit_code(mut self) -> Option<i32> {
-        drop(self.stdin.take());
-        self.child.wait().ok()?.code()
     }
 }
 
@@ -398,6 +439,85 @@ mod tests {
         assert!(!scratch.0.join("data").exists());
     }
 
+    #[tokio::test]
+    async fn a_diagnostic_can_arrive_after_the_readiness_wait() {
+        let scratch = Scratch::new("late-diagnostic");
+        let launcher = Launcher::new(scratch.0.clone(), None);
+        let (stdout, said_ready) = oneshot::channel();
+        let (diagnosis, stderr) = oneshot::channel();
+        drop(stdout);
+        // Stdout already closed. Even with no readiness time left, stderr gets its own wait.
+        let (result, ()) = tokio::join!(
+            launcher.await_ready(Ready { said_ready, stderr }, Duration::ZERO),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let _ = diagnosis.send("ritornel-server: library unavailable".to_owned());
+            }
+        );
+        assert!(matches!(result, Err(Error::Start(why)) if why == "library unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_is_drained_through_non_utf8_output_before_ready() {
+        let scratch = Scratch::new("bytes-before-ready");
+        let program = scratch.program(r"printf '\377\n'; echo 'ready pid=1 server_id=x'", "");
+        let (owned, ready) = Owned::spawn(&program, &scratch.0).unwrap();
+        let result = ready.said_ready.blocking_recv();
+        owned.stop(STOP_WAIT);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_slow_start_can_outlive_the_wait_and_keeps_the_same_child() {
+        let scratch = Scratch::new("no-ready");
+        let program = scratch.program("cat >/dev/null", "findstr \"^\" >nul\nexit /b 0");
+        let launcher = Launcher::new(scratch.0.clone(), Some(program.clone()));
+        let result = launcher.start(&program, Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::NotRunning {
+                    why: NotRunning::Starting,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        let pid = launcher.owned_pid().unwrap();
+        let retry = tokio::time::timeout(Duration::from_secs(5), launcher.find_or_start())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                retry,
+                Err(Error::NotRunning {
+                    why: NotRunning::Starting,
+                    ..
+                })
+            ),
+            "{retry:?}"
+        );
+        assert_eq!(launcher.owned_pid(), Some(pid));
+        assert!(matches!(
+            launcher.stop_owned(STOP_WAIT),
+            Some(Stopped::Exited(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_exited_child_is_no_longer_reported_as_owned() {
+        let scratch = Scratch::new("child-exited");
+        let program = scratch.program("exit 3", "exit /b 3");
+        let launcher = Launcher::new(scratch.0.clone(), None);
+        let (mut owned, _ready) = Owned::spawn(&program, &scratch.0).unwrap();
+        owned.child.wait().unwrap();
+        launcher.owned().replace(owned);
+        assert_eq!(launcher.owned_pid(), None);
+        launcher.find_or_start().await.unwrap_err();
+        assert!(launcher.stop_owned(STOP_WAIT).is_none());
+    }
+
     #[test]
     fn a_server_is_stopped_by_its_pipe_and_killed_if_it_ignores_it() {
         let scratch = Scratch::new("stops");
@@ -407,7 +527,7 @@ mod tests {
             "echo ready pid=1 server_id=x\nfindstr \"^\" >nul\nexit /b 0",
         );
         let (owned, ready) = Owned::spawn(&polite, &scratch.0).unwrap();
-        ready.wait().unwrap();
+        ready.said_ready.blocking_recv().unwrap();
         let stopped = owned.stop(STOP_WAIT);
         assert!(
             matches!(&stopped, Stopped::Exited(status) if status.success()),
@@ -421,7 +541,7 @@ mod tests {
             "echo ready pid=1 server_id=x\n:spin\ngoto spin",
         );
         let (owned, ready) = Owned::spawn(&deaf, &scratch.0).unwrap();
-        ready.wait().unwrap();
+        ready.said_ready.blocking_recv().unwrap();
         let begun = Instant::now();
         assert!(matches!(
             owned.stop(Duration::from_millis(200)),
