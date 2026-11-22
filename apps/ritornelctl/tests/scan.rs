@@ -1,6 +1,6 @@
 //! The real `ritornelctl` scanning a folder on the real `ritornel-server`,
 //! and a scan that the server's death cuts off being taken up by the next
-//! run. See "An effect, a job and a lease" in docs/design/server.md.
+//! run. See "Jobs and outbox" in docs/internals/server.md.
 //!
 //! As in `status.rs`, `ritornel-server` is taken from beside `ritornelctl`,
 //! where a build of the workspace puts it, and nothing here sleeps: each

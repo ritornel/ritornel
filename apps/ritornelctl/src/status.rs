@@ -1,5 +1,5 @@
 //! `ritornelctl status`: what the running server reports about itself. See
-//! "Configuration and logs" in docs/design/server.md.
+//! "Configuration and logging" in docs/internals/server.md.
 
 use std::io::Write;
 

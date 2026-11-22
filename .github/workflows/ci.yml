@@ -48,6 +48,7 @@ jobs:
       # failure names itself.
       - run: mise run fmt
       - run: mise run deps
+      - run: mise run docs
       - run: mise run licenses
       - run: mise run lint
       - run: mise run test

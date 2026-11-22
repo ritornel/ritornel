@@ -1,6 +1,6 @@
 //! The library this server holds, found when the server starts. See
-//! "Identity and the hub role" in docs/design/linking.md and "Which file
-//! holds what" in docs/design/server.md.
+//! "Identity and the hub role" in docs/design/linking.md and "Storage split"
+//! in docs/internals/server.md.
 //!
 //! A server's role is its own record, in `server.db`. Which server may
 //! write a library is the library's record, the hub pointer in

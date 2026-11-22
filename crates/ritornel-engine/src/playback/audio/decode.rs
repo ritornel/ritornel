@@ -873,7 +873,7 @@ pub(crate) fn run(
     run_joined(source, to, stop, &mut Sink(sink))
 }
 
-/// As [`run`], and each time a track ends the stream may give the track
+/// As `run`, and each time a track ends the stream may give the track
 /// that follows it: it is decoded into the same stream with nothing
 /// between them, and the stream is told the frame where it begins.
 pub(crate) fn run_joined(

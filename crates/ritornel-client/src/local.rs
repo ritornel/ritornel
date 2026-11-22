@@ -1,5 +1,5 @@
-//! Finding the server on this machine. See "Starting, finding and stopping"
-//! in docs/design/server.md, steps 1 and 2.
+//! Finding the server on this machine. See "Process lifecycle" in
+//! docs/internals/server.md, steps 1 and 2.
 //!
 //! 1. Resolve the data directory: `--data-dir`, then `RITORNEL_DATA_DIR`,
 //!    then the platform's default.

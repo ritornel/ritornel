@@ -1,5 +1,6 @@
 //! The migration runner: numbered SQL files that are only ever added to,
-//! applied in order on the writer. See decision 19 in docs/design/server.md.
+//! applied in order on the writer. See "Migrations" in
+//! docs/internals/server.md.
 //!
 //! The ledger is the table `schema_migration`, which the first migration of
 //! each database creates. A database's schema version is the highest number

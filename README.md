@@ -68,11 +68,11 @@ The server reads the file when it starts, so start it again: quit and reopen the
 | `schema/` | The databases' schemas, generated from the migrations |
 | `fixtures/` | Small synthetic audio files for the tests |
 
-[`AGENTS.md`](AGENTS.md) has the commands and the few rules, for people and for coding agents.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) maps the crates, dependency rules, invariants and vocabulary. [`AGENTS.md`](AGENTS.md) has the commands and the few rules, for people and for coding agents.
 
-## Design notes and history
+## Architecture docs and history
 
-Comments throughout the code cite design notes, such as `docs/design/server.md`, decisions by number, and now and then a prototype or a spike. All of that was written while Ritornel was being worked out in private. The notes are being added as each is brought up to date; the first is [`docs/design/platforms.md`](docs/design/platforms.md), what runs on each platform and what each still lacks.
+Subsystem guides live under `docs/internals/` and are indexed in [`ARCHITECTURE.md`](ARCHITECTURE.md). Some comments throughout the code still cite earlier `docs/design/` paths, numbered decisions, or early prototypes and spikes from when Ritornel was worked out in private; those citations are being updated as each subsystem guide is verified against the code and added under `docs/internals/`. (Comments inside shipped migration SQL files remain frozen because migrations are checksummed and never edited.)
 
 For the same reason this repository's history begins as a few large commits, one for each milestone of that private work. An earlier desktop app, built with Tauri and Svelte, came before the GPUI one. Some comments mention it as `apps/desktop-tauri`, and it is not here either.
 

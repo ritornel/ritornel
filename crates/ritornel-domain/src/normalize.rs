@@ -65,7 +65,7 @@ fn edge_symbols(marks: impl Iterator<Item = char>) -> String {
 }
 
 /// A name without the bracketed notes at its end: "Night Drives +" of
-/// "Night Drives + (Deluxe) [2024]".
+/// `Night Drives + (Deluxe) [2024]`.
 fn without_trailing_notes(text: &str) -> &str {
     let mut end = text.trim_end();
     while end.ends_with([')', ']', '}']) {

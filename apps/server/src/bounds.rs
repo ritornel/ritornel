@@ -27,8 +27,8 @@ pub const HEADER_WAIT: Duration = Duration::from_secs(10);
 
 /// How long a stop waits for requests in flight and for transports to end
 /// before it ends them itself. A program that owns the server kills it 15
-/// seconds after asking it to stop (docs/design/server.md), and a stop
-/// spends this at most twice.
+/// seconds after asking it to stop (docs/internals/server.md, "Shutdown and
+/// bounds"), and a stop spends this at most twice.
 pub const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// How long a socket ticket works for, counted from when it was made. A

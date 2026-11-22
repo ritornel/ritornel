@@ -13,7 +13,7 @@
 //! - [`descriptor`], [`health`], [`ticket`] and [`get`] are the HTTP routes.
 //!
 //! The client never opens a database: it does not contain the code to
-//! (docs/design/server.md, decisions 1 and 7).
+//! (docs/internals/server.md, "Decisions").
 
 // Tests may unwrap and index. Everything else is held to the workspace's
 // lints, which CI denies.

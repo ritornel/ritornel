@@ -1,8 +1,7 @@
 //! The desktop's launcher, `ritornel_client::launch`, with the real
 //! `ritornel-server`: it starts a server only when none is running, owns
 //! only the one it started, loses a race to start one gracefully, and stops
-//! its own cleanly. See "Starting, finding and stopping" in
-//! docs/design/server.md.
+//! its own cleanly. See "Process lifecycle" in docs/internals/server.md.
 //!
 //! Every server here plays through the null output, makes no sound, stays
 //! out of the system's media session, and listens on a port the system

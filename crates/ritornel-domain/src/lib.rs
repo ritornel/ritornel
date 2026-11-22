@@ -3,7 +3,7 @@
 //! no SQLite.
 //!
 //! - [`payload`] is what reading one file gives, stored verbatim.
-//! - [`extract`] turns a payload into claims.
+//! - [`extract`](mod@extract) turns a payload into claims.
 //! - [`resolve`](mod@resolve) decides which recording each source item is,
 //!   using the current file policy. Dry runs can also select earlier policies.
 //! - [`catalog`] forms releases, appearances, release groups and artists

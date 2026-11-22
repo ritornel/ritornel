@@ -1,7 +1,7 @@
 //! Starting a server on this machine when none is running, and stopping
-//! one that was started here: the desktop's launcher. See "Starting,
-//! finding and stopping" in docs/design/server.md, steps 2 and 3, "Second
-//! start" and "App quit".
+//! one that was started here: the desktop's launcher. See "Process
+//! lifecycle" in docs/internals/server.md (steps 2 and 3, "Single-instance
+//! lock", and "Owned and detached launches").
 //!
 //! 1. Find the server, as [`local::find`] does. If one answers, use it.
 //! 2. If none is running, spawn `ritornel-server serve --data-dir <dir>

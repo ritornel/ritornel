@@ -1,7 +1,7 @@
 //! Talking to the running server: what every command starts with.
 //!
-//! It does steps 1 and 2 of "Starting, finding and stopping" in
-//! docs/design/server.md and no more: it finds the server through
+//! It does steps 1 and 2 of "Process lifecycle" in
+//! docs/internals/server.md and no more: it finds the server through
 //! `server.json` and, with no server, says so. It never starts one.
 
 use std::io::Write;

@@ -1,6 +1,6 @@
 //! `ritornelctl`: the command-line client, and the first consumer of the
 //! contract. It talks to a running server through `ritornel-client` and
-//! never opens a database (docs/design/server.md, decision 7).
+//! never opens a database (docs/internals/server.md, "Decisions").
 
 // Tests may unwrap and index. Everything else is held to the workspace's
 // lints, which CI denies.

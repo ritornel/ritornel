@@ -1,6 +1,6 @@
 //! Delivering finished listens to the hub, from the outbox. See decision 21
-//! in docs/design/playback.md and "An effect, a job and a lease" in
-//! docs/design/server.md.
+//! in docs/design/playback.md and "Jobs and outbox" in
+//! docs/internals/server.md.
 //!
 //! A listen is staged in `server.db` and its delivery is an outbox row,
 //! written in the transaction that closed it. Delivering is the one ingest

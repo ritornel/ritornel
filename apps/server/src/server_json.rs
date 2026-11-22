@@ -1,6 +1,6 @@
 //! `server.json`: how a local client finds the running server. It is written
-//! once startup has succeeded and removed on a clean stop. See decision 3 and
-//! "The data directory" in docs/design/server.md.
+//! once startup has succeeded and removed on a clean stop. See "Data
+//! directory" in docs/internals/server.md.
 //!
 //! A client must not trust it alone. A server that was killed leaves it
 //! behind, so a client checks that the server it names answers.

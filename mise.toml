@@ -1,6 +1,6 @@
 # The Rust pin is rust-toolchain.toml. This file lists no Rust, because an
 # entry here would override that file, and the setting below is what makes
-# mise read it. See decision 28 in docs/design/server.md.
+# mise read it. See "Workspace and tooling" in docs/internals/server.md.
 [settings]
 idiomatic_version_file_enable_tools = ["rust"]
 
@@ -29,6 +29,7 @@ description = "Run everything CI runs"
 run = [
     { task = "fmt" },
     { task = "deps" },
+    { task = "docs" },
     { task = "licenses" },
     { task = "lint" },
     { task = "test" },
@@ -42,6 +43,14 @@ run = "cargo fmt --all --check"
 [tasks.deps]
 description = "Check that dependencies point one way"
 run = "scripts/check-deps.sh"
+
+[tasks.docs]
+description = "Check docs/internals citations, doc rules and rustdoc intra-doc links"
+run = [
+    "scripts/check-docs.sh",
+    "cargo doc --locked --workspace --no-deps --all-features --document-private-items",
+]
+env = { RUSTDOCFLAGS = "-D rustdoc::broken_intra_doc_links" }
 
 [tasks.licenses]
 description = "Check that every dependency's licence allows the app's, in the main workspace and the desktop app's"

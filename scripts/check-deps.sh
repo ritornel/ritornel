@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fails if a dependency points the wrong way: contract <- domain <- engine <-
-# server, and contract <- client <- each client program. See decision 8 and
-# "Workspace" in docs/design/server.md.
+# server, and contract <- client <- each client program. See "Workspace and
+# tooling" in docs/internals/server.md.
 #
 # A rule covers what a package is built with: its normal dependencies, direct
 # and transitive, on every platform and with every feature on. Dev and build

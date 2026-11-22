@@ -182,8 +182,8 @@ pub struct Descriptor {
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct NoParams {}
 
-/// The result of `server.status`. See "Configuration and logs" in
-/// docs/design/server.md.
+/// The result of `server.status`. See "Configuration and logging" in
+/// docs/internals/server.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -333,8 +333,8 @@ pub struct Dismissed {
 /// Where a server writes its backups, and the last it wrote. A backup is a
 /// copy of the server's databases in a folder of its own, written to a
 /// place outside the data directory that has to be named: with none named
-/// there is no backup. See "The data directory" in
-/// docs/design/server.md.
+/// there is no backup. See "Backups and pre-migration snapshots" in
+/// docs/internals/server.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

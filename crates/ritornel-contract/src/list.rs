@@ -5,7 +5,7 @@
 //! by the server, and returns a view ID and an exact total. Membership and
 //! order are frozen in the view; what a row says is read fresh each time
 //! it is asked for. A view is replaced, never changed: when the library
-//! changes the server sends a [`ListEvent`], and a client that must take a
+//! changes the server sends a [`crate::ListEvent`], and a client that must take a
 //! new order opens a successor with [`Replaces`], naming the row it wants
 //! to keep in place.
 //!

@@ -649,8 +649,8 @@ export type BackupReason = "on_demand" | "before_migration";
  * Where a server writes its backups, and the last it wrote. A backup is a
  * copy of the server's databases in a folder of its own, written to a
  * place outside the data directory that has to be named: with none named
- * there is no backup. See "The data directory" in
- * docs/design/server.md.
+ * there is no backup. See "Backups and pre-migration snapshots" in
+ * docs/internals/server.md.
  */
 export type BackupStatus = {
   /**
@@ -3974,8 +3974,8 @@ export type ServerInfo = {
 export type ServerRole = "unassigned" | "hub" | "satellite";
 
 /**
- * The result of `server.status`. See "Configuration and logs" in
- * docs/design/server.md.
+ * The result of `server.status`. See "Configuration and logging" in
+ * docs/internals/server.md.
  */
 export type ServerStatus = {
   /**

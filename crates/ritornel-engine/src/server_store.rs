@@ -1,6 +1,6 @@
 //! `server.db`: what describes this machine. In this layer that is the
-//! server's identity and the local credential's session. See "Which file
-//! holds what" in docs/design/server.md and decision 1 in
+//! server's identity and the local credential's session. See "Storage split"
+//! in docs/internals/server.md and decision 1 in
 //! docs/design/linking.md.
 
 use std::path::Path;

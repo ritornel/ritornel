@@ -1,6 +1,5 @@
 //! `ritornel-server serve`: one run of the server, from taking the lock to
-//! the clean stop. See "Starting, finding and stopping" in
-//! docs/design/server.md.
+//! the clean stop. See "Process lifecycle" in docs/internals/server.md.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -250,7 +249,7 @@ fn lastfm(env: Env<'_>) -> crate::LastfmRun {
 
 /// Sends a stop when standard input reaches its end: the program that
 /// started this server held the other end of that pipe and has let go of
-/// it, or died. See decision 4 in docs/design/server.md.
+/// it, or died. See "Owned and detached launches" in docs/internals/server.md.
 ///
 /// A blocking read cannot be cancelled, so it has a thread of its own, which
 /// ends with the process.

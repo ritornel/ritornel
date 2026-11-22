@@ -1,6 +1,5 @@
 //! `ritornelctl scan <folder>`: scans a folder into the library, as a job
-//! on the server. See "An effect, a job and a lease" in
-//! docs/design/server.md.
+//! on the server. See "Jobs and outbox" in docs/internals/server.md.
 //!
 //! The folder is added as a source if it is not one, which makes it a named
 //! root on the server. The server only ever reads it. The scan is the

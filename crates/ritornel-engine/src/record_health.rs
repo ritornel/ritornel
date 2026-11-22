@@ -2,7 +2,7 @@
 //! hold it: listens a server could not deliver to history, imports that
 //! failed, and scrobbles that may not have reached the service. A listen
 //! the player could not save at all is known only to the running server.
-//! See "Keeping the record" in docs/design/server.md.
+//! See "Record health" in docs/internals/server.md.
 
 use rusqlite::OptionalExtension;
 

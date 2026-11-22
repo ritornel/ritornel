@@ -1,6 +1,6 @@
 //! Settings. Each is read from its flag, then its `RITORNEL_*` environment
 //! variable, then `config.toml` in the data directory, then its default. See
-//! decision 26 and "Configuration and logs" in docs/design/server.md.
+//! "Configuration and logging" in docs/internals/server.md.
 //!
 //! `config.toml` holds only what the server needs before a database opens,
 //! and a container needs no file at all. The settings so far are the log

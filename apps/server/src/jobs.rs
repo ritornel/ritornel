@@ -1,6 +1,6 @@
 //! The worker that runs jobs: one thread that claims a queued job under
-//! this run's boot ID and carries it a step at a time. See decisions 5 and
-//! 23 and "An effect, a job and a lease" in docs/design/server.md.
+//! this run's boot ID and carries it a step at a time. See "Jobs and
+//! outbox" in docs/internals/server.md.
 //!
 //! A job never depends on a connected client. The worker holds a database
 //! only for the half of a step that writes, so a stop waits for no more
