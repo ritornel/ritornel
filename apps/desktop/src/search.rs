@@ -162,10 +162,15 @@ struct View {
     /// Whether `hits` answer `text`.
     settled: bool,
     failed: bool,
+    sent: bool,
     waiting: bool,
 }
 
 impl View {
+    fn dispatch(&mut self) -> bool {
+        !self.settled && !std::mem::replace(&mut self.sent, true)
+    }
+
     fn fail(&mut self) {
         self.hits.clear();
         self.selected = 0;
@@ -180,6 +185,7 @@ impl View {
         self.selected = 0;
         self.settled = false;
         self.failed = false;
+        self.sent = false;
         self.waiting = false;
     }
 }
@@ -255,6 +261,7 @@ impl SearchBox {
     /// The field's text changed.
     fn typed(&mut self, text: String, cx: &mut Context<Self>) {
         self.asked += 1;
+        self.hovered_song = None;
         if text.trim().is_empty() {
             self.asking = None;
             self.view = View {
@@ -269,7 +276,6 @@ impl SearchBox {
             self.dropped = Some(Instant::now());
         }
         self.view.start(text.clone());
-        self.hovered_song = None;
         let asked = self.asked;
         self.asking = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SETTLE).await;
@@ -280,6 +286,9 @@ impl SearchBox {
     }
 
     fn ask(&mut self, text: String, asked: u64, cx: &mut Context<Self>) {
+        if asked != self.asked || !self.view.dispatch() {
+            return;
+        }
         let Some(net) = self.link.read(cx).net() else {
             self.view.fail();
             cx.notify();
@@ -313,6 +322,7 @@ impl SearchBox {
                             selected,
                             settled: true,
                             failed: false,
+                            sent: true,
                             waiting: false,
                         };
                         search.pictures_wanted(cx);
@@ -456,6 +466,7 @@ impl SearchBox {
     /// with it, and the field lets go of the keys.
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.asked += 1;
+        self.hovered_song = None;
         self.asking = None;
         self.view = View {
             settled: true,
@@ -889,7 +900,9 @@ mod tests {
         assert_eq!(view.hits.len(), 1);
         assert_eq!(view.selected, 0);
         assert!(!view.settled);
+        assert!(view.dispatch());
         view.waiting = true;
+        assert!(!view.dispatch());
         view.fail();
         assert!(view.failed && view.settled);
         assert!(!view.waiting);
