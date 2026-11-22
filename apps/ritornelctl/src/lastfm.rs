@@ -308,10 +308,9 @@ pub(crate) fn lastfm(
             )
         }
         LastfmCommand::Signin(args) => {
-            let quiet = args.json;
             let account = server::ask_for(args, env, Some(SIGN_IN_WAIT), async |client| {
                 let started = client.call::<LastfmSignInStart>(&NoParams {}).await?;
-                let printed = if quiet {
+                let printed = if args.json {
                     writeln!(err, "{}", started.approval_url).and_then(|()| err.flush())
                 } else {
                     writeln!(

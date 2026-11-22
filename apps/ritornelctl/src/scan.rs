@@ -71,7 +71,6 @@ pub(crate) fn scan(args: &ScanArgs, env: local::Env<'_>, out: &mut dyn Write) ->
             .to_owned(),
     };
     let quiet = args.server.json;
-    let wait = (!args.no_wait).then_some(());
     let mut last = String::new();
     let detail = server::ask_for(
         &args.server,
@@ -83,7 +82,10 @@ pub(crate) fn scan(args: &ScanArgs, env: local::Env<'_>, out: &mut dyn Write) ->
                 job,
                 failed_items: Vec::new(),
             };
-            while wait.is_some() {
+            if args.no_wait {
+                return Ok(detail);
+            }
+            loop {
                 detail = client.job(detail.job.job_id).await?;
                 let line = progress(&detail.job);
                 if !quiet && line != last {

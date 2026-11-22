@@ -96,7 +96,9 @@ pub(crate) fn render(detail: &JobDetail) -> String {
         lines.push(("Took", format!("{}.{} s", tenths / 10, tenths % 10)));
     }
     if job.kind == "lastfm.sync" {
-        lines.push(("Scrobbles read", counted(job)));
+        if job.sync.is_none() {
+            lines.push(("Scrobbles read", counted(job)));
+        }
     } else {
         lines.push(("Files read", counted(job)));
         lines.push(("Bytes read", size(job.bytes)));
@@ -141,6 +143,17 @@ pub(crate) mod tests {
         let mut job = job();
         job.kind = "lastfm.sync".into();
         job.scan = None;
+        let running = render(&JobDetail {
+            job: Job {
+                state: JobState::Running,
+                ..job.clone()
+            },
+            failed_items: vec![],
+        });
+        assert!(
+            running.contains("Scrobbles read") && running.contains("1500 of 14000"),
+            "{running}"
+        );
         job.sync = Some(ritornel_client::contract::SyncSummary {
             read: 12,
             new: 3,
@@ -150,6 +163,10 @@ pub(crate) mod tests {
             job,
             failed_items: vec![],
         });
+        assert!(
+            !text.contains("Scrobbles read") && !text.contains("Bytes read"),
+            "{text}"
+        );
         assert!(
             text.contains("12") && text.contains("New") && !text.contains("Files read"),
             "{text}"
