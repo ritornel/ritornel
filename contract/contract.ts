@@ -1290,7 +1290,8 @@ export type HistoryOf = {
    */
   firstPlayed?: string,
   /**
-   * The local date of the last.
+   * The local date of the last play, as `YYYY-MM-DD`. Left out when the
+   * last play has no local date, though an earlier one has.
    */
   lastPlayed?: string,
   /**
@@ -3477,13 +3478,14 @@ export type RecentPlays = {
  */
 export type RecordPlayed = {
   /**
-   * Its plays.
+   * Its plays, dated or not.
    */
   plays: number,
   /**
-   * The year it was played most: the first such, when two tie.
+   * The year it was played most: the first such, when two tie. Left out
+   * when none of its plays has a date.
    */
-  peakYear: number,
+  peakYear?: number,
   /**
    * What the tile is.
    */

@@ -1164,14 +1164,14 @@ impl Artist {
                             .font_weight(FontWeight(550.))
                             .child(title),
                     )
-                    .child(
+                    .children(played.peak_year.map(|year| {
                         div()
                             .flex_none()
                             .text_size(px(12.5))
                             .text_color(theme::faint())
                             .font_features(crate::bar::tabular())
-                            .child(format!("most in {}", played.peak_year)),
-                    ),
+                            .child(format!("most in {year}"))
+                    })),
             );
         }
         list

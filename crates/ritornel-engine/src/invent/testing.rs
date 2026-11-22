@@ -62,3 +62,20 @@ fn library_with(albums: usize, entropy: Arc<dyn Entropy>) -> Library {
         scratch,
     }
 }
+
+/// Changes the library with `sql` as no command would, for a test to set
+/// up what invented plays do not make.
+pub(crate) fn tamper(store: &LibraryStore, sql: &str) {
+    let sql = sql.to_owned();
+    let request = WriteRequest {
+        method: "test.tamper",
+        command: None,
+        client: None,
+    };
+    store
+        .write(request, move |write| {
+            write.connection().execute_batch(&sql)?;
+            Ok(String::new())
+        })
+        .unwrap();
+}

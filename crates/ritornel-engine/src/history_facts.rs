@@ -35,7 +35,8 @@ const MOST_PLAYS: u64 = 10;
 pub(crate) struct Song {
     /// Its plays, wherever it was heard.
     pub(crate) plays: u64,
-    /// The local date of the last, YYYYMMDD.
+    /// The local date of the last, YYYYMMDD: of the play with the latest
+    /// instant, and `None` if that play has no local date.
     pub(crate) last: Option<i64>,
     /// Whether the listener gave it five stars.
     pub(crate) five_stars: bool,
@@ -212,7 +213,12 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
         .filter_map(|heard| Some((heard.at_ms?, heard.date?, heard)))
         .collect();
 
-    if let Some(&(_, first, _)) = dated.iter().min_by_key(|(at, ..)| *at)
+    // A play with no local date before it may be from a day earlier still,
+    // so nothing is said.
+    if let Some(&(first_at, first, _)) = dated.iter().min_by_key(|(at, ..)| *at)
+        && !record.plays.iter().any(|heard| {
+            heard.date.is_none() && heard.at_ms.is_some_and(|earlier| earlier < first_at)
+        })
         && let Some(ago) = ago(first, today.date)
     {
         let since = if plays > 1 {
@@ -235,10 +241,13 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
     for &(_, date, _) in &dated {
         *years.entry(year_of(date)).or_default() += 1;
     }
+    // Never a year the undated plays might have outdone.
+    let undated = plays - u64::try_from(dated.len()).unwrap_or(plays);
     if let Some((year, most)) = peak(&years)
         && plays >= YEAR_PLAYS
         && 10 * most >= 3 * plays
         && year < today.year
+        && most > undated
     {
         let more = if most == plays {
             format!("All {} of its plays came then.", grouped(plays))
@@ -347,12 +356,18 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
         ));
     }
 
-    // Unplayed for over a year before today, whatever was played today.
+    // Unplayed for over a year before today, whatever was played today. A
+    // later play with no local date may be from before today or not, so
+    // nothing is said.
     if let Some(&(at, last, _)) = dated
         .iter()
         .filter(|&&(_, date, _)| date < today.date)
         .max_by_key(|(at, ..)| *at)
         && at < today.now_ms - YEAR_MS
+        && !record
+            .plays
+            .iter()
+            .any(|heard| heard.date.is_none() && heard.at_ms.is_some_and(|later| later > at))
     {
         out.push(fact(
             FactKind::NotSince,
@@ -377,9 +392,16 @@ LEFT JOIN release heard ON heard.id = cta.release_id
 LEFT JOIN release rel ON rel.id = heard.canonical_id
 WHERE ta.public_id = ?1";
 
-/// A song's plays, wherever heard, and the local date of the last.
+/// A song's plays, wherever heard, and the local date of the last: of the
+/// play with the latest instant, which is not always the one with the
+/// latest local date when plays were heard in zones far apart.
 const SONG_PLAYS: &str = "
-SELECT count(*), max(local_date) FROM play_event
+SELECT count(*),
+       (SELECT local_date FROM play_event
+        WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0
+          AND event_at_utc_ms IS NOT NULL
+        ORDER BY event_at_utc_ms DESC, id DESC LIMIT 1)
+FROM play_event
 WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0";
 
 /// The songs of a record's versions, each with its title on the record and

@@ -322,10 +322,13 @@ pub struct RecordPlayed {
     /// The record, as an Albums tile shows it.
     #[serde(flatten)]
     pub tile: AlbumTile,
-    /// Its plays.
+    /// Its plays, dated or not.
     pub plays: u64,
-    /// The year it was played most: the first such, when two tie.
-    pub peak_year: i32,
+    /// The year it was played most: the first such, when two tie. Left out
+    /// when none of its plays has a date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub peak_year: Option<i32>,
 }
 
 /// The result of `history.artist` and `history.album`: what a page says of
@@ -347,7 +350,8 @@ pub struct HistoryOf {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub first_played: Option<String>,
-    /// The local date of the last.
+    /// The local date of the last play, as `YYYY-MM-DD`. Left out when the
+    /// last play has no local date, though an earlier one has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub last_played: Option<String>,

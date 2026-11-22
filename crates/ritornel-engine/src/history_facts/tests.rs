@@ -2,7 +2,7 @@ use ritornel_contract::{AlbumRef, Fact, FactKind};
 
 use super::{Gathered, Heard, Record, Song, ago, facts};
 use crate::history_pages::Today;
-use crate::invent::testing::{NOW, library_drawing};
+use crate::invent::testing::{NOW, library_drawing, tamper};
 use crate::invent::{PlaysPlan, invent_plays};
 use crate::{Id, LibraryStore};
 
@@ -331,6 +331,69 @@ fn a_record_unplayed_for_a_year_before_today_says_since_when() {
         ..Gathered::default()
     };
     assert_eq!(of(&facts(&lately, TODAY), FactKind::NotSince), None);
+
+    // Played since with no local date, so maybe before today: nothing is
+    // said.
+    let undated = Gathered {
+        record: Some(record(vec![
+            heard(900, 20240530, 1, 12, 0),
+            Heard {
+                at_ms: Some(NOW - 30 * DAY),
+                date: None,
+                song: 1,
+                hour: None,
+                offset: None,
+            },
+        ])),
+        ..Gathered::default()
+    };
+    assert_eq!(of(&facts(&undated, TODAY), FactKind::NotSince), None);
+}
+
+/// A play `days` before now with an instant and no local date.
+fn undated(days: i64, song: i64) -> Heard {
+    Heard {
+        at_ms: Some(NOW - days * DAY),
+        date: None,
+        song,
+        hour: None,
+        offset: None,
+    }
+}
+
+#[test]
+fn plays_with_no_local_date_leave_unsaid_what_they_might_contradict() {
+    // Heard first with no local date: when is not known.
+    let mut plays = vec![
+        heard(900, 20240530, 1, 12, 0),
+        heard(800, 20240907, 2, 12, 0),
+    ];
+    let first = |plays: &[Heard]| {
+        let gathered = Gathered {
+            record: Some(record(plays.to_vec())),
+            ..Gathered::default()
+        };
+        of(&facts(&gathered, TODAY), FactKind::FirstHeard)
+    };
+    assert!(first(&plays).is_some());
+    plays.push(undated(1_000, 1));
+    assert_eq!(first(&plays), None);
+
+    // 2024 held 30 of 50 plays. With 35 more that have no date, it may
+    // not have held most of them.
+    let mut many: Vec<Heard> = (0..30).map(|_| heard(800, 20240907, 1, 12, 0)).collect();
+    many.extend((0..20).map(|_| heard(300, 20250120, 2, 12, 0)));
+    let its_year = |plays: &[Heard]| {
+        let gathered = Gathered {
+            record: Some(record(plays.to_vec())),
+            ..Gathered::default()
+        };
+        of(&facts(&gathered, TODAY), FactKind::ItsYear)
+    };
+    let more: Vec<Heard> = (0..35).map(|_| undated(2_000, 1)).collect();
+    assert!(its_year(&many).is_some());
+    many.extend(more);
+    assert_eq!(its_year(&many), None);
 }
 
 /// The record played most, and an appearance on it that was played.
@@ -414,4 +477,66 @@ fn lean_back_counts_a_record_as_its_page_does() {
 
     let nobody = Id::from_bytes([0x99; 16]);
     assert_eq!(store.track_history(listener, nobody, TODAY).unwrap(), None);
+}
+
+#[test]
+fn a_songs_last_time_is_the_day_of_its_latest_play() {
+    let invented = library_drawing(40);
+    let store = &invented.store;
+    let listener = store.default_listener().unwrap().unwrap();
+    let plan = PlaysPlan {
+        plays: 4_000,
+        seed: 3,
+        now_ms: NOW,
+        years: 12,
+        zone: "Europe/London".to_owned(),
+    };
+    invent_plays(store, &plan, |_, _| {}).unwrap();
+    let (_, appearance) = favourite(store);
+    let hex: String = appearance
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let nth_play = |offset: u32| {
+        format!(
+            "(SELECT pe.id FROM play_event pe
+              JOIN track_appearance ta ON ta.public_id = x'{hex}'
+              JOIN track_appearance cta ON cta.id = ta.canonical_id
+              JOIN recording r ON r.id = cta.recording_id
+              WHERE pe.recording_id = r.canonical_id AND pe.counts = 1 AND pe.excluded = 0
+              ORDER BY pe.id LIMIT 1 OFFSET {offset})"
+        )
+    };
+    let last_time = || {
+        let history = store
+            .track_history(listener, appearance, TODAY)
+            .unwrap()
+            .unwrap();
+        of(&history.facts, FactKind::SongPlays).unwrap().1
+    };
+    // Its two latest plays: at 00:30 on 16 November in Kiritimati (UTC+14),
+    // and an hour and a half later at 01:59 on the 15th in Honolulu
+    // (UTC−10). The later is today's, though the earlier has the later date.
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET event_at_utc_ms = {}, local_date = 20261116 WHERE id = {};
+             UPDATE play_event SET event_at_utc_ms = {}, local_date = 20261115 WHERE id = {};",
+            NOW - 90 * 60_000,
+            nth_play(0),
+            NOW - 60_000,
+            nth_play(1),
+        ),
+    );
+    assert_eq!(last_time(), "The last time was earlier today.");
+    // With no local date, the day of the latest play is not known.
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET local_date = NULL WHERE id = {}",
+            nth_play(1)
+        ),
+    );
+    assert_eq!(last_time(), "");
 }

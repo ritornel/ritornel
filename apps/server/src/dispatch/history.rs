@@ -103,11 +103,15 @@ fn day_of(at_ms: i64, zone: &str) -> Option<String> {
     ritornel_engine::local_time(at_ms, zone).map(|local| date(local.date))
 }
 
-/// Reads `MM-DD` as MMDD.
+/// The days of each month in a leap year: every day some year has.
+const DAYS_IN: [i64; 12] = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/// Reads `MM-DD` as MMDD, if some year has that day.
 fn month_day(day: &str) -> Option<i64> {
     let (month, day) = day.split_once('-')?;
     let (month, day): (i64, i64) = (month.parse().ok()?, day.parse().ok()?);
-    ((1..=12).contains(&month) && (1..=31).contains(&day)).then_some(month * 100 + day)
+    let days = DAYS_IN.get(usize::try_from(month.checked_sub(1)?).ok()?)?;
+    (1..=*days).contains(&day).then_some(month * 100 + day)
 }
 
 impl Core {
@@ -161,8 +165,11 @@ impl Core {
     ) -> Result<OnThisDay, RpcError> {
         let wanted = match &params.day {
             Some(day) => month_day(day).ok_or_else(|| {
-                RpcError::new(ErrorCode::Invalid, "a day is written MM-DD")
-                    .with_detail("field", "day")
+                RpcError::new(
+                    ErrorCode::Invalid,
+                    "a day is written MM-DD, and is a day some year has",
+                )
+                .with_detail("field", "day")
             })?,
             // Today, where this server is.
             None => {
@@ -411,9 +418,33 @@ mod tests {
     fn a_day_is_month_and_day_and_a_date_is_written_in_full() {
         assert_eq!(month_day("11-15"), Some(1115));
         assert_eq!(month_day("1-5"), Some(105));
-        for wrong in ["13-01", "11-32", "1115", "11-", "nov-15"] {
+        assert_eq!(month_day("02-29"), Some(229));
+        assert_eq!(month_day("12-31"), Some(1231));
+        for wrong in [
+            "13-01", "00-10", "11-32", "02-30", "02-31", "04-31", "11-31", "1115", "11-", "nov-15",
+        ] {
             assert_eq!(month_day(wrong), None, "{wrong}");
         }
         assert_eq!(date(20_261_115), "2026-11-15");
+    }
+
+    #[test]
+    fn a_zone_boundary_on_a_day_its_zone_skipped_is_where_that_day_would_begin() {
+        // Samoa skipped 30 December 2011, moving across the date line. A
+        // period starting that day starts when the 29th ends, which is when
+        // the 31st begins, and is read back as the 31st.
+        let start = |date| ritornel_engine::start_of_day_ms(date, "Pacific/Apia").unwrap();
+        let skipped = start(20_111_230);
+        assert_eq!(skipped, start(20_111_231));
+        assert_eq!(skipped - start(20_111_229), 86_400_000);
+        assert_eq!(
+            day_of(skipped, "Pacific/Apia").as_deref(),
+            Some("2011-12-31")
+        );
+        // A day no year has is refused.
+        assert_eq!(
+            full_date("2026-02-31").and_then(|day| ritornel_engine::start_of_day_ms(day, "UTC")),
+            None
+        );
     }
 }
