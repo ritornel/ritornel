@@ -448,9 +448,10 @@ methods! {
     /// `history.export`: writes the record into a new folder of its own in
     /// the folder named, readable without Ritornel: every observation,
     /// every rating and what became of every play sent to a service, as
-    /// JSON Lines, and the plays derived from them as a table. The plays can
-    /// be derived again from the other files alone, by the rule the
-    /// manifest names. It answers when the folder is whole. Sent again, even
+    /// JSON Lines, and the plays derived from them as a table. Which plays
+    /// there are, what makes each and whether it counts can be derived
+    /// again from the other files alone, by the rule the manifest names. It
+    /// answers when the folder is whole. Sent again, even
     /// with the same key, it writes another: the receipt is made and not
     /// stored.
     HistoryExport: "history.export", Command, needs_full: true,

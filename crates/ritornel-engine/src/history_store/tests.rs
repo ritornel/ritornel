@@ -2964,6 +2964,32 @@ fn an_outside_reader_joins_an_echo_under_corrected_names_to_its_play_from_the_ex
         "Moss Arcade",
         "Paper Kites (Live)",
     );
+    // The same scrobble again at Last.fm, as a repeat there makes: a play
+    // of its own, as only one import echoes a listen.
+    let repeat = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: b"repeat".to_vec(),
+            played_at_ms: start,
+            track: ritornel_source::TrackText {
+                artist: "Moss Arcade".to_owned(),
+                album: Some("Tin Weather".to_owned()),
+                title: "Paper Kites (Live)".to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: start,
+            to_ms: start + 1000,
+        },
+        cursor: "{}".to_owned(),
+    };
+    at.library
+        .ingest(Observations::Imports {
+            account,
+            batch: &repeat,
+        })
+        .unwrap();
 
     let scratch = crate::testing::Scratch::new();
     let exported = at
@@ -2978,10 +3004,14 @@ fn an_outside_reader_joins_an_echo_under_corrected_names_to_its_play_from_the_ex
     // second, naming its track as sent or as the service took it.
     let observations = reading_an_export::lines(&scratch.path().join("observations.jsonl"));
     let deliveries = reading_an_export::lines(&scratch.path().join("deliveries.jsonl"));
-    let import = observations
+    // The imports in the order of the file: of two that echo one listen,
+    // the first joins its play.
+    let imports: Vec<&Value> = observations
         .iter()
-        .find(|line| line["kind"] == "import")
-        .unwrap();
+        .filter(|line| line["kind"] == "import")
+        .collect();
+    assert_eq!(imports.len(), 2);
+    let import = imports[0];
     let names = |artist: &Value, title: &Value| {
         (
             artist.as_str().unwrap_or_default().to_lowercase(),
@@ -3013,20 +3043,23 @@ fn an_outside_reader_joins_an_echo_under_corrected_names_to_its_play_from_the_ex
         && line["endpoint"] == listen["endpoint"]
         && line["sourceKey"] == listen["sourceKey"]));
 
-    // What the reader derived is what the table says: one play, the
-    // listen's, with the import beside it, and none of its own.
+    // What the reader derived is what the table says: the listen's play,
+    // with the first import beside it, and the repeat as a play of its own.
     let plays = reading_an_export::table(&scratch.path().join("plays.csv"));
-    assert_eq!(plays.len(), 1, "{plays:?}");
+    assert_eq!(plays.len(), 2, "{plays:?}");
+    let of = |source_key: &Value| {
+        plays
+            .iter()
+            .find(|play| play["source_key"] == source_key.as_str().unwrap())
+            .unwrap()
+    };
     assert_eq!(
-        plays[0]["source_key"],
-        listen["sourceKey"].as_str().unwrap()
-    );
-    assert_eq!(
-        plays[0]["corroborated_by"],
+        of(&listen["sourceKey"])["corroborated_by"],
         format!(
             "{}:{}",
             import["endpoint"].as_str().unwrap(),
             import["sourceKey"].as_str().unwrap()
         )
     );
+    assert_eq!(of(&imports[1]["sourceKey"])["corroborated_by"], "");
 }

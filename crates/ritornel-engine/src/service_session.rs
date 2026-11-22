@@ -61,19 +61,19 @@ pub(crate) fn remove_session(connection: &Connection, service: &str) -> Result<b
 }
 
 /// Turns scrobbling to `service` on from `now_ms`, unless it is on, or off.
+/// Whether there is a session to turn it on or off for.
 pub(crate) fn set_scrobbling(
     connection: &Connection,
     service: &str,
     on: bool,
     now_ms: i64,
-) -> Result<(), Error> {
-    connection.execute(
+) -> Result<bool, Error> {
+    Ok(connection.execute(
         "UPDATE service_session
          SET scrobble_from_ms = CASE WHEN ?2 THEN coalesce(scrobble_from_ms, ?3) END
          WHERE service = ?1",
         rusqlite::params![service, on, now_ms],
-    )?;
-    Ok(())
+    )? > 0)
 }
 
 impl ServerStore {
@@ -151,7 +151,7 @@ impl ServerStore {
     pub fn set_scrobbling(&self, service: &str, on: bool) -> Result<Option<ServiceSession>, Error> {
         let owned = service.to_owned();
         self.transact(move |transaction, now_ms, _| {
-            set_scrobbling(transaction, &owned, on, now_ms)
+            set_scrobbling(transaction, &owned, on, now_ms).map(|_| ())
         })?;
         self.service_session(service)
     }

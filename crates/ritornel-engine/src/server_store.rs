@@ -299,7 +299,9 @@ impl ServerStore {
     /// again changes nothing, so a retry that arrives after a newer command
     /// never undoes it; the same ID with other params is refused. Returns
     /// what the change found the first time: for a sign-out, whether there
-    /// was a session; for the others, `true`.
+    /// was a session; for the others, `true`. Scrobbling with no session to
+    /// turn it on or off for is refused as [`Error::NotFound`], and nothing
+    /// is kept of the command.
     pub fn change_once(
         &self,
         command: crate::Command,
@@ -313,8 +315,10 @@ impl ServerStore {
             let found = match &change {
                 SettingChange::Watching(on) => set_watching(transaction, *on).map(|()| true)?,
                 SettingChange::Scrobbling { service, on } => {
-                    crate::service_session::set_scrobbling(transaction, service, *on, now_ms)
-                        .map(|()| true)?
+                    if !crate::service_session::set_scrobbling(transaction, service, *on, now_ms)? {
+                        return Err(Error::NotFound("no session at the service"));
+                    }
+                    true
                 }
                 SettingChange::SignOut { service } => {
                     crate::service_session::remove_session(transaction, service)?

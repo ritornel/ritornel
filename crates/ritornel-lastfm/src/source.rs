@@ -192,7 +192,9 @@ async fn count(client: &Client, user: &str, from: u64, to: u64) -> Result<u64, s
 
 /// Reads `[from, to)` whole, as one scan, again while its pages disagree,
 /// [`ATTEMPTS`] times in all. Each second that falls across a page boundary
-/// is then read again on its own.
+/// is then read again on its own and put in place of what the pages gave
+/// of it; the two reads must count the same scrobbles in it, or the span
+/// changed between them and is read again.
 async fn read(
     client: &Client,
     user: &str,
@@ -202,27 +204,78 @@ async fn read(
     sink: &dyn Sink,
 ) -> Result<Option<Vec<Scrobble>>, Error> {
     let mut attempt = 1;
-    let (mut scrobbles, split) = loop {
-        match scan(client, user, from, to, page_size, sink).await {
-            Err(error) if error.kind() == ErrorKind::Inconsistent && attempt < ATTEMPTS => {
-                attempt += 1;
-            }
-            Err(error) => return Err(failed(&error)),
+    loop {
+        let reading = scan(client, user, from, to, page_size, sink).await;
+        let reading = match reading {
+            Ok(Some((scrobbles, split))) => mend(client, user, scrobbles, split, sink).await,
             Ok(None) => return Ok(None),
-            Ok(Some(read)) => break read,
+            Err(error) => Err(Unread::Scrobl(error)),
+        };
+        match reading {
+            Ok(read) => return Ok(read),
+            Err(unread) if unread.inconsistent() && attempt < ATTEMPTS => attempt += 1,
+            Err(Unread::Scrobl(error)) => return Err(failed(&error)),
+            Err(Unread::Changed(second)) => {
+                return Err(Error::source(format!(
+                    "Last.fm's scrobbles at {second} changed while they were read, {ATTEMPTS} \
+                     times"
+                )));
+            }
+            Err(Unread::TooMany(second)) => {
+                return Err(Error::source(format!(
+                    "Last.fm has more scrobbles at {second} than one page holds"
+                )));
+            }
         }
-    };
+    }
+}
+
+/// Why one read of a span was not kept.
+enum Unread {
+    Scrobl(scrobl::Error),
+    /// A second read on its own counted other scrobbles than the span's
+    /// pages did.
+    Changed(u64),
+    /// A second holds more scrobbles than one page.
+    TooMany(u64),
+}
+
+impl Unread {
+    /// Whether reading the span again may well come out whole.
+    fn inconsistent(&self) -> bool {
+        match self {
+            Self::Scrobl(error) => error.kind() == ErrorKind::Inconsistent,
+            Self::Changed(_) => true,
+            Self::TooMany(_) => false,
+        }
+    }
+}
+
+/// Puts each second in `split` read again on its own in place of what a
+/// span's pages gave of it.
+async fn mend(
+    client: &Client,
+    user: &str,
+    mut scrobbles: Vec<Scrobble>,
+    split: Vec<u64>,
+    sink: &dyn Sink,
+) -> Result<Option<Vec<Scrobble>>, Unread> {
     for second in split {
         let Some((again, still_split)) = scan(client, user, second, second + 1, SECOND_PAGE, sink)
             .await
-            .map_err(|error| failed(&error))?
+            .map_err(Unread::Scrobl)?
         else {
             return Ok(None);
         };
         if !still_split.is_empty() {
-            return Err(Error::source(format!(
-                "Last.fm has more scrobbles at {second} than one page holds"
-            )));
+            return Err(Unread::TooMany(second));
+        }
+        let paged = scrobbles
+            .iter()
+            .filter(|scrobble| scrobble.timestamp() == second)
+            .count();
+        if again.len() != paged {
+            return Err(Unread::Changed(second));
         }
         // Newest first: the second's scrobbles go where they were.
         scrobbles.retain(|scrobble| scrobble.timestamp() != second);

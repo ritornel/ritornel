@@ -17,16 +17,32 @@
 //! the ID of a play, which a rebuild can change (decision 4). The
 //! observations and the ratings are the record; the plays are derived
 //! from it, by the rule the manifest names, and are there to be used at
-//! once. The deliveries are what the record needs besides to derive the
-//! plays again without Ritornel: a play Ritornel scrobbled comes back in
-//! an import as its echo, which joins the play rather than making another.
-//! An import is the echo of a listen's delivery to the import's own
-//! endpoint when the delivery may have arrived (`sending`, `accepted` or
-//! `unknown`), was sent with the import's time to the second, and names
-//! the same track as it was sent or as the service took it: the artist and
-//! the title each equal once put in Unicode NFKC and lower case, with "&"
-//! read as "and" and punctuation and symbols set aside. Of several, the
-//! listen that comes first in observations.jsonl. What the library calls a track now (its title, artist and album)
+//! once. The deliveries are what the record needs besides to derive again,
+//! without Ritornel, which plays there are, which observations make each,
+//! and whether each counts: a play Ritornel scrobbled comes back in an
+//! import as its echo, which joins the play rather than making another.
+//! The names `plays.csv` shows are what the library calls each track now,
+//! and are not derived from the record.
+//!
+//! An import is the echo of a listen's delivery when all of these hold:
+//! - the delivery went to the import's own endpoint, and may have arrived:
+//!   its state is `sending`, `accepted` or `unknown`;
+//! - the import was played at a whole second, and that second is the
+//!   delivery's `sentTimestamp`;
+//! - the import names the same track as the delivery was sent under, or as
+//!   the service took it: the artist and the title each equal once made a
+//!   key, as `same_track` and `words_key` in `ritornel-domain` make it. In
+//!   short, a key is the text in Unicode NFKC and lower case, with "&" read
+//!   as "and", punctuation that parts words (a hyphen, a slash) made a
+//!   space, other punctuation and symbols removed, and each run of white
+//!   space made one space; a name with no letter or digit keeps its
+//!   punctuation.
+//!
+//! Of several deliveries an import could echo, it echoes the one whose
+//! listen comes first in observations.jsonl. A listen has one echo: of two
+//! imports that echo it, which only a scrobble repeated at the service
+//! makes, the first in observations.jsonl joins its play and the other
+//! stands as a play of its own. What the library calls a track now (its title, artist and album)
 //! is given beside each line for a reader's convenience, and is not part
 //! of the record.
 //!

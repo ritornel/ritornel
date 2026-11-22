@@ -142,6 +142,14 @@ mod enabled {
         )
     }
 
+    fn not_signed_in() -> RpcError {
+        RpcError::new(
+            ErrorCode::Unavailable,
+            "not signed in to Last.fm: sign in with `ritornelctl lastfm signin`",
+        )
+        .with_detail("reason", "not_signed_in")
+    }
+
     fn unsigned(number: i64) -> u64 {
         u64::try_from(number).unwrap_or(0)
     }
@@ -181,13 +189,7 @@ mod enabled {
                 .server()
                 .service_session(SERVICE)
                 .map_err(refused)?
-                .ok_or_else(|| {
-                    RpcError::new(
-                        ErrorCode::Unavailable,
-                        "not signed in to Last.fm: sign in with `ritornelctl lastfm signin`",
-                    )
-                    .with_detail("reason", "not_signed_in")
-                })
+                .ok_or_else(not_signed_in)
         }
 
         pub(in crate::dispatch) fn lastfm_status(
@@ -473,14 +475,13 @@ mod enabled {
             stores: &Stores,
             params: &ScrobblingParams,
         ) -> Result<ScrobblingSet, RpcError> {
-            Self::session(stores)?;
             let command = Command {
                 id: params.idempotency_key,
                 fingerprint: fingerprint::<LastfmSetScrobbling>(params)?,
             };
             // Turned off, nothing more is sent once this answers. Sent again
-            // after a newer change, it changes nothing, and answers with
-            // scrobbling as it is.
+            // after a newer change, a sign-out included, it changes nothing,
+            // and answers with scrobbling as it is.
             let change = self.lastfm().map(Lastfm::hold);
             stores
                 .server()
@@ -492,7 +493,10 @@ mod enabled {
                         on: params.on,
                     },
                 )
-                .map_err(refused)?;
+                .map_err(|error| match error {
+                    ritornel_engine::Error::NotFound(_) => not_signed_in(),
+                    other => refused(other),
+                })?;
             drop(change);
             self.wake_scrobbler();
             let session = stores.server().service_session(SERVICE).map_err(refused)?;
@@ -716,6 +720,16 @@ mod tests {
         // The same key with other params is refused.
         assert_eq!(scrobbling(0xb1, true), Err(ErrorCode::IdempotencyMismatch));
         assert!(!on());
+
+        // Sent again once signed out, it answers as it is, and a new one is
+        // refused, with nothing kept of it.
+        call(&core, &cli, "lastfm.signOut", key(0xa4)).unwrap();
+        assert!(scrobbling(0xa1, true).is_ok());
+        assert_eq!(scrobbling(0xc1, true), Err(ErrorCode::Unavailable));
+        sign_in(&core);
+        scrobbling(0xc1, true).unwrap();
+        assert!(on());
+        scrobbling(0xc2, false).unwrap();
 
         // A sign-out sent again after a new sign-in signs nothing out.
         let signed_out = call(&core, &cli, "lastfm.signOut", key(0xa2)).unwrap();

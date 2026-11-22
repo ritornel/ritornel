@@ -537,3 +537,75 @@ fn loved_tracks_answered_for_another_account_do_not_replace_the_list() {
     assert_eq!(sink.loves.len(), 1);
     assert_eq!(sink.loves[0].title, "Invented Song");
 }
+
+#[test]
+fn a_second_that_changed_before_it_was_read_again_has_its_span_read_again() {
+    // Four scrobbles in one second across a page boundary, and one a
+    // minute before. Once the span's pages are read, and before the second
+    // is read on its own, the earlier one is deleted at Last.fm and sent
+    // again into that second.
+    let second = NOW - 7_200;
+    let mut scrobbles = vec![
+        FakeScrobble::new(second + 60, "Invented Artist", "Invented Album", "Later"),
+        FakeScrobble::new(second - 60, "Invented Artist", "Invented Album", "Moved"),
+    ];
+    for title in ["A", "B", "C", "D"] {
+        scrobbles.push(FakeScrobble::new(
+            second,
+            "Invented Artist",
+            "Invented Album",
+            title,
+        ));
+    }
+    let fake = std::sync::Arc::new(FakeLastfm::start("someone", scrobbles));
+    let moved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut sink = Memory {
+        on_stop_check: Some(Box::new({
+            let (fake, moved) = (fake.clone(), moved.clone());
+            move || {
+                let reads = fake
+                    .seen()
+                    .iter()
+                    .filter(|seen| seen.method == "user.getRecentTracks")
+                    .count();
+                // The count, then the span's two pages.
+                if reads == 3 && !moved.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    fake.remove_at(second - 60);
+                    fake.add([FakeScrobble::new(
+                        second,
+                        "Invented Artist",
+                        "Invented Album",
+                        "Moved",
+                    )]);
+                }
+                false
+            }
+        })),
+        ..Default::default()
+    };
+    lastfm(&fake, 100)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut sink, true)
+        .unwrap();
+    assert!(moved.load(std::sync::atomic::Ordering::SeqCst));
+    // Read as it is now: the scrobble once, where it is now.
+    let mut held: Vec<(i64, String)> = sink
+        .records
+        .values()
+        .map(|record| (record.played_at_ms, record.track.title.clone()))
+        .collect();
+    held.sort();
+    let at = |s: u64, title: &str| (seconds_to_ms(s), title.to_owned());
+    assert_eq!(
+        held,
+        [
+            at(second, "A"),
+            at(second, "B"),
+            at(second, "C"),
+            at(second, "D"),
+            at(second, "Moved"),
+            at(second + 60, "Later"),
+        ]
+    );
+}
