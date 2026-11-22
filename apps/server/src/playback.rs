@@ -1,8 +1,8 @@
 //! The player's two threads: the control loop, which ticks the player a
 //! few times a second, and the effect worker, which delivers finished
 //! listens from the outbox to history. See "The pipeline" and decision 21
-//! in docs/design/playback.md, and "An effect, a job and a lease" in
-//! docs/design/server.md.
+//! in docs/design/playback.md, and "Jobs and outbox" in
+//! docs/internals/server.md.
 //!
 //! Neither depends on a connected client: closing every window changes
 //! nothing for either.

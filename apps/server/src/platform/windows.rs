@@ -58,7 +58,7 @@ pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
 }
 
 /// Nothing yet: the standard library cannot open a folder to flush it, so
-/// a rename is not flushed (docs/design/platforms.md, "To do").
+/// a rename is not flushed (docs/internals/platforms.md, "Verification").
 pub(crate) fn sync_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }

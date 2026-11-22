@@ -105,7 +105,7 @@ impl fmt::Display for Error {
                 "no data directory: give --data-dir or set {}",
                 ritornel_contract::local::DATA_DIR_VAR
             ),
-            // docs/design/server.md, "Second start".
+            // docs/internals/server.md, "Single-instance lock".
             Self::InUse {
                 dir,
                 pid: Some(pid),

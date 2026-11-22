@@ -1,6 +1,6 @@
 //! Logs: one JSON object a line, in a file a day under `logs/`. Every line
-//! carries the boot ID of the run that wrote it. See decision 27 and
-//! "Configuration and logs" in docs/design/server.md.
+//! carries the boot ID of the run that wrote it. See "Configuration and
+//! logging" in docs/internals/server.md.
 //!
 //! ```text
 //! {"ts":"2026-11-15T22:33:02.123Z","level":"info","boot_id":"019a…","target":"ritornel_server::serve","message":"ready","pid":4312}

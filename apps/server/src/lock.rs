@@ -1,5 +1,5 @@
 //! One server per data directory: an advisory lock on `server.lock`, held for
-//! the life of the process. See decision 2 in docs/design/server.md.
+//! the life of the process. See "Single-instance lock" in docs/internals/server.md.
 //!
 //! The operating system drops the lock when the process dies, however it
 //! dies, so a lock that is held always means a server that is running. A

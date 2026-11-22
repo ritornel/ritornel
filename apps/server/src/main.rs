@@ -3,8 +3,8 @@
 //!
 //! `main` is not async, on purpose. The async runtime runs on threads of its
 //! own and the main thread only waits: on macOS it blocks in the platform
-//! run loop, which the media session needs (docs/design/server.md,
-//! "Workspace").
+//! run loop, which the media session needs (docs/internals/server.md,
+//! "Shutdown and bounds").
 
 use std::process::ExitCode;
 

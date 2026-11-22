@@ -1,8 +1,7 @@
 //! `library.db`: the library, which follows the hub role from machine to
 //! machine. One server may write it, the one its hub pointer names. See
-//! decisions 14, 15, 21 and 22, "Which file holds what" and "A command, end
-//! to end" in docs/design/server.md, and decision 2 in
-//! docs/design/linking.md.
+//! "Storage split" and "Commands, receipts, and revisions" in
+//! docs/internals/server.md, and decision 2 in docs/design/linking.md.
 //!
 //! There is one way to change a library: [`LibraryStore::write`]. A write
 //! is a closure that runs in one transaction. The transaction takes the
@@ -61,7 +60,8 @@ impl Fingerprint {
 }
 
 /// What makes a write a command: the ID its client minted for it, and the
-/// fingerprint of the request. See decision 21 in docs/design/server.md.
+/// fingerprint of the request. See "Commands, receipts, and revisions" in
+/// docs/internals/server.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Command {
     /// The command ID. A job step derives its own from the job's ID and
@@ -139,8 +139,9 @@ pub struct Committed {
 
 /// Told of every write after it commits, on the writer thread and in the
 /// order of the commits. It is how the server tells clients that the
-/// library changed (decision 25 in docs/design/server.md: events are hints
-/// sent after the commit). It must be quick: the next write waits for it.
+/// library changed (docs/internals/server.md, "Commands, receipts, and
+/// revisions": events are hints sent after commit). It must be quick: the next
+/// write waits for it.
 pub type CommitHook = Arc<dyn Fn(Committed) + Send + Sync>;
 
 /// What `library_meta` says: which library this is, which server may write

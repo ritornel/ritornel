@@ -13,7 +13,7 @@ pub enum Error {
     /// SQLite refused something.
     Sqlite(rusqlite::Error),
     /// The SQLite this program was built with is not the one it was written
-    /// for. See decision 16 in docs/design/server.md.
+    /// for. See "SQLite" in docs/internals/server.md.
     SqliteVersion {
         /// The version found.
         found: &'static str,
@@ -66,7 +66,7 @@ pub enum Error {
     /// A library was to be created where there is one already.
     LibraryExists,
     /// This server may not write the library: its hub pointer is empty or
-    /// names another server. See decision 15 in docs/design/server.md.
+    /// names another server. See "Storage split" in docs/internals/server.md.
     NotTheHub {
         /// The library.
         library_id: Id,
@@ -99,8 +99,8 @@ pub enum Error {
         name: String,
     },
     /// A root's folder is missing, is not a folder or is empty: the root is
-    /// offline, not empty, and nothing in it is marked missing. See "The
-    /// data directory" in docs/design/server.md.
+    /// offline, not empty, and nothing in it is marked missing. See "Data
+    /// directory" in docs/internals/server.md.
     RootOffline {
         /// Where the root should be.
         path: std::path::PathBuf,

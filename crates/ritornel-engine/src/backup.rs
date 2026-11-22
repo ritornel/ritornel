@@ -1,5 +1,6 @@
 //! Copies of a database: the backup taken on demand, and the one taken
-//! before a migration. See "The data directory" in docs/design/server.md.
+//! before a migration. See "Backups and pre-migration snapshots" in
+//! docs/internals/server.md.
 //!
 //! A copy is made with `VACUUM INTO` on a read-only connection of its own.
 //! It is a consistent snapshot of the database as it was when the copy

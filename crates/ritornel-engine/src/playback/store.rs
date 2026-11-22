@@ -1,8 +1,8 @@
 //! The player's rows in `server.db`: the queue, the one session, each
 //! listen while it is open and until the hub has it, and the outbox row
 //! that carries it there. See "The queue" and "Recording a listen" in
-//! docs/design/playback.md, and "An effect, a job and a lease" in
-//! docs/design/server.md.
+//! docs/design/playback.md, and "Jobs and outbox" in
+//! docs/internals/server.md.
 
 use ritornel_domain::history::{ContextKind, EndReason, StartReason};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};

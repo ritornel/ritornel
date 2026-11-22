@@ -1,7 +1,7 @@
 //! The listener: the HTTP routes and the socket, on loopback. See "Session
 //! and frames" and "Media" in docs/design/contract.md, decisions 5 and 8 in
-//! docs/design/linking.md, and "Starting, finding and stopping" in
-//! docs/design/server.md.
+//! docs/design/linking.md, and "Process lifecycle" in
+//! docs/internals/server.md.
 //!
 //! ```text
 //! GET  /v1/descriptor            the public descriptor. The one route with no credential

@@ -25,7 +25,7 @@ publish = false
 # Dependencies point one way: contract <- domain <- engine <- server, and
 # contract <- client <- each client program. A plugin stands beside them:
 # source <- engine, and source <- each plugin <- server, and no plugin
-# depends on the engine. `scripts/check-deps.sh` enforces it. See decision 8 in docs/design/server.md.
+# depends on the engine. `scripts/check-deps.sh` enforces it. See "Workspace and tooling" in docs/internals/server.md.
 [workspace.dependencies]
 ritornel-contract = { path = "crates/ritornel-contract" }
 ritornel-domain = { path = "crates/ritornel-domain" }

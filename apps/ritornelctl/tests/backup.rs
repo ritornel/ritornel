@@ -5,8 +5,8 @@
 //! nothing is written beside the data in its place, and the status says
 //! so. An export is read back as plain JSON Lines and CSV. A listen that
 //! cannot be saved stops the record, and the status says so while the
-//! music goes on. See "The data
-//! directory" in docs/design/server.md and "Export" in
+//! music goes on. See "Backups and pre-migration snapshots" in
+//! docs/internals/server.md and "Export" in
 //! docs/design/history.md.
 //!
 //! As in `play.rs`, `ritornel-server` is taken from beside `ritornelctl`,

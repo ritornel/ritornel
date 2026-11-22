@@ -1,8 +1,7 @@
 //! What a server and the clients on its machine agree on outside the
 //! socket: where the data directory is, the lock that says a server is
 //! alive on it, the shape of `server.json`, and the name of the credential
-//! file. See "Starting, finding and stopping" in
-//! docs/design/server.md.
+//! file. See "Process lifecycle" in docs/internals/server.md.
 //!
 //! It is here because the server writes these and a local client reads
 //! them, and this is the one crate both may depend on. Nothing here touches

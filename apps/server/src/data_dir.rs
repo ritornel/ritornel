@@ -1,5 +1,5 @@
-//! The data directory: where it is, and what is in it. See "The data
-//! directory" in docs/design/server.md.
+//! The data directory: where it is, and what is in it. See "Data directory"
+//! in docs/internals/server.md.
 //!
 //! ```text
 //! <data-dir>/

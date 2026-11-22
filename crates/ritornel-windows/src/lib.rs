@@ -3,14 +3,17 @@
 //! function, so that every other crate of the workspace can go on
 //! forbidding unsafe code. On any other platform the crate is empty.
 //!
-//! - [`lock`]: a lock on one byte of a file, past its end, so that what the
+//! Code spans rather than intra-doc links are used below so `cargo doc`
+//! passes on macOS and Linux, where this crate is empty.
+//!
+//! - `lock`: a lock on one byte of a file, past its end, so that what the
 //!   file holds can still be read while the lock is held.
-//! - [`private`]: a file or folder only its owner can open, and the check
+//! - `private`: a file or folder only its owner can open, and the check
 //!   that one is.
-//! - [`file`]: which file a path is (its volume and file index), the path a
+//! - `file`: which file a path is (its volume and file index), the path a
 //!   handle really has, and the room left on a disk.
-//! - [`clock`]: milliseconds since the machine started, through sleep.
-//! - [`window`]: a hidden window, for a process that has none: it hears a
+//! - `clock`: milliseconds since the machine started, through sleep.
+//! - `window`: a hidden window, for a process that has none: it hears a
 //!   polite stop (`taskkill /PID`) and the end of the session, and is what
 //!   the system's media controls are tied to.
 

@@ -1,6 +1,6 @@
 //! How a database file is opened: the SQLite version, the settings every
 //! connection gets, the one writer and the readers. Both stores use it. See
-//! decisions 16 to 18 and "SQLite rules" in docs/design/server.md.
+//! "SQLite" in docs/internals/server.md.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -74,7 +74,7 @@ impl Location {
                 return Err(Error::NotWal { found: mode });
             }
         }
-        // An acknowledged commit must survive a power loss: decision 18.
+        // An acknowledged commit must survive a power loss ("SQLite" in docs/internals/server.md).
         connection.pragma_update(None, "synchronous", "FULL")?;
         Ok(connection)
     }
@@ -164,7 +164,7 @@ impl Drop for Writer {
 
 /// How many read connections a database has: enough that a slow read, such
 /// as a window of a large list, does not hold up the covers being found
-/// beside it. Measured on M1's walls (docs/design/server.md, "Deferred").
+/// beside it (docs/internals/server.md, "SQLite").
 const READERS: usize = 4;
 
 /// The read side of a database: a few connections that cannot write. With

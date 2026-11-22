@@ -150,7 +150,7 @@ fn trailing_disc(album: &str) -> Option<(String, i64)> {
     Some((title.to_owned(), disc))
 }
 
-/// The disc a folder's own name gives: "CD1", "Disc 2 [FLAC]", "Night
+/// The disc a folder's own name gives: "CD1", `Disc 2 [FLAC]`, "Night
 /// Drives (Disc 2)".
 fn disc_of_folder(name: &str) -> Option<i64> {
     let mut rest = name.trim_end();

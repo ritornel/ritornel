@@ -1,6 +1,6 @@
 //! `ritornelctl backup`: a copy of the server's databases, now, in the
-//! folder its backups go to. See "The data directory" in
-//! docs/design/server.md.
+//! folder its backups go to. See "Backups and pre-migration snapshots" in
+//! docs/internals/server.md.
 
 use std::io::Write;
 

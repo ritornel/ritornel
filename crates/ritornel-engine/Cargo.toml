@@ -24,7 +24,7 @@ ed25519-dalek = "3.0.0"
 # The operating system's random numbers, for IDs, keys and tokens.
 getrandom = "0.4.3"
 # Pinned exactly, because the SQLite it bundles is the one the server asserts
-# at startup. See decision 16 in docs/design/server.md.
+# at startup. See "SQLite" in docs/internals/server.md.
 # `cache` is its prepared-statement cache: a scan runs the same few inserts
 # for every file, and without it each would be parsed again every time.
 rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled", "cache", "functions"] }
@@ -71,7 +71,7 @@ ritornel-windows.workspace = true
 # plugins. On Linux cpal links libasound, so a build with the feature needs
 # ALSA's development files (alsa-lib, or libasound2-dev); WASAPI is part of
 # Windows and needs nothing installed. The headless hub is built without it
-# and links no audio library. See docs/design/platforms.md.
+# and links no audio library. See docs/internals/platforms.md.
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
 cpal = { version = "=0.18.2", optional = true }
 

@@ -1,5 +1,5 @@
 //! `ritornel-server service`: the optional background service. See
-//! "Background service" in docs/design/server.md.
+//! "Background service" in docs/internals/server.md.
 //!
 //! ```text
 //! ritornel-server service install [--data-dir <dir>]

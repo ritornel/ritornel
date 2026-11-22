@@ -12,7 +12,7 @@ default = ["audio-output", "lastfm", "media-session"]
 # WASAPI on Windows, and ALSA on Linux, where it needs ALSA's development
 # files to build. The
 # headless hub is built without it, links no audio library, and has no
-# player unless `--output null` asks for one. See docs/design/platforms.md.
+# player unless `--output null` asks for one. See docs/internals/platforms.md.
 audio-output = ["ritornel-engine/audio-output"]
 # Last.fm: the import of a history, loved tracks, and scrobbling, through
 # `ritornel-lastfm`. A server built without it links no Last.fm code, and

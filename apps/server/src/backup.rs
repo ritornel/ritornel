@@ -1,6 +1,6 @@
 //! Backups: a copy of this server's databases in a folder of its own, taken
-//! on demand and before a database is migrated. See "The data directory"
-//! in docs/design/server.md.
+//! on demand and before a database is migrated. See "Backups and
+//! pre-migration snapshots" in docs/internals/server.md.
 //!
 //! A backup is written to a place named outside the data directory, since
 //! a copy that lives beside what it copies is lost with it. With no place
