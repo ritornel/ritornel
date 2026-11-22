@@ -52,7 +52,8 @@ fn overrides(args: &ReResolveArgs) -> Result<PolicyOverrides, Error> {
             .map(|text| match text {
                 "1" => Ok(1),
                 "2" => Ok(2),
-                _ => Err(Error::Usage("--policy needs 1 or 2")),
+                "3" => Ok(3),
+                _ => Err(Error::Usage("--policy needs 1, 2 or 3")),
             })
             .transpose()?,
         bind_max: fraction(

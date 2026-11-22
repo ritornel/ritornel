@@ -1902,15 +1902,22 @@ fn sibling_folders_that_collide_and_share_no_title_can_be_discs_of_one_release()
 }
 
 #[test]
-fn policy_2_is_policy_1_with_four_choices_changed_and_is_what_scans_use() {
+fn the_named_policies_keep_their_versions_and_settings() {
     let (one, two) = (Policy::v1(), Policy::v2());
     assert_eq!((one.version, two.version), (1, 2));
-    assert_eq!(Policy::current(), two);
-    assert_eq!(Policy::default(), two);
-    assert_eq!(crate::RESOLVER_VERSION, two.version);
+    assert_eq!(
+        Policy::current(),
+        Policy {
+            version: 3,
+            ..two.clone()
+        }
+    );
+    assert_eq!(Policy::default(), Policy::current());
+    assert_eq!(crate::RESOLVER_VERSION, Policy::current().version);
     assert_eq!(Policy::of_version(1), Some(one.clone()));
     assert_eq!(Policy::of_version(2), Some(two.clone()));
-    assert_eq!(Policy::of_version(3), None);
+    assert_eq!(Policy::of_version(3), Some(Policy::current()));
+    assert_eq!(Policy::of_version(4), None);
     // The free band stays at two seconds, and every number is policy 1's.
     assert_eq!(two.duration_grace_ms, 2_000);
     assert_eq!(
@@ -2882,5 +2889,66 @@ fn an_artist_named_with_a_symbol_keeps_its_row_from_normaliser_2_or_1() {
             .iter()
             .any(|(r, key)| *key == "harbour lights +" && *r != Ref::Row(7)),
         "{found:?}"
+    );
+}
+
+#[test]
+fn an_ineligible_copy_cannot_hide_a_recordings_eligible_runner_up() {
+    let song = |path, audio, album, seconds, mbid: Option<&str>| {
+        file(path, audio)
+            .song("Glass Pier", "Ninefold", seconds)
+            .on(album, None, 1)
+            .with(|f| f.recording_mbid = mbid.map(str::to_owned))
+    };
+    let mut world = World::default();
+    world.add(song("A/1.flac", 1, "Long Field", 200, Some("rec-a")));
+    let runner = world.add(song("B/1.flac", 2, "Long Field", 207, Some("rec-b")));
+    world.add(song("C/1.flac", 3, "Other Shores", 201, Some("rec-b")));
+    let probe = world.add(song("D/1.flac", 4, "Long Field", 200, None));
+    let old = catalog::resolve(&world.library, &Policy::v2());
+    assert_eq!(decision(&old, probe).method, Method::TagsDuration);
+    // The same two eligible copies decide both outcomes; the required gap
+    // determines whether the probe binds or goes to review.
+    for (min_gap, method) in [(0.05, Method::TagsDuration), (0.25, Method::New)] {
+        let policy = Policy {
+            min_gap,
+            ..Policy::current()
+        };
+        let result = catalog::resolve(&world.library, &policy);
+        let judged = decision(&result, probe);
+        assert_eq!(judged.method, method);
+        assert_eq!(judged.needs_review, method == Method::New);
+        let [best, next] = &judged.evidence.candidates[..] else {
+            panic!("expected the two eligible copies");
+        };
+        assert_eq!(next.item, runner);
+        assert_eq!(judged.runner_up_gap, Some(next.distance - best.distance));
+    }
+}
+
+#[test]
+fn an_album_part_number_does_not_make_its_songs_different_versions() {
+    let (world, original, loose, decision) = after_first(
+        file("A/1.flac", 1)
+            .song("Glass Pier", "Ninefold", 200)
+            .on("Long Field Part II", None, 1),
+        file("B/1.flac", 2).song("Glass Pier", "Ninefold", 200),
+        Policy::current(),
+    );
+    assert_eq!(decision.method, Method::TagsDuration);
+    assert_eq!(world.recording(original), world.recording(loose));
+}
+
+#[test]
+fn a_negative_duration_claim_supplies_no_length_evidence() {
+    let first = file("A/1.flac", 1).song("Glass Pier", "Ninefold", 200);
+    let unknown = file("B/1.flac", 2)
+        .song("Glass Pier", "Ninefold", 200)
+        .with(|facts| facts.duration_ms = Some(i64::MIN));
+    let (_, _, _, decision) = after_first(first, unknown, Policy::current());
+    assert_eq!(decision.method, Method::New);
+    assert_eq!(
+        decision.evidence.candidates[0].penalties.unwrap().duration,
+        1.0
     );
 }

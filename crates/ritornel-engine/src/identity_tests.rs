@@ -54,7 +54,7 @@ fn straight_after_a_scan_the_dry_run_reports_no_change_and_writes_nothing() {
     let (before, revision) = (rig.dump(), rig.revision());
     let run = rig.library.dry_run(&detail()).unwrap();
     assert!(run.policy.exact);
-    assert_eq!(run.policy.resolver_version, 2);
+    assert_eq!(run.policy.resolver_version, 3);
     assert!(!run.would_write);
     assert!(!run.claims_stale);
     assert_eq!(run.items, 3);
@@ -383,7 +383,7 @@ fn hex(id: ritornel_contract::Id) -> String {
 }
 
 #[test]
-fn a_library_resolved_by_policy_1_is_resolved_by_policy_2_at_the_next_scan() {
+fn an_earlier_policy_is_updated_at_the_next_scan() {
     let mut rig = Rig::new();
     rig.put(ON_ALBUM, "a.m4a");
     rig.put(COMPILATION, "b.compilation.flac");
@@ -435,13 +435,13 @@ fn a_library_resolved_by_policy_1_is_resolved_by_policy_2_at_the_next_scan() {
     assert!(run.policy.exact);
     assert_eq!((run.would_change, run.would_write), (0, false));
 
-    // Asked about policy 2, the dry run lists the compilation's song, and
+    // Asked about the current policy, the dry run lists the compilation's song, and
     // nothing else: a recording of its own, marked for review, nearest the
     // album's file and its recording.
     let before = rig.dump();
     let run = rig.library.dry_run(&detail()).unwrap();
     assert!(run.policy.exact);
-    assert_eq!(run.policy.resolver_version, 2);
+    assert_eq!(run.policy.resolver_version, 3);
     assert!(!run.policy.tags_bind_across_albums);
     assert!(run.would_write);
     assert_eq!(
@@ -485,19 +485,19 @@ fn a_library_resolved_by_policy_1_is_resolved_by_policy_2_at_the_next_scan() {
     assert_eq!(rig.dump(), before);
 
     // The next scan finds every file unchanged, and resolves the library by
-    // policy 2 because the resolver's version changed.
+    // the current policy because the resolver's version changed.
     let summary = rig.scan();
     assert_eq!(
         (summary.unchanged, summary.assignments, summary.recordings),
         (2, 1, 1)
     );
     // Only the decision that changed is made again; the other stays policy
-    // 1's, which policy 2 agrees with.
+    // 1's, which the current policy agrees with.
     assert_eq!(
         rig.rows(decisions),
         [
             format!("{ON_ALBUM}|new|1|0"),
-            format!("{COMPILATION}|new|2|1")
+            format!("{COMPILATION}|new|3|1")
         ]
     );
     assert_ne!(
@@ -507,7 +507,7 @@ fn a_library_resolved_by_policy_1_is_resolved_by_policy_2_at_the_next_scan() {
     assert_eq!(
         rig.one("SELECT value_json FROM library_setting WHERE key = 'identity.versions'"),
         format!(
-            r#"{{"extractor":{},"resolver":2,"normalizer":{},"catalog":{}}}"#,
+            r#"{{"extractor":{},"resolver":3,"normalizer":{},"catalog":{}}}"#,
             ritornel_domain::EXTRACTOR_VERSION,
             ritornel_domain::NORMALIZER_VERSION,
             ritornel_domain::CATALOG_VERSION
@@ -556,7 +556,7 @@ fn a_library_resolved_by_policy_1_is_resolved_by_policy_2_at_the_next_scan() {
         recording_of(&rig, ON_ALBUM)
     );
 
-    // After it the dry run under policy 2 reports no change, and the scan
+    // After it the dry run under the current policy reports no change, and the scan
     // after it writes nothing. Policy 1 would bind the song again.
     let run = rig.library.dry_run(&detail()).unwrap();
     assert_eq!((run.would_change, run.would_write), (0, false));

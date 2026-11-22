@@ -398,7 +398,7 @@ fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was(
         &["identity", "re-resolve", "--dry-run", "--detail"],
     );
     assert_eq!(run["policy"]["exact"], true);
-    assert_eq!(run["policy"]["resolverVersion"], 2);
+    assert_eq!(run["policy"]["resolverVersion"], 3);
     assert_eq!(run["wouldWrite"], false);
     assert_eq!(
         (&run["items"], &run["unchanged"]),
@@ -409,7 +409,7 @@ fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was(
     let (code, stdout, _) = ritornelctl(&data_dir, &["identity", "re-resolve", "--dry-run"]);
     assert_eq!(code, Some(0));
     for line in [
-        "Policy            policy 2\n",
+        "Policy            policy 3\n",
         "Would change      0 (0 to another recording)\n",
         "Would write       no\n",
     ] {

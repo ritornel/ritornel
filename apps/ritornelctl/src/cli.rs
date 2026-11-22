@@ -197,8 +197,7 @@ Options:
 
 Policy values, for re-resolve --dry-run. A switch is on or off, and on
 when given alone:
-  --policy <n>          Start from policy 1 or 2 rather than the one scans
-                        use
+  --policy <n>          Start from policy 1, 2 or 3
   --bind-max <d>        A match by tags binds at this distance or less
   --min-gap <d>         and only this far ahead of the runner-up
   --review-below <d>    A new recording is marked for review if a candidate
@@ -574,7 +573,7 @@ pub(crate) struct ReResolveArgs {
     /// List every file that is not unchanged.
     #[arg(long)]
     pub(crate) detail: bool,
-    /// The named policy to start from: 1 or 2. The one scans use when it
+    /// The named policy to start from: 1, 2 or 3. The one scans use when it
     /// is left out.
     #[arg(long)]
     pub(crate) policy: Option<String>,
