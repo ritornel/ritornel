@@ -26,7 +26,7 @@ use crate::library::{
 };
 use unicode_normalization::UnicodeNormalization;
 
-use crate::normalize::{core, difference, fold_accents, normalize};
+use crate::normalize::{core_with_fullwidth, difference, fold_accents, normalize};
 
 /// The version of the policy scans resolve by, [`Policy::current`]: what
 /// `identity_decision.resolver_version` records for a decision it makes.
@@ -180,6 +180,10 @@ impl Policy {
     /// The file policy used by scans.
     pub fn current() -> Self {
         Self::v3()
+    }
+
+    pub(crate) fn title_core(&self, text: &str) -> String {
+        core_with_fullwidth(text, self.version >= 3)
     }
 
     /// The named policy of this number, if there is one.
@@ -452,9 +456,17 @@ impl Ev {
         Self {
             item,
             rec: usize::MAX,
-            core: facts.title.as_deref().map(core).map(key),
+            core: facts
+                .title
+                .as_deref()
+                .map(|text| policy.title_core(text))
+                .map(key),
             artist: facts.artist_text().as_deref().map(normalize).map(key),
-            album_core: facts.album.as_deref().map(core).map(key),
+            album_core: facts
+                .album
+                .as_deref()
+                .map(|text| policy.title_core(text))
+                .map(key),
             album_artist: facts.album_artist_text().as_deref().map(normalize).map(key),
             release: facts.release_mbid.clone(),
             release_group: facts.release_group_mbid.clone(),

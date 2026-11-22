@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::extract::{Facts, parse_date};
 use crate::library::Library;
-use crate::normalize::{core, normalize};
+use crate::normalize::normalize;
 use crate::resolve::Policy;
 
 /// The disc a marker names: "cd2", "disc 2", "disk-2", "cd #2". `None` for
@@ -211,7 +211,7 @@ pub(crate) fn apply_with_probes(
         }
     }
     if policy.discs_from_folders {
-        folder_discs(&mut implied);
+        folder_discs(&mut implied, policy);
     }
     Some(implied)
 }
@@ -228,7 +228,7 @@ struct Folder {
     years: BTreeSet<i64>,
 }
 
-fn folder_discs(library: &mut Library) {
+fn folder_discs(library: &mut Library, policy: &Policy) {
     // Sibling folders of one album by one album artist.
     type Key = (String, String, String);
     let mut albums: BTreeMap<Key, BTreeMap<String, Folder>> = BTreeMap::new();
@@ -260,7 +260,7 @@ fn folder_discs(library: &mut Library) {
                 .title
                 .as_deref()
                 .or(facts.title_inferred.as_deref())
-                .map(core),
+                .map(|text| policy.title_core(text)),
         );
         folder.numbered |= facts.disc.is_some_and(|disc| disc != 1);
         folder.years.extend(

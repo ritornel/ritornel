@@ -247,14 +247,18 @@ fn normalize_v1(text: &str) -> String {
 /// titles that differ only in such a note. A title that is all brackets
 /// keeps its full key.
 pub fn core(text: &str) -> String {
+    core_with_fullwidth(text, true)
+}
+
+pub(crate) fn core_with_fullwidth(text: &str, fullwidth: bool) -> String {
     let mut outside = String::with_capacity(text.len());
     // A bracket of symbols alone, as "(+)", is kept: it is no note.
     let mut inside = String::new();
     let mut depth = 0_u32;
     for c in text.chars() {
         match c {
-            '(' | '[' | '{' | '（' | '［' | '｛' => depth += 1,
-            ')' | ']' | '}' | '）' | '］' | '｝' => {
+            '(' | '[' | '{' | '（' | '［' | '｛' if fullwidth || c.is_ascii() => depth += 1,
+            ')' | ']' | '}' | '）' | '］' | '｝' if fullwidth || c.is_ascii() => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     let folded: String = inside.nfkc().collect();

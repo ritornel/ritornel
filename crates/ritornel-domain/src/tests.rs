@@ -2952,3 +2952,18 @@ fn a_negative_duration_claim_supplies_no_length_evidence() {
         1.0
     );
 }
+
+#[test]
+fn fullwidth_title_notes_use_the_selected_file_policy() {
+    for (policy, expected) in [
+        (Policy::v2(), Method::New),
+        (Policy::current(), Method::TagsDuration),
+    ] {
+        let (_, _, _, result) = after_first(
+            file("A/1.flac", 1).song("Lantern", "Ninefold", 200),
+            file("B/1.flac", 2).song("Lantern（Remastered）", "Ninefold", 200),
+            policy,
+        );
+        assert_eq!(result.method, expected);
+    }
+}
