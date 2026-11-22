@@ -63,7 +63,7 @@ pub(crate) const REACHED_TA: &str = reached!("ta");
 pub(crate) const REACHED_RELEASE_R: &str = reached_release!("r");
 
 mod discography;
-mod fold;
+pub(crate) mod fold;
 mod open;
 mod pages;
 mod rows;

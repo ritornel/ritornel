@@ -347,7 +347,7 @@ fn a_first_scan_records_every_file_and_resolves_the_ones_it_can_read() {
     // The text search index holds each appearance.
     assert_eq!(
         rig.rows("SELECT title, artist, album FROM search_text WHERE search_text MATCH 'kites' ORDER BY rowid"),
-        ["Paper Kites|Moss Arcade|Tin Weather", "Paper Kites|Moss Arcade|Tin Weather"]
+        ["paper kites|moss arcade|tin weather", "paper kites|moss arcade|tin weather"]
     );
     assert_eq!(
         rig.one("SELECT value_json FROM library_setting"),

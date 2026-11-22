@@ -10,6 +10,9 @@ use unicode_normalization::UnicodeNormalization;
 /// and "Royksopp", fold the same while a mark that makes another letter in
 /// another script stays.
 pub(crate) fn fold(text: &str) -> String {
+    if text.contains('\0') {
+        return fold(&text.replace('\0', ""));
+    }
     // Most names are plain ASCII, which has nothing to fold but case.
     if text.is_ascii() {
         return text.to_ascii_lowercase();

@@ -855,3 +855,46 @@ fn a_record_whose_files_joined_another_is_on_no_wall() {
         }
     }
 }
+
+#[test]
+fn a_scanned_song_is_found_with_either_spelling_of_a_folded_letter() {
+    let mut rig = crate::scan_tests::Rig::new();
+    rig.put("Quæł Søl.wav", "a.wav");
+    rig.scan();
+    for typed in ["Quæł", "quael", "søl", "sol"] {
+        let view = rig
+            .library
+            .list_open(
+                ListKind::Songs,
+                &Query {
+                    text: Some(typed.into()),
+                    ..Query::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(view.ids.len(), 1, "{typed}");
+        let songs = rig.library.search(typed, 10).unwrap().songs;
+        assert_eq!(songs.len(), 1, "{typed}");
+        assert_eq!(songs[0].song.title.as_deref(), Some("Quæł Søl"));
+    }
+}
+
+#[test]
+fn a_nul_in_typed_text_is_ignored_by_both_song_searches() {
+    let mut rig = crate::scan_tests::Rig::new();
+    rig.put("Tin Field.wav", "a.wav");
+    rig.scan();
+    let typed = "Ti\0n";
+    let view = rig
+        .library
+        .list_open(
+            ListKind::Songs,
+            &Query {
+                text: Some(typed.into()),
+                ..Query::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(view.ids.len(), 1);
+    assert_eq!(rig.library.search(typed, 10).unwrap().songs.len(), 1);
+}

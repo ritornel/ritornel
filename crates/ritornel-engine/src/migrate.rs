@@ -44,11 +44,18 @@ pub(crate) const SERVER: &[Migration] = &[Migration {
 }];
 
 /// The migrations of `library.db`.
-pub(crate) const LIBRARY: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_library",
-    sql: include_str!("../migrations/library/0001_library.sql"),
-}];
+pub(crate) const LIBRARY: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_library",
+        sql: include_str!("../migrations/library/0001_library.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_fold_search_text",
+        sql: include_str!("../migrations/library/0002_fold_search_text.sql"),
+    },
+];
 
 /// What a run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +133,22 @@ fn apply<'a>(
             version: migration.version,
             source,
         };
+        if migration.name == "0002_fold_search_text" {
+            use rusqlite::functions::FunctionFlags;
+            connection
+                .create_scalar_function(
+                    "search_fold",
+                    1,
+                    FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                    |ctx| {
+                        Ok(ctx
+                            .get::<Option<String>>(0)?
+                            .as_deref()
+                            .map(crate::list::fold::fold))
+                    },
+                )
+                .map_err(failed)?;
+        }
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failed)?;
