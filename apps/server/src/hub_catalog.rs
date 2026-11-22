@@ -56,17 +56,7 @@ fn display(summary: &TrackSummary) -> TrackDisplay {
 /// What a file now is: its size and modification time, as the player
 /// checks them.
 fn facts_of(path: &Path) -> Option<FileFacts> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let mtime_ms = metadata
-        .modified()
-        .ok()?
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|since| i64::try_from(since.as_millis()).ok())?;
-    Some(FileFacts {
-        size_bytes: metadata.len(),
-        mtime_ms,
-    })
+    Some(FileFacts::of(&std::fs::metadata(path).ok()?))
 }
 
 impl HubCatalog {
@@ -113,7 +103,12 @@ impl HubCatalog {
         ))?;
         std::fs::create_dir_all(&self.cache).map_err(Error::Io)?;
         let part = kept.with_extension("part");
-        let path = format!("{}/{appearance}/{}", route::AUDIO, copy.source_item_id);
+        let path = format!(
+            "{}/{appearance}/{}/{}",
+            route::AUDIO,
+            copy.source_item_id,
+            copy.revision
+        );
         let credential = self.uplink.credential();
         let started = std::time::Instant::now();
         let pulled = self.uplink.block_on(ritornel_client::download(
@@ -121,10 +116,15 @@ impl HubCatalog {
             &path,
             &credential,
             &part,
+            copy.size_bytes,
         ));
         match pulled {
             Ok(bytes) if bytes == copy.size_bytes => {
-                std::fs::rename(&part, &kept).map_err(Error::Io)?;
+                std::fs::rename(&part, &kept)
+                    .inspect_err(|_| {
+                        let _ = std::fs::remove_file(&part);
+                    })
+                    .map_err(Error::Io)?;
                 info!(
                     source_item = %copy.source_item_id,
                     bytes,

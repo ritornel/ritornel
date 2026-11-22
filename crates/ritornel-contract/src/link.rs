@@ -160,7 +160,8 @@ pub struct LinkCopiesParams {
 }
 
 /// The result of `link.copies`: the masters of a track the hub holds, best
-/// first, each fetched from `GET /v1/audio/{appearanceId}/{sourceItemId}`.
+/// first, each fetched from `GET /v1/audio/{appearanceId}/{sourceItemId}/
+/// {revision}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

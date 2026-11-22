@@ -10,7 +10,7 @@
 //! GET  /v1/ws                    the socket that carries calls and events
 //! GET  /v1/art/{artId}/{size}    a cover, with the credential or a media token
 //! POST /v1/link                  a satellite joining, with an invite's secret
-//! GET  /v1/audio/{appearanceId}/{sourceItemId}
+//! GET  /v1/audio/{appearanceId}/{sourceItemId}/{revision}
 //!                                a master, for a satellite, with its link session
 //! ```
 //!
@@ -56,6 +56,7 @@ use ritornel_contract::{
     ART_SIZES, Id, MEDIA_TOKEN_PARAM, NONCE_PARAM, SessionKind, TICKET_PARAM, hex,
 };
 use ritornel_engine::SessionToken;
+use ritornel_engine::playback::FileFacts;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -283,7 +284,7 @@ fn router(core: Arc<Core>, tickets: Arc<Tickets>) -> Router {
         .route(route::WS, get(socket))
         .route(&format!("{}/{{art}}/{{size}}", route::ART), get(art))
         .route(
-            &format!("{}/{{appearance}}/{{item}}", route::AUDIO),
+            &format!("{}/{{appearance}}/{{item}}/{{revision}}", route::AUDIO),
             get(audio),
         )
         // A path the server does not have is checked like any other, so
@@ -474,32 +475,38 @@ async fn ticket(
 const AUDIO_CHUNK: usize = 256 * 1024;
 
 /// A master, for a satellite to play: `GET /v1/audio/{appearanceId}/
-/// {sourceItemId}`, as `link.copies` named it. Only a link session reads
-/// it. The file is sent as it is read, and refused if it is no longer what
-/// the scan read.
+/// {sourceItemId}/{revision}`, as `link.copies` named it. Only a link
+/// session reads it. The file is sent as it is read, and refused if it is
+/// no longer what the scan read at that revision: its size or its time has
+/// changed, or a later scan has read it again.
 async fn audio(
     State(core): State<Arc<Core>>,
     Extension(peer): Extension<Option<Peer>>,
-    Path((appearance, item)): Path<(String, String)>,
+    Path((appearance, item, revision)): Path<(String, String, String)>,
 ) -> Response {
     if peer.is_none() {
         return (StatusCode::FORBIDDEN, "only a satellite reads masters\n").into_response();
     }
-    let (Ok(appearance), Ok(item)) = (appearance.parse::<Id>(), item.parse::<Id>()) else {
+    let (Ok(appearance), Ok(item), Ok(revision)) = (
+        appearance.parse::<Id>(),
+        item.parse::<Id>(),
+        revision.parse::<i64>(),
+    ) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     // Reading the library and opening the file wait on the disk.
     let opened = tokio::task::spawn_blocking(move || {
-        let (path, facts) = core.master(appearance, item)?;
+        let (path, scanned) = core.master(appearance, item, revision)?;
         let file = std::fs::File::open(path).ok()?;
-        let size = file.metadata().ok()?.len();
-        Some((file, size, facts))
+        let now = FileFacts::of(&file.metadata().ok()?);
+        Some((file, now, scanned))
     })
     .await;
-    let Ok(Some((file, size, facts))) = opened else {
+    let Ok(Some((file, now, scanned))) = opened else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if size != facts.size_bytes {
+    let size = now.size_bytes;
+    if now != scanned {
         return (
             StatusCode::CONFLICT,
             "the file has changed since it was scanned\n",

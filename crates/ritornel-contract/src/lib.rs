@@ -190,8 +190,8 @@ pub mod route {
     pub const LINK: &str = "/v1/link";
 
     /// A master, for a satellite to play: `GET /v1/audio/{appearanceId}/
-    /// {sourceItemId}` under this prefix, as `link.copies` names it. Only
-    /// a link session reads it, with its token in the header.
+    /// {sourceItemId}/{revision}` under this prefix, as `link.copies` names
+    /// it. Only a link session reads it, with its token in the header.
     pub const AUDIO: &str = "/v1/audio";
 
     /// Whether the server is up: a [`Health`]. It needs a credential.

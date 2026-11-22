@@ -2210,7 +2210,8 @@ export type Limits = {
 
 /**
  * The result of `link.copies`: the masters of a track the hub holds, best
- * first, each fetched from `GET /v1/audio/{appearanceId}/{sourceItemId}`.
+ * first, each fetched from `GET /v1/audio/{appearanceId}/{sourceItemId}/
+ * {revision}`.
  */
 export type LinkCopies = {
   /**

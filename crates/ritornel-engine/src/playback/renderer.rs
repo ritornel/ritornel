@@ -41,6 +41,16 @@ pub struct FileFacts {
     pub mtime_ms: i64,
 }
 
+impl FileFacts {
+    /// What a file's metadata says of it now, as the scan reads it.
+    pub fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            size_bytes: metadata.len(),
+            mtime_ms: crate::walk::mtime_ms(metadata),
+        }
+    }
+}
+
 /// How a span ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum End {

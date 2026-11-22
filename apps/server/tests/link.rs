@@ -742,7 +742,7 @@ async fn a_satellite_plays_the_hubs_music_from_copies_it_pulls() {
         // A master is read by a satellite's link session alone: not by a
         // client of the hub, and not by anyone without a credential.
         let path = format!(
-            "{}/{}/{}",
+            "{}/{}/{}/1",
             route::AUDIO,
             song.appearance_id,
             song.appearance_id

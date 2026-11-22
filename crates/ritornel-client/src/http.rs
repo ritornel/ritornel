@@ -114,13 +114,14 @@ const DOWNLOAD_IDLE: Duration = Duration::from_secs(30);
 /// Fetches `GET <path>` from `endpoint` with the credential into the file
 /// `to`, which is made or replaced, and returns how many bytes it holds.
 /// The body is written as it comes, never held whole. It gives up when no
-/// byte has come for 30 seconds, and leaves what it wrote for the caller
-/// to remove.
+/// byte has come for 30 seconds, or more than `max_bytes` have, and leaves
+/// what it wrote for the caller to remove.
 pub async fn download(
     endpoint: SocketAddr,
     path: &str,
     credential: &Credential,
     to: &std::path::Path,
+    max_bytes: u64,
 ) -> Result<u64, Error> {
     use std::io::Write;
 
@@ -169,6 +170,11 @@ pub async fn download(
                 source,
             })?;
             written += data.len() as u64;
+            if written > max_bytes {
+                return Err(Error::Protocol(format!(
+                    "GET {path} sent more than the {max_bytes} bytes it should"
+                )));
+            }
         }
     }
     file.sync_all().map_err(|source| Error::File {

@@ -439,8 +439,14 @@ impl Core {
     }
 
     /// Where a master of `appearance` is, with what the scan recorded of
-    /// it, for `GET /v1/audio`: only one `link.copies` offers.
-    pub(crate) fn master(&self, appearance: Id, source_item: Id) -> Option<(PathBuf, FileFacts)> {
+    /// it, for `GET /v1/audio`: only one `link.copies` offers, and only at
+    /// the revision it offered.
+    pub(crate) fn master(
+        &self,
+        appearance: Id,
+        source_item: Id,
+        revision: i64,
+    ) -> Option<(PathBuf, FileFacts)> {
         let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
         let stores = stores.as_ref()?;
         let library = stores
@@ -452,7 +458,7 @@ impl Core {
         Catalog::copies(library, appearance, self.server_id)
             .ok()?
             .into_iter()
-            .find(|copy| copy.source_item() == source_item)
+            .find(|copy| copy.source_item() == source_item && copy.revision_no() == revision)
             .and_then(|copy| Some((copy.path(&roots)?, copy.facts())))
     }
 
