@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use super::{Core, Stores};
 use crate::backup::{publish, reserve_named, stamp};
+use crate::platform::close_to_others;
 
 impl Core {
     /// Writes the record into a new folder, `ritornel-record-<time>`, in
@@ -48,11 +49,25 @@ impl Core {
             let (name, partial) =
                 reserve_named(folder, &format!("ritornel-record-{}", stamp(at_ms)))
                     .map_err(|error| unwritten(error.to_string()))?;
-            let exported = match library.export_record(&partial, at_ms) {
+            // A listening history is its owner's alone, as a backup is, and
+            // stays so when its files are copied out of the folder.
+            let exported = library
+                .export_record(&partial, at_ms)
+                .map_err(|error| format!("cannot export the record: {error}"))
+                .and_then(|exported| {
+                    let files = std::fs::read_dir(&partial).map_err(|error| error.to_string())?;
+                    for file in files {
+                        let path = file.map_err(|error| error.to_string())?.path();
+                        close_to_others(&path)
+                            .map_err(|error| format!("cannot close {}: {error}", path.display()))?;
+                    }
+                    Ok(exported)
+                });
+            let exported = match exported {
                 Ok(exported) => exported,
                 Err(error) => {
                     let _ = std::fs::remove_dir_all(&partial);
-                    return Err(unwritten(format!("cannot export the record: {error}")));
+                    return Err(unwritten(error));
                 }
             };
             let path =

@@ -1482,6 +1482,47 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
             .unwrap();
     }
 
+    // Where the listener said they were, and a recording rated and then
+    // merged into another.
+    let second: [u8; 16] = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT rec.public_id FROM source_item si
+                 JOIN recording rec ON rec.id = si.current_recording_id
+                 WHERE si.public_id = ?1",
+                [at.tracks[1].1.as_bytes()],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.zone_and_merge",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let connection = write.connection();
+                connection.execute(
+                    "INSERT INTO listener_zone_period (listener_id, zone_name, valid_from_ms,
+                                                       valid_to_ms, rev)
+                     VALUES (1, 'Europe/London', 1483228800000, 1704067200000, ?1)",
+                    [write.rev()],
+                )?;
+                connection.execute(
+                    "UPDATE recording SET
+                       redirect_to_id = (SELECT id FROM recording WHERE public_id = ?2),
+                       canonical_id = (SELECT id FROM recording WHERE public_id = ?2)
+                     WHERE public_id = ?1",
+                    (recording.as_slice(), second.as_slice()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
     let scratch = crate::testing::Scratch::new();
     let exported = at
         .library
@@ -1501,6 +1542,19 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
         (&manifest["format"], &manifest["version"]),
         (&serde_json::json!("ritornel-record"), &serde_json::json!(1))
     );
+    assert_eq!(
+        manifest["zonePeriods"],
+        serde_json::json!([{
+            "listener": at.listener.to_string(),
+            "zone": "Europe/London",
+            "from": "2017-01-01T00:00:00Z",
+            "until": "2024-01-01T00:00:00Z",
+        }])
+    );
+    assert_eq!(
+        manifest["files"]["plays.csv"]["playRuleVersions"],
+        serde_json::json!([1])
+    );
     let observations = reading_an_export::lines(&scratch.path().join("observations.jsonl"));
     let endpoint_kind = |id: &serde_json::Value| {
         manifest["endpoints"]
@@ -1518,6 +1572,15 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
         .find(|line| line["kind"] == "listen" && line["listen"]["endReason"] == "next")
         .unwrap();
     assert_eq!(endpoint_kind(&listen["endpoint"]), "player");
+    // The server it played on is named.
+    assert!(
+        manifest["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|server| server["id"] == listen["listen"]["playedOn"]),
+        "{manifest}"
+    );
     assert_eq!(listen["listen"]["msPlayed"], 20_000);
     assert_eq!(listen["listen"]["playedFrom"]["kind"], "album");
     assert_eq!(
@@ -1563,6 +1626,10 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
         .filter(|line| line["recording"]["id"] == Id::from_bytes(recording).to_string())
         .collect();
     assert_eq!(of_it.len(), 2);
+    // Said of the recording since merged away, and what that is now.
+    for line in &of_it {
+        assert_eq!(line["now"]["recording"], Id::from_bytes(second).to_string());
+    }
     assert_eq!(
         (&of_it[0]["value"], &of_it[0]["cleared"]),
         (&80.into(), &false.into())

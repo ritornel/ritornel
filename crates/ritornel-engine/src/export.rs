@@ -26,7 +26,7 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
+use rusqlite::{Connection, OpenFlags, Row};
 use serde_json::{Value, json};
 
 use crate::{Error, LibraryStore};
@@ -142,12 +142,15 @@ fn manifest(
         let rows = statement.query_map([], row)?;
         Ok(Value::Array(rows.collect::<Result<_, _>>()?))
     };
-    let rule: Option<i64> = connection
-        .query_row("SELECT max(play_rule_version) FROM play_event", [], |row| {
-            row.get(0)
-        })
-        .optional()?
-        .flatten();
+    // The rules the plays were derived by: more than one before a
+    // rebuild has caught up.
+    let versions = |column: &str| -> Result<Vec<i64>, Error> {
+        let mut statement = connection.prepare(&format!(
+            "SELECT DISTINCT {column} FROM play_event ORDER BY {column}"
+        ))?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    };
     Ok(json!({
         "format": EXPORT_FORMAT,
         "version": EXPORT_VERSION,
@@ -156,8 +159,16 @@ fn manifest(
         "files": {
             "observations.jsonl": { "lines": exported.observations },
             "ratings.jsonl": { "lines": exported.ratings },
-            "plays.csv": { "rows": exported.plays, "playRuleVersion": rule },
+            "plays.csv": {
+                "rows": exported.plays,
+                "playRuleVersions": versions("play_rule_version")?,
+                "grouperVersions": versions("grouper_version")?,
+            },
         },
+        "servers": list(
+            "SELECT public_id, name FROM server ORDER BY id",
+            |row| Ok(json!({ "id": key(row.get(0)?), "name": row.get::<_, String>(1)? })),
+        )?,
         "endpoints": list(
             "SELECT public_id, kind, name FROM history_endpoint ORDER BY id",
             |row| Ok(json!({ "id": key(row.get(0)?), "kind": row.get::<_, String>(1)?, "name": row.get::<_, String>(2)? })),
@@ -169,6 +180,19 @@ fn manifest(
         "sources": list(
             "SELECT public_id, kind, name FROM source_instance ORDER BY id",
             |row| Ok(json!({ "id": key(row.get(0)?), "kind": row.get::<_, String>(1)?, "name": row.get::<_, String>(2)? })),
+        )?,
+        // Where each listener was, as they said: what a play with no zone
+        // of its own is dated in.
+        "zonePeriods": list(
+            "SELECT l.public_id, z.zone_name, z.valid_from_ms, z.valid_to_ms
+             FROM listener_zone_period z JOIN listener l ON l.id = z.listener_id
+             ORDER BY z.listener_id, z.valid_from_ms IS NOT NULL, z.valid_from_ms, z.id",
+            |row| Ok(json!({
+                "listener": key(row.get(0)?),
+                "zone": row.get::<_, String>(1)?,
+                "from": utc(row.get(2)?),
+                "until": utc(row.get(3)?),
+            })),
         )?,
     }))
 }
@@ -399,7 +423,8 @@ fn ratings(connection: &Connection, path: &Path) -> Result<u64, Error> {
         "SELECT l.public_id, r.kind, r.value, r.cleared, r.rated_at_ms,
                 rec.public_id, rec.display_title, credit.display_text,
                 si.public_id, si.item_kind, si.provider_key, src.public_id,
-                e.public_id, r.actor_kind, r.actor_session_pid
+                e.public_id, r.actor_kind, r.actor_session_pid,
+                now.public_id, now.display_title, now_credit.display_text
          FROM listener_rating r
          JOIN listener l ON l.id = r.listener_id
          LEFT JOIN recording rec ON rec.id = r.recording_id
@@ -407,6 +432,11 @@ fn ratings(connection: &Connection, path: &Path) -> Result<u64, Error> {
          LEFT JOIN source_item si ON si.id = r.source_item_id
          LEFT JOIN source_instance src ON src.id = si.source_instance_id
          LEFT JOIN history_endpoint e ON e.id = r.endpoint_id
+         -- What it is of now: the recording it named, or its item's, as
+         -- merges have left it.
+         LEFT JOIN recording bound ON bound.id = coalesce(r.recording_id, si.current_recording_id)
+         LEFT JOIN recording now ON now.id = bound.canonical_id
+         LEFT JOIN artist_credit now_credit ON now_credit.id = now.display_artist_credit_id
          ORDER BY r.id",
     )?;
     let mut rows = statement.query([])?;
@@ -433,6 +463,11 @@ fn ratings(connection: &Connection, path: &Path) -> Result<u64, Error> {
             "endpoint": key(row.get(12)?),
             "by": row.get::<_, Option<String>>(13)?,
             "session": key(row.get(14)?),
+            "now": {
+                "recording": key(row.get(15)?),
+                "title": row.get::<_, Option<String>>(16)?,
+                "artist": row.get::<_, Option<String>>(17)?,
+            },
         });
         line(&mut file, &value)?;
         written += 1;
@@ -442,7 +477,7 @@ fn ratings(connection: &Connection, path: &Path) -> Result<u64, Error> {
 }
 
 /// The columns of `plays.csv`.
-const PLAY_COLUMNS: [&str; 17] = [
+const PLAY_COLUMNS: [&str; 18] = [
     "play",
     "listener",
     "played_at_utc",
@@ -460,6 +495,7 @@ const PLAY_COLUMNS: [&str; 17] = [
     "source",
     "endpoint",
     "source_key",
+    "corroborated_by",
 ];
 
 fn plays(connection: &Connection, path: &Path) -> Result<u64, Error> {
@@ -471,10 +507,15 @@ fn plays(connection: &Connection, path: &Path) -> Result<u64, Error> {
     let mut statement = connection.prepare(
         "SELECT p.public_id, l.public_id, p.event_at_utc_ms, p.local_date, p.zone_name,
                 coalesce(credit.display_text, imported.artist),
-                coalesce(rec.display_title, imported.title),
-                coalesce(rel.display_title, imported.album),
+                coalesce(ta.display_title, queued.display_title, rec.display_title, imported.title),
+                coalesce(rel.display_title, queued_release.display_title, imported.album),
                 p.ms_played, p.track_duration_ms, p.outcome, p.counts, p.excluded,
-                p.context_kind, e.kind, e.public_id, o.source_key
+                p.context_kind, e.kind, e.public_id, o.source_key,
+                (SELECT group_concat(hex(ce.public_id) || ':' || hex(co.source_key), ' ')
+                 FROM play_event_observation c
+                 JOIN history_observation co ON co.id = c.observation_id
+                 JOIN history_endpoint ce ON ce.id = co.endpoint_id
+                 WHERE c.play_event_id = p.id AND c.role = 'corroborating')
          FROM play_event p
          JOIN listener l ON l.id = p.listener_id
          -- Every play has a primary observation, and one that somehow had
@@ -484,10 +525,18 @@ fn plays(connection: &Connection, path: &Path) -> Result<u64, Error> {
          LEFT JOIN history_observation o ON o.id = primary_one.observation_id
          LEFT JOIN history_endpoint e ON e.id = o.endpoint_id
          LEFT JOIN observation_import imported ON imported.observation_id = o.id
+         -- The track as the library shows it: the play's own appearance,
+         -- or for one not bound, the appearance its listen queued, before
+         -- the recording's own title and credit.
+         LEFT JOIN observation_listen heard ON heard.observation_id = o.id
+         LEFT JOIN track_appearance queued ON queued.id = heard.queued_appearance_id
+         LEFT JOIN release queued_release ON queued_release.id = queued.release_id
          LEFT JOIN recording rec ON rec.id = p.recording_id
-         LEFT JOIN artist_credit credit ON credit.id = rec.display_artist_credit_id
          LEFT JOIN track_appearance ta ON ta.id = p.appearance_id
          LEFT JOIN release rel ON rel.id = ta.release_id
+         LEFT JOIN artist_credit credit ON credit.id = coalesce(
+           ta.display_artist_credit_id, queued.display_artist_credit_id,
+           rec.display_artist_credit_id)
          ORDER BY p.event_at_utc_ms IS NULL, p.event_at_utc_ms, p.id",
     )?;
     let mut rows = statement.query([])?;
@@ -520,12 +569,38 @@ fn plays(connection: &Connection, path: &Path) -> Result<u64, Error> {
             row.get::<_, Option<Vec<u8>>>(16)?
                 .map(|bytes| hex(&bytes))
                 .unwrap_or_default(),
+            row.get::<_, Option<String>>(17)?
+                .map(|also| named_observations(&also))
+                .unwrap_or_default(),
         ];
         csv_row(&mut file, cells.into_iter())?;
         written += 1;
     }
     finish(file)?;
     Ok(written)
+}
+
+/// The observations a play's `corroborated_by` names, as SQLite lists them,
+/// `<endpoint hex>:<source key hex>` apart by spaces, each as
+/// `<endpoint ID>:<source key>`, as the lines of observations.jsonl name
+/// them.
+fn named_observations(listed: &str) -> String {
+    listed
+        .split(' ')
+        .filter_map(|one| {
+            let (endpoint, source_key) = one.split_once(':')?;
+            let bytes: Vec<u8> = (0..endpoint.len())
+                .step_by(2)
+                .filter_map(|at| u8::from_str_radix(endpoint.get(at..at + 2)?, 16).ok())
+                .collect();
+            let endpoint = match key(Some(bytes)) {
+                Value::String(text) => text,
+                _ => return None,
+            };
+            Some(format!("{endpoint}:{}", source_key.to_lowercase()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// One row of RFC 4180 CSV: a cell with a comma, a quote or a line break
@@ -549,4 +624,22 @@ fn csv_row(
     }
     row.push_str("\r\n");
     file.write_all(row.as_bytes()).map_err(Error::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corroborating_observations_are_named_as_the_lines_name_them() {
+        assert_eq!(
+            named_observations(&format!(
+                "{}:6563686F01 {}:AB",
+                "11".repeat(16),
+                "22".repeat(16)
+            )),
+            "11111111-1111-1111-1111-111111111111:6563686f01 \
+             22222222-2222-2222-2222-222222222222:ab"
+        );
+    }
 }

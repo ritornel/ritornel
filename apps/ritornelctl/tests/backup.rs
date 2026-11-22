@@ -427,6 +427,16 @@ fn an_export_is_read_back_without_ritornel_and_holds_a_skipped_listen_with_where
     assert_eq!(path.parent(), Some(out.as_path()));
     server.stop();
 
+    // A listening history is its owner's alone: a file's mode is the
+    // system's to say.
+    #[cfg(unix)]
+    for file in std::fs::read_dir(&path).unwrap() {
+        use std::os::unix::fs::PermissionsExt;
+        let file = file.unwrap();
+        let mode = file.metadata().unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "{:?}", file.file_name());
+    }
+
     // From here on, only what is in the folder.
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(path.join("manifest.json")).unwrap()).unwrap();
