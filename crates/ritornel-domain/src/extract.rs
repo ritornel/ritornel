@@ -470,12 +470,22 @@ pub fn extract(payload: &Payload) -> Vec<Claim> {
     let track = values(payload, names::TRACK);
     let disc = values(payload, names::DISC);
     let total = |position: &[&str], totals: &[&str]| {
+        let positive = |n: &u32| *n > 0;
         position
             .first()
             .and_then(|value| after_slash(value))
-            .or_else(|| totals.first().and_then(|value| leading_number(value)))
-            .or_else(|| position.get(1).and_then(|value| leading_number(value)))
-            .filter(|n| *n > 0)
+            .filter(positive)
+            .or_else(|| {
+                totals
+                    .iter()
+                    .find_map(|value| leading_number(value).filter(positive))
+            })
+            .or_else(|| {
+                position
+                    .get(1)
+                    .and_then(|value| leading_number(value))
+                    .filter(positive)
+            })
     };
     let track_total = total(&track, &values(payload, names::TRACK_TOTAL));
     let disc_total = total(&disc, &values(payload, names::DISC_TOTAL));
@@ -948,6 +958,19 @@ mod tests {
             ],
         ));
         assert!(!claims.iter().any(|c| c.name.ends_with("_total")));
+    }
+
+    #[test]
+    fn an_unknown_slash_total_leaves_room_for_an_explicit_total() {
+        let claims = extract(&payload(
+            "single.flac",
+            vec![tag("TRACKNUMBER", "4/0"), tag("TRACKTOTAL", "12")],
+        ));
+        assert!(
+            claims
+                .iter()
+                .any(|claim| claim.name == "track_total" && claim.value == "12")
+        );
     }
 
     #[test]
