@@ -103,7 +103,23 @@ pub(crate) struct GainTags {
     pub(crate) album: GainTag,
 }
 
+impl GainTag {
+    /// This pair, or `other` if this has no gain: a gain and its peak are
+    /// measured together, so they are not taken from two tags.
+    fn or(self, other: Self) -> Self {
+        if self.gain_db.is_some() { self } else { other }
+    }
+}
+
 impl GainTags {
+    /// These tags, and `other`'s where these have none.
+    fn or(self, other: Self) -> Self {
+        Self {
+            track: self.track.or(other.track),
+            album: self.album.or(other.album),
+        }
+    }
+
     /// The factor a track plays at for `mode`. Limited by the peak, less a
     /// decibel for what resampling adds between the samples, and with no
     /// peak tag never above unity, since then nothing says how far it may
@@ -147,27 +163,31 @@ fn gain_tags(format: &mut dyn FormatReader) -> GainTags {
     let mut log = format.metadata();
     loop {
         if let Some(revision) = log.current() {
+            // Each block of tags gives its own pairs, which the first block
+            // with a gain wins.
+            let mut found = GainTags::default();
             let per_track = revision.per_track.iter().map(|track| &track.metadata);
             for container in std::iter::once(&revision.media).chain(per_track) {
                 for tag in &container.tags {
                     let (slot, value) = match &tag.std {
                         Some(StandardTag::ReplayGainTrackGain(value)) => {
-                            (&mut tags.track.gain_db, value)
+                            (&mut found.track.gain_db, value)
                         }
                         Some(StandardTag::ReplayGainTrackPeak(value)) => {
-                            (&mut tags.track.peak, value)
+                            (&mut found.track.peak, value)
                         }
                         Some(StandardTag::ReplayGainAlbumGain(value)) => {
-                            (&mut tags.album.gain_db, value)
+                            (&mut found.album.gain_db, value)
                         }
                         Some(StandardTag::ReplayGainAlbumPeak(value)) => {
-                            (&mut tags.album.peak, value)
+                            (&mut found.album.peak, value)
                         }
                         _ => continue,
                     };
                     *slot = slot.or_else(|| gain_number(value));
                 }
             }
+            tags = tags.or(found);
         }
         if log.is_latest() {
             break;
@@ -359,6 +379,7 @@ impl Source {
             hint.with_extension(extension);
         }
         let mut format = probe(Box::new(opened.reader(opened.len)), &hint)?;
+        let mut tags = gain_tags(format.as_mut());
         // As the scan reads them: a tag after the last frame of an MP3 or
         // a FLAC is hidden, or its frame scanner would play it as audio.
         if matches!(
@@ -367,6 +388,9 @@ impl Source {
         ) && opened.audio_end < opened.len
         {
             format = probe(Box::new(opened.reader(opened.audio_end)), &hint)?;
+            // The tags before the audio come first. One after it, where
+            // mp3gain and foobar2000 write theirs, gives what they lack.
+            tags = gain_tags(format.as_mut()).or(tags);
         }
         let track = format
             .default_track(TrackType::Audio)
@@ -404,7 +428,6 @@ impl Source {
                 || "unknown".to_owned(),
                 |codec| codec.codec.info.short_name.to_owned(),
             );
-        let tags = gain_tags(format.as_mut());
         let mut source = Self {
             format,
             decoder,

@@ -725,6 +725,95 @@ fn replay_gain_tags_are_read_from_vorbis_comments_and_id3() {
     );
 }
 
+/// A copy of a fixture with an APEv2 tag of `items` after its audio, with
+/// a header and a footer, as mp3gain and foobar2000 write one.
+fn with_ape_tag(name: &str, to: &Path, items: &[(&str, &str)]) {
+    let mut body = Vec::new();
+    for (key, value) in items {
+        body.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(&0_u32.to_le_bytes());
+        body.extend_from_slice(key.as_bytes());
+        body.push(0);
+        body.extend_from_slice(value.as_bytes());
+    }
+    let size = u32::try_from(body.len() + 32).unwrap();
+    let count = u32::try_from(items.len()).unwrap();
+    let block = |flags: u32| {
+        let mut block = b"APETAGEX".to_vec();
+        for word in [2000, size, count, flags] {
+            block.extend_from_slice(&u32::to_le_bytes(word));
+        }
+        block.extend_from_slice(&[0; 8]);
+        block
+    };
+    let mut bytes = std::fs::read(fixture(name)).unwrap();
+    // The header says it is one, and both say there is a header.
+    bytes.extend(block(0xA000_0000));
+    bytes.extend(body);
+    bytes.extend(block(0x8000_0000));
+    std::fs::write(to, bytes).unwrap();
+}
+
+#[test]
+fn replay_gain_in_an_ape_tag_after_the_audio_is_applied_and_the_tag_is_not_played() {
+    let scratch = crate::testing::Scratch::new();
+    let untouched = peak(&s16("a.flac.s16le"));
+    for name in ["a.mp3", "a.flac"] {
+        let path = scratch.path().join(name);
+        let items = [
+            ("REPLAYGAIN_TRACK_GAIN", "-6.02 dB"),
+            ("REPLAYGAIN_TRACK_PEAK", "0.125"),
+        ];
+        with_ape_tag(name, &path, &items);
+        let tags = Source::open(&path, 0).unwrap().tags;
+        assert_eq!(tags.track.gain_db, Some(-6.02), "{name}");
+        assert_eq!(tags.track.peak, Some(0.125), "{name}");
+        let (mut renderer, tap) = AudioRenderer::tapped(AS_IS, 50).unwrap();
+        renderer.set_replay_gain(ReplayGain::Track);
+        renderer.load(&path, facts(&path), 0, 1).unwrap();
+        renderer.play();
+        let mut said = Vec::new();
+        until(&mut renderer, &mut said, |said| ended(said, 1).is_some());
+        assert_eq!(ended(&said, 1), Some((8000, End::Drained)), "{name}");
+        let heard = tap.lock().unwrap();
+        assert_eq!(heard.len(), 8000, "{name}");
+        let level = peak(&heard) / untouched;
+        assert!((level - 0.5).abs() < 0.03, "{name}: {level}");
+    }
+}
+
+#[test]
+fn a_gain_tagged_before_the_audio_is_the_one_applied_whatever_a_tag_after_it_says() {
+    let scratch = crate::testing::Scratch::new();
+    for name in ["rg.flac", "rg.mp3"] {
+        let path = scratch.path().join(name);
+        with_ape_tag(name, &path, &[("REPLAYGAIN_TRACK_GAIN", "-30 dB")]);
+        let tags = Source::open(&path, 0).unwrap().tags;
+        assert_eq!(tags.track.gain_db, Some(-6.02), "{name}");
+        assert_eq!(tags.album.gain_db, Some(20.0), "{name}");
+    }
+    // A gain and its peak are measured together: a peak with no gain
+    // before the audio is not paired with a gain after it.
+    let path = scratch.path().join("peak-only.flac");
+    with_ape_tag("rg.flac", &path, &[("REPLAYGAIN_TRACK_GAIN", "+20 dB")]);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let key = b"REPLAYGAIN_TRACK_GAIN";
+    let at = bytes
+        .windows(key.len())
+        .position(|word| word == key)
+        .unwrap();
+    bytes[at] = b'X';
+    std::fs::write(&path, bytes).unwrap();
+    let tags = Source::open(&path, 0).unwrap().tags;
+    assert_eq!(
+        tags.track,
+        decode::GainTag {
+            gain_db: Some(20.0),
+            peak: None
+        }
+    );
+}
+
 #[test]
 fn a_gain_is_held_under_full_scale_by_its_peak_and_never_raised_with_none() {
     let tag = |gain_db, peak| decode::GainTag {
