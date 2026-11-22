@@ -560,6 +560,163 @@ fn an_album_of_many_artists_with_no_album_artist_is_one_release_by_various_artis
     assert_eq!(resolution.artists.len(), 1);
 }
 
+/// The artists the releases show.
+fn shown_artists(resolution: &Resolution) -> std::collections::BTreeSet<usize> {
+    resolution
+        .releases
+        .iter()
+        .filter_map(|release| release.credit)
+        .flat_map(|credit| {
+            resolution.credits[credit]
+                .names
+                .iter()
+                .map(|(artist, ..)| *artist)
+        })
+        .collect()
+}
+
+#[test]
+fn albums_whose_files_name_no_artist_are_one_unknown_artists() {
+    let mut world = World::default();
+    let nameless = |path: &'static str, audio: i64, album: &str| {
+        file(path, audio)
+            .with(|facts| {
+                facts.title = Some(format!("Song {audio}"));
+                facts.duration_ms = Some(200_000);
+            })
+            .on(album, None, audio)
+    };
+    world.add(nameless("Field Notes/1.flac", 1, "Field Notes"));
+    world.add(nameless("Field Notes/2.flac", 2, "Field Notes"));
+    world.add(nameless("Glass Pier/1.flac", 3, "Glass Pier"));
+    // A file whose album artist is written as that name is the same artist.
+    world.add(nameless("Salt Road/1.flac", 4, "Salt Road").by("Unknown Artist"));
+    let resolution = world.settle();
+    assert_eq!(resolution.releases.len(), 3);
+    let credits: Vec<&str> = resolution
+        .releases
+        .iter()
+        .map(|release| resolution.credits[release.credit.unwrap()].text.as_str())
+        .collect();
+    assert_eq!(credits, ["Unknown Artist"; 3]);
+    assert_eq!(shown_artists(&resolution).len(), 1);
+    world.assert_settled();
+
+    // A library resolved when such an album was Various Artists' keeps the
+    // album's rows when it becomes Unknown Artist's. Its old credit is
+    // what an album artist tag of Various Artists gives.
+    let mut world = World::default();
+    let ids = [1, 2, 3].map(|id| {
+        let path: &'static str = Box::leak(format!("Album {id}/1.flac").into_boxed_str());
+        world.add(nameless(path, id, &format!("Album {id}")).by("Various Artists"))
+    });
+    world.settle();
+    let before = ids.map(|id| (world.release(id), world.group(id)));
+    for item in &mut world.library.items {
+        item.facts.album_artist.clear();
+    }
+    let resolution = world.settle();
+    assert_eq!(ids.map(|id| (world.release(id), world.group(id))), before);
+    for release in &resolution.releases {
+        assert_eq!(
+            resolution.credits[release.credit.unwrap()].text,
+            "Unknown Artist"
+        );
+    }
+    world.assert_settled();
+}
+
+/// Unknown Artist is only what such an album shows: it is formed and
+/// grouped as it was when it was shown as Various Artists'.
+#[test]
+fn an_album_shown_as_unknown_artists_is_formed_and_grouped_as_before() {
+    let credit_of = |resolution: &Resolution, world: &World, id: i64| {
+        let row = world.release(id).unwrap();
+        let release = resolution
+            .releases
+            .iter()
+            .find(|release| release.r == Ref::Row(row))
+            .unwrap();
+        resolution.credits[release.credit.unwrap()].text.clone()
+    };
+    let nameless = |path: &'static str, audio: i64, track: i64| {
+        file(path, audio)
+            .with(|facts| {
+                facts.title = Some(format!("Song {audio}"));
+                facts.duration_ms = Some(200_000);
+            })
+            .on("Night Drives", None, track)
+    };
+
+    // A compilation with one file that names no artist stays whole.
+    let mut world = World::default();
+    let ada = world.add(
+        file("Night Drives/1.flac", 1)
+            .song("Glass Pier", "Ada Wren", 200)
+            .on("Night Drives", None, 1)
+            .by("Various Artists"),
+    );
+    world.add(
+        file("Night Drives/2.flac", 2)
+            .song("Salt Road", "Ninefold", 200)
+            .on("Night Drives", None, 2)
+            .by("Various Artists"),
+    );
+    let untagged = world.add(nameless("Night Drives/3.flac", 3, 3));
+    // Settled twice, so that every release has its row.
+    world.settle();
+    let resolution = world.settle();
+    assert_eq!(resolution.releases.len(), 1);
+    assert_eq!(world.release(ada), world.release(untagged));
+    assert_eq!(credit_of(&resolution, &world, ada), "Various Artists");
+    world.assert_settled();
+
+    // A record tagged as Unknown Artist's is not joined to one that names
+    // no artist, though both show the one artist.
+    let mut world = World::default();
+    let bare = world.add(nameless("Here/1.flac", 1, 1));
+    let tagged = world.add(nameless("There/2.flac", 2, 2).by("Unknown Artist"));
+    // Settled twice, so that every release has its row.
+    world.settle();
+    let resolution = world.settle();
+    assert_ne!(world.release(bare), world.release(tagged));
+    assert_eq!(credit_of(&resolution, &world, bare), "Unknown Artist");
+    assert_eq!(credit_of(&resolution, &world, tagged), "Unknown Artist");
+    assert_eq!(shown_artists(&resolution).len(), 1);
+    world.assert_settled();
+
+    // Copies of one record, one with no artist named and two tagged as
+    // Various Artists', are one group, and it shows one artist.
+    let mut world = World::default();
+    let copies = ["A", "B", "C"].map(|folder| {
+        let path: &'static str = Box::leak(format!("{folder}/1.flac").into_boxed_str());
+        let copy = nameless(path, 1, 1);
+        world.add(if folder == "A" {
+            copy
+        } else {
+            copy.by("Various Artists")
+        })
+    });
+    // Settled twice, so that every release has its row.
+    world.settle();
+    let resolution = world.settle();
+    assert_eq!(resolution.releases.len(), 3);
+    assert_eq!(resolution.groups.len(), 1);
+    assert_eq!(credit_of(&resolution, &world, copies[0]), "Various Artists");
+    assert_eq!(credit_of(&resolution, &world, copies[1]), "Various Artists");
+    world.assert_settled();
+
+    // A record whose files name their artists only in a list of them
+    // names artists.
+    let mut world = World::default();
+    let listed = world.add(nameless("Listed/1.flac", 1, 1).with(|facts| {
+        facts.artists = vec!["Ada Wren".to_owned(), "Ninefold".to_owned()];
+    }));
+    world.settle();
+    let resolution = world.settle();
+    assert_eq!(credit_of(&resolution, &world, listed), "Various Artists");
+}
+
 #[test]
 fn a_multi_disc_album_in_disc_folders_is_one_release_when_the_discs_are_numbered() {
     let discs = |numbered: bool, policy: Policy| {

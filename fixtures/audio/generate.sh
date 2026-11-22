@@ -54,6 +54,9 @@ $FF -i b.flac -map 0:a -c copy -map_metadata -1 -metadata "title=Paper Kites" \
     -metadata "artist=Moss Arcade" -metadata "album=Night Drives" \
     -metadata "album_artist=Various Artists" -metadata "compilation=1" -metadata "track=7" \
     b.compilation.flac
+# The same song with an album and no artist at all.
+$FF -i b.flac -map 0:a -c copy -map_metadata -1 -metadata "title=Salt Road" \
+    -metadata "album=Field Notes" -metadata "track=1" b.no-artist.flac
 
 # MP3: ID3v2.4, with Picard's user-defined frames.
 $FF -i "$tmp/a.wav" -c:a libmp3lame -b:a 32k -id3v2_version 4 "${PLAIN[@]}" \

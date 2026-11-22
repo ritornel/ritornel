@@ -21,7 +21,7 @@ fn read(name: &str) -> Payload {
 
 /// Each fixture that is audio: its codec, its duration in milliseconds and
 /// its audio hash.
-const PINNED: [(&str, &str, u64, &str); 26] = [
+const PINNED: [(&str, &str, u64, &str); 27] = [
     (
         "a.flac",
         "flac",
@@ -48,6 +48,12 @@ const PINNED: [(&str, &str, u64, &str); 26] = [
     ),
     (
         "b.compilation.flac",
+        "flac",
+        500,
+        "965afb3a8fd3e3aa0d08901d19024674e12a3c0b71a790183057a893e0b1f6e2",
+    ),
+    (
+        "b.no-artist.flac",
         "flac",
         500,
         "965afb3a8fd3e3aa0d08901d19024674e12a3c0b71a790183057a893e0b1f6e2",
@@ -223,6 +229,7 @@ fn retagging_never_changes_the_hash_and_other_audio_always_does() {
         ("a.ogg", "a.retagged.ogg"),
         ("a.opus", "a.retagged.opus"),
         ("b.flac", "b.compilation.flac"),
+        ("b.flac", "b.no-artist.flac"),
         // ReplayGain tags are tags.
         ("a.flac", "rg.flac"),
         ("a.mp3", "rg.mp3"),
