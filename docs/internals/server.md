@@ -162,9 +162,9 @@ Settings resolve in order: **CLI flag → `RITORNEL_*` environment variable → 
 | Listen address | `--listen` | `RITORNEL_LISTEN` | `127.0.0.1:4747` (fallback: OS port); or `private:<port>` |
 | Log level | `--log-level` | `RITORNEL_LOG_LEVEL` | `info` |
 | Backup folder | `--backup-dir` | `RITORNEL_BACKUP_DIR` | None (backups disabled until set) |
-| Server name (`name`) | `--name` | `RITORNEL_NAME` | None (the stored name stands) |
+| Server name | `--name` | `RITORNEL_NAME` | None (the stored name stands) |
 
-A name given in the settings replaces the stored one in `server_identity` at every start (`Server::start_run`), so a headless machine is called what its settings say however it was named before. It is trimmed and must be 1 to `MAX_CLIENT_TEXT` (100) characters with no control characters. Without one, the stored name stands: `Ritornel server` on a new server, or the last name a setting gave.
+A name given in the settings (`name` in `config.toml`) replaces the stored one in `server_identity` at every start (`Server::start_run`), so a headless machine is called what its settings say however it was named before. It is trimmed and must be 1 to `MAX_CLIENT_TEXT` (100) characters with no control characters. Without one, the stored name stands: `Ritornel server` on a new server, or the last name a setting gave.
 
 `--data-dir` / `RITORNEL_DATA_DIR` selects the data directory before `config.toml` is read, and `--output` (`default`, `null`, `none`) selects the audio output mode. All other persistent settings live in `library.db` (library-wide) or `server.db` (machine-local).
 

@@ -284,8 +284,8 @@ impl ServerStore {
 
     /// Changes the server's display name, and returns the identity as it
     /// now is: `None` if the server has none yet. The ID and the key never
-    /// change. What a name may be is for the call that takes one from a
-    /// client to decide; there is none yet.
+    /// change. What a name may be is for whoever passes it to decide: the
+    /// server's `name` setting is checked as it is read.
     pub fn rename(&self, name: &str) -> Result<Option<ServerIdentity>, Error> {
         let name = name.to_owned();
         self.writer.call(move |connection| {

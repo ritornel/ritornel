@@ -77,7 +77,13 @@ What differs between systems sits in a `platform` module in each crate that need
 - The desktop app follows the server; the server uses 1–2% of one core and 27 MB while playing.
 - Because the standard library cannot open a directory handle on Windows to flush it, `sync_dir` in `apps/server/src/platform/windows.rs` is currently a no-op (each file inside a backup is flushed before rename, while the directory rename itself is tracked in [#111](https://github.com/ritornel/ritornel/issues/111)).
 
-**Not yet verified on hardware:** hardware media keys or desktop media widgets, the systemd service across logout/login, real Bluetooth or HDMI output changes, headphone unplug/device loss on Windows, and a USB output unplugged behind PipeWire, which the stall rule ("Audio pipeline" in `docs/internals/playback.md`) is there to catch.
+**arm64 Linux** (the headless player in release, on GitHub's Ubuntu 24.04 arm64 runner, measured by `scripts/player-footprint.sh`):
+
+- The engine's and the server's tests pass, the decoding ones bit for bit.
+- `ritornel-server` is 18 MiB as built and 13 MiB stripped, and links `libasound` and libc only.
+- The server holds 11 MB resident at idle with an empty data directory, 2 MB of it its own memory and the rest its mapped program.
+
+**Not yet verified on hardware:** hardware media keys or desktop media widgets, the systemd service across logout/login, real Bluetooth or HDMI output changes, headphone unplug/device loss on Windows, the headless player on a Raspberry Pi, and a USB output unplugged behind PipeWire, which the stall rule ("Audio pipeline" in `docs/internals/playback.md`) is there to catch.
 
 ## Later
 

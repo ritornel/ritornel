@@ -133,7 +133,8 @@ impl Server {
             "server.db is open"
         );
 
-        let (mut identity, issued) = store.ensure_identity(DEFAULT_NAME)?;
+        let first_name = run.name.as_deref().unwrap_or(DEFAULT_NAME);
+        let (mut identity, issued) = store.ensure_identity(first_name)?;
         if issued.is_some() {
             info!(server_id = %identity.server_id, "first start: created this server's identity");
         }
