@@ -2884,3 +2884,34 @@ fn an_artist_named_with_a_symbol_keeps_its_row_from_normaliser_2_or_1() {
         "{found:?}"
     );
 }
+
+#[test]
+fn an_ineligible_copy_cannot_hide_a_recordings_eligible_runner_up() {
+    let song = |path, audio, album, seconds, mbid: Option<&str>| {
+        file(path, audio)
+            .song("Glass Pier", "Ninefold", seconds)
+            .on(album, None, 1)
+            .with(|f| f.recording_mbid = mbid.map(str::to_owned))
+    };
+    let mut world = World::default();
+    world.add(song("A/1.flac", 1, "Long Field", 200, Some("rec-a")));
+    world.add(song("B/1.flac", 2, "Long Field", 207, Some("rec-b")));
+    world.add(song("C/1.flac", 3, "Other Shores", 201, Some("rec-b")));
+    let probe = world.add(song("D/1.flac", 4, "Long Field", 200, None));
+    let r = world.settle();
+    assert_eq!(decision(&r, probe).method, Method::New);
+    assert!(decision(&r, probe).needs_review);
+}
+
+#[test]
+fn an_album_part_number_does_not_make_its_songs_different_versions() {
+    let (world, original, loose, decision) = after_first(
+        file("A/1.flac", 1)
+            .song("Glass Pier", "Ninefold", 200)
+            .on("Long Field Part II", None, 1),
+        file("B/1.flac", 2).song("Glass Pier", "Ninefold", 200),
+        Policy::v2(),
+    );
+    assert_eq!(decision.method, Method::TagsDuration);
+    assert_eq!(world.recording(original), world.recording(loose));
+}

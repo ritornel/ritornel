@@ -327,7 +327,12 @@ pub(crate) fn part_number(word: &str) -> Option<u32> {
 /// With policy 2's list (`list` 2), every spelling of "a cappella" is one
 /// marker, and a part number is one: "Part II", "Pt. 2" and "Part Two"
 /// are all `part 2`. Like the others, they can only stop a match.
-fn markers(text: Option<&str>, words: &'static [&'static str], list: u8) -> Vec<String> {
+fn markers(
+    text: Option<&str>,
+    words: &'static [&'static str],
+    list: u8,
+    parts: bool,
+) -> Vec<String> {
     let text = text.unwrap_or("");
     let lower: String = text.nfkc().flat_map(char::to_lowercase).collect();
     let split: Vec<&str> = lower
@@ -349,7 +354,7 @@ fn markers(text: Option<&str>, words: &'static [&'static str], list: u8) -> Vec<
             add((*marker).to_owned());
         }
     }
-    if list >= 2 {
+    if parts && list >= 2 {
         for pair in split.windows(2) {
             if let [word, number] = pair
                 && PART.contains(word)
@@ -379,7 +384,7 @@ fn apart(a: Option<(Option<i64>, i64)>, b: Option<(Option<i64>, i64)>) -> bool {
 
 /// The version markers of a title by a marker list.
 pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
-    markers(Some(title), VERSION_MARKERS, list)
+    markers(Some(title), VERSION_MARKERS, list, true)
 }
 
 /// The version markers of an album title, such as "live" or "acoustic", by
@@ -387,7 +392,7 @@ pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
 /// "Acoustics" as "acoustic"; the file resolver's policies do not, so that
 /// their results stay as they are.
 pub(crate) fn album_markers_of(album: &str) -> Vec<String> {
-    let mut found = markers(Some(album), ALBUM_MARKERS, 2);
+    let mut found = markers(Some(album), ALBUM_MARKERS, 2, true);
     // Read as `markers` reads, between any marks and with marks inside a
     // word joining it.
     let lower: String = album.nfkc().flat_map(char::to_lowercase).collect();
@@ -423,8 +428,18 @@ impl Ev {
             release: facts.release_mbid.clone(),
             release_group: facts.release_group_mbid.clone(),
             duration: facts.duration_ms,
-            markers: markers(facts.title.as_deref(), VERSION_MARKERS, policy.marker_list),
-            album_markers: markers(facts.album.as_deref(), ALBUM_MARKERS, policy.marker_list),
+            markers: markers(
+                facts.title.as_deref(),
+                VERSION_MARKERS,
+                policy.marker_list,
+                true,
+            ),
+            album_markers: markers(
+                facts.album.as_deref(),
+                ALBUM_MARKERS,
+                policy.marker_list,
+                false,
+            ),
             on_release: on_release.cloned(),
             position: facts.track.map(|track| (facts.disc, track)),
             mbid: facts.recording_mbid.clone(),
@@ -856,6 +871,7 @@ impl<'a> Fold<'a> {
         let policy = self.policy;
         let mut claims = Vec::new();
         let mut candidates: Vec<Weighed> = Vec::new();
+        let mut bindable: Vec<Weighed> = Vec::new();
         if contradictions.is_empty()
             && let (Some(full), Some(core), Some(artist)) =
                 (&probe.full, &probe.core, &probe.artist)
@@ -878,15 +894,9 @@ impl<'a> Fold<'a> {
             for alias in self.title_alias.get(full).into_iter().flatten() {
                 indexes.extend(self.by_full.get(alias).into_iter().flatten().copied());
             }
-            // Each recording is weighed by its nearest evidence. When tags
-            // may not bind across albums, evidence they may bind by that is
-            // near enough to bind comes first, so that a copy of the file's
-            // own album is what the recording is weighed by.
-            let rank = |weighed: &Weighed| -> (bool, f64) {
-                let bindable = weighed.may_bind(policy) && weighed.distance <= policy.bind_max;
-                (!bindable, weighed.distance)
-            };
-            let mut best: HashMap<usize, Weighed> = HashMap::new();
+            // Keep the closest evidence overall and the closest eligible to
+            // bind. A runner-up can narrow the gap even above bind_max.
+            let mut best: HashMap<usize, (Weighed, Option<Weighed>)> = HashMap::new();
             let mut clashes: HashMap<usize, i64> = HashMap::new();
             for index in indexes {
                 let Some(ev) = self.evs.get(index) else {
@@ -925,20 +935,31 @@ impl<'a> Fold<'a> {
                         apart_ms: probe.duration.zip(ev.duration).map(|(a, b)| (a - b).abs()),
                         clash: None,
                     };
-                    let entry = best.entry(ev.rec).or_insert(weighed);
-                    if rank(&weighed) < rank(entry) {
-                        *entry = weighed;
+                    let (nearest, eligible) = best.entry(ev.rec).or_insert((weighed, None));
+                    if distance < nearest.distance {
+                        *nearest = weighed;
+                    }
+                    if weighed.may_bind(policy) && eligible.is_none_or(|e| distance < e.distance) {
+                        *eligible = Some(weighed);
                     }
                 }
             }
-            candidates = best
-                .into_values()
-                .map(|weighed| Weighed {
-                    clash: clashes.get(&weighed.rec).copied(),
-                    ..weighed
-                })
-                .collect();
-            candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.rec.cmp(&b.rec)));
+            for (mut nearest, eligible) in best.into_values() {
+                if let Some(&item) = clashes.get(&nearest.rec) {
+                    nearest.clash = Some(item);
+                } else if let Some(eligible) = eligible {
+                    bindable.push(eligible);
+                    if eligible.distance <= policy.bind_max {
+                        nearest = eligible;
+                    }
+                }
+                candidates.push(nearest);
+            }
+            let order = |a: &Weighed, b: &Weighed| {
+                a.distance.total_cmp(&b.distance).then(a.rec.cmp(&b.rec))
+            };
+            candidates.sort_by(order);
+            bindable.sort_by(order);
         }
         let listed: Vec<Candidate> = candidates
             .iter()
@@ -949,24 +970,16 @@ impl<'a> Fold<'a> {
                 penalties: Some(weighed.penalties),
             })
             .collect();
-        let gap_of = |list: &[&Weighed]| match (list.first(), list.get(1)) {
+        let gap_of = |list: &[Weighed]| match (list.first(), list.get(1)) {
             (Some(best), Some(next)) => Some(next.distance - best.distance),
             _ => None,
         };
-        let binds = |list: &[&Weighed]| {
-            list.first().copied().copied().filter(|best| {
+        let binds = |list: &[Weighed]| {
+            list.first().copied().filter(|best| {
                 best.distance <= policy.bind_max
                     && gap_of(list).is_none_or(|gap| gap >= policy.min_gap)
             })
         };
-        let all: Vec<&Weighed> = candidates.iter().collect();
-        // Only the candidates tags may bind to: when they may not bind
-        // across albums, one on another album, at a length that is not the
-        // same, is no binding and no runner-up to one either.
-        let bindable: Vec<&Weighed> = candidates
-            .iter()
-            .filter(|weighed| weighed.may_bind(policy))
-            .collect();
         if let Some(best) = binds(&bindable) {
             return Outcome::Bind {
                 rec: best.rec,
@@ -1013,7 +1026,7 @@ impl<'a> Fold<'a> {
             decision: Decision {
                 method: Method::New,
                 score: 0.0,
-                runner_up_gap: gap_of(&all),
+                runner_up_gap: gap_of(&candidates),
                 penalties: None,
                 needs_review: doubtful || !contradictions.is_empty() || withheld.is_some(),
                 evidence: Evidence {
