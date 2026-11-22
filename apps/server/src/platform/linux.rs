@@ -39,6 +39,40 @@ fn units_dir(env: Env<'_>) -> Result<PathBuf, Error> {
     Ok(config.join("systemd/user"))
 }
 
+/// The machine's pretty name if one is set, as `hostnamectl` shows it, or
+/// else its host name.
+pub(crate) fn computer_name() -> Option<String> {
+    let pretty = std::fs::read_to_string("/etc/machine-info")
+        .ok()
+        .and_then(|info| {
+            info.lines().find_map(|line| {
+                let value = line.strip_prefix("PRETTY_HOSTNAME=")?;
+                Some(value.trim().trim_matches(['"', '\'']).to_owned())
+            })
+        })
+        .filter(|name| !name.is_empty());
+    pretty.or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+}
+
+/// Holds an idle inhibitor lock through `systemd-inhibit`, which holds it
+/// for as long as the `cat` it runs is reading: until this server closes
+/// its end of the pipe, or ends. Screen blanking is not inhibited.
+pub(crate) fn stay_awake(why: &str) -> std::io::Result<super::Awake> {
+    Command::new("systemd-inhibit")
+        .args([
+            "--what=idle",
+            "--mode=block",
+            "--who=Ritornel",
+            &format!("--why={why}"),
+            "cat",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(super::Awake)
+}
+
 /// Writes the unit that serves `data_dir`, enables it and starts it,
 /// replacing one registered before, and says what was done.
 pub(crate) fn install_service(data_dir: Option<&Path>, env: Env<'_>) -> Result<String, Error> {

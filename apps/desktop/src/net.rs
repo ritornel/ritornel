@@ -65,6 +65,8 @@ pub(crate) struct Net {
     pub versions: Option<Versions>,
     /// Whether the server holds a library.
     pub holds: bool,
+    /// On a satellite, its hub, and whether it answers.
+    pub hub: Option<ritornel_contract::HubStatus>,
 }
 
 impl Net {
@@ -121,6 +123,7 @@ impl Net {
                 holds: status
                     .as_ref()
                     .is_none_or(|status| status.library.is_some()),
+                hub: status.as_ref().and_then(|status| status.hub.clone()),
             },
             events,
         ))
@@ -136,6 +139,7 @@ impl Net {
             role: status.role,
             versions: Some(status.versions.clone()),
             holds: status.library.is_some(),
+            hub: status.hub.clone(),
         }
     }
 

@@ -22,6 +22,10 @@ const LOCAL_CREDENTIAL_SESSION: &str = "local_credential_session_id";
 /// Absent means it does.
 const WATCH_SETTING: &str = "library.watch";
 
+/// The `server_setting` row that says when this server keeps its machine
+/// from sleeping for its linked servers. Absent means the default.
+const AWAKE_SETTING: &str = "link.awake";
+
 /// The `server_setting` rows that say when this server last backed up, and
 /// when a backup last failed if none has worked since.
 const BACKUP_TAKEN: &str = "backup.last";
@@ -33,6 +37,8 @@ const BACKUP_FAILED: &str = "backup.failed";
 pub enum SettingChange {
     /// Watching the library's folders, on or off.
     Watching(bool),
+    /// When to keep the machine awake for linked servers.
+    Awake(ritornel_contract::Awake),
     /// Scrobbling to a service, on from now or off.
     Scrobbling {
         /// The service.
@@ -63,6 +69,17 @@ fn set_watching(connection: &Connection, on: bool) -> Result<(), Error> {
         "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
          ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
         (WATCH_SETTING, if on { "true" } else { "false" }),
+    )?;
+    Ok(())
+}
+
+fn set_awake(connection: &Connection, awake: ritornel_contract::Awake) -> Result<(), Error> {
+    let value = serde_json::to_string(&awake)
+        .map_err(|_| Error::Invalid("the wake setting could not be written"))?;
+    connection.execute(
+        "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+        (AWAKE_SETTING, value),
     )?;
     Ok(())
 }
@@ -314,6 +331,26 @@ impl ServerStore {
         })
     }
 
+    /// When this server keeps its machine from sleeping for its linked
+    /// servers, if it has been set. A stored value that cannot be read is
+    /// [`Error::Invalid`]. See "Keeping a hub awake" in
+    /// docs/internals/server.md.
+    pub fn awake(&self) -> Result<Option<ritornel_contract::Awake>, Error> {
+        self.reader.call(|connection| {
+            let value: Option<String> = connection
+                .query_row(
+                    "SELECT value_json FROM server_setting WHERE key = ?1",
+                    [AWAKE_SETTING],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            value
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(|_| Error::Invalid("the stored wake setting cannot be read"))
+        })
+    }
+
     /// Turns watching on or off, for this machine.
     pub fn set_watching(&self, on: bool) -> Result<(), Error> {
         self.writer
@@ -341,6 +378,7 @@ impl ServerStore {
             }
             let found = match &change {
                 SettingChange::Watching(on) => set_watching(transaction, *on).map(|()| true)?,
+                SettingChange::Awake(awake) => set_awake(transaction, *awake).map(|()| true)?,
                 SettingChange::Scrobbling { service, on } => {
                     if !crate::service_session::set_scrobbling(transaction, service, *on, now_ms)? {
                         return Err(Error::NotFound("no session at the service"));
@@ -613,6 +651,42 @@ mod tests {
                 Ok(rows.collect::<Result<_, _>>()?)
             })
             .unwrap()
+    }
+
+    #[test]
+    fn the_wake_setting_is_the_default_until_set_and_kept_once_set() {
+        let clock = Arc::new(FixedClock::at(T0));
+        let store = in_memory(&clock);
+        assert_eq!(store.awake().unwrap(), None);
+        let command = crate::Command {
+            id: Id::from_bytes([7; 16]),
+            fingerprint: crate::Fingerprint::of("link.setAwake", b"never"),
+        };
+        let changed = store
+            .change_once(
+                command,
+                "link.setAwake",
+                SettingChange::Awake(ritornel_contract::Awake::Never),
+            )
+            .unwrap();
+        assert!(changed.now);
+        assert_eq!(
+            store.awake().unwrap(),
+            Some(ritornel_contract::Awake::Never)
+        );
+        // The same command again changes nothing.
+        let again = store
+            .change_once(
+                command,
+                "link.setAwake",
+                SettingChange::Awake(ritornel_contract::Awake::Always),
+            )
+            .unwrap();
+        assert!(!again.now);
+        assert_eq!(
+            store.awake().unwrap(),
+            Some(ritornel_contract::Awake::Never)
+        );
     }
 
     #[test]

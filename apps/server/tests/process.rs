@@ -69,6 +69,7 @@ fn serve(data_dir: &Path, extra: &[&str]) -> Command {
         .arg(data_dir)
         .args(["--listen", "127.0.0.1:0"])
         .args(extra)
+        .env("RITORNEL_TEST_COMPUTER_NAME", "Invented Desk")
         .env_remove("RITORNEL_DATA_DIR")
         .env_remove("RITORNEL_LISTEN")
         .env_remove("RITORNEL_LOG_LEVEL")
@@ -372,7 +373,7 @@ fn a_second_server_on_the_same_directory_is_refused_and_the_first_stops_cleanly(
             "pid": first.pid,
             "endpoint": endpoint,
             "serverId": first.server_id,
-            "contractVersion": 0,
+            "contractVersion": ritornel_contract::CONTRACT_VERSION,
         })
     );
 
@@ -521,6 +522,7 @@ fn every_log_line_is_json_with_the_runs_boot_id_and_no_secret() {
             "starting",
             "server.db is open",
             "first start: created this server's identity",
+            "this server is named after its computer",
             "local credential",
             "listening",
             "ready",
@@ -541,7 +543,7 @@ fn every_log_line_is_json_with_the_runs_boot_id_and_no_secret() {
         assert_eq!(line["boot_id"].as_str().unwrap().len(), 36, "{line}");
     }
     // One boot ID a run, and a new one for the next.
-    let (first, second) = lines.split_at(8);
+    let (first, second) = lines.split_at(9);
     assert!(
         first
             .iter()
@@ -557,11 +559,12 @@ fn every_log_line_is_json_with_the_runs_boot_id_and_no_secret() {
     assert_eq!(lines[1]["sqlite"], "3.54.1");
     assert_eq!(lines[1]["schema_version"], 2);
     assert_eq!(lines[1]["migrations_applied"], 2);
-    assert_eq!(lines[9]["migrations_applied"], 0);
-    assert_eq!(lines[3]["credential"], "issued");
-    assert_eq!(lines[10]["credential"], "kept");
+    assert_eq!(lines[10]["migrations_applied"], 0);
+    assert_eq!(lines[3]["name"], "Invented Desk");
+    assert_eq!(lines[4]["credential"], "issued");
+    assert_eq!(lines[11]["credential"], "kept");
     // Each run listened where the system put it.
-    for listening in [&lines[4], &lines[11]] {
+    for listening in [&lines[5], &lines[12]] {
         let endpoint = listening["endpoint"].as_str().unwrap();
         assert!(endpoint.starts_with("127.0.0.1:"), "{endpoint}");
     }

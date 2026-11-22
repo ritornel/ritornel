@@ -35,6 +35,17 @@ impl Drop for Transports {
     }
 }
 
+/// A task of the server's own, ended when the server stops or is dropped,
+/// so that it never outlives the server it holds.
+#[derive(Debug)]
+struct Task(tokio::task::JoinHandle<()>);
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A running server.
 #[derive(Debug)]
 pub struct Server {
@@ -47,6 +58,12 @@ pub struct Server {
     scrobbler: crate::lastfm::Scrobbler,
     /// The thread that watches the hub's folders.
     watcher: crate::watch::Watcher,
+    /// What follows a satellite's hub and tells its clients when the hub
+    /// is away, or back.
+    hub: Task,
+    /// What lets a hub's machine sleep again once no linked server is
+    /// active.
+    awake: Task,
     transports: Transports,
     listening: Listening,
     bounds: Bounds,
@@ -116,9 +133,19 @@ impl Server {
             "server.db is open"
         );
 
-        let (identity, issued) = store.ensure_identity(DEFAULT_NAME)?;
+        let (mut identity, issued) = store.ensure_identity(DEFAULT_NAME)?;
         if issued.is_some() {
             info!(server_id = %identity.server_id, "first start: created this server's identity");
+        }
+        // Named after its computer, so that a hub's satellites and a
+        // satellite's hub say which machine each is. A name someone chose
+        // is kept.
+        if identity.name == DEFAULT_NAME
+            && let Some(name) = run.name.as_deref()
+            && let Some(renamed) = store.rename(name)?
+        {
+            info!(name = %renamed.name, "this server is named after its computer");
+            identity = renamed;
         }
         let (credential, verifier) = credential::ensure(&store, &dir.credential(), issued)?;
         match credential {
@@ -182,6 +209,7 @@ impl Server {
         if let Some(player) = player {
             core.set_player(player);
         }
+        core.follow_awake_at_start();
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
         core.set_watch(run.watch);
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
@@ -204,6 +232,8 @@ impl Server {
         let scrobbler =
             crate::lastfm::Scrobbler::start(Arc::clone(&core)).map_err(Error::Runtime)?;
         let watcher = crate::watch::Watcher::start(Arc::clone(&core)).map_err(Error::Runtime)?;
+        let hub = Task(tokio::spawn(crate::uplink::follow(Arc::clone(&core))));
+        let awake = Task(tokio::spawn(crate::awake::check(Arc::clone(&core))));
 
         // The server answers, so a client may be told where it is.
         let server_json = ServerJson::publish(
@@ -217,6 +247,8 @@ impl Server {
             playback,
             scrobbler,
             watcher,
+            hub,
+            awake,
             core,
             listening,
             bounds,
@@ -316,6 +348,8 @@ impl Server {
     /// without a bound is a call that has started: closing the database
     /// waits for it to finish.
     pub async fn stop(self) -> Result<(), Error> {
+        drop(self.hub);
+        drop(self.awake);
         self.core.close_sessions();
         self.listening.stop().await;
         self.core.end_transports(self.bounds.stop_grace).await;
@@ -489,7 +523,12 @@ mod tests {
     }
 
     fn hello(id: u32) -> String {
-        let params = json!({ "name": "test", "kind": "cli", "version": "1", "contractVersion": 0 });
+        let params = json!({
+            "name": "test",
+            "kind": "cli",
+            "version": "1",
+            "contractVersion": ritornel_contract::CONTRACT_VERSION,
+        });
         request(id, "server.hello", &params)
     }
 

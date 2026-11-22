@@ -333,8 +333,41 @@ impl Link {
                 }
                 let net = Arc::new(net.restated(&status));
                 link.state = State::Connected(Arc::clone(&net));
+                link.say_when_quiet_ends(&net, cx);
                 cx.emit(LinkEvent::Restated(net));
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A hub that has just gone is not spoken of for a few seconds
+    /// (`crate::away`). When those end and it is still away, the session is
+    /// handed on again as it is, so that what says so is drawn.
+    fn say_when_quiet_ends(&self, net: &Arc<Net>, cx: &mut Context<Self>) {
+        let Some(away) = crate::away::away(net) else {
+            return;
+        };
+        if away.wait_ms(crate::away::now_ms()).is_none() {
+            return;
+        }
+        let net = Arc::clone(net);
+        cx.spawn(async move |link, cx| {
+            // The timer keeps time apart from the clock the absence is
+            // dated by, and may end a moment early by it: it waits until
+            // the absence may be said.
+            while let Some(wait) = away.wait_ms(crate::away::now_ms()) {
+                cx.background_executor()
+                    .timer(Duration::from_millis(wait))
+                    .await;
+            }
+            let _ = link.update(cx, |link, cx| {
+                if let State::Connected(held) = &link.state
+                    && Arc::ptr_eq(held, &net)
+                {
+                    cx.emit(LinkEvent::Restated(Arc::clone(&net)));
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -348,6 +381,7 @@ impl Link {
     ) {
         self.looking = false;
         self.state = State::Connected(Arc::clone(&net));
+        self.say_when_quiet_ends(&net, cx);
         cx.emit(LinkEvent::Connected(net));
         cx.notify();
         // The events, read on the runtime and handed to the foreground in

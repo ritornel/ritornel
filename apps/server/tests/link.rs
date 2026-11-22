@@ -16,15 +16,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ritornel_client::contract::methods::{
-    LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkStatusCall, PlaybackPlay, QueueWindow,
-    RatingsSet, SourcesAdd,
+    LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkSetAwake, LinkStatusCall,
+    PlaybackPlay, QueueWindow, RatingsSet, SourcesAdd,
 };
 use ritornel_client::contract::{
-    CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink, LinkInviteParams,
-    LinkJoinParams, LinkListenParams, LinkRequest, LinkStatus, ListKind, ListOpenParams,
-    ListenTaken, NoParams, PlaySource, PlaybackPlayParams, PlaybackStatus, Query,
-    QueueWindowParams, RatingSetParams, Row, ServerRole, SourcesAddParams, Topic, Window,
-    capability, hex, link_request_proof, route,
+    Awake, AwakeParams, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink,
+    LinkInviteParams, LinkJoinParams, LinkListenParams, LinkPingParams, LinkRequest, LinkStatus,
+    ListKind, ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackPlayParams,
+    PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole, SourcesAddParams,
+    Topic, Window, capability, hex, link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -395,7 +395,7 @@ async fn a_satellite_of_another_contract_version_is_refused() {
         };
         let (status, body) = post(&hub, &asked).await;
         assert_eq!(status, 409);
-        assert!(body.contains("contract version"), "{body}");
+        assert!(body.contains("update the hub"), "{body}");
         // The invite is not spent by a refusal.
         assert_eq!(
             post(&hub, &request(&parsed, desk.server_id(), 1)).await.0,
@@ -997,6 +997,160 @@ async fn a_listen_sent_again_is_taken_once_and_only_from_its_own_player() {
             .await
             .unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_stays_awake() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, _desk, _desk_client) = linked(&scratch).await;
+        let token = {
+            let db =
+                rusqlite::Connection::open(scratch.data_dir("desk").join("server.db")).unwrap();
+            db.query_row("SELECT token FROM hub_link", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+        };
+        let linked = Client::connect(hub.endpoint(), &Credential::new(&token))
+            .await
+            .unwrap();
+        linked
+            .hello(&HelloParams {
+                name: "desk".to_owned(),
+                kind: ClientKind::Server,
+                version: "1".to_owned(),
+                contract_version: CONTRACT_VERSION,
+            })
+            .await
+            .unwrap();
+        // Whether the hub is kept awake is the system's to grant, so only
+        // the answer is looked for here; the rule has tests of its own.
+        linked
+            .call::<LinkPing>(&LinkPingParams { playing: true })
+            .await
+            .unwrap();
+        let refused = hub_client
+            .call::<LinkPing>(&LinkPingParams { playing: true })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
+
+        // While active, for 30 minutes, until the owner says otherwise.
+        let status = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(status.awake, Awake::default());
+        let never = |awake| AwakeParams {
+            idempotency_key: ritornel_client::idempotency_key().unwrap(),
+            awake,
+        };
+        let set = hub_client
+            .call::<LinkSetAwake>(&never(Awake::Never))
+            .await
+            .unwrap();
+        assert_eq!(set.link.awake, Awake::Never);
+        assert!(!set.link.kept_awake);
+        // A satellite does not decide when its hub sleeps.
+        let refused = linked
+            .call::<LinkSetAwake>(&never(Awake::Always))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
+        let refused = hub_client
+            .call::<LinkSetAwake>(&never(Awake::WhileActive { minutes: 1_000_000 }))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Invalid), "{refused}");
+        let status = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(status.awake, Awake::Never);
+        // A command sent again changes nothing, and its ID is not taken
+        // for another.
+        let once = never(Awake::Always);
+        hub_client.call::<LinkSetAwake>(&once).await.unwrap();
+        let other = AwakeParams {
+            awake: Awake::Never,
+            ..once
+        };
+        assert!(hub_client.call::<LinkSetAwake>(&other).await.is_err());
+        let again = hub_client.call::<LinkSetAwake>(&once).await.unwrap();
+        assert_eq!(again.link.awake, Awake::Always);
+        hub_client
+            .call::<LinkSetAwake>(&never(Awake::default()))
+            .await
+            .unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_takes_its_computers_name_and_keeps_one_chosen() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let named = |name: &str| Run {
+            name: Some(name.to_owned()),
+            ..Run::default()
+        };
+        let start_named = async |name: &str| {
+            Server::start_run(
+                HeldDir::take(scratch.data_dir("desk")).unwrap(),
+                Listen::on_port(0),
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+                Bounds::default(),
+                named(name),
+            )
+            .await
+            .unwrap()
+        };
+        let desk = start_named("Studio Mac").await;
+        assert_eq!(desk.name(), "Studio Mac");
+        desk.stop().await.unwrap();
+        // The computer renamed later does not rename a server that already
+        // has a name of its own.
+        let desk = start_named("Other Name").await;
+        assert_eq!(desk.name(), "Studio Mac");
+        desk.stop().await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellites_clients_hear_when_the_hub_goes_and_comes_back() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, _desk, mut desk_client) = linked(&scratch).await;
+        desk_client
+            .call::<LibraryStats>(&NoParams {})
+            .await
+            .unwrap();
+        desk_client.subscribe(&[Topic::Servers]).await.unwrap();
+        let port = hub.endpoint().port();
+        drop(hub_client);
+        hub.stop().await.unwrap();
+        // Nothing is asked of the hub: the satellite finds out by itself,
+        // and says so on its own status.
+        loop {
+            if let Event::Servers(_) = desk_client.next_event().await.unwrap()
+                && desk_client.status().await.unwrap().hub.unwrap().answers == Some(false)
+            {
+                break;
+            }
+        }
+        let _hub = start_on(&scratch, "hub", Listen::on_port(port)).await;
+        loop {
+            if let Event::Servers(_) = desk_client.next_event().await.unwrap()
+                && desk_client.status().await.unwrap().hub.unwrap().answers == Some(true)
+            {
+                break;
+            }
+        }
     })
     .await;
 }

@@ -530,6 +530,7 @@ impl LibraryStore {
         if self.read(due)?.is_empty() {
             return Ok(Vec::new());
         }
+        let hub = self.hub();
         let written = self.write(
             WriteRequest {
                 method: DELIVERY_METHOD,
@@ -562,14 +563,17 @@ impl LibraryStore {
                     if !seconds.insert(row.timestamp_s) {
                         continue;
                     }
+                    // Sent by this server, the hub: the row says so, for the
+                    // day a satellite may send one itself.
                     connection
                         .prepare_cached(
                             "UPDATE history_delivery
                              SET state = 'sending', attempts = attempts + 1, updated_at_ms = ?2,
-                                 rev = ?3
+                                 rev = ?3,
+                                 sent_by_server_id = (SELECT id FROM server WHERE public_id = ?4)
                              WHERE id = ?1",
                         )?
-                        .execute((row.delivery, write.now_ms(), write.rev()))?;
+                        .execute((row.delivery, write.now_ms(), write.rev(), hub.as_bytes()))?;
                     rederive_delivery(write, row.delivery)?;
                     taken.push(row.delivery);
                 }

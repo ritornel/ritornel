@@ -315,6 +315,9 @@ pub(crate) struct Wall {
     keeping: Option<gpui::Task<()>>,
     /// Whether the view could not be opened.
     failed: bool,
+    /// Whether it could not because the hub did not answer, so that it is
+    /// opened again once the hub does.
+    failed_for_hub: bool,
     view: Option<HeldView>,
     total: usize,
     /// How many songs the library has, read when the wall opens empty:
@@ -456,6 +459,7 @@ impl Wall {
             arrivals: None,
             keeping: None,
             failed: false,
+            failed_for_hub: false,
             view: None,
             total: 0,
             songs: None,
@@ -569,6 +573,13 @@ impl Wall {
     /// when the session began is opened at once.
     fn restated(&mut self, net: Arc<Net>, cx: &mut Context<Self>) {
         let opens = net.holds && !self.net.as_ref().is_some_and(|held| held.holds);
+        // The hub is back: a wall its absence kept from being read is read.
+        let back = self.failed && self.failed_for_hub && crate::away::away(&net).is_none();
+        if back {
+            self.net = Some(net);
+            self.try_again(cx);
+            return;
+        }
         if opens {
             self.start(net, cx);
         } else {
@@ -1427,6 +1438,22 @@ impl Wall {
         self.view.as_ref().map(|held| held.id.as_str())
     }
 
+    /// Opens the view again in a moment, if it has still not been read.
+    fn try_again_soon(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            this.update(cx, |wall, cx| {
+                if wall.failed {
+                    wall.try_again(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Opens the view again, as "Try again" does.
     pub(crate) fn try_again(&mut self, cx: &mut Context<Self>) {
         self.failed = false;
@@ -1466,6 +1493,7 @@ impl Wall {
         });
         cx.spawn(async move |this, cx| {
             let answer = opened.await;
+            let for_hub = hub_unreachable(&answer);
             this.update(cx, |wall, cx| {
                 // Opened for a wall, an order or a session since left, or
                 // overtaken by another open.
@@ -1501,7 +1529,21 @@ impl Wall {
                             wall.locate(artist, cx);
                         }
                     }
-                    Ok(Err(_)) | Err(_) => wall.failed = true,
+                    Ok(Err(_)) | Err(_) => {
+                        wall.failed = true;
+                        wall.failed_for_hub = for_hub;
+                        // The hub came back before this answer did: no
+                        // word of it is coming, so the wall asks again in
+                        // a moment.
+                        if for_hub
+                            && wall
+                                .net
+                                .as_deref()
+                                .is_some_and(|net| crate::away::away(net).is_none())
+                        {
+                            wall.try_again_soon(cx);
+                        }
+                    }
                 }
                 cx.notify();
             })
@@ -2266,6 +2308,18 @@ impl Wall {
     }
 }
 
+/// Whether a read failed because the satellite's hub did not answer.
+fn hub_unreachable<T>(
+    answer: &Result<Result<T, ritornel_client::Error>, tokio::task::JoinError>,
+) -> bool {
+    matches!(
+        answer,
+        Ok(Err(ritornel_client::Error::Call(error)))
+            if error.data.details.get("reason").and_then(|reason| reason.as_str())
+                == Some("hub_unreachable")
+    )
+}
+
 /// Whether a call on a view failed because the server had let the view go.
 fn expired<T>(answer: &Result<Result<T, ritornel_client::Error>, tokio::task::JoinError>) -> bool {
     matches!(
@@ -2394,6 +2448,14 @@ impl Wall {
                 .into()
             });
             return Some(blank);
+        }
+        // A wall the hub's absence kept from being read says that, and
+        // reads itself again when the hub is back: there is nothing to do.
+        if self.failed
+            && let Some(away) = crate::away::away(net)
+        {
+            let (title, text) = away.blank();
+            return Some(Blank::new(title, text));
         }
         if self.failed {
             let mut blank = Blank::new(

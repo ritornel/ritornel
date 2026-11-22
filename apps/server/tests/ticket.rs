@@ -195,7 +195,7 @@ async fn call(socket: &mut Socket, id: u32, method: &str, params: Value) -> Valu
 }
 
 fn hello() -> Value {
-    json!({ "name": "ticket-test", "kind": "desktop", "version": "1.2.3", "contractVersion": 0 })
+    json!({ "name": "ticket-test", "kind": "desktop", "version": "1.2.3", "contractVersion": ritornel_contract::CONTRACT_VERSION })
 }
 
 /// What a raw HTTP request was answered with.

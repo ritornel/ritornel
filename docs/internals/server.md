@@ -37,6 +37,20 @@ On `SIGINT`, `SIGTERM`, a polite Windows stop (`taskkill /PID` via the hidden wi
 
 Runtime bounds (`apps/server/src/bounds.rs`) keep resource usage bounded: `MAX_CONNECTIONS = 128` concurrent HTTP connections, `MAX_SESSIONS = 64` open WebSocket/in-memory sessions, `HEADER_WAIT = 10s`, `STOP_GRACE = 5s`, and `TICKET_LIFE = 10s` for single-use socket tickets.
 
+### Server name
+
+A server is named after its computer (`platform::computer_name`), so a hub's satellites and a satellite's hub say which machine each is: the computer name on macOS, `PRETTY_HOSTNAME` in `/etc/machine-info` or else the hostname on Linux, and `COMPUTERNAME` on Windows. A server still carrying the first-start name `DEFAULT_NAME` takes its computer's name at start, and a name someone chose is kept. `RITORNEL_TEST_COMPUTER_NAME` stands in for the computer's name in tests.
+
+### Keeping a hub awake
+
+A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so being linked is not reason enough to keep a machine awake. When a hub keeps its machine from idle sleep is the owner's preference, kept in `server.db` (`server_setting` row `link.awake`) so it follows the server, and set with `link.setAwake` (`ritornelctl link awake`). It is one of three modes (`Awake`):
+
+- **While active**, the default, for 30 minutes: while a linked server plays, or has made a call within the minutes given. The window is at most a week (`Awake::MAX_MINUTES`), and zero means while one plays only. A stored setting that cannot be read, or is out of range, gives way to the default with a warning in the log.
+- **Always**, for as long as the server runs.
+- **Never**: the machine sleeps as its own settings say.
+
+`awake::keeps_awake` in `apps/server/src/awake.rs` is the rule. Every call on a link session counts as activity but those that keep the link itself (`awake::is_activity`): `server.hello` and `events.subscribe`, which a satellite makes whenever its connection comes back, and `link.ping`, which it sends every ten seconds to say whether it plays. A word that it plays holds for 30 seconds. The hub asks the system (`platform::stay_awake`) when the rule first holds, and lets go when it no longer does. It checks on each call, once a minute, and when the setting changes. The display may still sleep. Where the system refuses, or has no way to ask, the server logs a warning, runs on, and asks again a minute later at the soonest. [`platforms.md`](platforms.md) says how each system is asked, and `link.status` says the setting and whether the machine is kept awake now.
+
 ## Data directory
 
 ```text

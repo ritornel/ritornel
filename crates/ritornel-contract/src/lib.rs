@@ -94,9 +94,10 @@ pub use library::{
     SourcesAddParams, SourcesList,
 };
 pub use link::{
-    HubCopy, HubStatus, InviteLink, LinkCopies, LinkCopiesParams, LinkGranted, LinkInvite,
-    LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened, LinkRequest, LinkStatus,
-    LinkTracks, LinkTracksParams, ListenTaken, SatelliteStatus, link_request_proof,
+    Awake, AwakeParams, AwakeSet, HubCopy, HubStatus, InviteLink, LinkCopies, LinkCopiesParams,
+    LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened,
+    LinkPingParams, LinkPinged, LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken,
+    SatelliteStatus, link_request_proof,
 };
 pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,
@@ -131,11 +132,12 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 
 /// The version of the contract these types are.
 ///
-/// It is 0 while the contract is unstable ("Session and frames" in
-/// docs/internals/contract.md): a client and a server are built from one commit, and a
-/// server refuses a client whose number is not its own. From 1 on, changes
-/// within a version are additive only and clients gate on capability flags.
-pub const CONTRACT_VERSION: u32 = 0;
+/// It changes whenever the wire does: a test fails when `contract.ts`
+/// changes and this number has not, so two builds with one number speak
+/// one contract. A server refuses a client whose number is not its own,
+/// and a satellite refuses a hub of another ("Session and frames" in
+/// docs/internals/contract.md).
+pub const CONTRACT_VERSION: u32 = 1;
 
 /// The capability flags a server may list in its descriptor.
 pub mod capability {
@@ -165,8 +167,8 @@ pub mod capability {
     pub const PLAYBACK: &str = "playback";
 }
 
-/// The HTTP routes. Each is a `GET` but [`TICKET`](route::TICKET), which
-/// is a `POST`.
+/// The HTTP routes. Each is a `GET` but [`TICKET`](route::TICKET) and
+/// [`LINK`](route::LINK), which are `POST`s.
 pub mod route {
     /// The socket that carries calls and events. It needs a credential: in
     /// an `Authorization` header, or as a [ticket](crate::SocketTicket) in

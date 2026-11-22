@@ -8,6 +8,7 @@
 
 mod album;
 mod artist;
+mod away;
 mod banner;
 mod bar;
 mod blank;

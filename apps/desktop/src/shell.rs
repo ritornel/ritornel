@@ -255,6 +255,9 @@ pub(crate) struct Shell {
     bar: Entity<PlayerBar>,
     search: Entity<SearchBox>,
     pages: History<Page>,
+    /// Whether the pointer is on the title bar's connection, which then
+    /// says how the library is reached.
+    connection_hovered: bool,
     /// How the page now open arrives.
     arrival: Arrival,
     /// The page left, fading out under it.
@@ -333,6 +336,7 @@ impl Shell {
             bar,
             search,
             pages: History::new(Page::Library),
+            connection_hovered: false,
             arrival,
             leaving: None,
             tints: Vec::new(),
@@ -443,6 +447,12 @@ impl Shell {
     /// for it, at 1180 points wide or more.
     fn pushed(&self, cx: &gpui::App) -> bool {
         self.player.read(cx).open && self.width >= upnext::ROOM_FOR_CARD
+    }
+
+    /// Holds the pointer on the title bar's connection, or lets it go.
+    pub(crate) fn hover_connection(&mut self, over: bool, cx: &mut Context<Self>) {
+        self.connection_hovered = over;
+        cx.notify();
     }
 
     /// Opens or closes Up next's card, as ⌥⌘U and the player bar's button do.
@@ -1660,8 +1670,30 @@ impl Render for Shell {
             .size_full()
             .children(pages)
             .into_any_element();
-        let server: Option<gpui::SharedString> =
-            self.link.read(cx).net().map(|net| net.name.clone().into());
+        let server = self.link.read(cx).net().map(|net| {
+            let away = crate::away::said(&net);
+            let card = self.connection_hovered.then(|| match (&away, &net.hub) {
+                (Some(away), _) => Some(away.card(&crate::away::clock())),
+                (None, Some(hub)) => Some(crate::away::fine_card(&hub.name)),
+                (None, None) => None,
+            });
+            let shell = cx.entity().downgrade();
+            frame::Server {
+                // On a satellite, the computer the library is on.
+                name: net
+                    .hub
+                    .as_ref()
+                    .map_or_else(|| net.name.clone(), |hub| hub.name.clone())
+                    .into(),
+                away: away.is_some(),
+                card: card
+                    .flatten()
+                    .map(|(first, then)| (first.into(), then.into())),
+                on_hover: std::rc::Rc::new(move |over, _, cx| {
+                    let _ = shell.update(cx, |shell, cx| shell.hover_connection(over, cx));
+                }),
+            }
+        });
         let shell = cx.entity().downgrade();
         let on_tab: frame::OnTab = std::rc::Rc::new(move |tab, _, cx| {
             let _ = shell.update(cx, |shell, cx| shell.go(tab, cx));

@@ -25,6 +25,7 @@
     )
 )]
 
+mod awake;
 mod backup;
 mod bounds;
 mod cli;

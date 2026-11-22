@@ -7,15 +7,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::PoisonError;
 
-use ritornel_contract::methods::{LinkListen, Method};
+use ritornel_contract::methods::{LinkListen, LinkSetAwake, Method};
 use ritornel_contract::{
-    CONTRACT_VERSION, ErrorCode, HubCopy, HubStatus, Id, InviteLink, LinkCopies, LinkCopiesParams,
-    LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened,
-    LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken, MAX_CLIENT_TEXT, RpcError,
+    Awake, AwakeParams, AwakeSet, CONTRACT_VERSION, ErrorCode, HubCopy, HubStatus, Id, InviteLink,
+    LinkCopies, LinkCopiesParams, LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams,
+    LinkListenParams, LinkListened, LinkPingParams, LinkPinged, LinkRequest, LinkStatus,
+    LinkTracks, LinkTracksParams, ListenTaken, MAX_CLIENT_TEXT, Receipt, ReceiptStatus, RpcError,
     SatelliteStatus, ServerRole, hex, link_request_proof,
 };
 use ritornel_engine::playback::{Catalog, Delivered, FileFacts, deliver_listens_to};
-use ritornel_engine::{Clock, HubLink, Ingested, LISTEN_RECORD_VERSION, ListenRecord, SendStamps};
+use ritornel_engine::{
+    Clock, Command, HubLink, Ingested, LISTEN_RECORD_VERSION, ListenRecord, SendStamps,
+    SettingChange,
+};
 use tracing::{info, warn};
 
 use super::{Core, Stores, lock};
@@ -114,6 +118,7 @@ pub(super) fn kept_from_a_link(method: &str) -> bool {
             | "server.backup"
             | "link.invite"
             | "link.join"
+            | "link.setAwake"
     )
 }
 
@@ -224,11 +229,7 @@ impl Core {
         if asked.contract_version != CONTRACT_VERSION {
             return Err(refused(
                 409,
-                &format!(
-                    "this hub speaks contract version {CONTRACT_VERSION} and the satellite {}: \
-                     update both to the same release",
-                    asked.contract_version
-                ),
+                &link::versions_differ(CONTRACT_VERSION, asked.contract_version),
             ));
         }
         let secret = hex::decode(&asked.secret).unwrap_or_default();
@@ -290,6 +291,7 @@ impl Core {
         // Whatever the satellite had open on the session it held before
         // ends with it.
         self.close_linked(asked.server_id);
+        self.linked_server_called(asked.server_id);
         info!(satellite = %asked.server_id, name = %name, "a satellite joined");
         Ok(LinkGranted {
             token: token.expose().to_owned(),
@@ -501,6 +503,64 @@ impl Core {
     /// `link.listen`, on a hub: one listen from a satellite's outbox, taken
     /// in as the hub's own player's are. A satellite reports listens for
     /// its own player only.
+    /// `link.setAwake`: the setting is kept in `server.db` with the
+    /// command's receipt, and followed at once. Sent again, after a newer
+    /// command or not, it changes nothing, and answers with the link as it
+    /// is.
+    pub(super) fn link_set_awake(
+        &self,
+        stores: &Stores,
+        params: &AwakeParams,
+    ) -> Result<AwakeSet, RpcError> {
+        if !params.awake.is_valid() {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!("minutes are at most {}, a week", Awake::MAX_MINUTES),
+            ));
+        }
+        let command = Command {
+            id: params.idempotency_key,
+            fingerprint: super::fingerprint::<LinkSetAwake>(params)?,
+        };
+        let changed = stores
+            .server()
+            .change_once(
+                command,
+                LinkSetAwake::NAME,
+                SettingChange::Awake(params.awake),
+            )
+            .map_err(crate::Error::Store)
+            .map_err(super::failed)?;
+        if changed.now {
+            self.follow_stored_awake(stores);
+        }
+        Ok(AwakeSet {
+            receipt: Receipt {
+                command_id: params.idempotency_key,
+                status: ReceiptStatus::Done,
+                revision: None,
+            },
+            link: self.link_status(stores)?,
+        })
+    }
+
+    /// `link.ping`: a satellite says it is there and whether it plays.
+    pub(super) fn link_ping(
+        &self,
+        session: &Session,
+        params: LinkPingParams,
+    ) -> Result<LinkPinged, RpcError> {
+        let Some(peer) = session.peer() else {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "link.ping is for a satellite's link session",
+            ));
+        };
+        Ok(LinkPinged {
+            kept_awake: self.linked_server_pinged(peer, params.playing),
+        })
+    }
+
     pub(super) fn link_listen(
         &self,
         stores: &Stores,
@@ -657,10 +717,13 @@ impl Core {
                 linked_at_ms: session.created_at_ms,
             })
             .collect();
+        let (awake, kept_awake) = self.awake();
         Ok(LinkStatus {
             role: lock(&self.this).role,
             hub,
             satellites,
+            awake,
+            kept_awake,
         })
     }
 }

@@ -51,6 +51,8 @@ const ROUTES: &[(&str, &str)] = &[
     ("descriptor", route::DESCRIPTOR),
     ("health", route::HEALTH),
     ("art", route::ART),
+    ("link", route::LINK),
+    ("audio", route::AUDIO),
 ];
 
 /// The capability flags, by the name each has in `CAPABILITIES`. A flag
@@ -238,6 +240,8 @@ fn generate() -> String {
     declarations.visit::<PublicDescriptor>();
     declarations.visit::<route::Health>();
     declarations.visit::<SocketTicket>();
+    declarations.visit::<crate::LinkRequest>();
+    declarations.visit::<crate::LinkGranted>();
 
     // `TOPICS` and the event map are written from `Topic::ALL`, and the
     // types `Topic` and `Event` from the enums. They must agree: the map
@@ -296,7 +300,7 @@ fn generate() -> String {
 /** The version of the contract these types are. */
 export const CONTRACT_VERSION = {CONTRACT_VERSION};
 
-/** The HTTP routes. Each is a `GET` but `ticket`, which is a `POST`. */
+/** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {{
 {routes}}} as const;
 
@@ -397,6 +401,100 @@ fn the_committed_typescript_is_what_the_contract_generates() {
             line + 1
         );
     }
+}
+
+/// The contract's version and the digest of the wire it was set for,
+/// committed beside `contract.ts`.
+const VERSION_FILE: &str = "contract/contract.version";
+
+/// A digest of the wire as `contract.ts` writes it: FNV-1a, 64 bits, of
+/// its words, leaving out the version's line and the comments. It only has
+/// to change when the wire does, and neither a comment nor where a comment
+/// moves the line breaks is the wire.
+fn wire_digest(text: &str) -> String {
+    let comment = |line: &str| {
+        let line = line.trim_start();
+        line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
+    };
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    let words = text
+        .lines()
+        .filter(|line| !line.starts_with("export const CONTRACT_VERSION = ") && !comment(line))
+        .flat_map(str::split_whitespace);
+    for word in words {
+        for byte in word.bytes().chain(std::iter::once(b' ')) {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("{digest:016x}")
+}
+
+/// `contract.version`'s text for this version and wire.
+fn version_file(digest: &str) -> String {
+    format!(
+        "# The contract version, and a digest of the wire it was set for. Written by\n\
+         # `mise run contract`, which refuses when the wire has changed and the\n\
+         # version has not: raise CONTRACT_VERSION in crates/ritornel-contract.\n\
+         version {CONTRACT_VERSION}\ndigest {digest}\n"
+    )
+}
+
+#[test]
+fn the_contract_version_changes_whenever_the_wire_does() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(VERSION_FILE);
+    let digest = wire_digest(&generate());
+    let committed = std::fs::read_to_string(&path).unwrap_or_default();
+    let field = |name: &str| {
+        committed
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+            .map(str::to_owned)
+    };
+    let (version, recorded) = (field("version"), field("digest"));
+    let same_version = version.as_deref() == Some(CONTRACT_VERSION.to_string().as_str());
+    let same_wire = recorded.as_deref() == Some(digest.as_str());
+    assert!(
+        same_wire || !same_version,
+        "the wire has changed and CONTRACT_VERSION has not: raise it in \
+         crates/ritornel-contract/src/lib.rs, then run `mise run contract`"
+    );
+    if std::env::var_os(BLESS).is_some() {
+        std::fs::write(&path, version_file(&digest)).unwrap();
+        return;
+    }
+    assert!(
+        same_version && same_wire,
+        "{VERSION_FILE} is not this version and wire: run `mise run contract` and commit the result"
+    );
+}
+
+#[test]
+fn the_wire_digest_follows_the_text_and_not_the_version() {
+    let text = generate();
+    assert_eq!(wire_digest(&text), wire_digest(&text));
+    assert_ne!(
+        wire_digest(&text),
+        wire_digest(&format!("{text}export const MORE = 1;\n"))
+    );
+    assert_eq!(
+        wire_digest(&text),
+        wire_digest(&format!("{text}/** A comment. */\n"))
+    );
+    let other = text.replace(
+        &format!("export const CONTRACT_VERSION = {CONTRACT_VERSION};"),
+        "export const CONTRACT_VERSION = 999999;",
+    );
+    assert_eq!(wire_digest(&text), wire_digest(&other));
+    // A field given a comment is put on a line of its own.
+    let commented = text.replace(
+        "export type Dismissed = { record: RecordStatus,",
+        "export type Dismissed = {\n/**\n * The record.\n */\nrecord: RecordStatus,",
+    );
+    assert_ne!(text, commented);
+    assert_eq!(wire_digest(&text), wire_digest(&commented));
 }
 
 #[test]

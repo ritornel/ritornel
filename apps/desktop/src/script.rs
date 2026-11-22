@@ -30,6 +30,7 @@
 //!   nth zone of the list; `settings focus`: make it the key window, as a
 //!   click on it would; `settings close`: as ⌘W does
 //! - `lean`: open Lean back, or close it, as the player bar's button does
+//! - `connection`: hold the pointer on the title bar's connection, as hovering it does; `connection leave` lets go
 //! - `upnext`: open or close Up next's card, as ⌥⌘U does; `upnext open` or `upnext close`
 //! - `press <x> <y>`, `move <x> <y>`, `release`: the left button held down
 //!   there, the pointer moved there in steps while it is held, and let go
@@ -505,6 +506,14 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
                             );
                         });
                     }
+                }
+                "connection" => {
+                    let over = rest.trim() != "leave";
+                    let _ = window.update(cx, |root, _, cx| {
+                        if let Ok(shell) = root.downcast::<Shell>() {
+                            shell.update(cx, |shell, cx| shell.hover_connection(over, cx));
+                        }
+                    });
                 }
                 "upnext" => {
                     let open = match rest.trim() {

@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ritornel_client::contract::{
@@ -79,6 +80,9 @@ pub(crate) struct Uplink {
     reach: Mutex<Reach>,
     /// Each client session's connection, by the session's ID.
     sessions: Mutex<HashMap<u64, Arc<Client>>>,
+    /// Counts the times the hub began or stopped answering, for whoever
+    /// tells this server's clients.
+    changes: tokio::sync::watch::Sender<u64>,
     /// The server's own connection.
     own: Mutex<Option<Arc<Client>>>,
 }
@@ -103,6 +107,7 @@ impl Uplink {
             entropy,
             reach: Mutex::default(),
             sessions: Mutex::default(),
+            changes: tokio::sync::watch::Sender::new(0),
             own: Mutex::default(),
         }
     }
@@ -127,6 +132,11 @@ impl Uplink {
             return None;
         }
         reach.route.as_deref().and_then(|route| route.parse().ok())
+    }
+
+    /// What changes each time the hub begins or stops answering.
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     /// The hub, as `link.status` and `server.status` show it.
@@ -169,14 +179,19 @@ impl Uplink {
         error
     }
 
-    fn answered(&self, route: SocketAddr) {
+    /// The hub answered: on a connection just opened to `route`, or on one
+    /// already open.
+    fn answered(&self, route: Option<SocketAddr>) {
         let mut reach = lock(&self.reach);
         if reach.answers != Some(true) {
-            info!(hub = %self.link.hub, %route, "the hub answers");
+            info!(hub = %self.link.hub, "the hub answers");
             reach.since_ms = Some(self.clock.now_ms());
+            self.changes.send_modify(|count| *count += 1);
         }
         reach.answers = Some(true);
-        reach.route = Some(route.to_string());
+        if let Some(route) = route {
+            reach.route = Some(route.to_string());
+        }
         reach.problem = None;
         reach.failed_at_ms = None;
     }
@@ -186,6 +201,7 @@ impl Uplink {
         if reach.answers != Some(false) {
             warn!(hub = %self.link.hub, problem = why, "the hub does not answer");
             reach.since_ms = Some(self.clock.now_ms());
+            self.changes.send_modify(|count| *count += 1);
         }
         reach.answers = Some(false);
         reach.problem = Some(why.to_owned());
@@ -239,7 +255,7 @@ impl Uplink {
             };
             match opened {
                 Ok(client) => {
-                    self.answered(route);
+                    self.answered(Some(route));
                     return Ok(client);
                 }
                 Err(why) => tried.push(format!("{route}: {why}")),
@@ -258,8 +274,15 @@ impl Uplink {
     /// What became of a call: the hub's own answer, or the hub lost.
     fn answer(&self, result: Result<Value, ritornel_client::Error>) -> Result<Value, RpcError> {
         match result {
-            Ok(value) => Ok(value),
-            Err(ritornel_client::Error::Call(error)) => Err(error),
+            // An answer, even a refusal, is the hub answering.
+            Ok(value) => {
+                self.answered(None);
+                Ok(value)
+            }
+            Err(ritornel_client::Error::Call(error)) => {
+                self.answered(None);
+                Err(error)
+            }
             Err(other) => {
                 self.lost(&other.to_string());
                 Err(self.unreachable())
@@ -446,5 +469,61 @@ async fn relay(mut events: tokio::sync::mpsc::UnboundedReceiver<Event>, session:
         if HUB_TOPICS.contains(&event.topic()) {
             session.publish(event);
         }
+    }
+}
+
+/// How often a satellite asks its hub whether it answers, while nothing
+/// else does: often enough that its clients hear within seconds that the
+/// hub is away, or back.
+const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Follows a satellite's hub for as long as the server runs: tells its
+/// clients, with a `servers` event, each time the hub begins or stops
+/// answering, and pings the hub every [`CHECK_EVERY`] so that a hub that
+/// went while nothing was asked of it is found out. The ping says whether
+/// this server plays, which keeps the hub awake while it does. A server
+/// that is no satellite yet is looked at again until it is one.
+pub(crate) async fn follow(core: std::sync::Arc<crate::dispatch::Core>) {
+    loop {
+        let Some(uplink) = core.uplink() else {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        };
+        let mut changes = uplink.changes();
+        // What changed before this began to look is told as well.
+        core.hub_changed();
+        let pinging = Arc::new(AtomicBool::new(false));
+        loop {
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    core.hub_changed();
+                }
+                () = tokio::time::sleep(CHECK_EVERY) => ping(&core, &uplink, &pinging),
+            }
+        }
+    }
+}
+
+/// Pings the hub, saying whether this server plays, unless a ping is still
+/// out. The ping may wait on the hub as long as a call does, so it runs on
+/// a thread of its own: news of the hub is told while it waits, and a
+/// server that stops does not wait for it.
+fn ping(core: &crate::dispatch::Core, uplink: &Arc<Uplink>, pinging: &Arc<AtomicBool>) {
+    if pinging.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let params = serde_json::json!({ "playing": core.playing() });
+    let (asked, out) = (Arc::clone(uplink), Arc::clone(pinging));
+    let started = std::thread::Builder::new()
+        .name("hub ping".to_owned())
+        .spawn(move || {
+            let _ = asked.call("link.ping", params);
+            out.store(false, Ordering::Release);
+        });
+    if started.is_err() {
+        pinging.store(false, Ordering::Release);
     }
 }

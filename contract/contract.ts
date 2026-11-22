@@ -10,15 +10,17 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 0;
+export const CONTRACT_VERSION = 1;
 
-/** The HTTP routes. Each is a `GET` but `ticket`, which is a `POST`. */
+/** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
   ws: "/v1/ws",
   ticket: "/v1/ticket",
   descriptor: "/v1/descriptor",
   health: "/v1/health",
   art: "/v1/art",
+  link: "/v1/link",
+  audio: "/v1/audio",
 } as const;
 
 /**
@@ -131,6 +133,8 @@ export const METHODS = {
   "link.tracks": { kind: "query", needsFull: true },
   "link.copies": { kind: "query", needsFull: true },
   "link.listen": { kind: "command", needsFull: true },
+  "link.ping": { kind: "session", needsFull: true },
+  "link.setAwake": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -207,6 +211,8 @@ export type MethodMap = {
   "link.tracks": { params: LinkTracksParams; result: LinkTracks };
   "link.copies": { params: LinkCopiesParams; result: LinkCopies };
   "link.listen": { params: LinkListenParams; result: LinkListened };
+  "link.ping": { params: LinkPingParams; result: LinkPinged };
+  "link.setAwake": { params: AwakeParams; result: AwakeSet };
 };
 
 /** The name of a method. */
@@ -582,6 +588,55 @@ export type AutoRun = {
  * What starts a rescan or an import on its own.
  */
 export type AutoTrigger = "change" | "lost" | "returned" | "start" | "timer";
+
+/**
+ * When a hub keeps its machine from sleeping for its linked servers: a
+ * preference of the server's own, set with `link.setAwake` and kept with
+ * it. The display may sleep in every mode.
+ */
+export type Awake = { "mode": "while_active",
+  /**
+   * How long after a linked server's last call.
+   */
+  minutes: number, } | { "mode": "always" } | { "mode": "never" };
+
+/**
+ * The params of `link.setAwake`.
+ */
+export type AwakeParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * When to keep the machine awake from now on.
+   */
+  awake: Awake,
+};
+
+/**
+ * The result of `link.setAwake`: the receipt, and the link as
+ * `link.status` now says it.
+ */
+export type AwakeSet = {
+  /**
+   * The link, as `link.status` now says it.
+   */
+  link: LinkStatus,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
 
 /**
  * The result of `server.backup`: the receipt, and the backup.
@@ -2233,6 +2288,24 @@ export type LinkCopiesParams = {
 };
 
 /**
+ * What the hub answers a satellite that joined.
+ */
+export type LinkGranted = {
+  /**
+   * The link session's token, which the satellite presents from now on.
+   */
+  token: string,
+  /**
+   * The library the hub holds.
+   */
+  libraryId: string,
+  /**
+   * The hub epoch.
+   */
+  epoch: number,
+};
+
+/**
  * The result of `link.invite`.
  */
 export type LinkInvite = {
@@ -2312,6 +2385,60 @@ export type LinkListened = {
 };
 
 /**
+ * What a satellite tells its hub every few seconds with `link.ping`.
+ */
+export type LinkPingParams = {
+  /**
+   * Whether the satellite's player is playing.
+   */
+  playing: boolean,
+};
+
+/**
+ * The result of `link.ping`.
+ */
+export type LinkPinged = {
+  /**
+   * Whether the hub keeps its machine from sleeping for its linked
+   * servers now.
+   */
+  keptAwake: boolean,
+};
+
+/**
+ * What a satellite sends to `POST /v1/link` to join: the invite's secret
+ * and who it is.
+ */
+export type LinkRequest = {
+  /**
+   * The invite's secret, as hex.
+   */
+  secret: string,
+  /**
+   * The satellite's server ID.
+   */
+  serverId: string,
+  /**
+   * The satellite's name.
+   */
+  name: string,
+  /**
+   * The satellite's public key, as 64 hex digits.
+   */
+  publicKey: string,
+  /**
+   * The signature, as 128 hex digits, of [`link_request_proof`] for the
+   * hub and this secret: proof that the satellite holds its key.
+   */
+  proof: string,
+  /**
+   * The [contract version](crate::CONTRACT_VERSION) the satellite
+   * speaks. A hub refuses another.
+   */
+  contractVersion: number,
+};
+
+/**
  * The result of `link.status`, and of `link.join`.
  */
 export type LinkStatus = {
@@ -2327,6 +2454,15 @@ export type LinkStatus = {
    * On a hub, the satellites linked to it, oldest first.
    */
   satellites: Array<SatelliteStatus>,
+  /**
+   * When this server keeps its machine from sleeping for its linked
+   * servers.
+   */
+  awake: Awake,
+  /**
+   * Whether it does now.
+   */
+  keptAwake: boolean,
 };
 
 /**

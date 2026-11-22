@@ -30,6 +30,7 @@
 //! ritornelctl link invite [--route <address:port>]...
 //! ritornelctl link join <link>
 //! ritornelctl link status
+//! ritornelctl link awake <while-active [<minutes>] | always | never>
 //! ```
 //!
 //! Every command takes `--data-dir <dir>` and `--json`.
@@ -89,6 +90,8 @@ Usage:
   ritornelctl link invite [--route <address:port>]... [--data-dir <dir>] [--json]
   ritornelctl link join <link> [--data-dir <dir>] [--json]
   ritornelctl link status [--data-dir <dir>] [--json]
+  ritornelctl link awake <while-active [<minutes>] | always | never>
+                         [--data-dir <dir>] [--json]
 
 Commands:
   status           Show the running server's ID, name and role, the versions
@@ -201,7 +204,12 @@ Commands:
                    if not at the addresses it finds it has
   link join <link> Make this server, which holds no library, the satellite
                    of the hub that made the link
-  link status      Show this server's hub, or its satellites
+  link status      Show this server's hub, or its satellites, and when it
+                   keeps its machine awake
+  link awake       When this hub keeps its machine from sleeping for its
+                   linked servers: while one plays or has made a call
+                   within the minutes given, 30 unless said, which is the
+                   default; always; or never. The display may sleep
 
 Options:
   --name <name>         scan, artists pictures: the name the folder is
@@ -391,6 +399,19 @@ pub(crate) enum LinkCommand {
     Invite(InviteArgs),
     Join(JoinArgs),
     Status(ServerArgs),
+    Awake(AwakeArgs),
+}
+
+/// What `link awake` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct AwakeArgs {
+    /// `while-active`, `always` or `never`.
+    pub(crate) mode: String,
+    /// For `while-active`, how many minutes after a linked server's last
+    /// call.
+    pub(crate) minutes: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `link invite` takes.

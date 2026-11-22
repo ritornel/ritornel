@@ -63,6 +63,72 @@ pub struct LinkStatus {
     /// On a hub, the satellites linked to it, oldest first.
     #[serde(default)]
     pub satellites: Vec<SatelliteStatus>,
+    /// When this server keeps its machine from sleeping for its linked
+    /// servers.
+    pub awake: Awake,
+    /// Whether it does now.
+    pub kept_awake: bool,
+}
+
+/// When a hub keeps its machine from sleeping for its linked servers: a
+/// preference of the server's own, set with `link.setAwake` and kept with
+/// it. The display may sleep in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum Awake {
+    /// While a linked server plays, or has made a call within the last
+    /// `minutes`: at most [`Awake::MAX_MINUTES`], and none for while one
+    /// plays only.
+    WhileActive {
+        /// How long after a linked server's last call.
+        minutes: u32,
+    },
+    /// For as long as the server runs.
+    Always,
+    /// Never: the machine sleeps as its own settings say.
+    Never,
+}
+
+impl Awake {
+    /// The longest window: a week.
+    pub const MAX_MINUTES: u32 = 7 * 24 * 60;
+
+    /// Whether a server takes this setting.
+    pub fn is_valid(self) -> bool {
+        !matches!(self, Self::WhileActive { minutes } if minutes > Self::MAX_MINUTES)
+    }
+}
+
+impl Default for Awake {
+    /// While active, for 30 minutes.
+    fn default() -> Self {
+        Self::WhileActive { minutes: 30 }
+    }
+}
+
+/// The params of `link.setAwake`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AwakeParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// When to keep the machine awake from now on.
+    pub awake: Awake,
+}
+
+/// The result of `link.setAwake`: the receipt, and the link as
+/// `link.status` now says it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AwakeSet {
+    /// The receipt.
+    #[serde(flatten)]
+    pub receipt: crate::Receipt,
+    /// The link, as `link.status` now says it.
+    pub link: LinkStatus,
 }
 
 /// A satellite's hub, as the satellite knows it.
@@ -230,9 +296,29 @@ pub struct LinkListened {
     pub taken: ListenTaken,
 }
 
+/// What a satellite tells its hub every few seconds with `link.ping`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPingParams {
+    /// Whether the satellite's player is playing.
+    pub playing: bool,
+}
+
+/// The result of `link.ping`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPinged {
+    /// Whether the hub keeps its machine from sleeping for its linked
+    /// servers now.
+    pub kept_awake: bool,
+}
+
 /// What a satellite sends to `POST /v1/link` to join: the invite's secret
 /// and who it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct LinkRequest {
     /// The invite's secret, as hex.
@@ -253,6 +339,7 @@ pub struct LinkRequest {
 
 /// What the hub answers a satellite that joined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct LinkGranted {
     /// The link session's token, which the satellite presents from now on.
