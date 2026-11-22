@@ -79,6 +79,9 @@ pub(crate) struct Uplink {
     reach: Mutex<Reach>,
     /// Each client session's connection, by the session's ID.
     sessions: Mutex<HashMap<u64, Arc<Client>>>,
+    /// Counts the times the hub began or stopped answering, for whoever
+    /// tells this server's clients.
+    changes: tokio::sync::watch::Sender<u64>,
     /// The server's own connection.
     own: Mutex<Option<Arc<Client>>>,
 }
@@ -103,6 +106,7 @@ impl Uplink {
             entropy,
             reach: Mutex::default(),
             sessions: Mutex::default(),
+            changes: tokio::sync::watch::Sender::new(0),
             own: Mutex::default(),
         }
     }
@@ -127,6 +131,11 @@ impl Uplink {
             return None;
         }
         reach.route.as_deref().and_then(|route| route.parse().ok())
+    }
+
+    /// What changes each time the hub begins or stops answering.
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     /// The hub, as `link.status` and `server.status` show it.
@@ -174,6 +183,7 @@ impl Uplink {
         if reach.answers != Some(true) {
             info!(hub = %self.link.hub, %route, "the hub answers");
             reach.since_ms = Some(self.clock.now_ms());
+            self.changes.send_modify(|count| *count += 1);
         }
         reach.answers = Some(true);
         reach.route = Some(route.to_string());
@@ -186,6 +196,7 @@ impl Uplink {
         if reach.answers != Some(false) {
             warn!(hub = %self.link.hub, problem = why, "the hub does not answer");
             reach.since_ms = Some(self.clock.now_ms());
+            self.changes.send_modify(|count| *count += 1);
         }
         reach.answers = Some(false);
         reach.problem = Some(why.to_owned());
@@ -445,6 +456,43 @@ async fn relay(mut events: tokio::sync::mpsc::UnboundedReceiver<Event>, session:
         };
         if HUB_TOPICS.contains(&event.topic()) {
             session.publish(event);
+        }
+    }
+}
+
+/// How often a satellite asks its hub whether it answers, while nothing
+/// else does: often enough that its clients hear within seconds that the
+/// hub is away, or back.
+const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Follows a satellite's hub for as long as the server runs: tells its
+/// clients, with a `servers` event, each time the hub begins or stops
+/// answering, and asks the hub every [`CHECK_EVERY`] so that a hub that
+/// went while nothing was asked of it is found out. A server that is no
+/// satellite yet is looked at again until it is one.
+pub(crate) async fn follow(core: std::sync::Arc<crate::dispatch::Core>) {
+    loop {
+        let Some(uplink) = core.uplink() else {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        };
+        let mut changes = uplink.changes();
+        loop {
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    core.hub_changed();
+                }
+                () = tokio::time::sleep(CHECK_EVERY) => {
+                    let asked = Arc::clone(&uplink);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        asked.call("servers.list", Value::Object(serde_json::Map::new()))
+                    })
+                    .await;
+                }
+            }
         }
     }
 }

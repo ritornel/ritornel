@@ -35,6 +35,17 @@ impl Drop for Transports {
     }
 }
 
+/// The task that follows a satellite's hub, ended when the server stops or
+/// is dropped, so that it never outlives the server it holds.
+#[derive(Debug)]
+struct Following(tokio::task::JoinHandle<()>);
+
+impl Drop for Following {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A running server.
 #[derive(Debug)]
 pub struct Server {
@@ -47,6 +58,9 @@ pub struct Server {
     scrobbler: crate::lastfm::Scrobbler,
     /// The thread that watches the hub's folders.
     watcher: crate::watch::Watcher,
+    /// What follows a satellite's hub and tells its clients when the hub
+    /// is away, or back.
+    hub: Following,
     transports: Transports,
     listening: Listening,
     bounds: Bounds,
@@ -215,6 +229,7 @@ impl Server {
         let scrobbler =
             crate::lastfm::Scrobbler::start(Arc::clone(&core)).map_err(Error::Runtime)?;
         let watcher = crate::watch::Watcher::start(Arc::clone(&core)).map_err(Error::Runtime)?;
+        let hub = Following(tokio::spawn(crate::uplink::follow(Arc::clone(&core))));
 
         // The server answers, so a client may be told where it is.
         let server_json = ServerJson::publish(
@@ -228,6 +243,7 @@ impl Server {
             playback,
             scrobbler,
             watcher,
+            hub,
             core,
             listening,
             bounds,
@@ -327,6 +343,7 @@ impl Server {
     /// without a bound is a call that has started: closing the database
     /// waits for it to finish.
     pub async fn stop(self) -> Result<(), Error> {
+        drop(self.hub);
         self.core.close_sessions();
         self.listening.stop().await;
         self.core.end_transports(self.bounds.stop_grace).await;

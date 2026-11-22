@@ -346,6 +346,14 @@ impl Core {
         lock(&self.sessions).open.get(&session.id()).cloned()
     }
 
+    /// Tells every session that follows this server's status that its hub
+    /// began or stopped answering: their status, which carries the hub's,
+    /// has changed.
+    pub(crate) fn hub_changed(&self) {
+        let mut this = lock(&self.this);
+        self.changed(&mut this);
+    }
+
     /// Keeps the machine awake, its screen free to sleep, once a satellite
     /// is linked to this hub: a sleeping hub is one its satellites cannot
     /// reach. It holds until the server stops.

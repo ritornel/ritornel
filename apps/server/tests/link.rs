@@ -1032,3 +1032,37 @@ async fn a_server_takes_its_computers_name_and_keeps_one_chosen() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellites_clients_hear_when_the_hub_goes_and_comes_back() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, _desk, mut desk_client) = linked(&scratch).await;
+        desk_client
+            .call::<LibraryStats>(&NoParams {})
+            .await
+            .unwrap();
+        desk_client.subscribe(&[Topic::Servers]).await.unwrap();
+        let port = hub.endpoint().port();
+        drop(hub_client);
+        hub.stop().await.unwrap();
+        // Nothing is asked of the hub: the satellite finds out by itself,
+        // and says so on its own status.
+        loop {
+            if let Event::Servers(_) = desk_client.next_event().await.unwrap()
+                && desk_client.status().await.unwrap().hub.unwrap().answers == Some(false)
+            {
+                break;
+            }
+        }
+        let _hub = start_on(&scratch, "hub", Listen::on_port(port)).await;
+        loop {
+            if let Event::Servers(_) = desk_client.next_event().await.unwrap()
+                && desk_client.status().await.unwrap().hub.unwrap().answers == Some(true)
+            {
+                break;
+            }
+        }
+    })
+    .await;
+}
