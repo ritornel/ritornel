@@ -166,6 +166,7 @@ fn not_eligible(
         clock: String,
         evidence: String,
         account_has_it: bool,
+        sent_from_another: bool,
         recording_id: Option<i64>,
         title: Option<String>,
         artist: Option<String>,
@@ -180,6 +181,11 @@ fn not_eligible(
                     EXISTS (SELECT 1 FROM play_event_observation x
                             JOIN history_observation xo ON xo.id = x.observation_id
                             WHERE x.play_event_id = pe.id AND xo.endpoint_id = ?2),
+                    EXISTS (SELECT 1 FROM history_delivery other
+                            JOIN play_event_observation y ON y.observation_id = other.observation_id
+                            WHERE y.play_event_id = pe.id AND other.endpoint_id = ?2
+                              AND other.id <> d.id
+                              AND other.state NOT IN ('pending', 'withdrawn')),
                     pe.recording_id, {NAMES}
              FROM history_delivery d
              JOIN play_event_observation peo
@@ -198,12 +204,13 @@ fn not_eligible(
                 clock: row.get(3)?,
                 evidence: row.get(4)?,
                 account_has_it: row.get(5)?,
-                recording_id: row.get(6)?,
-                title: row.get(7)?,
-                artist: row.get(8)?,
-                album: row.get(9)?,
-                album_artist: row.get(10)?,
-                track_number: row.get(11)?,
+                sent_from_another: row.get(6)?,
+                recording_id: row.get(7)?,
+                title: row.get(8)?,
+                artist: row.get(9)?,
+                album: row.get(10)?,
+                album_artist: row.get(11)?,
+                track_number: row.get(12)?,
             })
         })
         .optional()?;
@@ -246,6 +253,8 @@ fn not_eligible(
         Some("its play is not dated by a trusted clock")
     } else if play.account_has_it {
         Some("the account already has this play")
+    } else if play.sent_from_another {
+        Some("its play was sent from another of its listens")
     } else if play.recording_id.is_none() {
         Some("its play is no longer bound to a recording")
     } else if play.artist.as_deref() != Some(artist.as_str())
@@ -757,9 +766,14 @@ impl LibraryStore {
         self.held_for_import()
     }
 
-    /// An import has run and brought back what the service has: scrobbling
-    /// is held back no longer. Whether it was.
-    pub fn release_hold(&self) -> Result<bool, Error> {
+    /// An import from the account has run and brought back what the
+    /// service has: scrobbling is held back no longer. First, each play
+    /// still waiting that the service took after the backup, which the
+    /// import brought back at the very second it was to be sent with and
+    /// under the names it was to be sent with, is recorded as accepted, so
+    /// that the import joins its play as its echo and it is not sent again.
+    /// Whether scrobbling was held.
+    pub fn release_hold(&self, account: Id) -> Result<bool, Error> {
         if self.held_for_import()?.is_none() {
             return Ok(false);
         }
@@ -769,10 +783,66 @@ impl LibraryStore {
                 command: None,
                 client: None,
             },
-            |write| {
-                write
-                    .connection()
-                    .execute("DELETE FROM library_setting WHERE key = ?1", [HELD_SETTING])?;
+            move |write| {
+                let connection = write.connection();
+                let (endpoint, _) = endpoint_of(connection, account)?;
+                let waiting: Vec<(i64, i64, String, String)> = connection
+                    .prepare(
+                        "SELECT id, sent_timestamp_s, artist, title FROM history_delivery
+                         WHERE endpoint_id = ?1 AND state = 'pending'
+                         ORDER BY sent_timestamp_s, id",
+                    )?
+                    .query_map([endpoint], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                for (delivery, seconds, artist, title) in waiting {
+                    // An import already part of a play some listen made is
+                    // that play's.
+                    let found: Vec<(String, String)> = connection
+                        .prepare_cached(
+                            "SELECT i.artist, i.title FROM observation_import i
+                             JOIN history_observation o ON o.id = i.observation_id
+                             WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms = ?2
+                               AND NOT EXISTS (
+                                 SELECT 1 FROM play_event_observation x
+                                 JOIN play_event_observation y
+                                   ON y.play_event_id = x.play_event_id
+                                 JOIN history_observation yo
+                                   ON yo.id = y.observation_id AND yo.kind = 'listen'
+                                 WHERE x.observation_id = i.observation_id)
+                             ORDER BY o.id",
+                        )?
+                        .query_map((endpoint, seconds * 1000), |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })?
+                        .collect::<Result<_, _>>()?;
+                    let Some((took_artist, took_title)) =
+                        found.into_iter().find(|(their_artist, their_title)| {
+                            same_track(&artist, &title, their_artist, their_title)
+                        })
+                    else {
+                        continue;
+                    };
+                    connection
+                        .prepare_cached(
+                            "UPDATE history_delivery
+                             SET state = 'accepted', accepted_artist = ?2, accepted_title = ?3,
+                                 detail = ?4, next_attempt_at_ms = NULL, updated_at_ms = ?5,
+                                 rev = ?6
+                             WHERE id = ?1",
+                        )?
+                        .execute(rusqlite::params![
+                            delivery,
+                            took_artist,
+                            took_title,
+                            "the service had it already when the library was restored",
+                            write.now_ms(),
+                            write.rev(),
+                        ])?;
+                    rederive_delivery(write, delivery)?;
+                }
+                connection.execute("DELETE FROM library_setting WHERE key = ?1", [HELD_SETTING])?;
                 Ok(String::new())
             },
         )?;

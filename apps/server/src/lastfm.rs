@@ -465,11 +465,20 @@ mod enabled {
             Taken::Show(began) => began,
         };
         let client = lastfm.client().ok()?;
+        // As a batch of scrobbles is: never as a session that has changed
+        // by the time it is sent, nor while a restored library waits.
+        let _turn = lastfm.turn.batch()?;
         let session = core.with_stores(|stores| stores.server().service_session(SERVICE));
         let Some(Ok(Some(session))) = session else {
             return None;
         };
         if session.scrobble_from_ms.is_none() || session.sign_in_again {
+            return None;
+        }
+        if !matches!(
+            core.with_library(|_, library| library.held_for_import()),
+            Some(Ok(None))
+        ) {
             return None;
         }
         let names = match core.with_library(|_, library| library.playing(began.appearance)) {
@@ -795,7 +804,7 @@ mod enabled {
                     Some(Ok((matched, stored))) => {
                         // What Last.fm has is known now: plays a restored
                         // library had waiting that it took are not sent.
-                        match core.with_library(|_, library| library.release_hold()) {
+                        match core.with_library(|_, library| library.release_hold(account)) {
                             Some(Ok(true)) => {
                                 info!("an import has run since the restore: scrobbling resumes")
                             }
@@ -1477,12 +1486,13 @@ mod enabled {
             let turn = Arc::new(super::Turn::default());
             let signed_in = Arc::new(AtomicBool::new(true));
             let sent = Arc::new(AtomicUsize::new(0));
+            let settled = Arc::new(AtomicUsize::new(0));
             // The first batch is held at the moment it would leave until
             // the sign-out is waiting for it.
             let sending = Arc::new(Barrier::new(2));
             let scrobbler = {
                 let (turn, signed_in, sent) = (turn.clone(), signed_in.clone(), sent.clone());
-                let sending = sending.clone();
+                let (sending, settled) = (sending.clone(), settled.clone());
                 std::thread::spawn(move || {
                     let taken = Cell::new(0_i64);
                     send_due(&Sending {
@@ -1513,7 +1523,10 @@ mod enabled {
                                 })
                                 .collect())
                         },
-                        settle: &|_| true,
+                        settle: &|_| {
+                            settled.fetch_add(1, Ordering::SeqCst);
+                            true
+                        },
                         refuse: &|_| {},
                         now: &|| 0,
                         paused: &|_| false,
@@ -1526,7 +1539,10 @@ mod enabled {
             // its way, and once it is done nothing more leaves.
             {
                 let _held = turn.change();
+                // The batch on its way was sent and recorded before the
+                // change went ahead.
                 assert_eq!(sent.load(Ordering::SeqCst), 1);
+                assert_eq!(settled.load(Ordering::SeqCst), 1);
                 signed_in.store(false, Ordering::SeqCst);
             }
             scrobbler.join().unwrap();

@@ -255,8 +255,11 @@ mod tests {
         assert_eq!(restored.opened_restored().unwrap(), held);
         assert_eq!(restored.held_for_import().unwrap(), held);
         // An import lifts it, once.
-        assert!(restored.release_hold().unwrap());
-        assert!(!restored.release_hold().unwrap());
+        let account = restored
+            .ensure_service_account("lastfm", "someone")
+            .unwrap();
+        assert!(restored.release_hold(account).unwrap());
+        assert!(!restored.release_hold(account).unwrap());
         assert_eq!(restored.opened_restored().unwrap(), None);
     }
 

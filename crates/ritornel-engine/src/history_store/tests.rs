@@ -2817,3 +2817,116 @@ fn an_echo_of_one_play_does_not_withdraw_another_play_of_the_same_track() {
         [start / 1000 + 1]
     );
 }
+
+#[test]
+fn after_a_restore_the_import_finds_the_plays_the_service_took_and_only_those() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+    // Two plays of one track a second apart, and one of another track, all
+    // waiting to be sent when the backup was taken.
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    at.send(&at.listen(2, 0, start + 1_000, 200_000), PlayRule::V1);
+    at.send(&at.listen(3, 1, start + 10 * MINUTE, 250_000), PlayRule::V1);
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        3
+    );
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.restore",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                crate::delivery_store::hold_sending(write.connection(), start)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    // The server the backup was taken from sent the first before it went;
+    // the import brings it back.
+    scrobble_of(&at, account, start / 1000, "Moss Arcade", "Paper Kites");
+    let counted = || at.count("SELECT count(*) FROM play_event WHERE counts = 1");
+    assert_eq!(
+        counted(),
+        4,
+        "until it is recognised, the echo is a play of its own"
+    );
+    assert!(at.library.release_hold(account).unwrap());
+    // It is the first play's echo now, and the first is not sent again.
+    assert_eq!(counted(), 3);
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [("accepted".to_owned(), 1), ("pending".to_owned(), 2)]
+    );
+    // The two the service did not take are sent, the near twin included.
+    let mut sent = Vec::new();
+    for _ in 0..2 {
+        sent.extend(
+            at.library
+                .take_due_deliveries(account, 0, 50)
+                .unwrap()
+                .into_iter()
+                .map(|due| due.timestamp_s),
+        );
+    }
+    assert_eq!(sent, [start / 1000 + 1, (start + 10 * MINUTE) / 1000]);
+    let incremental = at.library.derived_history().unwrap();
+    at.rebuild(PlayRule::V1, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn a_play_joined_by_a_late_middle_listen_is_not_sent_again_from_its_first() {
+    use crate::Settled;
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 + 10 * MINUTE;
+    // One hearing in three parts, each after a crash, the first and the
+    // last long enough to count alone: the last arrives first and is sent,
+    // then the first, and the middle one last.
+    let mut first = at.listen(3, 1, start, 160_000);
+    first.end_reason = "crash".to_owned();
+    let mut middle = at.listen(4, 1, start + 4 * MINUTE, 20_000);
+    middle.end_reason = "crash".to_owned();
+    middle.continues = Some(first.listen_id);
+    middle.start_position_ms = 160_000;
+    let mut last = at.listen(5, 1, start + 6 * MINUTE, 160_000);
+    last.continues = Some(middle.listen_id);
+    last.start_position_ms = 140_000;
+    at.send(&last, PlayRule::V1);
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        1
+    );
+    for due in at.library.take_due_deliveries(account, 0, 50).unwrap() {
+        at.library
+            .settle_deliveries(vec![(
+                due.delivery,
+                Settled::Accepted {
+                    artist: due.artist.clone(),
+                    title: due.title.clone(),
+                },
+            )])
+            .unwrap();
+    }
+    at.send(&first, PlayRule::V1);
+    // Not yet one play with the last: the first part is planned alone.
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        1
+    );
+    at.send(&middle, PlayRule::V1);
+    // Whatever was planned for the first part before the three were one
+    // play is not sent: the play went from its last part.
+    let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
+    assert!(due.is_empty(), "{due:?}");
+}
