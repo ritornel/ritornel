@@ -83,6 +83,7 @@ impl Core {
                 version: EXPORT_VERSION,
                 observations: exported.observations,
                 ratings: exported.ratings,
+                deliveries: exported.deliveries,
                 plays: exported.plays,
             })
         })

@@ -783,6 +783,19 @@ mod enabled {
             Some(Err(failed)) => return finish(JobState::Failed, Some(failed.to_string()), None),
             None => return,
         };
+        // Asked for one account, while another is signed in now: it would
+        // read the other's history and say it was this one's.
+        if job.target != Some(session.account) {
+            warn!(job_id = %job_id, "a Last.fm sync for an account no longer signed in is cancelled");
+            return finish(
+                JobState::Cancelled,
+                Some(format!(
+                    "another account, {}, was signed in after this import was asked for",
+                    session.account_name
+                )),
+                None,
+            );
+        }
         let mut sink = JobSink {
             core,
             lastfm,
@@ -1194,6 +1207,71 @@ mod enabled {
             })
             .unwrap();
             assert!(sink.stopping());
+        }
+
+        #[test]
+        fn a_sync_asked_for_one_account_is_cancelled_when_another_is_signed_in() {
+            use ritornel_engine::{Command, Fingerprint, JobState, NewJob, ServiceKey};
+            use ritornel_lastfm::fake::{API_KEY, API_SECRET, FakeLastfm};
+            let fake = FakeLastfm::start("another", Vec::new());
+            let (core, scratch) = crate::testing::core();
+            core.set_lastfm(Lastfm::new(
+                super::super::LastfmRun {
+                    credentials: Some(ritornel_lastfm::ApiCredentials::new(API_KEY, API_SECRET)),
+                    base_url: Some(fake.base_url()),
+                    ..Default::default()
+                },
+                scratch.path(),
+            ));
+            let id = |n| Id::from_bytes([n; 16]);
+            let job = core
+                .with_stores(|stores| {
+                    let store = stores.server();
+                    // Asked for someone; then another signed in.
+                    store
+                        .start_job(
+                            Command {
+                                id: id(1),
+                                fingerprint: Fingerprint::of("lastfm.sync", b"{}"),
+                            },
+                            "lastfm.sync",
+                            NewJob {
+                                kind: "lastfm.sync",
+                                dedupe_key: "someone".into(),
+                                target: id(2),
+                                params_json: "{}".into(),
+                                session: None,
+                            },
+                        )
+                        .unwrap();
+                    store
+                        .save_service_session(
+                            "lastfm",
+                            id(3),
+                            "another",
+                            &ServiceKey::new("KEY_B"),
+                            false,
+                        )
+                        .unwrap();
+                    store.claim_job(id(4)).unwrap().unwrap()
+                })
+                .unwrap();
+            let public_id = job.public_id;
+            super::run_sync(&core, job, &std::sync::atomic::AtomicBool::new(false));
+            let ended = core
+                .with_stores(|stores| stores.server().job(public_id).unwrap().unwrap())
+                .unwrap();
+            assert_eq!(ended.state, JobState::Cancelled);
+            assert!(
+                ended
+                    .error
+                    .as_deref()
+                    .is_some_and(|why| why.contains("another")),
+                "{:?}",
+                ended.error
+            );
+            // Nothing of the other account's was read.
+            assert!(fake.seen().is_empty(), "{:?}", fake.seen());
         }
 
         #[test]

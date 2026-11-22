@@ -27,6 +27,35 @@ const WATCH_SETTING: &str = "library.watch";
 const BACKUP_TAKEN: &str = "backup.last";
 const BACKUP_FAILED: &str = "backup.failed";
 
+/// A setting of this machine that a command changes, for
+/// [`ServerStore::change_once`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingChange {
+    /// Watching the library's folders, on or off.
+    Watching(bool),
+    /// Scrobbling to a service, on from now or off.
+    Scrobbling {
+        /// The service.
+        service: String,
+        /// On or off.
+        on: bool,
+    },
+    /// Signing out of a service.
+    SignOut {
+        /// The service.
+        service: String,
+    },
+}
+
+fn set_watching(connection: &Connection, on: bool) -> Result<(), Error> {
+    connection.execute(
+        "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+        (WATCH_SETTING, if on { "true" } else { "false" }),
+    )?;
+    Ok(())
+}
+
 /// A backup that was written: when, where and why.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BackupTaken {
@@ -261,13 +290,44 @@ impl ServerStore {
 
     /// Turns watching on or off, for this machine.
     pub fn set_watching(&self, on: bool) -> Result<(), Error> {
-        self.writer.call(move |connection| {
-            connection.execute(
-                "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
-                 ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
-                (WATCH_SETTING, if on { "true" } else { "false" }),
+        self.writer
+            .call(move |connection| set_watching(connection, on))
+    }
+
+    /// Carries out a command that changes a setting of this machine, once:
+    /// the change and its receipt are written together. The same command
+    /// again changes nothing, so a retry that arrives after a newer command
+    /// never undoes it; the same ID with other params is refused. Returns
+    /// what the change found the first time: for a sign-out, whether there
+    /// was a session; for the others, `true`.
+    pub fn change_once(
+        &self,
+        command: crate::Command,
+        method: &'static str,
+        change: SettingChange,
+    ) -> Result<bool, Error> {
+        self.transact(move |transaction, now_ms, _| {
+            if let Some(stored) = crate::jobs::receipt(transaction, &command)? {
+                return Ok(stored == "true");
+            }
+            let found = match &change {
+                SettingChange::Watching(on) => set_watching(transaction, *on).map(|()| true)?,
+                SettingChange::Scrobbling { service, on } => {
+                    crate::service_session::set_scrobbling(transaction, service, *on, now_ms)
+                        .map(|()| true)?
+                }
+                SettingChange::SignOut { service } => {
+                    crate::service_session::remove_session(transaction, service)?
+                }
+            };
+            crate::jobs::record_receipt(
+                transaction,
+                &command,
+                method,
+                if found { "true" } else { "false" },
+                now_ms,
             )?;
-            Ok(())
+            Ok(found)
         })
     }
 

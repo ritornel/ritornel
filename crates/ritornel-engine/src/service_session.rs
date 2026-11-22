@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::{Error, Id, ServerStore};
 
@@ -53,6 +53,27 @@ pub struct ServiceSession {
     /// The service refused the session: nothing is sent until a new
     /// sign-in.
     pub sign_in_again: bool,
+}
+
+/// Forgets the session at `service`. Whether there was one.
+pub(crate) fn remove_session(connection: &Connection, service: &str) -> Result<bool, Error> {
+    Ok(connection.execute("DELETE FROM service_session WHERE service = ?1", [service])? > 0)
+}
+
+/// Turns scrobbling to `service` on from `now_ms`, unless it is on, or off.
+pub(crate) fn set_scrobbling(
+    connection: &Connection,
+    service: &str,
+    on: bool,
+    now_ms: i64,
+) -> Result<(), Error> {
+    connection.execute(
+        "UPDATE service_session
+         SET scrobble_from_ms = CASE WHEN ?2 THEN coalesce(scrobble_from_ms, ?3) END
+         WHERE service = ?1",
+        rusqlite::params![service, on, now_ms],
+    )?;
+    Ok(())
 }
 
 impl ServerStore {
@@ -121,12 +142,7 @@ impl ServerStore {
     /// Forgets the session at `service`. Whether there was one.
     pub fn remove_service_session(&self, service: &str) -> Result<bool, Error> {
         let service = service.to_owned();
-        self.transact(move |transaction, _, _| {
-            Ok(
-                transaction.execute("DELETE FROM service_session WHERE service = ?1", [service])?
-                    > 0,
-            )
-        })
+        self.transact(move |transaction, _, _| remove_session(transaction, &service))
     }
 
     /// Turns scrobbling to `service` on, for plays from now on, or off.
@@ -135,13 +151,7 @@ impl ServerStore {
     pub fn set_scrobbling(&self, service: &str, on: bool) -> Result<Option<ServiceSession>, Error> {
         let owned = service.to_owned();
         self.transact(move |transaction, now_ms, _| {
-            transaction.execute(
-                "UPDATE service_session
-                 SET scrobble_from_ms = CASE WHEN ?2 THEN coalesce(scrobble_from_ms, ?3) END
-                 WHERE service = ?1",
-                rusqlite::params![owned, on, now_ms],
-            )?;
-            Ok(())
+            set_scrobbling(transaction, &owned, on, now_ms)
         })?;
         self.service_session(service)
     }

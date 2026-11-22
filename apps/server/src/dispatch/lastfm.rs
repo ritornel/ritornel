@@ -117,12 +117,12 @@ impl Core {
 
 #[cfg(feature = "lastfm")]
 mod enabled {
-    use ritornel_contract::methods::{LastfmSync, Method};
+    use ritornel_contract::methods::{LastfmSetScrobbling, LastfmSignOut, LastfmSync, Method};
     use ritornel_contract::{
         DeliveryCount, DoubtfulTrack, ImportSchedule, LastImport, NearlyMatched, Receipt,
         ReceiptStatus,
     };
-    use ritornel_engine::{Command, LibraryStore, NewJob, ServiceSession};
+    use ritornel_engine::{Command, LibraryStore, NewJob, ServiceSession, SettingChange};
 
     use super::*;
     use crate::dispatch::calls::job;
@@ -420,11 +420,22 @@ mod enabled {
             stores: &Stores,
             params: &KeyParams,
         ) -> Result<SignedOut, RpcError> {
+            let command = Command {
+                id: params.idempotency_key,
+                fingerprint: fingerprint::<LastfmSignOut>(params)?,
+            };
             // Once this answers, nothing more is sent as the session ended.
+            // Sent again after a newer sign-in, it signs nothing out.
             let change = self.lastfm().map(Lastfm::hold);
             let was_signed_in = stores
                 .server()
-                .remove_service_session(SERVICE)
+                .change_once(
+                    command,
+                    LastfmSignOut::NAME,
+                    SettingChange::SignOut {
+                        service: SERVICE.to_owned(),
+                    },
+                )
                 .map_err(refused)?;
             drop(change);
             Ok(SignedOut {
@@ -463,14 +474,28 @@ mod enabled {
             params: &ScrobblingParams,
         ) -> Result<ScrobblingSet, RpcError> {
             Self::session(stores)?;
-            // Turned off, nothing more is sent once this answers.
+            let command = Command {
+                id: params.idempotency_key,
+                fingerprint: fingerprint::<LastfmSetScrobbling>(params)?,
+            };
+            // Turned off, nothing more is sent once this answers. Sent again
+            // after a newer change, it changes nothing, and answers with
+            // scrobbling as it is.
             let change = self.lastfm().map(Lastfm::hold);
-            let session = stores
+            stores
                 .server()
-                .set_scrobbling(SERVICE, params.on)
+                .change_once(
+                    command,
+                    LastfmSetScrobbling::NAME,
+                    SettingChange::Scrobbling {
+                        service: SERVICE.to_owned(),
+                        on: params.on,
+                    },
+                )
                 .map_err(refused)?;
             drop(change);
             self.wake_scrobbler();
+            let session = stores.server().service_session(SERVICE).map_err(refused)?;
             Ok(ScrobblingSet {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Done),
                 scrobbling_since: session.and_then(|s| s.scrobble_from_ms),
@@ -667,6 +692,53 @@ mod tests {
 
     fn schedule(core: &Core, session: &Session) -> Value {
         call(core, session, "lastfm.status", json!({})).unwrap()["import"].clone()
+    }
+
+    #[test]
+    fn a_settings_command_sent_again_never_undoes_a_newer_one() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, cli) = hub(&clock);
+        let scrobbling = |byte: u8, on: bool| {
+            let mut params = key(byte);
+            params["on"] = json!(on);
+            call(&core, &cli, "lastfm.setScrobbling", params)
+        };
+        let on = || {
+            call(&core, &cli, "lastfm.status", json!({})).unwrap()["scrobblingSince"].is_number()
+        };
+        // On with A, off with B, then A again, as a client retrying a reply
+        // it lost would: it stays off.
+        scrobbling(0xa1, true).unwrap();
+        scrobbling(0xb1, false).unwrap();
+        let again = scrobbling(0xa1, true).unwrap();
+        assert!(!on());
+        assert_eq!(again["scrobblingSince"], Value::Null);
+        // The same key with other params is refused.
+        assert_eq!(scrobbling(0xb1, true), Err(ErrorCode::IdempotencyMismatch));
+        assert!(!on());
+
+        // A sign-out sent again after a new sign-in signs nothing out.
+        let signed_out = call(&core, &cli, "lastfm.signOut", key(0xa2)).unwrap();
+        assert_eq!(signed_out["wasSignedIn"], true);
+        sign_in(&core);
+        let again = call(&core, &cli, "lastfm.signOut", key(0xa2)).unwrap();
+        assert_eq!(again["wasSignedIn"], true);
+        let status = call(&core, &cli, "lastfm.status", json!({})).unwrap();
+        assert_eq!(status["account"], "someone");
+
+        // Watching: off with A, on with B, then A again stays on.
+        let watching = |byte: u8, on: bool| {
+            let mut params = key(byte);
+            params["on"] = json!(on);
+            call(&core, &cli, "library.setWatching", params).unwrap()
+        };
+        watching(0xa3, false);
+        watching(0xb3, true);
+        watching(0xa3, false);
+        assert!(
+            core.with_stores(|stores| stores.server().watching().unwrap())
+                .unwrap()
+        );
     }
 
     #[test]

@@ -453,3 +453,87 @@ fn cancellation_after_the_first_count_stops_an_incremental_import() {
     assert!(synced.stopped);
     assert_eq!(fake.seen().len(), 1);
 }
+
+#[test]
+fn scrobbles_of_one_second_split_across_pages_are_read_again_as_one() {
+    // Five scrobbles in one second, two of them identical, between others,
+    // in pages of four: the second falls across page boundaries, and
+    // Last.fm gives its scrobbles in another order on every other read.
+    let second = NOW - 7_200;
+    let mut scrobbles = vec![
+        FakeScrobble::new(second + 60, "Invented Artist", "Invented Album", "Later"),
+        FakeScrobble::new(second - 60, "Invented Artist", "Invented Album", "Earlier"),
+        FakeScrobble::new(
+            second - 120,
+            "Invented Artist",
+            "Invented Album",
+            "Earliest",
+        ),
+    ];
+    for title in ["A", "B", "C", "D", "D"] {
+        scrobbles.push(FakeScrobble::new(
+            second,
+            "Invented Artist",
+            "Invented Album",
+            title,
+        ));
+    }
+    let fake = FakeLastfm::start("someone", scrobbles);
+    fake.unstable_order();
+    let mut sink = Memory::default();
+    lastfm(&fake, 100)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut sink, true)
+        .unwrap();
+    let mut at_second: Vec<String> = sink
+        .records
+        .values()
+        .filter(|record| record.played_at_ms == seconds_to_ms(second))
+        .map(|record| record.track.title.clone())
+        .collect();
+    at_second.sort();
+    // Each once, and the two identical ones as two.
+    assert_eq!(at_second, ["A", "B", "C", "D", "D"]);
+    assert_eq!(sink.records.len(), 8);
+    // Read again, nothing is new and nothing has gone.
+    let again = lastfm(&fake, 100)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut sink, true)
+        .unwrap();
+    assert_eq!((again.new, again.gone), (0, 0));
+}
+
+#[test]
+fn loved_tracks_answered_for_another_account_do_not_replace_the_list() {
+    let fake = FakeLastfm::start("someone", Vec::new());
+    fake.set_loved(vec![("Invented Artist", "Invented Song", NOW)]);
+    fake.answer_loved_as("another");
+    let kept = Love {
+        artist: "Invented Artist".into(),
+        title: "Kept Song".into(),
+        loved_at_ms: seconds_to_ms(NOW),
+    };
+    let mut sink = Memory {
+        loves: vec![kept.clone()],
+        ..Default::default()
+    };
+    let result = lastfm(&fake, 10)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut sink, true);
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(sink.loves, [kept]);
+    // Answered as the same account, spelled another way, it is taken.
+    let fake = FakeLastfm::start("someone", Vec::new());
+    fake.set_loved(vec![("Invented Artist", "Invented Song", NOW)]);
+    fake.answer_loved_as("SomeOne");
+    lastfm(&fake, 10)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut sink, true)
+        .unwrap();
+    assert_eq!(sink.loves.len(), 1);
+    assert_eq!(sink.loves[0].title, "Invented Song");
+}

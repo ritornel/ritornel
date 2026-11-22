@@ -4,11 +4,12 @@
 
 use std::path::PathBuf;
 
+use ritornel_contract::methods::{LibrarySetWatching, Method};
 use ritornel_contract::{
     AutoTrigger, Id, Receipt, ReceiptStatus, RpcError, WatchStatus, WatchedFolder, WatchedKind,
     WatchingParams, WatchingSet,
 };
-use ritornel_engine::{Command, Fingerprint, JobState, NewJob, WriteRequest};
+use ritornel_engine::{Command, Fingerprint, JobState, NewJob, SettingChange, WriteRequest};
 use serde::Serialize;
 use tracing::{info, warn};
 
@@ -55,15 +56,21 @@ impl Core {
     /// what a setting in the app calls, with the databases the call holds
     /// already: taking them again could wait behind the server stopping,
     /// which waits for the call.
+    #[cfg(test)]
     pub(crate) fn set_watching(&self, stores: &Stores, on: bool) -> Result<(), crate::Error> {
         stores.server().set_watching(on)?;
+        self.watching_set(on);
+        Ok(())
+    }
+
+    /// Says watching was turned on or off, and tells the watching thread.
+    fn watching_set(&self, on: bool) {
         info!(
             on,
             "watching the library's folders is turned {}",
             if on { "on" } else { "off" }
         );
         self.wake_watch();
-        Ok(())
     }
 
     /// Why this server is not watching its folders now, if it is not. Only
@@ -309,16 +316,29 @@ impl Core {
         }
     }
 
-    /// `library.setWatching`: the setting is kept in `server.db` and the
-    /// watching thread told. Setting it again changes nothing, so the
-    /// receipt is made and not stored, as `lastfm.setScrobbling`'s is.
+    /// `library.setWatching`: the setting is kept in `server.db` with the
+    /// command's receipt, and the watching thread told. Sent again, after
+    /// a newer command or not, it changes nothing, and answers with
+    /// watching as it is.
     pub(super) fn library_set_watching(
         &self,
         stores: &Stores,
         params: &WatchingParams,
     ) -> Result<WatchingSet, RpcError> {
-        self.set_watching(stores, params.on)
+        let command = Command {
+            id: params.idempotency_key,
+            fingerprint: super::fingerprint::<LibrarySetWatching>(params)?,
+        };
+        stores
+            .server()
+            .change_once(
+                command,
+                LibrarySetWatching::NAME,
+                SettingChange::Watching(params.on),
+            )
+            .map_err(crate::Error::Store)
             .map_err(super::failed)?;
+        self.watching_set(params.on);
         Ok(WatchingSet {
             receipt: Receipt {
                 command_id: params.idempotency_key,

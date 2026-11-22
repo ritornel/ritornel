@@ -8,6 +8,8 @@
 //! observations.jsonl   every observation, oldest first: a listen, an import
 //!                      record or a correction, with the record as it was received
 //! ratings.jsonl        every rating and love as it was said, a clearing included
+//! deliveries.jsonl     every play sent, or to be sent, to a service such as
+//!                      Last.fm: what was sent and what became of it
 //! plays.csv            the plays derived from them, as a plain table
 //! ```
 //!
@@ -15,7 +17,16 @@
 //! the ID of a play, which a rebuild can change (decision 4). The
 //! observations and the ratings are the record; the plays are derived
 //! from it, by the rule the manifest names, and are there to be used at
-//! once. What the library calls a track now (its title, artist and album)
+//! once. The deliveries are what the record needs besides to derive the
+//! plays again without Ritornel: a play Ritornel scrobbled comes back in
+//! an import as its echo, which joins the play rather than making another.
+//! An import is the echo of a listen's delivery to the import's own
+//! endpoint when the delivery may have arrived (`sending`, `accepted` or
+//! `unknown`), was sent with the import's time to the second, and names
+//! the same track as it was sent or as the service took it: the artist and
+//! the title each equal once put in Unicode NFKC and lower case, with "&"
+//! read as "and" and punctuation and symbols set aside. Of several, the
+//! listen that comes first in observations.jsonl. What the library calls a track now (its title, artist and album)
 //! is given beside each line for a reader's convenience, and is not part
 //! of the record.
 //!
@@ -34,15 +45,16 @@ use crate::{Error, LibraryStore};
 /// The format's name, in the manifest.
 pub const EXPORT_FORMAT: &str = "ritornel-record";
 
-/// The format's version. A change a reader of version 1 would misread is
-/// version 2.
-pub const EXPORT_VERSION: u32 = 1;
+/// The format's version. A change a reader of one version would misread is
+/// the next. Version 2 added `deliveries.jsonl`.
+pub const EXPORT_VERSION: u32 = 2;
 
 /// How many of each were written.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Exported {
     pub observations: u64,
     pub ratings: u64,
+    pub deliveries: u64,
     pub plays: u64,
 }
 
@@ -56,6 +68,7 @@ impl LibraryStore {
         let exported = Exported {
             observations: observations(&connection, &into.join("observations.jsonl"))?,
             ratings: ratings(&connection, &into.join("ratings.jsonl"))?,
+            deliveries: deliveries(&connection, &into.join("deliveries.jsonl"))?,
             plays: plays(&connection, &into.join("plays.csv"))?,
         };
         let manifest = manifest(&connection, self.library_id(), now_ms, exported)?;
@@ -159,6 +172,7 @@ fn manifest(
         "files": {
             "observations.jsonl": { "lines": exported.observations },
             "ratings.jsonl": { "lines": exported.ratings },
+            "deliveries.jsonl": { "lines": exported.deliveries },
             "plays.csv": {
                 "rows": exported.plays,
                 "playRuleVersions": versions("play_rule_version")?,
@@ -495,6 +509,61 @@ fn ratings(connection: &Connection, path: &Path) -> Result<u64, Error> {
                 "title": row.get::<_, Option<String>>(16)?,
                 "artist": row.get::<_, Option<String>>(17)?,
             },
+        });
+        line(&mut file, &value)?;
+        written += 1;
+    }
+    finish(file)?;
+    Ok(written)
+}
+
+fn deliveries(connection: &Connection, path: &Path) -> Result<u64, Error> {
+    let mut file = create(path)?;
+    let mut statement = connection.prepare(
+        "SELECT oe.public_id, o.source_key, de.public_id, d.state, d.sent_timestamp_s,
+                d.artist, d.title, d.album, d.album_artist, d.track_number, d.duration_ms,
+                d.accepted_artist, d.accepted_title, d.ignored_code, d.detail,
+                d.attempts, d.created_at_ms, d.updated_at_ms
+         FROM history_delivery d
+         JOIN history_observation o ON o.id = d.observation_id
+         JOIN history_endpoint oe ON oe.id = o.endpoint_id
+         JOIN history_endpoint de ON de.id = d.endpoint_id
+         ORDER BY d.id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut written = 0;
+    while let Some(row) = rows.next()? {
+        let accepted: (Option<String>, Option<String>) = (row.get(11)?, row.get(12)?);
+        let value = json!({
+            // The listen sent, as observations.jsonl names it.
+            "observation": {
+                "endpoint": key(row.get(0)?),
+                "sourceKey": hex(&row.get::<_, Vec<u8>>(1)?),
+            },
+            // Where it was sent: an endpoint the manifest lists.
+            "destination": key(row.get(2)?),
+            "state": row.get::<_, String>(3)?,
+            // The time it was sent with, which is what its echo carries.
+            "sentTimestamp": utc(row.get::<_, i64>(4)?.checked_mul(1000)),
+            "sent": {
+                "artist": row.get::<_, String>(5)?,
+                "title": row.get::<_, String>(6)?,
+                "album": row.get::<_, Option<String>>(7)?,
+                "albumArtist": row.get::<_, Option<String>>(8)?,
+                "trackNumber": row.get::<_, Option<i64>>(9)?,
+                "durationMs": row.get::<_, Option<i64>>(10)?,
+            },
+            // The names the service took it under, which it may have
+            // corrected; only once it was accepted.
+            "accepted": match accepted {
+                (Some(artist), Some(title)) => json!({ "artist": artist, "title": title }),
+                _ => Value::Null,
+            },
+            "ignoredCode": row.get::<_, Option<i64>>(13)?,
+            "detail": row.get::<_, Option<String>>(14)?,
+            "attempts": row.get::<_, i64>(15)?,
+            "recordedAt": utc(row.get(16)?),
+            "updatedAt": utc(row.get(17)?),
         });
         line(&mut file, &value)?;
         written += 1;

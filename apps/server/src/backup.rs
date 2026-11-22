@@ -19,7 +19,10 @@
 //!
 //! Each database is copied whole with `VACUUM INTO` on a connection of its
 //! own, beside the writer, so the server goes on playing and recording
-//! while it is taken. The folder is written under a name that begins with
+//! while it is taken. The two are copied one after the other, not at one
+//! moment: a listen open in the copy of `server.db` may already be in the
+//! copy of `library.db`, which keeps its own and records the other as a
+//! conflict when the listen is delivered after a restore. The folder is written under a name that begins with
 //! a dot and is renamed once everything in it is whole, so a folder with
 //! the plain name is a backup that finished.
 
@@ -45,8 +48,12 @@ const README: &str = "\
 A backup of a Ritornel server, taken by the server itself.
 
 server.db and library.db are whole SQLite databases, each a consistent copy
-of the database as it was when the backup began. backup.json says when it
-was taken, why, and what each file is.
+of that database as it was when its own copy began: server.db first, then
+library.db. The two can differ by what happened in between: a listen still
+being heard in server.db may have ended, and reached your history, by the
+time library.db was copied. Restored, the history in library.db is kept as
+it is, and the copy of that listen in server.db is set aside. backup.json
+says when the backup was taken, why, and what each file is.
 
 To restore it, stop the server, and put server.db, library.db and, if it is
 here, config.toml into an empty data directory: on a Mac
@@ -571,6 +578,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(first.path.join("backup.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest["reason"], "on_demand");
+        // The two databases are copied one after the other, and the README
+        // says what that means for a listen heard meanwhile.
+        let readme = std::fs::read_to_string(first.path.join("README.txt")).unwrap();
+        assert!(readme.contains("server.db first, then"), "{readme}");
         assert_eq!(manifest["takenAt"], "2025-11-21T17:01:02.123Z");
 
         // A second in the same second is told apart, and nothing is left

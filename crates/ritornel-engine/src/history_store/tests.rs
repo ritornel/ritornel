@@ -1559,7 +1559,7 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
             .unwrap();
     assert_eq!(
         (&manifest["format"], &manifest["version"]),
-        (&serde_json::json!("ritornel-record"), &serde_json::json!(1))
+        (&serde_json::json!("ritornel-record"), &serde_json::json!(2))
     );
     assert_eq!(
         manifest["zonePeriods"],
@@ -2929,4 +2929,104 @@ fn a_play_joined_by_a_late_middle_listen_is_not_sent_again_from_its_first() {
     // play is not sent: the play went from its last part.
     let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
     assert!(due.is_empty(), "{due:?}");
+}
+
+#[test]
+fn an_outside_reader_joins_an_echo_under_corrected_names_to_its_play_from_the_export_alone() {
+    use crate::Settled;
+    use serde_json::Value;
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        1
+    );
+    let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
+    // Last.fm took it under another title, and the import brings it back so.
+    at.library
+        .settle_deliveries(vec![(
+            due[0].delivery,
+            Settled::Accepted {
+                artist: "Moss Arcade".to_owned(),
+                title: "Paper Kites (Live)".to_owned(),
+            },
+        )])
+        .unwrap();
+    scrobble_of(
+        &at,
+        account,
+        start / 1000,
+        "Moss Arcade",
+        "Paper Kites (Live)",
+    );
+
+    let scratch = crate::testing::Scratch::new();
+    let exported = at
+        .library
+        .export_record(scratch.path(), T0 + 99 * MINUTE)
+        .unwrap();
+    assert_eq!(exported.deliveries, 1);
+
+    // From here on, only what is in the folder, read as a program that
+    // knows nothing of Ritornel would: an import is the echo of the
+    // delivery to its own endpoint that may have arrived, sent at its
+    // second, naming its track as sent or as the service took it.
+    let observations = reading_an_export::lines(&scratch.path().join("observations.jsonl"));
+    let deliveries = reading_an_export::lines(&scratch.path().join("deliveries.jsonl"));
+    let import = observations
+        .iter()
+        .find(|line| line["kind"] == "import")
+        .unwrap();
+    let names = |artist: &Value, title: &Value| {
+        (
+            artist.as_str().unwrap_or_default().to_lowercase(),
+            title.as_str().unwrap_or_default().to_lowercase(),
+        )
+    };
+    let theirs = names(&import["import"]["artist"], &import["import"]["title"]);
+    let echoed: Vec<&Value> = deliveries
+        .iter()
+        .filter(|delivery| {
+            delivery["destination"] == import["endpoint"]
+                && ["sending", "accepted", "unknown"].contains(&delivery["state"].as_str().unwrap())
+                && delivery["sentTimestamp"] == import["import"]["playedAt"]
+                && (names(&delivery["sent"]["artist"], &delivery["sent"]["title"]) == theirs
+                    || names(
+                        &delivery["accepted"]["artist"],
+                        &delivery["accepted"]["title"],
+                    ) == theirs)
+        })
+        .collect();
+    assert_eq!(echoed.len(), 1);
+    // Only the names Last.fm took say so: the names sent do not.
+    assert_ne!(
+        names(&echoed[0]["sent"]["artist"], &echoed[0]["sent"]["title"]),
+        theirs
+    );
+    let listen = &echoed[0]["observation"];
+    assert!(observations.iter().any(|line| line["kind"] == "listen"
+        && line["endpoint"] == listen["endpoint"]
+        && line["sourceKey"] == listen["sourceKey"]));
+
+    // What the reader derived is what the table says: one play, the
+    // listen's, with the import beside it, and none of its own.
+    let plays = reading_an_export::table(&scratch.path().join("plays.csv"));
+    assert_eq!(plays.len(), 1, "{plays:?}");
+    assert_eq!(
+        plays[0]["source_key"],
+        listen["sourceKey"].as_str().unwrap()
+    );
+    assert_eq!(
+        plays[0]["corroborated_by"],
+        format!(
+            "{}:{}",
+            import["endpoint"].as_str().unwrap(),
+            import["sourceKey"].as_str().unwrap()
+        )
+    );
 }

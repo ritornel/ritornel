@@ -1251,6 +1251,10 @@ export type HistoryExported = {
    */
   ratings: number,
   /**
+   * How many plays sent, or to be sent, to a service such as Last.fm.
+   */
+  deliveries: number,
+  /**
    * How many plays in the table derived from them.
    */
   plays: number,
@@ -2656,8 +2660,8 @@ export type PlaySource = { "type": "tracks",
 };
 
 /**
- * What a playback command returns: the receipt, and where the player is
- * after it. The whole state is read with `playback.get` or sent on the
+ * What a playback command returns: the receipt, and where the command put
+ * the player. The whole state is read with `playback.get` or sent on the
  * `playback` topic.
  */
 export type PlaybackChanged = {
@@ -2666,7 +2670,9 @@ export type PlaybackChanged = {
    */
   queueRevision: number,
   /**
-   * The entry the player is on after it.
+   * The entry the command put the player on. One that cannot be played
+   * is moved past at once, so the player may already be on a later
+   * entry: `playback.get` and the `playback` topic say where it is.
    */
   entryId?: string,
   /**
