@@ -569,6 +569,18 @@ impl Wall {
     /// when the session began is opened at once.
     fn restated(&mut self, net: Arc<Net>, cx: &mut Context<Self>) {
         let opens = net.holds && !self.net.as_ref().is_some_and(|held| held.holds);
+        // The hub is back: a wall its absence kept from being read is read.
+        let back = self.failed
+            && self
+                .net
+                .as_deref()
+                .is_some_and(|held| crate::away::away(held).is_some())
+            && crate::away::away(&net).is_none();
+        if back {
+            self.net = Some(net);
+            self.try_again(cx);
+            return;
+        }
         if opens {
             self.start(net, cx);
         } else {
@@ -2394,6 +2406,14 @@ impl Wall {
                 .into()
             });
             return Some(blank);
+        }
+        // A wall the hub's absence kept from being read says that, and
+        // reads itself again when the hub is back: there is nothing to do.
+        if self.failed
+            && let Some(away) = crate::away::away(net)
+        {
+            let (title, text) = away.blank();
+            return Some(Blank::new(title, text));
         }
         if self.failed {
             let mut blank = Blank::new(

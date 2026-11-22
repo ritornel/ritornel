@@ -1,0 +1,133 @@
+//! What the app says while the computer its library is on does not answer:
+//! the server it runs with is a satellite, and its hub has gone.
+//!
+//! It says nothing for a few seconds, since a hub that is back at once
+//! needs no word. Then a notice says so, once, and another when it is
+//! back. Meanwhile the toolbar's connection shows it, and hovering it says
+//! what is wrong, since when and what still works. The library is never
+//! emptied: a wall already drawn stays, and one that could not be read
+//! says why in its place.
+
+use crate::net::Net;
+use crate::settings::words::{Clock, Style, when};
+
+/// How long the hub may be away before anything is said.
+pub(crate) const QUIET_MS: i64 = 5_000;
+
+/// The hub, away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Away {
+    /// The hub's name.
+    pub hub: String,
+    /// Since when it has not answered, in Unix milliseconds.
+    pub since_ms: i64,
+}
+
+/// Now, read in this machine's zone and locale.
+pub(crate) fn clock() -> Clock {
+    Clock {
+        now: now_ms(),
+        zone: jiff::tz::TimeZone::system(),
+        style: Style::of_locale(&crate::platform::locale().unwrap_or_else(|| "en-US".to_owned())),
+    }
+}
+
+/// Now, in Unix milliseconds.
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(0))
+}
+
+/// The hub of the server `net` talks to, if it has one and it does not
+/// answer.
+pub(crate) fn away(net: &Net) -> Option<Away> {
+    let hub = net.hub.as_ref()?;
+    (hub.answers == Some(false)).then(|| Away {
+        hub: hub.name.clone(),
+        since_ms: hub.since_ms.unwrap_or(0),
+    })
+}
+
+/// The same, once it has been away long enough to say so.
+pub(crate) fn said(net: &Net) -> Option<Away> {
+    away(net).filter(|away| away.said(now_ms()))
+}
+
+impl Away {
+    /// Whether it has been away long enough to say so at `now_ms`.
+    pub(crate) fn said(&self, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.since_ms) >= QUIET_MS
+    }
+
+    /// How long until it is said, in milliseconds, if it is not yet.
+    pub(crate) fn wait_ms(&self, now_ms: i64) -> Option<u64> {
+        let left = QUIET_MS - now_ms.saturating_sub(self.since_ms);
+        u64::try_from(left).ok().filter(|left| *left > 0)
+    }
+
+    /// Since when, as a person reads it: a time today, or a day and a time.
+    fn since(&self, clock: &Clock) -> String {
+        let at = when(self.since_ms, clock);
+        match at.strip_prefix("today at ") {
+            Some(time) => time.to_owned(),
+            None => at,
+        }
+    }
+
+    /// The notice when the hub has gone.
+    pub(crate) fn toast(&self) -> String {
+        format!("Can’t reach {}. Waiting for it to come back.", self.hub)
+    }
+
+    /// What hovering the toolbar's connection says: what is wrong, then
+    /// since when and what still works.
+    pub(crate) fn card(&self, clock: &Clock) -> (String, String) {
+        (
+            format!("Can’t reach {}", self.hub),
+            format!(
+                "No connection since {}. What’s playing keeps going, and your listens are \
+                 saved until it’s back.",
+                self.since(clock)
+            ),
+        )
+    }
+
+    /// What the library says in its place when it could not be read.
+    pub(crate) fn blank(&self) -> (String, String) {
+        (
+            format!("Can’t reach {}.", self.hub),
+            format!("Your library will be here as soon as {} is back.", self.hub),
+        )
+    }
+}
+
+/// The notice when the hub is back.
+pub(crate) fn back_toast(hub: &str) -> String {
+    format!("{hub} is back.")
+}
+
+/// What hovering the toolbar's connection says while the hub answers.
+pub(crate) fn fine_card(hub: &str) -> (String, String) {
+    (
+        format!("Connected to {hub}"),
+        "Your library and listening history are kept there.".to_owned(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_is_said_for_the_first_seconds() {
+        let away = Away {
+            hub: "Studio Mac".to_owned(),
+            since_ms: 1_000_000,
+        };
+        assert!(!away.said(1_000_000 + QUIET_MS - 1));
+        assert_eq!(away.wait_ms(1_000_000 + 1_000), Some(4_000));
+        assert!(away.said(1_000_000 + QUIET_MS));
+        assert_eq!(away.wait_ms(1_000_000 + QUIET_MS), None);
+    }
+}

@@ -161,11 +161,28 @@ pub(crate) fn menus(cx: &mut App) {
 /// Goes to a tab, as clicking it does.
 pub(crate) type OnTab = std::rc::Rc<dyn Fn(Tab, &mut gpui::Window, &mut App)>;
 
+/// The connection, as the title bar shows it at the right of the middle.
+pub(crate) struct Server {
+    /// The name it is shown by.
+    pub name: SharedString,
+    /// Whether the computer the library is on has gone: the dot is then an
+    /// amber ring.
+    pub away: bool,
+    /// What it says while the pointer is on it: a first line and a second,
+    /// which may be empty.
+    pub card: Option<(SharedString, SharedString)>,
+    /// Told when the pointer comes onto it, or leaves.
+    pub on_hover: OnHover,
+}
+
+/// Told whether the pointer is on something.
+pub(crate) type OnHover = Rc<dyn Fn(bool, &mut gpui::Window, &mut App)>;
+
 pub(crate) fn title_bar(
     can_go_back: bool,
     lit: Tab,
-    // The server's name, or `None` when there is no connection.
-    server: Option<SharedString>,
+    // The connection, or `None` when there is none.
+    server: Option<Server>,
     search: gpui::AnyElement,
     on_back: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut App) + 'static,
     on_tab: OnTab,
@@ -271,28 +288,77 @@ pub(crate) fn title_bar(
                 .text_size(px(12.5))
                 .text_color(theme::dim())
                 .whitespace_nowrap()
-                .child(
-                    div()
-                        .size(px(7.))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(if server.is_some() {
-                            gpui::rgb(0x3fae6a)
-                        } else {
-                            theme::fill2()
-                        }),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .child(server.unwrap_or_else(|| "Not connected".into())),
-                ),
+                .child(connection(server)),
         )
         .child(search)
         .when(platform::CHROME.app_buttons, |bar| {
             bar.child(caption_buttons())
         })
+}
+
+/// The connection's dot and name, and what hovering them says.
+fn connection(server: Option<Server>) -> impl IntoElement {
+    let dot = div().size(px(7.)).flex_none().rounded_full();
+    let dot = match &server {
+        Some(server) if server.away => dot.border(px(1.5)).border_color(theme::warn()),
+        Some(_) => dot.bg(gpui::rgb(0x3fae6a)),
+        None => dot.bg(theme::fill2()),
+    };
+    let Some(Server {
+        name,
+        card,
+        on_hover,
+        ..
+    }) = server
+    else {
+        return div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .min_w_0()
+            .child(dot)
+            .child(div().min_w_0().truncate().child("Not connected"))
+            .into_any_element();
+    };
+    div()
+        .id("connection")
+        .relative()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .min_w_0()
+        .on_hover(move |over, window, cx| on_hover(*over, window, cx))
+        .child(dot)
+        .child(div().min_w_0().truncate().child(name))
+        .children(card.map(|(first, then)| {
+            // Over the page, as the search's results are, under the name
+            // and ending where it ends.
+            gpui::deferred(
+                div()
+                    .absolute()
+                    .top(px(24.))
+                    .right_0()
+                    .w(px(300.))
+                    .p(px(12.))
+                    .rounded(px(12.))
+                    .bg(theme::raised())
+                    .shadow(crate::search::shadow())
+                    .whitespace_normal()
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .child(
+                        div()
+                            .font_weight(FontWeight(600.))
+                            .text_color(theme::ink())
+                            .child(first),
+                    )
+                    .when(!then.is_empty(), |card| {
+                        card.child(div().mt(px(3.)).text_color(theme::dim()).child(then))
+                    }),
+            )
+            .with_priority(1)
+        }))
+        .into_any_element()
 }
 
 /// The button that opens the app's menus where the system has no menu

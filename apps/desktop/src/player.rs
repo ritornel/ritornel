@@ -221,6 +221,9 @@ pub(crate) struct Player {
     /// What is being said, and since when.
     pub toast: Option<(SharedString, Instant)>,
     toast_ends: Option<Task<()>>,
+    /// Whether the toast has said the hub is away, and not yet that it is
+    /// back.
+    hub_away_said: bool,
     /// What plays next, while the card is open.
     pub up_next: Option<UpNext>,
     /// Whether Up next's card is open.
@@ -237,10 +240,16 @@ impl Player {
                 player.state = None;
                 player.rated = Ratings::default();
                 player.net = Some(Arc::clone(net));
+                player.hub_away_said = false;
+                player.say_of_hub(net, cx);
                 player.read(cx);
             }
-            // The same session: nothing it read has changed.
-            LinkEvent::Restated(net) => player.net = Some(Arc::clone(net)),
+            // The same session: nothing it read has changed, but what it
+            // says of its hub may have.
+            LinkEvent::Restated(net) => {
+                player.net = Some(Arc::clone(net));
+                player.say_of_hub(net, cx);
+            }
             LinkEvent::Away => {
                 player.net = None;
                 player.rated = Ratings::default();
@@ -287,6 +296,7 @@ impl Player {
             eq_since: None,
             rated: Ratings::default(),
             toast: None,
+            hub_away_said: false,
             toast_ends: None,
             up_next: None,
             open: false,
@@ -437,6 +447,24 @@ impl Player {
                 }
             }
         }));
+    }
+
+    /// Says once that the hub has gone, when it has been away long enough
+    /// to say so (`crate::away`), and once that it is back.
+    fn say_of_hub(&mut self, net: &Net, cx: &mut Context<Self>) {
+        match crate::away::said(net) {
+            Some(away) if !self.hub_away_said => {
+                self.hub_away_said = true;
+                self.say(away.toast(), cx);
+            }
+            None if self.hub_away_said && crate::away::away(net).is_none() => {
+                self.hub_away_said = false;
+                if let Some(hub) = &net.hub {
+                    self.say(crate::away::back_toast(&hub.name), cx);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Says `text` for a moment, in place of whatever was being said.
