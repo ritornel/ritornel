@@ -1199,6 +1199,31 @@ fn an_artist_read_through_its_sort_name_keeps_its_row_and_its_name() {
 }
 
 #[test]
+fn a_sort_name_that_is_not_the_name_reordered_names_no_one_else() {
+    let mut world = World::default();
+    // Sorted without its article, and sorted under its leader.
+    world.add(
+        file("A/1.flac", 1)
+            .song("One", "The Dream", 200)
+            .with(|facts| {
+                facts.artist_sort = Some("Dream".to_owned());
+            }),
+    );
+    world.add(
+        file("A/2.flac", 2)
+            .song("Two", "Ada Wren and the Pines", 200)
+            .with(|facts| {
+                facts.artist_sort = Some("Ada Wren".to_owned());
+            }),
+    );
+    world.add(file("B/1.flac", 3).song("Three", "Dream", 200));
+    world.add(file("B/2.flac", 4).song("Four", "Ada Wren", 200));
+    let resolution = world.settle();
+    assert_eq!(resolution.artists.len(), 4);
+    world.assert_settled();
+}
+
+#[test]
 fn a_sort_name_two_artists_claim_names_neither() {
     let mut world = World::default();
     for (at, (artist, mbid)) in [("Iris Vane", "art-iris"), ("Iris  Vane", "art-other")]

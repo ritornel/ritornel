@@ -714,15 +714,23 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
     // A name with no ID that is written as one artist's sort name, and as
     // no other's, is that artist: "Vane, Iris" where Iris Vane's files claim
     // that sort name. A sort name that is the artist's own name, as for most
-    // bands, says nothing. The artists that claim it are counted once each,
-    // whether their files name them by ID or by name alone.
+    // bands, says nothing, and so does one that is not the name's own words
+    // reordered, such as "Dream" for The Dream. The artists that claim it
+    // are counted once each, whether their files name them by ID or by name
+    // alone.
+    let words = |key: &str| -> Vec<String> {
+        let mut words: Vec<String> = key.split(' ').map(str::to_owned).collect();
+        words.sort();
+        words
+    };
     let mut sorted_as: HashMap<String, BTreeSet<ArtistKey>> = HashMap::new();
     for (key, entry) in &seen {
         let names: HashSet<String> = entry.names.iter().map(|name| normalize(name)).collect();
         let claimant = credited_under(key).unwrap_or_else(|| key.clone());
         for sort in &entry.sorts {
             let sort = normalize(sort);
-            if !names.contains(&sort) {
+            let reordered = names.iter().any(|name| words(name) == words(&sort));
+            if !names.contains(&sort) && reordered {
                 sorted_as.entry(sort).or_default().insert(claimant.clone());
             }
         }
