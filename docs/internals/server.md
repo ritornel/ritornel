@@ -41,6 +41,8 @@ Runtime bounds (`apps/server/src/bounds.rs`) keep resource usage bounded: `MAX_C
 
 A server is named after its computer (`platform::computer_name`), so a hub's satellites and a satellite's hub say which machine each is: the computer name on macOS, `PRETTY_HOSTNAME` in `/etc/machine-info` or else the hostname on Linux, and `COMPUTERNAME` on Windows. A server still carrying the first-start name `DEFAULT_NAME` takes its computer's name at start, and a name someone chose is kept. `RITORNEL_TEST_COMPUTER_NAME` stands in for the computer's name in tests.
 
+A name given in the settings (`--name`, `RITORNEL_NAME`, or `name` in `config.toml`) wins over both at every start (`Server::start_run`), so a headless machine is called what a person calls its speakers rather than its hostname. It is trimmed and must be 1 to `MAX_CLIENT_TEXT` (100) characters with no control characters. Without one, the stored name stands, including the last one a setting gave.
+
 ### Keeping a hub awake
 
 A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so being linked is not reason enough to keep a machine awake. When a hub keeps its machine from idle sleep is the owner's preference, kept in `server.db` (`server_setting` row `link.awake`) so it follows the server, and set with `link.setAwake` (`ritornelctl link awake`). It is one of three modes (`Awake`):
@@ -164,7 +166,7 @@ Settings resolve in order: **CLI flag → `RITORNEL_*` environment variable → 
 | Backup folder | `--backup-dir` | `RITORNEL_BACKUP_DIR` | None (backups disabled until set) |
 | Server name | `--name` | `RITORNEL_NAME` | None (the stored name stands) |
 
-A name given in the settings (`name` in `config.toml`) replaces the stored one in `server_identity` at every start (`Server::start_run`), so a headless machine is called what its settings say however it was named before. It is trimmed and must be 1 to `MAX_CLIENT_TEXT` (100) characters with no control characters. Without one, the stored name stands: `Ritornel server` on a new server, or the last name a setting gave.
+The name setting is described under "Server name" above.
 
 `--data-dir` / `RITORNEL_DATA_DIR` selects the data directory before `config.toml` is read, and `--output` (`default`, `null`, `none`) selects the audio output mode. All other persistent settings live in `library.db` (library-wide) or `server.db` (machine-local).
 
