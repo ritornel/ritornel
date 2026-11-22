@@ -647,6 +647,114 @@ fn an_artists_records_show_no_plays_and_their_other_songs_do() {
     assert!(open(&library, ListKind::Songs, &loose).shows_plays());
 }
 
+/// A record whose files name no artist is on the Artists wall under
+/// Unknown Artist, whose page lists it.
+#[test]
+fn a_record_whose_files_name_no_artist_is_unknown_artists() {
+    let mut rig = crate::scan_tests::Rig::new();
+    rig.put("Moss Arcade/Tin Weather/02.flac", "a.flac");
+    rig.put("Field Notes/01.flac", "b.no-artist.flac");
+    rig.scan();
+    let open = |kind: ListKind, query: &Query| {
+        let view = rig.library.list_open(kind, query).unwrap();
+        rig.library.list_rows(kind, &view.ids).unwrap()
+    };
+    let artists = open(ListKind::Artists, &Query::default());
+    assert_eq!(titles(&artists), ["Moss Arcade", "Unknown Artist"]);
+    let Row::Artist(unknown) = &artists[1] else {
+        panic!("{artists:?}")
+    };
+    assert_eq!((unknown.album_count, unknown.track_count), (1, 1));
+    let theirs = Query {
+        filter: Some(Filter {
+            version: FILTER_VERSION,
+            predicate: Predicate::WithArtist {
+                artist_id: unknown.artist_id,
+            },
+        }),
+        ..query(SortKey::Discography)
+    };
+    assert_eq!(titles(&open(ListKind::Albums, &theirs)), ["Field Notes"]);
+}
+
+/// A library that catalog version 2 resolved showed such a record as
+/// Various Artists'. The next scan of its unchanged files resolves it again,
+/// keeps every row it had, and shows it as Unknown Artist's; the scan after
+/// that changes nothing.
+#[test]
+fn a_record_shown_as_various_artists_before_keeps_its_rows_as_unknown_artists() {
+    let mut rig = crate::scan_tests::Rig::new();
+    rig.put("Moss Arcade/Tin Weather/02.flac", "a.flac");
+    rig.put("Field Notes/01.flac", "b.no-artist.flac");
+    rig.scan();
+    let rows = "SELECT r.id, r.release_group_id, ta.id, ta.recording_id
+                FROM release r JOIN track_appearance ta ON ta.release_id = r.id
+                WHERE r.display_title = 'Field Notes'";
+    let before = rig.one(rows);
+    let shown = "SELECT ac.display_text FROM release r
+                 JOIN artist_credit ac ON ac.id = r.display_artist_credit_id
+                 WHERE r.display_title = 'Field Notes'";
+    assert_eq!(rig.one(shown), "Unknown Artist");
+
+    // As version 2 left it: the record credited to Various Artists, whose
+    // artist the claims still name, and the library marked as resolved by
+    // that version.
+    let request = WriteRequest {
+        method: "test.catalog",
+        command: None,
+        client: None,
+    };
+    rig.library
+        .write(request, |write| {
+            let connection = write.connection();
+            let various: i64 = connection.query_row(
+                "SELECT id FROM artist WHERE display_name = 'Various Artists'",
+                [],
+                |row| row.get(0),
+            )?;
+            connection.execute(
+                "INSERT INTO artist_credit (display_text, rev) VALUES ('Various Artists', ?1)",
+                [write.rev()],
+            )?;
+            let credit = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO artist_credit_name
+                   (artist_credit_id, position, artist_id, credited_name, rev)
+                 VALUES (?1, 0, ?2, 'Various Artists', ?3)",
+                (credit, various, write.rev()),
+            )?;
+            connection.execute(
+                "UPDATE release SET display_artist_credit_id = ?1
+                 WHERE display_title = 'Field Notes'",
+                [credit],
+            )?;
+            let versions: String = connection.query_row(
+                "SELECT value_json FROM library_setting WHERE key = 'identity.versions'",
+                [],
+                |row| row.get(0),
+            )?;
+            let old = versions.replace(
+                &format!("\"catalog\":{}", ritornel_domain::CATALOG_VERSION),
+                "\"catalog\":2",
+            );
+            assert_ne!(old, versions);
+            connection.execute(
+                "UPDATE library_setting SET value_json = ?1 WHERE key = 'identity.versions'",
+                [old],
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert_eq!(rig.one(shown), "Various Artists");
+
+    rig.scan();
+    assert_eq!(rig.one(rows), before);
+    assert_eq!(rig.one(shown), "Unknown Artist");
+    let settled = rig.dump();
+    rig.scan();
+    assert_eq!(rig.dump(), settled);
+}
+
 /// When every file of a record is retagged to join another that the
 /// library has, the record they left keeps its rows, for whatever named
 /// them, and is on no wall, in no search and not in what the scrobble

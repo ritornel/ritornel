@@ -15,7 +15,9 @@ use std::hash::Hash;
 ///
 /// 1: a name with no ID written as one artist's sort name is that artist.
 /// 2: a disc marker before an album title's bracketed notes is a disc.
-pub const CATALOG_VERSION: i64 = 2;
+/// 3: an album none of whose files names an artist is shown as Unknown
+///    Artist's, not Various Artists', and is formed and grouped as before.
+pub const CATALOG_VERSION: i64 = 3;
 
 use crate::extract::{Facts, parse_date};
 use crate::library::{
@@ -28,6 +30,22 @@ use crate::resolve::{Policy, RecKey, fold};
 /// The name of the album artist of an album whose tracks have different
 /// artists and no album artist tag.
 const VARIOUS: &str = "Various Artists";
+
+/// The name an album none of whose files names an artist is shown under, as
+/// other players show it. It is only shown: the album is formed and grouped
+/// as one of Various Artists, as it was before it had a name of its own. A
+/// file tagged with this name is the same artist.
+const UNKNOWN: &str = "Unknown Artist";
+
+/// Whether a file names no artist at all, neither its track's nor its
+/// album's, by name or by ID.
+fn names_no_artist(facts: &Facts) -> bool {
+    facts.artist.is_empty()
+        && facts.artists.is_empty()
+        && facts.artist_mbids.is_empty()
+        && facts.album_artist.is_empty()
+        && facts.album_artist_mbids.is_empty()
+}
 
 /// The most common of some values, and among equals the one seen first.
 /// The values come in first-seen order of their items.
@@ -165,7 +183,13 @@ struct Active<'a> {
     /// The recording its assignment names.
     assign: Ref,
     track_credit: Option<CreditSpec>,
+    /// The album artist credit its claims give, which forms and groups
+    /// releases.
     release_credit: Option<CreditSpec>,
+    /// The album artist credit its release shows: `release_credit`, or
+    /// Unknown Artist when no file of the release names an artist (and no
+    /// other version of the record does, which is settled with the groups).
+    shown_credit: Option<CreditSpec>,
     /// The index of its release in `releases`.
     release: Option<usize>,
     appearance: Option<usize>,
@@ -474,6 +498,7 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 facts.artist_sort.as_ref(),
             ),
             release_credit: None,
+            shown_credit: None,
             release: None,
             appearance: None,
             pinned: bound.pinned,
@@ -653,13 +678,24 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             }),
         }
     }
+    let unknown = credit(&[UNKNOWN.to_owned()], &[], &[], None);
     for (index, release) in forming.iter_mut().enumerate() {
         if release.r == Ref::New(usize::MAX) {
             release.r = Ref::New(index);
         }
+        let nameless = release.members.iter().all(|member| {
+            actives
+                .get(*member)
+                .is_some_and(|active| names_no_artist(&active.item.facts))
+        });
         for member in &release.members {
             if let Some(active) = actives.get_mut(*member) {
                 active.release = Some(index);
+                active.shown_credit = if nameless {
+                    unknown.clone()
+                } else {
+                    active.release_credit.clone()
+                };
             }
         }
     }
@@ -755,9 +791,17 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 .iter()
                 .flat_map(|spec| spec.names.iter().map(|(key, _, _)| key.clone())),
         );
-        for spec in [&active.track_credit, &active.release_credit]
-            .into_iter()
-            .flatten()
+        // Every artist the claims name, as before there was Unknown Artist,
+        // and Unknown Artist where a release shows it instead.
+        let shown = Some(&active.shown_credit).filter(|shown| **shown != active.release_credit);
+        for spec in [
+            Some(&active.track_credit),
+            Some(&active.release_credit),
+            shown,
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
         {
             for (key, name, _) in &spec.names {
                 let entry = seen.entry(key.clone()).or_insert_with(|| Seen {
@@ -1237,6 +1281,8 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         recordings: HashSet<usize>,
         group_mbid: Option<String>,
         family: (String, String),
+        /// The credit its claims give, while it shows Unknown Artist.
+        claimed: Option<CreditSpec>,
         lossless: bool,
         tracks: usize,
         first: usize,
@@ -1253,6 +1299,11 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             members
                 .iter()
                 .filter_map(|active| active.release_credit.clone()),
+        );
+        let shown = pick(
+            members
+                .iter()
+                .filter_map(|active| active.shown_credit.clone()),
         );
         let title = edit(Kind::Release, release.r, "album").or_else(|| {
             pick(
@@ -1285,6 +1336,7 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                     .unwrap_or_default(),
                 title.as_deref().map(core).unwrap_or_default(),
             ),
+            claimed: spec.clone().filter(|spec| Some(spec) != shown.as_ref()),
             lossless: members.iter().all(|active| active.item.lossless),
             tracks: members
                 .iter()
@@ -1302,7 +1354,7 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             r: release.r,
             group: 0,
             title,
-            credit: spec.and_then(|spec| credit_of(&spec)),
+            credit: shown.and_then(|spec| credit_of(&spec)),
             date,
             year,
             picture: pick(members.iter().filter_map(|active| active.item.cover)),
@@ -1555,6 +1607,23 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             first_date,
             first_year,
         });
+    }
+
+    // A record shows one artist on every version of it: a version that
+    // names no artist shows Unknown Artist only when no other version of
+    // its group names one, and otherwise what its claims give.
+    let named: HashSet<usize> = releases
+        .iter()
+        .zip(&formed)
+        .filter(|(_, formed)| formed.claimed.is_none())
+        .map(|(release, _)| release.group)
+        .collect();
+    for (release, formed) in releases.iter_mut().zip(&formed) {
+        if let Some(claimed) = &formed.claimed
+            && named.contains(&release.group)
+        {
+            release.credit = credit_of(claimed);
+        }
     }
 
     // Each item's outcome, beside what it has now.
