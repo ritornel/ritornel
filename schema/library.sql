@@ -5,6 +5,7 @@
 -- Migrations, each with the SHA-256 recorded when it is applied. A checksum
 -- that changes here means a migration that has shipped was edited.
 --   0001_library  62cec2a19a590384d34a42a3b8b3bb1c4cabdcc21f7f7371bcd49f848bebee56
+--   0002_fold_search_text  6c46673f3d3da76a0115cc787be0537d9f2ec2660002ca9f579514ff617b498e
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,

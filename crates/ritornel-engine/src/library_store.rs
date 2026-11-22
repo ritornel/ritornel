@@ -880,7 +880,7 @@ mod tests {
         // gives the library's ID the bytes 00 to 09.
         let library_id = "019a7afd-1e00-7001-8203-040506070809";
         assert_eq!(store.library_id().to_string(), library_id);
-        assert_eq!(store.schema_version(), 1);
+        assert_eq!(store.schema_version(), 2);
         assert_eq!(
             store.meta().unwrap(),
             LibraryMeta {
@@ -1265,11 +1265,36 @@ mod tests {
     }
 
     #[test]
+    fn opening_schema_one_reindexes_existing_songs_before_the_first_search() {
+        let scratch = Scratch::new();
+        let path = library_db(&scratch);
+        let mut db = Connection::open(&path).unwrap();
+        migrate::run(&mut db, &migrate::LIBRARY[..1], &FixedClock::at(T0)).unwrap();
+        db.execute_batch(include_str!("../saved/library/0001.sql"))
+            .unwrap();
+        drop(db);
+
+        let store = open_on_disk(&path, id(0x11)).unwrap();
+        for query in ["title:quael", "artist:solen", "album:blae"] {
+            let key: i64 = store
+                .read(|db| {
+                    Ok(db.query_row(
+                        "SELECT rowid FROM search_text WHERE search_text MATCH ?1",
+                        [query],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(key, 7);
+        }
+    }
+
+    #[test]
     fn a_library_is_the_same_library_after_a_restart() {
         let scratch = Scratch::new();
         let path = library_db(&scratch);
         let (store, _) = create_on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 1);
+        assert_eq!(store.migrations_applied(), 2);
         let created = store.meta().unwrap();
         store
             .write(request("test.write", None), set("kept"))
@@ -1279,7 +1304,7 @@ mod tests {
 
         let store = open_on_disk(&path, id(0x11)).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 1);
+        assert_eq!(store.schema_version(), 2);
         assert_eq!(store.library_id(), created.library_id);
         assert_eq!(
             store.meta().unwrap(),
@@ -1436,11 +1461,11 @@ mod tests {
         create_on_disk(&path).unwrap().0.close().unwrap();
         tamper_file(
             &path,
-            "INSERT INTO schema_migration VALUES (2, '0002_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (3, '0003_from_the_future', x'00', 0)",
         );
         let refused = open_on_disk(&path, id(0x11));
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 2, known: 1 })),
+            matches!(refused, Err(Error::NewerSchema { found: 3, known: 2 })),
             "{refused:?}"
         );
     }

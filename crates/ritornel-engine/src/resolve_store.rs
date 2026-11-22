@@ -678,15 +678,17 @@ impl Plan {
                 }
                 None => true,
             });
+            let fold = crate::list::fold::fold;
             let text = (
-                out.title.clone().unwrap_or_default(),
+                fold(out.title.as_deref().unwrap_or_default()),
                 out.credit
                     .and_then(|at| resolution.credits.get(at))
-                    .map(|credit| credit.text.clone())
+                    .map(|credit| fold(&credit.text))
                     .unwrap_or_default(),
                 out.release
                     .and_then(|at| resolution.releases.get(at))
-                    .and_then(|release| release.title.clone())
+                    .and_then(|release| release.title.as_deref())
+                    .map(fold)
                     .unwrap_or_default(),
             );
             let indexed = as_row(out.r).and_then(|row| shown.search.get(&row));

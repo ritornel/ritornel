@@ -5,6 +5,7 @@
 //! each database creates. A database's schema version is the highest number
 //! in it.
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
@@ -44,11 +45,18 @@ pub(crate) const SERVER: &[Migration] = &[Migration {
 }];
 
 /// The migrations of `library.db`.
-pub(crate) const LIBRARY: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_library",
-    sql: include_str!("../migrations/library/0001_library.sql"),
-}];
+pub(crate) const LIBRARY: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_library",
+        sql: include_str!("../migrations/library/0001_library.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_fold_search_text",
+        sql: include_str!("../migrations/library/0002_fold_search_text.sql"),
+    },
+];
 
 /// What a run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +106,25 @@ pub(crate) fn run(
         }
     }
 
+    if shipped.len() == 0 {
+        return Ok(Migrated {
+            applied: 0,
+            version: known,
+        });
+    }
+    // SQL migrations can fold search text exactly as queries do.
+    connection.create_scalar_function(
+        "search_fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            Ok(ctx
+                .get::<Option<String>>(0)?
+                .as_deref()
+                .map(crate::list::fold::fold))
+        },
+    )?;
+
     // A migration that changes a table rebuilds it: a new table, the rows
     // copied, the old one dropped. SQLite's procedure for that turns foreign
     // keys off for the migration, which only works outside a transaction,
@@ -107,6 +134,7 @@ pub(crate) fn run(
     connection.pragma_update(None, "foreign_keys", false)?;
     let applied = apply(connection, shipped, clock);
     connection.pragma_update(None, "foreign_keys", enforced)?;
+    connection.remove_function("search_fold", 1)?;
     Ok(Migrated {
         applied: applied?,
         version: known,

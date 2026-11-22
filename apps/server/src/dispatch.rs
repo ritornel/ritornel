@@ -1377,7 +1377,7 @@ mod tests {
                 "contract": CONTRACT_VERSION,
                 "sqlite": "3.54.1",
                 "serverSchema": 1,
-                "librarySchema": 1,
+                "librarySchema": 2,
             })
         );
         assert_eq!(

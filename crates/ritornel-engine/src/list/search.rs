@@ -378,8 +378,11 @@ fn songs(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked,
     match typed.longest_word() {
         Some(word) => {
             let phrase = format!("{{title}} : \"{}\"", word.replace('"', "\"\""));
-            let mut statement = connection
-                .prepare("SELECT rowid, title FROM search_text WHERE search_text MATCH ?1")?;
+            let mut statement = connection.prepare(
+                "SELECT ta.id, ta.display_title FROM search_text
+                          JOIN track_appearance ta ON ta.id = search_text.rowid
+                          WHERE search_text MATCH ?1",
+            )?;
             let mut rows = statement.query([phrase])?;
             while let Some(row) = rows.next()? {
                 let title = text(row.get_ref(1)?);

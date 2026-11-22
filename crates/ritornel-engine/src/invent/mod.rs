@@ -933,9 +933,12 @@ impl Rows {
                 .revision_picture
                 .execute((revision, picture, rev))?;
         }
-        statements
-            .search_text
-            .execute((appearance, track.title, track.artist, track.album))?;
+        statements.search_text.execute((
+            appearance,
+            crate::list::fold::fold(track.title),
+            crate::list::fold::fold(track.artist),
+            crate::list::fold::fold(track.album),
+        ))?;
         Ok(())
     }
 }
@@ -1371,7 +1374,7 @@ impl Churn {
                     for appearance in appearances {
                         connection.execute(
                             "UPDATE search_text SET album = ?1 WHERE rowid = ?2",
-                            (title, appearance),
+                            (crate::list::fold::fold(title), appearance),
                         )?;
                     }
                 }

@@ -27,7 +27,7 @@ getrandom = "0.4.3"
 # at startup. See decision 16 in docs/design/server.md.
 # `cache` is its prepared-statement cache: a scan runs the same few inserts
 # for every file, and without it each would be parsed again every time.
-rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled", "cache"] }
+rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled", "cache", "functions"] }
 # The ring between the decode thread and the output, which the output's
 # real-time callback reads without locking or allocating. Pinned as
 # docs/design/playback.md names it.
