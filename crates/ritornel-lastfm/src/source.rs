@@ -19,7 +19,7 @@
 //! A span is always whole seconds, so every scrobble of one second is read
 //! in the same span, and that place is the same whenever it is read.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ritornel_source::{
     Batch, Error, HistorySource, Identifiers, ImportRecord, Love, Progress, Sink, Span, Synced,
@@ -285,6 +285,15 @@ async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Ve
             loved_at_ms: seconds_to_ms(row.loved_at()),
         }));
         if loved_page_complete(loves.len() as u64, total, rows == 0, page_number >= pages)? {
+            let mut seen = HashSet::new();
+            if !loves
+                .iter()
+                .all(|row| seen.insert((&row.artist, &row.title, row.loved_at_ms)))
+            {
+                return Err(Error::source(
+                    "Last.fm repeated a loved track while reading the list",
+                ));
+            }
             return Ok(Some(loves));
         }
         page_number += 1;

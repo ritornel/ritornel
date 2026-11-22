@@ -371,47 +371,53 @@ fn a_partial_last_page_cannot_replace_loved_tracks() {
 }
 
 #[test]
-fn an_unlove_between_pages_cannot_clear_a_different_track() {
-    let fake = std::sync::Arc::new(FakeLastfm::start("someone", vec![]));
-    let loved: Vec<String> = (0..1002).map(|i| format!("Invented Song {i}")).collect();
-    fake.set_loved(
-        loved
-            .iter()
-            .map(|t| ("Invented Artist", t.as_str(), NOW))
-            .collect(),
-    );
-    let mut sink = Memory {
-        loves: vec![Love {
-            artist: "Invented Artist".into(),
-            title: loved[1000].clone(),
-            loved_at_ms: seconds_to_ms(NOW),
-        }],
-        on_stop_check: Some(Box::new({
-            let fake = fake.clone();
-            move || {
-                if fake
-                    .seen()
-                    .iter()
-                    .any(|req| req.method == "user.getLovedTracks")
-                {
-                    fake.set_loved(
-                        loved
+fn a_change_between_pages_cannot_clear_a_different_track() {
+    for same_total in [true, false] {
+        let fake = std::sync::Arc::new(FakeLastfm::start("someone", vec![]));
+        let loved: Vec<String> = (0..1002).map(|i| format!("Invented Song {i}")).collect();
+        fake.set_loved(
+            loved
+                .iter()
+                .map(|t| ("Invented Artist", t.as_str(), NOW))
+                .collect(),
+        );
+        let held = if same_total { 1001 } else { 1000 };
+        let mut sink = Memory {
+            loves: vec![Love {
+                artist: "Invented Artist".into(),
+                title: loved[held].clone(),
+                loved_at_ms: seconds_to_ms(NOW),
+            }],
+            on_stop_check: Some(Box::new({
+                let fake = fake.clone();
+                move || {
+                    if fake
+                        .seen()
+                        .iter()
+                        .any(|req| req.method == "user.getLovedTracks")
+                    {
+                        let mut updated: Vec<_> = loved
                             .iter()
-                            .skip(1)
                             .map(|t| ("Invented Artist", t.as_str(), NOW))
-                            .collect(),
-                    );
+                            .collect();
+                        if same_total {
+                            updated.rotate_right(1);
+                        } else {
+                            updated.remove(0);
+                        }
+                        fake.set_loved(updated);
+                    }
+                    false
                 }
-                false
-            }
-        })),
-        ..Default::default()
-    };
-    let result = lastfm(&fake, 10)
-        .source("someone")
-        .until(NOW)
-        .sync(&mut sink, true);
-    assert!(result.is_err(), "{result:?}");
-    assert_eq!(sink.loves.len(), 1);
-    assert_eq!(sink.loves[0].title, "Invented Song 1000");
+            })),
+            ..Default::default()
+        };
+        let result = lastfm(&fake, 10)
+            .source("someone")
+            .until(NOW)
+            .sync(&mut sink, true);
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(sink.loves.len(), 1);
+        assert_eq!(sink.loves[0].title, format!("Invented Song {held}"));
+    }
 }
