@@ -84,6 +84,23 @@ pub(crate) fn menus(cx: &mut App) {
             let _ = window.update(cx, |_, window, _| window.zoom_window());
         }
     });
+    // Controls › Play and Shuffle, as the player bar's buttons do, from
+    // whichever window is in front.
+    cx.on_action(|_: &Play, cx| {
+        if let Some(player) = crate::menu::player(cx) {
+            player.update(cx, |player, cx| player.toggle(cx));
+        }
+    });
+    cx.on_action(|_: &Shuffle, cx| {
+        if let Some(player) = crate::menu::player(cx) {
+            player.update(cx, |player, cx| {
+                if player.on() {
+                    let shuffle = player.state.as_ref().is_some_and(|state| state.shuffle);
+                    player.set_shuffle(!shuffle, cx);
+                }
+            });
+        }
+    });
     let system = platform::KEYS;
     let mut bindings: Vec<KeyBinding> = Vec::new();
     bindings.extend(keys(system.quit, Quit, None));
