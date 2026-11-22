@@ -47,10 +47,11 @@ fn is_symbol(c: char) -> bool {
             | '\u{29d8}'..='\u{29db}' | '\u{29fc}' | '\u{29fd}')
 }
 
-/// Whether a mark only says how the character before it is drawn, as text
-/// or as an emoji: no part of a key from version 3.
+/// Whether a mark only says whether the character before it is drawn as
+/// text or as an emoji: no part of a key from version 3. Other variation
+/// selectors, which can make another ideograph, stay.
 fn is_presentation(c: char) -> bool {
-    matches!(c, '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
+    matches!(c, '\u{fe0e}' | '\u{fe0f}')
 }
 
 /// The symbols in the marks before a name's first letter or digit, or
@@ -84,8 +85,14 @@ fn without_trailing_notes(text: &str) -> &str {
             }
         }
         match open {
-            Some(at) => end = end[..at].trim_end(),
-            None => break,
+            // A bracket of symbols alone is no note: "Night Drives (+)".
+            Some(at)
+                if end[at..].chars().any(char::is_alphanumeric)
+                    || !end[at..].chars().any(is_symbol) =>
+            {
+                end = end[..at].trim_end();
+            }
+            _ => break,
         }
     }
     end
@@ -241,7 +248,8 @@ pub fn core(text: &str) -> String {
             ')' | ']' | '}' => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    if !inside.chars().any(char::is_alphanumeric) && inside.chars().any(is_symbol) {
+                    let folded: String = inside.nfkc().collect();
+                    if !folded.chars().any(char::is_alphanumeric) && folded.chars().any(is_symbol) {
                         outside.push(' ');
                         outside.push_str(&inside);
                         outside.push(' ');
@@ -456,6 +464,18 @@ mod tests {
             normalize("Night Drives (Deluxe)")
         );
         assert_eq!(core("Night Drives + (Deluxe)"), "night drives +");
+        // A bracket of symbols before a note is the symbol, not a note.
+        assert_eq!(
+            normalize("Night Drives (+) (Deluxe)"),
+            "night drives + deluxe"
+        );
+        // A plus however wide, in brackets too.
+        assert_eq!(core("Night Drives (\u{ff0b})"), "night drives +");
+        // A selector that makes another ideograph keeps two names apart.
+        assert_ne!(
+            normalize("\u{845b}\u{e0100}"),
+            normalize("\u{845b}\u{e0101}")
+        );
         // "&" is "and" wherever it is.
         assert_eq!(normalize("Night Drives + &"), "night drives and");
         // Marks that part words are not symbols, however they are written.

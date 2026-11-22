@@ -299,8 +299,15 @@ fn album_words(album: &str) -> Vec<String> {
     while words.len() > 1 && matches!(words.last(), Some(&("ep" | "the"))) {
         words.pop();
     }
-    if words.len() > 1 && words.first() == Some(&"the") {
-        words.remove(0);
+    // A leading "The", after any symbols before it.
+    let first = words
+        .iter()
+        .position(|word| word.chars().any(char::is_alphanumeric));
+    if let Some(at) = first
+        && words.get(at) == Some(&"the")
+        && words.len() > at + 1
+    {
+        words.remove(at);
     }
     words.into_iter().map(str::to_owned).collect()
 }
@@ -489,7 +496,15 @@ impl Album {
                 "vol" | "volume" | "part" | "pt" | "chapter" | "book"
             );
         let rest = long.get(short.len()..).unwrap_or_default();
-        let by_artist = album_words(&rest.join(" ")).concat() == self.artist;
+        // By its letters: a symbol inside a title is no word of it.
+        let letters = |text: &str| -> String {
+            text.chars()
+                .filter(|c| {
+                    c.is_alphanumeric() || unicode_normalization::char::is_combining_mark(*c)
+                })
+                .collect()
+        };
+        let by_artist = letters(&album_words(&rest.join(" ")).concat()) == letters(&self.artist);
         // Set off: the longer title, outside its notes, is the shorter one
         // and then a colon, a dash or a full stop; or both have the same
         // title before such a mark, and one subtitle runs on from the
@@ -938,6 +953,61 @@ mod tests {
         assert!(matches!(
             judge("The Quiet Harbour", None, "Lanterns"),
             Verdict::Bind { recording: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn a_symbol_in_brackets_before_a_note_names_the_song_with_the_symbol() {
+        let catalog = Catalog::new(vec![
+            recording(13, "Mira Vale", "Night Drives (Deluxe)", &[(131, "Glass")]),
+            recording(
+                14,
+                "Mira Vale",
+                "Night Drives + (Deluxe)",
+                &[(141, "Glass")],
+            ),
+        ]);
+        assert!(matches!(
+            catalog.judge(Scrobbled {
+                artist: "Mira Vale",
+                album: Some("Glass"),
+                title: "Night Drives (+) (Deluxe)",
+            }),
+            Verdict::Bind { recording: 14, .. }
+        ));
+    }
+
+    #[test]
+    fn a_leading_symbol_hides_neither_the_artist_nor_the_article_of_an_album() {
+        let catalog = Catalog::new(vec![
+            recording(
+                15,
+                "\u{21c4} Mira Vale",
+                "Undertow",
+                &[(151, "Blue Water \u{21c4} Mira Vale")],
+            ),
+            recording(
+                16,
+                "Mira Vale",
+                "Lanterns",
+                &[(161, "\u{21c4} The Blue Water")],
+            ),
+        ]);
+        assert!(matches!(
+            catalog.judge(Scrobbled {
+                artist: "\u{21c4} Mira Vale",
+                album: Some("Blue Water"),
+                title: "Undertow",
+            }),
+            Verdict::Bind { recording: 15, .. }
+        ));
+        assert!(matches!(
+            catalog.judge(Scrobbled {
+                artist: "Mira Vale",
+                album: Some("\u{21c4} Blue Water"),
+                title: "Lanterns",
+            }),
+            Verdict::Bind { recording: 16, .. }
         ));
     }
 
