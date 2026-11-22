@@ -355,8 +355,19 @@ impl Uplink {
                     .map_err(|_| self.unreachable())?;
                 let events = client.take_events();
                 let client = Arc::new(client);
+                {
+                    // Checked under the lock `forget` takes, so a session
+                    // that closed while this connected keeps no connection.
+                    let mut sessions = lock(&self.sessions);
+                    if session.is_closed() {
+                        return Err(RpcError::new(
+                            ErrorCode::Unavailable,
+                            "the session has closed",
+                        ));
+                    }
+                    sessions.insert(session.id(), Arc::clone(&client));
+                }
                 self.runtime.spawn(relay(events, Arc::downgrade(session)));
-                lock(&self.sessions).insert(session.id(), Arc::clone(&client));
                 (client, true)
             }
         };
