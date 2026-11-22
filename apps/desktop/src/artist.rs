@@ -200,7 +200,10 @@ pub(crate) struct Artist {
     /// Their picture blurred for the wash, and for the banner.
     pub blur: Option<(Arc<RenderImage>, Instant)>,
     banner_blur: Option<(Arc<RenderImage>, Instant)>,
-    pictured_for: Option<Option<Id>>,
+    /// The picture the page's pictures were made from, and whether it is
+    /// their portrait: a portrait added or taken away can keep the picture's
+    /// ID, when it is the same as a cover's.
+    pictured_for: Option<(Option<Id>, bool)>,
     pub top: f32,
     elastic: crate::elastic::Elastic,
     /// How tall the page was when last drawn, and the column of history
@@ -486,26 +489,27 @@ impl Artist {
         .detach();
     }
 
-    /// Lets the portrait go, and the one made from it.
-    fn forget_portrait(&mut self, cx: &mut Context<Self>) {
+    /// Lets the portrait go, and the one made from it. While the window is
+    /// drawing, GPUI holds it apart from its others, and lets an image go
+    /// from it only when it is handed the window.
+    fn forget_portrait(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.portrait = None;
         if let Some((_, old, _)) = self.melted.take() {
-            cx.drop_image(old, None);
+            cx.drop_image(old, window);
         }
     }
 
     /// Their picture: the face for the strip, the portrait, and the blurs
     /// for the banner and the wash; with no picture, soft colour from their name.
-    fn pictures(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn pictures(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(artist) = &self.page else { return };
-        let art = artist.artist.art_id;
-        if self.pictured_for == Some(art) {
+        let (art, wants_portrait) = (artist.artist.art_id, artist.artist.portrait);
+        if self.pictured_for == Some((art, wants_portrait)) {
             return;
         }
-        self.pictured_for = Some(art);
+        self.pictured_for = Some((art, wants_portrait));
         // A portrait of another picture, or of none, is not kept meanwhile.
-        let wants_portrait = artist.artist.portrait;
-        self.forget_portrait(cx);
+        self.forget_portrait(Some(window), cx);
         let scale = window.scale_factor();
         let (width, viewport) = viewport_of(window);
         let banner_radius = crate::blur::radius(crate::blur::BANNER.0, width + 120.);
@@ -537,10 +541,10 @@ impl Artist {
                 if let Ok(Some(source)) = read.await {
                     this.update(cx, |page, cx| {
                         // Too late: the page shows another picture now.
-                        if page.pictured_for != Some(Some(art)) {
+                        if page.pictured_for != Some((Some(art), true)) {
                             return;
                         }
-                        page.forget_portrait(cx);
+                        page.forget_portrait(None, cx);
                         page.portrait = Some(Arc::new(source));
                         cx.notify();
                     })

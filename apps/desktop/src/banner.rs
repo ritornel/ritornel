@@ -544,16 +544,35 @@ fn placed(iw: f32, ih: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
 pub(crate) fn melted(source: &RgbaImage, w: u32, h: u32) -> RenderImage {
     let (w, h) = (w.max(1), h.max(1));
     let (sw, sh) = (source.width().max(1), source.height().max(1));
-    let (x, y, dw, dh) = placed(sw as f32, sh as f32, w as f32, h as f32);
-    // The whole picture at the size it is drawn, then the box cut from it,
-    // so that where it is cut is off by half a device pixel at most.
-    let (dw, dh) = ((dw.round() as u32).max(w), (dh.round() as u32).max(h));
-    let drawn = image::imageops::resize(source, dw, dh, image::imageops::FilterType::Triangle);
+    let (x, y, dw, _) = placed(sw as f32, sh as f32, w as f32, h as f32);
+    // The part of the picture the box shows, in the picture's own pixels,
+    // with a margin for the resampling filter to read past its edge; it is
+    // drawn at its size and the box cut from that, so that where it is cut
+    // is off by half a device pixel at most, and a picture of any shape
+    // costs no more than its box.
+    let scale = dw / sw as f32;
+    let (from_x, from_y) = (-x / scale, -y / scale);
+    let (to_x, to_y) = (from_x + w as f32 / scale, from_y + h as f32 / scale);
+    let margin = 2.;
     let (left, top) = (
-        ((-x).round() as u32).min(dw - w),
-        ((-y).round() as u32).min(dh - h),
+        ((from_x - margin).floor().max(0.) as u32).min(sw - 1),
+        ((from_y - margin).floor().max(0.) as u32).min(sh - 1),
     );
-    let mut out = image::imageops::crop_imm(&drawn, left, top, w, h).to_image();
+    let (right, bottom) = (
+        ((to_x + margin).ceil() as u32).clamp(left + 1, sw),
+        ((to_y + margin).ceil() as u32).clamp(top + 1, sh),
+    );
+    let part = image::imageops::crop_imm(source, left, top, right - left, bottom - top);
+    let (pw, ph) = (
+        (((right - left) as f32 * scale).round() as u32).max(w),
+        (((bottom - top) as f32 * scale).round() as u32).max(h),
+    );
+    let drawn = image::imageops::resize(&*part, pw, ph, image::imageops::FilterType::Triangle);
+    let (cut_x, cut_y) = (
+        (((from_x - left as f32) * scale).round().max(0.) as u32).min(pw - w),
+        (((from_y - top as f32) * scale).round().max(0.) as u32).min(ph - h),
+    );
+    let mut out = image::imageops::crop_imm(&drawn, cut_x, cut_y, w, h).to_image();
     let melt = w as f32 * MELT;
     for (column, _, pixel) in out.enumerate_pixels_mut() {
         let [r, g, b, a] = pixel.0;
@@ -643,5 +662,46 @@ mod tests {
         let whole = (760. * MELT).ceil() as usize;
         assert!((whole..760).all(|x| alpha(x) == 255));
         assert!((1..760).all(|x| alpha(x) >= alpha(x - 1)));
+        // The colour is the picture's, not darkened with the alpha.
+        let [b, _, r, _] = at(half, 250);
+        assert!(r > 240 && b < 15, "{r} {b}");
+    }
+
+    #[test]
+    fn a_picture_of_any_shape_is_made_at_its_box_size() {
+        // A line of a picture either way, and one pixel: made from the part
+        // the box shows, not from the whole picture drawn at its size.
+        for (pw, ph) in [(1, 1024), (1024, 1), (1, 1), (3, 2)] {
+            let made = melted(&RgbaImage::new(pw, ph), 761, 427);
+            let size = made.size(0);
+            assert_eq!((size.width.0, size.height.0), (761, 427), "{pw}x{ph}");
+        }
+    }
+
+    #[test]
+    fn a_wide_portrait_is_cut_at_its_middle_across() {
+        // Three bands across, red, green and blue, 1200 by 400: drawn 428
+        // tall it is 1284 wide, cut 262 in from each side, so the box shows
+        // green between red and blue at its two ends.
+        let source = RgbaImage::from_fn(1200, 400, |x, _| match x {
+            0..400 => image::Rgba([255, 0, 0, 255]),
+            400..800 => image::Rgba([0, 255, 0, 255]),
+            _ => image::Rgba([0, 0, 255, 255]),
+        });
+        let made = melted(&source, 760, 428);
+        let bytes = made.as_bytes(0).unwrap_or_default();
+        let at = |x: usize| -> [u8; 4] {
+            bytes
+                .get((200 * 760 + x) * 4..(200 * 760 + x) * 4 + 4)
+                .and_then(|pixel| <[u8; 4]>::try_from(pixel).ok())
+                .unwrap_or_default()
+        };
+        // In BGRA: red up to 166 (428 - 262), green to 594, then blue.
+        let [b, g, r, _] = at(150);
+        assert!(r > 240 && g < 15 && b < 15, "{r} {g} {b}");
+        let [b, g, r, _] = at(380);
+        assert!(g > 240 && r < 15 && b < 15, "{r} {g} {b}");
+        let [b, g, r, _] = at(620);
+        assert!(b > 240 && r < 15 && g < 15, "{r} {g} {b}");
     }
 }
