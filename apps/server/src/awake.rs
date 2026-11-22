@@ -219,6 +219,17 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_does_not_ask_holds_nothing() {
+        let mut kept = KeptAwake {
+            setting: Awake::Always,
+            ..KeptAwake::default()
+        };
+        assert!(!kept.asks);
+        assert!(!kept.follow_the_rule(0));
+        assert!(!kept.held());
+    }
+
+    #[test]
     fn always_and_never_do_not_ask_what_linked_servers_do() {
         let mut activity = Activity::default();
         assert!(keeps_awake(Awake::Always, &activity, 0));

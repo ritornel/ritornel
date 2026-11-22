@@ -328,11 +328,12 @@ async fn a_route_may_be_a_name_resolved_at_each_dial_and_a_name_for_another_serv
             "{refused}"
         );
 
-        // A name that answers with the hub links, and is kept as a name,
-        // to be resolved again each time the satellite dials.
-        let status = join(&desk_client, &by_name(hub.endpoint().port()))
-            .await
-            .unwrap();
+        // A name that answers with the hub links, after one that resolves
+        // to nothing, and is kept first, as a name, to be resolved again
+        // each time the satellite dials.
+        let mut named = InviteLink::parse(&by_name(hub.endpoint().port())).unwrap();
+        named.routes.insert(0, "nowhere.invalid:4747".to_owned());
+        let status = join(&desk_client, &named.to_string()).await.unwrap();
         let hub_status = status.hub.unwrap();
         assert_eq!(hub_status.server_id, hub.server_id());
         assert_eq!(

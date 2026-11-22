@@ -79,10 +79,18 @@ pub(crate) fn computer_name() -> Option<String> {
 /// invite offers first, so that a hub whose address changes is still
 /// found.
 pub(crate) fn mdns_name() -> Option<String> {
-    let host = system::mdns_host()?.trim().to_ascii_lowercase();
+    local_name(&system::mdns_host()?)
+}
+
+/// `host` as a `.local` name, if it is a label multicast DNS answers to:
+/// not `localhost`, which no responder announces.
+fn local_name(host: &str) -> Option<String> {
+    let host = host.trim().to_ascii_lowercase();
     let host = host.strip_suffix(".local").unwrap_or(&host);
-    let valid = !host.is_empty()
-        && host.len() <= 63
+    let valid = (1..=63).contains(&host.len())
+        && host != "localhost"
+        && !host.starts_with('-')
+        && !host.ends_with('-')
         && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
     valid.then(|| format!("{host}.local"))
 }
@@ -224,6 +232,30 @@ mod tests {
 
     use super::*;
     use crate::testing::Scratch;
+
+    #[test]
+    fn a_local_name_is_one_label_multicast_dns_answers_to() {
+        assert_eq!(
+            local_name("Studio-Mac\n").as_deref(),
+            Some("studio-mac.local")
+        );
+        assert_eq!(
+            local_name("studio-mac.local").as_deref(),
+            Some("studio-mac.local")
+        );
+        let long = "a".repeat(64);
+        for not in [
+            "",
+            "localhost",
+            "-studio",
+            "studio-",
+            "studio mac",
+            "studio.lan",
+            &long,
+        ] {
+            assert_eq!(local_name(not), None, "{not}");
+        }
+    }
 
     #[test]
     fn a_directory_that_exists_has_room_and_one_that_does_not_has_no_answer() {

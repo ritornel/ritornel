@@ -133,8 +133,9 @@ pub(crate) fn found_routes(port: u16) -> Vec<String> {
     let tailnet = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
+        .filter(|interface| interface.oper_status != if_addrs::IfOperStatus::Down)
         .map(|interface| interface.ip())
-        .filter(|ip| matches!(ip, IpAddr::V4(v4) if is_tailnet(*v4)));
+        .filter(|ip| matches!(ip, IpAddr::V4(v4) if crate::config::is_tailnet(*v4)));
     for ip in default.into_iter().chain(tailnet) {
         let route = SocketAddr::new(ip, port).to_string();
         if !ip.is_loopback() && is_private_route(ip) && !found.contains(&route) {
@@ -142,12 +143,6 @@ pub(crate) fn found_routes(port: u16) -> Vec<String> {
         }
     }
     found
-}
-
-/// Whether `ip` is in the shared address space tailnets use.
-fn is_tailnet(ip: Ipv4Addr) -> bool {
-    let [first, second, ..] = ip.octets();
-    first == 100 && (64..128).contains(&second)
 }
 
 /// Whether `ip` is an address a satellite may dial: this machine, or one
@@ -206,7 +201,8 @@ fn is_name_and_port(route: &str) -> bool {
         return false;
     };
     let host = host.strip_suffix('.').unwrap_or(host);
-    port.parse::<u16>().is_ok_and(|port| port != 0)
+    port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
         && !host.is_empty()
         && host.len() <= 253
         && host.split('.').all(|label| {
@@ -449,6 +445,7 @@ mod tests {
         let long = format!("{}.local:4747", "a".repeat(64));
         for wrong in [
             "127.0.0.1:0",
+            "8.8.8.8:+4747",
             "-studio.local:4747",
             "studio-.local:4747",
             long.as_str(),
@@ -479,10 +476,10 @@ mod tests {
     #[test]
     fn a_tailnet_is_the_shared_address_space() {
         for ip in ["100.64.0.1", "100.100.100.100", "100.127.255.254"] {
-            assert!(is_tailnet(ip.parse().unwrap()), "{ip}");
+            assert!(crate::config::is_tailnet(ip.parse().unwrap()), "{ip}");
         }
         for ip in ["100.63.255.255", "100.128.0.1", "192.168.1.20"] {
-            assert!(!is_tailnet(ip.parse().unwrap()), "{ip}");
+            assert!(!crate::config::is_tailnet(ip.parse().unwrap()), "{ip}");
         }
     }
 

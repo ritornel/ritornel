@@ -30,6 +30,13 @@ pub(crate) const BACKUP_DIR_VAR: &str = "RITORNEL_BACKUP_DIR";
 /// The port a server listens on when nobody has said and it is free.
 pub(crate) const DEFAULT_PORT: u16 = 4747;
 
+/// Whether `ip` is in `100.64.0.0/10`, the shared address space a tailnet
+/// uses.
+pub(crate) fn is_tailnet(ip: std::net::Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    first == 100 && (64..128).contains(&second)
+}
+
 /// Where the server listens: on loopback, the default, or on the private
 /// network. Nothing else can be named, so the server never binds a public
 /// address ("Listener and transport boundaries" in
@@ -115,11 +122,8 @@ impl Listen {
         };
         match peer {
             IpAddr::V4(v4) => {
-                let [a, b, ..] = v4.octets();
-                // 100.64.0.0/10, the shared address space a tailnet uses.
-                let tailnet = a == 100 && (64..128).contains(&b);
                 v4.is_loopback()
-                    || (self.private && (v4.is_private() || v4.is_link_local() || tailnet))
+                    || (self.private && (v4.is_private() || v4.is_link_local() || is_tailnet(v4)))
             }
             IpAddr::V6(v6) => {
                 let first = v6.segments()[0];
