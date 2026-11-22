@@ -15,8 +15,9 @@ const NOW: u64 = 1_800_000_000;
 /// A sink that keeps what it is handed in memory, as the core would: a
 /// record stored before writes nothing, and a batch with nothing new
 /// writes nothing, its cursor included.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Memory {
+    on_stop_check: Option<Box<dyn Fn() -> bool>>,
     records: BTreeMap<Vec<u8>, ImportRecord>,
     cursor: Option<String>,
     writes: usize,
@@ -75,7 +76,8 @@ impl Sink for Memory {
     fn progress(&mut self, _: Progress) {}
 
     fn stopping(&self) -> bool {
-        self.stop_after.is_some_and(|after| self.batches >= after)
+        self.on_stop_check.as_ref().is_some_and(|check| check())
+            || self.stop_after.is_some_and(|after| self.batches >= after)
     }
 }
 
@@ -271,4 +273,183 @@ fn a_stretch_emptied_at_last_fm_is_still_read_so_what_is_gone_is_seen() {
         .unwrap();
     assert_eq!((synced.new, synced.gone), (0, 5));
     assert_eq!(sink.records.len(), 25, "nothing is removed");
+}
+
+#[test]
+fn an_interrupted_rescan_keeps_the_previously_read_boundary() {
+    for full in [false, true] {
+        let fake = FakeLastfm::start("someone", history(15));
+        let lastfm = lastfm(&fake, 5);
+        let mut sink = Memory {
+            cursor: Some(cursor(NOW)),
+            stop_after: Some(1),
+            ..Memory::default()
+        };
+        let synced = lastfm
+            .source("someone")
+            .until(NOW + 10)
+            .sync(&mut sink, full)
+            .unwrap();
+        assert!(synced.stopped && synced.new > 0);
+        assert_eq!(sink.cursor, Some(cursor(NOW)));
+    }
+}
+
+#[test]
+fn one_span_is_counted_once() {
+    let fake = FakeLastfm::start("someone", history(2));
+    lastfm(&fake, 10)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut Memory::default(), true)
+        .unwrap();
+    assert_eq!(
+        fake.seen()
+            .iter()
+            .filter(|call| call.method == "user.getRecentTracks"
+                && call.params.get("limit").is_some_and(|n| n == "1"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn milliseconds_saturate_at_the_last_representable_instant() {
+    let last = i64::MAX as u64 / 1000;
+    assert_eq!(seconds_to_ms(last), last as i64 * 1000);
+    assert_eq!(seconds_to_ms(last + 1), i64::MAX);
+    assert_eq!(seconds_to_ms(u64::MAX), i64::MAX);
+}
+
+#[test]
+fn cancelling_between_pages_discards_the_incomplete_span_or_loved_list() {
+    for method in ["user.getRecentTracks", "user.getLovedTracks"] {
+        let fake = std::sync::Arc::new(FakeLastfm::start("someone", history(12)));
+        fake.set_loved(vec![("Invented", "Song", NOW); 1001]);
+        let mut sink = Memory {
+            on_stop_check: Some(Box::new({
+                let fake = fake.clone();
+                move || {
+                    fake.seen().iter().any(|req| {
+                        req.method == method && req.params.get("limit").is_some_and(|n| n != "1")
+                    })
+                }
+            })),
+            ..Memory::default()
+        };
+        let synced = lastfm(&fake, 20)
+            .source("someone")
+            .until(NOW)
+            .sync(&mut sink, true)
+            .unwrap();
+        assert!(synced.stopped);
+        assert!(synced.loves.is_none());
+        assert_eq!(
+            fake.seen()
+                .iter()
+                .filter(
+                    |req| req.method == method && req.params.get("limit").is_some_and(|n| n != "1")
+                )
+                .count(),
+            1
+        );
+        if method == "user.getRecentTracks" {
+            assert!(sink.records.is_empty());
+        }
+    }
+}
+
+#[test]
+fn a_partial_last_page_cannot_replace_loved_tracks() {
+    let two_pages = LovedPaging {
+        total: 4,
+        pages: 2,
+        per_page: 2,
+    };
+    assert!(!two_pages.complete(1, 2, 2).unwrap());
+    assert!(two_pages.complete(2, 2, 4).unwrap());
+    assert!(two_pages.complete(1, 1, 1).is_err());
+    assert!(two_pages.complete(2, 1, 3).is_err());
+    assert!(two_pages.complete(2, 0, 4).is_err());
+    assert!(two_pages.complete(2, 3, 5).is_err());
+    let empty = LovedPaging {
+        total: 0,
+        pages: 1,
+        per_page: 2,
+    };
+    assert!(empty.complete(1, 0, 0).unwrap());
+}
+
+#[test]
+fn a_change_between_pages_cannot_clear_a_different_track() {
+    for same_total in [true, false] {
+        let fake = std::sync::Arc::new(FakeLastfm::start("someone", vec![]));
+        let loved: Vec<String> = (0..1002).map(|i| format!("Invented Song {i}")).collect();
+        fake.set_loved(
+            loved
+                .iter()
+                .map(|t| ("Invented Artist", t.as_str(), NOW))
+                .collect(),
+        );
+        let held = if same_total { 1001 } else { 1000 };
+        let mut sink = Memory {
+            loves: vec![Love {
+                artist: "Invented Artist".into(),
+                title: loved[held].clone(),
+                loved_at_ms: seconds_to_ms(NOW),
+            }],
+            on_stop_check: Some(Box::new({
+                let fake = fake.clone();
+                move || {
+                    if fake
+                        .seen()
+                        .iter()
+                        .any(|req| req.method == "user.getLovedTracks")
+                    {
+                        // Shift the list after the first page has been read.
+                        let mut updated: Vec<_> = loved
+                            .iter()
+                            .map(|t| ("Invented Artist", t.as_str(), NOW))
+                            .collect();
+                        if same_total {
+                            updated.rotate_right(1);
+                            updated[1000].2 += 1;
+                        } else {
+                            updated.remove(0);
+                        }
+                        fake.set_loved(updated);
+                    }
+                    false
+                }
+            })),
+            ..Default::default()
+        };
+        let result = lastfm(&fake, 10)
+            .source("someone")
+            .until(NOW)
+            .sync(&mut sink, true);
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(sink.loves.len(), 1);
+        assert_eq!(sink.loves[0].title, format!("Invented Song {held}"));
+    }
+}
+
+#[test]
+fn cancellation_after_the_first_count_stops_an_incremental_import() {
+    let fake = std::sync::Arc::new(FakeLastfm::start("someone", history(1)));
+    let mut sink = Memory {
+        cursor: Some(cursor(NOW)),
+        on_stop_check: Some(Box::new({
+            let fake = fake.clone();
+            move || !fake.seen().is_empty()
+        })),
+        ..Memory::default()
+    };
+    let synced = lastfm(&fake, 10)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut sink, false)
+        .unwrap();
+    assert!(synced.stopped);
+    assert_eq!(fake.seen().len(), 1);
 }

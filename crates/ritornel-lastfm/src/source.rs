@@ -19,7 +19,7 @@
 //! A span is always whole seconds, so every scrobble of one second is read
 //! in the same span, and that place is the same whenever it is read.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ritornel_source::{
     Batch, Error, HistorySource, Identifiers, ImportRecord, Love, Progress, Sink, Span, Synced,
@@ -98,7 +98,7 @@ fn failed(error: &scrobl::Error) -> Error {
 }
 
 fn seconds_to_ms(seconds: u64) -> i64 {
-    i64::try_from(seconds).unwrap_or(i64::MAX / 1000) * 1000
+    i64::try_from(seconds.saturating_mul(1000)).unwrap_or(i64::MAX)
 }
 
 /// What a record is of, as the key hashes it: an album that is absent and
@@ -190,10 +190,11 @@ async fn read(
     from: u64,
     to: u64,
     page_size: u32,
-) -> Result<Vec<Scrobble>, scrobl::Error> {
+    sink: &dyn Sink,
+) -> Result<Option<Vec<Scrobble>>, scrobl::Error> {
     let mut attempt = 1;
     loop {
-        match scan(client, user, from, to, page_size).await {
+        match scan(client, user, from, to, page_size, sink).await {
             Err(error) if error.kind() == ErrorKind::Inconsistent && attempt < ATTEMPTS => {
                 attempt += 1;
             }
@@ -210,7 +211,8 @@ async fn scan(
     from: u64,
     to: u64,
     page_size: u32,
-) -> Result<Vec<Scrobble>, scrobl::Error> {
+    sink: &dyn Sink,
+) -> Result<Option<Vec<Scrobble>>, scrobl::Error> {
     let mut scan = client
         .user(user)
         .recent_tracks()
@@ -218,36 +220,99 @@ async fn scan(
         .limit(page_size)
         .scan()?;
     let mut scrobbles = Vec::new();
-    while let Some(page) = scan.next_page().await? {
+    loop {
+        if sink.stopping() {
+            return Ok(None);
+        }
+        let Some(page) = scan.next_page().await? else {
+            break;
+        };
         scrobbles.extend(page.into_value().into_scrobbles());
     }
     scan.finish()?;
-    Ok(scrobbles)
+    Ok(Some(scrobbles))
 }
 
-/// Every track `user` has loved, as the list stands now, a page at a time.
-/// Nothing ties one page of it to the next, so a track loved during the
-/// read can be missing until the next sync.
-async fn loved(client: &Client, user: &str) -> Result<Vec<Love>, scrobl::Error> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LovedPaging {
+    total: u64,
+    pages: u32,
+    per_page: u32,
+}
+
+impl LovedPaging {
+    /// Can the rows collected through this page replace the saved list?
+    fn complete(self, page: u32, rows: usize, read: u64) -> Result<bool, Error> {
+        let expected = self.total.min(u64::from(page) * u64::from(self.per_page));
+        if read != expected {
+            return Err(Error::source(format!(
+                "Last.fm's loved-track page {page} accounts for {read} tracks, expected {expected}"
+            )));
+        }
+        let last = page >= self.pages;
+        if read == self.total && last && (rows != 0 || self.total == 0) {
+            return Ok(true);
+        }
+        if rows == 0 || last || read >= self.total {
+            return Err(Error::source(
+                "Last.fm's loved-track pages disagree with their total",
+            ));
+        }
+        Ok(false)
+    }
+}
+
+/// Read the loved list before replacing it. Inconsistent paging or a
+/// repeated track can mean another track slipped across a page boundary.
+async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Vec<Love>>, Error> {
     let mut loves = Vec::new();
+    let mut first_paging = None;
     let mut page_number = 1;
     loop {
+        if sink.stopping() {
+            return Ok(None);
+        }
         let page = client
             .user(user)
             .loved_tracks()
             .limit(LOVED_PAGE)
             .page(page_number)
             .send()
-            .await?;
-        let total = page.total();
+            .await
+            .map_err(|error| failed(&error))?;
+        if page.number() != page_number {
+            return Err(Error::source(
+                "Last.fm returned a different loved-track page than requested",
+            ));
+        }
+        let paging = LovedPaging {
+            total: page.total(),
+            pages: page.total_pages(),
+            per_page: page.per_page(),
+        };
+        let expected = *first_paging.get_or_insert(paging);
+        if paging != expected {
+            return Err(Error::source(format!(
+                "Last.fm's loved-track list changed on page {page_number}: the total, page count or page size differs from the first page"
+            )));
+        }
         let rows = page.len();
         loves.extend(page.items().iter().map(|row| Love {
             artist: row.track().artist().name().to_owned(),
             title: row.track().name().to_owned(),
             loved_at_ms: seconds_to_ms(row.loved_at()),
         }));
-        if rows == 0 || loves.len() as u64 >= total {
-            return Ok(loves);
+        if paging.complete(page_number, rows, loves.len() as u64)? {
+            let mut seen = HashSet::new();
+            if !loves
+                .iter()
+                .all(|row| seen.insert((&row.artist, &row.title)))
+            {
+                return Err(Error::source(
+                    "Last.fm repeated a loved track while reading the list",
+                ));
+            }
+            return Ok(Some(loves));
         }
         page_number += 1;
     }
@@ -263,11 +328,17 @@ impl LastfmSource<'_> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs())
         });
-        let stored = sink.cursor()?.as_deref().and_then(read_cursor);
-        let start = match stored {
+        let previous_cursor = sink.cursor()?.as_deref().and_then(read_cursor);
+        let start = match previous_cursor {
             Some(read_before) if !full => read_before.min(now).saturating_sub(settings.recent_s),
             _ => 0,
         };
+        if sink.stopping() {
+            return Ok(Synced {
+                stopped: true,
+                ..Synced::default()
+            });
+        }
         let mut synced = Synced {
             source_total: Some(count(client, user, 0, now).await.map_err(|e| failed(&e))?),
             ..Synced::default()
@@ -275,6 +346,10 @@ impl LastfmSource<'_> {
         let to_read = if start == 0 {
             synced.source_total
         } else {
+            if sink.stopping() {
+                synced.stopped = true;
+                return Ok(synced);
+            }
             Some(
                 count(client, user, start, now)
                     .await
@@ -289,8 +364,8 @@ impl LastfmSource<'_> {
 
         // The last span pushed is the next one read, so the history is read
         // oldest first and each span's end is a cursor that holds.
-        let mut spans = vec![(start, now)];
-        while let Some((from, to)) = spans.pop() {
+        let mut spans = vec![(start, now, to_read)];
+        while let Some((from, to, counted)) = spans.pop() {
             if from >= to {
                 continue;
             }
@@ -298,21 +373,28 @@ impl LastfmSource<'_> {
                 synced.stopped = true;
                 return Ok(synced);
             }
-            let theirs = count(client, user, from, to)
-                .await
-                .map_err(|e| failed(&e))?;
+            let theirs = match counted {
+                Some(total) => total,
+                None => count(client, user, from, to)
+                    .await
+                    .map_err(|e| failed(&e))?,
+            };
             // A span Last.fm counts empty is still read, as one checked
             // scan of a single page, and handed over: what the core holds
             // there and Last.fm no longer has is what has gone.
             if theirs > settings.chunk && to - from > 1 {
                 let middle = from + (to - from) / 2;
-                spans.push((middle, to));
-                spans.push((from, middle));
+                spans.push((middle, to, None));
+                spans.push((from, middle, None));
                 continue;
             }
-            let scrobbles = read(client, user, from, to, settings.page_size)
+            let Some(scrobbles) = read(client, user, from, to, settings.page_size, sink)
                 .await
-                .map_err(|e| failed(&e))?;
+                .map_err(|e| failed(&e))?
+            else {
+                synced.stopped = true;
+                return Ok(synced);
+            };
             let records = records(&scrobbles);
             synced.read += records.len() as u64;
             let stored = sink.commit(Batch {
@@ -321,7 +403,7 @@ impl LastfmSource<'_> {
                     from_ms: seconds_to_ms(from),
                     to_ms: seconds_to_ms(to),
                 },
-                cursor: cursor(to),
+                cursor: cursor(to.max(previous_cursor.unwrap_or(0))),
             })?;
             synced.new += stored.new;
             synced.gone += stored.gone;
@@ -341,7 +423,14 @@ impl LastfmSource<'_> {
             total: to_read,
             label: Some("reading the loved tracks".to_owned()),
         });
-        let loves = loved(client, user).await.map_err(|e| failed(&e))?;
+        let Some(loves) = loved(client, user, sink).await? else {
+            synced.stopped = true;
+            return Ok(synced);
+        };
+        if sink.stopping() {
+            synced.stopped = true;
+            return Ok(synced);
+        }
         synced.loves = Some(sink.loves(loves)?);
         Ok(synced)
     }
