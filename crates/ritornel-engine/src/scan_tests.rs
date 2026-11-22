@@ -730,6 +730,32 @@ fn a_file_that_vanishes_is_marked_missing_and_reclaims_its_rows_when_it_returns(
 }
 
 #[test]
+fn a_folder_that_cannot_be_read_is_passed_over_and_its_files_are_not_taken_for_gone() {
+    use crate::platform::set_listable;
+    let mut rig = Rig::new();
+    album(&mut rig);
+    let lost = rig.root().join("lost+found");
+    std::fs::create_dir(&lost).unwrap();
+    // As a disk's `lost+found` is.
+    set_listable(&lost, false);
+    // The rest of the root is scanned.
+    assert_eq!(rig.scan().files, 5);
+
+    // A folder of known files closed since: they are not missing.
+    let album = rig.root().join("Moss Arcade");
+    set_listable(&album, false);
+    let summary = rig.scan();
+    set_listable(&album, true);
+    set_listable(&lost, true);
+    assert_eq!((summary.files, summary.missing), (3, 0));
+    assert_eq!(
+        rig.one("SELECT count(*) FROM source_item WHERE missing_since_ms IS NOT NULL"),
+        "0"
+    );
+    assert_eq!(rig.scan().unchanged, 5);
+}
+
+#[test]
 fn a_root_that_is_unreachable_or_empty_fails_the_scan_and_marks_nothing_missing() {
     let mut rig = Rig::new();
     album(&mut rig);

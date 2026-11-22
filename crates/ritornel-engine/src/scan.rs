@@ -410,8 +410,16 @@ impl ScanRun {
                 self.queue.push(file.clone());
             }
         }
+        // A file in a folder the walk could not read is neither there nor
+        // gone: it is left as it was.
+        let unread = |path: &str| {
+            walked.unreadable.iter().any(|folder| {
+                path.strip_prefix(folder.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        };
         for (path, known) in &self.known {
-            if present.contains(path.as_str()) {
+            if present.contains(path.as_str()) || unread(path) {
                 continue;
             }
             if let Some(audio) = &known.audio {

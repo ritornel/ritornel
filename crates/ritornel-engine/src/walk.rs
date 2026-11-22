@@ -4,6 +4,7 @@
 //! "Scanning one file" step 1 and "Rescans" in docs/design/identity.md.
 
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
@@ -36,8 +37,12 @@ pub(crate) struct Walked {
     /// Each folder's own images, by the folder's path relative to the
     /// root, in the order of their names.
     pub(crate) images: BTreeMap<String, Vec<Seen>>,
-    /// Files passed over, with why: a name that is not UTF-8.
+    /// Files and folders passed over, with why: a name that is not UTF-8,
+    /// or a folder the server may not read.
     pub(crate) skipped: Vec<(String, &'static str)>,
+    /// The folders the server may not read, relative to the root, in the
+    /// order of their paths. What was known in them is not taken for gone.
+    pub(crate) unreadable: Vec<String>,
     /// Which folder the root was when it was walked: its device and inode,
     /// or on Windows its volume's serial number and its file index. An
     /// unmounted disk leaves another folder at the same path.
@@ -85,8 +90,41 @@ fn is_audio(name: &str) -> bool {
     })
 }
 
+/// Names the folder `rel` as one the walk could not read, and drops what
+/// it found in it before it was refused: all of it is left as it was.
+fn unreadable(walked: &mut Walked, rel: &str) {
+    let inside = |path: &str| {
+        path.strip_prefix(rel)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    walked.files.retain(|seen| !inside(&seen.path));
+    walked
+        .images
+        .retain(|folder, _| folder != rel && !inside(folder));
+    walked.unreadable.retain(|folder| !inside(folder));
+    walked.unreadable.push(rel.to_owned());
+    walked
+        .skipped
+        .push((rel.to_owned(), "the folder cannot be read"));
+}
+
 fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> Result<(), Error> {
-    for entry in std::fs::read_dir(dir).map_err(Error::Io)? {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // A folder inside the root that the server may not read, as a
+        // disk's `lost+found` is, is passed over and named, and what was
+        // known in it is kept. Any other failure fails the walk, rather
+        // than what the folder held being taken for gone.
+        // A folder removed since its parent was listed is gone, with all
+        // that was in it, as it would be had the walk come a moment later.
+        Err(error) if !rel.is_empty() && error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) if !rel.is_empty() && error.kind() == ErrorKind::PermissionDenied => {
+            unreadable(walked, rel);
+            return Ok(());
+        }
+        Err(error) => return Err(Error::Io(error)),
+    };
+    for entry in entries {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -109,7 +147,19 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
         } else {
             format!("{rel}/{name}")
         };
-        let kind = entry.file_type().map_err(Error::Io)?;
+        // A folder that may be listed but not gone into, mode `r--`, says
+        // no only here: it is passed over as one that cannot be listed.
+        let denied =
+            |error: &std::io::Error| !rel.is_empty() && error.kind() == ErrorKind::PermissionDenied;
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) if denied(&error) => {
+                unreadable(walked, rel);
+                return Ok(());
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
         if kind.is_dir() {
             walk_into(&entry.path(), &path, walked, stop)?;
             continue;
@@ -118,9 +168,16 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
         // could lead back to where the walk came from. A link that leads
         // nowhere is passed over; a file the system will not describe
         // fails the walk, rather than being taken for gone.
+        // A file removed since the folder was listed is gone, as it would
+        // be had the walk come a moment later.
         let metadata = match std::fs::metadata(entry.path()) {
             Ok(metadata) => metadata,
             Err(_) if kind.is_symlink() => continue,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) if denied(&error) => {
+                unreadable(walked, rel);
+                return Ok(());
+            }
             Err(error) => return Err(Error::Io(error)),
         };
         if !metadata.is_file() {
@@ -161,6 +218,8 @@ pub(crate) fn walk(root: &Path, stop: &AtomicBool) -> Result<Walked, Error> {
         return Err(offline());
     }
     walked.files.sort_by(|a, b| a.path.cmp(&b.path));
+    walked.unreadable.sort();
+    walked.skipped.sort();
     for images in walked.images.values_mut() {
         images.sort_by(|a, b| a.path.cmp(&b.path));
     }
@@ -215,6 +274,61 @@ mod tests {
         assert_eq!(images, [("a", "a/Folder.PNG"), ("b", "b/cover.jpg")]);
         assert_eq!(folder_of("a/deep/er/01.ogg"), "a/deep/er");
         assert_eq!(folder_of("top.wav"), "");
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_read_is_passed_over_and_named() {
+        use crate::platform::set_listable;
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        for path in ["a/01.flac", "lost+found/02.flac", "b/c/03.flac"] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"12345").unwrap();
+        }
+        // As a disk's `lost+found` is.
+        set_listable(&root.join("lost+found"), false);
+        set_listable(&root.join("b/c"), false);
+        let walked = walk(root, &AtomicBool::new(false));
+        set_listable(&root.join("lost+found"), true);
+        set_listable(&root.join("b/c"), true);
+        let walked = walked.unwrap();
+        let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
+        assert_eq!(paths, ["a/01.flac"]);
+        assert_eq!(walked.unreadable, ["b/c", "lost+found"]);
+        assert_eq!(
+            walked.skipped,
+            [
+                ("b/c".to_owned(), "the folder cannot be read"),
+                ("lost+found".to_owned(), "the folder cannot be read"),
+            ]
+        );
+    }
+
+    // A folder that may be listed but not gone into, mode `r--`: the mode
+    // is the system's.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_can_be_listed_but_not_gone_into_is_passed_over_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        for path in ["a/01.flac", "listed/02.flac", "listed/deeper/03.flac"] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"12345").unwrap();
+        }
+        let mode = |mode: u32| {
+            std::fs::set_permissions(root.join("listed"), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        mode(0o444);
+        let walked = walk(root, &AtomicBool::new(false));
+        mode(0o755);
+        let walked = walked.unwrap();
+        let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
+        assert_eq!(paths, ["a/01.flac"]);
+        assert_eq!(walked.unreadable, ["listed"]);
     }
 
     #[test]
