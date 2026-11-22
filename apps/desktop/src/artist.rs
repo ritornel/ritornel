@@ -41,7 +41,7 @@ use ritornel_contract::{
 
 use crate::banner::{self, Actions, Banner};
 use crate::link::{Link, LinkEvent};
-use crate::net::Net;
+use crate::net::{Net, NoArt};
 use crate::player::{Doing, Many, Player};
 use crate::record::{self, Words};
 use crate::theme;
@@ -184,6 +184,7 @@ pub(crate) struct Artist {
     history: Option<HistoryOf>,
     covers: HashMap<(Id, u32), Arc<RenderImage>>,
     asked: HashSet<(Id, u32)>,
+    retries: crate::covers::Retries,
     fetches: crate::covers::FetchBag,
     revision: u64,
     /// Whether it is behind another page, kept for Back, and what changed
@@ -256,6 +257,8 @@ impl Artist {
                     // Revisions are the server's: another may count from
                     // lower.
                     page.revision = 0;
+                    // What could not be read is asked for again at once.
+                    page.retries = crate::covers::Retries::default();
                     false
                 }
                 LinkEvent::Server(Event::Library(event))
@@ -286,6 +289,7 @@ impl Artist {
             history: None,
             covers: HashMap::new(),
             asked: HashSet::new(),
+            retries: crate::covers::Retries::default(),
             fetches: crate::covers::FetchBag::default(),
             revision: 0,
             freshness: crate::stage::Freshness::default(),
@@ -461,14 +465,25 @@ impl Artist {
         self.problem = false;
     }
 
-    /// Reads a cover at `px` pixels, once, and keeps it.
+    /// Reads a cover at `px` pixels, once, and keeps it. One that could not
+    /// be read is asked for again after a while.
     fn want(&mut self, art: Id, px: u32, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
         if let Some(image) = self.covers.get(&(art, px)) {
             return Some(Arc::clone(image));
         }
-        if self.asked.insert((art, px)) {
-            self.fetch(art, px, cx, move |page, image, _| {
-                page.covers.insert((art, px), image);
+        if !self.retries.waits(art, Instant::now()) && self.asked.insert((art, px)) {
+            self.fetch(art, px, cx, move |page, image, cx| match image {
+                Ok(image) => {
+                    page.retries.read(art);
+                    page.covers.insert((art, px), image);
+                }
+                // Not there: it is not asked for again.
+                Err(NoArt::Missing) => {}
+                Err(NoArt::Failed) => {
+                    page.asked.remove(&(art, px));
+                    let wait = page.retries.failed(art, Instant::now());
+                    crate::covers::notify_after(wait, cx);
+                }
             });
         }
         // Meanwhile, as it was read for another size or display.
@@ -484,7 +499,7 @@ impl Artist {
         art: Id,
         px: u32,
         cx: &mut Context<Self>,
-        took: impl FnOnce(&mut Self, Arc<RenderImage>, &mut Context<Self>) + 'static,
+        took: impl FnOnce(&mut Self, Result<Arc<RenderImage>, NoArt>, &mut Context<Self>) + 'static,
     ) {
         let http = Arc::clone(&self.net.art);
         let sizes = self.net.art_sizes.clone();
@@ -494,13 +509,12 @@ impl Artist {
             .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
         self.fetches.push(read.abort_handle());
         cx.spawn(async move |this, cx| {
-            if let Ok(Some((image, _, _))) = read.await {
-                this.update(cx, |page, cx| {
-                    took(page, Arc::new(image), cx);
-                    cx.notify();
-                })
-                .ok();
-            }
+            let image = read.await.unwrap_or(Err(NoArt::Failed));
+            this.update(cx, |page, cx| {
+                took(page, image.map(|(image, _, _)| Arc::new(image)), cx);
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
@@ -603,7 +617,7 @@ impl Artist {
         let http = Arc::clone(&self.net.art);
         let tone = crate::blur::wash_tone(theme::dark());
         let blurs = self.net.rt().spawn(async move {
-            let bytes = http.get(art, crate::blur::SIDE).await?;
+            let bytes = http.get(art, crate::blur::SIDE).await.ok()?;
             crate::covers::decode(move || {
                 Some((
                     crate::blur::jpeg(&bytes, banner_radius, crate::blur::BANNER.1)?,
@@ -689,9 +703,9 @@ impl Artist {
             move |page, image, cx| {
                 // Asked for before the last: for a display the window has
                 // left since, or another picture.
-                if page.face_read != read {
+                let Some(image) = image.ok().filter(|_| page.face_read == read) else {
                     return;
-                }
+                };
                 if let Some(old) = page.face.replace(image) {
                     crate::covers::drop_unshared(old, None, cx);
                 }
@@ -715,7 +729,7 @@ impl Artist {
         let http = Arc::clone(&self.net.art);
         let bucket = self.net.bucket((2. * 380. * scale).ceil() as u32);
         let read = self.net.rt().spawn(async move {
-            let bytes = http.get(art, bucket).await?;
+            let bytes = http.get(art, bucket).await.ok()?;
             crate::covers::decode(move || crate::covers::decode_picture(&bytes)).await
         });
         self.fetches.push(read.abort_handle());

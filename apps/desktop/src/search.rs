@@ -342,7 +342,7 @@ impl SearchBox {
                 .rt()
                 .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
             cx.spawn(async move |this, cx| {
-                let result = read.await.ok().flatten();
+                let result = read.await.ok().and_then(Result::ok);
                 this.update(cx, |search, cx| match result {
                     Some((image, _, _)) => {
                         let keep: HashSet<Id> = search

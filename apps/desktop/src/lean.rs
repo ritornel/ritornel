@@ -900,7 +900,7 @@ impl LeanBack {
         });
         async move {
             match read {
-                Some(read) => read.await.ok().flatten(),
+                Some(read) => read.await.ok().and_then(Result::ok),
                 None => None,
             }
         }
@@ -924,7 +924,7 @@ impl LeanBack {
             (Some(art), Some(net)) => {
                 let http = Arc::clone(&net.art);
                 Some(net.rt().spawn(async move {
-                    let bytes = http.get(art, crate::blur::SIDE).await?;
+                    let bytes = http.get(art, crate::blur::SIDE).await.ok()?;
                     crate::covers::decode(move || {
                         crate::blur::jpeg_toned(&bytes, radius, saturation, brightness)
                     })
