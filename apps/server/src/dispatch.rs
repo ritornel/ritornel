@@ -731,10 +731,9 @@ impl Core {
                 ),
             ));
         }
-        // What a linked server asks keeps this hub awake for a while; its
-        // ping only says whether it plays.
+        // What a linked server asks keeps this hub awake for a while.
         if let Some(peer) = session.peer()
-            && row.name != LinkPing::NAME
+            && crate::awake::is_activity(row.name)
         {
             self.linked_server_called(peer);
         }

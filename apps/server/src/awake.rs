@@ -25,6 +25,17 @@ pub(crate) const CHECK_EVERY: Duration = Duration::from_secs(60);
 /// How long the hub waits to ask the system again after it refused.
 const ASK_AGAIN_MS: i64 = 60_000;
 
+/// Whether a linked server's call to `method` is activity. Saying hello,
+/// subscribing to events and pinging are how a link keeps itself, and a
+/// satellite does them whenever its connection comes back, so they keep
+/// nothing awake.
+pub(crate) fn is_activity(method: &str) -> bool {
+    !matches!(
+        method,
+        "server.hello" | "events.subscribe" | "events.unsubscribe" | "link.ping"
+    )
+}
+
 /// What a hub knows of its linked servers' activity.
 #[derive(Debug)]
 pub(crate) struct Activity {
@@ -149,6 +160,16 @@ mod tests {
 
     fn server(n: u8) -> Id {
         Id::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn keeping_the_link_is_not_activity() {
+        for kept in ["server.hello", "events.subscribe", "link.ping"] {
+            assert!(!is_activity(kept), "{kept}");
+        }
+        for used in ["list.open", "link.copies", "link.listen", "servers.list"] {
+            assert!(is_activity(used), "{used}");
+        }
     }
 
     #[test]
