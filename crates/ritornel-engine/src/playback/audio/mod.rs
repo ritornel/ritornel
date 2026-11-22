@@ -1,6 +1,6 @@
 //! The audio pipeline: a decode thread per ring, a ring, and an output
-//! that drives the real-time callback. See "The pipeline" in
-//! docs/design/playback.md.
+//! that drives the real-time callback. See "Audio pipeline" in
+//! docs/internals/playback.md.
 //!
 //! ```text
 //! control (the player)   load / seek / unload, queue next, play / pause ↓   events, progress ↑

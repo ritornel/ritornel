@@ -1,5 +1,5 @@
 //! The queue in memory, in queue order and in play order, and the writes
-//! that change it. See "The queue" in docs/design/playback.md.
+//! that change it. See "Queue and session" in docs/internals/playback.md.
 //!
 //! Each entry has a position in queue order and, while shuffle is on, a
 //! place in the stored play order. Both are spread with room between them,

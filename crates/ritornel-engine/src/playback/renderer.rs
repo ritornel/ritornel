@@ -1,6 +1,6 @@
 //! The renderer interface the player sits on: "prepare, play, pause, seek"
-//! going down, and "started, ended" coming up. See decision 24 in
-//! docs/design/playback.md. The player never sees the decoder, the ring or
+//! going down, and "started, ended" coming up. See "Audio pipeline" in
+//! docs/internals/playback.md. The player never sees the decoder, the ring or
 //! the output.
 //!
 //! A track is played in spans: an unbroken run of one track through the
@@ -111,8 +111,8 @@ pub struct Progress {
     pub lost: bool,
 }
 
-/// Which ReplayGain tag a track plays at. See decision 7 in
-/// docs/design/playback.md.
+/// Which ReplayGain tag a track plays at. See "Audio pipeline" in
+/// docs/internals/playback.md.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ReplayGain {
     /// None: the samples as they are.

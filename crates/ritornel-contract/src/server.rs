@@ -434,7 +434,7 @@ pub struct BackedUp {
 
 /// How a hub notices changes to its folders: it watches them, rescans a
 /// music root or imports a picture folder once changes settle, and rescans
-/// on a timer as well. See "Watching" in docs/design/identity.md.
+/// on a timer as well. See "Watching" in docs/internals/identity.md.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

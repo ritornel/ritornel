@@ -88,5 +88,8 @@ Detailed guides for shipped subsystems live under `docs/internals/`:
 - [`docs/internals/contract.md`](docs/internals/contract.md) — wire schema, TypeScript generation, HTTP routes and tickets, JSON-RPC framing, list views, events, commands, and cover media.
 - [`docs/internals/schema.md`](docs/internals/schema.md) — two-database split, durable vs. rebuildable tables, immutability triggers, ratings, revision stamping, and migrations.
 - [`docs/internals/plugins.md`](docs/internals/plugins.md) — compiled-in plugin boundary (`ritornel-source`), `ritornel-lastfm`, and Cargo feature gating.
+- [`docs/internals/playback.md`](docs/internals/playback.md) — audio pipeline, gapless transitions, copy selection, persisted queue, frame-counted listen recording, and OS media sessions.
+- [`docs/internals/history.md`](docs/internals/history.md) — immutable observations, play derivation, monotonic timekeeping, indexed queries, Last.fm sync/scrobbling, and portable export.
+- [`docs/internals/identity.md`](docs/internals/identity.md) — read-only scanning, audio-only hashing, folder watching, normalization, recording resolution, catalog projection, and scrobble matching.
 
-Additional subsystem guides (`identity`, `history`, `playback`, `linking`, `desktop`) are being moved into `docs/internals/` as each is verified against the current code.
+Additional subsystem guides (`linking`, `desktop`) are being moved into `docs/internals/` as each is verified against the current code.

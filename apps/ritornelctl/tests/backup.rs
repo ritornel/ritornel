@@ -7,7 +7,7 @@
 //! cannot be saved stops the record, and the status says so while the
 //! music goes on. See "Backups and pre-migration snapshots" in
 //! docs/internals/server.md and "Export" in
-//! docs/design/history.md.
+//! docs/internals/history.md.
 //!
 //! As in `play.rs`, `ritornel-server` is taken from beside `ritornelctl`,
 //! and nothing here sleeps: each wait is for a process to print a line or

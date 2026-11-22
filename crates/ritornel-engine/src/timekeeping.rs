@@ -1,8 +1,8 @@
 //! The clocks a listen is stamped with besides the wall clock: a monotonic
 //! clock that keeps counting while the machine sleeps, the boot it counts
 //! from, and the zone the machine is in. None can be backfilled, so every
-//! listen and every send records them. See decision 20 and "Clocks" in
-//! docs/design/history.md.
+//! listen and every send records them. See "Clocks and monotonic age dating"
+//! in docs/internals/history.md.
 //!
 //! The monotonic clock is the machine's, and two readings of it compare
 //! only within one boot of the machine. So the boot ID that goes with each

@@ -1,8 +1,8 @@
 //! The player with a fake renderer, both stores in memory and clocks the
 //! test moves: the queue, the session, what every listen records, the
 //! crash, and delivery to history. The catalog is a few invented tracks
-//! written straight into the library. See docs/design/playback.md and
-//! docs/design/history.md.
+//! written straight into the library. See docs/internals/playback.md and
+//! docs/internals/history.md.
 
 use std::sync::Arc;
 
@@ -590,8 +590,8 @@ fn a_track_of_30_seconds_or_less_played_whole_does_not_count_and_the_album_plays
 
 #[test]
 fn the_recording_example_pause_seek_and_next_with_its_checkpoints_and_its_crash() {
-    // playback.md, "Recording a listen": a 4:00 track queued from an
-    // album. The table's times are minutes after 21:00:00.
+    // Recording a 4:00 track queued from an album, with checkpoints every 5 s,
+    // a pause, a seek, and a skip. Times below are minutes after 21:00:00.
     let mut rig = Rig::new();
     rig.play(0);
     // Written once its first frame is heard, dated then, with what was
@@ -649,7 +649,8 @@ fn the_recording_example_pause_seek_and_next_with_its_checkpoints_and_its_crash(
 
 #[test]
 fn a_crash_at_2_40_with_a_checkpoint_at_2_35_is_closed_as_a_crash_and_resumed_as_one_play() {
-    // history.md, "What a listen contains": a 5:00 track.
+    // A 5:00 track crashes at 2:40 after a 2:35 checkpoint and resumes as one
+    // play.
     let mut rig = Rig::new();
     rig.play(1);
     rig.pass(159_000);

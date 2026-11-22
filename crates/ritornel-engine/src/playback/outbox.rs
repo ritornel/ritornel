@@ -1,5 +1,5 @@
-//! Delivering finished listens to the hub, from the outbox. See decision 21
-//! in docs/design/playback.md and "Jobs and outbox" in
+//! Delivering finished listens to the hub, from the outbox. See "Recording a
+//! listen" in docs/internals/playback.md and "Jobs and outbox" in
 //! docs/internals/server.md.
 //!
 //! A listen is staged in `server.db` and its delivery is an outbox row,

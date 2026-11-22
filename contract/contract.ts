@@ -1281,9 +1281,9 @@ export type HistoryExported = {
  * It counts the plays that count and are not excluded, of songs the
  * library has bound them to: an artist's are the plays of their songs, by
  * each song's credit; an album's are those heard from one of its
- * versions. A play bound to no song reaches no page (docs/design/history.md,
- * "Last.fm"), so this is read again whenever plays change: a binding made
- * later moves them here.
+ * versions. A play bound to no song reaches no page ("Queries" in
+ * docs/internals/history.md), so this is read again whenever plays change:
+ * a binding made later moves them here.
  */
 export type HistoryOf = {
   /**
@@ -2413,7 +2413,7 @@ export type OutputInfo = {
 };
 
 /**
- * How an output runs. See decision 5 in docs/design/playback.md.
+ * How an output runs. See "Audio pipeline" in docs/internals/playback.md.
  */
 export type OutputMode = "shared";
 
@@ -3623,7 +3623,7 @@ export type RecordStatus = {
 export type RecordType = "album" | "ep" | "single" | "broadcast" | "other";
 
 /**
- * Repeat. See "The queue" in docs/design/playback.md.
+ * Repeat. See "Queue and session" in docs/internals/playback.md.
  */
 export type Repeat = "off" | "all" | "one";
 
@@ -4754,7 +4754,7 @@ export type WatchState = "watching" | "polling" | "offline";
 /**
  * How a hub notices changes to its folders: it watches them, rescans a
  * music root or imports a picture folder once changes settle, and rescans
- * on a timer as well. See "Watching" in docs/design/identity.md.
+ * on a timer as well. See "Watching" in docs/internals/identity.md.
  */
 export type WatchStatus = {
   /**

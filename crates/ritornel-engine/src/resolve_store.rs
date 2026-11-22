@@ -1,7 +1,7 @@
 //! The resolver and the projector against `library.db`: reading the
 //! library as the resolver sees it, and writing what its resolution asks
-//! for. See steps 7 and 8 of "Scanning one file", "Displayed metadata" and
-//! "The proof" in docs/design/identity.md.
+//! for. See "Recording resolution" and "Catalog projection and displayed
+//! metadata" in docs/internals/identity.md.
 //!
 //! The resolution says what the catalog should be. [`Plan`] compares it
 //! with what the rows hold and keeps only what differs, so a resolution

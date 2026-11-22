@@ -2,7 +2,7 @@
 //! report of how much of it matched the library, and scrobbling. Also the
 //! zones the listener was in by date, which dates an imported play, and one
 //! track as `ritornelctl show` gives it. See "Last.fm" in
-//! docs/design/history.md.
+//! docs/internals/history.md.
 //!
 //! A server built without Last.fm answers each `lastfm.*` call with
 //! `unavailable`; `lastfm.status` says so in `available`.

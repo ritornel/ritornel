@@ -1,7 +1,6 @@
 //! Scrobbling, as the library records it: which plays are eligible to be
 //! sent to an account, the row that records each before it is sent, and
-//! what became of it. See "Last.fm" and decision 3 in
-//! docs/design/history.md.
+//! what became of it. See "Last.fm" in docs/internals/history.md.
 //!
 //! A delivery is durable and names the play's primary observation, a
 //! listen, never the derived play. It is written as `pending`, becomes

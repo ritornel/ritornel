@@ -21,7 +21,7 @@ lastfm = ["dep:ritornel-lastfm", "dep:ritornel-source"]
 # The system's media session: Now Playing and the media keys on macOS,
 # with `main` blocking in the platform run loop, and MPRIS on the session
 # bus on Linux. The hub is built without it. See "OS integration" in
-# docs/design/playback.md.
+# docs/internals/playback.md.
 media-session = ["dep:souvlaki", "dep:objc2-core-foundation", "dep:zbus"]
 
 [dependencies]

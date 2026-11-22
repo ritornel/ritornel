@@ -1,9 +1,9 @@
 //! The player's calls: `playback.*`, `queue.*` and `sources.tracks`, and
 //! the events the player sends. See "Commands, playback, and jobs" in
-//! docs/internals/contract.md and docs/design/playback.md.
+//! docs/internals/contract.md and docs/internals/playback.md.
 //!
 //! A server with no output has no player, and answers the player's calls
-//! with `unsupported` (docs/design/playback.md, decision 2).
+//! with `unsupported` ("Audio pipeline" in docs/internals/playback.md).
 
 use std::path::Path;
 use std::sync::PoisonError;

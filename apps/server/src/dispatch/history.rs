@@ -1,5 +1,6 @@
 //! The history calls: recent listening, "on this day", and the rebuild.
-//! See "Queries M1 must answer" and "Rebuild" in docs/design/history.md.
+//! See "Queries" and "Incremental updates and rebuilds" in
+//! docs/internals/history.md.
 //!
 //! Direct history queries serve history reads without opening a list view
 //! (see "Large lists" in docs/internals/contract.md).

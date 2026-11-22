@@ -1,6 +1,6 @@
 //! The dry run and the review listing against a library that a scan of the
-//! audio fixtures made: the proofs of "The proof" in
-//! docs/design/identity.md that the calls built so far allow. A merge, a
+//! audio fixtures made: the checks for "Recording resolution" in
+//! docs/internals/identity.md that the calls built so far allow. A merge, a
 //! split, a confirmation and a never-link are calls a later slice adds;
 //! until then the domain's tests show them pinned and blocked.
 //!

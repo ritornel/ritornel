@@ -1,6 +1,6 @@
 //! `ritornelctl export <folder>`: the record, written by the server into a
 //! new folder of its own in `<folder>`. See "Export" in
-//! docs/design/history.md.
+//! docs/internals/history.md.
 
 use std::io::Write;
 

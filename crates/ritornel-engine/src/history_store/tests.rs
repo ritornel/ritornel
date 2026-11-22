@@ -1,7 +1,7 @@
 //! History in `library.db`: ingest, derivation in the same transaction,
 //! and the rebuild, which must give exactly what incremental ingest gave,
-//! on every fixture and after the rule changes. See decision 22 and
-//! "Rebuild" in docs/design/history.md.
+//! on every fixture and after the rule changes. See "Incremental updates and
+//! rebuilds" in docs/internals/history.md.
 //!
 //! The fixtures are listens made up for the purpose, sent as the player
 //! would send them, against the invented album of the player's tests.

@@ -1,7 +1,8 @@
 //! The scan against copies of the audio fixtures in a temporary root: what
-//! a first scan records and resolves, every row of the "Rescans" table in
-//! docs/design/identity.md, that a root is only ever read, and that a scan
-//! cut off after any step converges to what an uninterrupted one makes.
+//! a first scan records and resolves, the rescan cases in "Rescans and file
+//! moves" in docs/internals/identity.md, that a root is only ever read, and
+//! that a scan cut off after any step converges to what an uninterrupted one
+//! makes.
 //!
 //! `a.flac`, `b.flac`, `a.mp3` and `a.m4a` are tagged as one invented song,
 //! "Paper Kites", and `b.flac` holds other audio than the rest. The

@@ -1,6 +1,6 @@
 //! What the system's media session asks of the player and shows of it.
 //! A key takes the path a contract call takes, with a command ID of its
-//! own. See "OS integration" in docs/design/playback.md.
+//! own. See "OS integration" in docs/internals/playback.md.
 
 use std::path::PathBuf;
 

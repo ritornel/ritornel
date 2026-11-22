@@ -1,7 +1,7 @@
-//! What the resolver is given and what it returns. See "The proof" in
-//! docs/design/identity.md: the resolver is a pure function over claims, a
-//! catalog snapshot, user assignments, exclusions, learned aliases and a
-//! policy, processing items in first-seen order.
+//! What the resolver is given and what it returns. See "Recording
+//! resolution" in docs/internals/identity.md: the resolver is a pure
+//! function over claims, a catalog snapshot, user assignments, exclusions,
+//! learned aliases and a policy, processing items in first-seen order.
 //!
 //! Rows are named by their integer keys in `library.db`. The resolver
 //! never makes one: something it wants created is a [`Ref::New`] that the
@@ -346,7 +346,8 @@ pub struct LearnedAlias {
     pub spelling_b: String,
 }
 
-/// One decision, with the full score shape. See decision 8.
+/// One decision, with the full score shape. See "Recording resolution" in
+/// docs/internals/identity.md.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     /// How it was decided.

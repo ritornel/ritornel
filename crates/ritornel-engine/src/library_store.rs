@@ -21,8 +21,8 @@ use crate::sqlite::{self, Location, Reader, Writer};
 use crate::{Clock, Entropy, Error, Id, ServerIdentity, new_id};
 
 /// The classes of metadata source and their ranks, highest first: what a
-/// new library starts with. See "Displayed metadata" in
-/// docs/design/identity.md.
+/// new library starts with. See "Catalog projection and displayed metadata"
+/// in docs/internals/identity.md.
 const METADATA_SOURCES: [(&str, i64); 6] = [
     ("user", 60),
     ("musicbrainz", 50),

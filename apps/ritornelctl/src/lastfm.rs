@@ -1,7 +1,7 @@
 //! `ritornelctl lastfm`: signing the server in to Last.fm, the sync of the
 //! history, the report of what matched, and scrobbling; and `ritornelctl
 //! show`, one track with its plays and loves. See "Last.fm" in
-//! docs/design/history.md.
+//! docs/internals/history.md.
 //!
 //! The server holds the session and does the work. This program never sees
 //! the API key, the secret or the session key: what it prints of a sign-in

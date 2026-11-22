@@ -1,5 +1,5 @@
-//! `identity.dryRun` and `identity.review` against `library.db`. See "The
-//! proof" and "Resolver policy 1" in docs/design/identity.md.
+//! `identity.dryRun` and `identity.review` against `library.db`. See
+//! "Recording resolution" in docs/internals/identity.md.
 //!
 //! The dry run reads the library as the resolver sees it, with the claims
 //! that the stored revisions gave, runs the pure resolver over it by the

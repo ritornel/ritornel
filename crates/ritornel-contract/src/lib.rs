@@ -151,7 +151,7 @@ pub mod capability {
     /// The server has a player: the `playback.*` and `queue.*` calls and
     /// the `playback`, `progress` and `queue` topics. A server with no
     /// audio output has none, and refuses those calls as `unsupported`
-    /// (docs/design/playback.md, decision 2).
+    /// ("Audio pipeline" in docs/internals/playback.md).
     pub const PLAYBACK: &str = "playback";
 }
 

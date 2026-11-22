@@ -2,8 +2,8 @@
 //! place plays are scrobbled to and what is playing is shown. It stands on the `scrobl` crate,
 //! which makes every request, checks every page of a history against the
 //! others, and keeps credentials out of every error and `Debug`. See
-//! "Last.fm" in docs/design/history.md and "Shipped crates and Cargo features"
-//! in docs/internals/plugins.md.
+//! "Last.fm" in docs/internals/history.md and "Shipped crates and Cargo
+//! features" in docs/internals/plugins.md.
 //!
 //! This crate does no storage. It reads and sends, and hands what it reads
 //! to the core through [`ritornel_source::Sink`]. A server built without

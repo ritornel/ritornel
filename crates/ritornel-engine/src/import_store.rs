@@ -2,7 +2,8 @@
 //! records and their cursor through the one ingest call, the text-only
 //! items that name what each was of and their matching to the library, the
 //! loved tracks, and the report on how much of it matched. See "Last.fm" in
-//! docs/design/history.md and "Scrobbles" in docs/design/identity.md.
+//! docs/internals/history.md and "Scrobble matching" in
+//! docs/internals/identity.md.
 //!
 //! A service's plays are observations of the account's own history
 //! endpoint, each with an `observation_import` detail and the record

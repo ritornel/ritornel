@@ -1,7 +1,8 @@
 //! Walking a root: every audio file under it, with its size and when it
 //! was last modified, and each folder's own images. Nothing is opened, and
 //! nothing is ever written: a root is read-only to the server. See
-//! "Scanning one file" step 1 and "Rescans" in docs/design/identity.md.
+//! "Scanning and audio hashing" and "Rescans and file moves" in
+//! docs/internals/identity.md.
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;

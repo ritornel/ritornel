@@ -30,7 +30,7 @@ pub struct TrackText {
 }
 
 /// The identifiers a source attaches to a record. They support a match and
-/// never make one alone (docs/design/identity.md, "Scrobbles").
+/// never make one alone ("Scrobble matching" in docs/internals/identity.md).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Identifiers {
     /// The artist's MusicBrainz ID, as the source gives it.

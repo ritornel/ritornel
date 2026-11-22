@@ -3,8 +3,8 @@
 //! frame is heard, dated then; each span's end adds its frames and the
 //! range of the track they covered; and the listen closes, dated when its
 //! last frame was, unless a seek's span carries it on. Played time is
-//! counted in frames handed to the output. See decisions 19 and 20 and
-//! "Recording a listen" in docs/design/playback.md.
+//! counted in frames handed to the output. See "Recording a listen" in
+//! docs/internals/playback.md.
 
 use std::collections::HashMap;
 

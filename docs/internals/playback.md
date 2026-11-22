@@ -1,0 +1,77 @@
+# Playback
+
+The server owns audio playback, the playback queue, listen recording, and OS media controls so playback continues uninterrupted when clients disconnect or close. Audio decoding, resampling, and output live in `crates/ritornel-engine/src/playback/`, pure copy selection lives in `crates/ritornel-domain/src/selection.rs`, the server control loop, outbox delivery worker, media session, and RPC handlers live in `apps/server/src/{playback,media_session}.rs` and `apps/server/src/dispatch/{playback,media_keys}.rs`, and CLI controls live in `apps/ritornelctl/src/playback.rs`.
+
+See [`docs/internals/contract.md`](contract.md) for playback/queue RPCs and events, [`docs/internals/history.md`](history.md) for how delivered listens become plays, and [`docs/internals/platforms.md`](platforms.md) for platform audio backends and headless hub builds.
+
+## Audio pipeline
+
+Playback is split into three stages separated by lock-free queues (`crates/ritornel-engine/src/playback/audio/`):
+
+```text
+control (Player)     load / seek / unload, queue next, play / pause ↓   events, progress ↑
+   │ messages and rings down, events up, through lock-free queues
+decode thread        file → Symphonia → ReplayGain → channels → rubato → rtrb ring (500 ms)
+   │                 then the next track joined seamlessly with a Marker where it begins
+output callback      rtrb ring → 20 ms fade, volume → cpal device (or null output)
+```
+
+- **Renderer boundary (`playback/renderer.rs`):** `Player` drives any implementation of `Renderer` (`AudioRenderer` in production, a deterministic fake in tests) and never touches the decoder, ring buffer, or audio device directly. Playback is modeled as numbered **spans** (one unbroken run of a track from a position): loading starts a span, seeking replaces it with a new span, and a preloaded next track joins seamlessly. The output reports `Event::Began` on the first frame rendered and exactly one `Event::Ended` (`End::{Joined, Drained, Failed, Replaced}`) with its exact rendered frame count, plus live `Progress { span, frames, lost }`.
+- **Decode and DSP (`audio/decode.rs`):** Files are decoded by `symphonia` (`=0.6.1`, `features = ["all"]`) into 32-bit float samples (exact for 16-bit and 24-bit audio). Tracks outside `1_000..=768_000` Hz are rejected. Symphonia does not trim AAC encoder priming and padding samples. Each processing step is skipped when unneeded:
+  - **ReplayGain:** `ReplayGain::Album` (used when `ContextKind::Album`, falling back to track gain) or `ReplayGain::Track` (all other contexts), limiting peak amplitude to `PEAK_HEADROOM = 0.891` (-1 dB) to leave headroom for inter-sample peaks during resampling; untagged tracks play at unity (`1.0`).
+  - **Channels:** Adapted only when the track's channel count differs from the output's.
+  - **Resampling:** `rubato` (`=5.1.0`) fixed-ratio FFT resampler (`RESAMPLER_CHUNK = 1024`), skipped when the track's sample rate matches the output's.
+- **Gapless transitions:** As soon as a track starts (and after any queue edit invalidating the next track), `Player` prepares the next entry and offers it to the active decode thread via `Handoff`. Tracks sharing sample rate and channel count reuse the same resampler. A `Marker` marks the exact ring frame where the next span begins, guarded by an atomic `Gate` (`0` when withdrawn, `CROSSED` once entered) so the next track is either played from frame 0 or never started.
+- **Real-time output callback (`audio/output.rs`):** Runs on the audio thread and never locks, allocates, waits, or performs I/O. Pops frames from the `rtrb` (`=0.4.1`) ring (500 ms buffer, `RING_MS = 500`), applies a 20 ms gain ramp (`RAMP_MS = 20`) on play/pause/seek/volume to avoid clicks, and sends events back on a 1,024-slot lock-free queue (`EVENTS = 1024`).
+- **Outputs (`audio/device.rs`, `audio/null.rs`):**
+  - **Default system device (`Output::Default`):** Opened in shared mode (`OutputMode::Shared`) via `cpal` (`=0.18.2`) at the device's default rate and channels in 32-bit float (CoreAudio on macOS, WASAPI on Windows, ALSA on Linux via PipeWire/PulseAudio) on a dedicated `"ritornel-output"` thread. Gated behind the `audio-output` Cargo feature.
+  - **Null output (`Output::Null { speed }`):** Discards frames at real-time speed or a multiple for headless testing (`--output null`).
+  - **No output:** A server built without `audio-output` (or started with `--output none`) has no player, omits the `playback` capability, and returns `unsupported` on playback/queue calls.
+- **Output loss and recovery:** If the output device cannot be opened or disappears mid-track (`Progress::lost`), the player pauses in place without blaming or skipping tracks, records `output.problem` (`since`, `detail`) in `PlaybackState`, and retries opening the output on demand (`OnDemand`) when play/resume is next requested. Only the system default output is opened today; selecting a device or automatically following default-device changes is not yet built.
+
+## Copy selection
+
+Choosing which file to play for a track appearance is a pure function in `crates/ritornel-domain/src/selection.rs` (`select`):
+
+- Candidates marked `missing` by the last scan are excluded.
+- Remaining local master copies are ranked best first: lossless before lossy, higher `sample_rate_hz`, higher `bit_depth`, higher `bitrate_kbps`, lowest `audio_asset` ID, then lowest `source_item` ID.
+- The player tries candidates in order and checks each file's current `(size_bytes, mtime_ms)` (`FileFacts`) against what the scan recorded so a modified file is not played under a stale identity.
+- Unplayable entries record `failed_reason` on `queue_entry` and advance automatically; `FAILURES_BEFORE_STOP` (3) consecutive failures stop the player so a broken root does not spin through the entire queue.
+
+## Queue and session
+
+The queue and player settings are persisted in `server.db` (`queue_entry`, `playback_session`) and mirrored in memory (`playback/queue.rs`, `playback/store.rs`, `playback/player/edits.rs`):
+
+- **Dual ordering:** Every `queue_entry` carries an opaque `entryId` (`public_id`), a `position` in queue order, and (while shuffle is on) a `shuffle_position` in stored play order. Positions are spaced by `GAP = 1 << 16` so insertions and moves rewrite only the affected rows until a gap closes and the order rebalances.
+- **Edits and persistence:** Every edit computes a `QueueWrite`, commits it to `server.db` (bumping `queue_revision` atomically), and only then updates memory. `queue.add` supports placing tracks `next`, `end` (at random future positions when shuffled), or `after` an entry, with optional `playIfEmpty` to start playback if the queue was empty.
+- **Repeat and navigation:** `Repeat::Off` plays once; `Repeat::All` wraps at the end (reshuffling when shuffled); `Repeat::One` restarts the current entry as a new listen while Next still advances. `playback.skip` with `direction: previous` restarts the current track if past `RESTART_AFTER_MS` (3,000 ms), otherwise moves to the previous entry.
+- **Volume and control loop:** Volume (`0..=1`) and mute apply inside the output callback independently of system volume. The server's playback control thread (`apps/server/src/playback.rs`) ticks `Player` every 50 ms (`TICK`), publishing `progress` events every 1,000 ms (`PROGRESS_EVERY_MS`) while playing.
+
+## Recording a listen
+
+Listen recording (`playback/listen.rs`, `playback/store.rs`, `playback/outbox.rs`) is driven solely by renderer events, never wall-clock estimates:
+
+- **Frame-counted listens:** A listen opens when its span's `Event::Began` arrives and closes on `Event::Ended` unless a seek span continues it. `ms_played` is computed from rendered frames at the output sample rate. Heard intervals merge into `heard_ranges_json`; if more than `MAX_RANGES` (4,096) intervals accumulate, the closest neighboring gaps are merged and `heard_ranges_approximate` is set permanently to `1`.
+- **Start and end reasons:** Every listen records `StartReason` (`user_pick`, `auto_advance`, `repeat`, `resume`), `EndReason` (`finished`, `next`, `previous`, `jump`, `replaced`, `removed`, `stopped`, `error`, `output_lost`, `shutdown`, `crash`), playback context (`ContextKind`: `manual`, `album`, `artist`, `playlist`, `query`, `agent` plus optional `context_ref`), `source_item_pid`, `source_revision_no`, `asset_pid`, `appearance_pid`, and monotonic/wall/zone timestamps (`docs/internals/history.md`).
+- **Staging and crash recovery:** Active listens live in `server.db`'s `listen_staging` (at most one open row per server via `listen_staging_open`) and checkpoint every `CHECKPOINT_EVERY_MS` (5,000 ms) of played audio alongside `playback_session.position_ms`. On restart, any open staging row is closed with `end_reason = 'crash'` at its last checkpoint, and `playback_session.resume_listen_pid` links a subsequent resume via `continues_listen_id`.
+- **Outbox delivery:** Closing a listen inserts a `history.ingest` row into `server.db`'s `outbox` in the same transaction. The delivery worker (`deliver_listens`) sends up to `PER_PASS` (100) listens per pass to `library.db` with fresh `SendStamps` on every attempt, backing off exponentially from 1 s up to `MAX_BACKOFF_MS` (5 minutes) on failure. Staging and outbox rows are deleted only after the library commits; duplicates are harmless because ingest is keyed by `listen_id`.
+- **Never block playback on storage:** If saving a listen fails (for example, disk full), playback continues and the failure is surfaced through `server.status` record health (`ListenUnsaved` / `ListensUndelivered`).
+
+## OS integration
+
+System media controls and Now Playing metadata are owned by `ritornel-server` behind the `media-session` Cargo feature (`apps/server/src/media_session.rs`, `apps/server/src/dispatch/media_keys.rs`) so media keys work even when no desktop window is open. Nothing is published to the OS until the player first plays, so restoring a paused server on startup does not steal media keys from other apps. Keys route through the same command paths as RPC calls.
+
+- **macOS:** Uses `souvlaki` (`=0.9.3`) for Now Playing and remote commands, with `main` running Core Foundation's run loop (`objc2-core-foundation` in `platform::wait`).
+- **Linux:** Exposes MPRIS (`org.mpris.MediaPlayer2.ritornel` at `/org/mpris/MediaPlayer2`) over the session bus using `zbus` (`=6.3.0`) on the server's Tokio runtime (`platform/linux_mpris.rs`), including entry-targeted `NextFrom` and `SeekIn` commands and `SEEKED_AFTER = 1 s` drift detection. Quietly disables itself if no session bus responds within `CONNECT_WITHIN` (3 s).
+- **Windows:** Not yet implemented (media controls are a no-op placeholder).
+
+## Decisions
+
+- **Server-owned playback.** Running the player and OS media session inside `ritornel-server` lets desktop, CLI, and future remote clients share one queue and keeps music playing across window closes.
+- **`Renderer` trait seam.** Isolating `Player` from `cpal`, `symphonia`, and `rubato` lets playback, gapless joins, queue edits, crash recovery, and listen recording run deterministically in tests with a fake renderer and controlled clocks.
+- **Frame-counted listens staged before delivery.** Counting rendered frames and staging listens in `server.db` before outbox delivery ensures accurate play time and no lost listens across crashes or temporary storage failures, losing at most `CHECKPOINT_EVERY_MS` (5 s) of play time on a crash.
+- **Shared-mode 32-bit float pipeline with skippable stages.** Opening the default output in float avoids exclusive device contention while preserving 16- and 24-bit precision and bypassing gain, channel, and resampling math when unnecessary.
+
+## Later
+
+- `listen_staging.copy_kind` and `observation_listen.copy_kind` already carry `master`, `derived`, `stream_master`, and `stream_transcode` so playback and history can distinguish local derived copies and streamed audio when multi-server playback arrives.

@@ -1,7 +1,7 @@
 //! `ritornelctl identity re-resolve --dry-run`: the resolver run again over
 //! what the library has stored, by the policy scans use, by another named
-//! policy or by other values, and what that would change. It writes nothing. See "The proof" in
-//! docs/design/identity.md.
+//! policy or by other values, and what that would change. It writes nothing.
+//! See "Recording resolution" in docs/internals/identity.md.
 //!
 //! `ritornelctl identity review`: the bindings marked for review, with the
 //! candidate each nearly matched and why it did not bind.

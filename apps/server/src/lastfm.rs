@@ -1,7 +1,7 @@
 //! Last.fm in the server: the client and its API key and secret, the
 //! sign-ins in progress, the job that syncs an account's history, when the
 //! hub starts that job by itself, and the worker that scrobbles and tells
-//! Last.fm what is playing. See "Last.fm" in docs/design/history.md.
+//! Last.fm what is playing. See "Last.fm" in docs/internals/history.md.
 //!
 //! All of it is built with the `lastfm` feature. Without it a server has
 //! the same calls, which say Last.fm is not built in, and links nothing of

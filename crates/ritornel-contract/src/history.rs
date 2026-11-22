@@ -1,6 +1,6 @@
 //! Reading history: recent listening, "on this day", and the rebuild of
-//! the derived tables. See "Queries M1 must answer" and "Rebuild" in
-//! docs/design/history.md.
+//! the derived tables. See "Queries" and "Incremental updates and rebuilds"
+//! in docs/internals/history.md.
 //!
 //! Direct history queries serve history reads without opening a list view
 //! (see "Large lists" in docs/internals/contract.md).
@@ -339,9 +339,9 @@ pub struct RecordPlayed {
 /// It counts the plays that count and are not excluded, of songs the
 /// library has bound them to: an artist's are the plays of their songs, by
 /// each song's credit; an album's are those heard from one of its
-/// versions. A play bound to no song reaches no page (docs/design/history.md,
-/// "Last.fm"), so this is read again whenever plays change: a binding made
-/// later moves them here.
+/// versions. A play bound to no song reaches no page ("Queries" in
+/// docs/internals/history.md), so this is read again whenever plays change:
+/// a binding made later moves them here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

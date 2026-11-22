@@ -1,6 +1,6 @@
 //! The history derivation's fixtures: listens made up for the purpose, a
-//! few fields each. See "From observations to plays" and "Time" in
-//! docs/design/history.md.
+//! few fields each. See "Observations and derivation" and "Time and time
+//! zones" in docs/internals/history.md.
 
 use std::collections::HashMap;
 
@@ -153,8 +153,8 @@ fn how_a_play_that_does_not_count_ended_says_whether_it_was_a_skip() {
 
 #[test]
 fn the_crash_example_is_one_play_that_counts_dated_at_the_first_listens_start() {
-    // history.md, "What a listen contains": a 5:00 track crashes at 2:40
-    // with a checkpoint at 2:35. Listen 1 is 155 seconds, ended by crash.
+    // A 5:00 track crashes at 2:40 with a checkpoint at 2:35: listen 1 is
+    // 155 seconds, ended by crash.
     let mut first = listen(1, 1, 155_000);
     first.track_duration_ms = 300_000;
     first.end_reason = EndReason::Crash;

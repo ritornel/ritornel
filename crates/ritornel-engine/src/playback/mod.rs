@@ -1,6 +1,6 @@
 //! Playback: the player, its queue and session in `server.db`, the listen
 //! recorder, and the audio pipeline under them. See
-//! docs/design/playback.md.
+//! docs/internals/playback.md.
 //!
 //! - [`Player`] owns the queue, the session and the open listen. It sits on
 //!   a [`Renderer`], and never sees the decoder or the output.
