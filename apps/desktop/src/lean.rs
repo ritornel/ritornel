@@ -390,6 +390,12 @@ struct Read {
     revision: u64,
 }
 
+impl Read {
+    fn for_track(&self, track: &TrackSummary) -> Option<Vec<Fact>> {
+        (self.appearance == track.appearance_id).then(|| facts_for(track, self.facts.as_deref()))
+    }
+}
+
 /// How the view is coming or going.
 #[derive(Debug, Clone, Copy)]
 enum Stage {
@@ -484,10 +490,12 @@ impl LeanBack {
                 }
                 LinkEvent::Away => lean.net = None,
                 LinkEvent::Server(Event::Library(event)) => {
-                    if let Some(read) = &lean.read
-                        && event.library_revision > read.revision
+                    if let Some(appearance) = lean.appearance
+                        && lean
+                            .read
+                            .as_ref()
+                            .is_none_or(|read| event.library_revision > read.revision)
                     {
-                        let appearance = read.appearance;
                         lean.read_facts(appearance, cx);
                     }
                 }
@@ -599,10 +607,10 @@ impl LeanBack {
             && self.appearance != Some(track.appearance_id)
         {
             self.appearance = Some(track.appearance_id);
+            self.read = None;
             let of = track.release_id.unwrap_or(track.appearance_id);
             if self.record != Some(of) {
                 self.record = Some(of);
-                self.read = None;
                 self.read_count += 1;
                 self.at = 0;
                 self.stepping = None;
@@ -625,6 +633,9 @@ impl LeanBack {
         self.asking = Some(cx.spawn(async move |this, cx| {
             let answer = call.await.ok().and_then(Result::ok);
             this.update(cx, |lean, cx| {
+                if lean.appearance != Some(appearance) {
+                    return;
+                }
                 lean.read = Some(match answer {
                     Some(history) => Read {
                         appearance,
@@ -670,9 +681,7 @@ impl LeanBack {
 
     /// The facts shown now, once read.
     fn facts(&self, track: &TrackSummary) -> Option<Vec<Fact>> {
-        self.read
-            .as_ref()
-            .map(|read| facts_for(track, read.facts.as_deref()))
+        self.read.as_ref().and_then(|read| read.for_track(track))
     }
 
     fn fact_count(&self, cx: &gpui::App) -> usize {
@@ -1915,6 +1924,19 @@ mod tests {
             ],
             more: Some("10 October 2007. 541 plays since.".to_owned()),
         }
+    }
+
+    #[test]
+    fn a_song_on_the_same_record_does_not_inherit_the_last_songs_facts() {
+        let mut track = song();
+        let read = Read {
+            appearance: track.appearance_id,
+            facts: Some(vec![found()]),
+            revision: 1,
+        };
+        assert_eq!(read.for_track(&track), Some(vec![found()]));
+        track.appearance_id = Id::from_bytes([4; 16]);
+        assert_eq!(read.for_track(&track), None);
     }
 
     #[test]

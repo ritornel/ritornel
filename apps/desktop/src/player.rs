@@ -143,6 +143,43 @@ fn said(error: &Error) -> Option<&'static str> {
     })
 }
 
+/// Edits still waiting for their reply, keyed by recording.
+#[derive(Default)]
+struct PendingRatings(HashMap<Id, (Id, Option<u32>)>);
+
+impl PendingRatings {
+    fn start(&mut self, recording: Id, key: Id, rating: Option<u32>) {
+        self.0.insert(recording, (key, rating));
+    }
+
+    fn own(&self, recording: Id, saved: Option<u32>) -> Option<u32> {
+        self.0.get(&recording).map_or(saved, |(_, rating)| *rating)
+    }
+
+    fn finish(&mut self, recording: Id, key: Id) -> bool {
+        if self
+            .0
+            .get(&recording)
+            .is_some_and(|(pending, _)| *pending == key)
+        {
+            self.0.remove(&recording);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn keep_state(kept: &mut Option<PlaybackState>, state: PlaybackState) -> Option<&PlaybackState> {
+    if kept
+        .as_ref()
+        .is_some_and(|previous| state.revision <= previous.revision)
+    {
+        return None;
+    }
+    Some(kept.insert(state))
+}
+
 pub(crate) struct Player {
     net: Option<Arc<Net>>,
     /// The player's state, whole, or `None` before it is read or on a server with none.
@@ -154,8 +191,7 @@ pub(crate) struct Player {
     /// they have been moving: they hold while it is paused.
     eq_base: f32,
     eq_since: Option<Instant>,
-    /// Stars set here, by recording, until a read says the same.
-    rated: HashMap<Id, Option<u32>>,
+    rated: PendingRatings,
     /// What is being said, and since when.
     pub toast: Option<(SharedString, Instant)>,
     toast_ends: Option<Task<()>>,
@@ -172,21 +208,33 @@ impl Player {
     pub(crate) fn new(link: &Entity<Link>, cx: &mut Context<Self>) -> Self {
         let followed = cx.subscribe(link, |player, _, event: &LinkEvent, cx| match event {
             LinkEvent::Connected(net) => {
+                player.state = None;
+                player.rated = PendingRatings::default();
                 player.net = Some(Arc::clone(net));
                 player.read(cx);
             }
             LinkEvent::Away => {
                 player.net = None;
+                player.rated = PendingRatings::default();
                 player.state = None;
                 player.tick.playing = false;
                 player.ticker = None;
                 cx.notify();
             }
             LinkEvent::Server(ritornel_contract::Event::Playback(event)) => {
-                player.took(event.state.clone(), false, cx);
+                player.took(event.state.clone(), cx);
             }
             LinkEvent::Server(ritornel_contract::Event::Progress(event)) => {
                 player.ticked(event, cx);
+            }
+            LinkEvent::Server(ritornel_contract::Event::Library(event))
+                if player.open
+                    && (event.changed.is_empty()
+                        || event
+                            .changed
+                            .contains(&ritornel_contract::LibraryChange::Ratings)) =>
+            {
+                player.read_up_next(cx);
             }
             LinkEvent::Server(ritornel_contract::Event::Queue(_)) => {
                 if player.open {
@@ -206,7 +254,7 @@ impl Player {
             ticker: None,
             eq_base: 0.,
             eq_since: None,
-            rated: HashMap::new(),
+            rated: PendingRatings::default(),
             toast: None,
             toast_ends: None,
             up_next: None,
@@ -263,13 +311,15 @@ impl Player {
         cx.spawn(async move |this, cx| {
             let answer = read.await;
             this.update(cx, |player, cx| {
-                match answer {
-                    Ok(Ok(state)) => player.took(state, true, cx),
-                    Ok(Err(Error::Call(_))) => {
-                        player.state = None;
-                        cx.notify();
-                    }
-                    _ => {}
+                if !player
+                    .net
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &net))
+                {
+                    return;
+                }
+                if let Ok(Ok(state)) = answer {
+                    player.took(state, cx);
                 }
                 if player.open {
                     player.read_up_next(cx);
@@ -280,26 +330,22 @@ impl Player {
         .detach();
     }
 
-    /// Takes a state, unless it is older than the one held. One read afresh is always taken.
-    fn took(&mut self, state: PlaybackState, fresh: bool, cx: &mut Context<Self>) {
+    /// Takes a state, unless it is older than the one held.
+    fn took(&mut self, state: PlaybackState, cx: &mut Context<Self>) {
         crate::debug(format_args!(
             "playback: revision {}, {:?}, entry {:?} at {} ms, queue {}",
             state.revision, state.status, state.entry_id, state.position_ms, state.queue_length
         ));
-        if !fresh
-            && let Some(kept) = &self.state
-            && state.revision < kept.revision
-        {
+        let before = self.state.as_ref().and_then(|kept| kept.entry_id);
+        let Some(state) = keep_state(&mut self.state, state) else {
             return;
-        }
+        };
+        let entry = state.entry_id;
         self.tick = Tick {
             position_ms: state.position_ms,
             at: Instant::now(),
             playing: state.status == PlaybackStatus::Playing,
         };
-        let before = self.state.as_ref().and_then(|kept| kept.entry_id);
-        let entry = state.entry_id;
-        self.state = Some(state);
         self.carry(cx);
         // What is next moves on with the entry.
         if self.open && before != entry {
@@ -475,10 +521,10 @@ impl Player {
     }
 
     /// Moves the playing entry to `position_ms`, and shows it there at once.
-    pub(crate) fn seek(&mut self, position_ms: u64, cx: &mut Context<Self>) {
-        let Some(entry) = self.state.as_ref().and_then(|state| state.entry_id) else {
+    pub(crate) fn seek(&mut self, entry: Id, position_ms: u64, cx: &mut Context<Self>) {
+        if self.state.as_ref().and_then(|state| state.entry_id) != Some(entry) {
             return;
-        };
+        }
         let Some(key) = self.key(cx) else { return };
         self.tick.position_ms = position_ms;
         self.tick.at = Instant::now();
@@ -679,7 +725,7 @@ impl Player {
 
     /// The listener's own rating of a recording: one set here, or what the server said.
     pub(crate) fn own(&self, recording: Id, said: Option<u32>) -> Option<u32> {
-        self.rated.get(&recording).copied().unwrap_or(said)
+        self.rated.own(recording, said)
     }
 
     /// A click on star `star` of `recording`, whose stars the server last
@@ -698,7 +744,7 @@ impl Player {
     /// Sets a recording's stars, or takes them away with `None`.
     pub(crate) fn rate(&mut self, recording: Id, rating: Option<u32>, cx: &mut Context<Self>) {
         let Some(key) = self.key(cx) else { return };
-        let before = self.rated.insert(recording, rating);
+        self.rated.start(recording, key, rating);
         cx.notify();
         let sent = self.send::<RatingsSet>(
             RatingSetParams {
@@ -709,16 +755,16 @@ impl Player {
             cx,
         );
         cx.spawn(async move |this, cx| {
-            if sent.await.is_none() {
-                this.update(cx, |player, cx| {
-                    match before {
-                        Some(before) => player.rated.insert(recording, before),
-                        None => player.rated.remove(&recording),
-                    };
-                    player.say("The stars could not be saved", cx);
-                })
-                .ok();
-            }
+            let failed = sent.await.is_none();
+            this.update(cx, |player, cx| {
+                if player.rated.finish(recording, key) {
+                    if failed {
+                        player.say("The stars could not be saved", cx);
+                    }
+                    cx.notify();
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -866,6 +912,38 @@ impl Doing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_initial_read_cannot_rewind_a_newer_event() -> Result<(), serde_json::Error> {
+        let event: PlaybackState = serde_json::from_value(serde_json::json!({
+            "revision": 12, "status": "paused", "positionMs": 2000, "volume": 1.0,
+            "muted": false, "shuffle": false, "repeat": "off", "queueRevision": 1,
+            "queueLength": 1, "output": {"mode": "shared", "sampleRateHz": 44100, "channels": 2}
+        }))?;
+        let mut kept = None;
+        assert!(keep_state(&mut kept, event.clone()).is_some());
+        let mut reply = event.clone();
+        reply.position_ms = 0;
+        for revision in [11, 12] {
+            reply.revision = revision;
+            assert!(keep_state(&mut kept, reply.clone()).is_none());
+        }
+        assert_eq!(kept, Some(event));
+        assert!(keep_state(&mut None, reply).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn rating_replies_only_retire_their_own_edit() {
+        let [song, first, second] = [1, 2, 3].map(|n| Id::from_bytes([n; 16]));
+        let mut ratings = PendingRatings::default();
+        ratings.start(song, first, Some(80));
+        ratings.start(song, second, None);
+        assert!(!ratings.finish(song, first));
+        assert_eq!(ratings.own(song, Some(40)), None);
+        assert!(ratings.finish(song, second));
+        assert_eq!(ratings.own(song, Some(40)), Some(40));
+    }
 
     #[test]
     fn the_position_is_carried_on_and_stops_at_the_end() {
