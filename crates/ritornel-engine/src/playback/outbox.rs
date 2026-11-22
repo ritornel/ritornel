@@ -121,6 +121,11 @@ pub fn deliver_listens_to(
 ) -> Result<Delivered, Error> {
     let now = clock.now_ms();
     let (due, mut next_due_ms) = server.due_deliveries(now, PER_PASS)?;
+    // A full pass may have left more that are due already: the next pass
+    // is due at once.
+    if due.len() >= PER_PASS as usize {
+        next_due_ms = Some(now);
+    }
     let mut done = Delivered::default();
     for delivery in due {
         let sent = server

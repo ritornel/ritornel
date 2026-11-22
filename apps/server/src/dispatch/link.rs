@@ -1,7 +1,7 @@
 //! `link.invite`, `link.join` and `link.status`, the hub's side of a
-//! satellite joining, and what a hub tells a satellite's player:
-//! `link.tracks` and `link.copies`. See "Hub and satellites" in
-//! docs/internals/linking.md.
+//! satellite joining, what a hub tells a satellite's player (`link.tracks`
+//! and `link.copies`), and the listens it takes from one (`link.listen`).
+//! See "Hub and satellites" in docs/internals/linking.md.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -559,7 +559,11 @@ impl Core {
                     sent_boot: params.sent_boot,
                 },
             )
-            .map_err(internal)?;
+            .map_err(|error| match error {
+                // The satellite's to put right, not the hub's.
+                ritornel_engine::Error::BadListen(why) => RpcError::new(ErrorCode::Invalid, why),
+                other => internal(other),
+            })?;
         let taken = match ingested {
             Ingested::Stored(_) => {
                 // A play that counts may now be scrobbled, here.
