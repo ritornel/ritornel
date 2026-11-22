@@ -140,9 +140,14 @@ fn subject(
     Ok((connection.last_insert_rowid(), true))
 }
 
-/// The library as the matcher reads it: every canonical recording, with
-/// what it and each of its appearances show.
+/// The library as the matcher reads it: every canonical recording a file
+/// reaches, with what it and each of its appearances show.
 fn catalog(connection: &Connection) -> Result<Catalog, Error> {
+    Ok(Catalog::new(catalog_recordings(connection)?))
+}
+
+/// The recordings of [`catalog`].
+pub(crate) fn catalog_recordings(connection: &Connection) -> Result<Vec<Recording>, Error> {
     let mut recordings: BTreeMap<i64, Recording> = BTreeMap::new();
     let mut statement = connection.prepare(
         "SELECT r.id, r.display_title, ac.display_text FROM recording r
@@ -161,15 +166,18 @@ fn catalog(connection: &Connection) -> Result<Catalog, Error> {
         let recording = recording?;
         recordings.insert(recording.recording, recording);
     }
-    let mut statement = connection.prepare(
+    // Only what a file reaches: a song or a record whose files were all
+    // retagged onto another keeps its rows, and a play is not bound to it.
+    let mut statement = connection.prepare(&format!(
         "SELECT ta.id, ta.recording_id, r.canonical_id, ta.display_title, ac.display_text,
                 rel.display_title
          FROM track_appearance ta
          JOIN recording r ON r.id = ta.recording_id
          LEFT JOIN artist_credit ac ON ac.id = ta.display_artist_credit_id
          LEFT JOIN release rel ON rel.id = ta.release_id
-         WHERE ta.redirect_to_id IS NULL",
-    )?;
+         WHERE ta.redirect_to_id IS NULL AND ta.id IN ({})",
+        crate::list::REACHED
+    ))?;
     let rows = statement.query_map([], |row| {
         Ok((
             row.get::<_, i64>(2)?,
@@ -188,7 +196,10 @@ fn catalog(connection: &Connection) -> Result<Catalog, Error> {
             recording.appearances.push(appearance);
         }
     }
-    Ok(Catalog::new(recordings.into_values().collect()))
+    Ok(recordings
+        .into_values()
+        .filter(|recording| !recording.appearances.is_empty())
+        .collect())
 }
 
 /// Binds a subject item as the matcher says, unless it is bound already:

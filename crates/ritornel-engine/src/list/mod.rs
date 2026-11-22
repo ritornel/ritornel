@@ -18,6 +18,38 @@
 //! a leading article set aside, accents and case ignored, names that start
 //! with no letter after Z.
 
+/// The appearances a file reaches, as an `IN` list: those a current
+/// assignment of a file that is not retired names, followed through
+/// redirects. A song or a record no file reaches any more, because its
+/// files were retagged onto another the library has, keeps its rows for
+/// whatever named them (a listen, a rating, a playlist entry), and is on
+/// no wall and in no search until a file reaches it again. A file that is
+/// missing still reaches what it reached.
+macro_rules! reached {
+    () => {
+        "SELECT x.canonical_id FROM assignment asg
+         JOIN source_item si ON si.id = asg.source_item_id
+         JOIN track_appearance x ON x.id = asg.appearance_id
+         WHERE asg.superseded_at_ms IS NULL AND si.item_kind = 'file'
+           AND si.retired_at_ms IS NULL"
+    };
+}
+
+/// The releases a file reaches, as an `IN` list: those of the appearances
+/// in [`reached`].
+macro_rules! reached_releases {
+    () => {
+        concat!(
+            "SELECT y.release_id FROM track_appearance y WHERE y.id IN (",
+            reached!(),
+            ")"
+        )
+    };
+}
+
+/// [`reached`], for reads outside the lists.
+pub(crate) const REACHED: &str = reached!();
+
 mod discography;
 mod fold;
 mod open;

@@ -238,7 +238,7 @@ fn add_plays(
 
 fn artists(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked, Error> {
     // Those the Artists list has: whom a record's credit names.
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(concat!(
         "SELECT a.id, a.display_name, a.display_sort_name
          FROM artist a
          WHERE a.redirect_to_id IS NULL
@@ -247,9 +247,10 @@ fn artists(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranke
              FROM release r
              CROSS JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
              CROSS JOIN artist ca ON ca.id = acn.artist_id
-             WHERE r.redirect_to_id IS NULL
-           )",
-    )?;
+             WHERE r.redirect_to_id IS NULL AND r.id IN (",
+        reached_releases!(),
+        "))"
+    ))?;
     let mut found = Vec::new();
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
@@ -283,13 +284,17 @@ fn artists(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranke
         connection,
         // In this order, by `release_display_artist_credit` and
         // `track_appearance_release`: left to itself SQLite reads every song.
-        "SELECT a.canonical_id, ta.recording_id
-         FROM artist_credit_name acn
-         CROSS JOIN artist a ON a.id = acn.artist_id
-         CROSS JOIN release r ON r.display_artist_credit_id = acn.artist_credit_id
-         CROSS JOIN track_appearance ta ON ta.release_id = r.id
-         WHERE a.canonical_id IN ({})
-           AND r.redirect_to_id IS NULL AND ta.redirect_to_id IS NULL",
+        concat!(
+            "SELECT a.canonical_id, ta.recording_id
+             FROM artist_credit_name acn
+             CROSS JOIN artist a ON a.id = acn.artist_id
+             CROSS JOIN release r ON r.display_artist_credit_id = acn.artist_credit_id
+             CROSS JOIN track_appearance ta ON ta.release_id = r.id
+             WHERE a.canonical_id IN ({})
+               AND r.redirect_to_id IS NULL AND ta.redirect_to_id IS NULL AND ta.id IN (",
+            reached!(),
+            ")"
+        ),
         &keys,
         |row| {
             pairs.push((row.get(0)?, row.get(1)?));
@@ -328,8 +333,12 @@ fn albums(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked
     let mut pairs = Vec::new();
     for_each_in(
         connection,
-        "SELECT release_id, recording_id FROM track_appearance
-         WHERE release_id IN ({}) AND redirect_to_id IS NULL",
+        concat!(
+            "SELECT release_id, recording_id FROM track_appearance
+             WHERE release_id IN ({}) AND redirect_to_id IS NULL AND id IN (",
+            reached!(),
+            ")"
+        ),
         &release_keys,
         |row| {
             let release: i64 = row.get(0)?;
@@ -382,10 +391,12 @@ fn songs(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked,
             }
         }
         None => {
-            let mut statement = connection.prepare(
+            let mut statement = connection.prepare(concat!(
                 "SELECT id, display_title, recording_id, release_id IS NULL
-                 FROM track_appearance WHERE redirect_to_id IS NULL",
-            )?;
+                 FROM track_appearance WHERE redirect_to_id IS NULL AND id IN (",
+                reached!(),
+                ")"
+            ))?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 let title = text(row.get_ref(1)?);
@@ -462,8 +473,12 @@ fn live_songs(connection: &Connection, keys: &[i64]) -> Result<HashMap<i64, (i64
         live.insert(row.get(0)?, (row.get(1)?, row.get(2)?));
         Ok(())
     };
-    let columns = "SELECT id, recording_id, release_id IS NULL FROM track_appearance
-                   WHERE redirect_to_id IS NULL";
+    let columns = concat!(
+        "SELECT id, recording_id, release_id IS NULL FROM track_appearance
+         WHERE redirect_to_id IS NULL AND id IN (",
+        reached!(),
+        ")"
+    );
     // A long list is most of the table, which one pass reads faster.
     if keys.len() > 4 * CHUNK {
         let wanted: HashSet<i64> = keys.iter().copied().collect();
