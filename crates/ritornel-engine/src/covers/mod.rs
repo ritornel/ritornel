@@ -454,24 +454,36 @@ impl LibraryStore {
                  FROM picture p
                  JOIN revision_picture rp ON rp.picture_id = p.id
                  JOIN source_item_revision sr ON sr.id = rp.revision_id
-                 JOIN source_item si ON si.id = sr.source_item_id
+                 JOIN source_item si ON si.current_revision_id = sr.id AND si.id = sr.source_item_id
                  JOIN source_instance src ON src.id = si.source_instance_id
                  JOIN library_root lr ON lr.id = src.root_id
                  WHERE p.public_id = ?1
                    AND si.retired_at_ms IS NULL
                    AND si.missing_since_ms IS NULL
-                 ORDER BY rp.source_kind DESC, rp.id
-                 LIMIT 8",
+                 ORDER BY rp.source_kind DESC, rp.id",
             )?;
             let mut rows = statement.query([art.as_bytes()])?;
+            let mut locations = std::collections::HashSet::new();
             while let Some(row) = rows.next()? {
                 let folder_image: Option<String> = row.get(2)?;
+                let root: String = row.get(0)?;
+                let path: String = row.get(1)?;
+                let location = match &folder_image {
+                    Some(name) => Path::new(&path).with_file_name(name),
+                    None => Path::new(&path).to_owned(),
+                };
+                if !locations.insert((root.clone(), location)) {
+                    continue;
+                }
                 sources.push(Source {
-                    root: row.get(0)?,
-                    path: row.get(1)?,
+                    root,
+                    path,
                     place: folder_image.map_or(Place::Embedded, Place::FolderImage),
                     hash: row.get(3)?,
                 });
+                if locations.len() == 8 {
+                    break;
+                }
             }
             Ok(sources)
         })

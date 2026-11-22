@@ -203,6 +203,34 @@ fn a_scanned_picture_is_read_from_its_file_while_it_is_the_same_picture() {
 }
 
 #[test]
+fn repeated_folder_art_leaves_room_for_a_readable_copy() {
+    let mut rig = Rig::new();
+    for n in 0..9 {
+        rig.put(&format!("First/{n}.flac"), "b.flac");
+    }
+    rig.put("Second/1.flac", "b.flac");
+    let root = std::path::PathBuf::from(&rig.server.roots().unwrap()[0].1);
+    let bytes = super::scale(&image::DynamicImage::new_rgb8(32, 24), 64).unwrap();
+    for name in ["First", "Second"] {
+        std::fs::write(root.join(name).join("cover.jpg"), &bytes).unwrap();
+    }
+    rig.scan();
+    let art = rig
+        .library
+        .read(|db| {
+            let id = db.query_row("SELECT public_id FROM picture", [], |row| row.get(0))?;
+            Ok(Id::from_bytes(id))
+        })
+        .unwrap();
+    std::fs::remove_file(root.join("First/cover.jpg")).unwrap();
+    assert_eq!(rig.library.picture_sources(art).unwrap().len(), 2);
+    Covers::new(&root.join("../cache"))
+        .unwrap()
+        .render(&rig.library, &rig.server, art, 64)
+        .unwrap();
+}
+
+#[test]
 fn a_colour_is_the_hue_a_picture_has_most_of_and_grey_has_none() {
     use super::color_of_pixels;
     // All one red.
