@@ -585,8 +585,13 @@ impl Artist {
                 match blurs {
                     Some((banner, wash)) => {
                         let now = Instant::now();
-                        page.banner_blur = Some((Arc::new(banner), now));
-                        page.blur = Some((Arc::new(wash), now));
+                        let gone = [
+                            crate::blur::replace(&mut page.banner_blur, Arc::new(banner), now),
+                            crate::blur::replace(&mut page.blur, Arc::new(wash), now),
+                        ];
+                        for old in gone.into_iter().flatten() {
+                            crate::covers::drop_unshared(old, None, cx);
+                        }
                     }
                     // A picture the server cannot make (one in a format it
                     // does not read) is no picture: the page takes its
@@ -717,24 +722,22 @@ impl Artist {
         &mut self,
         banner_radius: usize,
         wash_radius: usize,
-        window: Option<&mut Window>,
+        mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         let soft = theme::soft_pixels(&self.name, crate::blur::SIDE);
         let tone = crate::blur::wash_tone(theme::dark());
         let now = Instant::now();
-        self.banner_blur = Some((
-            Arc::new(crate::blur::pixels(
-                &soft,
-                banner_radius,
-                crate::blur::BANNER.1,
-            )),
-            now,
-        ));
-        self.blur = Some((
-            Arc::new(crate::blur::toned(&soft, wash_radius, tone.0, tone.1)),
-            now,
-        ));
+        let banner = crate::blur::pixels(&soft, banner_radius, crate::blur::BANNER.1);
+        let wash = crate::blur::toned(&soft, wash_radius, tone.0, tone.1);
+        // The blurs they replace are let go, as the face is.
+        let gone = [
+            crate::blur::replace(&mut self.banner_blur, Arc::new(banner), now),
+            crate::blur::replace(&mut self.blur, Arc::new(wash), now),
+        ];
+        for old in gone.into_iter().flatten() {
+            crate::covers::drop_unshared(old, window.as_deref_mut(), cx);
+        }
         self.soft_face(window, cx);
     }
 
