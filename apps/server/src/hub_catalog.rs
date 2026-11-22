@@ -1,8 +1,7 @@
 //! What a satellite's player reads of the library: the hub's, through the
 //! link. A track's master is pulled whole from the hub into the satellite's
-//! own cache before it plays, and kept there for the next time. See "The
-//! link between the hub and a satellite" and "When the hub is unreachable"
-//! in docs/design/linking.md.
+//! own cache before it plays, and kept there for the next time. See
+//! "Hub and satellites" in docs/internals/linking.md.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

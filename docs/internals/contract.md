@@ -23,6 +23,7 @@ The server exposes a single HTTP/1.1 listener (`apps/server/src/listener.rs`), o
 | `/v1/ticket` | `POST` | Bearer (no `Origin`) | Exchanges a credential for a single-use `SocketTicket` (`Cache-Control: no-store`). |
 | `/v1/ws` | `GET` | Bearer or `?ticket=` | WebSocket upgrade carrying JSON-RPC 2.0 text frames. |
 | `/v1/art/{artId}/{size}` | `GET` | Bearer or `?token=` | Immutable JPEG cover art at a fixed size bucket. |
+| `/v1/audio/{appearanceId}/{sourceItemId}/{revision}` | `GET` | Bearer, link session only | A master, for a satellite to play, as `link.copies` named it. |
 | `/v1/link` | `POST` | Invite secret in the body (no `Origin`) | A server joining this hub as a satellite: trades a `LinkRequest` for a `LinkGranted` link-session token. |
 
 All routes except `GET /v1/descriptor` and `POST /v1/link` require authentication (`401 Unauthorized` with `WWW-Authenticate: Bearer` on failure, including unknown paths so unauthenticated callers learn nothing about what exists). Credentials are checked in memory against loaded verifiers in constant time (`subtle::ConstantTimeEq`), never touching disk or SQLite on async worker threads.
@@ -117,6 +118,7 @@ Every mutating call (`MethodKind::Command`) carries a client-generated UUID `ide
 Cover art and artist portraits are served over plain HTTP at `GET /v1/art/{artId}/{size}`:
 
 - **Fixed buckets and immutability:** `{size}` must be one of `ART_SIZES` (`[64, 96, 128, 192, 256, 384, 512, 768, 1024]`, longest edge in pixels), also advertised in `PublicDescriptor.artSizes`. Responses are `image/jpeg` with `Cache-Control: private, max-age=31536000, immutable`; a changed image gets a new `artId`. Invalid IDs, non-bucket sizes, or missing covers return `404 Not Found`.
+- **Masters for satellites:** `GET /v1/audio/{appearanceId}/{sourceItemId}/{revision}` serves a master to a link session alone, streamed in 256 KiB chunks, and only while the file is at the revision `link.copies` offered and its size and modification time are what the scan recorded (`409 Conflict` otherwise). A satellite pulls the whole file into `cache/audio/` in its data directory, stopping if it grows past the offered `sizeBytes`, and plays it from there (`apps/server/src/hub_catalog.rs`); the cache keeps the newest 2 GiB.
 - **On-demand rendering (`apps/server/src/media.rs`):** Cache hits are read via `spawn_blocking`. Cache misses run on a dedicated 4-thread `CoverPool` in LIFO (newest-first) order so covers currently scrolled into view render before stale off-screen requests. Dropping a cancelled HTTP request cancels its queued job before it starts, and each worker catches panics so a bad image cannot shrink the pool.
 
 ## Errors and capabilities
@@ -148,12 +150,12 @@ Clients gate optional behavior on `PublicDescriptor.capabilities` rather than ve
 
 ## Method summary
 
-All 66 methods are registered in `crates/ritornel-contract/src/methods.rs` (see `contract/contract.ts` for exact field types):
+All 68 methods are registered in `crates/ritornel-contract/src/methods.rs` (see `contract/contract.ts` for exact field types):
 
 | Area | Methods |
 |---|---|
 | Session & server | `server.hello`, `server.status`, `servers.list`, `events.subscribe`, `events.unsubscribe`, `server.backup`, `record.dismiss` |
-| Linking | `link.invite`, `link.join`, `link.status` |
+| Linking | `link.invite`, `link.join`, `link.status`, `link.tracks`, `link.copies` |
 | Library & sources | `library.create`, `sources.list`, `sources.add`, `sources.tracks`, `scan.start`, `library.stats`, `library.setWatching`, `artists.importPictures`, `artists.pictureFolders` |
 | Jobs & identity | `jobs.list`, `jobs.get`, `jobs.cancel`, `identity.dryRun`, `identity.review` |
 | Browse & media | `list.open`, `list.window`, `list.sections`, `list.locate`, `list.close`, `library.search`, `album.get`, `artist.get`, `tracks.get`, `media.token` |
