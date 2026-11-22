@@ -180,8 +180,7 @@ impl Launcher {
         let (owned, ready) = Owned::spawn(program, &self.data_dir)?;
         // One that was started earlier and has died is let go of.
         drop(self.owned().replace(owned));
-        let deadline = tokio::time::Instant::now() + wait;
-        let ready_line = tokio::time::timeout_at(deadline, ready.said_ready).await;
+        let ready_line = tokio::time::timeout(wait, ready.said_ready).await;
         match ready_line {
             Ok(Ok(())) => return Ok(()),
             Err(_) => return Err(self.still_starting()),
@@ -201,7 +200,7 @@ impl Launcher {
         {
             return Ok(());
         }
-        let said = tokio::time::timeout_at(deadline, ready.stderr)
+        let said = tokio::time::timeout(Duration::from_secs(2), ready.stderr)
             .await
             .ok()
             .and_then(Result::ok)
@@ -424,6 +423,25 @@ mod tests {
         let found = launcher.find_or_start().await.unwrap_err();
         assert!(matches!(found, Error::NotRunning { .. }), "{found:?}");
         assert!(!scratch.0.join("data").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_diagnostic_can_arrive_after_the_readiness_wait() {
+        let scratch = Scratch::new("late-diagnostic");
+        let program = scratch.program(
+            "sh -c 'sleep 1.5; echo ritornel-server: library unavailable >&2' </dev/null >/dev/null & exit 1",
+            "",
+        );
+        let launcher = Launcher::new(scratch.0.clone(), None);
+        let failed = launcher
+            .start(&program, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&failed, Error::Start(why) if why == "library unavailable"),
+            "{failed:?}"
+        );
     }
 
     #[cfg(unix)]
