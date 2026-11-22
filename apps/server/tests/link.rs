@@ -258,8 +258,9 @@ async fn an_invite_works_once_and_only_for_the_hub_it_names() {
         );
         // The hub answered, so it is not said to be unreachable.
         assert_eq!(code(&refused), Some(ErrorCode::Conflict), "{refused}");
-        // And a page in a browser may not try at all.
-        let asked = serde_json::to_vec(&request(&parsed, other.server_id(), 3)).unwrap();
+        // And a page in a browser may not try at all. It is refused on its
+        // origin alone, before a body is read, so it sends none: a body the
+        // hub never reads could reset the connection before the answer.
         let page = tokio::task::spawn_blocking({
             let endpoint = hub.endpoint();
             move || {
@@ -268,11 +269,9 @@ async fn an_invite_works_once_and_only_for_the_hub_it_names() {
                 write!(
                     stream,
                     "POST /v1/link HTTP/1.1\r\nHost: {endpoint}\r\nOrigin: http://example.invalid\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    asked.len()
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .unwrap();
-                stream.write_all(&asked).unwrap();
                 let mut answer = String::new();
                 stream.read_to_string(&mut answer).unwrap();
                 answer
