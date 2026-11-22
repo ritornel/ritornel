@@ -22,7 +22,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AppContext, Bounds, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement,
@@ -39,7 +39,7 @@ use ritornel_contract::{
 
 use crate::banner::{self, Actions, Banner, Hung};
 use crate::link::{Link, LinkEvent};
-use crate::net::Net;
+use crate::net::{Net, NoArt};
 use crate::player::Player;
 use crate::record::{self, Words};
 use crate::theme;
@@ -141,6 +141,7 @@ impl Album {
             let plays_only = match event {
                 LinkEvent::Connected(net) => {
                     page.net = Arc::clone(net);
+                    page.more_covers.again();
                     false
                 }
                 LinkEvent::Server(Event::Library(event))
@@ -377,29 +378,36 @@ impl Album {
             .take(columns)
             .filter_map(|tile| tile.art_id)
             .collect();
+        let now = Instant::now();
         for art in arts {
-            if !self.more_covers.ask(art) {
+            if !self.more_covers.ask(art, now) {
                 continue;
             }
             self.fetch_opt(art, px, cx, move |page, image, cx| match image {
-                Some(image) => {
+                Ok(image) => {
                     if let Some(old) = page.more_covers.took(art, px, image) {
                         crate::covers::drop_unshared(old, None, cx);
                     }
                 }
-                None => page.more_covers.failed(art, px),
+                // Not there: it is not asked for again.
+                Err(NoArt::Missing) => {}
+                Err(NoArt::Failed) => {
+                    if let Some(wait) = page.more_covers.failed(art, px, Instant::now()) {
+                        crate::covers::notify_after(wait, cx);
+                    }
+                }
             });
         }
     }
 
-    /// Reads a cover at `px` pixels, and gives it to `took`, or `None`
-    /// when it cannot be read.
+    /// Reads a cover at `px` pixels, and gives it to `took`, or why it
+    /// could not be read.
     fn fetch_opt(
         &mut self,
         art: Id,
         px: u32,
         cx: &mut Context<Self>,
-        took: impl FnOnce(&mut Self, Option<Arc<RenderImage>>, &mut gpui::App) + 'static,
+        took: impl FnOnce(&mut Self, Result<Arc<RenderImage>, NoArt>, &mut Context<Self>) + 'static,
     ) {
         let http = Arc::clone(&self.net.art);
         let sizes = self.net.art_sizes.clone();
@@ -411,8 +419,7 @@ impl Album {
         cx.spawn(async move |this, cx| {
             let image = read
                 .await
-                .ok()
-                .flatten()
+                .unwrap_or(Err(NoArt::Failed))
                 .map(|(image, _, _)| Arc::new(image));
             this.update(cx, |page, cx| {
                 took(page, image, cx);
@@ -442,7 +449,7 @@ impl Album {
         let http = Arc::clone(&self.net.art);
         let tone = crate::blur::wash_tone(theme::dark());
         let blurs = self.net.rt().spawn(async move {
-            let bytes = http.get(art, crate::blur::SIDE).await?;
+            let bytes = http.get(art, crate::blur::SIDE).await.ok()?;
             crate::covers::decode(move || {
                 Some((
                     crate::blur::jpeg(&bytes, banner_radius, crate::blur::BANNER.1)?,
@@ -490,7 +497,7 @@ impl Album {
             move |page, image, cx| {
                 // Asked for before the last, for a display the window has
                 // left since.
-                let Some(image) = image.filter(|_| page.large_read == large_read) else {
+                let Some(image) = image.ok().filter(|_| page.large_read == large_read) else {
                     return;
                 };
                 let at = page
@@ -509,7 +516,7 @@ impl Album {
             (28. * scale).ceil() as u32,
             cx,
             move |page, image, cx| {
-                let Some(image) = image.filter(|_| page.face_read == face_read) else {
+                let Some(image) = image.ok().filter(|_| page.face_read == face_read) else {
                     return;
                 };
                 if let Some(old) = page.face.replace(image) {
@@ -1256,6 +1263,7 @@ impl Render for Album {
 struct MoreCovers {
     covers: HashMap<Id, Arc<RenderImage>>,
     asked: HashSet<(Id, u32)>,
+    retries: crate::covers::Retries,
     px: u32,
 }
 
@@ -1268,9 +1276,10 @@ impl MoreCovers {
         }
     }
 
-    /// Whether `art` is to be read now: it has not been asked for at this size.
-    fn ask(&mut self, art: Id) -> bool {
-        self.asked.insert((art, self.px))
+    /// Whether `art` is to be read now: it has not been asked for at this
+    /// size, nor is it waiting to be asked for again.
+    fn ask(&mut self, art: Id, now: Instant) -> bool {
+        !self.retries.waits(art, now) && self.asked.insert((art, self.px))
     }
 
     /// A cover read at `px` came: kept in place of the one before, which is
@@ -1281,12 +1290,21 @@ impl MoreCovers {
         if px != self.px {
             return None;
         }
+        self.retries.read(art);
         self.covers.insert(art, image)
     }
 
-    /// A cover read at `px` could not be read: it may be asked for again.
-    fn failed(&mut self, art: Id, px: u32) {
-        self.asked.remove(&(art, px));
+    /// A cover read at `px` could not be read at `now`: it may be asked for
+    /// again after the wait given, unless the row has left that size.
+    fn failed(&mut self, art: Id, px: u32, now: Instant) -> Option<Duration> {
+        self.asked
+            .remove(&(art, px))
+            .then(|| self.retries.failed(art, now))
+    }
+
+    /// A new session: what could not be read is asked for again at once.
+    fn again(&mut self) {
+        self.retries = crate::covers::Retries::default();
     }
 
     fn get(&self, art: Id) -> Option<Arc<RenderImage>> {
@@ -1314,9 +1332,9 @@ mod tests {
         let art = Id::from_bytes([1; 16]);
         // Asked at one scale, then at another before the first came.
         more.size(100);
-        assert!(more.ask(art));
+        assert!(more.ask(art, Instant::now()));
         more.size(200);
-        assert!(more.ask(art));
+        assert!(more.ask(art, Instant::now()));
         let sharp = tiny();
         assert!(more.took(art, 200, Arc::clone(&sharp)).is_none());
         // The read at the size the row has left comes last.
@@ -1333,6 +1351,38 @@ mod tests {
         assert!(more.took(art, 100, Arc::clone(&first)).is_none());
         let gone = more.took(art, 100, tiny());
         assert!(gone.is_some_and(|gone| Arc::ptr_eq(&gone, &first)));
+    }
+
+    #[test]
+    fn a_cover_that_could_not_be_read_is_asked_for_again_after_a_wait_and_a_missing_one_never() {
+        let mut more = MoreCovers::default();
+        let (failing, missing) = (Id::from_bytes([3; 16]), Id::from_bytes([4; 16]));
+        let now = Instant::now();
+        more.size(100);
+        assert!(more.ask(failing, now));
+        assert!(more.ask(missing, now));
+        // Drawn again at once, as a failure draws the page: neither is asked.
+        let wait = more.failed(failing, 100, now);
+        assert_eq!(wait, Some(Duration::from_secs(2)));
+        assert!(!more.ask(failing, now));
+        assert!(!more.ask(missing, now));
+        // After the wait the one that failed is asked again; the missing
+        // one, left asked, is not.
+        let later = now + Duration::from_secs(2);
+        assert!(more.ask(failing, later));
+        assert!(!more.ask(missing, later));
+        // A new session asks at once.
+        assert!(more.failed(failing, 100, later).is_some());
+        more.again();
+        assert!(more.ask(failing, later));
+        // A failure for a size the row has left asks nothing more, and a
+        // read for it does not end the wait at the size it has now.
+        more.size(200);
+        assert_eq!(more.failed(failing, 100, later), None);
+        assert!(more.ask(failing, later));
+        assert!(more.failed(failing, 200, later).is_some());
+        assert!(more.took(failing, 100, tiny()).is_none());
+        assert!(!more.ask(failing, later));
     }
 
     #[test]

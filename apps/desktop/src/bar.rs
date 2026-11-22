@@ -20,7 +20,8 @@ use gpui::{
 use ritornel_contract::{Id, Repeat, SkipDirection};
 
 use crate::icons::icon;
-use crate::link::Link;
+use crate::link::{Link, LinkEvent};
+use crate::net::NoArt;
 use crate::player::{Player, stars_of};
 use crate::theme;
 use crate::wall::PLAYER_BAR;
@@ -65,6 +66,11 @@ pub(crate) struct PlayerBar {
     cover: Option<(Id, Arc<RenderImage>, Instant)>,
     /// The art being read, so that it is read once.
     reading: Option<(Id, Task<()>)>,
+    /// A cover the server does not have, not asked for again.
+    missing: Option<Id>,
+    /// Covers that could not be read, asked for again after a while: the
+    /// bar is drawn often, and would otherwise ask at every frame.
+    retries: crate::covers::Retries,
     /// When the song playing changed, for its cover to settle into place.
     arrived: Option<(Id, Instant)>,
     /// Where the pointer holds the seek bar, from 0 to 1, while it does.
@@ -80,11 +86,21 @@ pub(crate) struct PlayerBar {
     /// Whether the cover is hidden while a copy of it travels (Lean back's).
     pub cover_away: bool,
     _player: Subscription,
+    _link: Subscription,
 }
 
 impl PlayerBar {
     pub(crate) fn new(link: Entity<Link>, player: Entity<Player>, cx: &mut Context<Self>) -> Self {
         let followed = cx.observe(&player, |_, _, cx| cx.notify());
+        // A new session: the cover is asked for again at once, and a read
+        // through the session before is let go.
+        let session = cx.subscribe(&link, |bar: &mut Self, _, event: &LinkEvent, cx| {
+            if let LinkEvent::Connected(_) = event {
+                bar.reading = None;
+                bar.retries = crate::covers::Retries::default();
+                cx.notify();
+            }
+        });
         cx.on_release(|bar, cx| {
             if let Some((_, image, _)) = bar.cover.take() {
                 crate::covers::drop_unshared(image, None, cx);
@@ -96,6 +112,8 @@ impl PlayerBar {
             player,
             cover: None,
             reading: None,
+            missing: None,
+            retries: crate::covers::Retries::default(),
             arrived: None,
             held: None,
             seek_bounds: Rc::default(),
@@ -104,6 +122,7 @@ impl PlayerBar {
             washed: false,
             cover_away: false,
             _player: followed,
+            _link: session,
         }
     }
 
@@ -116,8 +135,14 @@ impl PlayerBar {
             self.reading = None;
             return;
         };
+        // A read for the song before is let go: it would land in its place.
+        if self.reading.as_ref().is_some_and(|(id, _)| *id != art) {
+            self.reading = None;
+        }
         if self.cover.as_ref().is_some_and(|(id, _, _)| *id == art)
             || self.reading.as_ref().is_some_and(|(id, _)| *id == art)
+            || self.missing == Some(art)
+            || self.retries.waits(art, Instant::now())
         {
             return;
         }
@@ -131,14 +156,23 @@ impl PlayerBar {
             .rt()
             .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
         let task = cx.spawn(async move |this, cx| {
-            let image = read.await.ok().flatten();
+            let image = read.await.unwrap_or(Err(NoArt::Failed));
             this.update(cx, |bar, cx| {
                 bar.reading = None;
-                if let Some((image, _, _)) = image
-                    && let Some((_, old, _)) =
-                        bar.cover.replace((art, Arc::new(image), Instant::now()))
-                {
-                    crate::covers::drop_unshared(old, None, cx);
+                match image {
+                    Ok((image, _, _)) => {
+                        bar.retries.read(art);
+                        if let Some((_, old, _)) =
+                            bar.cover.replace((art, Arc::new(image), Instant::now()))
+                        {
+                            crate::covers::drop_unshared(old, None, cx);
+                        }
+                    }
+                    Err(NoArt::Missing) => bar.missing = Some(art),
+                    Err(NoArt::Failed) => {
+                        let wait = bar.retries.failed(art, Instant::now());
+                        crate::covers::notify_after(wait, cx);
+                    }
                 }
                 cx.notify();
             })

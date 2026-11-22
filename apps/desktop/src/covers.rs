@@ -32,7 +32,7 @@ use ritornel_contract::Id;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::net::Net;
+use crate::net::{Net, NoArt};
 
 /// Fetches at once. The server renders a cover on its own threads, newest
 /// first, when its size is not cached on disk yet.
@@ -132,6 +132,75 @@ impl Drop for FetchBag {
     }
 }
 
+/// How a fetch for the wall ended.
+enum Read {
+    /// The cover came, or it is not there, or it is no longer wanted.
+    Done,
+    /// It could not be read this time.
+    Failed,
+}
+
+/// The first wait before a cover that could not be read is asked for again.
+/// Each failure after doubles it, up to `RETRY_MOST`, so one the server keeps
+/// failing is asked for now and then, and not at every frame.
+const RETRY_FIRST: Duration = Duration::from_secs(2);
+const RETRY_MOST: Duration = Duration::from_secs(64);
+
+/// The covers that could not be read, and when each may be asked for again.
+#[derive(Default)]
+pub(crate) struct Retries(HashMap<Id, (Instant, u32)>);
+
+impl Retries {
+    /// `art` could not be read at `now`: how long until it may be asked
+    /// for again.
+    pub(crate) fn failed(&mut self, art: Id, now: Instant) -> Duration {
+        let failures = self.0.get(&art).map_or(0, |(_, failures)| *failures);
+        let wait = RETRY_FIRST
+            .saturating_mul(1 << failures.min(6))
+            .min(RETRY_MOST);
+        self.0.insert(art, (now + wait, failures + 1));
+        wait
+    }
+
+    /// `art` was read, or it is not there: no more waiting for it.
+    pub(crate) fn read(&mut self, art: Id) {
+        self.0.remove(&art);
+    }
+
+    /// Whether `art` is not to be asked for yet.
+    pub(crate) fn waits(&self, art: Id, now: Instant) -> bool {
+        self.0.get(&art).is_some_and(|(again, _)| *again > now)
+    }
+
+    /// When the first of `wanted` still waiting may be asked for again.
+    fn next(&self, wanted: &[Id], now: Instant) -> Option<Instant> {
+        wanted
+            .iter()
+            .filter_map(|art| self.0.get(art))
+            .map(|(again, _)| *again)
+            .filter(|again| *again > now)
+            .min()
+    }
+}
+
+/// Draws the entity again after `wait`, for what it waits to ask for again
+/// (`Retries`).
+pub(crate) fn notify_after<T: 'static>(wait: Duration, cx: &mut gpui::Context<T>) {
+    cx.spawn(async move |this, cx| {
+        cx.background_executor().timer(wait).await;
+        this.update(cx, |_, cx| cx.notify()).ok();
+    })
+    .detach();
+}
+
+/// Sleeps until `at`; with none, for ever.
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Starts the loader on the network runtime. It runs until `wants` is dropped.
 pub(crate) fn start(
     net: Arc<Net>,
@@ -196,10 +265,12 @@ impl Compressed {
 
 impl Loader {
     async fn run(mut self) {
-        let mut tasks: JoinSet<Id> = JoinSet::new();
+        let mut tasks: JoinSet<(Id, Read)> = JoinSet::new();
         let mut running: HashMap<Id, tokio::task::AbortHandle> = HashMap::new();
         // Delivered a moment ago and not yet out of the wall's list.
         let mut delivered: HashMap<Id, Instant> = HashMap::new();
+        // Could not be read: still wanted, they are asked for again later.
+        let mut retries = Retries::default();
         loop {
             let wants = Arc::clone(&self.wanted.borrow_and_update());
             let wanted: HashSet<Id> = wants.ids.iter().copied().collect();
@@ -220,12 +291,18 @@ impl Loader {
                 if running.len() >= MAX_FETCHES {
                     break;
                 }
-                if running.contains_key(art) || delivered.contains_key(art) {
+                if running.contains_key(art)
+                    || delivered.contains_key(art)
+                    || retries.waits(*art, now)
+                {
                     continue;
                 }
                 let handle = tasks.spawn(self.fetch(*art, wants.px));
                 running.insert(*art, handle);
             }
+            // The wall says nothing new while it rests: the loader wakes
+            // itself for the next cover to ask for again.
+            let again = retries.next(&wants.ids, now);
             tokio::select! {
                 changed = self.wanted.changed() => {
                     if changed.is_err() {
@@ -233,17 +310,30 @@ impl Loader {
                         return;
                     }
                 }
-                Some(done) = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Ok(art) = done {
+                Some(done) = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                    // One aborted after it ended, for a cover asked for
+                    // again since, says nothing of the fetch now running.
+                    if let Ok((id, (art, read))) = done
+                        && running.get(&art).is_some_and(|handle| handle.id() == id)
+                    {
                         running.remove(&art);
-                        delivered.insert(art, Instant::now());
+                        match read {
+                            Read::Done => {
+                                retries.read(art);
+                                delivered.insert(art, Instant::now());
+                            }
+                            Read::Failed => {
+                                retries.failed(art, Instant::now());
+                            }
+                        }
                     }
                 }
+                () = sleep_until(again), if again.is_some() => {}
             }
         }
     }
 
-    fn fetch(&self, art: Id, px: u32) -> impl Future<Output = Id> + Send + 'static {
+    fn fetch(&self, art: Id, px: u32) -> impl Future<Output = (Id, Read)> + Send + 'static {
         let net = Arc::clone(&self.net);
         let decode = Arc::clone(&self.decode);
         let compressed = Arc::clone(&self.compressed);
@@ -257,9 +347,14 @@ impl Loader {
             let bytes = match held {
                 Some(bytes) => bytes,
                 None => {
-                    let Some(bytes) = net.art.get(art, bucket).await else {
-                        let _ = arrive.unbounded_send(Arrived::Missing { art });
-                        return art;
+                    let bytes = match net.art.get(art, bucket).await {
+                        Ok(bytes) => bytes,
+                        Err(NoArt::Missing) => {
+                            let _ = arrive.unbounded_send(Arrived::Missing { art });
+                            return (art, Read::Done);
+                        }
+                        // Asked for again after a while (`Retries`).
+                        Err(NoArt::Failed) => return (art, Read::Failed),
                     };
                     if let Ok(mut counts) = counts.lock() {
                         counts.fetched += 1;
@@ -282,7 +377,7 @@ impl Loader {
                     match held {
                         Some(bytes) => bytes,
                         None => match net.art.get(art, larger).await {
-                            Some(again) => {
+                            Ok(again) => {
                                 if let Ok(mut counts) = counts.lock() {
                                     counts.fetched += 1;
                                 }
@@ -292,21 +387,21 @@ impl Loader {
                                 }
                                 again
                             }
-                            None => bytes,
+                            Err(_) => bytes,
                         },
                     }
                 }
                 None => bytes,
             };
             let Ok(permit) = Arc::clone(&decode).acquire_owned().await else {
-                return art;
+                return (art, Read::Done);
             };
             // Waiting for a decoder, the wall may have moved on.
             if !wanted.borrow().ids.contains(&art) {
                 if let Ok(mut counts) = counts.lock() {
                     counts.skipped_decode += 1;
                 }
-                return art;
+                return (art, Read::Done);
             }
             let decoded = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
@@ -332,7 +427,7 @@ impl Loader {
                     let _ = arrive.unbounded_send(Arrived::Missing { art });
                 }
             }
-            art
+            (art, Read::Done)
         }
     }
 }
@@ -462,21 +557,24 @@ pub(crate) fn sharper(jpeg: &[u8], px: u32, bucket: u32, sizes: &[u32]) -> Optio
 
 /// A picture for a square slot `px` pixels: fetched at the size the slot
 /// asks for, and once more at a larger one when it is not square and so too
-/// short once cut square (`sharper`); then decoded (`decode_cover`).
+/// short once cut square (`sharper`); then decoded (`decode_cover`). One
+/// that cannot be decoded is as good as missing.
 pub(crate) async fn fetch_square(
     http: &crate::net::ArtHttp,
     sizes: &[u32],
     art: Id,
     px: u32,
-) -> Option<(RenderImage, Rgba, usize)> {
+) -> Result<(RenderImage, Rgba, usize), NoArt> {
     let bucket = crate::net::bucket_in(sizes, px);
     let mut bytes = http.get(art, bucket).await?;
     if let Some(larger) = sharper(&bytes, px, bucket, sizes)
-        && let Some(again) = http.get(art, larger).await
+        && let Ok(again) = http.get(art, larger).await
     {
         bytes = again;
     }
-    decode(move || decode_cover(&bytes, px)).await
+    decode(move || decode_cover(&bytes, px))
+        .await
+        .ok_or(NoArt::Missing)
 }
 
 /// Decodes a JPEG, cuts it square as it is shown (`squared`), resizes it
@@ -956,5 +1054,29 @@ mod shape_tests {
             };
             assert_eq!((size.width.0, size.height.0), (side, side), "{w}x{h}");
         }
+    }
+
+    #[test]
+    fn a_cover_that_could_not_be_read_waits_longer_each_time_until_it_is_read() {
+        let mut retries = Retries::default();
+        let art = Id::from_bytes([3; 16]);
+        let other = Id::from_bytes([4; 16]);
+        let now = Instant::now();
+        assert!(!retries.waits(art, now));
+        let waits: Vec<Duration> = (0..9).map(|_| retries.failed(art, now)).collect();
+        let secs: Vec<u64> = waits.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, [2, 4, 8, 16, 32, 64, 64, 64, 64]);
+        assert!(retries.waits(art, now));
+        assert!(!retries.waits(art, now + RETRY_MOST));
+        assert!(!retries.waits(other, now));
+        // The loader wakes for the first still wanted.
+        retries.failed(other, now);
+        assert_eq!(retries.next(&[art, other], now), Some(now + RETRY_FIRST));
+        assert_eq!(retries.next(&[art], now), Some(now + RETRY_MOST));
+        assert_eq!(retries.next(&[], now), None);
+        // Read at last, it starts again from the first wait.
+        retries.read(art);
+        assert!(!retries.waits(art, now));
+        assert_eq!(retries.failed(art, now), RETRY_FIRST);
     }
 }

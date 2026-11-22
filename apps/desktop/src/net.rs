@@ -150,27 +150,38 @@ const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
 /// prolific artist or album page does not open dozens of sockets at once.
 const MAX_ART_IN_FLIGHT: usize = 12;
 
+/// Why a cover could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoArt {
+    /// The server has none: asked again, it gives the same answer.
+    Missing,
+    /// It could not be read this time: the connection, or the server, failed.
+    Failed,
+}
+
 impl ArtHttp {
-    /// Reads one cover. `None` when it is not there (404) or the server
-    /// could not be read. Dropped part way, the connection is closed, and
-    /// the server drops the cover from its queue if it has not begun it.
-    pub(crate) async fn get(&self, art: Id, size: u32) -> Option<Vec<u8>> {
-        let _permit = self.in_flight.acquire().await.ok()?;
+    /// Reads one cover. Dropped part way, the connection is closed, and the
+    /// server drops the cover from its queue if it has not begun it.
+    pub(crate) async fn get(&self, art: Id, size: u32) -> Result<Vec<u8>, NoArt> {
+        fn failed<E>(_: E) -> NoArt {
+            NoArt::Failed
+        }
+        let _permit = self.in_flight.acquire().await.map_err(failed)?;
         let idle = self.idle.lock().ok().and_then(|mut idle| idle.pop());
         let mut sender = match idle {
             Some(sender) if !sender.is_closed() => sender,
             _ => {
-                let stream = TcpStream::connect(self.endpoint).await.ok()?;
-                stream.set_nodelay(true).ok()?;
+                let stream = TcpStream::connect(self.endpoint).await.map_err(failed)?;
+                stream.set_nodelay(true).map_err(failed)?;
                 let (sender, connection) =
                     hyper::client::conn::http1::handshake(TokioIo::new(stream))
                         .await
-                        .ok()?;
+                        .map_err(failed)?;
                 tokio::spawn(connection);
                 sender
             }
         };
-        sender.ready().await.ok()?;
+        sender.ready().await.map_err(failed)?;
         let path = format!(
             "{}/{art}/{size}?{MEDIA_TOKEN_PARAM}={}",
             route::ART,
@@ -179,19 +190,25 @@ impl ArtHttp {
         let request = hyper::Request::get(path)
             .header(HOST, self.endpoint.to_string())
             .body(Empty::<Bytes>::new())
-            .ok()?;
-        let response = sender.send_request(request).await.ok()?;
-        let ok = response.status().is_success();
+            .map_err(failed)?;
+        let response = sender.send_request(request).await.map_err(failed)?;
+        let status = response.status();
         let body = Limited::new(response.into_body(), MAX_ART_BYTES)
             .collect()
             .await
-            .ok()?
+            .map_err(failed)?
             .to_bytes();
         // At most MAX_ART_IN_FLIGHT permits exist, so the idle pool stays bounded.
         if let Ok(mut idle) = self.idle.lock() {
             idle.push(sender);
         }
-        ok.then(|| body.to_vec())
+        if status.is_success() {
+            Ok(body.to_vec())
+        } else if status == hyper::StatusCode::NOT_FOUND {
+            Err(NoArt::Missing)
+        } else {
+            Err(NoArt::Failed)
+        }
     }
 }
 
@@ -274,12 +291,81 @@ mod tests {
             }
             for task in tasks {
                 let got = tokio::time::timeout(Duration::from_secs(5), task).await??;
-                assert_eq!(got, Some(b"ok".to_vec()));
+                assert_eq!(got, Ok(b"ok".to_vec()));
             }
             assert!(peak.load(Ordering::SeqCst) <= MAX_ART_IN_FLIGHT);
             let idle_len = art.idle.lock().map_or(usize::MAX, |idle| idle.len());
             assert!(idle_len <= MAX_ART_IN_FLIGHT);
             server.abort();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_cover_the_server_has_not_is_missing_and_one_it_failed_to_give_is_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = listener.local_addr()?;
+            // The status asked for is the first byte of the art ID.
+            let server = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while let Ok(n) = socket.read(&mut chunk).await {
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                                continue;
+                            };
+                            let head = String::from_utf8_lossy(buf.get(..end).unwrap_or_default())
+                                .into_owned();
+                            buf.drain(..end + 4);
+                            let status = if head.contains("/01010101") {
+                                "404 Not Found"
+                            } else if head.contains("/05050505") {
+                                "500 Internal Server Error"
+                            } else if head.contains("/06060606") {
+                                "503 Service Unavailable"
+                            } else {
+                                "200 OK"
+                            };
+                            let reply = format!("HTTP/1.1 {status}\r\nContent-Length: 2\r\n\r\nok");
+                            if socket.write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            let art = ArtHttp {
+                endpoint,
+                token: "test".to_owned(),
+                idle: Mutex::new(Vec::new()),
+                in_flight: Semaphore::new(MAX_ART_IN_FLIGHT),
+            };
+            let id = |byte| Id::from_bytes([byte; 16]);
+            assert_eq!(art.get(id(1), 256).await, Err(NoArt::Missing));
+            assert_eq!(art.get(id(5), 256).await, Err(NoArt::Failed));
+            assert_eq!(art.get(id(6), 256).await, Err(NoArt::Failed));
+            assert_eq!(art.get(id(2), 256).await, Ok(b"ok".to_vec()));
+            server.abort();
+            let _ = server.await;
+
+            // No server to answer.
+            let gone = ArtHttp {
+                endpoint,
+                token: "test".to_owned(),
+                idle: Mutex::new(Vec::new()),
+                in_flight: Semaphore::new(MAX_ART_IN_FLIGHT),
+            };
+            assert_eq!(gone.get(id(2), 256).await, Err(NoArt::Failed));
             Ok(())
         })
     }

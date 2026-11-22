@@ -248,7 +248,7 @@ impl UpNextCard {
                 .rt()
                 .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
             cx.spawn(async move |this, cx| {
-                let result = read.await.ok().flatten();
+                let result = read.await.ok().and_then(Result::ok);
                 this.update(cx, |card, cx| {
                     card.in_flight.remove(&art);
                     if let Some((image, _, _)) = result {
