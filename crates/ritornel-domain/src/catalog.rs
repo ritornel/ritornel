@@ -241,26 +241,42 @@ fn split_by_folder(members: &[(usize, &Item)]) -> Vec<Vec<usize>> {
 }
 
 /// Gives each thing being formed the row most of its members are on now,
-/// each row to at most one. `votes` is, for each thing, the rows its
-/// members name. The rest are new.
-fn keep_rows(votes: Vec<(String, Vec<i64>)>) -> Vec<Option<i64>> {
-    let mut ballots: Vec<(usize, i64, usize)> = Vec::new();
+/// each row to at most one. Rows in `owner_rows` (rows carrying owner edits,
+/// merges, or settings) always win over unedited rows so automatic regrouping
+/// never discards owner input. `preferred` gives `(row, index)` pairs that
+/// break ties in vote count when a group splits.
+fn keep_rows(
+    votes: Vec<(String, Vec<i64>)>,
+    owner_rows: &HashSet<i64>,
+    preferred: &HashSet<(i64, usize)>,
+) -> Vec<Option<i64>> {
+    let mut ballots: Vec<(bool, usize, bool, i64, usize)> = Vec::new();
     for (index, (_, rows)) in votes.iter().enumerate() {
         let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
         for row in rows {
             *counts.entry(*row).or_default() += 1;
         }
-        ballots.extend(counts.into_iter().map(|(row, count)| (count, row, index)));
+        ballots.extend(counts.into_iter().map(|(row, count)| {
+            (
+                owner_rows.contains(&row),
+                count,
+                preferred.contains(&(row, index)),
+                row,
+                index,
+            )
+        }));
     }
     ballots.sort_by(|a, b| {
         let key = |index: usize| votes.get(index).map(|(key, _)| key.as_str());
         b.0.cmp(&a.0)
-            .then_with(|| key(a.2).cmp(&key(b.2)))
-            .then(a.1.cmp(&b.1))
+            .then(b.1.cmp(&a.1))
+            .then(b.2.cmp(&a.2))
+            .then_with(|| key(a.4).cmp(&key(b.4)))
+            .then(a.3.cmp(&b.3))
     });
     let mut kept: Vec<Option<i64>> = vec![None; votes.len()];
     let mut taken: HashSet<i64> = HashSet::new();
-    for (_, row, index) in ballots {
+    for (_, _, _, row, index) in ballots {
         if let Some(slot) = kept.get_mut(index)
             && slot.is_none()
             && taken.insert(row)
@@ -537,6 +553,68 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         }
         forming = joined.into_values().collect();
     }
+    let mut owner_groups: HashSet<i64> = library
+        .groups
+        .iter()
+        .filter(|(_, group)| group.has_presentation || group.preferred_release.is_some())
+        .map(|(row, _)| *row)
+        .collect();
+    for (kind, row, _) in library.edits.keys() {
+        if *kind == Kind::ReleaseGroup {
+            owner_groups.insert(*row);
+        }
+    }
+    let mut owner_releases: HashSet<i64> = merged.clone();
+    for (kind, row, _) in library.edits.keys() {
+        if *kind == Kind::Release {
+            owner_releases.insert(*row);
+        }
+    }
+    for existing in library.releases.values() {
+        if existing.chosen_group.is_some() || owner_groups.contains(&existing.group) {
+            owner_releases.insert(existing.canonical);
+        }
+    }
+    // Automatic release formation never silently collapses two distinct
+    // canonical releases that BOTH carry owner input (edits, merges, a chosen
+    // group, or membership in an owner-edited group).
+    let mut split_forming: Vec<Forming> = Vec::with_capacity(forming.len());
+    for release in forming {
+        let mut distinct_owners: BTreeSet<i64> = BTreeSet::new();
+        for &member in &release.members {
+            if let Some(rel) = actives
+                .get(member)
+                .and_then(|active| release_of(active.item))
+                && owner_releases.contains(&rel)
+            {
+                distinct_owners.insert(rel);
+            }
+        }
+        if distinct_owners.len() <= 1 {
+            split_forming.push(release);
+            continue;
+        }
+        let first_owner = *distinct_owners.iter().next().unwrap_or(&0);
+        let mut buckets: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+        for member in release.members {
+            let bucket = actives
+                .get(member)
+                .and_then(|active| release_of(active.item))
+                .filter(|rel| distinct_owners.contains(rel))
+                .unwrap_or(first_owner);
+            buckets.entry(bucket).or_default().push(member);
+        }
+        for (owner_rel, members) in buckets {
+            split_forming.push(Forming {
+                key: format!("{}\u{1f}o{owner_rel}", release.key),
+                members,
+                r: Ref::New(0),
+            });
+        }
+    }
+    forming = split_forming;
+
+    let no_preferred: HashSet<(i64, usize)> = HashSet::new();
     let votes = forming
         .iter()
         .map(|release| {
@@ -549,7 +627,10 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             (release.key.clone(), rows)
         })
         .collect();
-    for (release, row) in forming.iter_mut().zip(keep_rows(votes)) {
+    for (release, row) in forming
+        .iter_mut()
+        .zip(keep_rows(votes, &owner_releases, &no_preferred))
+    {
         release.r = row.map_or(Ref::New(usize::MAX), Ref::Row);
     }
     // Each pinned file joins the release it is on, or holds it alone.
@@ -1076,6 +1157,8 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
     }
 
     let mut appearances: Vec<AppearanceOut> = Vec::new();
+    let mut emitted_appearances: HashSet<i64> = HashSet::new();
+    let mut redirected_appearances: BTreeMap<i64, Vec<&Active<'_>>> = BTreeMap::new();
     for (r, members) in &appearance_rows {
         let members: Vec<&Active<'_>> = members
             .iter()
@@ -1084,6 +1167,15 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         let Some(first) = members.first() else {
             continue;
         };
+        if let Ref::Row(row) = *r {
+            emitted_appearances.insert(row);
+            if let Some(&canon) = library.appearance_canonical.get(&row) {
+                redirected_appearances
+                    .entry(canon)
+                    .or_default()
+                    .extend(members.iter().copied());
+            }
+        }
         let credit = pick(
             members
                 .iter()
@@ -1095,6 +1187,39 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             recording: first.assign,
             release: first.release,
             title: edit(Kind::TrackAppearance, *r, "title").or_else(|| pick(from_tags(&members))),
+            credit,
+            disc: pick(members.iter().filter_map(|active| active.item.facts.disc)),
+            track: pick(members.iter().filter_map(|active| active.item.facts.track)),
+            duration_ms: pick(
+                members
+                    .iter()
+                    .filter_map(|active| active.item.facts.duration_ms),
+            ),
+            added_at_ms: members.iter().map(|active| active.item.first_seen_ms).min(),
+        });
+    }
+    // If a canonical merged track appearance has no direct live assignment of
+    // its own, still project its display from its edits and the claims of
+    // appearances redirecting into it so playback and lists stay up to date.
+    for (canon, members) in redirected_appearances {
+        if emitted_appearances.contains(&canon) {
+            continue;
+        }
+        let Some(first) = members.first() else {
+            continue;
+        };
+        let credit = pick(
+            members
+                .iter()
+                .filter_map(|active| active.track_credit.clone()),
+        )
+        .and_then(|spec| credit_of(&spec));
+        let r = Ref::Row(canon);
+        appearances.push(AppearanceOut {
+            r,
+            recording: first.assign,
+            release: first.release,
+            title: edit(Kind::TrackAppearance, r, "title").or_else(|| pick(from_tags(&members))),
             credit,
             disc: pick(members.iter().filter_map(|active| active.item.facts.disc)),
             track: pick(members.iter().filter_map(|active| active.item.facts.track)),
@@ -1186,7 +1311,9 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
 
     // Release groups: the owner's choice, then a shared release-group
     // MBID, then the same album artist and title with at least half of the
-    // smaller release's recordings shared.
+    // smaller release's recordings shared. Automatic regrouping never
+    // collapses two distinct groups that both carry owner input (an active
+    // edit, an explicit presentation, or a preferred release).
     let chosen = |release: &ReleaseOut| match release.r {
         Ref::Row(row) => library
             .releases
@@ -1195,28 +1322,98 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         Ref::New(_) => None,
     };
     let mut parents: Vec<usize> = (0..releases.len()).collect();
-    let mut by_mbid: HashMap<&str, usize> = HashMap::new();
-    let mut families: HashMap<&(String, String), Vec<usize>> = HashMap::new();
+    let mut comp_owner_group: Vec<Option<i64>> = releases
+        .iter()
+        .map(|release| match release.r {
+            Ref::Row(row) => library
+                .releases
+                .get(&row)
+                .map(|existing| existing.group)
+                .filter(|group| owner_groups.contains(group)),
+            Ref::New(_) => None,
+        })
+        .collect();
+    let safe_union = |parents: &mut [usize], comp_owner: &mut [Option<i64>], a: usize, b: usize| {
+        let (ra, rb) = (find(parents, a), find(parents, b));
+        if ra == rb {
+            return;
+        }
+        let (oa, ob) = (
+            comp_owner.get(ra).copied().flatten(),
+            comp_owner.get(rb).copied().flatten(),
+        );
+        if let (Some(g1), Some(g2)) = (oa, ob)
+            && g1 != g2
+        {
+            return;
+        }
+        let root = ra.min(rb);
+        union(parents, ra, rb);
+        if let Some(slot) = comp_owner.get_mut(root) {
+            *slot = oa.or(ob);
+        }
+    };
+    let mut by_mbid: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    let mut families: BTreeMap<&(String, String), Vec<usize>> = BTreeMap::new();
     for (index, (release, formed)) in releases.iter().zip(&formed).enumerate() {
         if chosen(release).is_some() {
             continue;
         }
         if let Some(mbid) = &formed.group_mbid {
-            let other = *by_mbid.entry(mbid.as_str()).or_insert(index);
-            union(&mut parents, other, index);
+            by_mbid.entry(mbid.as_str()).or_default().push(index);
         }
         families.entry(&formed.family).or_default().push(index);
     }
+    // First unite releases sharing an MBID that already belong to the same
+    // owner-edited group, then unite remaining pairs in deterministic order.
+    for members in by_mbid.values() {
+        for (at, a) in members.iter().enumerate() {
+            for b in members.iter().skip(at + 1) {
+                let oa = comp_owner_group
+                    .get(find(&mut parents, *a))
+                    .copied()
+                    .flatten();
+                let ob = comp_owner_group
+                    .get(find(&mut parents, *b))
+                    .copied()
+                    .flatten();
+                if oa.is_some() && oa == ob {
+                    safe_union(&mut parents, &mut comp_owner_group, *a, *b);
+                }
+            }
+        }
+        for (at, a) in members.iter().enumerate() {
+            for b in members.iter().skip(at + 1) {
+                safe_union(&mut parents, &mut comp_owner_group, *a, *b);
+            }
+        }
+    }
     for family in families.values() {
-        for (at, a) in family.iter().enumerate() {
-            for b in family.iter().skip(at + 1) {
-                let (Some(mine), Some(theirs)) = (formed.get(*a), formed.get(*b)) else {
-                    continue;
-                };
-                let both = mine.recordings.intersection(&theirs.recordings).count();
-                let smaller = mine.recordings.len().min(theirs.recordings.len());
-                if smaller > 0 && both * 2 >= smaller {
-                    union(&mut parents, *a, *b);
+        for pass in [true, false] {
+            for (at, a) in family.iter().enumerate() {
+                for b in family.iter().skip(at + 1) {
+                    let (Some(mine), Some(theirs)) = (formed.get(*a), formed.get(*b)) else {
+                        continue;
+                    };
+                    let both = mine.recordings.intersection(&theirs.recordings).count();
+                    let smaller = mine.recordings.len().min(theirs.recordings.len());
+                    if smaller > 0 && both * 2 >= smaller {
+                        if pass {
+                            let oa = comp_owner_group
+                                .get(find(&mut parents, *a))
+                                .copied()
+                                .flatten();
+                            let ob = comp_owner_group
+                                .get(find(&mut parents, *b))
+                                .copied()
+                                .flatten();
+                            if oa.is_some() && oa == ob {
+                                safe_union(&mut parents, &mut comp_owner_group, *a, *b);
+                            }
+                        } else {
+                            safe_union(&mut parents, &mut comp_owner_group, *a, *b);
+                        }
+                    }
                 }
             }
         }
@@ -1233,9 +1430,11 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         }
     }
     let components: Vec<Vec<usize>> = components.into_values().collect();
+    let mut preferred_group_hits: HashSet<(i64, usize)> = HashSet::new();
     let votes = components
         .iter()
-        .map(|members| {
+        .enumerate()
+        .map(|(comp_idx, members)| {
             let key = members
                 .iter()
                 .filter_map(|index| forming.get(*index))
@@ -1243,19 +1442,29 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 .min()
                 .unwrap_or("")
                 .to_owned();
-            let rows = members
-                .iter()
-                .filter_map(|index| match releases.get(*index)?.r {
-                    Ref::Row(row) => library.releases.get(&row).map(|release| release.group),
-                    Ref::New(_) => None,
-                })
-                .collect();
+            let mut rows = Vec::new();
+            for index in members {
+                if let Some(Ref::Row(rel_row)) = releases.get(*index).map(|release| release.r)
+                    && let Some(existing) = library.releases.get(&rel_row)
+                {
+                    let group = existing.group;
+                    if library.groups.get(&group).and_then(|g| g.preferred_release) == Some(rel_row)
+                    {
+                        preferred_group_hits.insert((group, comp_idx));
+                    }
+                    rows.push(group);
+                }
+            }
             (key, rows)
         })
         .collect();
     let mut grouped: Vec<(Ref, Vec<usize>)> = Vec::new();
     let mut group_at: HashMap<i64, usize> = HashMap::new();
-    for (members, row) in components.into_iter().zip(keep_rows(votes)) {
+    for (members, row) in
+        components
+            .into_iter()
+            .zip(keep_rows(votes, &owner_groups, &preferred_group_hits))
+    {
         match row {
             Some(row) => {
                 group_at.insert(row, grouped.len());
@@ -1308,7 +1517,7 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         // The release a collapsed tile shows: the owner's, or else lossless
         // before lossy, then the most tracks, then the earliest date.
         let preferred = match r {
-            Ref::Row(row) => library.groups.get(row).copied().flatten(),
+            Ref::Row(row) => library.groups.get(row).and_then(|g| g.preferred_release),
             Ref::New(_) => None,
         };
         let display_release = ordered

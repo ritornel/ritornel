@@ -111,7 +111,7 @@ impl LibraryStore {
             let connection = write.connection();
             let found: Option<(i64, [u8; 16])> = connection
                 .query_row(
-                    "SELECT c.id, c.public_id FROM recording r
+                    "SELECT r.id, c.public_id FROM recording r
                      JOIN recording c ON c.id = r.canonical_id
                      WHERE r.public_id = ?1",
                     [recording.as_bytes()],
@@ -271,5 +271,126 @@ mod tests {
             |rev, _| rev.to_string(),
         );
         assert!(matches!(unknown, Err(Error::NotFound(_))));
+    }
+
+    fn merge_recording(library: &LibraryStore, from: i64, into: i64) {
+        library
+            .write(
+                WriteRequest {
+                    method: "test.mergeRecording",
+                    command: None,
+                    client: None,
+                },
+                move |write| {
+                    write.connection().execute(
+                        "UPDATE recording SET redirect_to_id = ?2, canonical_id = ?2 WHERE id = ?1",
+                        (from, into),
+                    )?;
+                    Ok(String::new())
+                },
+            )
+            .unwrap();
+    }
+
+    fn unmerge_recording(library: &LibraryStore, row: i64) {
+        library
+            .write(
+                WriteRequest {
+                    method: "test.unmergeRecording",
+                    command: None,
+                    client: None,
+                },
+                move |write| {
+                    write.connection().execute(
+                        "UPDATE recording SET redirect_to_id = NULL, canonical_id = id WHERE id = ?1",
+                        [row],
+                    )?;
+                    Ok(String::new())
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn rating_a_redirected_recording_keeps_the_named_entity_after_undo() {
+        let (library, recordings) = library();
+        let [(rec_a, id_a), (rec_b, id_b), ..] = recordings[..] else {
+            panic!("the album has four tracks");
+        };
+        // Merge B into A, then rate B while it redirects to A.
+        merge_recording(&library, rec_b, rec_a);
+        let written = library
+            .set_rating(
+                WriteRequest {
+                    method: "ratings.set",
+                    command: None,
+                    client: None,
+                },
+                id_b,
+                Some(80),
+                |_, canonical| canonical.to_string(),
+            )
+            .unwrap();
+        // The response names the canonical recording A, while the stored row
+        // names B.
+        assert_eq!(written.result_json, id_a.to_string());
+        assert_eq!(
+            library.said_of(vec![rec_a]).unwrap()[&rec_a].rating,
+            Some(80)
+        );
+
+        // Undo the merge: the rating belongs to B (the recording rated), not A.
+        unmerge_recording(&library, rec_b);
+        let after = library.said_of(vec![rec_a, rec_b]).unwrap();
+        assert_eq!(after.get(&rec_a).and_then(|s| s.rating), None);
+        assert_eq!(after[&rec_b].rating, Some(80));
+    }
+
+    #[test]
+    fn competing_ratings_and_clears_across_a_merge_and_its_undo() {
+        let (library, recordings) = library();
+        let [(rec_a, id_a), (rec_b, id_b), ..] = recordings[..] else {
+            panic!("the album has four tracks");
+        };
+
+        // 1. Competing ratings before merge: A=60 then B=80 -> merged shows 80.
+        rate(&library, 11, id_a, Some(60));
+        rate(&library, 12, id_b, Some(80));
+        merge_recording(&library, rec_b, rec_a);
+        assert_eq!(
+            library.said_of(vec![rec_a]).unwrap()[&rec_a].rating,
+            Some(80)
+        );
+
+        // 2. Rating A while merged (90) beats B's earlier 80; clearing B while
+        //    merged beats A's 90 so the merged song shows no stars.
+        rate(&library, 13, id_a, Some(90));
+        assert_eq!(
+            library.said_of(vec![rec_a]).unwrap()[&rec_a].rating,
+            Some(90)
+        );
+        rate(&library, 14, id_b, None);
+        assert_eq!(library.said_of(vec![rec_a]).unwrap()[&rec_a].rating, None);
+
+        // 3. Undoing the merge restores A=90 and B=cleared (None).
+        unmerge_recording(&library, rec_b);
+        let after = library.said_of(vec![rec_a, rec_b]).unwrap();
+        assert_eq!(after[&rec_a].rating, Some(90));
+        assert_eq!(after[&rec_b].rating, None);
+
+        // 4. Symmetric clear on A while merged: B=40, merge B->A, clear A ->
+        //    merged shows None; undo restores A=None, B=40.
+        rate(&library, 15, id_b, Some(40));
+        merge_recording(&library, rec_b, rec_a);
+        assert_eq!(
+            library.said_of(vec![rec_a]).unwrap()[&rec_a].rating,
+            Some(40)
+        );
+        rate(&library, 16, id_a, None);
+        assert_eq!(library.said_of(vec![rec_a]).unwrap()[&rec_a].rating, None);
+        unmerge_recording(&library, rec_b);
+        let symmetric = library.said_of(vec![rec_a, rec_b]).unwrap();
+        assert_eq!(symmetric[&rec_a].rating, None);
+        assert_eq!(symmetric[&rec_b].rating, Some(40));
     }
 }

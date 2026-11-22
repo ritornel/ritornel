@@ -172,7 +172,7 @@ impl World {
             .map(|out| self.row(out.r))
             .collect();
         for (out, row) in resolution.groups.iter().zip(&groups) {
-            self.library.groups.entry(*row).or_insert(None);
+            self.library.groups.entry(*row).or_default();
             self.shown.insert(
                 (Kind::ReleaseGroup, *row),
                 format!(
@@ -1752,6 +1752,336 @@ fn undoing_an_artist_merge_keeps_the_restored_artists_credits_even_if_target_sha
             .any(|out| out.r == Ref::Row(row_source))
     );
     world.assert_settled();
+}
+
+#[test]
+fn automatic_regrouping_keeps_edited_groups_and_never_collapses_two_edited_groups() {
+    let mut world = World::default();
+    // Group 1: 1 release (L1), carries an owner edit.
+    world.add(
+        file("A/1.flac", 1)
+            .song("Paper Kites", "Moss Arcade", 200)
+            .on("Tin Weather", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| facts.release_mbid = Some("rel-1".to_owned())),
+    );
+    // Group 2: 2 releases (L2, L3) sharing rg-shared, unedited.
+    world.add(
+        file("B/1.flac", 2)
+            .song("Salt Road", "Moss Arcade", 200)
+            .on("Other Title", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| {
+                facts.release_mbid = Some("rel-2".to_owned());
+                facts.release_group_mbid = Some("rg-shared".to_owned());
+            }),
+    );
+    world.add(
+        file("C/1.flac", 3)
+            .song("Low Field", "Moss Arcade", 200)
+            .on("Other Title Deluxe", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| {
+                facts.release_mbid = Some("rel-3".to_owned());
+                facts.release_group_mbid = Some("rg-shared".to_owned());
+            }),
+    );
+    let first = world.settle();
+    assert_eq!(first.groups.len(), 2);
+    let rel_l1 = world
+        .library
+        .appearances
+        .get(&world.library.items[0].current.unwrap().appearance.unwrap())
+        .unwrap()
+        .1
+        .unwrap();
+    let g1 = world.library.releases[&rel_l1].group;
+
+    // Owner edits G1's original_date.
+    world.library.edits.insert(
+        (Kind::ReleaseGroup, g1, "original_date".to_owned()),
+        "2018".to_owned(),
+    );
+
+    // Now L1 gets tagged with `rg-shared` too: automatic regrouping combines
+    // [L1, L2, L3]. Even though G2 has 2 releases to G1's 1, G1 MUST survive
+    // because G1 carries owner input.
+    world.library.items[0].facts.release_group_mbid = Some("rg-shared".to_owned());
+    let joined = world.settle();
+    assert_eq!(joined.groups.len(), 1);
+    assert_eq!(joined.groups[0].r, Ref::Row(g1));
+    assert_eq!(joined.groups[0].first_date.as_deref(), Some("2018"));
+    world.assert_settled();
+
+    // Two distinct groups that BOTH carry owner input must NOT be silently
+    // collapsed by an automatic regrouping.
+    let mut world2 = World::default();
+    world2.add(
+        file("A/1.flac", 1)
+            .song("Paper Kites", "Moss Arcade", 200)
+            .on("Tin Weather", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| facts.release_mbid = Some("rel-a".to_owned())),
+    );
+    world2.add(
+        file("B/1.flac", 2)
+            .song("Salt Road", "Moss Arcade", 200)
+            .on("Harbor Fog", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| facts.release_mbid = Some("rel-b".to_owned())),
+    );
+    world2.settle();
+    let mut group_ids: Vec<i64> = world2.library.groups.keys().copied().collect();
+    group_ids.sort_unstable();
+    let (ga, gb) = (group_ids[0], group_ids[1]);
+    world2.library.edits.insert(
+        (Kind::ReleaseGroup, ga, "original_date".to_owned()),
+        "2018".to_owned(),
+    );
+    world2.library.groups.get_mut(&gb).unwrap().has_presentation = true;
+
+    world2.library.items[0].facts.release_group_mbid = Some("rg-both".to_owned());
+    world2.library.items[1].facts.release_group_mbid = Some("rg-both".to_owned());
+    let kept = world2.settle();
+    assert_eq!(kept.groups.len(), 2);
+    let kept_ids: Vec<Ref> = kept.groups.iter().map(|g| g.r).collect();
+    assert!(kept_ids.contains(&Ref::Row(ga)));
+    assert!(kept_ids.contains(&Ref::Row(gb)));
+    world2.assert_settled();
+}
+
+#[test]
+fn a_release_edit_is_kept_when_an_unedited_release_joins_it() {
+    let mut world = World::default();
+    world.add(
+        file("A/1.flac", 1)
+            .song("One", "Moss Arcade", 200)
+            .on("Tin Weather", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| facts.release_mbid = Some("rel-1".to_owned())),
+    );
+    world.add(
+        file("B/2.flac", 2)
+            .song("Two", "Moss Arcade", 200)
+            .on("Tin Weather", Some(1), 2)
+            .by("Moss Arcade")
+            .with(|facts| facts.release_mbid = Some("rel-2".to_owned())),
+    );
+    world.add(
+        file("B/3.flac", 3)
+            .song("Three", "Moss Arcade", 200)
+            .on("Tin Weather", Some(1), 3)
+            .by("Moss Arcade")
+            .with(|facts| facts.release_mbid = Some("rel-2".to_owned())),
+    );
+    world.settle();
+    let rel1 = world
+        .library
+        .appearances
+        .get(&world.library.items[0].current.unwrap().appearance.unwrap())
+        .unwrap()
+        .1
+        .unwrap();
+    world
+        .library
+        .edits
+        .insert((Kind::Release, rel1, "date".to_owned()), "1999".to_owned());
+    world.library.items[0].facts.release_mbid = Some("rel-2".to_owned());
+    let combined = world.settle();
+    assert_eq!(combined.releases.len(), 1);
+    assert_eq!(combined.releases[0].r, Ref::Row(rel1));
+    assert_eq!(combined.releases[0].date.as_deref(), Some("1999"));
+    world.assert_settled();
+}
+
+#[test]
+fn two_owner_edited_releases_and_two_same_group_releases_with_shared_mbid_stay_intact() {
+    // 1. Two distinct owner-edited releases acquiring the same release MBID do
+    //    NOT collapse and orphan either edit.
+    let mut world = World::default();
+    world.add(
+        file("A/1.flac", 1)
+            .song("One", "Moss Arcade", 200)
+            .on("Tin Weather", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| facts.release_mbid = Some("rel-1".to_owned())),
+    );
+    world.add(
+        file("B/2.flac", 2)
+            .song("Two", "Moss Arcade", 200)
+            .on("Tin Weather", Some(1), 2)
+            .by("Moss Arcade")
+            .with(|facts| facts.release_mbid = Some("rel-2".to_owned())),
+    );
+    world.settle();
+    let rel1 = world
+        .library
+        .appearances
+        .get(&world.library.items[0].current.unwrap().appearance.unwrap())
+        .unwrap()
+        .1
+        .unwrap();
+    let rel2 = world
+        .library
+        .appearances
+        .get(&world.library.items[1].current.unwrap().appearance.unwrap())
+        .unwrap()
+        .1
+        .unwrap();
+    world
+        .library
+        .edits
+        .insert((Kind::Release, rel1, "date".to_owned()), "1999".to_owned());
+    world
+        .library
+        .edits
+        .insert((Kind::Release, rel2, "date".to_owned()), "2001".to_owned());
+    world.library.items[0].facts.release_mbid = Some("rel-2".to_owned());
+    let both = world.settle();
+    assert_eq!(both.releases.len(), 2);
+    assert!(
+        both.releases
+            .iter()
+            .any(|r| r.r == Ref::Row(rel1) && r.date.as_deref() == Some("1999"))
+    );
+    assert!(
+        both.releases
+            .iter()
+            .any(|r| r.r == Ref::Row(rel2) && r.date.as_deref() == Some("2001"))
+    );
+    world.assert_settled();
+
+    // 2. Shared MBID where edited group A comes first and edited group B has
+    //    two releases with different title families: B1 and B2 stay together
+    //    in group B rather than splitting.
+    let mut world2 = World::default();
+    world2.add(
+        file("A/1.flac", 1)
+            .song("One", "Moss Arcade", 200)
+            .on("Alpha", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| facts.release_mbid = Some("rel-a".to_owned())),
+    );
+    world2.add(
+        file("B1/1.flac", 2)
+            .song("Two", "Moss Arcade", 200)
+            .on("Beta First", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| {
+                facts.release_mbid = Some("rel-b1".to_owned());
+                facts.release_group_mbid = Some("rg-b".to_owned());
+            }),
+    );
+    world2.add(
+        file("B2/1.flac", 3)
+            .song("Three", "Moss Arcade", 200)
+            .on("Gamma Second", Some(1), 1)
+            .by("Moss Arcade")
+            .with(|facts| {
+                facts.release_mbid = Some("rel-b2".to_owned());
+                facts.release_group_mbid = Some("rg-b".to_owned());
+            }),
+    );
+    world2.settle();
+    let rel_a = world2
+        .library
+        .appearances
+        .get(&world2.library.items[0].current.unwrap().appearance.unwrap())
+        .unwrap()
+        .1
+        .unwrap();
+    let rel_b1 = world2
+        .library
+        .appearances
+        .get(&world2.library.items[1].current.unwrap().appearance.unwrap())
+        .unwrap()
+        .1
+        .unwrap();
+    let ga = world2.library.releases[&rel_a].group;
+    let gb = world2.library.releases[&rel_b1].group;
+    assert_ne!(ga, gb);
+    world2.library.edits.insert(
+        (Kind::ReleaseGroup, ga, "original_date".to_owned()),
+        "2018".to_owned(),
+    );
+    world2.library.edits.insert(
+        (Kind::ReleaseGroup, gb, "original_date".to_owned()),
+        "2020".to_owned(),
+    );
+    // Now A also claims `rg-b`: A stays in ga, and B1+B2 remain together in gb.
+    world2.library.items[0].facts.release_group_mbid = Some("rg-b".to_owned());
+    let settled = world2.settle();
+    assert_eq!(settled.groups.len(), 2);
+    let grp_of = |rel: i64| {
+        settled.groups[settled
+            .releases
+            .iter()
+            .find(|r| r.r == Ref::Row(rel))
+            .unwrap()
+            .group]
+            .r
+    };
+    let rel_b2 = world2
+        .library
+        .appearances
+        .get(&world2.library.items[2].current.unwrap().appearance.unwrap())
+        .unwrap()
+        .1
+        .unwrap();
+    assert_eq!(grp_of(rel_a), Ref::Row(ga));
+    assert_eq!(grp_of(rel_b1), Ref::Row(gb));
+    assert_eq!(grp_of(rel_b2), Ref::Row(gb));
+    world2.assert_settled();
+}
+
+#[test]
+fn preferred_release_breaks_ties_on_group_split_without_overriding_majority() {
+    let mut world = World::default();
+    for (idx, (dir, mbid)) in [("A/1.flac", "r1"), ("B/1.flac", "r2"), ("C/1.flac", "r3")]
+        .into_iter()
+        .enumerate()
+    {
+        world.add(
+            file(dir, idx as i64 + 1)
+                .song(&format!("Song {idx}"), "Moss Arcade", 200)
+                .on(&format!("Album {idx}"), Some(1), 1)
+                .by("Moss Arcade")
+                .with(move |facts| {
+                    facts.release_mbid = Some(mbid.to_owned());
+                    facts.release_group_mbid = Some("rg-all".to_owned());
+                }),
+        );
+    }
+    world.settle();
+    let rel_of = |i: usize| {
+        world
+            .library
+            .appearances
+            .get(&world.library.items[i].current.unwrap().appearance.unwrap())
+            .unwrap()
+            .1
+            .unwrap()
+    };
+    let (r1, r2, r3) = (rel_of(0), rel_of(1), rel_of(2));
+    let g = world.library.releases[&r1].group;
+    world.library.groups.get_mut(&g).unwrap().preferred_release = Some(r1);
+    // Split r1 off from {r2, r3}: the 2-release majority keeps group `g`, not
+    // the lone departing preferred release.
+    world.library.items[0].facts.release_group_mbid = Some("rg-solo".to_owned());
+    let split = world.settle();
+    assert_eq!(split.groups.len(), 2);
+    let grp_of = |rel: i64| {
+        split.groups[split
+            .releases
+            .iter()
+            .find(|r| r.r == Ref::Row(rel))
+            .unwrap()
+            .group]
+            .r
+    };
+    assert_eq!(grp_of(r2), Ref::Row(g));
+    assert_eq!(grp_of(r3), Ref::Row(g));
+    assert_ne!(grp_of(r1), Ref::Row(g));
 }
 
 #[test]

@@ -10,8 +10,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ritornel_domain::library::{
-    ArtistKeyKind, Current, Evidence, ExistingArtistKey, ExistingCredit, ExistingRelease, Item,
-    Kind, Library, Method, Ref, Resolution,
+    ArtistKeyKind, Current, Evidence, ExistingArtistKey, ExistingCredit, ExistingGroup,
+    ExistingRelease, Item, Kind, Library, Method, Ref, Resolution,
 };
 use ritornel_domain::normalize::normalize;
 use ritornel_domain::{
@@ -24,7 +24,7 @@ use serde::Serialize;
 use crate::library_store::Write;
 use crate::scan_store::{PENDING_SETTING, VERSIONS_SETTING};
 use crate::walk::folder_of;
-use crate::{Error, LibraryStore, WriteRequest, Written};
+use crate::{Error, Id, LibraryStore, SubjectKind, WriteRequest, Written};
 
 type Text = Option<String>;
 
@@ -48,6 +48,7 @@ type AppearanceShown = (
 pub(crate) struct Shown {
     artists: HashMap<i64, (Text, Text, Text)>,
     artist_keys: HashMap<(ArtistKeyKind, String), (i64, Option<i64>)>,
+    edited_artists: HashSet<i64>,
     recordings: HashMap<i64, (Text, Option<i64>)>,
     groups: HashMap<i64, GroupShown>,
     releases: HashMap<i64, ReleaseShown>,
@@ -269,20 +270,31 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
         }
         shown.recordings.insert(id, (title, credit));
     }
-    for (id, recording, release, display) in rows(
+    for (id, canonical, recording, release, display) in rows(
         connection,
-        "SELECT id, recording_id, release_id, display_title, display_artist_credit_id, display_disc_number,
-                display_track_number, display_duration_ms, display_added_at_ms
+        "SELECT id, canonical_id, recording_id, release_id, display_title, display_artist_credit_id,
+                display_disc_number, display_track_number, display_duration_ms, display_added_at_ms
          FROM track_appearance",
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                (row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?),
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                (
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ),
             ))
         },
     )? {
+        if canonical != id {
+            library.appearance_canonical.insert(id, canonical);
+        }
         library.appearances.insert(id, (recording, release));
         shown.appearances.insert(id, display);
     }
@@ -314,26 +326,30 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
         library.releases.insert(id, existing);
         shown.releases.insert(id, display);
     }
-    for (id, preferred, display) in rows(
+    for (id, group, display) in rows(
         connection,
-        "SELECT id, preferred_release_id, display_primary_type, display_secondary_types_json,
-                display_first_date, display_first_year, display_release_id
+        "SELECT id, preferred_release_id, presentation IS NOT NULL, display_primary_type,
+                display_secondary_types_json, display_first_date, display_first_year,
+                display_release_id
          FROM release_group",
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, Option<i64>>(1)?,
+                ExistingGroup {
+                    preferred_release: row.get(1)?,
+                    has_presentation: row.get(2)?,
+                },
                 (
-                    row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ),
             ))
         },
     )? {
-        library.groups.insert(id, preferred);
+        library.groups.insert(id, group);
         shown.groups.insert(id, display);
     }
     // A row is found by its durable key in `artist_key`. When the library was
@@ -460,16 +476,36 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
             _ => {}
         }
     }
-    for (kind, entity, field, value) in rows(
+    // Active edits follow redirects through `canonical_id` where the kind has
+    // one, ordered oldest-to-newest so the newest active edit across a merged
+    // group wins while every row keeps the `entity_id` it originally named.
+    for (kind, raw_entity, entity, field, value) in rows(
         connection,
-        "SELECT entity_kind, entity_id, field, value FROM metadata_edit
-         WHERE withdrawn_at_ms IS NULL AND ordinal = 0",
+        "SELECT m.entity_kind,
+                m.entity_id,
+                CASE m.entity_kind
+                  WHEN 'recording'        THEN coalesce(rec.canonical_id, m.entity_id)
+                  WHEN 'track_appearance' THEN coalesce(ta.canonical_id, m.entity_id)
+                  WHEN 'release'          THEN coalesce(rel.canonical_id, m.entity_id)
+                  WHEN 'artist'           THEN coalesce(art.canonical_id, m.entity_id)
+                  ELSE m.entity_id
+                END,
+                m.field,
+                m.value
+         FROM metadata_edit m
+         LEFT JOIN recording rec        ON m.entity_kind = 'recording'        AND rec.id = m.entity_id
+         LEFT JOIN track_appearance ta  ON m.entity_kind = 'track_appearance' AND ta.id = m.entity_id
+         LEFT JOIN release rel          ON m.entity_kind = 'release'          AND rel.id = m.entity_id
+         LEFT JOIN artist art           ON m.entity_kind = 'artist'           AND art.id = m.entity_id
+         WHERE m.withdrawn_at_ms IS NULL AND m.ordinal = 0
+         ORDER BY m.id ASC",
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         },
     )? {
@@ -480,6 +516,9 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
             "release_group" => Kind::ReleaseGroup,
             _ => Kind::Artist,
         };
+        if kind == Kind::Artist && field == "name" {
+            shown.edited_artists.insert(raw_entity);
+        }
         library.edits.insert((kind, entity, field), value);
     }
     for (row, title, artist, album) in rows(
@@ -768,8 +807,8 @@ impl Plan {
                     let row = entry.artist;
                     let stored = &entry.value;
                     let version = entry.normalizer_version.or(library.artist_keys_by);
-                    let edited =
-                        library
+                    let edited = shown.edited_artists.contains(&row)
+                        || library
                             .edits
                             .contains_key(&(Kind::Artist, row, "name".to_owned()));
                     let name = shown
@@ -1537,5 +1576,205 @@ impl LibraryStore {
         })?;
         let resolved = serde_json::from_str(&written.result_json)?;
         Ok((written, resolved))
+    }
+
+    /// Records a metadata edit on the exact entity `entity` named (keeping its
+    /// own `id` even if it currently redirects to another row), withdraws any
+    /// prior active edit on that same named `(kind, entity, field)`, and
+    /// re-projects the catalog in the same transaction.
+    ///
+    /// Supported `(kind, field)` pairs:
+    /// - `Artist`: `"name"`
+    /// - `Recording`: `"title"`
+    /// - `TrackAppearance`: `"title"`
+    /// - `Release`: `"album"`, `"date"` (`YYYY`, `YYYY-MM`, or `YYYY-MM-DD`)
+    /// - `ReleaseGroup`: `"primary_type"` (`album`, `single`, `ep`, `broadcast`, `other`),
+    ///   `"original_date"` (`YYYY`, `YYYY-MM`, or `YYYY-MM-DD`)
+    pub fn set_metadata_edit(
+        &self,
+        request: WriteRequest,
+        kind: Kind,
+        entity: Id,
+        field: &str,
+        value: &str,
+    ) -> Result<Written, Error> {
+        if value.is_empty() {
+            return Err(Error::Invalid("an edit value may not be empty"));
+        }
+        match (kind, field) {
+            (Kind::Artist, "name")
+            | (Kind::Recording, "title")
+            | (Kind::TrackAppearance, "title")
+            | (Kind::Release, "album") => {}
+            (Kind::Release, "date") | (Kind::ReleaseGroup, "original_date") => {
+                if ritornel_domain::extract::parse_date(value).is_none() {
+                    return Err(Error::Invalid(
+                        "a date edit must be YYYY, YYYY-MM, or YYYY-MM-DD",
+                    ));
+                }
+            }
+            (Kind::ReleaseGroup, "primary_type") => {
+                if !matches!(value, "album" | "single" | "ep" | "broadcast" | "other") {
+                    return Err(Error::Invalid("unknown release-group primary_type"));
+                }
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported metadata edit field for entity kind",
+                ));
+            }
+        }
+        let field = field.to_owned();
+        let value = value.to_owned();
+        let actor = match request
+            .client
+            .map_or(SubjectKind::Person, |client| client.kind)
+        {
+            SubjectKind::Agent => "agent",
+            SubjectKind::Person | SubjectKind::Server => "person",
+        };
+        let session = request.client.map(|client| client.session);
+        self.write(request, move |write| {
+            let connection = write.connection();
+            let (kind_str, table) = match kind {
+                Kind::Recording => ("recording", "recording"),
+                Kind::TrackAppearance => ("track_appearance", "track_appearance"),
+                Kind::Release => ("release", "release"),
+                Kind::ReleaseGroup => ("release_group", "release_group"),
+                Kind::Artist => ("artist", "artist"),
+            };
+            // Store the named row's own ID, never its canonical target, so
+            // undoing a merge leaves the edit on the entity that was edited.
+            let entity_id: Option<i64> = connection
+                .query_row(
+                    &format!("SELECT id FROM {table} WHERE public_id = ?1"),
+                    [entity.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(entity_id) = entity_id else {
+                return Err(Error::NotFound("no such entity"));
+            };
+            let now_ms = write.now_ms();
+            let rev = write.rev();
+            connection.execute(
+                "UPDATE metadata_edit
+                 SET withdrawn_at_ms = ?4, rev = ?5
+                 WHERE entity_kind = ?1 AND entity_id = ?2 AND field = ?3
+                   AND ordinal = 0 AND withdrawn_at_ms IS NULL",
+                (kind_str, entity_id, &field, now_ms, rev),
+            )?;
+            connection.execute(
+                "INSERT INTO metadata_edit
+                   (entity_kind, entity_id, field, value, ordinal, actor_kind,
+                    actor_session_pid, edited_at_ms, rev)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    kind_str,
+                    entity_id,
+                    &field,
+                    &value,
+                    actor,
+                    session.as_ref().map(Id::as_bytes),
+                    now_ms,
+                    rev,
+                ],
+            )?;
+            let (library, mut shown) = load_in(connection)?;
+            shown.revision = rev - 1;
+            let policy = Policy::current();
+            let resolution = ritornel_domain::resolve(&library, &policy);
+            let plan = Plan::new(resolution, &library, &shown, policy.version);
+            if !plan.is_empty() {
+                plan.apply(write)?;
+                crate::history_store::rebind(write)?;
+            }
+            Ok(serde_json::to_string(&rev)?)
+        })
+    }
+
+    /// Withdraws the active metadata edit on the exact entity `entity` named
+    /// and re-projects the catalog in the same transaction. Returns `Ok(None)`
+    /// without taking a revision when that named row has no active edit on
+    /// `field`.
+    ///
+    /// Withdrawing affects only the named row: if another row in the same
+    /// merged group still carries an active edit on `field`, that edit shows
+    /// through until it is also withdrawn or the merge is undone.
+    pub fn withdraw_metadata_edit(
+        &self,
+        request: WriteRequest,
+        kind: Kind,
+        entity: Id,
+        field: &str,
+    ) -> Result<Option<Written>, Error> {
+        if field.is_empty() {
+            return Err(Error::Invalid("an edit must name a field"));
+        }
+        let field = field.to_owned();
+        let (kind_str, table) = match kind {
+            Kind::Recording => ("recording", "recording"),
+            Kind::TrackAppearance => ("track_appearance", "track_appearance"),
+            Kind::Release => ("release", "release"),
+            Kind::ReleaseGroup => ("release_group", "release_group"),
+            Kind::Artist => ("artist", "artist"),
+        };
+        let check_field = field.clone();
+        let has_active: bool = self.read(move |connection| {
+            let entity_id: Option<i64> = connection
+                .query_row(
+                    &format!("SELECT id FROM {table} WHERE public_id = ?1"),
+                    [entity.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(entity_id) = entity_id else {
+                return Err(Error::NotFound("no such entity"));
+            };
+            Ok(connection.query_row(
+                "SELECT EXISTS (
+                   SELECT 1 FROM metadata_edit
+                   WHERE entity_kind = ?1 AND entity_id = ?2 AND field = ?3
+                     AND ordinal = 0 AND withdrawn_at_ms IS NULL
+                 )",
+                (kind_str, entity_id, &check_field),
+                |row| row.get(0),
+            )?)
+        })?;
+        if !has_active {
+            return Ok(None);
+        }
+        let written = self.write(request, move |write| {
+            let connection = write.connection();
+            let entity_id: Option<i64> = connection
+                .query_row(
+                    &format!("SELECT id FROM {table} WHERE public_id = ?1"),
+                    [entity.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(entity_id) = entity_id else {
+                return Err(Error::NotFound("no such entity"));
+            };
+            let rev = write.rev();
+            connection.execute(
+                "UPDATE metadata_edit
+                 SET withdrawn_at_ms = ?4, rev = ?5
+                 WHERE entity_kind = ?1 AND entity_id = ?2 AND field = ?3
+                   AND ordinal = 0 AND withdrawn_at_ms IS NULL",
+                (kind_str, entity_id, &field, write.now_ms(), rev),
+            )?;
+            let (library, mut shown) = load_in(connection)?;
+            shown.revision = rev - 1;
+            let policy = Policy::current();
+            let resolution = ritornel_domain::resolve(&library, &policy);
+            let plan = Plan::new(resolution, &library, &shown, policy.version);
+            if !plan.is_empty() {
+                plan.apply(write)?;
+                crate::history_store::rebind(write)?;
+            }
+            Ok(serde_json::to_string(&rev)?)
+        })?;
+        Ok(Some(written))
     }
 }
