@@ -93,7 +93,7 @@ pub(super) async fn choose_folder(
     window: Retained<NSWindow>,
     prompt: String,
     message: String,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>, String> {
     let (send, chosen) = oneshot::channel();
     let send = Cell::new(Some(send));
     soon(move || {
@@ -121,7 +121,7 @@ pub(super) async fn choose_folder(
         });
         panel.beginSheetModalForWindow_completionHandler(&window, &handler);
     });
-    chosen.await.ok().flatten()
+    chosen.await.map_err(|err| err.to_string())
 }
 
 /// The language a page's `Intl` writes in: the first the system prefers.

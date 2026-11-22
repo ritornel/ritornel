@@ -16,7 +16,8 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::Arc;
+use std::process::Child;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -119,6 +120,7 @@ pub(crate) struct Link {
     launcher: Option<Arc<Launcher>>,
     /// The server to start apart from the app, where it outlives it.
     apart: Option<Arc<Program>>,
+    pending: Arc<Mutex<Pending>>,
     /// Whether a look is under way, for "Looking…".
     pub(crate) looking: bool,
     attempt: Option<Task<()>>,
@@ -161,6 +163,7 @@ impl Link {
             state: State::Looking,
             launcher,
             apart,
+            pending: Arc::default(),
             looking: false,
             attempt: None,
         };
@@ -200,8 +203,15 @@ impl Link {
     /// What Quit stops: the server this app started, held or apart, on this
     /// run or an earlier one. A server it found is left running.
     pub(crate) fn stop_started(&self) {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let started = self.started_apart();
+        if let Some(pid) = started {
+            pending.ready(pid);
+        }
+        pending.quit();
+        drop(pending);
         self.stop_owned();
-        if let Some(pid) = self.started_apart() {
+        if let Some(pid) = started {
             crate::platform::stop_server(pid, ritornel_client::launch::STOP_WAIT);
         }
     }
@@ -240,14 +250,16 @@ impl Link {
         self.looking = true;
         cx.notify();
         let apart = self.apart.clone();
+        let pending = Arc::clone(&self.pending);
         // Dropping the attempt before stops the looking it was doing.
         self.attempt = Some(cx.spawn(async move |link, cx| {
             let mut tries = 0usize;
             loop {
                 let (launched, apart) = (Arc::clone(&launcher), apart.clone());
+                let pending = Arc::clone(&pending);
                 let found = rt()
                     .spawn(async move {
-                        let server = find_or_start(&launched, apart.as_deref()).await?;
+                        let server = find_or_start(&launched, apart.as_deref(), &pending).await?;
                         Net::open(&server).await
                     })
                     .await;
@@ -334,12 +346,69 @@ impl Link {
 /// How long a server started apart has to come up.
 const START_WITHIN: Duration = Duration::from_secs(10);
 
+/// A detached child that has not announced itself yet. Explicit Quit and
+/// starting the process take the same lock, including the spawn itself.
+#[derive(Default)]
+struct Pending {
+    quitting: bool,
+    child: Option<Child>,
+}
+
+impl Pending {
+    fn start(&mut self, spawn: impl FnOnce() -> std::io::Result<Child>) -> Result<(), Error> {
+        if self.quitting {
+            return Err(Error::Start("Ritornel is quitting.".into()));
+        }
+        if let Some(child) = self.child.as_mut()
+            && child
+                .try_wait()
+                .map_err(|err| Error::Start(err.to_string()))?
+                .is_none()
+        {
+            return Ok(());
+        }
+        self.child = Some(spawn().map_err(|err| Error::Start(err.to_string()))?);
+        Ok(())
+    }
+
+    fn ready(&mut self, pid: u32) {
+        if self.child.as_ref().is_some_and(|child| child.id() != pid) {
+            // Another server won the directory. Our child is no longer needed.
+            self.stop_child();
+        } else if let Some(mut child) = self.child.take() {
+            let _ = std::thread::Builder::new()
+                .name("server reaper".into())
+                .spawn(move || child.wait());
+        }
+    }
+
+    fn stop_child(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn quit(&mut self) {
+        self.quitting = true;
+        self.stop_child();
+    }
+}
+
 /// Finds the server, or, with a program to start apart from the app and
 /// none running, starts it and finds it once it is up. One that loses the
 /// race to another ends, and the other is found.
-async fn find_or_start(launcher: &Launcher, apart: Option<&Program>) -> Result<LocalServer, Error> {
+async fn find_or_start(
+    launcher: &Launcher,
+    apart: Option<&Program>,
+    pending: &Mutex<Pending>,
+) -> Result<LocalServer, Error> {
+    let pending = || pending.lock().unwrap_or_else(PoisonError::into_inner);
     let error = match launcher.find_or_start().await {
-        Ok(server) => return Ok(server),
+        Ok(server) => {
+            pending().ready(server.pid());
+            return Ok(server);
+        }
         Err(error) => error,
     };
     let (
@@ -352,40 +421,79 @@ async fn find_or_start(launcher: &Launcher, apart: Option<&Program>) -> Result<L
     else {
         return Err(error);
     };
-    let mut child = crate::platform::start_server(program, launcher.data_dir())
-        .map_err(|error| Error::Start(format!("{}: {error}", program.path.display())))?;
+    pending().start(|| {
+        crate::platform::start_server(program, launcher.data_dir()).map_err(|err| {
+            std::io::Error::new(err.kind(), format!("{}: {err}", program.path.display()))
+        })
+    })?;
     let started = Instant::now();
     let mut ended = None;
-    let found = loop {
+    loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if ended.is_none() {
-            ended = child.try_wait().ok().flatten();
+            let mut pending = pending();
+            if let Some(child) = pending.child.as_mut() {
+                ended = child.try_wait().ok().flatten();
+            } else if pending.quitting {
+                return Err(Error::Start("Ritornel is quitting.".into()));
+            }
         }
         let lost_race = ended.is_some_and(|status| {
             status.code() == Some(i32::from(ritornel_contract::local::EXIT_IN_USE))
         });
         match launcher.find_or_start().await {
-            Ok(server) => break Ok(server),
+            Ok(server) => {
+                pending().ready(server.pid());
+                return Ok(server);
+            }
             Err(_) if ended.is_some() && !lost_race => {
                 let status = ended.map(|status| status.to_string()).unwrap_or_default();
-                break Err(Error::Start(format!(
+                return Err(Error::Start(format!(
                     "the server ended before it was ready ({status})"
                 )));
             }
-            Err(error) if started.elapsed() >= START_WITHIN => break Err(error),
+            Err(error) if started.elapsed() >= START_WITHIN => return Err(error),
             Err(_) => {}
         }
-    };
-    // It is reaped when it ends, while the app runs; after, it is the system's.
-    if ended.is_none() {
-        let _ = std::thread::Builder::new()
-            .name("server reaper".to_owned())
-            .spawn(move || child.wait());
     }
-    found
 }
 
 /// The link, made once for the app.
 pub(crate) fn new(data_dir: Option<&Path>, cx: &mut gpui::App) -> gpui::Entity<Link> {
     cx.new(|cx| Link::new(data_dir, cx))
+}
+
+#[cfg(all(test, unix))]
+mod launch_tests {
+    use super::*;
+
+    #[test]
+    fn quit_stops_a_pending_child_and_prevents_a_later_spawn() -> gpui::Result<()> {
+        let mut pending = Pending::default();
+        pending.start(|| std::process::Command::new("sleep").arg("60").spawn())?;
+        let pid = pending
+            .child
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("child missing"))?
+            .id();
+        pending.quit();
+        assert!(
+            !std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()?
+                .status
+                .success()
+        );
+        let mut spawned = false;
+        assert!(
+            pending
+                .start(|| {
+                    spawned = true;
+                    Err(std::io::ErrorKind::Interrupted.into())
+                })
+                .is_err()
+        );
+        assert!(!spawned);
+        Ok(())
+    }
 }

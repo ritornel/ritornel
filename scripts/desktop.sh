@@ -48,6 +48,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 app=$root/apps/desktop
 system=$(uname -s)
+source "$root/scripts/wait-for-server.sh"
 
 case $system in
     Darwin) ;;
@@ -130,18 +131,15 @@ serve() {
     exec 3< <(while kill -0 $$ 2>/dev/null; do sleep 1; done)
     log=$(mktemp)
     RITORNEL_TEST_NO_MEDIA_SESSION=1 "$server" serve --owned --data-dir "$data" \
-        --listen 127.0.0.1:0 --output null --log-level warn ${RITORNEL_GPUI_SERVE_ARGS:-} <&3 >"$log" &
+        --listen 127.0.0.1:0 --output null --log-level warn ${RITORNEL_GPUI_SERVE_ARGS:-} <&3 >>"$log" 2> >(tee -a "$log" >&2) &
     served=$!
     trap 'kill $served ${hidden:-} 2>/dev/null; rm -f "$log"' EXIT
-    for _ in $(seq 100); do
-        grep -q '^ready' "$log" && return
-        kill -0 $served 2>/dev/null || { echo "the server did not start" >&2; exit 1; }
-        sleep 0.1
-    done
+    wait_for_server "$served" "$log" 100
 }
 
 case "${1:-}" in
     check)
+        bash "$root/scripts/tests/wait-for-server.sh"
         gpui fmt --check
         gpui clippy --locked --all-targets -- -D warnings
         gpui test --locked

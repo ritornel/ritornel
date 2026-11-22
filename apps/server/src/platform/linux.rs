@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use super::service::{installed, prepare};
-use super::systemd::{UNIT, must, status, stop, uninstall, unit};
-use crate::error::io_error;
+use super::systemd::{UNIT, install, status, uninstall, unit};
 use crate::{Env, Error};
 
 pub(crate) use super::fallback::wait;
@@ -47,17 +46,7 @@ pub(crate) fn install_service(data_dir: Option<&Path>, env: Env<'_>) -> Result<S
     let path = units.join(UNIT);
     // The log directory must be there before systemd opens the log in it.
     let (dir, program) = prepare(data_dir, env)?;
-    // One registered before goes first, and its server stops.
-    stop(&systemctl)?;
-    std::fs::create_dir_all(&units).map_err(io_error("create", &units))?;
-    let staged = path.with_extension("service.new");
-    std::fs::write(&staged, unit(&program, dir.root())).map_err(io_error("write", &staged))?;
-    std::fs::rename(&staged, &path).map_err(io_error("write", &path))?;
-    must(&systemctl, &["daemon-reload".as_ref()])?;
-    must(
-        &systemctl,
-        &["enable".as_ref(), "--now".as_ref(), UNIT.as_ref()],
-    )?;
+    install(&path, &unit(&program, dir.root()), &systemctl)?;
     Ok(installed(&program, &dir))
 }
 

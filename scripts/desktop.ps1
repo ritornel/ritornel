@@ -1,27 +1,28 @@
+#requires -Version 7.0
 # Builds and runs the desktop app (apps/desktop), in GPUI, on Windows, as
 # scripts/desktop.sh does on a Mac. The server is built here too, from the
 # main workspace.
 #
-#   .\scripts\desktop.ps1 run [args]     run it against an invented library
+#   pwsh -File .\scripts\desktop.ps1 run [args]     run it against an invented library
 #                                        of 8,600 albums, never a real one:
 #                                        made once in apps\desktop\.invented,
 #                                        served silently on a port of its
 #                                        own, stopped on quit (-DataDir runs
 #                                        it on another data directory)
-#   .\scripts\desktop.ps1 tones [args]   run it against a library that plays:
+#   pwsh -File .\scripts\desktop.ps1 tones [args]   run it against a library that plays:
 #                                        one invented album of four tones a
 #                                        minute and a half long, made once
 #                                        with the pinned ffmpeg in
 #                                        apps\desktop\.tones, played into
 #                                        nothing
-#   .\scripts\desktop.ps1 app            build the app with the release
+#   pwsh -File .\scripts\desktop.ps1 app            build the app with the release
 #                                        ritornel-server.exe beside it, as
 #                                        the launcher looks for it, in
 #                                        apps\desktop\target\release\bundle\Ritornel
 #
 # Other arguments go to the app:
-#   .\scripts\desktop.ps1 run --size 1400x900
-#   .\scripts\desktop.ps1 run --measure 25 --out report.json
+#   pwsh -File .\scripts\desktop.ps1 run --size 1400x900
+#   pwsh -File .\scripts\desktop.ps1 run --measure 25 --out report.json
 param(
     [Parameter(Position = 0)][ValidateSet('run', 'tones', 'app')][string]$Command = 'run',
     [string]$DataDir,
@@ -88,6 +89,8 @@ function Invoke-App([string]$Data) {
         Stop-Served $served
     }
 }
+
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 switch ($Command) {
     'run' {

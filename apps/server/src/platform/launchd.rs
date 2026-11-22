@@ -138,6 +138,53 @@ pub(crate) fn bootout(job: &str, launchctl: Launchctl<'_>) -> Result<bool, Error
     }
 }
 
+pub(crate) fn install(
+    job: &str,
+    domain: &str,
+    path: &Path,
+    contents: &str,
+    launchctl: Launchctl<'_>,
+) -> Result<(), Error> {
+    let replacement = super::service::Replacement::install(path, contents)?;
+    let registered = || {
+        let out = launchctl(&["print".as_ref(), job.as_ref()])?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(PRINT_NO_SUCH_JOB) => Ok(false),
+            _ => Err(failed("print", &out)),
+        }
+    };
+    let bootstrap = || {
+        let output = launchctl(&["bootstrap".as_ref(), domain.as_ref(), path.as_os_str()])?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(failed("bootstrap", &output))
+        }
+    };
+    let was_loaded = match registered() {
+        Ok(loaded) => loaded,
+        Err(error) => return Err(replacement.rollback(error, || Ok(()))),
+    };
+    let replacement = replacement.protect_running(was_loaded)?;
+    if was_loaded && let Err(error) = bootout(job, launchctl) {
+        return Err(replacement.rollback(error, || {
+            if !registered()? {
+                bootstrap()?;
+            }
+            Ok(())
+        }));
+    }
+    bootstrap().map_err(|error| {
+        replacement.rollback(error, || {
+            if was_loaded {
+                bootstrap()?;
+            }
+            Ok(())
+        })
+    })
+}
+
 /// Stops the job and removes its plist, and says what was done. The
 /// plist stays if the job could not be removed, so that it can be tried
 /// again.
@@ -226,26 +273,60 @@ mod tests {
         }
     }
 
-    struct Plist(std::path::PathBuf);
+    struct Plist {
+        path: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
 
     impl Plist {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "ritornel-service-{}-{name}.plist",
-                std::process::id()
-            ));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{name}.plist"));
             std::fs::write(&path, "<plist/>").unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for Plist {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            Self { path, _dir: dir }
         }
     }
 
     const JOB: &str = "gui/501/dev.ritornel.server";
+
+    #[test]
+    fn failed_registration_puts_the_running_definition_back() {
+        let file = Plist::new("rollback");
+        let fake = Fake::new(vec![
+            ("print", output(0, "")),
+            ("bootout", output(0, "")),
+            ("print", output(113, "")),
+            ("bootstrap", output(1, "bad plist")),
+            ("bootstrap", output(0, "")),
+        ]);
+        assert!(
+            install(JOB, "gui/501", &file.path, "new plist", &|args| fake
+                .run(args))
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "<plist/>");
+        assert!(fake.answers.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_running_service_with_no_saved_definition_is_left_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing");
+        let fake = Fake::new(vec![("print", output(0, ""))]);
+        let error =
+            install(JOB, "gui/501", &path, "new plist", &|args| fake.run(args)).unwrap_err();
+        assert!(error.to_string().contains("no saved definition"));
+        assert!(!path.exists());
+        assert!(fake.answers.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_failed_stage_leaves_the_manager_alone() {
+        let file = Plist::new("stage-error");
+        let path = file.path.join("not-a-directory");
+        let fake = Fake::new(vec![]);
+        assert!(install(JOB, "gui/501", &path, "new plist", &|args| fake.run(args)).is_err());
+    }
 
     #[test]
     fn a_running_service_is_stopped_waited_for_and_its_plist_removed() {
@@ -255,9 +336,9 @@ mod tests {
             ("print", output(0, "state = running")),
             ("print", output(PRINT_NO_SUCH_JOB, "Could not find service")),
         ]);
-        let said = uninstall(JOB, &plist.0, &|args| fake.run(args)).unwrap();
+        let said = uninstall(JOB, &plist.path, &|args| fake.run(args)).unwrap();
         assert_eq!(said, "Removed the background service");
-        assert!(!plist.0.exists());
+        assert!(!plist.path.exists());
         assert_eq!(*fake.calls.borrow(), ["bootout", "print", "print"]);
     }
 
@@ -266,10 +347,10 @@ mod tests {
         let plist = Plist::new("absent");
         let absent = || output(BOOTOUT_NO_SUCH_JOB, "Boot-out failed: 3: No such process");
         let fake = Fake::new(vec![("bootout", absent()), ("bootout", absent())]);
-        let said = uninstall(JOB, &plist.0, &|args| fake.run(args)).unwrap();
+        let said = uninstall(JOB, &plist.path, &|args| fake.run(args)).unwrap();
         assert_eq!(said, "Removed the background service");
-        assert!(!plist.0.exists());
-        let said = uninstall(JOB, &plist.0, &|args| fake.run(args)).unwrap();
+        assert!(!plist.path.exists());
+        let said = uninstall(JOB, &plist.path, &|args| fake.run(args)).unwrap();
         assert_eq!(said, "The background service is not installed");
     }
 
@@ -280,21 +361,21 @@ mod tests {
             "bootout",
             output(5, "Boot-out failed: 5: Input/output error"),
         )]);
-        let failed = uninstall(JOB, &plist.0, &|args| fake.run(args)).unwrap_err();
+        let failed = uninstall(JOB, &plist.path, &|args| fake.run(args)).unwrap_err();
         assert_eq!(
             failed.to_string(),
             "the background service: launchctl bootout failed: Boot-out failed: 5: \
              Input/output error"
         );
-        assert!(plist.0.exists());
+        assert!(plist.path.exists());
 
         // A print that fails for another reason is no proof it stopped.
         let fake = Fake::new(vec![("bootout", output(0, "")), ("print", output(1, ""))]);
-        let failed = uninstall(JOB, &plist.0, &|args| fake.run(args)).unwrap_err();
+        let failed = uninstall(JOB, &plist.path, &|args| fake.run(args)).unwrap_err();
         assert_eq!(
             failed.to_string(),
             "the background service: launchctl print failed with exit code 1"
         );
-        assert!(plist.0.exists());
+        assert!(plist.path.exists());
     }
 }
