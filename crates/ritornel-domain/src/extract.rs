@@ -1,4 +1,4 @@
-//! Extractor 2: turns one stored payload into claims. See "Scanning one
+//! Extractor 3: turns one stored payload into claims. See "Scanning one
 //! file" step 6 and decision 3 in docs/design/identity.md.
 //!
 //! The tag names are the ones MusicBrainz Picard and beets write, taken
@@ -18,7 +18,7 @@
 use crate::payload::{Payload, Tag};
 
 /// The version of this extractor. Claims are rebuilt when it changes.
-pub const EXTRACTOR_VERSION: i64 = 2;
+pub const EXTRACTOR_VERSION: i64 = 3;
 
 /// The kind of entity a claim describes. It is never a pointer to one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -245,7 +245,7 @@ fn rank(tag: &Tag) -> u8 {
 
 /// Every value of the tags with one of these names, in the file's order,
 /// from the one block of tags that is trusted most among those that have
-/// any. A value that is there twice is there once.
+/// any. Repeated values are one, except for the positional MP4 number/total pair.
 fn values<'a>(payload: &'a Payload, names: &[&str]) -> Vec<&'a str> {
     let named: Vec<&Tag> = payload
         .tags
@@ -269,7 +269,9 @@ fn values<'a>(payload: &'a Payload, names: &[&str]) -> Vec<&'a str> {
     let mut found: Vec<&str> = Vec::new();
     for tag in named.iter().filter(|tag| tag.block == best.block) {
         for value in tag.values.iter().map(|value| value.trim()) {
-            if !value.is_empty() && !found.contains(&value) {
+            if !value.is_empty()
+                && (matches!(tag.key.as_str(), "trkn" | "disk") || !found.contains(&value))
+            {
                 found.push(value);
             }
         }
@@ -468,11 +470,22 @@ pub fn extract(payload: &Payload) -> Vec<Claim> {
     let track = values(payload, names::TRACK);
     let disc = values(payload, names::DISC);
     let total = |position: &[&str], totals: &[&str]| {
+        let positive = |n: &u32| *n > 0;
         position
             .first()
             .and_then(|value| after_slash(value))
-            .or_else(|| totals.first().and_then(|value| leading_number(value)))
-            .or_else(|| position.get(1).and_then(|value| leading_number(value)))
+            .filter(positive)
+            .or_else(|| {
+                totals
+                    .iter()
+                    .find_map(|value| leading_number(value).filter(positive))
+            })
+            .or_else(|| {
+                position
+                    .get(1)
+                    .and_then(|value| leading_number(value))
+                    .filter(positive)
+            })
     };
     let track_total = total(&track, &values(payload, names::TRACK_TOTAL));
     let disc_total = total(&disc, &values(payload, names::DISC_TOTAL));
@@ -912,6 +925,52 @@ mod tests {
         assert_eq!(facts.primary_type.as_deref(), Some("single"));
         assert_eq!(facts.original_date.as_deref(), Some("1999"));
         assert!(facts.compilation);
+    }
+
+    #[test]
+    fn mp4_position_and_total_are_two_fields_even_when_equal() {
+        let claims = extract(&payload(
+            "single.m4a",
+            vec![
+                tag("trkn", "8"),
+                tag("trkn", "8"),
+                tag("disk", "1"),
+                tag("disk", "1"),
+            ],
+        ));
+        for (field, expected) in [("track_total", "8"), ("disc_total", "1")] {
+            assert!(
+                claims
+                    .iter()
+                    .any(|c| c.name == field && c.value == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_is_an_unknown_total() {
+        let claims = extract(&payload(
+            "single.flac",
+            vec![
+                tag("TRACKNUMBER", "4/0"),
+                tag("DISCNUMBER", "1"),
+                tag("DISCTOTAL", "0"),
+            ],
+        ));
+        assert!(!claims.iter().any(|c| c.name.ends_with("_total")));
+    }
+
+    #[test]
+    fn an_unknown_slash_total_leaves_room_for_an_explicit_total() {
+        let claims = extract(&payload(
+            "single.flac",
+            vec![tag("TRACKNUMBER", "4/0"), tag("TRACKTOTAL", "12")],
+        ));
+        assert!(
+            claims
+                .iter()
+                .any(|claim| claim.name == "track_total" && claim.value == "12")
+        );
     }
 
     #[test]
