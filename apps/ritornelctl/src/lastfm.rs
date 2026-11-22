@@ -157,7 +157,7 @@ fn render_summary(summary: &SyncSummary) -> String {
         lines.push(("Loved", loved.to_string()));
     }
     if summary.matched_after > 0 {
-        lines.push(("Newly matched", summary.matched_after.to_string()));
+        lines.push(("Matched again", summary.matched_after.to_string()));
     }
     server::facts(&lines)
 }

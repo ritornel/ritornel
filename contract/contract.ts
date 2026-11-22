@@ -900,9 +900,10 @@ export type DoubtfulTrack = {
   plays: number,
   /**
    * Why it was not bound: `several`, when the artist and title name
-   * several recordings the album cannot tell apart, or `near`, when
-   * nothing matches exactly but something does without accents and
-   * bracketed notes.
+   * several recordings the album cannot tell apart; `album`, when they
+   * name one and the album is none it is on, so the play may be of
+   * another version; or `near`, when nothing matches exactly but
+   * something does without accents and bracketed notes.
    */
   doubt: string,
   /**
@@ -4455,8 +4456,8 @@ export type SyncSummary = {
    */
   loved?: number,
   /**
-   * Tracks bound to the library at the end, which the library did not
-   * have when they were first seen.
+   * Tracks whose binding changed when every track was judged again at
+   * the end: newly bound, moved to another recording, or released.
    */
   matchedAfter: number,
 };

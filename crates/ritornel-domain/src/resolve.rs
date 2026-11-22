@@ -293,7 +293,7 @@ struct Ev {
 
 /// The number a part is written as: digits, a roman numeral up to
 /// thirty-nine, or a word up to ten.
-fn part_number(word: &str) -> Option<u32> {
+pub(crate) fn part_number(word: &str) -> Option<u32> {
     if let Ok(number) = word.parse::<u32>() {
         return Some(number);
     }
@@ -377,10 +377,29 @@ fn apart(a: Option<(Option<i64>, i64)>, b: Option<(Option<i64>, i64)>) -> bool {
     }
 }
 
-/// The version markers of a title by a marker list, for tests.
-#[cfg(test)]
+/// The version markers of a title by a marker list.
 pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
     markers(Some(title), VERSION_MARKERS, list)
+}
+
+/// The version markers of an album title, such as "live" or "acoustic", by
+/// policy 2's list, as the scrobble matcher reads them. It also reads
+/// "Acoustics" as "acoustic"; the file resolver's policies do not, so that
+/// their results stay as they are.
+pub(crate) fn album_markers_of(album: &str) -> Vec<String> {
+    let mut found = markers(Some(album), ALBUM_MARKERS, 2);
+    // Read as `markers` reads, between any marks and with marks inside a
+    // word joining it.
+    let lower: String = album.nfkc().flat_map(char::to_lowercase).collect();
+    let acoustics = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .chain(crate::normalize::joined_words(album).split(' '))
+        .any(|word| word == "acoustics");
+    if acoustics && !found.iter().any(|marker| marker == "acoustic") {
+        found.push("acoustic".to_owned());
+    }
+    found.sort();
+    found
 }
 
 impl Ev {

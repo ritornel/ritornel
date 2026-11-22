@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ritornel_domain::NORMALIZER_VERSION;
 use ritornel_domain::scrobble::{
-    Appearance, Catalog, MATCHER_VERSION, Recording, Scrobbled, Verdict,
+    Appearance, Catalog, MATCHER_VERSION, Recording, Rule, Scrobbled, Verdict,
 };
 use ritornel_source::{Batch, Love, LovesStored, Stored};
 use rusqlite::{Connection, OptionalExtension};
@@ -37,6 +37,10 @@ pub const MATCH_METHOD: &str = "identity.matchScrobbles";
 
 /// A subject item with its text: its row, artist, album and title.
 type Subject = (i64, String, Option<String>, String);
+
+/// What a subject is bound to: a recording, and an appearance where one is
+/// known.
+type Bound = (i64, Option<i64>);
 
 /// What a track shows: its canonical recording's row and ID, its title,
 /// artist and album.
@@ -202,34 +206,157 @@ pub(crate) fn catalog_recordings(connection: &Connection) -> Result<Vec<Recordin
         .collect())
 }
 
-/// Binds a subject item as the matcher says, unless it is bound already:
-/// a decision of its own, the assignment, and the item's cached recording.
-fn bind(
-    write: &Write<'_>,
-    item: i64,
-    text: (&str, Option<&str>, &str),
+/// What the matcher would bind a subject item to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Wanted {
     recording: i64,
     appearance: Option<i64>,
     candidates: usize,
+    rule: Rule,
+}
+
+/// What the matcher says of a subject's text.
+fn wanted(
+    catalog: &Catalog,
+    except: &HashSet<i64>,
+    artist: &str,
+    album: Option<&str>,
+    title: &str,
+) -> Option<Wanted> {
+    match catalog.judge_except(
+        Scrobbled {
+            artist,
+            album,
+            title,
+        },
+        except,
+    ) {
+        Verdict::Bind {
+            recording,
+            appearance,
+            candidates,
+            rule,
+        } => Some(Wanted {
+            recording,
+            appearance,
+            candidates,
+            rule,
+        }),
+        Verdict::Doubtful { .. } | Verdict::Absent => None,
+    }
+}
+
+/// The binding in force on an item, when the matcher made it or there is
+/// none: its assignment, and the recording and appearance it ends at
+/// through redirects. `Err` holds back an item the owner bound.
+type Current = Option<(i64, i64, Option<i64>)>;
+
+fn current(connection: &Connection, item: i64) -> Result<Result<Current, ()>, Error> {
+    let found: Option<(i64, i64, Option<i64>, String)> = connection
+        .prepare_cached(
+            "SELECT a.id, r.canonical_id, ta.canonical_id, d.actor_kind FROM assignment a
+             JOIN identity_decision d ON d.id = a.decision_id
+             JOIN recording r ON r.id = a.recording_id
+             LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
+             WHERE a.source_item_id = ?1 AND a.superseded_at_ms IS NULL",
+        )?
+        .query_row([item], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .optional()?;
+    Ok(match found {
+        Some((.., actor)) if actor != "resolver" => Err(()),
+        Some((id, recording, appearance, _)) => Ok(Some((id, recording, appearance))),
+        None => Ok(None),
+    })
+}
+
+/// The recordings the owner said each item is not, as the canonical
+/// recordings they end at, so that a merge cannot carry a binding past
+/// one.
+type Exclusions = HashMap<i64, HashSet<i64>>;
+
+fn exclusions(connection: &Connection) -> Result<Exclusions, Error> {
+    let mut statement = connection.prepare(
+        "SELECT e.source_item_id, x.canonical_id FROM identity_exclusion e
+         JOIN recording x ON x.id = e.recording_id
+         JOIN source_item si ON si.id = e.source_item_id
+         WHERE si.item_kind = 'scrobble_subject'",
+    )?;
+    let mut found: Exclusions = HashMap::new();
+    for row in statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))? {
+        let (item, recording): (i64, i64) = row?;
+        found.entry(item).or_default().insert(recording);
+    }
+    Ok(found)
+}
+
+/// Whether the binding in force, as the recording and appearance it ends at
+/// through redirects, is what is wanted: both the recording its plays count
+/// for and the appearance. A binding a merge carries there is kept, so that
+/// undoing the merge gives it back. The matcher names a canonical
+/// appearance, and that appearance's own recording.
+fn holds(
+    connection: &Connection,
+    now: Option<Bound>,
+    wanted: Option<Wanted>,
+) -> Result<bool, Error> {
+    Ok(match (now, wanted) {
+        (None, None) => true,
+        (Some((recording, appearance)), Some(wanted)) => {
+            let canonical: i64 = connection
+                .prepare_cached("SELECT canonical_id FROM recording WHERE id = ?1")?
+                .query_row([wanted.recording], |row| row.get(0))?;
+            recording == canonical && appearance == wanted.appearance
+        }
+        _ => false,
+    })
+}
+
+/// Binds a subject item as the matcher says: a binding in force that
+/// differs is superseded, and a new one is a decision of its own, the
+/// assignment and the item's cached recording. With nothing wanted the item
+/// is left unbound. Returns whether its binding changed.
+fn settle(
+    write: &Write<'_>,
+    item: i64,
+    text: (&str, Option<&str>, &str),
+    wanted: Option<Wanted>,
 ) -> Result<bool, Error> {
     let connection = write.connection();
-    let bound: bool = connection
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM assignment
-                            WHERE source_item_id = ?1 AND superseded_at_ms IS NULL)",
-        )?
-        .query_row([item], |row| row.get(0))?;
-    if bound {
+    // The owner may have bound it since it was judged.
+    let Ok(now) = current(connection, item)? else {
+        return Ok(false);
+    };
+    if holds(
+        connection,
+        now.map(|(_, recording, appearance)| (recording, appearance)),
+        wanted,
+    )? {
         return Ok(false);
     }
+    if let Some((old, ..)) = now {
+        connection
+            .prepare_cached("UPDATE assignment SET superseded_at_ms = ?2, rev = ?3 WHERE id = ?1")?
+            .execute((old, write.now_ms(), write.rev()))?;
+    }
+    let Some(wanted) = wanted else {
+        connection
+            .prepare_cached(
+                "UPDATE source_item SET current_recording_id = NULL, rev = ?2 WHERE id = ?1",
+            )?
+            .execute((item, write.rev()))?;
+        return Ok(true);
+    };
     let (artist, album, title) = text;
     let evidence = serde_json::json!({
         "matcher": MATCHER_VERSION,
         "artist": artist,
         "album": album,
         "title": title,
-        "candidates": candidates,
-        "byAlbum": candidates > 1,
+        "candidates": wanted.candidates,
+        "byAlbum": wanted.candidates > 1,
+        "rule": wanted.rule.as_str(),
     });
     connection
         .prepare_cached(
@@ -255,50 +382,41 @@ fn bind(
         )?
         .execute((
             item,
-            recording,
-            appearance,
+            wanted.recording,
+            wanted.appearance,
             decision,
             write.now_ms(),
             write.rev(),
         ))?;
+    if let Some((old, ..)) = now {
+        connection
+            .prepare_cached("UPDATE assignment SET superseded_by_id = ?2 WHERE id = ?1")?
+            .execute((old, connection.last_insert_rowid()))?;
+    }
     connection
         .prepare_cached(
             "UPDATE source_item SET current_recording_id =
                (SELECT canonical_id FROM recording WHERE id = ?2), rev = ?3
              WHERE id = ?1",
         )?
-        .execute((item, recording, write.rev()))?;
+        .execute((item, wanted.recording, write.rev()))?;
     Ok(true)
 }
 
-/// Matches these subject items and binds those the matcher is sure of.
-/// Returns how many it bound.
+/// Judges these subject items and binds them as the matcher says. Returns
+/// how many bindings changed.
 fn match_items(write: &Write<'_>, catalog: &Catalog, items: &[Subject]) -> Result<usize, Error> {
-    let mut bound = 0;
+    let except = exclusions(write.connection())?;
+    let none = HashSet::new();
+    let mut changed = 0;
     for (item, artist, album, title) in items {
-        let verdict = catalog.judge(Scrobbled {
-            artist,
-            album: album.as_deref(),
-            title,
-        });
-        if let Verdict::Bind {
-            recording,
-            appearance,
-            candidates,
-        } = verdict
-            && bind(
-                write,
-                *item,
-                (artist, album.as_deref(), title),
-                recording,
-                appearance,
-                candidates,
-            )?
-        {
-            bound += 1;
+        let except = except.get(item).unwrap_or(&none);
+        let wanted = wanted(catalog, except, artist, album.as_deref(), title);
+        if settle(write, *item, (artist, album.as_deref(), title), wanted)? {
+            changed += 1;
         }
     }
-    Ok(bound)
+    Ok(changed)
 }
 
 /// The keys among `keys` that the endpoint has stored.
@@ -449,7 +567,7 @@ pub struct Doubtful {
     pub title: String,
     /// Its plays.
     pub plays: i64,
-    /// Why it was not bound: `several` or `near`.
+    /// Why it was not bound: `several`, `album` or `near`.
     pub doubt: &'static str,
     /// What it nearly matched: title, artist credit.
     pub candidates: Vec<(Option<String>, Option<String>)>,
@@ -775,28 +893,28 @@ impl LibraryStore {
         Ok(stored)
     }
 
-    /// Matches the account's unbound tracks to the library again, binds
-    /// those the matcher is now sure of, and derives their plays again.
-    /// Run after a sync, since the library may have grown since a track was
-    /// first seen. Returns how many it bound; with none, nothing is written.
+    /// Judges every one of the account's tracks again, bound or not, but
+    /// those the owner bound: binds those the matcher is now sure of, moves
+    /// or releases a binding that no longer holds, and derives their plays
+    /// again. Run after a sync, since the library may have changed since a
+    /// track was judged. Returns how many bindings changed; with none,
+    /// nothing is written.
     pub fn match_scrobbles(&self, account: Id) -> Result<usize, Error> {
         let sure = self.read(move |connection| {
             let rows = rows_of(connection, account)?;
             let catalog = catalog(connection)?;
-            let unbound = unbound_subjects(connection, rows.instance)?;
-            Ok(unbound
-                .into_iter()
-                .filter(|(_, artist, album, title)| {
-                    matches!(
-                        catalog.judge(Scrobbled {
-                            artist,
-                            album: album.as_deref(),
-                            title,
-                        }),
-                        Verdict::Bind { .. }
-                    )
-                })
-                .collect::<Vec<_>>())
+            let except = exclusions(connection)?;
+            let none = HashSet::new();
+            let mut differ = Vec::new();
+            for (subject, now) in judged_subjects(connection, rows.instance)? {
+                let (_, artist, album, title) = &subject;
+                let except = except.get(&subject.0).unwrap_or(&none);
+                let wanted = wanted(&catalog, except, artist, album.as_deref(), title);
+                if !holds(connection, now, wanted)? {
+                    differ.push(subject);
+                }
+            }
+            Ok(differ)
         })?;
         if sure.is_empty() {
             return Ok(0);
@@ -860,6 +978,43 @@ fn loved_now(
         }
     }
     Ok(loved)
+}
+
+/// The account's subject items the matcher judges, which are all but those
+/// the owner bound, with their text and the recording and appearance they
+/// are bound to now, through redirects.
+fn judged_subjects(
+    connection: &Connection,
+    instance: i64,
+) -> Result<Vec<(Subject, Option<Bound>)>, Error> {
+    let mut statement = connection.prepare(
+        "SELECT si.id, si.provider_key, r.canonical_id, ta.canonical_id FROM source_item si
+         LEFT JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+         LEFT JOIN identity_decision d ON d.id = a.decision_id
+         LEFT JOIN recording r ON r.id = a.recording_id
+         LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
+         WHERE si.source_instance_id = ?1 AND si.item_kind = ?2 AND si.retired_at_ms IS NULL
+           AND (a.id IS NULL OR d.actor_kind = 'resolver')",
+    )?;
+    let rows = statement.query_map((instance, SUBJECT), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (item, key, recording, appearance) = row?;
+        if let Some((artist, album, title)) = subject_text(&key) {
+            found.push((
+                (item, artist, album, title),
+                recording.map(|recording| (recording, appearance)),
+            ));
+        }
+    }
+    Ok(found)
 }
 
 /// The account's subject items that no assignment binds, with their text.
@@ -932,6 +1087,8 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
     report.matched_tracks = plays_of.keys().filter(|item| bound.contains(item)).count() as i64;
 
     let catalog = catalog(connection)?;
+    let except = exclusions(connection)?;
+    let none = HashSet::new();
     let shows = |recording: i64| -> Result<(Option<String>, Option<String>), Error> {
         Ok(connection.query_row(
             "SELECT r.display_title, ac.display_text FROM recording r
@@ -945,11 +1102,14 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
         let Some(&plays) = plays_of.get(&item) else {
             continue;
         };
-        match catalog.judge(Scrobbled {
-            artist: &artist,
-            album: album.as_deref(),
-            title: &title,
-        }) {
+        match catalog.judge_except(
+            Scrobbled {
+                artist: &artist,
+                album: album.as_deref(),
+                title: &title,
+            },
+            except.get(&item).unwrap_or(&none),
+        ) {
             Verdict::Doubtful { doubt, candidates } => {
                 report.doubtful_tracks += 1;
                 report.doubtful_plays += plays;
