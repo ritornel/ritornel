@@ -56,6 +56,11 @@ pub(crate) const LIBRARY: &[Migration] = &[
         name: "0002_fold_search_text",
         sql: include_str!("../migrations/library/0002_fold_search_text.sql"),
     },
+    Migration {
+        version: 3,
+        name: "0003_claim_and_love_indexes",
+        sql: include_str!("../migrations/library/0003_claim_and_love_indexes.sql"),
+    },
 ];
 
 /// What a run did.
@@ -428,6 +433,36 @@ mod tests {
         assert_eq!(ledger(&connection).len(), 2);
         // The table the broken migration made before it failed is gone too.
         assert_eq!(tables(&connection), ["fixture_album", "schema_migration"]);
+    }
+
+    /// The steps of the plan SQLite makes for `sql`.
+    fn plan(connection: &Connection, sql: &str) -> Vec<String> {
+        connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([1], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_files_claims_and_an_accounts_loves_are_found_without_reading_every_row() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run(&mut connection, LIBRARY, &FixedClock::at(0)).unwrap();
+        // A rescan clears each changed file's claims before it writes them
+        // again, and an import of loves reads the newest of each.
+        for sql in [
+            "DELETE FROM metadata_claim WHERE source_item_id = ?1",
+            "DELETE FROM identifier_claim WHERE source_item_id = ?1",
+            crate::import_store::LOVED_NOW,
+        ] {
+            let plan = plan(&connection, sql);
+            assert!(
+                plan.iter().all(|step| !step.starts_with("SCAN")),
+                "{sql}: {plan:?}"
+            );
+        }
     }
 
     #[test]

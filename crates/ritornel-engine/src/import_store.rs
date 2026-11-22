@@ -948,6 +948,16 @@ impl LibraryStore {
     }
 }
 
+/// Each love item of the endpoint `?1` with its newest love row: the
+/// account's answer for it.
+pub(crate) const LOVED_NOW: &str =
+    "SELECT si.id, si.provider_key, lr.cleared FROM listener_rating lr
+     JOIN source_item si ON si.id = lr.source_item_id
+     WHERE lr.endpoint_id = ?1 AND lr.kind = 'love'
+       AND lr.id = (SELECT max(x.id) FROM listener_rating x
+                    WHERE x.source_item_id = lr.source_item_id AND x.endpoint_id = ?1
+                      AND x.kind = 'love')";
+
 /// The account's love items that are loved now, by artist and title: for
 /// each item, its newest love row is the account's answer.
 fn loved_now(
@@ -955,14 +965,7 @@ fn loved_now(
     account: Id,
 ) -> Result<HashMap<(String, String), i64>, Error> {
     let rows = rows_of(connection, account)?;
-    let mut statement = connection.prepare(
-        "SELECT si.id, si.provider_key, lr.cleared FROM listener_rating lr
-         JOIN source_item si ON si.id = lr.source_item_id
-         WHERE lr.endpoint_id = ?1 AND lr.kind = 'love'
-           AND lr.id = (SELECT max(x.id) FROM listener_rating x
-                        WHERE x.source_item_id = lr.source_item_id AND x.endpoint_id = ?1
-                          AND x.kind = 'love')",
-    )?;
+    let mut statement = connection.prepare(LOVED_NOW)?;
     let found = statement.query_map([rows.endpoint], |row| {
         Ok((
             row.get::<_, i64>(0)?,
