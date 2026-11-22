@@ -324,6 +324,10 @@ pub(crate) struct Wall {
     replace_again: bool,
     /// After a replacement, the row to keep where it was on screen.
     pending_anchor: Option<(usize, f32)>,
+    /// Bumped with each open or replacement of the view, and whenever the
+    /// wall or the session changes: an answer to any but the latest is let
+    /// go, and the view it opened is closed.
+    opening: u64,
     /// Which wall, in which order, and whether the large letters stand beside it.
     pub kind: WallKind,
     pub order: Order,
@@ -413,6 +417,7 @@ impl Wall {
             last_replace: None,
             replace_again: false,
             pending_anchor: None,
+            opening: 0,
             kind: WallKind::Artists,
             order: BY_NAME,
             letters: true,
@@ -462,6 +467,7 @@ impl Wall {
         self.wants = Some(wants);
         self.loader = loader;
         self.net = Some(net);
+        self.forget_asks();
         self.view = None;
         self.pages.clear();
         self.pages_in_flight = 0;
@@ -473,6 +479,7 @@ impl Wall {
     /// The session ended: what was read is let go, and the covers already
     /// decoded are kept.
     fn end(&mut self, cx: &mut Context<Self>) {
+        self.forget_asks();
         self.net = None;
         self.wants = None;
         self.arrivals = None;
@@ -480,6 +487,15 @@ impl Wall {
         self.pages.clear();
         self.pages_in_flight = 0;
         cx.notify();
+    }
+
+    /// Lets go of every open and replacement under way: their answers are
+    /// for a wall, an order or a session since left.
+    fn forget_asks(&mut self) {
+        self.opening += 1;
+        self.replacing = None;
+        self.replace_again = false;
+        self.pending_anchor = None;
     }
 
     /// How the wall is laid out: under headings of time for a date, else
@@ -514,6 +530,7 @@ impl Wall {
         if let Some(view) = self.view.take() {
             self.close_view(view);
         }
+        self.forget_asks();
         self.kind = kind;
         self.order = order;
         self.pages.clear();
@@ -1131,7 +1148,8 @@ impl Wall {
             WallKind::Albums => ListKind::Albums,
         };
         let key = self.order.key;
-        let asked = (self.kind, self.order);
+        self.opening += 1;
+        let asked = self.opening;
         let selected = self.selected.clone();
         let offset = (index / PAGE * PAGE) as u64;
         let replaced = net.rt().spawn(async move {
@@ -1182,10 +1200,15 @@ impl Wall {
         cx.spawn(async move |wall, cx| {
             let answer = replaced.await;
             let _ = wall.update(cx, |wall, cx| {
+                // Asked for a wall, an order or a session since left.
+                if wall.opening != asked {
+                    if let Ok(Ok((opened, ..))) = &answer {
+                        wall.close_view(opened.view.clone());
+                    }
+                    return;
+                }
                 wall.replacing = None;
-                if (wall.kind, wall.order) == asked
-                    && let Ok(Ok((opened, sections, near, found))) = answer
-                {
+                if let Ok(Ok((opened, sections, near, found))) = answer {
                     wall.total = opened.total as usize;
                     wall.sections = sections
                         .sections
@@ -1263,7 +1286,8 @@ impl Wall {
             WallKind::Albums => ListKind::Albums,
         };
         let key = self.order.key;
-        let asked = (self.kind, self.order);
+        self.opening += 1;
+        let asked = self.opening;
         let opened = net.rt().spawn(async move {
             let opened = client
                 .list_open(&ListOpenParams {
@@ -1285,8 +1309,9 @@ impl Wall {
         cx.spawn(async move |this, cx| {
             let answer = opened.await;
             this.update(cx, |wall, cx| {
-                // Opened for a wall or an order since left.
-                if (wall.kind, wall.order) != asked {
+                // Opened for a wall, an order or a session since left, or
+                // overtaken by another open.
+                if wall.opening != asked {
                     if let Ok(Ok((opened, _))) = &answer {
                         wall.close_view(opened.view.clone());
                     }
