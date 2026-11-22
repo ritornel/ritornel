@@ -371,8 +371,8 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
     }
     // A row is found by the key the normaliser made of its names. When the
     // library was last resolved by another normaliser, the stored keys are
-    // that one's, and the resolver also looks rows up by them, or an artist
-    // with no ID would take a new row and a new public ID.
+    // that one's, and the resolver looks rows up by them instead, or an
+    // artist with no ID would take a new row and a new public ID.
     library.artist_keys_by = connection
         .query_row(
             "SELECT json_extract(value_json, '$.normalizer') FROM library_setting WHERE key = ?1",
@@ -396,8 +396,11 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
             ))
         },
     )? {
-        if let (false, Some(match_name)) = (redirected, &match_name) {
-            library.artists.push((id, match_name.clone()));
+        // A row given no key is still found by its ID.
+        if !redirected {
+            library
+                .artists
+                .push((id, match_name.clone().unwrap_or_default()));
         }
         shown.artists.insert(id, (name, sort, match_name));
     }
@@ -718,12 +721,13 @@ impl Plan {
                 .iter()
                 .map(|out| out.match_name.as_str())
                 .collect();
+            // A name is trusted only when it gives back the key the row
+            // holds: an edit, in force or withdrawn, gives another.
+            let version = library.artist_keys_by;
             let left: Vec<(i64, &String, Option<String>)> = library
                 .artists
                 .iter()
-                .filter(|(row, _)| {
-                    !reached.contains(row) && !library.artist_mbids.contains_key(row)
-                })
+                .filter(|(row, _)| !reached.contains(row))
                 .map(|(row, stored)| {
                     let edited =
                         library
@@ -732,8 +736,17 @@ impl Plan {
                     let name = shown
                         .artists
                         .get(row)
-                        .and_then(|(name, _, _)| name.as_deref());
-                    (*row, stored, name.filter(|_| !edited).map(normalize))
+                        .and_then(|(name, _, _)| name.as_deref())
+                        .filter(|name| {
+                            !edited
+                                && version
+                                    .and_then(|version| {
+                                        ritornel_domain::normalize::normalize_by(version, name)
+                                    })
+                                    .as_ref()
+                                    == Some(stored)
+                        });
+                    (*row, stored, name.map(normalize))
                 })
                 .collect();
             let mut wanted: HashMap<&str, usize> = HashMap::new();
@@ -746,7 +759,8 @@ impl Plan {
                 let key = key.as_ref().filter(|key| {
                     !held.contains(key.as_str()) && wanted.get(key.as_str()) == Some(&1)
                 });
-                if key != Some(*stored) {
+                let now = Some(*stored).filter(|stored| !stored.is_empty());
+                if key != now {
                     rekeyed.push((*row, key.cloned()));
                 }
             }

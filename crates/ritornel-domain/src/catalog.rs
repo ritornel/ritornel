@@ -725,10 +725,66 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
     for (row, match_name) in &library.artists {
         match library.artist_mbids.get(row) {
             Some(mbid) => id_rows.entry(mbid.as_str()).or_default().push_back(*row),
+            // A row given no key is found by no name.
+            None if match_name.is_empty() => {}
             None => free_rows
                 .entry(match_name.as_str())
                 .or_default()
                 .push_back(*row),
+        }
+    }
+    // After the normaliser changed, the rows hold the keys the earlier
+    // version made of their files' names, and an artist with no ID is
+    // found by those alone: today's key of one artist may be another's old
+    // one. First each takes the row of a spelling whose key did not
+    // change, then the others take rows by the old key most of their files
+    // give.
+    let mut migrated: HashMap<&ArtistKey, i64> = HashMap::new();
+    if let Some(version) = library.artist_keys_by {
+        let unnamed: Vec<(&ArtistKey, &Seen)> = artist_keys
+            .iter()
+            .copied()
+            .filter(|(key, _)| matches!(key, ArtistKey::Name(_)))
+            .collect();
+        for (key, entry) in &unnamed {
+            let ArtistKey::Name(own) = key else { continue };
+            let unchanged = entry
+                .names
+                .iter()
+                .any(|spelling| normalize_by(version, spelling).as_deref() == Some(own.as_str()));
+            if let Some(row) = unchanged
+                .then(|| {
+                    free_rows
+                        .get_mut(own.as_str())
+                        .and_then(VecDeque::pop_front)
+                })
+                .flatten()
+            {
+                migrated.insert(key, row);
+            }
+        }
+        for (key, entry) in &unnamed {
+            if migrated.contains_key(key) {
+                continue;
+            }
+            let mut votes: Vec<(String, usize, usize)> = Vec::new();
+            for (at, spelling) in entry.names.iter().enumerate() {
+                let Some(old) = normalize_by(version, spelling) else {
+                    continue;
+                };
+                match votes.iter_mut().find(|(key, _, _)| *key == old) {
+                    Some(vote) => vote.1 += 1,
+                    None => votes.push((old, 1, at)),
+                }
+            }
+            votes.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+            if let Some(row) = votes.iter().find_map(|(old, _, _)| {
+                free_rows
+                    .get_mut(old.as_str())
+                    .and_then(VecDeque::pop_front)
+            }) {
+                migrated.insert(key, row);
+            }
         }
     }
     let mut artists: Vec<ArtistOut> = Vec::new();
@@ -744,16 +800,8 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 Some(mbid.clone()),
             ),
             ArtistKey::Name(_) => {
-                // After the normaliser changed, the rows hold the keys the
-                // earlier version made of their files' names, and a row is
-                // looked for by those alone: today's key of one artist may
-                // be another's old one.
                 let row = match library.artist_keys_by {
-                    Some(version) => entry.names.iter().find_map(|spelling| {
-                        free_rows
-                            .get_mut(normalize_by(version, spelling)?.as_str())?
-                            .pop_front()
-                    }),
+                    Some(_) => migrated.get(key).copied(),
                     None => free_rows
                         .get_mut(match_name.as_str())
                         .and_then(VecDeque::pop_front),

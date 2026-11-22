@@ -1014,6 +1014,29 @@ fn after_a_change_of_normaliser_no_artist_takes_a_row_by_today_s_key() {
 }
 
 #[test]
+fn after_a_change_of_normaliser_an_artist_first_takes_the_row_of_its_unchanged_spelling() {
+    let mut world = World::default();
+    world.add(file("A/1.flac", 1).song("One", "Here/There", 200));
+    world.add(file("A/2.flac", 2).song("Two", "Here / There", 200));
+    world.add(file("A/3.flac", 3).song("Three", "Here'There", 200));
+    // Normaliser 1 made the first and third one artist, "herethere", and
+    // the second another, "here there". Today the first two are one.
+    world.library.artists = vec![(1, "herethere".to_owned()), (2, "here there".to_owned())];
+    world.next = 10;
+    world.library.artist_keys_by = Some(1);
+    let resolution = world.settle();
+    let found: Vec<(Ref, &str)> = resolution
+        .artists
+        .iter()
+        .map(|out| (out.r, out.match_name.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [(Ref::Row(2), "here there"), (Ref::Row(1), "herethere")]
+    );
+}
+
+#[test]
 fn an_artist_with_no_id_keeps_its_row_across_a_change_of_normaliser() {
     for edited in [false, true] {
         let mut world = World::default();

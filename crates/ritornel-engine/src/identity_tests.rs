@@ -684,6 +684,13 @@ fn an_artist_no_file_credits_is_keyed_again_when_the_normaliser_changes() {
                     ),
                 )?;
             }
+            // A row whose name was an edit since withdrawn: its name and
+            // its key disagree.
+            connection.execute(
+                "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
+                 VALUES (906, ?1, 906, 'Salt Harbour', 'Salt Harbour', 'tinharbour', ?2)",
+                (write.new_id()?.as_bytes(), write.rev()),
+            )?;
             connection.execute(
                 "INSERT INTO metadata_edit (entity_kind, entity_id, field, value, actor_kind, edited_at_ms, rev)
                  VALUES ('artist', 902, 'name', 'Tin/Harbour', 'person', ?1, ?2)",
@@ -718,12 +725,20 @@ fn an_artist_no_file_credits_is_keyed_again_when_the_normaliser_changes() {
     // The first has today's key, so its files find it when they return.
     // The others have none, and are never found: the renamed one, whose
     // files' names are not known; the one whose key today is the scanned
-    // artist's; and the two that would share a key.
+    // artist's; the two that would share a key; and the one whose name its
+    // key does not come from.
     assert_eq!(
         rig.rows(
             "SELECT id || '|' || coalesce(match_name, '-') FROM artist WHERE id > 900 ORDER BY id"
         ),
-        ["901|lanterns 42", "902|-", "903|-", "904|-", "905|-"]
+        [
+            "901|lanterns 42",
+            "902|-",
+            "903|-",
+            "904|-",
+            "905|-",
+            "906|-"
+        ]
     );
     // A second resolution changes nothing.
     assert!(

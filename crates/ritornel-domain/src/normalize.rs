@@ -18,25 +18,9 @@ pub const NORMALIZER_VERSION: i64 = 2;
 /// slashes and the like. Everything else that is not a letter, a digit or a
 /// mark joins what is on either side of it, as an apostrophe does.
 fn parts_words(c: char) -> bool {
-    matches!(
-        c,
-        '-' | '\u{2010}'
-            ..='\u{2015}'
-                | '\u{2212}'
-                | '\u{2E3A}'
-                | '\u{2E3B}'
-                | '/'
-                | '\\'
-                | '|'
-                | '+'
-                | ','
-                | ';'
-                | ':'
-                | '_'
-                | '~'
-                | '\u{00B7}'
-                | '\u{2022}'
-    )
+    matches!(c, '\u{2010}'..='\u{2015}')
+        || "-\u{2212}\u{2E3A}\u{2E3B}/\\|+,;:_~\u{00B7}\u{2022}\u{2044}\u{2215}\u{30FB}\u{3001}\u{301C}\u{00D7}()[]{}"
+            .contains(c)
 }
 
 /// The key of a name: NFKC, lower case, "&" as "and", punctuation that
@@ -48,12 +32,13 @@ pub fn normalize(text: &str) -> String {
     // again, and the dot that a capital dotted I leaves on its small i
     // taken off, as Turkish reads it.
     let folded: String = text
+        .replace('\u{0130}', "I")
         .nfkc()
         .flat_map(char::to_lowercase)
         .collect::<String>()
+        .replace("i\u{0307}", "i")
         .nfc()
-        .collect::<String>()
-        .replace("i\u{0307}", "i");
+        .collect();
     // "&" alone is a name of punctuation, not the word "and".
     if !folded.chars().any(char::is_alphanumeric) {
         return folded.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -83,7 +68,8 @@ pub fn normalize(text: &str) -> String {
     if key.is_empty() {
         folded.split_whitespace().collect::<Vec<_>>().join(" ")
     } else {
-        key
+        // Taking punctuation out can bring a letter and its mark together.
+        key.nfc().collect()
     }
 }
 
@@ -230,6 +216,18 @@ mod tests {
         assert_eq!(normalize("ÉTÉ"), "été");
         // A capital dotted I is a small i, as in Turkish.
         assert_eq!(normalize("İzmir"), normalize("izmir"));
+        assert_eq!(normalize("İ\u{0323}"), normalize("i\u{0323}"));
+        assert_eq!(normalize("e'\u{0301}"), normalize("é"));
+        for spelling in [
+            "Here⁄There",
+            "Here∕There",
+            "Here・There",
+            "Here×There",
+            "Here〜There",
+            "Here(There)",
+        ] {
+            assert_eq!(normalize(spelling), "here there", "{spelling}");
+        }
         assert_eq!(normalize("H\u{0331}"), normalize("\u{1E96}"));
     }
 
