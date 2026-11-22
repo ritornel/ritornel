@@ -407,9 +407,9 @@ Record            The listen playing can’t be saved, since 2025-11-21 17:01 UT
                   Importing from Last.fm failed, since 2025-11-21 17:01 UTC: Last.fm did not answer
                   Ritornel tries again at the next import. If it keeps failing, check the internet connection, and the API key and secret in lastfm.env in Ritornel’s data folder, then restart the server.
 Note              1 scrobble may not have reached Last.fm, since 2025-11-21 17:01 UTC
-                  The play is still in your history here. Each import from Last.fm clears any that arrived; Ritornel doesn’t send it again. `ritornelctl status --dismiss` sets this note aside.
+                  The play is still in your history here. If the next import from Last.fm finds it there, this note clears; Ritornel doesn’t send it again. `ritornelctl status --dismiss` sets this note aside.
                   2 plays weren’t sent to Last.fm, since 2025-11-21 17:01 UTC: its play is excluded
-                  They’re still in your history here. Ritornel didn’t send them because they stopped counting, or grew too old for Last.fm, before their turn came. `ritornelctl status --dismiss` sets this note aside.
+                  They’re still in your history here. Ritornel chose not to send them, for the reason given for the latest. `ritornelctl status --dismiss` sets this note aside.
 "
         );
         // Notes alone: the record advances, and they are said all the same.

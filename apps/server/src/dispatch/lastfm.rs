@@ -778,7 +778,12 @@ mod tests {
 
         // Last.fm refuses the session: nothing starts by itself, whatever
         // the trigger, until a new sign-in.
-        core.with_stores(|stores| stores.server().refuse_service_session(SERVICE).unwrap());
+        core.with_stores(|stores| {
+            stores
+                .server()
+                .refuse_service_session(SERVICE, "k")
+                .unwrap()
+        });
         let refused = Auto::Off("Last.fm refused the session: sign in again".to_owned());
         assert_eq!(tick(&core, true), refused);
         clock.set(T0 + 24 * HOUR);

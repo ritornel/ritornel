@@ -129,17 +129,25 @@ impl ServerStore {
     pub fn session_refused(&self, service: &str) -> Result<Option<i64>, Error> {
         let service = service.to_owned();
         self.read(move |connection| {
-            let refused: Option<(bool, Option<String>)> = connection
+            let refused: Option<(bool, Option<String>, i64)> = connection
                 .query_row(
-                    "SELECT s.sign_in_again, t.value_json FROM service_session s
+                    "SELECT s.sign_in_again, t.value_json, s.signed_in_at_ms
+                     FROM service_session s
                      LEFT JOIN server_setting t ON t.key = s.service || '.refused_at_ms'
                      WHERE s.service = ?1",
                     [&service],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
+            // A refusal recorded before its time was kept, or one older than
+            // the session (a time kept for an earlier one), is said from the
+            // sign-in: the earliest it can have been.
             Ok(match refused {
-                Some((true, at)) => Some(at.and_then(|at| at.parse().ok()).unwrap_or(0)),
+                Some((true, at, signed_in)) => Some(
+                    at.and_then(|at| at.parse::<i64>().ok())
+                        .filter(|at| *at >= signed_in)
+                        .unwrap_or(signed_in),
+                ),
                 _ => None,
             })
         })
@@ -429,13 +437,19 @@ mod tests {
         };
         save();
         assert_eq!(store.session_refused("lastfm").unwrap(), None);
-        store.refuse_service_session("lastfm").unwrap();
+        // A refusal that came late, for a session signed out of since, is
+        // not this one's.
+        store
+            .refuse_service_session("lastfm", "an older key")
+            .unwrap();
+        assert_eq!(store.session_refused("lastfm").unwrap(), None);
+        store.refuse_service_session("lastfm", "invented").unwrap();
         assert_eq!(
             store.session_refused("lastfm").unwrap(),
             Some(1_794_776_400_000)
         );
         // Refused again, it is still since the first time.
-        store.refuse_service_session("lastfm").unwrap();
+        store.refuse_service_session("lastfm", "invented").unwrap();
         assert_eq!(
             store.session_refused("lastfm").unwrap(),
             Some(1_794_776_400_000)

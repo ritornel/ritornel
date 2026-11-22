@@ -77,23 +77,21 @@ pub fn then(problem: &RecordProblem, words: Words<'_>) -> String {
              that the disk Ritornel’s data is on has free space, and look in the server’s log."
             .to_owned(),
         RecordProblemKind::ScrobblesUnknown if one => format!(
-            "The play is still in your history here. Each import from Last.fm clears any that \
-             arrived; Ritornel doesn’t send it again. {dismiss} sets this note aside."
-        ),
-        RecordProblemKind::ScrobblesUnknown => format!(
-            "The plays are still in your history here. Each import from Last.fm clears those \
-             that arrived; Ritornel doesn’t send the others again. {dismiss} sets this note \
+            "The play is still in your history here. If the next import from Last.fm finds it \
+             there, this note clears; Ritornel doesn’t send it again. {dismiss} sets this note \
              aside."
         ),
+        RecordProblemKind::ScrobblesUnknown => format!(
+            "The plays are still in your history here. Those the next import from Last.fm finds \
+             there clear; Ritornel doesn’t send the others again. {dismiss} sets this note aside."
+        ),
         RecordProblemKind::ScrobblesWithdrawn if one => format!(
-            "It’s still in your history here. Ritornel didn’t send it because it stopped \
-             counting, or grew too old for Last.fm, before its turn came. {dismiss} sets this \
-             note aside."
+            "It’s still in your history here. Ritornel chose not to send it, for the reason \
+             given. {dismiss} sets this note aside."
         ),
         RecordProblemKind::ScrobblesWithdrawn => format!(
-            "They’re still in your history here. Ritornel didn’t send them because they \
-             stopped counting, or grew too old for Last.fm, before their turn came. {dismiss} \
-             sets this note aside."
+            "They’re still in your history here. Ritornel chose not to send them, for the \
+             reason given for the latest. {dismiss} sets this note aside."
         ),
         RecordProblemKind::ScrobblesRefused => format!(
             "Check the API key and secret Ritornel uses, in lastfm.env in its data folder, then \
