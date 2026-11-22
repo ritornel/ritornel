@@ -7,7 +7,8 @@
 //! both disc rules on, and a match on tags alone bound across two albums
 //! only when the lengths agree almost exactly
 //! ([`Policy::tags_bind_across_albums`],
-//! [`Policy::across_albums_within_ms`]).
+//! [`Policy::across_albums_within_ms`]). Policy 3 weighs eligible runner-ups
+//! independently and reads part numbers as version markers only on songs.
 //!
 //! Items are taken in first-seen order, and each sees only what the items
 //! before it said. A recording is made by the first item that binds to
@@ -176,13 +177,9 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// Policy 3 keeps a recording's eligible runner-up evidence and treats
-    /// a numbered album as context, not a version marker on every song.
+    /// The file policy used by scans.
     pub fn current() -> Self {
-        Self {
-            version: RESOLVER_VERSION,
-            ..Self::v2()
-        }
+        Self::v3()
     }
 
     /// The named policy of this number, if there is one.
@@ -190,7 +187,7 @@ impl Policy {
         match version {
             1 => Some(Self::v1()),
             2 => Some(Self::v2()),
-            RESOLVER_VERSION => Some(Self::current()),
+            3 => Some(Self::v3()),
             _ => None,
         }
     }
@@ -231,6 +228,27 @@ impl Policy {
             tracks_of_one_release_differ: true,
             marker_list: 2,
             ..Self::v1()
+        }
+    }
+
+    /// Policy 3 compares eligible runner-ups and treats an album part
+    /// number as part of its title.
+    pub fn v3() -> Self {
+        Self {
+            version: 3,
+            ..Self::v2()
+        }
+    }
+
+    fn uses_eligible_runner_up(&self) -> bool {
+        self.version >= 3
+    }
+
+    fn album_part_numbers(&self) -> PartNumbers {
+        if self.version < 3 {
+            PartNumbers::Include
+        } else {
+            PartNumbers::Ignore
         }
     }
 }
@@ -325,6 +343,12 @@ pub(crate) fn part_number(word: &str) -> Option<u32> {
         .filter(|total| (1..40).contains(total))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartNumbers {
+    Include,
+    Ignore,
+}
+
 /// The version markers in a title as it is written. The words are taken
 /// before any punctuation is stripped, so that a marker stuck to the word
 /// before it, as in `Lantern(Live)` or `Lantern-Remix`, is still a word,
@@ -332,13 +356,13 @@ pub(crate) fn part_number(word: &str) -> Option<u32> {
 ///
 /// With policy 2's list (`list` 2), every spelling of "a cappella" is one
 /// marker, and a part number is one: "Part II", "Pt. 2" and "Part Two"
-/// are all `part 2` when `parts` is enabled. Policy 3 reserves that rule
+/// are all `part 2` when part numbers are included. Policy 3 reserves that rule
 /// for song titles. Like the others, these markers can only stop a match.
 fn markers(
     text: Option<&str>,
     words: &'static [&'static str],
     list: u8,
-    parts: bool,
+    parts: PartNumbers,
 ) -> Vec<String> {
     let text = text.unwrap_or("");
     let lower: String = text.nfkc().flat_map(char::to_lowercase).collect();
@@ -361,7 +385,7 @@ fn markers(
             add((*marker).to_owned());
         }
     }
-    if parts && list >= 2 {
+    if parts == PartNumbers::Include && list >= 2 {
         for pair in split.windows(2) {
             if let [word, number] = pair
                 && PART.contains(word)
@@ -391,7 +415,7 @@ fn apart(a: Option<(Option<i64>, i64)>, b: Option<(Option<i64>, i64)>) -> bool {
 
 /// The version markers of a title by a marker list.
 pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
-    markers(Some(title), VERSION_MARKERS, list, true)
+    markers(Some(title), VERSION_MARKERS, list, PartNumbers::Include)
 }
 
 /// The version markers of an album title, such as "live" or "acoustic", by
@@ -399,7 +423,7 @@ pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
 /// "Acoustics" as "acoustic"; the file resolver's policies do not, so that
 /// their results stay as they are.
 pub(crate) fn album_markers_of(album: &str) -> Vec<String> {
-    let mut found = markers(Some(album), ALBUM_MARKERS, 2, true);
+    let mut found = markers(Some(album), ALBUM_MARKERS, 2, PartNumbers::Include);
     // Read as `markers` reads, between any marks and with marks inside a
     // word joining it.
     let lower: String = album.nfkc().flat_map(char::to_lowercase).collect();
@@ -439,13 +463,13 @@ impl Ev {
                 facts.title.as_deref(),
                 VERSION_MARKERS,
                 policy.marker_list,
-                true,
+                PartNumbers::Include,
             ),
             album_markers: markers(
                 facts.album.as_deref(),
                 ALBUM_MARKERS,
                 policy.marker_list,
-                policy.version < 3,
+                policy.album_part_numbers(),
             ),
             on_release: on_release.cloned(),
             position: facts.track.map(|track| (facts.disc, track)),
@@ -955,14 +979,15 @@ impl<'a> Fold<'a> {
                 if let Some(close) = eligible.filter(|e| e.distance <= policy.bind_max) {
                     nearest = close;
                 }
-                if let Some(&item) = clashes.get(&nearest.rec) {
-                    nearest.clash = Some(item);
-                } else if policy.version >= 3 {
-                    bindable.extend(eligible);
-                } else if nearest.may_bind(policy) {
-                    // Earlier policies took the runner-up from the one
-                    // piece of evidence chosen to represent each recording.
-                    bindable.push(nearest);
+                nearest.clash = clashes.get(&nearest.rec).copied();
+                // A clash rules out every copy of the recording.
+                if nearest.clash.is_none() {
+                    if policy.uses_eligible_runner_up() {
+                        bindable.extend(eligible);
+                    } else if nearest.may_bind(policy) {
+                        // Earlier policies chose one copy to represent each recording.
+                        bindable.push(nearest);
+                    }
                 }
                 candidates.push(nearest);
             }
@@ -976,25 +1001,20 @@ impl<'a> Fold<'a> {
             (Some(best), Some(next)) => Some(next.distance - best.distance),
             _ => None,
         };
-        let binds = |list: &[Weighed]| {
-            list.first().copied().filter(|best| {
-                best.distance <= policy.bind_max
-                    && gap_of(list).is_none_or(|gap| gap >= policy.min_gap)
-            })
-        };
-        let binding = binds(&bindable);
-        // When an eligible runner-up prevents a binding, show the copies
-        // whose distances actually decided the outcome.
-        let compared = if policy.version >= 3
-            && binding.is_none()
-            && bindable
-                .first()
-                .is_some_and(|best| best.distance <= policy.bind_max)
-        {
-            &bindable
-        } else {
-            &candidates
-        };
+        let close = bindable
+            .first()
+            .copied()
+            .filter(|best| best.distance <= policy.bind_max);
+        let eligible_gap = gap_of(&bindable);
+        let binding = close.filter(|_| eligible_gap.is_none_or(|gap| gap >= policy.min_gap));
+        // Show the copies whose gap decided the outcome. Without a
+        // runner-up, the other nearby copies still give useful context.
+        let compared =
+            if policy.uses_eligible_runner_up() && close.is_some() && eligible_gap.is_some() {
+                &bindable
+            } else {
+                &candidates
+            };
         let listed: Vec<Candidate> = compared
             .iter()
             .take(5)
@@ -1010,7 +1030,7 @@ impl<'a> Fold<'a> {
                 decision: Decision {
                     method: Method::TagsDuration,
                     score: best.distance,
-                    runner_up_gap: gap_of(&bindable),
+                    runner_up_gap: eligible_gap,
                     penalties: Some(best.penalties),
                     evidence: Evidence {
                         claims,

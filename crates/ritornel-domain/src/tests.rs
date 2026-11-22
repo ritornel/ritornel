@@ -2907,15 +2907,23 @@ fn an_ineligible_copy_cannot_hide_a_recordings_eligible_runner_up() {
     let probe = world.add(song("D/1.flac", 4, "Long Field", 200, None));
     let old = catalog::resolve(&world.library, &Policy::v2());
     assert_eq!(decision(&old, probe).method, Method::TagsDuration);
-    let r = world.settle();
-    assert_eq!(decision(&r, probe).method, Method::New);
-    let review = decision(&r, probe);
-    assert!(review.needs_review);
-    let [best, next] = &review.evidence.candidates[..] else {
-        panic!("expected the two eligible copies");
-    };
-    assert_eq!(next.item, runner);
-    assert_eq!(review.runner_up_gap, Some(next.distance - best.distance));
+    // The same two eligible copies decide both outcomes; the required gap
+    // determines whether the probe binds or goes to review.
+    for (min_gap, method) in [(0.05, Method::TagsDuration), (0.25, Method::New)] {
+        let policy = Policy {
+            min_gap,
+            ..Policy::current()
+        };
+        let result = catalog::resolve(&world.library, &policy);
+        let judged = decision(&result, probe);
+        assert_eq!(judged.method, method);
+        assert_eq!(judged.needs_review, method == Method::New);
+        let [best, next] = &judged.evidence.candidates[..] else {
+            panic!("expected the two eligible copies");
+        };
+        assert_eq!(next.item, runner);
+        assert_eq!(judged.runner_up_gap, Some(next.distance - best.distance));
+    }
 }
 
 #[test]
