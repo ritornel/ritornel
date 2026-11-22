@@ -210,6 +210,9 @@ pub(crate) struct Artist {
     /// their portrait: a portrait added or taken away can keep the picture's
     /// ID, when it is the same as a cover's.
     pictured_for: Option<(Option<Id>, bool)>,
+    /// The display's scale they were read for: on another display the face
+    /// and the portrait are read again, sharp there.
+    pictured_scale: f32,
     pub top: f32,
     elastic: crate::elastic::Elastic,
     /// How tall the page was when last drawn, and the column of history
@@ -273,6 +276,7 @@ impl Artist {
             blur: None,
             banner_blur: None,
             pictured_for: None,
+            pictured_scale: 0.,
             top: 0.,
             elastic: crate::elastic::Elastic::default(),
             height: Rc::new(Cell::new(0.)),
@@ -416,13 +420,17 @@ impl Artist {
         if let Some(image) = self.covers.get(&(art, px)) {
             return Some(Arc::clone(image));
         }
-        if !self.asked.insert((art, px)) {
-            return None;
+        if self.asked.insert((art, px)) {
+            self.fetch(art, px, cx, move |page, image, _| {
+                page.covers.insert((art, px), image);
+            });
         }
-        self.fetch(art, px, cx, move |page, image| {
-            page.covers.insert((art, px), image);
-        });
-        None
+        // Meanwhile, as it was read for another size or display.
+        self.covers
+            .iter()
+            .filter(|((at, _), _)| *at == art)
+            .max_by_key(|((_, size), _)| *size)
+            .map(|(_, image)| Arc::clone(image))
     }
 
     fn fetch(
@@ -430,7 +438,7 @@ impl Artist {
         art: Id,
         px: u32,
         cx: &mut Context<Self>,
-        took: impl FnOnce(&mut Self, Arc<RenderImage>) + 'static,
+        took: impl FnOnce(&mut Self, Arc<RenderImage>, &mut Context<Self>) + 'static,
     ) {
         let http = Arc::clone(&self.net.art);
         let sizes = self.net.art_sizes.clone();
@@ -442,7 +450,7 @@ impl Artist {
         cx.spawn(async move |this, cx| {
             if let Ok(Some((image, _, _))) = read.await {
                 this.update(cx, |page, cx| {
-                    took(page, Arc::new(image));
+                    took(page, Arc::new(image), cx);
                     cx.notify();
                 })
                 .ok();
@@ -522,14 +530,18 @@ impl Artist {
     fn pictures(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(artist) = &self.page else { return };
         let (art, wants_portrait) = (artist.artist.art_id, artist.artist.portrait);
+        let scale = window.scale_factor();
         if self.pictured_for == Some((art, wants_portrait)) {
+            if self.pictured_scale != scale {
+                self.sharpen(art, scale, cx);
+            }
             return;
         }
         self.pictured_for = Some((art, wants_portrait));
+        self.pictured_scale = scale;
         // A portrait of another picture, or of none, is not kept meanwhile.
         self.forget_portrait(Some(window), cx);
         self.picture_failed = false;
-        let scale = window.scale_factor();
         let (width, viewport) = viewport_of(window);
         let banner_radius = crate::blur::radius(crate::blur::BANNER.0, width + 120.);
         let wash_radius =
@@ -538,42 +550,8 @@ impl Artist {
             self.soft_pictures(banner_radius, wash_radius, scale);
             return;
         };
-        self.fetch(art, (28. * scale).ceil() as u32, cx, |page, image| {
-            page.face = Some(image);
-        });
-        // Their portrait stands at most 380 points wide at the banner's right
-        // end; with none, the cover their picture is stands in for it, so that
-        // every artist's circle on the wall has somewhere to fly to. It is
-        // kept at its own shape, and cropped to its box as it is made. It is
-        // asked for at twice the box's widest, so that a picture up to twice
-        // as tall as it is wide still covers the box sharply, as far as the
-        // server's largest size allows.
-        {
-            let http = Arc::clone(&self.net.art);
-            let bucket = self.net.bucket((2. * 380. * scale).ceil() as u32);
-            let read = self.net.rt().spawn(async move {
-                let bytes = http.get(art, bucket).await?;
-                crate::covers::decode(move || crate::covers::decode_picture(&bytes)).await
-            });
-            self.fetches.push(read.abort_handle());
-            cx.spawn(async move |this, cx| {
-                let source = read.await.ok().flatten();
-                this.update(cx, |page, cx| {
-                    // Too late: the page shows another picture now.
-                    if page.pictured_for.map(|(at, _)| at) != Some(Some(art)) {
-                        return;
-                    }
-                    page.forget_portrait(None, cx);
-                    match source {
-                        Some(source) => page.portrait = Some(Arc::new(source)),
-                        None => page.picture_failed = true,
-                    }
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
+        self.read_face(art, scale, cx);
+        self.read_portrait(art, scale, false, cx);
         let http = Arc::clone(&self.net.art);
         let tone = crate::blur::wash_tone(theme::dark());
         let blurs = self.net.rt().spawn(async move {
@@ -600,6 +578,94 @@ impl Artist {
                     // does not read) is no picture: the page takes its
                     // colour from their name, rather than no colour.
                     None => page.soft_pictures(banner_radius, wash_radius, scale),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Moved to a display of another scale: the face read again for it, and
+    /// the portrait when the server has it larger. Each shown is kept until
+    /// its sharper one comes; the blurs do not depend on the scale.
+    fn sharpen(&mut self, art: Option<Id>, scale: f32, cx: &mut Context<Self>) {
+        let before = self.pictured_scale;
+        self.pictured_scale = scale;
+        let Some(art) = art else {
+            self.face = Some(theme::soft_cached(&self.name, (28. * scale).ceil() as u32));
+            return;
+        };
+        self.read_face(art, scale, cx);
+        let portrait_px = |scale: f32| self.net.bucket((2. * 380. * scale).ceil() as u32);
+        if !self.picture_failed && portrait_px(before) != portrait_px(scale) {
+            self.read_portrait(art, scale, true, cx);
+        }
+    }
+
+    /// The face for the strip, read for the display's `scale`.
+    fn read_face(&mut self, art: Id, scale: f32, cx: &mut Context<Self>) {
+        self.fetch(
+            art,
+            (28. * scale).ceil() as u32,
+            cx,
+            move |page, image, cx| {
+                // Read for a display the window has left since.
+                if page.pictured_scale != scale {
+                    return;
+                }
+                if let Some(old) = page.face.replace(image) {
+                    crate::covers::drop_unshared(old, None, cx);
+                }
+            },
+        );
+    }
+
+    /// Their portrait, read for the display's `scale`; `again` when it is the
+    /// same picture read sharper, the one shown kept until one is made from it.
+    fn read_portrait(&mut self, art: Id, scale: f32, again: bool, cx: &mut Context<Self>) {
+        // Their portrait stands at most 380 points wide at the banner's right
+        // end; with none, the cover their picture is stands in for it, so that
+        // every artist's circle on the wall has somewhere to fly to. It is
+        // kept at its own shape, and cropped to its box as it is made. It is
+        // asked for at twice the box's widest, so that a picture up to twice
+        // as tall as it is wide still covers the box sharply, as far as the
+        // server's largest size allows.
+        let http = Arc::clone(&self.net.art);
+        let bucket = self.net.bucket((2. * 380. * scale).ceil() as u32);
+        let read = self.net.rt().spawn(async move {
+            let bytes = http.get(art, bucket).await?;
+            crate::covers::decode(move || crate::covers::decode_picture(&bytes)).await
+        });
+        self.fetches.push(read.abort_handle());
+        cx.spawn(async move |this, cx| {
+            let source = read.await.ok().flatten();
+            this.update(cx, |page, cx| {
+                // Too late: the page shows another picture now, or is on
+                // another display.
+                if page.pictured_for.map(|(at, _)| at) != Some(Some(art))
+                    || page.pictured_scale != scale
+                {
+                    return;
+                }
+                match source {
+                    Some(source) => {
+                        if again {
+                            // Made again from this at the next render; the
+                            // one shown stays until then.
+                            if let Some(made) = &mut page.melted {
+                                made.0 = (0, 0);
+                            }
+                        } else {
+                            page.forget_portrait(None, cx);
+                        }
+                        page.portrait = Some(Arc::new(source));
+                    }
+                    None if again => {}
+                    None => {
+                        page.forget_portrait(None, cx);
+                        page.picture_failed = true;
+                    }
                 }
                 cx.notify();
             })
