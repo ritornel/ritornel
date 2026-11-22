@@ -45,6 +45,8 @@ enum Target {
     Wall(usize),
     /// A record on a page, as its landings know it.
     Landing(Rc<Landings>, Id),
+    /// An artist's portrait at the right end of their banner.
+    Portrait(Entity<Artist>),
     /// Nowhere: it fades where it stands.
     Nowhere,
 }
@@ -55,6 +57,7 @@ enum Hidden {
     Wall,
     Landing(Rc<Landings>),
     Album(Entity<Album>),
+    Portrait(Entity<Artist>),
 }
 
 /// A cover travelling between pages (`motion.ts`, `Flight`).
@@ -64,6 +67,11 @@ struct Carry {
     from: Bounds<Pixels>,
     /// Its corners where it starts and where it lands.
     radius: (f32, f32),
+    /// An artist's picture, which is round on the wall and their portrait
+    /// on their page: whether each end is round, and the picture at the end
+    /// it flies to, which comes in over the one it leaves on the way.
+    round: (bool, bool),
+    to_image: Option<Arc<RenderImage>>,
     target: Target,
     phase: Phase,
     back: bool,
@@ -557,7 +565,7 @@ impl Shell {
         let album_ref = match row.subject {
             crate::wall::Subject::Album(album) => album,
             crate::wall::Subject::Artist(artist) => {
-                self.open_artist(artist, row.title.clone(), window, cx);
+                self.open_artist_from(artist, row.title.clone(), small, flight, window, cx);
                 return;
             }
         };
@@ -607,6 +615,8 @@ impl Shell {
                     ground: takeoff.ground,
                     from: takeoff.from,
                     radius: (10., 12.),
+                    round: (false, false),
+                    to_image: None,
                     target: Target::Album(album.clone()),
                     phase: Phase::Waiting,
                     back: false,
@@ -716,6 +726,22 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_artist_from(artist, name, None, None, window, cx);
+    }
+
+    /// Opens an artist's page. With a take-off from their tile on the wall,
+    /// their picture travels from its circle to their portrait in the
+    /// banner, the portrait coming in over the circle on the way; with no
+    /// portrait to land on, it fades where it stands.
+    fn open_artist_from(
+        &mut self,
+        artist: Id,
+        name: SharedString,
+        small: Option<Arc<RenderImage>>,
+        takeoff: Option<Takeoff>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(net) = self.link.read(cx).net() else {
             return;
         };
@@ -727,12 +753,102 @@ impl Shell {
         let left = self.shown();
         let left_top = left.top(cx);
         let carried = self.carry_cover_from(&left, cx);
+        let flies = match takeoff {
+            Some(Takeoff {
+                came: Came::Wall(index),
+                from,
+                ground,
+            }) if !crate::platform::reduce_motion() => {
+                self.wall.update(cx, |wall, _| wall.away = Some(index));
+                page.update(cx, |page, _| page.portrait_away = true);
+                self.carry = Some(Carry {
+                    image: small,
+                    ground,
+                    from,
+                    radius: (0., 0.),
+                    round: (true, false),
+                    to_image: None,
+                    target: Target::Portrait(page.clone()),
+                    phase: Phase::Waiting,
+                    back: false,
+                    hidden: vec![Hidden::Wall, Hidden::Portrait(page.clone())],
+                    started: Instant::now(),
+                    frames: Vec::new(),
+                });
+                true
+            }
+            _ => false,
+        };
         self.pages.go(Page::Artist {
             artist: page,
             _events: events,
         });
-        self.aim_carried(carried, &left, cx);
+        if !flies {
+            self.aim_carried(carried, &left, cx);
+        }
         self.moved(left, left_top, cx);
+    }
+
+    /// Where an artist's portrait stands in their banner, the page scrolled
+    /// `top` points, in a window `width` points across.
+    fn portrait_bounds(width: f32, top: f32) -> Bounds<Pixels> {
+        let wide = crate::banner::portrait_wide(width);
+        Bounds::new(
+            gpui::point(
+                px(width - wide),
+                px(TITLE_BAR - top.min(crate::banner::SLIDE)),
+            ),
+            gpui::size(px(wide), px(crate::banner::HEIGHT)),
+        )
+    }
+
+    /// Back to the wall from an artist's page, their portrait travels to
+    /// their circle on the wall, the circle coming in over it on the way:
+    /// when the portrait is shown, the banner whole, and their tile read.
+    fn carry_portrait_home(&mut self, left: &Shown, cx: &mut Context<Self>) -> bool {
+        let Shown::Artist(page) = left else {
+            return false;
+        };
+        if crate::platform::reduce_motion() {
+            return false;
+        }
+        let (artist, top, portrait) = {
+            let page = page.read(cx);
+            (page.artist_id, page.top, page.portrait())
+        };
+        let Some(portrait) = portrait.filter(|_| top < 8.) else {
+            return false;
+        };
+        let found = self.wall.update(cx, |wall, _| {
+            let index = wall.index_of(artist)?;
+            let row = wall.row(index)?;
+            let image = row.art.and_then(|art| wall.covers.image(art));
+            let ground = row
+                .art
+                .and_then(|art| wall.covers.colors.get(&art).copied())
+                .map_or(row.soft, theme::ground);
+            wall.away = Some(index);
+            Some((index, image, ground))
+        });
+        let Some((index, image, ground)) = found else {
+            return false;
+        };
+        page.update(cx, |page, _| page.portrait_away = true);
+        self.carry = Some(Carry {
+            image: Some(portrait),
+            ground,
+            from: Self::portrait_bounds(self.width, top),
+            radius: (0., 0.),
+            round: (false, true),
+            to_image: image,
+            target: Target::Wall(index),
+            phase: Phase::Waiting,
+            back: true,
+            hidden: vec![Hidden::Wall, Hidden::Portrait(page.clone())],
+            started: Instant::now(),
+            frames: Vec::new(),
+        });
+        true
     }
 
     /// Up to an artist from one of their records: back, when their page is
@@ -802,6 +918,8 @@ impl Shell {
             ground: page.row.soft,
             from,
             radius: (12., 10.),
+            round: (false, false),
+            to_image: None,
             target: Target::Nowhere,
             phase: Phase::Waiting,
             back: true,
@@ -897,6 +1015,10 @@ impl Shell {
                     album.cover_away = false;
                     cx.notify();
                 }),
+                Hidden::Portrait(artist) => artist.update(cx, |artist, cx| {
+                    artist.portrait_away = false;
+                    cx.notify();
+                }),
             }
         }
         cx.notify();
@@ -981,9 +1103,14 @@ impl Shell {
         let leaving_artist = self.artist_page().map(|page| page.read(cx).artist_id);
         let back_to_wall = matches!(self.pages.previous(), Some(Page::Library));
         let mut carried = self.carry_cover_from(&left, cx);
+        let flies_home = back_to_wall && self.carry_portrait_home(&left, cx);
         self.pages.back();
-        // Back on the wall from an artist's page, theirs settles into place.
-        if back_to_wall && let Some(artist) = leaving_artist {
+        // Back on the wall from an artist's page, theirs settles into place,
+        // unless their picture flies home to it.
+        if back_to_wall
+            && !flies_home
+            && let Some(artist) = leaving_artist
+        {
             self.wall.update(cx, |wall, cx| wall.settle(artist, cx));
         }
         // Home to the tile it came from, which may not be the one the wall
@@ -1016,6 +1143,10 @@ impl Shell {
             ),
             Target::Wall(index) => self.wall.read(cx).art_bounds(*index),
             Target::Landing(landings, record) => landings.bounds(*record),
+            Target::Portrait(artist) => artist
+                .read(cx)
+                .expects_portrait()
+                .then(|| Self::portrait_bounds(width, 0.)),
             Target::Nowhere => None,
         };
         let now = Instant::now();
@@ -1520,31 +1651,85 @@ impl Render for Shell {
                 Phase::Holding { .. } => 1.,
                 _ => 0.,
             };
-            let radius = lerp(carry.radius.0, carry.radius.1, along);
-            let side = f32::from(bounds.size.width);
-            let mut cover = div()
-                .absolute()
-                .left(bounds.origin.x)
-                .top(bounds.origin.y)
-                .size(px(side))
-                .rounded(px(radius))
-                .opacity(opacity)
-                .bg(linear_gradient(
-                    180.,
-                    linear_color_stop(carry.ground.0, 0.),
-                    linear_color_stop(carry.ground.1, 1.),
-                ));
-            if let Some(image) = &carry.image {
-                cover = cover.child(
-                    img(Arc::clone(image))
+            if carry.round != (false, false) {
+                // An artist's picture: each end drawn as it is drawn there,
+                // the one it flies to coming in over the one it leaves
+                // before that goes (`Flight`), and never reshaped on the way.
+                let to_image = carry.to_image.clone().or_else(|| match &carry.target {
+                    Target::Portrait(artist) => artist.read(cx).portrait(),
+                    _ => None,
+                });
+                let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                let face = |image: Option<Arc<RenderImage>>, round: bool, shown: f32| {
+                    if round {
+                        let d = w.min(h);
+                        div()
+                            .absolute()
+                            .left(px((w - d) / 2.))
+                            .top(px((h - d) / 2.))
+                            .size(px(d))
+                            .rounded_full()
+                            .overflow_hidden()
+                            .opacity(shown)
+                            .bg(linear_gradient(
+                                180.,
+                                linear_color_stop(carry.ground.0, 0.),
+                                linear_color_stop(carry.ground.1, 1.),
+                            ))
+                            .children(image.map(|image| img(image).size(px(d)).rounded_full()))
+                    } else {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w(px(w))
+                            .h(px(h))
+                            .opacity(shown)
+                            .children(image.map(|image| {
+                                img(image).size_full().object_fit(gpui::ObjectFit::Fill)
+                            }))
+                    }
+                };
+                let (leaving, coming) = moves::crossed(along);
+                flying = Some(
+                    div()
                         .absolute()
-                        .top_0()
-                        .left_0()
-                        .size(px(side))
-                        .rounded(px(radius)),
+                        .left(bounds.origin.x)
+                        .top(bounds.origin.y)
+                        .w(px(w))
+                        .h(px(h))
+                        .opacity(opacity)
+                        .child(face(carry.image.clone(), carry.round.0, leaving))
+                        .child(face(to_image, carry.round.1, coming))
+                        .into_any_element(),
                 );
+            } else {
+                let radius = lerp(carry.radius.0, carry.radius.1, along);
+                let side = f32::from(bounds.size.width);
+                let mut cover = div()
+                    .absolute()
+                    .left(bounds.origin.x)
+                    .top(bounds.origin.y)
+                    .size(px(side))
+                    .rounded(px(radius))
+                    .opacity(opacity)
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(carry.ground.0, 0.),
+                        linear_color_stop(carry.ground.1, 1.),
+                    ));
+                if let Some(image) = &carry.image {
+                    cover = cover.child(
+                        img(Arc::clone(image))
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size(px(side))
+                            .rounded(px(radius)),
+                    );
+                }
+                flying = Some(cover.into_any_element());
             }
-            flying = Some(cover.into_any_element());
         }
         if done {
             self.finish_carry(cx);
