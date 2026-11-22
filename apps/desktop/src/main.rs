@@ -174,7 +174,8 @@ fn main() {
         })
         .detach();
         // A test that must not be seen opens on the display it names
-        // (`tools/offscreen.m` makes one), out of the Dock (developer-only).
+        // (`scripts/desktop.sh` resolves one when `RITORNEL_OFFSCREEN=1`),
+        // out of the Dock (developer-only).
         let display = match std::env::var("RITORNEL_TEST_DISPLAY") {
             Err(_) => None,
             Ok(wanted) => {

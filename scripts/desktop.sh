@@ -28,15 +28,14 @@
 #                                          with the pinned ffmpeg in
 #                                          apps/desktop/.tones, played
 #                                          into nothing
-#   scripts/desktop.sh offscreen      a display no one sees, for test
-#                                          windows, while it runs: prints
-#                                          `offscreen <id> <x> <y>`
 #
-# With RITORNEL_OFFSCREEN=1, `run` and `tones` open their windows
-# on a display no one sees (`tools/offscreen.m`), out of the Dock and never
-# taking the keyboard, so that someone can go on using the Mac meanwhile:
-# an agent's runs always set it. A run that cannot be hidden does not start,
-# so on Linux, which has no such display yet, nothing starts with it.
+# With RITORNEL_OFFSCREEN=1, `run` and `tones` open their windows on a
+# display no one sees, out of the Dock and never taking the keyboard, so
+# that someone can go on using the Mac meanwhile. If RITORNEL_TEST_DISPLAY
+# is set it is used as given; otherwise `hidden-display ensure` is called
+# when available (and left running for other runs to share). A run that
+# cannot be hidden does not start, so on Linux, which has no such display
+# yet, nothing starts with it.
 #
 # It is a Cargo workspace of its own, so that GPUI reaches neither the main
 # workspace's build nor its lock file. It is checked on macOS and Linux; it
@@ -49,6 +48,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 app=$root/apps/desktop
 system=$(uname -s)
 source "$root/scripts/wait-for-server.sh"
+source "$root/scripts/hidden-display.sh"
 
 case $system in
     Darwin) ;;
@@ -73,47 +73,9 @@ case $system in
         ;;
 esac
 
-# What only a Mac can do, said rather than pretended elsewhere.
-mac_only() {
-    [[ $system == Darwin ]] && return
-    echo "$1 works on macOS only: Linux has no display no one sees for it yet." >&2
-    exit 1
-}
-
 # Cargo, in the app's own workspace.
 gpui() {
     cargo "$1" --manifest-path "$app/Cargo.toml" "${@:2}"
-}
-
-# The tool that makes a display no one sees, built when it changes.
-offscreen_tool() {
-    mkdir -p "$app/target/tools"
-    tool=$app/target/tools/offscreen
-    [[ $tool -nt $app/tools/offscreen.m ]] ||
-        clang -fobjc-arc -framework Foundation -framework CoreGraphics \
-            "$app/tools/offscreen.m" -o "$tool"
-}
-
-# hide: with RITORNEL_OFFSCREEN=1, makes that display for as long as this
-# script runs, and tells the app to open its windows on it.
-hide() {
-    [[ ${RITORNEL_OFFSCREEN:-} == 1 ]] || return 0
-    mac_only RITORNEL_OFFSCREEN
-    offscreen_tool
-    local said line
-    said=$(mktemp)
-    "$tool" >"$said" &
-    hidden=$!
-    for _ in $(seq 50); do
-        line=$(grep -m1 '^offscreen [0-9]' "$said" || true)
-        [[ -n $line ]] && break
-        kill -0 $hidden 2>/dev/null || break
-        sleep 0.1
-    done
-    rm -f "$said"
-    [[ -n $line ]] || { echo "no display to hide the windows on" >&2; exit 1; }
-    read -r _ id x y <<<"$line"
-    export RITORNEL_TEST_DISPLAY=$id RITORNEL_TEST_DISPLAY_AT=$x,$y
 }
 
 # serve: starts a silent server on the invented library, stopped when this
@@ -133,25 +95,27 @@ serve() {
     RITORNEL_TEST_NO_MEDIA_SESSION=1 "$server" serve --owned --data-dir "$data" \
         --listen 127.0.0.1:0 --output null --log-level warn ${RITORNEL_GPUI_SERVE_ARGS:-} <&3 >>"$log" 2> >(tee -a "$log" >&2) &
     served=$!
-    trap 'kill $served ${hidden:-} 2>/dev/null; rm -f "$log"' EXIT
+    trap 'kill $served 2>/dev/null; rm -f "$log"' EXIT
     wait_for_server "$served" "$log" 100
 }
 
 case "${1:-}" in
     check)
         bash "$root/scripts/tests/wait-for-server.sh"
+        bash "$root/scripts/tests/hidden-display.sh"
         gpui fmt --check
         gpui clippy --locked --all-targets -- -D warnings
         gpui test --locked
         gpui build --locked --release
         ;;
     run)
-        gpui build --locked --release --quiet
         hide
+        gpui build --locked --release --quiet
         serve
         "$app/target/release/ritornel-gpui" --data-dir "$data" "${@:2}"
         ;;
     tones)
+        hide
         # The invented library has no audio, so nothing on it plays.
         data=$app/.tones/data
         folder="$app/.tones/root/The Test Tones/Long Tones"
@@ -168,7 +132,6 @@ case "${1:-}" in
             done
         fi
         gpui build --locked --release --quiet
-        hide
         serve
         if [[ ! -f $data/.scanned ]]; then
             (cd "$root" && cargo build --locked --release --quiet -p ritornelctl)
@@ -177,11 +140,6 @@ case "${1:-}" in
             touch "$data/.scanned"
         fi
         "$app/target/release/ritornel-gpui" --data-dir "$data" "${@:2}"
-        ;;
-    offscreen)
-        mac_only "scripts/desktop.sh offscreen"
-        offscreen_tool
-        exec "$tool"
         ;;
     app)
         # The app and the server it starts, side by side in one bundle, as
@@ -212,7 +170,7 @@ case "${1:-}" in
         echo "built $bundle"
         ;;
     *)
-        echo "usage: $0 check | app | run [args] | tones [args] | offscreen" >&2
+        echo "usage: $0 check | app | run [args] | tones [args]" >&2
         exit 2
         ;;
 esac

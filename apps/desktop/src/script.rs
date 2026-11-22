@@ -67,7 +67,7 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
                         .await;
                 }
                 "shot" => {
-                    // Run on a display no one sees (RITORNEL_OFFSCREEN), the
+                    // Run on a display no one sees (`RITORNEL_TEST_DISPLAY`), the
                     // window is never covered, and so never stale.
                     let path = std::path::PathBuf::from(rest.trim());
                     let _ = window.update(cx, |_, window, _| {
