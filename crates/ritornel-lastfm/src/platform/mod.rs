@@ -20,11 +20,12 @@ pub(crate) use system::private;
 /// The plain behaviour, for what a system has no code of its own for.
 #[allow(dead_code, reason = "each system takes only what it lacks")]
 mod fallback {
+    #[cfg(test)]
     use std::path::Path;
 
     /// Whether only the file's owner may read or write it. Nothing to
     /// check where there are no Unix modes.
-    pub(crate) fn private(_path: &Path) -> bool {
+    pub(crate) fn private(_meta: &std::fs::Metadata) -> bool {
         true
     }
 

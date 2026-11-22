@@ -1,12 +1,13 @@
 //! Unix: a file's owner alone may read it when its mode says so.
 
+#[cfg(test)]
 use std::path::Path;
 
 /// Whether only the file's owner may read or write it: no permission bit
 /// for the group or others.
-pub(crate) fn private(path: &Path) -> bool {
+pub(crate) fn private(meta: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o077 == 0)
+    meta.permissions().mode() & 0o077 == 0
 }
 
 /// Makes the file at `path` one only its owner may read: mode `0600`.
@@ -37,6 +38,10 @@ mod tests {
         let refused = ApiCredentials::find(none, &dir).unwrap_err();
         assert!(refused.contains("chmod 600"), "{refused}");
         assert!(!refused.contains("SENTINEL"), "{refused}");
+        std::fs::write(&path, [0xff]).unwrap();
+        let refused = ApiCredentials::find(none, &dir).unwrap_err();
+        assert!(refused.contains("chmod 600"), "{refused}");
+        std::fs::write(&path, "SCROBL_API_KEY=test\nSCROBL_API_SECRET=test").unwrap();
         super::close_to_others(&path);
         assert!(ApiCredentials::find(none, &dir).unwrap().is_some());
         std::fs::remove_dir_all(&dir).unwrap();
