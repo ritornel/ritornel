@@ -167,6 +167,11 @@ impl Session {
     /// every topic the session then has. Whatever is queued after this is
     /// sent after every event on those topics that the session will ever
     /// get.
+    /// The topics the session is subscribed to.
+    pub(crate) fn topics(&self) -> Vec<Topic> {
+        self.state().topics.iter().copied().collect()
+    }
+
     pub(crate) fn unsubscribe(&self, topics: &[Topic]) -> Vec<Topic> {
         let mut state = self.state();
         for topic in topics {

@@ -240,6 +240,7 @@ mod tests {
             watch: None,
             backup: None,
             record: None,
+            hub: None,
         }
     }
 
