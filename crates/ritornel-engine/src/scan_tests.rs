@@ -758,7 +758,7 @@ fn a_moved_file_keeps_its_item_when_other_audio_takes_its_old_path() {
 }
 
 #[test]
-fn files_that_move_into_each_others_paths_keep_their_items() {
+fn a_file_renamed_into_a_moved_files_old_path_keeps_its_item() {
     let mut rig = Rig::new();
     rig.put("Tin Weather/02.flac", "b.flac");
     rig.put("Tin Weather/03.flac", "a.retagged.flac");
@@ -1305,8 +1305,14 @@ fn another_disk_mounted_at_the_root_after_the_walk_is_not_judged_against_it() {
     rig.put("Tin Weather/02.flac", "b.flac");
     rig.scan();
     let (root, away) = (rig.root(), rig.scratch.path().join("unmounted"));
-    for nothing_to_read in [false, true] {
-        if nothing_to_read {
+    for (nothing_to_read, swapped_before_judging) in [(false, false), (true, false), (false, true)]
+    {
+        if swapped_before_judging {
+            // The walk sees only other audio at 01, which is read from
+            // the disk walked. The swap comes before it is judged.
+            rig.scan();
+            rig.put("Tin Weather/01.flac", "b.flac");
+        } else if nothing_to_read {
             // The walk sees only a file gone, and the scan goes straight to
             // judging what is missing.
             rig.scan();
@@ -1320,11 +1326,18 @@ fn another_disk_mounted_at_the_root_after_the_walk_is_not_judged_against_it() {
         }
         let (revision, before) = (rig.revision(), rig.dump());
         let (mut run, row) = walked(&mut rig);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        if swapped_before_judging {
+            // The batch is read, and nothing is missing.
+            for _ in 0..2 {
+                assert!(run.prepare(&stop, &mut |_| {}).unwrap());
+                assert_eq!(run.commit(&rig.library).unwrap(), None);
+            }
+        }
         // Then the disk is swapped for another whose files all read, with
         // other audio at 01.
         std::fs::rename(&root, &away).unwrap();
-        rig.put("Tin Weather/01.flac", "b.flac");
-        let stop = std::sync::atomic::AtomicBool::new(false);
+        rig.put("Tin Weather/01.flac", "a.retagged.flac");
         let refused = loop {
             match run.prepare(&stop, &mut |_| {}) {
                 Ok(_) => assert_eq!(run.commit(&rig.library).unwrap(), None),

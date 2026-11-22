@@ -48,6 +48,13 @@ pub(crate) fn open(
                 });
             }
             let library = opened().map_err(Error::Library)?;
+            // And again, in case the file was replaced in between.
+            if library.library_id() != found {
+                return Err(Error::AnotherLibrary {
+                    claimed: identity.library_id,
+                    found: library.library_id(),
+                });
+            }
             (identity, library)
         }
         Role::Unassigned => match opened() {
