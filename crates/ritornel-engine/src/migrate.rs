@@ -5,6 +5,7 @@
 //! each database creates. A database's schema version is the highest number
 //! in it.
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
@@ -105,6 +106,25 @@ pub(crate) fn run(
         }
     }
 
+    if shipped.len() == 0 {
+        return Ok(Migrated {
+            applied: 0,
+            version: known,
+        });
+    }
+    // SQL migrations can fold search text exactly as queries do.
+    connection.create_scalar_function(
+        "search_fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            Ok(ctx
+                .get::<Option<String>>(0)?
+                .as_deref()
+                .map(crate::list::fold::fold))
+        },
+    )?;
+
     // A migration that changes a table rebuilds it: a new table, the rows
     // copied, the old one dropped. SQLite's procedure for that turns foreign
     // keys off for the migration, which only works outside a transaction,
@@ -114,6 +134,7 @@ pub(crate) fn run(
     connection.pragma_update(None, "foreign_keys", false)?;
     let applied = apply(connection, shipped, clock);
     connection.pragma_update(None, "foreign_keys", enforced)?;
+    connection.remove_function("search_fold", 1)?;
     Ok(Migrated {
         applied: applied?,
         version: known,
@@ -133,22 +154,6 @@ fn apply<'a>(
             version: migration.version,
             source,
         };
-        if migration.name == "0002_fold_search_text" {
-            use rusqlite::functions::FunctionFlags;
-            connection
-                .create_scalar_function(
-                    "search_fold",
-                    1,
-                    FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                    |ctx| {
-                        Ok(ctx
-                            .get::<Option<String>>(0)?
-                            .as_deref()
-                            .map(crate::list::fold::fold))
-                    },
-                )
-                .map_err(failed)?;
-        }
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(failed)?;

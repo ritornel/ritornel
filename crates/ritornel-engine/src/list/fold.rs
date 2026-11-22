@@ -105,7 +105,7 @@ pub(crate) fn rank(sort_text: &str) -> u8 {
 
 /// What was typed, read for matching: folded, and trimmed.
 pub(crate) fn needle(typed: &str) -> String {
-    fold(typed.trim())
+    fold(typed.trim_matches(|c: char| c.is_whitespace() || c == '\0'))
 }
 
 /// Whether `haystack`, folded, matches `needle`: contains it, or for a
@@ -126,6 +126,8 @@ mod tests {
 
     #[test]
     fn folding_takes_away_case_and_accents() {
+        assert_eq!(needle("\0   \0"), "");
+        assert_eq!(needle("\0  t\0in  \0"), "tin");
         assert_eq!(fold("Éclair Brûlée"), "eclair brulee");
         assert_eq!(fold("MÖTLEY"), "motley");
         assert_eq!(fold("ﬁne"), "fine");
