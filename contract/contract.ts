@@ -125,6 +125,9 @@ export const METHODS = {
   "server.backup": { kind: "command", needsFull: true },
   "history.export": { kind: "command", needsFull: true },
   "record.dismiss": { kind: "command", needsFull: true },
+  "link.invite": { kind: "session", needsFull: true },
+  "link.join": { kind: "command", needsFull: true },
+  "link.status": { kind: "query", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -195,6 +198,9 @@ export type MethodMap = {
   "server.backup": { params: BackupParams; result: BackedUp };
   "history.export": { params: HistoryExportParams; result: HistoryExported };
   "record.dismiss": { params: DismissParams; result: Dismissed };
+  "link.invite": { params: LinkInviteParams; result: LinkInvite };
+  "link.join": { params: LinkJoinParams; result: LinkStatus };
+  "link.status": { params: NoParams; result: LinkStatus };
 };
 
 /** The name of a method. */
@@ -1448,6 +1454,36 @@ export type HistoryStream = {
 };
 
 /**
+ * A satellite's hub, as the satellite knows it.
+ */
+export type HubStatus = {
+  /**
+   * The hub's server ID.
+   */
+  serverId: string,
+  /**
+   * The hub's name. Text from another machine: display only.
+   */
+  name: string,
+  /**
+   * The library the hub holds.
+   */
+  libraryId: string,
+  /**
+   * The hub epoch the satellite last saw.
+   */
+  epoch: number,
+  /**
+   * Where the hub is reached, in the order they are tried.
+   */
+  routes: Array<string>,
+  /**
+   * When the satellite joined, as Unix milliseconds.
+   */
+  linkedAtMs: number,
+};
+
+/**
  * The params of `artists.importPictures`.
  */
 export type ImportPicturesParams = {
@@ -2118,6 +2154,65 @@ export type Limits = {
    * ends it.
    */
   viewIdleMs: number,
+};
+
+/**
+ * The result of `link.invite`.
+ */
+export type LinkInvite = {
+  /**
+   * The link to give the satellite: `link.join` takes it. It holds a
+   * secret, and works once.
+   */
+  link: string,
+  /**
+   * When it stops working, as Unix milliseconds.
+   */
+  expiresAtMs: number,
+};
+
+/**
+ * The params of `link.invite`.
+ */
+export type LinkInviteParams = {
+  /**
+   * Where the satellite may reach the hub, as `address:port`, in the
+   * order to try. Left empty, the hub offers the addresses it finds it
+   * has on the private network and a tailnet.
+   */
+  routes: Array<string>,
+};
+
+/**
+ * The params of `link.join`.
+ */
+export type LinkJoinParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The link `link.invite` gave on the hub.
+   */
+  link: string,
+};
+
+/**
+ * The result of `link.status`, and of `link.join`.
+ */
+export type LinkStatus = {
+  /**
+   * This server's role.
+   */
+  role: ServerRole,
+  /**
+   * On a satellite, its hub. Left out on any other server.
+   */
+  hub?: HubStatus,
+  /**
+   * On a hub, the satellites linked to it, oldest first.
+   */
+  satellites: Array<SatelliteStatus>,
 };
 
 /**
@@ -3743,6 +3838,24 @@ export type RpcError = {
    * What a client acts on.
    */
   data: ErrorData,
+};
+
+/**
+ * A satellite, as its hub knows it.
+ */
+export type SatelliteStatus = {
+  /**
+   * The satellite's server ID.
+   */
+  serverId: string,
+  /**
+   * Its name when it joined. Text from another machine: display only.
+   */
+  name: string,
+  /**
+   * When it joined, as Unix milliseconds.
+   */
+  linkedAtMs: number,
 };
 
 /**

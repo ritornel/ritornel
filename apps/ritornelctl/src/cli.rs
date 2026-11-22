@@ -27,6 +27,9 @@
 //! ritornelctl lastfm sync [--full] [--no-wait]
 //! ritornelctl lastfm report [--limit <n>]
 //! ritornelctl lastfm scrobbling <on | off>
+//! ritornelctl link invite [--route <address:port>]...
+//! ritornelctl link join <link>
+//! ritornelctl link status
 //! ```
 //!
 //! Every command takes `--data-dir <dir>` and `--json`.
@@ -45,7 +48,7 @@ use ritornel_client::contract::SkipDirection;
 use ritornel_client::contract::local::Env;
 
 use crate::{
-    artists, backup, export, history, identity, jobs, lastfm, library, playback, scan, status,
+    artists, backup, export, history, identity, jobs, lastfm, library, link, playback, scan, status,
 };
 
 const USAGE: &str = "\
@@ -83,6 +86,9 @@ Usage:
   ritornelctl lastfm sync [--full] [--no-wait] [--data-dir <dir>] [--json]
   ritornelctl lastfm report [--limit <n>] [--data-dir <dir>] [--json]
   ritornelctl lastfm scrobbling <on | off> [--data-dir <dir>] [--json]
+  ritornelctl link invite [--route <address:port>]... [--data-dir <dir>] [--json]
+  ritornelctl link join <link> [--data-dir <dir>] [--json]
+  ritornelctl link status [--data-dir <dir>] [--json]
 
 Commands:
   status           Show the running server's ID, name and role, the versions
@@ -186,6 +192,16 @@ Commands:
   lastfm scrobbling on | off
                    Send the plays that count to Last.fm from now on, or
                    stop
+  link invite      On a library's hub that listens on the private network
+                   (`ritornel-server serve --listen private:<port>`), make a
+                   link another server joins with to become its satellite:
+                   it browses this library, plays its music and sends its
+                   listens here. The link works once, for ten minutes, and
+                   holds a secret. --route names where the hub is reached,
+                   if not at the addresses it finds it has
+  link join <link> Make this server, which holds no library, the satellite
+                   of the hub that made the link
+  link status      Show this server's hub, or its satellites
 
 Options:
   --name <name>         scan, artists pictures: the name the folder is
@@ -366,6 +382,34 @@ enum Command {
     Show(ShowArgs),
     #[command(subcommand)]
     Lastfm(LastfmCommand),
+    #[command(subcommand)]
+    Link(LinkCommand),
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum LinkCommand {
+    Invite(InviteArgs),
+    Join(JoinArgs),
+    Status(ServerArgs),
+}
+
+/// What `link invite` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct InviteArgs {
+    /// Where the hub is reached, in order.
+    #[arg(long)]
+    pub(crate) route: Vec<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `link join` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct JoinArgs {
+    /// The link `link invite` made on the hub.
+    pub(crate) link: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `status` takes.
@@ -758,6 +802,7 @@ fn try_run(
         Command::History(args) => history::history(&args, env, out),
         Command::Show(args) => lastfm::show(&args, env, out),
         Command::Lastfm(command) => lastfm::lastfm(&command, env, out, err),
+        Command::Link(command) => link::link(&command, env, out),
     }
 }
 

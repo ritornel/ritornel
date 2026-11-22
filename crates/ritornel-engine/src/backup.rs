@@ -294,13 +294,13 @@ mod tests {
             .unwrap();
         let mut newer = migrate::SERVER.to_vec();
         newer.push(Migration {
-            version: 2,
-            name: "0002_next",
+            version: 3,
+            name: "0003_next",
             sql: "",
         });
         assert_eq!(
             pending_in(&connection, &newer).unwrap(),
-            Some(Pending { from: 1, to: 2 })
+            Some(Pending { from: 2, to: 3 })
         );
         // And one that knows fewer would refuse to open it, so there is
         // nothing to copy for.

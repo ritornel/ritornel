@@ -3,9 +3,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
-use hyper::header::{AUTHORIZATION, HOST, HeaderValue};
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use ritornel_contract::route::{self, Health};
@@ -51,18 +51,33 @@ pub async fn get(
     credential: Option<&Credential>,
 ) -> Result<Answer, Error> {
     let stream = connect(endpoint).await?;
-    send(stream, endpoint, Method::GET, path, credential).await
+    send(stream, endpoint, Method::GET, path, credential, None).await
 }
 
-/// Sends one request with no body on a connection that is already made,
-/// with the credential if there is one, and returns whatever came back.
-/// Nothing has been sent on the connection yet.
+/// Sends `POST <path>` to `endpoint` with `body` as JSON, with the
+/// credential if there is one, and returns whatever came back.
+pub async fn post(
+    endpoint: SocketAddr,
+    path: &str,
+    credential: Option<&Credential>,
+    body: &impl serde::Serialize,
+) -> Result<Answer, Error> {
+    let body = serde_json::to_vec(body)
+        .map_err(|error| Error::Protocol(format!("a body for POST {path}: {error}")))?;
+    let stream = connect(endpoint).await?;
+    send(stream, endpoint, Method::POST, path, credential, Some(body)).await
+}
+
+/// Sends one request on a connection that is already made, with the
+/// credential if there is one and a JSON body if there is one, and returns
+/// whatever came back. Nothing has been sent on the connection yet.
 async fn send(
     stream: TcpStream,
     endpoint: SocketAddr,
     method: Method,
     path: &str,
     credential: Option<&Credential>,
+    json: Option<Vec<u8>>,
 ) -> Result<Answer, Error> {
     within_deadline(async {
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -79,7 +94,12 @@ async fn send(
         if let Some(credential) = credential {
             request = request.header(AUTHORIZATION, authorization(credential)?);
         }
-        let request = request.body(Empty::<Bytes>::new()).map_err(transport)?;
+        if json.is_some() {
+            request = request.header(CONTENT_TYPE, "application/json");
+        }
+        let request = request
+            .body(Full::new(Bytes::from(json.unwrap_or_default())))
+            .map_err(transport)?;
         let response = sender.send_request(request).await.map_err(transport)?;
         let status = response.status().as_u16();
         let body = Limited::new(response.into_body(), MAX_BODY_BYTES)
@@ -168,6 +188,7 @@ pub(crate) async fn ticket_over(
         Method::POST,
         route::TICKET,
         Some(credential),
+        None,
     )
     .await?;
     let path = route::TICKET;

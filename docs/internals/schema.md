@@ -21,7 +21,8 @@ Holds everything that belongs to the music library itself:
 
 Holds everything private to one `ritornel-server` installation:
 
-- **Identity and access:** `schema_migration`, `server_identity` (singleton row holding `server_id`, Ed25519 signing/public keypair, display name, role, and `library_id`), `server_setting`, `session`.
+- **Identity and access:** `schema_migration`, `server_identity` (singleton row holding `server_id`, Ed25519 signing/public keypair, display name, role, and `library_id`), `server_setting`, `session` (on a hub, a satellite's link session also records `peer_server_pid` and the `peer_public_key` it proved when it joined).
+- **Hub link:** `hub_link`, on a satellite only: a singleton row with the hub's ID and pinned public key, its name, the library ID and hub epoch at joining, the routes to try in order, and the link session's token.
 - **Local paths and receipts:** `root` (maps logical `library_root.name` values to absolute filesystem paths on this machine), `command_receipt`.
 - **Background work:** `job`, `job_item`, `outbox`.
 - **Playback and external sessions:** `queue_entry`, `playback_session` (singleton row), `listen_staging` (at most one open listen per server via partial unique index `listen_staging_open`), `service_session` (stores external service session secrets such as Last.fm's `session_key`).

@@ -24,6 +24,14 @@ See [`docs/internals/server.md`](server.md) for the data directory and storage s
 - **Loopback or the private network (`apps/server/src/config.rs`):** `Listen` binds IPv4 loopback (`127.0.0.1`) by default, on `DEFAULT_PORT` (`4747`) with fallback to an OS-chosen port (`0`) when unspecified and already in use. `private:<port>` binds every IPv4 interface and closes any connection whose peer is not loopback, private, link-local or in the tailnet range before reading a byte (`Listen::admits`). No other address can be named, so a public address is never bound. Clients discover the active port from `server.json` rather than assuming `4747`.
 - **Authenticated routes and bounds (`apps/server/src/listener.rs`, `dispatch.rs`):** Every HTTP route except `GET /v1/descriptor` requires authentication (bearer header, one-time ticket on `GET /v1/ws`, or media token on `GET /v1/art/…`), even on loopback, to block cross-origin browser requests to `127.0.0.1` (see ["Query-string credentials and origin checks" in `docs/internals/contract.md`](contract.md#query-string-credentials-and-origin-checks)). Connection admission is bounded by `Bounds::max_connections` and `Bounds::header_wait` before auth, HTTP request heads are capped at `MAX_HEAD_BYTES` (`16 KiB`), and WebSocket control frames are capped at `MAX_MESSAGE_BYTES` (`1 MiB`) so bulk transfers stay off the control channel.
 
+## Hub and satellites
+
+A hub owns `library.db`. A satellite is another server that plays and records through the hub's library rather than holding one of its own. The server side lives in `apps/server/src/link.rs` and `apps/server/src/dispatch/link.rs`, storage in `crates/ritornel-engine/src/link_store.rs`, wire types in `crates/ritornel-contract/src/link.rs`, and the command line in `apps/ritornelctl/src/link.rs`. ["Link sessions" in `docs/internals/contract.md`](contract.md#link-sessions) has the invite, the request and what the hub refuses.
+
+- **Invite and join:** `link.invite` on the hub makes a one-time invite naming the hub's ID, its public key, and the private routes it listens on. `link.join` on the other server dials those routes in order, checks the descriptor proof against the key in the invite, and proves its own key over the invite's secret. The secret travels after `#`, so it is never part of a route or a log line.
+- **What each side keeps:** The hub registers the satellite in `library.db`'s `server` table and issues it a link session in `server.db` (`SubjectKind::Server`, with the satellite's ID and the public key it proved). The satellite keeps one `hub_link` row in `server.db`: the hub's ID and pinned key, its name, the routes, and the link session's token. It takes `Role::Satellite` and the hub's library ID.
+- **Status:** `link.status` reports the link from either side: on a hub its satellites, on a satellite its hub.
+
 ## Decisions
 
 - **Authoritative hub pointer in `library.db`.** Storing `hub_server_id` inside the library itself prevents accidental split-brain writes when a database file is copied or moved between machines.
@@ -33,4 +41,4 @@ See [`docs/internals/server.md`](server.md) for the data directory and storage s
 
 ## Later
 
-- The schema and engine already include hooks for multi-server linking: `server_identity.role` (`Role::Satellite`), `session.subject_kind` (`SubjectKind::Server`), `session.media_token_hash`, `library_meta.hub_epoch`, and `library.db`'s `server` table, so peer pairing, LAN listeners, and hub/satellite forwarding build on this foundation without migrating existing single-machine libraries.
+- `library_meta.hub_epoch` and the `server` registry prepare for moving the hub role to another server.

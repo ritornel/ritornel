@@ -54,6 +54,7 @@ mod import_store;
 pub mod invent;
 mod jobs;
 mod library_store;
+mod link_store;
 mod list;
 mod media;
 #[cfg(test)]
@@ -112,6 +113,7 @@ pub use library_store::{
     Client, Command, CommitHook, Committed, Fingerprint, LibraryMeta, LibraryStore, SubjectKind,
     WriteRequest, Written,
 };
+pub use link_store::{HubLink, LinkSession};
 pub use list::{ListError, View};
 pub use ratings::Said;
 pub use record_health::{Dismissal, Failing, LostScrobbles};

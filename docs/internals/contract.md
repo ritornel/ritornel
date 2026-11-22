@@ -23,8 +23,9 @@ The server exposes a single HTTP/1.1 listener (`apps/server/src/listener.rs`), o
 | `/v1/ticket` | `POST` | Bearer (no `Origin`) | Exchanges a credential for a single-use `SocketTicket` (`Cache-Control: no-store`). |
 | `/v1/ws` | `GET` | Bearer or `?ticket=` | WebSocket upgrade carrying JSON-RPC 2.0 text frames. |
 | `/v1/art/{artId}/{size}` | `GET` | Bearer or `?token=` | Immutable JPEG cover art at a fixed size bucket. |
+| `/v1/link` | `POST` | Invite secret in the body (no `Origin`) | A server joining this hub as a satellite: trades a `LinkRequest` for a `LinkGranted` link-session token. |
 
-All routes except `GET /v1/descriptor` require authentication (`401 Unauthorized` with `WWW-Authenticate: Bearer` on failure, including unknown paths so unauthenticated callers learn nothing about what exists). Credentials are checked in memory against loaded verifiers in constant time (`subtle::ConstantTimeEq`), never touching disk or SQLite on async worker threads.
+All routes except `GET /v1/descriptor` and `POST /v1/link` require authentication (`401 Unauthorized` with `WWW-Authenticate: Bearer` on failure, including unknown paths so unauthenticated callers learn nothing about what exists). Credentials are checked in memory against loaded verifiers in constant time (`subtle::ConstantTimeEq`), never touching disk or SQLite on async worker threads.
 
 ### Query-string credentials and origin checks
 
@@ -33,6 +34,12 @@ Native clients (`ritornel-desktop-gpui`, `ritornelctl`) authenticate with `Autho
 - **Socket tickets (`apps/server/src/ticket.rs`):** `POST /v1/ticket` issues 32 random bytes (64 lowercase hex digits) valid for one `GET /v1/ws?ticket=<ticket>` upgrade within `Bounds::ticket_life` (default 10 s), capped at 64 waiting tickets (oldest evicted when full). Redeeming a ticket consumes it immediately regardless of whether the upgrade succeeds. `POST /v1/ticket` rejects any request carrying an `Origin` header (`403 Forbidden`), and no route answers CORS preflight (`OPTIONS`), so arbitrary web pages cannot obtain tickets.
 - **Origin check on `/v1/ws`:** A WebSocket upgrade with no `Origin` header (native clients) is allowed. A request carrying an `Origin` header is rejected (`403 Forbidden`) unless it authenticated with a ticket and every `Origin` equals the known desktop webview origin (`tauri://localhost`).
 - **Media tokens (`apps/server/src/media.rs`):** `media.token` returns a session-scoped 64-hex-digit token valid only on `GET /v1/art/...?token=<token>` for the lifetime of that WebSocket session, revoked when the session closes.
+
+### Link sessions
+
+A hub links a satellite with a one-time invite (`link.invite`): an `InviteLink` (`ritornel://link/<hubId>?key=<publicKey>&route=<address:port>…#<secret>`) valid for ten minutes and kept in memory only. The joining server (`link.join`) dials only private routes, checks the hub's descriptor `proof` against the pinned key, and posts a `LinkRequest` to `POST /v1/link` with the secret, its server ID, its public key and a signature of `link_request_proof(hubId, secret)`. The hub refuses another `CONTRACT_VERSION`, a missing or wrong proof, a spent or expired secret, a request that names an `Origin`, and a server ID already linked under another key; otherwise it registers the satellite in the library and issues a link session (`apps/server/src/dispatch/link.rs`).
+
+A link session is a `full` session that knows its satellite (`Session::peer`). It authenticates on the socket upgrade with the bearer token, never with a ticket, and the hub refuses it the calls that name the hub's own folders, backups and links (`kept_from_a_link`). A satellite joining again closes the sockets of its previous session.
 
 ### Transport-neutral dispatcher
 
@@ -135,11 +142,12 @@ Clients gate optional behavior on `PublicDescriptor.capabilities` rather than ve
 
 ## Method summary
 
-All 63 methods are registered in `crates/ritornel-contract/src/methods.rs` (see `contract/contract.ts` for exact field types):
+All 66 methods are registered in `crates/ritornel-contract/src/methods.rs` (see `contract/contract.ts` for exact field types):
 
 | Area | Methods |
 |---|---|
 | Session & server | `server.hello`, `server.status`, `servers.list`, `events.subscribe`, `events.unsubscribe`, `server.backup`, `record.dismiss` |
+| Linking | `link.invite`, `link.join`, `link.status` |
 | Library & sources | `library.create`, `sources.list`, `sources.add`, `sources.tracks`, `scan.start`, `library.stats`, `library.setWatching`, `artists.importPictures`, `artists.pictureFolders` |
 | Jobs & identity | `jobs.list`, `jobs.get`, `jobs.cancel`, `identity.dryRun`, `identity.review` |
 | Browse & media | `list.open`, `list.window`, `list.sections`, `list.locate`, `list.close`, `library.search`, `album.get`, `artist.get`, `tracks.get`, `media.token` |

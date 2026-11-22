@@ -261,7 +261,7 @@ impl ServerStore {
                     |row| row.get::<_, [u8; 32]>(0),
                 )
                 .optional()?
-                .map(crate::Signer::new))
+                .map(crate::Signer::from_seed))
         })
     }
 
@@ -509,7 +509,7 @@ impl ServerStore {
     }
 }
 
-fn read_identity(connection: &Connection) -> Result<Option<ServerIdentity>, Error> {
+pub(crate) fn read_identity(connection: &Connection) -> Result<Option<ServerIdentity>, Error> {
     Ok(connection
         .query_row(
             "SELECT server_id, public_key, name, role, library_id, created_at_ms
@@ -624,8 +624,8 @@ mod tests {
     #[test]
     fn a_new_database_is_at_the_newest_schema_and_has_no_identity() {
         let store = in_memory(&Arc::new(FixedClock::at(T0)));
-        assert_eq!(store.schema_version(), 1);
-        assert_eq!(store.migrations_applied(), 1);
+        assert_eq!(store.schema_version(), crate::SERVER_SCHEMA_VERSION);
+        assert_eq!(store.migrations_applied(), migrate::SERVER.len());
         assert_eq!(store.identity().unwrap(), None);
         assert!(sessions(&store).is_empty());
     }
@@ -841,7 +841,7 @@ mod tests {
         let path = scratch.path().join("server.db");
 
         let store = on_disk(&path).unwrap();
-        assert_eq!(store.migrations_applied(), 1);
+        assert_eq!(store.migrations_applied(), migrate::SERVER.len());
         let (first, token) = store.ensure_identity("desk").unwrap();
         let token = token.unwrap();
         store.close().unwrap();
@@ -849,7 +849,7 @@ mod tests {
 
         let store = on_disk(&path).unwrap();
         assert_eq!(store.migrations_applied(), 0);
-        assert_eq!(store.schema_version(), 1);
+        assert_eq!(store.schema_version(), crate::SERVER_SCHEMA_VERSION);
         let (second, none) = store.ensure_identity("desk").unwrap();
         assert_eq!(second, first);
         assert!(none.is_none());
@@ -906,11 +906,11 @@ mod tests {
         on_disk(&path).unwrap().close().unwrap();
         tamper(
             &path,
-            "INSERT INTO schema_migration VALUES (2, '0002_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration VALUES (3, '0003_from_the_future', x'00', 0)",
         );
         let refused = on_disk(&path);
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 2, known: 1 })),
+            matches!(refused, Err(Error::NewerSchema { found: 3, known: 2 })),
             "{refused:?}"
         );
     }

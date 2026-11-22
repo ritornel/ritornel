@@ -25,6 +25,9 @@ lastfm = ["dep:ritornel-lastfm", "dep:ritornel-source"]
 media-session = ["dep:souvlaki", "dep:objc2-core-foundation", "dep:zbus"]
 
 [dependencies]
+# A satellite talks to its hub as any client does: the descriptor, the
+# socket and the routes, through the same client.
+ritornel-client.workspace = true
 ritornel-contract.workspace = true
 ritornel-engine = { workspace = true, default-features = false }
 ritornel-lastfm = { workspace = true, optional = true }

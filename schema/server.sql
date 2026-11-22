@@ -5,6 +5,7 @@
 -- Migrations, each with the SHA-256 recorded when it is applied. A checksum
 -- that changes here means a migration that has shipped was edited.
 --   0001_server  dcd8fce9c43a2974357d2bcb8f016bde876f16f86ec8437e2786de62803ae0c7
+--   0002_hub_link  dd4608c7904bfdcf0e97bd4fef1a83f0f77051bb90189b6a7e9dccd467984cdb
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -41,7 +42,7 @@ CREATE TABLE session (
   media_token_hash    BLOB UNIQUE,                                           -- hash of the media-only token from media.token (contract.md)
   created_at_ms       INTEGER NOT NULL,
   revoked_at_ms       INTEGER                                                -- sessions end by revocation, not by time
-) STRICT;
+, peer_server_pid BLOB CHECK (peer_server_pid IS NULL OR length(peer_server_pid) = 16), peer_public_key BLOB CHECK (peer_public_key IS NULL OR length(peer_public_key) = 32)) STRICT;
 
 CREATE TABLE root (
   id             INTEGER PRIMARY KEY,
@@ -191,4 +192,16 @@ CREATE TABLE service_session (
   signed_in_at_ms     INTEGER NOT NULL,
   scrobble_from_ms    INTEGER,                                          -- plays from this time on are sent; NULL sends none
   sign_in_again       INTEGER NOT NULL DEFAULT 0 CHECK (sign_in_again IN (0, 1))   -- the service refused the session; nothing is sent until a new sign-in
+) STRICT;
+
+CREATE TABLE hub_link (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  hub_server_id      BLOB NOT NULL CHECK (length(hub_server_id) = 16),
+  hub_public_key     BLOB NOT NULL CHECK (length(hub_public_key) = 32),   -- checked against the descriptor's proof on every connection
+  hub_name           TEXT NOT NULL,                                       -- untrusted display text
+  library_id         BLOB NOT NULL CHECK (length(library_id) = 16),
+  hub_epoch          INTEGER NOT NULL,
+  routes_json        TEXT NOT NULL CHECK (json_valid(routes_json)),       -- ["192.168.1.20:4747", ...], tried in order
+  token              TEXT NOT NULL,                                       -- the link session's token at the hub: a secret, never logged
+  linked_at_ms       INTEGER NOT NULL
 ) STRICT;
