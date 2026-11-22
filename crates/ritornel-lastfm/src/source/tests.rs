@@ -354,3 +354,13 @@ fn cancelling_between_pages_discards_the_incomplete_span_or_loved_list() {
         }
     }
 }
+
+#[test]
+fn a_partial_last_page_cannot_replace_loved_tracks() {
+    assert!(loved_page_complete(1, 2, false, true).is_err());
+    assert!(loved_page_complete(1, 2, true, false).is_err());
+    assert!(loved_page_complete(2, 1, false, true).is_err());
+    assert!(loved_page_complete(0, 0, true, true).unwrap());
+    assert!(!loved_page_complete(1, 2, false, false).unwrap());
+    assert!(loved_page_complete(2, 2, false, true).unwrap());
+}

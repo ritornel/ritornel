@@ -233,14 +233,23 @@ async fn scan(
     Ok(Some(scrobbles))
 }
 
+/// Only a complete list may replace the saved loved tracks.
+fn loved_page_complete(read: u64, total: u64, empty: bool, last: bool) -> Result<bool, Error> {
+    if read == total && last {
+        return Ok(true);
+    }
+    if empty || last || read >= total {
+        return Err(Error::source(
+            "Last.fm's loved-track pages disagree with their total",
+        ));
+    }
+    Ok(false)
+}
+
 /// Every track `user` has loved, as the list stands now, a page at a time.
 /// Nothing ties one page of it to the next, so a track loved during the
 /// read can be missing until the next sync.
-async fn loved(
-    client: &Client,
-    user: &str,
-    sink: &dyn Sink,
-) -> Result<Option<Vec<Love>>, scrobl::Error> {
+async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Vec<Love>>, Error> {
     let mut loves = Vec::new();
     let mut page_number = 1;
     loop {
@@ -253,7 +262,13 @@ async fn loved(
             .limit(LOVED_PAGE)
             .page(page_number)
             .send()
-            .await?;
+            .await
+            .map_err(|error| failed(&error))?;
+        if page.number() != page_number {
+            return Err(Error::source(
+                "Last.fm returned a different loved-track page than requested",
+            ));
+        }
         let total = page.total();
         let rows = page.len();
         loves.extend(page.items().iter().map(|row| Love {
@@ -261,7 +276,12 @@ async fn loved(
             title: row.track().name().to_owned(),
             loved_at_ms: seconds_to_ms(row.loved_at()),
         }));
-        if rows == 0 || loves.len() as u64 >= total || page_number >= page.total_pages() {
+        if loved_page_complete(
+            loves.len() as u64,
+            total,
+            rows == 0,
+            page_number >= page.total_pages(),
+        )? {
             return Ok(Some(loves));
         }
         page_number += 1;
@@ -363,7 +383,7 @@ impl LastfmSource<'_> {
             total: to_read,
             label: Some("reading the loved tracks".to_owned()),
         });
-        let Some(loves) = loved(client, user, sink).await.map_err(|e| failed(&e))? else {
+        let Some(loves) = loved(client, user, sink).await? else {
             synced.stopped = true;
             return Ok(synced);
         };
