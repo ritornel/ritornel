@@ -41,6 +41,9 @@ const STARTING_WAIT: Duration = Duration::from_secs(2);
 /// longer, so the child keeps running when the wait ends.
 const READY_WAIT: Duration = Duration::from_secs(120);
 
+/// How long stderr gets to deliver the startup diagnostic after stdout closes.
+const DIAGNOSTIC_WAIT: Duration = Duration::from_secs(2);
+
 /// How often a wait looks again.
 const POLL: Duration = Duration::from_millis(25);
 
@@ -111,9 +114,7 @@ impl Launcher {
 
     /// The pid of the server this launcher started, while it holds one.
     pub fn owned_pid(&self) -> Option<u32> {
-        let mut slot = self.owned();
-        let child = slot.as_mut()?;
-        (!child.has_exited()).then(|| child.pid())
+        self.live_owned().as_ref().map(Owned::pid)
     }
 
     /// Finds the server running on the data directory, or starts one if
@@ -127,11 +128,6 @@ impl Launcher {
         let mut races = 0;
         let mut starting_since = None;
         loop {
-            let have_child = {
-                let mut slot = self.owned();
-                slot.take_if(Owned::has_exited);
-                slot.is_some()
-            };
             let error = match local::find(&self.data_dir).await {
                 Ok(server) => return Ok(server),
                 Err(error) => error,
@@ -146,7 +142,7 @@ impl Launcher {
                 ) if races < RACES => {
                     // A cancelled or timed-out caller may have left its
                     // server starting up, even before it acquired the lock.
-                    if have_child {
+                    if self.owned_pid().is_some() {
                         return Err(self.still_starting());
                     }
                     races += 1;
@@ -179,8 +175,7 @@ impl Launcher {
     /// find now.
     async fn start(&self, program: &Program, wait: Duration) -> Result<(), Error> {
         let (owned, ready) = Owned::spawn(program, &self.data_dir)?;
-        // One that was started earlier and has died is let go of.
-        drop(self.owned().replace(owned));
+        self.owned().replace(owned);
         self.await_ready(ready, wait).await
     }
 
@@ -205,7 +200,7 @@ impl Launcher {
         {
             return Ok(());
         }
-        let said = tokio::time::timeout(Duration::from_secs(2), ready.stderr)
+        let said = tokio::time::timeout(DIAGNOSTIC_WAIT, ready.stderr)
             .await
             .ok()
             .and_then(Result::ok)
@@ -222,8 +217,14 @@ impl Launcher {
     /// has not ended after `wait`. A server that was found is left
     /// running. It blocks.
     pub fn stop_owned(&self, wait: Duration) -> Option<Stopped> {
-        let owned = self.owned().take()?;
+        let owned = self.live_owned().take()?;
         Some(owned.stop(wait))
+    }
+
+    fn live_owned(&self) -> MutexGuard<'_, Option<Owned>> {
+        let mut slot = self.owned();
+        slot.take_if(Owned::has_exited);
+        slot
     }
 
     fn owned(&self) -> MutexGuard<'_, Option<Owned>> {
@@ -283,15 +284,19 @@ impl Owned {
             .name("server stdout".to_owned())
             .spawn(move || {
                 let Some(stdout) = stdout else { return };
-                let mut said = Some(said);
-                for line in BufReader::new(stdout).split(b'\n') {
-                    let Ok(line) = line else { break };
-                    if line.split(|&byte| byte == b' ' || byte == b'\r').next()
+                let mut reader = BufReader::new(stdout);
+                let mut line = Vec::new();
+                while let Ok(1..) = reader.read_until(b'\n', &mut line) {
+                    if line
+                        .split(|&byte| matches!(byte, b' ' | b'\r' | b'\n'))
+                        .next()
                         == Some(agreed::READY.as_bytes())
-                        && let Some(said) = said.take()
                     {
                         let _ = said.send(());
+                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                        break;
                     }
+                    line.clear();
                 }
             });
         let stderr = std::thread::Builder::new()
@@ -441,6 +446,7 @@ mod tests {
         let (stdout, said_ready) = oneshot::channel();
         let (diagnosis, stderr) = oneshot::channel();
         drop(stdout);
+        // Stdout already closed. Even with no readiness time left, stderr gets its own wait.
         let (result, ()) = tokio::join!(
             launcher.await_ready(Ready { said_ready, stderr }, Duration::ZERO),
             async {
