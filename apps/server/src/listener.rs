@@ -551,8 +551,9 @@ async fn art(State(core): State<Arc<Core>>, Path((art, size)): Path<(String, Str
     if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || std::fs::read(read)).await {
         return jpeg(bytes);
     }
-    // A satellite has no pictures: it asks its hub, and keeps what it is
-    // given beside the covers it would have made.
+    // A satellite has no pictures: it asks its hub, on the route the hub
+    // last proved itself on, and keeps what it is given beside the covers
+    // it would have made.
     if let Some(uplink) = core.uplink() {
         let Some(route) = uplink.route() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -564,11 +565,17 @@ async fn art(State(core): State<Arc<Core>>, Path((art, size)): Path<(String, Str
         {
             Ok(answer) if answer.status == 200 => {
                 let body = answer.body.clone();
+                // Written beside it and moved into place, so a reader never
+                // finds half a cover.
                 let kept = tokio::task::spawn_blocking(move || {
                     if let Some(folder) = cached.parent() {
                         std::fs::create_dir_all(folder)?;
                     }
-                    std::fs::write(cached, body)
+                    let part = cached.with_extension("part");
+                    std::fs::write(&part, body)?;
+                    std::fs::rename(&part, &cached).inspect_err(|_| {
+                        let _ = std::fs::remove_file(&part);
+                    })
                 })
                 .await;
                 if !matches!(kept, Ok(Ok(()))) {

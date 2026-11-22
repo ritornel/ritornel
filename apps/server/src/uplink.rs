@@ -54,6 +54,10 @@ struct Reach {
 /// before its own clients give up on it: `ritornelctl` waits ten seconds.
 const CALL_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// The most routes a connection tries, so one to a hub that does not
+/// answer is bounded however many routes the invite named.
+const MAX_ROUTES: usize = 8;
+
 /// The longest a connection to the hub may take on one route, the proof
 /// and the hello included. On a home network it takes milliseconds.
 const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
@@ -109,13 +113,16 @@ impl Uplink {
         Credential::new(self.link.token.expose())
     }
 
-    /// The route the last connection was made on, or else the first.
+    /// The route the hub last proved it holds its key on, while it
+    /// answers there: where the link session may be sent outside a
+    /// connection, for media. `None` until a connection has been made, and
+    /// while the hub does not answer.
     pub(crate) fn route(&self) -> Option<SocketAddr> {
-        lock(&self.reach)
-            .route
-            .as_deref()
-            .or(self.link.routes.first().map(String::as_str))
-            .and_then(|route| route.parse().ok())
+        let reach = lock(&self.reach);
+        if reach.answers != Some(true) {
+            return None;
+        }
+        reach.route.as_deref().and_then(|route| route.parse().ok())
     }
 
     /// The hub, as `link.status` and `server.status` show it.
@@ -197,7 +204,8 @@ impl Uplink {
             .routes
             .iter()
             .filter_map(|route| route.parse::<SocketAddr>().ok())
-            .filter(|route| link::is_private_route(route.ip()));
+            .filter(|route| link::is_private_route(route.ip()))
+            .take(MAX_ROUTES);
         for route in routes {
             let opened = async {
                 link::reach(
