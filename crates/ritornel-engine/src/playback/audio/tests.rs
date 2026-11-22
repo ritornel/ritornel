@@ -280,7 +280,7 @@ fn a_seek_ends_the_span_with_its_count_and_the_next_plays_the_rest() {
         Progress {
             span: 3,
             frames: 0,
-            lost: false
+            lost: None
         }
     );
     renderer.unload();
@@ -1597,6 +1597,134 @@ fn an_output_that_goes_away_mid_track_saves_where_it_was_heard_and_play_goes_on_
     assert!(
         (saved + resumed.heard.ms_played - 2_000).abs() <= 1,
         "{resumed:?}"
+    );
+}
+
+/// A held output the player opens on demand, already open, that counts as
+/// stalled after `stall_after` of asking for nothing while playing. Opened
+/// again, it is a null output with no hold.
+fn on_demand_held(
+    at_ms: u64,
+    stall_after: Duration,
+) -> (
+    super::OnDemand,
+    super::null::Tap,
+    std::sync::Arc<super::null::Hold>,
+) {
+    let (mut held, tap, hold) = AudioRenderer::held(AS_IS, 1, at_ms * 16).unwrap();
+    held.stall_after = stall_after;
+    let renderer = super::OnDemand {
+        output: Output::Null { speed: 4 },
+        opened: Some(held),
+        gain: ReplayGain::Off,
+        volume: 1.0,
+        said: Vec::new(),
+    };
+    (renderer, tap, hold)
+}
+
+/// Now, as the pipeline's listens are stamped: Unix milliseconds.
+fn wall_ms() -> i64 {
+    use crate::Clock;
+    crate::SystemClock.now_ms()
+}
+
+#[test]
+fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_stays_silent() {
+    use crate::playback::Status;
+    // At real time, the output stops asking for frames 800 ms in, with no
+    // error, as a stream does behind a sound server whose device went
+    // away.
+    let stall_after = Duration::from_millis(300);
+    let (renderer, tap, hold) = on_demand_held(800, stall_after);
+    let mut rig = Pipeline::new(&[2_000], Box::new(renderer));
+    rig.play();
+    rig.until(|_| hold.waiting().is_some());
+    let stopped_by = wall_ms();
+    rig.until(|state| state.status == Status::Paused);
+    let noticed_by = wall_ms();
+
+    // The player pauses in place and says why, as for an output that went
+    // away.
+    let state = rig.player.state();
+    let failing = state.output_failing.clone().unwrap();
+    assert_eq!(failing.detail, "the output stopped taking sound");
+    let heard = i64::try_from(tap.lock().unwrap().len() / 16).unwrap();
+    assert!((800..820).contains(&heard), "{heard}");
+    // The listen ends as output_lost with every frame the output took, and
+    // when it took the last of them, not when the stall was noticed.
+    let [lost] = rig.staged().try_into().unwrap();
+    let ended = lost.ended.clone().unwrap();
+    assert_eq!(ended.end_reason.as_str(), "output_lost");
+    assert_eq!(
+        (lost.heard.ms_played, ended.end_position_ms),
+        (heard, heard)
+    );
+    assert_eq!(rig.server.playback_session().unwrap().position_ms, heard);
+    // It was noticed once the output had asked for nothing for the time a
+    // stall takes.
+    assert!(
+        ended.ended_at_ms + 300 <= noticed_by + 1,
+        "{ended:?}, noticed by {noticed_by}"
+    );
+    assert!(
+        ended.ended_at_ms <= stopped_by + 20,
+        "{ended:?}, stopped by {stopped_by}"
+    );
+    assert!(failing.since_ms >= ended.ended_at_ms, "{failing:?}");
+
+    // The device takes frames again: nothing more is heard, because the
+    // output was let go.
+    hold.let_go();
+    std::thread::sleep(Duration::from_millis(200));
+    rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    assert_eq!(rig.player.state().status, Status::Paused);
+    assert_eq!(
+        tap.lock().unwrap().len(),
+        usize::try_from(heard * 16).unwrap()
+    );
+
+    // Play opens an output again and carries on, continuing the listen.
+    let request = rig.request("playback.resume");
+    let (server, library) = (&rig.server, Some(&rig.library));
+    rig.player.resume(request, server, library).unwrap();
+    rig.until(|state| state.status == Status::Stopped);
+    assert_eq!(rig.player.state().output_failing, None);
+    let [_, resumed] = rig.staged().try_into().unwrap();
+    assert_eq!(resumed.started.continues, Some(lost.started.listen_id));
+    assert_eq!(resumed.started.start_position_ms, heard);
+    assert!(
+        (heard + resumed.heard.ms_played - 2_000).abs() <= 1,
+        "{resumed:?}"
+    );
+}
+
+#[test]
+fn an_output_that_asks_for_nothing_while_paused_is_not_lost() {
+    use crate::playback::Status;
+    let stall_after = Duration::from_millis(200);
+    let (renderer, _tap, hold) = on_demand_held(500, stall_after);
+    let mut rig = Pipeline::new(&[1_000], Box::new(renderer));
+    rig.play();
+    rig.until(|_| hold.waiting().is_some());
+    let request = rig.request("playback.pause");
+    rig.player.pause(request, &rig.server).unwrap();
+    // Held still for longer than a stall while paused.
+    std::thread::sleep(stall_after * 3);
+    rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    let state = rig.player.state();
+    assert_eq!((state.status, state.output_failing), (Status::Paused, None));
+    // It asks again, and play goes on through the same output to the end.
+    hold.let_go();
+    let request = rig.request("playback.resume");
+    let (server, library) = (&rig.server, Some(&rig.library));
+    rig.player.resume(request, server, library).unwrap();
+    rig.until(|state| state.status == Status::Stopped);
+    let [listen] = rig.staged().try_into().unwrap();
+    let ended = listen.ended.unwrap();
+    assert_eq!(
+        (ended.end_reason.as_str(), listen.heard.ms_played),
+        ("finished", 1_000)
     );
 }
 

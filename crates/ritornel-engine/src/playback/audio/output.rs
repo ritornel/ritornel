@@ -119,11 +119,18 @@ pub(crate) struct Shared {
     /// Callbacks run, so that the control side can tell the output is
     /// alive.
     pub(crate) callbacks: AtomicU64,
+    /// When the frames the output last asked for are done playing, on the
+    /// output's clock: 0 until it first asks. An output that stops asking
+    /// has stalled, and the frames it took end there.
+    pub(crate) asked_until: AtomicU64,
     /// Errors the output's stream reported.
     pub(crate) stream_errors: AtomicU64,
     /// Whether the stream reported an error it cannot go on from: its
     /// device went away or its configuration is no longer valid.
     pub(crate) lost: AtomicBool,
+    /// Whether the output asked for no frames for too long while told to
+    /// play, which loses it as an error would.
+    pub(crate) stalled: AtomicBool,
 }
 
 impl Shared {
@@ -401,6 +408,10 @@ impl Callback {
         let now = (self.clock)();
         self.take_messages(now);
         self.shared.callbacks.fetch_add(1, Ordering::Relaxed);
+        let asked_until = self.time_of(now, out.len() / self.channels);
+        self.shared
+            .asked_until
+            .store(asked_until, Ordering::Relaxed);
         let channels = self.channels;
         let mut written = 0;
         for frame in out.chunks_exact_mut(channels) {

@@ -72,7 +72,7 @@ What differs between systems sits in a `platform` module in each crate that need
 - The desktop app follows the server; the server uses 1–2% of one core and 27 MB while playing.
 - Because the standard library cannot open a directory handle on Windows to flush it, `sync_dir` in `apps/server/src/platform/windows.rs` is currently a no-op (each file inside a backup is flushed before rename, while the directory rename itself is tracked in [#111](https://github.com/ritornel/ritornel/issues/111)).
 
-**Not yet verified on hardware:** hardware media keys or desktop media widgets, the systemd service across logout/login, real Bluetooth or HDMI output changes, and headphone unplug/device loss on Windows.
+**Not yet verified on hardware:** hardware media keys or desktop media widgets, the systemd service across logout/login, real Bluetooth or HDMI output changes, headphone unplug/device loss on Windows, and a USB output unplugged behind PipeWire, which the stall rule ("Audio pipeline" in `docs/internals/playback.md`) is there to catch.
 
 ## Later
 

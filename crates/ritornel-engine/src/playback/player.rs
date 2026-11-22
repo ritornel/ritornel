@@ -1250,8 +1250,10 @@ impl Player {
         {
             return Err(Error::FailPoint);
         }
-        if self.progress.lost && self.loaded.is_some() {
-            let lost = RenderError::new("output", "the output went away");
+        if let Some(why) = self.progress.lost
+            && self.loaded.is_some()
+        {
+            let lost = RenderError::new("output", why);
             self.lose_output(server, &lost, &mut events)?;
             self.changed(&mut events);
             return Ok(events);
