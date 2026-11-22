@@ -755,3 +755,71 @@ fn an_artist_no_file_credits_is_keyed_again_when_the_normaliser_changes() {
     let (library, _) = rig.library.load().unwrap();
     assert_eq!(library.artist_keys_by, None);
 }
+
+#[test]
+fn an_artist_keyed_by_normaliser_2_is_keyed_again_with_its_symbol() {
+    let rig = scanned();
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.normaliser",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let connection = write.connection();
+                connection.execute(
+                    "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
+                     VALUES (911, ?1, 911, 'Harbour Lights +', 'Harbour Lights +', ?2, ?3)",
+                    (
+                        write.new_id()?.as_bytes(),
+                        ritornel_domain::normalize::normalize_by(2, "Harbour Lights +"),
+                        write.rev(),
+                    ),
+                )?;
+                let versions: String = connection.query_row(
+                    "SELECT value_json FROM library_setting WHERE key = 'identity.versions'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let old = versions.replace(
+                    &format!("\"normalizer\":{}", ritornel_domain::NORMALIZER_VERSION),
+                    "\"normalizer\":2",
+                );
+                assert_ne!(old, versions);
+                connection.execute(
+                    "UPDATE library_setting SET value_json = ?1 WHERE key = 'identity.versions'",
+                    [old],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        rig.one("SELECT match_name FROM artist WHERE id = 911"),
+        "harbour lights"
+    );
+    let (library, _) = rig.library.load().unwrap();
+    assert_eq!(library.artist_keys_by, Some(2));
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolve",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    assert_eq!(
+        rig.one("SELECT match_name FROM artist WHERE id = 911"),
+        "harbour lights +"
+    );
+    assert!(
+        rig.library
+            .resolve(WriteRequest {
+                method: "test.resolve",
+                command: None,
+                client: None,
+            })
+            .unwrap()
+            .is_none()
+    );
+}
