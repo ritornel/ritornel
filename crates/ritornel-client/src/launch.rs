@@ -111,7 +111,9 @@ impl Launcher {
 
     /// The pid of the server this launcher started, while it holds one.
     pub fn owned_pid(&self) -> Option<u32> {
-        self.owned().as_ref().map(Owned::pid)
+        let mut slot = self.owned();
+        let child = slot.as_mut()?;
+        (!child.has_exited()).then(|| child.pid())
     }
 
     /// Finds the server running on the data directory, or starts one if
@@ -125,6 +127,11 @@ impl Launcher {
         let mut races = 0;
         let mut starting_since = None;
         loop {
+            let have_child = {
+                let mut slot = self.owned();
+                slot.take_if(Owned::has_exited);
+                slot.is_some()
+            };
             let error = match local::find(&self.data_dir).await {
                 Ok(server) => return Ok(server),
                 Err(error) => error,
@@ -139,13 +146,7 @@ impl Launcher {
                 ) if races < RACES => {
                     // A cancelled or timed-out caller may have left its
                     // server starting up, even before it acquired the lock.
-                    if let Some(owned) = self.owned().as_mut()
-                        && owned
-                            .child
-                            .try_wait()
-                            .map_err(|error| Error::Start(error.to_string()))?
-                            .is_none()
-                    {
+                    if have_child {
                         return Err(self.still_starting());
                     }
                     races += 1;
@@ -180,6 +181,10 @@ impl Launcher {
         let (owned, ready) = Owned::spawn(program, &self.data_dir)?;
         // One that was started earlier and has died is let go of.
         drop(self.owned().replace(owned));
+        self.await_ready(ready, wait).await
+    }
+
+    async fn await_ready(&self, ready: Ready, wait: Duration) -> Result<(), Error> {
         let ready_line = tokio::time::timeout(wait, ready.said_ready).await;
         match ready_line {
             Ok(Ok(())) => return Ok(()),
@@ -314,6 +319,10 @@ impl Owned {
         }
     }
 
+    fn has_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
     fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -425,23 +434,21 @@ mod tests {
         assert!(!scratch.0.join("data").exists());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_diagnostic_can_arrive_after_the_readiness_wait() {
         let scratch = Scratch::new("late-diagnostic");
-        let program = scratch.program(
-            "sh -c 'sleep 1.5; echo ritornel-server: library unavailable >&2' </dev/null >/dev/null & exit 1",
-            "",
-        );
         let launcher = Launcher::new(scratch.0.clone(), None);
-        let failed = launcher
-            .start(&program, Duration::from_secs(1))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&failed, Error::Start(why) if why == "library unavailable"),
-            "{failed:?}"
+        let (stdout, said_ready) = oneshot::channel();
+        let (diagnosis, stderr) = oneshot::channel();
+        drop(stdout);
+        let (result, ()) = tokio::join!(
+            launcher.await_ready(Ready { said_ready, stderr }, Duration::ZERO),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let _ = diagnosis.send("ritornel-server: library unavailable".to_owned());
+            }
         );
+        assert!(matches!(result, Err(Error::Start(why)) if why == "library unavailable"));
     }
 
     #[cfg(unix)]
@@ -490,6 +497,19 @@ mod tests {
             launcher.stop_owned(STOP_WAIT),
             Some(Stopped::Exited(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn an_exited_child_is_no_longer_reported_as_owned() {
+        let scratch = Scratch::new("child-exited");
+        let program = scratch.program("exit 3", "exit /b 3");
+        let launcher = Launcher::new(scratch.0.clone(), None);
+        let (mut owned, _ready) = Owned::spawn(&program, &scratch.0).unwrap();
+        owned.child.wait().unwrap();
+        launcher.owned().replace(owned);
+        assert_eq!(launcher.owned_pid(), None);
+        launcher.find_or_start().await.unwrap_err();
+        assert!(launcher.stop_owned(STOP_WAIT).is_none());
     }
 
     #[test]
