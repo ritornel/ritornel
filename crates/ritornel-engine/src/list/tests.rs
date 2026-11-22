@@ -394,6 +394,56 @@ fn a_filter_by_artist_gives_their_records_and_songs() {
 }
 
 #[test]
+fn songs_by_record_are_found_by_a_letter_however_many_are_on_no_record() {
+    let library = library(150);
+    // Most songs are on no record: they come after every record.
+    library
+        .store
+        .write(
+            WriteRequest {
+                method: "test.write",
+                command: None,
+                client: None,
+            },
+            |write| {
+                write.connection().execute(
+                    "UPDATE track_appearance SET release_id = NULL
+                     WHERE release_id NOT IN (SELECT id FROM release ORDER BY id LIMIT 10)",
+                    [],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    let songs = open(&library, ListKind::Songs, &query(SortKey::Album));
+    let letters: Vec<_> = songs
+        .sections
+        .iter()
+        .filter(|section| section.label != "#")
+        .collect();
+    assert!(letters.len() > 2, "{:?}", songs.sections);
+    for section in letters {
+        let typed = section.label.to_lowercase();
+        assert_eq!(
+            library.store.list_locate_prefix(&songs, &typed).unwrap(),
+            Some(section.index),
+            "{typed}"
+        );
+    }
+    // Past the last letter is the first song on no record.
+    let loose = songs
+        .sections
+        .iter()
+        .rfind(|section| section.label == "#")
+        .map(|section| section.index);
+    assert!(loose.is_some());
+    assert_eq!(
+        library.store.list_locate_prefix(&songs, "zzzzzz").unwrap(),
+        loose
+    );
+}
+
+#[test]
 fn a_row_found_by_id_or_by_the_start_of_its_name() {
     let library = library(150);
     let artists = open(&library, ListKind::Artists, &Query::default());
