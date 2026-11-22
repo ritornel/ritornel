@@ -408,20 +408,21 @@ fn the_committed_typescript_is_what_the_contract_generates() {
 const VERSION_FILE: &str = "contract/contract.version";
 
 /// A digest of the wire as `contract.ts` writes it: FNV-1a, 64 bits, of
-/// every line but the version's and the comments'. It only has to change
-/// when the wire does, and a comment is not the wire.
+/// its words, leaving out the version's line and the comments. It only has
+/// to change when the wire does, and neither a comment nor where a comment
+/// moves the line breaks is the wire.
 fn wire_digest(text: &str) -> String {
-    let version = format!("export const CONTRACT_VERSION = {CONTRACT_VERSION};");
     let comment = |line: &str| {
         let line = line.trim_start();
         line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
     };
     let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
-    for line in text
+    let words = text
         .lines()
-        .filter(|line| *line != version && !comment(line))
-    {
-        for byte in line.bytes().chain(std::iter::once(b'\n')) {
+        .filter(|line| !line.starts_with("export const CONTRACT_VERSION = ") && !comment(line))
+        .flat_map(str::split_whitespace);
+    for word in words {
+        for byte in word.bytes().chain(std::iter::once(b' ')) {
             digest ^= u64::from(byte);
             digest = digest.wrapping_mul(0x0100_0000_01b3);
         }
@@ -486,7 +487,14 @@ fn the_wire_digest_follows_the_text_and_not_the_version() {
         &format!("export const CONTRACT_VERSION = {CONTRACT_VERSION};"),
         "export const CONTRACT_VERSION = 999999;",
     );
-    assert_ne!(wire_digest(&text), wire_digest(&other));
+    assert_eq!(wire_digest(&text), wire_digest(&other));
+    // A field given a comment is put on a line of its own.
+    let commented = text.replace(
+        "export type Dismissed = { record: RecordStatus,",
+        "export type Dismissed = {\n/**\n * The record.\n */\nrecord: RecordStatus,",
+    );
+    assert_ne!(text, commented);
+    assert_eq!(wire_digest(&text), wire_digest(&commented));
 }
 
 #[test]
