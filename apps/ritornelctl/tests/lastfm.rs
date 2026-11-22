@@ -629,7 +629,13 @@ fn the_hub_imports_on_its_own_when_it_starts_and_a_failure_waits_for_the_next_tr
     // Set up, and never imported: the next is due now.
     let server = Server::start(&data_dir, &fake, &[]);
     assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["lastfm", "signin"]).0, Some(0));
+    let (code, stdout, stderr) = ritornelctl(&data_dir, &["lastfm", "signin", "--json"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap()["account"],
+        "someone"
+    );
+    assert!(stderr.contains(TOKEN), "{stderr}");
     let (_, text, _) = ritornelctl(&data_dir, &["lastfm", "status"]);
     assert!(
         text.contains("Next import       only by hand: no zones"),

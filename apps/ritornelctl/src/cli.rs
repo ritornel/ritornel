@@ -449,7 +449,7 @@ pub(crate) struct PlayArgs {
     #[arg(long)]
     pub(crate) album: Option<String>,
     /// The track to start at, from 1.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub(crate) start: Option<u32>,
     /// Show each track as it starts, until the queue ends.
     #[arg(long)]
@@ -695,7 +695,7 @@ pub(crate) fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    match try_run(args, env, out) {
+    match try_run(args, env, out, err) {
         Ok(()) => 0,
         Err(error) => {
             // Nothing useful can be done if the terminal is gone.
@@ -714,6 +714,7 @@ fn try_run(
     args: impl IntoIterator<Item = OsString>,
     env: Env<'_>,
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) -> Result<(), Error> {
     let command = match parse(args) {
         Ok(cli) => cli.command,
@@ -757,7 +758,7 @@ fn try_run(
         Command::Queue(args) => playback::queue(&args, env, out),
         Command::History(args) => history::history(&args, env, out),
         Command::Show(args) => lastfm::show(&args, env, out),
-        Command::Lastfm(command) => lastfm::lastfm(&command, env, out),
+        Command::Lastfm(command) => lastfm::lastfm(&command, env, out, err),
     }
 }
 
@@ -1053,6 +1054,11 @@ mod tests {
                 "{line:?}"
             );
         }
+    }
+
+    #[test]
+    fn play_start_counts_from_one() {
+        assert!(parse(args(&["play", "--start", "0", "track"])).is_err());
     }
 
     #[test]
