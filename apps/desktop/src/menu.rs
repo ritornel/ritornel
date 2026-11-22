@@ -548,7 +548,7 @@ pub(crate) fn now_menu(track: &TrackSummary, cx: &App) -> Vec<Option<Entry>> {
     let mut entries: Vec<Option<Entry>> = track_places(track).into_iter().collect();
     entries.push(SEPARATOR);
     if let (Some(recording), Some(player)) = (track.recording_id, player(cx)) {
-        let own = player.read(cx).own(recording, track.rating);
+        let own = player.read(cx).own(recording, track.rating, None);
         let stars = crate::player::stars_of(own, false);
         let rate = |to: Option<u32>| {
             let checked = match to {

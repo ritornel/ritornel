@@ -165,6 +165,7 @@ struct Read {
     artist: Option<ArtistPage>,
     shelves: Option<Vec<(Shelf, Vec<AlbumTile>)>>,
     songs: Vec<SongRow>,
+    songs_revision: u64,
     history: Option<HistoryOf>,
     revision: u64,
 }
@@ -389,6 +390,7 @@ impl Artist {
                     artist: None,
                     shelves: None,
                     revision: loose.revision,
+                    songs_revision: loose.revision,
                     songs: songs_of(loose),
                     history: history.ok(),
                 });
@@ -414,6 +416,7 @@ impl Artist {
                     .max(loose.revision),
                 artist: Some(artist),
                 shelves: Some(shelve(&records.rows, &records.sections)),
+                songs_revision: loose.revision,
                 songs: songs_of(loose),
                 history: history.ok(),
             })
@@ -460,8 +463,9 @@ impl Artist {
             kind: ContextKind::Artist,
             reference: Some(self.artist_id),
         };
-        self.tracks
-            .update(cx, |tracks, cx| tracks.set(read.songs, None, context, cx));
+        self.tracks.update(cx, |tracks, cx| {
+            tracks.set(read.songs, read.songs_revision, None, context, cx)
+        });
         self.problem = false;
     }
 

@@ -283,7 +283,7 @@ impl Render for PlayerBar {
         let own = track.as_ref().and_then(|track| {
             track
                 .recording_id
-                .map(|recording| player.own(recording, track.rating))
+                .map(|recording| player.own(recording, track.rating, None))
         });
         let entry = state.as_ref().and_then(|state| state.entry_id);
         self.held = self.held.filter(|drag| drag.for_entry(entry));
@@ -451,7 +451,7 @@ impl Render for PlayerBar {
                     move |bar: &mut Self, star, cx| {
                         let Some(recording) = recording else { return };
                         bar.player.update(cx, |player, cx| {
-                            player.click_star(recording, said, star, cx);
+                            player.click_star(recording, said, None, star, cx);
                         });
                     },
                 );

@@ -43,6 +43,7 @@ pub(crate) const UP_NEXT: u32 = 150;
 #[derive(Debug, Clone)]
 pub(crate) struct UpNext {
     pub revision: u64,
+    pub ratings_revision: u64,
     /// How many there are in all.
     pub total: u64,
     pub entries: Vec<QueueEntry>,
@@ -147,7 +148,7 @@ fn said(error: &Error) -> Option<&'static str> {
 #[derive(Default)]
 struct Ratings {
     pending: HashMap<Id, (Id, Option<u32>)>,
-    confirmed: Option<(Id, Option<u32>)>,
+    confirmed: HashMap<Id, (u64, Option<u32>)>,
     revision: u64,
 }
 
@@ -156,13 +157,17 @@ impl Ratings {
         self.pending.insert(recording, (key, rating));
     }
 
-    fn own(&self, recording: Id, saved: Option<u32>) -> Option<u32> {
+    fn own(&self, recording: Id, saved: Option<u32>, row_revision: Option<u64>) -> Option<u32> {
         if let Some((_, rating)) = self.pending.get(&recording) {
             return *rating;
         }
-        self.confirmed
-            .filter(|(id, _)| *id == recording)
-            .map_or(saved, |(_, rating)| rating)
+        if let Some(&(written, rating)) = self.confirmed.get(&recording) {
+            // Playback events have their own clock. List rows carry a library revision.
+            if row_revision.map_or(written >= self.revision, |read| written > read) {
+                return rating;
+            }
+        }
+        saved
     }
 
     fn finish(&mut self, recording: Id, key: Id) -> bool {
@@ -179,17 +184,14 @@ impl Ratings {
     }
 
     /// The receipt can arrive on either side of its own library event.
-    fn confirmed(&mut self, recording: Id, rating: Option<u32>, revision: u64) {
-        if revision >= self.revision {
-            self.revision = revision;
-            self.confirmed = Some((recording, rating));
-        }
-    }
-
-    fn changed(&mut self, revision: u64) {
-        if revision > self.revision {
-            self.revision = revision;
-            self.confirmed = None;
+    fn confirm(&mut self, recording: Id, rating: Option<u32>, revision: u64) {
+        self.revision = self.revision.max(revision);
+        if self
+            .confirmed
+            .get(&recording)
+            .is_none_or(|(kept, _)| revision > *kept)
+        {
+            self.confirmed.insert(recording, (revision, rating));
         }
     }
 }
@@ -257,7 +259,7 @@ impl Player {
                         .changed
                         .contains(&ritornel_contract::LibraryChange::Ratings) =>
             {
-                player.rated.changed(event.library_revision);
+                player.rated.revision = player.rated.revision.max(event.library_revision);
                 if player.open {
                     player.read_up_next(cx);
                 }
@@ -707,6 +709,7 @@ impl Player {
         let Some(net) = self.net.clone() else { return };
         self.reading += 1;
         let asked = self.reading;
+        let ratings_revision = self.rated.revision;
         let client = Arc::clone(&net.client);
         let read = net.rt().spawn(async move {
             client
@@ -720,7 +723,12 @@ impl Player {
         cx.spawn(async move |this, cx| {
             let Ok(Ok(window)) = read.await else { return };
             this.update(cx, |player, cx| {
-                if asked != player.reading {
+                if asked != player.reading
+                    || player
+                        .net
+                        .as_ref()
+                        .is_none_or(|current| !Arc::ptr_eq(current, &net))
+                {
                     return;
                 }
                 crate::debug(format_args!(
@@ -731,6 +739,7 @@ impl Player {
                 ));
                 player.up_next = Some(UpNext {
                     revision: window.queue_revision,
+                    ratings_revision,
                     total: window.total,
                     entries: window.entries,
                 });
@@ -751,8 +760,13 @@ impl Player {
     }
 
     /// The listener's own rating of a recording: one set here, or what the server said.
-    pub(crate) fn own(&self, recording: Id, said: Option<u32>) -> Option<u32> {
-        self.rated.own(recording, said)
+    pub(crate) fn own(
+        &self,
+        recording: Id,
+        said: Option<u32>,
+        row_revision: Option<u64>,
+    ) -> Option<u32> {
+        self.rated.own(recording, said, row_revision)
     }
 
     /// A click on star `star` of `recording`, whose stars the server last
@@ -761,10 +775,11 @@ impl Player {
         &mut self,
         recording: Id,
         said: Option<u32>,
+        row_revision: Option<u64>,
         star: u32,
         cx: &mut Context<Self>,
     ) {
-        let to = clicked(star, self.own(recording, said));
+        let to = clicked(star, self.own(recording, said, row_revision));
         self.rate(recording, to, cx);
     }
 
@@ -793,9 +808,10 @@ impl Player {
                         .is_some_and(|(from, current)| Arc::ptr_eq(from, current))
                         && let Some(revision) = set.receipt.revision
                     {
-                        player
-                            .rated
-                            .confirmed(set.recording_id, set.rating, revision);
+                        player.rated.confirm(recording, set.rating, revision);
+                        if set.recording_id != recording {
+                            player.rated.confirm(set.recording_id, set.rating, revision);
+                        }
                     }
                 } else if current_edit {
                     player.say("The stars could not be saved", cx);
@@ -978,9 +994,9 @@ mod tests {
         ratings.start(song, first, Some(80));
         ratings.start(song, second, None);
         assert!(!ratings.finish(song, first));
-        assert_eq!(ratings.own(song, Some(40)), None);
+        assert_eq!(ratings.own(song, Some(40), None), None);
         assert!(ratings.finish(song, second));
-        assert_eq!(ratings.own(song, Some(40)), Some(40));
+        assert_eq!(ratings.own(song, Some(40), None), Some(40));
     }
 
     #[test]
@@ -990,17 +1006,29 @@ mod tests {
             let mut ratings = Ratings::default();
             ratings.start(song, edit, Some(80));
             if event_first {
-                ratings.changed(5);
+                ratings.revision = 5;
             }
             assert!(ratings.finish(song, edit));
-            ratings.confirmed(song, Some(80), 5);
-            ratings.changed(5);
-            assert_eq!(ratings.own(song, Some(20)), Some(80));
-            assert_eq!(clicked(4, ratings.own(song, Some(20))), None);
-            ratings.changed(6);
-            ratings.confirmed(song, Some(80), 5);
-            assert_eq!(ratings.own(song, Some(40)), Some(40));
+            ratings.confirm(song, Some(80), 5);
+            ratings.revision = 5;
+            assert_eq!(ratings.own(song, Some(20), None), Some(80));
+            assert_eq!(clicked(4, ratings.own(song, Some(20), None)), None);
+            ratings.revision = 6;
+            ratings.confirm(song, Some(80), 5);
+            assert_eq!(ratings.own(song, Some(40), None), Some(40));
         }
+    }
+
+    #[test]
+    fn two_song_ratings_stay_visible_until_their_rows_refresh() {
+        let [first, second] = [1, 2].map(|n| Id::from_bytes([n; 16]));
+        let mut ratings = Ratings::default();
+        ratings.confirm(first, Some(80), 5);
+        ratings.confirm(second, None, 6);
+        assert_eq!(ratings.own(first, None, Some(4)), Some(80));
+        assert_eq!(ratings.own(second, Some(40), Some(4)), None);
+        assert_eq!(clicked(4, ratings.own(first, None, Some(4))), None);
+        assert_eq!(ratings.own(first, Some(20), Some(7)), Some(20));
     }
 
     #[test]

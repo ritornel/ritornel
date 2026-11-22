@@ -1255,7 +1255,7 @@ impl Render for LeanBack {
             .and_then(|track| {
                 track
                     .recording_id
-                    .map(|recording| player.own(recording, track.rating))
+                    .map(|recording| player.own(recording, track.rating, None))
             })
             .flatten();
         let track = state.as_ref().and_then(|state| state.track.clone());
@@ -1734,7 +1734,7 @@ impl Render for LeanBack {
                 move |lean: &mut Self, star, cx| {
                     let Some(recording) = recording else { return };
                     lean.player.update(cx, |player, cx| {
-                        player.click_star(recording, said, star, cx);
+                        player.click_star(recording, said, None, star, cx);
                     });
                 },
             );
