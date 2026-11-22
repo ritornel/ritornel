@@ -44,6 +44,19 @@ const RING_MS: u32 = 500;
 /// How long a change waits for the output to take it.
 const OUTPUT_WAIT: Duration = Duration::from_secs(2);
 
+/// How long an output told to play may ask for no frames before it counts
+/// as lost. A sound server whose device goes away may leave a stream
+/// waiting with no error, as PipeWire is expected to when its only sink is
+/// unplugged.
+/// See "Audio pipeline" in docs/internals/playback.md.
+const STALL: Duration = Duration::from_secs(5);
+
+/// What the player is told when the output went away, by a stream error.
+const WENT_AWAY: &str = "the output went away";
+
+/// What the player is told when the output stopped asking for sound.
+const STALLED: &str = "the output stopped taking sound";
+
 /// Which output a player renders through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Output {
@@ -291,6 +304,11 @@ pub struct AudioRenderer {
     gain: ReplayGain,
     /// Whether the output was last told to play.
     playing: bool,
+    /// When it was, on the output's clock.
+    played_at: u64,
+    /// How long it may ask for no frames while playing: [`STALL`], but for
+    /// a test.
+    stall_after: Duration,
     /// What the output said, as the renderer has read it, and what the
     /// renderer says itself, in order, until drained.
     said: Vec<Event>,
@@ -412,6 +430,8 @@ impl AudioRenderer {
             decoding: None,
             gain: ReplayGain::Off,
             playing: false,
+            played_at: 0,
+            stall_after: STALL,
             said: Vec::new(),
             given: Vec::new(),
             failed: None,
@@ -419,9 +439,52 @@ impl AudioRenderer {
         }
     }
 
-    /// Whether the output went away or stopped answering.
-    fn lost(&self) -> bool {
-        self.running.is_none() || self.shared.lost.load(Ordering::SeqCst)
+    /// Why the output can play no more, if it cannot: it went away, it
+    /// stopped answering, or it stopped asking for frames while told to
+    /// play. A stall is marked lost here, for good, as a stream error is
+    /// marked where it is heard, so a device that comes back is not played
+    /// through until the output is opened again.
+    fn lost(&self) -> Option<&'static str> {
+        if self.running.is_none() {
+            return Some("the output stopped answering");
+        }
+        if self.shared.lost.load(Ordering::SeqCst) {
+            return Some(WENT_AWAY);
+        }
+        if self.stalled() {
+            self.shared.stalled.store(true, Ordering::SeqCst);
+        }
+        self.shared
+            .stalled
+            .load(Ordering::SeqCst)
+            .then_some(STALLED)
+    }
+
+    /// Whether the output, told to play, has asked for no frames for
+    /// [`stall_after`](Self::stall_after): since it last asked, or since it
+    /// was told to play if that was later.
+    fn stalled(&self) -> bool {
+        if !self.playing {
+            return false;
+        }
+        // Now first: a callback that runs between the two reads then counts.
+        let now = output::now();
+        let asked = self.shared.asked_until.load(Ordering::SeqCst);
+        let since = asked.max(self.played_at);
+        Duration::from_nanos(now.saturating_sub(since)) >= self.stall_after
+    }
+
+    /// When the output last took frames, on its clock: when the last it
+    /// asked for are done, or now if it never asked. `heard` is when the
+    /// last frame of a span is done, where that is known, which leaves out
+    /// any silence the output took after it. Either may be a moment ahead
+    /// of now, as the output stamps a buffer for when it will play, and so
+    /// never before the span's own `Began`.
+    fn last_taken(&self, heard: u64) -> u64 {
+        match (heard, self.shared.asked_until.load(Ordering::SeqCst)) {
+            (0, 0) => output::now(),
+            (0, at) | (at, _) => at,
+        }
     }
 
     /// Sends a message to the callback, and says whether it went. The
@@ -449,7 +512,7 @@ impl AudioRenderer {
     fn wait_for(&mut self, span: u64) -> Result<(), RenderError> {
         let deadline = Instant::now() + OUTPUT_WAIT;
         while self.shared.progress().0 != span {
-            if self.lost() || Instant::now() >= deadline {
+            if self.lost().is_some() || Instant::now() >= deadline {
                 let error = RenderError::new(
                     "output",
                     format!(
@@ -474,9 +537,16 @@ impl AudioRenderer {
         }
         self.running = None;
         self.collect();
-        let (installed, consumed) = self.shared.progress();
+        let (installed, consumed, heard) = self.shared.heard();
+        // Its spans end when it last took frames, as its own ends do: for
+        // one that stalled, seconds before it was let go.
         for span in self.given.clone() {
-            self.ended_here(span, if span == installed { consumed } else { 0 });
+            let (frames, at) = if span == installed {
+                (consumed, self.last_taken(heard))
+            } else {
+                (0, self.last_taken(0))
+            };
+            self.ended_at(span, frames, at);
         }
     }
 
@@ -551,6 +621,12 @@ impl AudioRenderer {
     /// A span the output will say nothing more of ends here, if it has not
     /// ended already.
     fn ended_here(&mut self, span: u64, frames: u64) {
+        self.ended_at(span, frames, output::now());
+    }
+
+    /// As [`ended_here`](Self::ended_here), with its last frame done at
+    /// `at`.
+    fn ended_at(&mut self, span: u64, frames: u64, at: u64) {
         if !self.given.contains(&span) {
             return;
         }
@@ -558,7 +634,7 @@ impl AudioRenderer {
         self.said.push(Event::Ended {
             span,
             frames,
-            at: output::now(),
+            at,
             end: End::Replaced,
         });
     }
@@ -714,6 +790,7 @@ impl Renderer for AudioRenderer {
 
     fn play(&mut self) {
         self.playing = true;
+        self.played_at = output::now();
         if let Some(decoding) = &mut self.decoding {
             decoding.decoder.start();
         }
@@ -750,10 +827,15 @@ impl Renderer for AudioRenderer {
 
     fn unload(&mut self) {
         self.collect();
+        // Read before the output is told it plays no more, which a stall
+        // is measured against.
+        let lost = self.lost().is_some();
+        // With nothing loaded, nothing plays, so nothing can stall.
+        self.playing = false;
         let Some(old) = self.decoding.take() else {
             return;
         };
-        if self.shared.lost.load(Ordering::SeqCst) {
+        if lost {
             self.decoding = Some(old);
             self.abandon();
             return;
@@ -886,7 +968,7 @@ impl OnDemand {
     }
 
     fn let_go_if_lost(&mut self) {
-        if let Some(mut lost) = self.opened.take_if(|opened| opened.lost()) {
+        if let Some(mut lost) = self.opened.take_if(|opened| opened.lost().is_some()) {
             lost.unload();
             self.said.extend(lost.drain());
         }

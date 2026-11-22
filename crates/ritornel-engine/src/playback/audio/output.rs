@@ -116,31 +116,50 @@ pub(crate) struct Shared {
     installed: AtomicU64,
     /// Frames of that span handed to the output.
     consumed: AtomicU64,
+    /// When the last of them is done, on the output's clock: 0 for none.
+    heard_until: AtomicU64,
     /// Callbacks run, so that the control side can tell the output is
     /// alive.
     pub(crate) callbacks: AtomicU64,
+    /// When the frames the output last asked for are done playing, on the
+    /// output's clock: 0 until it first asks. An output that stops asking
+    /// has stalled, and the frames it took end there.
+    pub(crate) asked_until: AtomicU64,
     /// Errors the output's stream reported.
     pub(crate) stream_errors: AtomicU64,
     /// Whether the stream reported an error it cannot go on from: its
     /// device went away or its configuration is no longer valid.
     pub(crate) lost: AtomicBool,
+    /// Whether the output asked for no frames for too long while told to
+    /// play, which loses it as an error would.
+    pub(crate) stalled: AtomicBool,
 }
 
 impl Shared {
-    fn publish(&self, span: u64, frames: u64) {
+    fn publish(&self, span: u64, frames: u64, last: u64) {
         self.written.fetch_add(1, Ordering::SeqCst);
         self.installed.store(span, Ordering::SeqCst);
         self.consumed.store(frames, Ordering::SeqCst);
+        let last = if last == NOT_YET { 0 } else { last };
+        self.heard_until.store(last, Ordering::SeqCst);
         self.written.fetch_add(1, Ordering::SeqCst);
     }
 
     /// The span the callback plays and its frames so far, read together.
     pub(crate) fn progress(&self) -> (u64, u64) {
+        let (span, frames, _) = self.heard();
+        (span, frames)
+    }
+
+    /// The span the callback plays, its frames so far, and when the last
+    /// of them is done (0 for none yet), read together.
+    pub(crate) fn heard(&self) -> (u64, u64, u64) {
         loop {
             let before = self.written.load(Ordering::SeqCst);
             let read = (
                 self.installed.load(Ordering::SeqCst),
                 self.consumed.load(Ordering::SeqCst),
+                self.heard_until.load(Ordering::SeqCst),
             );
             if before.is_multiple_of(2) && self.written.load(Ordering::SeqCst) == before {
                 return read;
@@ -398,9 +417,19 @@ impl Callback {
     /// many frames came from the ring: they are the first of `out`, and the
     /// rest is silence.
     pub(crate) fn render(&mut self, out: &mut [f32]) -> usize {
+        // A stalled output is lost for good: should it ask again before it
+        // is let go, it is handed silence, and nothing more of any span.
+        if self.shared.stalled.load(Ordering::SeqCst) {
+            out.fill(0.0);
+            return 0;
+        }
         let now = (self.clock)();
         self.take_messages(now);
         self.shared.callbacks.fetch_add(1, Ordering::Relaxed);
+        let asked_until = self.time_of(now, out.len() / self.channels);
+        self.shared
+            .asked_until
+            .store(asked_until, Ordering::Relaxed);
         let channels = self.channels;
         let mut written = 0;
         for frame in out.chunks_exact_mut(channels) {
@@ -472,7 +501,7 @@ impl Callback {
             self.seamless = None;
         }
         self.settle(at);
-        self.shared.publish(self.span, self.consumed);
+        self.shared.publish(self.span, self.consumed, self.last);
         written
     }
 

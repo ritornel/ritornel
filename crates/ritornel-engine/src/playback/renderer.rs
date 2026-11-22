@@ -115,10 +115,11 @@ pub struct Progress {
     pub span: u64,
     /// Frames of it handed over so far.
     pub frames: u64,
-    /// Whether the output went away, a device unplugged or taken by the
-    /// system: nothing more is heard through it, and the next load opens
-    /// the output afresh.
-    pub lost: bool,
+    /// Why the output can play no more, where it cannot: a device
+    /// unplugged or taken by the system, or one that stopped taking sound
+    /// while playing. Nothing more is heard through it, and the next load
+    /// opens the output afresh.
+    pub lost: Option<&'static str>,
 }
 
 /// Which ReplayGain tag a track plays at. See "Audio pipeline" in
@@ -740,7 +741,7 @@ pub(crate) mod fake {
             Progress {
                 span,
                 frames,
-                lost: state.lost,
+                lost: state.lost.then_some("the output went away"),
             }
         }
 
