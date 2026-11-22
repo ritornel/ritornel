@@ -88,6 +88,18 @@ pub(crate) struct GainTags {
 }
 
 impl GainTags {
+    /// These, with each of the track's and the album's gain that these do
+    /// not give taken from `other`, with its peak.
+    fn or(self, other: Self) -> Self {
+        let pick = |own: GainTag, other: GainTag| {
+            if own.gain_db.is_some() { own } else { other }
+        };
+        Self {
+            track: pick(self.track, other.track),
+            album: pick(self.album, other.album),
+        }
+    }
+
     /// The factor a track plays at for `mode`. Limited by the peak, less a
     /// decibel for what resampling adds between the samples, and with no
     /// peak tag never above unity, since then nothing says how far it may
@@ -340,14 +352,18 @@ impl Source {
             hint.with_extension(extension);
         }
         let mut format = probe(Box::new(opened.reader(opened.len)), &hint)?;
-        // As the scan reads them: a tag after the last frame of an MP3 or
-        // a FLAC is hidden, or its frame scanner would play it as audio.
+        let mut tags = gain_tags(format.as_mut());
+        // A tag after the last frame of an MP3 or a FLAC is hidden, as the
+        // scan hides it, or the frame scanner would play it as audio. The
+        // file's own tags then say the gain, and the tag after the frames,
+        // where mp3gain and others write it, says what they do not.
         if matches!(
             format.format_info().short_name,
             "mp1" | "mp2" | "mp3" | "flac"
         ) && opened.audio_end < opened.len
         {
             format = probe(Box::new(opened.reader(opened.audio_end)), &hint)?;
+            tags = gain_tags(format.as_mut()).or(tags);
         }
         let track = format
             .default_track(TrackType::Audio)
@@ -379,7 +395,6 @@ impl Source {
                 || "unknown".to_owned(),
                 |codec| codec.codec.info.short_name.to_owned(),
             );
-        let tags = gain_tags(format.as_mut());
         let mut source = Self {
             format,
             decoder,

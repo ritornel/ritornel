@@ -619,6 +619,66 @@ fn replay_gain_tags_are_read_from_vorbis_comments_and_id3() {
     );
 }
 
+/// An APEv2 tag of `items`, with its header and footer, as mp3gain and
+/// others write after the last frame.
+fn ape_tag(items: &[(&str, &str)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (key, value) in items {
+        body.extend(u32::try_from(value.len()).unwrap().to_le_bytes());
+        body.extend(0_u32.to_le_bytes());
+        body.extend(key.as_bytes());
+        body.push(0);
+        body.extend(value.as_bytes());
+    }
+    let size = u32::try_from(body.len() + 32).unwrap();
+    let count = u32::try_from(items.len()).unwrap();
+    let frame = |flags: u32| {
+        let mut frame = b"APETAGEX".to_vec();
+        frame.extend(2000_u32.to_le_bytes());
+        frame.extend(size.to_le_bytes());
+        frame.extend(count.to_le_bytes());
+        frame.extend(flags.to_le_bytes());
+        frame.extend([0; 8]);
+        frame
+    };
+    // Bit 31: the tag has a header. Bit 29: this is the header.
+    let mut tag = frame(0xa000_0000);
+    tag.extend(body);
+    tag.extend(frame(0x8000_0000));
+    tag
+}
+
+#[test]
+fn replay_gain_in_a_tag_after_the_last_frame_is_read() {
+    let scratch = crate::testing::Scratch::new();
+    for name in ["a.flac", "a.mp3"] {
+        let path = scratch.path().join(name);
+        let mut bytes = std::fs::read(fixture(name)).unwrap();
+        bytes.extend(ape_tag(&[
+            ("REPLAYGAIN_TRACK_GAIN", "-6.02 dB"),
+            ("REPLAYGAIN_TRACK_PEAK", "0.125000"),
+        ]));
+        std::fs::write(&path, bytes).unwrap();
+        let tags = Source::open(&path, 0).unwrap().tags;
+        assert_eq!(tags.track.gain_db, Some(-6.02), "{name}");
+        assert_eq!(tags.track.peak, Some(0.125), "{name}");
+    }
+    // A file that has the gain in its own tags too, as one gained again by
+    // another tool: the file's own tags win, as they did.
+    for name in ["rg.flac", "rg.mp3"] {
+        let path = scratch.path().join(name);
+        let mut bytes = std::fs::read(fixture(name)).unwrap();
+        bytes.extend(ape_tag(&[
+            ("REPLAYGAIN_TRACK_GAIN", "-1.00 dB"),
+            ("REPLAYGAIN_TRACK_PEAK", "0.500000"),
+        ]));
+        std::fs::write(&path, bytes).unwrap();
+        let tags = Source::open(&path, 0).unwrap().tags;
+        assert_eq!(tags.track.gain_db, Some(-6.02), "{name}");
+        assert_eq!(tags.track.peak, Some(0.125), "{name}");
+    }
+}
+
 #[test]
 fn a_gain_is_held_under_full_scale_by_its_peak_and_never_raised_with_none() {
     let tag = |gain_db, peak| decode::GainTag {
