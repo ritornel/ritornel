@@ -755,7 +755,7 @@ async fn the_dry_run_and_the_review_read_the_library_and_check_what_they_are_ask
         (json!({ "policy": { "bindMax": 1.5 } }), "bindMax"),
         (json!({ "policy": { "minGap": -0.1 } }), "minGap"),
         (json!({ "policy": { "reviewBelow": 2 } }), "reviewBelow"),
-        (json!({ "policy": { "version": 3 } }), "version"),
+        (json!({ "policy": { "version": 4 } }), "version"),
         (json!({ "policy": { "markerList": 0 } }), "markerList"),
         (
             json!({ "policy": { "acrossAlbumsWithinMs": 60_001 } }),

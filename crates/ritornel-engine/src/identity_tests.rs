@@ -54,10 +54,7 @@ fn straight_after_a_scan_the_dry_run_reports_no_change_and_writes_nothing() {
     let (before, revision) = (rig.dump(), rig.revision());
     let run = rig.library.dry_run(&detail()).unwrap();
     assert!(run.policy.exact);
-    assert_eq!(
-        run.policy.resolver_version,
-        ritornel_domain::RESOLVER_VERSION
-    );
+    assert_eq!(run.policy.resolver_version, 3);
     assert!(!run.would_write);
     assert!(!run.claims_stale);
     assert_eq!(run.items, 3);
@@ -444,10 +441,7 @@ fn an_earlier_policy_is_updated_at_the_next_scan() {
     let before = rig.dump();
     let run = rig.library.dry_run(&detail()).unwrap();
     assert!(run.policy.exact);
-    assert_eq!(
-        run.policy.resolver_version,
-        ritornel_domain::RESOLVER_VERSION
-    );
+    assert_eq!(run.policy.resolver_version, 3);
     assert!(!run.policy.tags_bind_across_albums);
     assert!(run.would_write);
     assert_eq!(

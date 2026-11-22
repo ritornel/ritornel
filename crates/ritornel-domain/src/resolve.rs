@@ -165,6 +165,7 @@ pub struct Policy {
     /// Which list of version markers: 1 is policy 1's; 2 also reads every
     /// spelling of "a cappella" as one marker, and part numbers ("Part
     /// II", "Pt. 2") as markers.
+    /// Policy 3 reads a part number as a marker only in a song title.
     pub marker_list: u8,
 }
 
@@ -331,7 +332,8 @@ pub(crate) fn part_number(word: &str) -> Option<u32> {
 ///
 /// With policy 2's list (`list` 2), every spelling of "a cappella" is one
 /// marker, and a part number is one: "Part II", "Pt. 2" and "Part Two"
-/// are all `part 2`. Like the others, they can only stop a match.
+/// are all `part 2` when `parts` is enabled. Policy 3 reserves that rule
+/// for song titles. Like the others, these markers can only stop a match.
 fn markers(
     text: Option<&str>,
     words: &'static [&'static str],
