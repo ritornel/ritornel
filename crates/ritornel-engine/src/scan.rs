@@ -492,10 +492,17 @@ impl ScanRun {
                 self.failed
                     .push((payload.path.clone(), "failed", detail.unwrap_or_default()));
             }
+            // The item's own file: the same audio under other tags, a file
+            // that is back, or one that cannot be read now. After a failed
+            // read, it is the only audio the item has had, or any audio if
+            // it has had none.
+            let own = |known: &Known| match (&known.audio, &audio) {
+                (_, None) => true,
+                (Some(had), Some(now)) => had == now,
+                (None, Some(now)) => known.earlier_audio.iter().all(|had| had == now),
+            };
             match self.known.get(&payload.path) {
-                // The same audio under other tags, a file that is back, or
-                // a file that could not be read before or cannot now.
-                Some(known) if known.audio == audio || known.audio.is_none() || audio.is_none() => {
+                Some(known) if own(known) => {
                     if known.missing {
                         counted.returned += 1;
                     } else {
