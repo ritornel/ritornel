@@ -39,6 +39,7 @@ pub mod covers;
 mod delivery_store;
 mod entropy;
 mod error;
+mod export;
 mod history_facts;
 mod history_pages;
 #[cfg(test)]
@@ -87,6 +88,7 @@ pub use delivery_store::{
 };
 pub use entropy::{Entropy, OsEntropy};
 pub use error::Error;
+pub use export::{EXPORT_FORMAT, EXPORT_VERSION, Exported};
 pub use history_pages::Today;
 pub use history_store::{
     INGEST_METHOD, IngestOutcome, Ingested, LISTEN_RECORD_VERSION, ListenRecord, ListenRow,

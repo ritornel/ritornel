@@ -12,16 +12,16 @@ use std::time::Duration;
 
 use ritornel_contract::methods::{
     self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, EventsSubscribe,
-    EventsUnsubscribe, HistoryAlbum, HistoryArtist, HistoryOnThisDay, HistoryRebuild,
-    HistoryRecent, HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones, IdentityDryRun,
-    IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall, LastfmSetScrobbling,
-    LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall, LastfmSync,
-    LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, ListClose, ListLocate,
-    ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet, PlaybackJump,
-    PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet, PlaybackSkip,
-    PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow, RatingsSet, ScanStart,
-    ServerBackup, ServerHello, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks,
-    TracksGet,
+    EventsUnsubscribe, HistoryAlbum, HistoryArtist, HistoryExport, HistoryOnThisDay,
+    HistoryRebuild, HistoryRecent, HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones,
+    IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall,
+    LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
+    LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, ListClose,
+    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
+    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
+    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
+    RatingsSet, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList, SourcesAdd,
+    SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -48,6 +48,7 @@ use crate::{Bounds, Error};
 mod backup;
 mod calls;
 mod churn;
+mod export;
 mod history;
 mod lastfm;
 mod lists;
@@ -697,6 +698,9 @@ impl Core {
             }
             HistoryRebuild::NAME => {
                 run::<HistoryRebuild>(params, |params| self.history_rebuild(stores, &params))
+            }
+            HistoryExport::NAME => {
+                run::<HistoryExport>(params, |params| self.history_export(stores, &params))
             }
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {

@@ -123,6 +123,7 @@ export const METHODS = {
   "artists.pictureFolders": { kind: "query", needsFull: true },
   "library.setWatching": { kind: "command", needsFull: true },
   "server.backup": { kind: "command", needsFull: true },
+  "history.export": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -191,6 +192,7 @@ export type MethodMap = {
   "artists.pictureFolders": { params: NoParams; result: PictureFolders };
   "library.setWatching": { params: WatchingParams; result: WatchingSet };
   "server.backup": { params: BackupParams; result: BackedUp };
+  "history.export": { params: HistoryExportParams; result: HistoryExported };
 };
 
 /** The name of a method. */
@@ -1177,6 +1179,61 @@ export type HelloParams = {
    * built with. A server refuses one that is not its own.
    */
   contractVersion: number,
+};
+
+/**
+ * The params of `history.export`.
+ */
+export type HistoryExportParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The folder, on the server's own disk, an absolute path, that the
+   * export's own folder is made in. It must be there.
+   */
+  folder: string,
+};
+
+/**
+ * The result of `history.export`: where the record was written, and how
+ * much of it.
+ */
+export type HistoryExported = {
+  /**
+   * The export's folder, on the server's own disk.
+   */
+  path: string,
+  /**
+   * The format's version, in its `manifest.json` too.
+   */
+  version: number,
+  /**
+   * How many observations: listens, import records and corrections.
+   */
+  observations: number,
+  /**
+   * How many ratings and loves, each one said or cleared.
+   */
+  ratings: number,
+  /**
+   * How many plays in the table derived from them.
+   */
+  plays: number,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
 };
 
 /**

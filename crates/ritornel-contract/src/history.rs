@@ -215,6 +215,39 @@ pub struct OnThisDay {
     pub plays: Vec<Play>,
 }
 
+/// The params of `history.export`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryExportParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// The folder, on the server's own disk, an absolute path, that the
+    /// export's own folder is made in. It must be there.
+    pub folder: String,
+}
+
+/// The result of `history.export`: where the record was written, and how
+/// much of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryExported {
+    /// The receipt.
+    #[serde(flatten)]
+    pub receipt: crate::Receipt,
+    /// The export's folder, on the server's own disk.
+    pub path: String,
+    /// The format's version, in its `manifest.json` too.
+    pub version: u32,
+    /// How many observations: listens, import records and corrections.
+    pub observations: u64,
+    /// How many ratings and loves, each one said or cleared.
+    pub ratings: u64,
+    /// How many plays in the table derived from them.
+    pub plays: u64,
+}
+
 /// The params of `history.rebuild`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]

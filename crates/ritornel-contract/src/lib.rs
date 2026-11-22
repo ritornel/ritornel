@@ -68,10 +68,10 @@ pub use event::{
 };
 pub use frame::{Frame, Malformed, Notification, Request, RequestId, Response};
 pub use history::{
-    Fact, FactKind, HistoryOf, HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams,
-    HistoryStream, OnThisDay, OnThisDayParams, Phrase, Play, PlayCursor, PlayOutcome, PlayedListen,
-    PlayedTrack, RecentPlays, RecordPlayed, StreamLayer, TrackHistory, TrackHistoryParams,
-    YearPlays, YearSpan,
+    Fact, FactKind, HistoryExportParams, HistoryExported, HistoryOf, HistoryRebuildParams,
+    HistoryRebuilt, HistoryRecentParams, HistoryStream, OnThisDay, OnThisDayParams, Phrase, Play,
+    PlayCursor, PlayOutcome, PlayedListen, PlayedTrack, RecentPlays, RecordPlayed, StreamLayer,
+    TrackHistory, TrackHistoryParams, YearPlays, YearSpan,
 };
 pub use id::{Id, NotAnId};
 pub use identity::{
