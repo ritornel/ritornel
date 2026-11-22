@@ -1354,7 +1354,13 @@ fn names_that_the_same_audio_showed_to_be_one_widen_the_candidates() {
     let resolution = world.settle();
     assert_eq!(
         decision(&resolution, same_audio).aliases,
-        [(Kind::Artist, "nesta".to_owned(), "neta".to_owned())]
+        [crate::library::LearnedAlias {
+            kind: Kind::Artist,
+            name_a: "nesta".to_owned(),
+            name_b: "neta".to_owned(),
+            spelling_a: "Nesta".to_owned(),
+            spelling_b: "Ne$ta".to_owned(),
+        }]
     );
     let decided = decision(&resolution, by_alias);
     assert_eq!(decided.method, Method::TagsDuration);

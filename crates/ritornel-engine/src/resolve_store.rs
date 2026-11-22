@@ -49,6 +49,7 @@ pub(crate) struct Shown {
     artists: HashMap<i64, (Text, Text, Text)>,
     artist_keys: HashMap<(ArtistKeyKind, String), (i64, Option<i64>)>,
     edited_artists: HashSet<i64>,
+    stale_aliases: Vec<(i64, String, String, String, String)>,
     recordings: HashMap<i64, (Text, Option<i64>)>,
     groups: HashMap<i64, GroupShown>,
     releases: HashMap<i64, ReleaseShown>,
@@ -451,29 +452,65 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
     .into_iter()
     .collect();
     // Pairs the owner's own actions linked. What the resolver learned it
-    // learns again, in the order it learned it. A pair is of keys, and a key
-    // made by another version of the normaliser is not comparable with
-    // today's, so such a pair is not read: the call that teaches one keeps
-    // its spellings, to make its keys again.
-    for (scope, a, b) in rows(
+    // learns again, in the order it learned it. A pair written under an older
+    // normaliser version is recomputed from its stored spellings (`spelling_a`,
+    // `spelling_b`) and scheduled for upgrade to `NORMALIZER_VERSION`.
+    let owner_aliases = rows(
         connection,
-        &format!(
-            "SELECT o.scope, o.name_a, o.name_b FROM alias_observation o
-             JOIN identity_decision d ON d.id = o.decision_id
-             WHERE d.actor_kind <> 'resolver' AND o.normalizer_version = {NORMALIZER_VERSION}"
-        ),
+        "SELECT o.id, o.scope, o.name_a, o.name_b, o.spelling_a, o.spelling_b, o.normalizer_version
+         FROM alias_observation o
+         JOIN identity_decision d ON d.id = o.decision_id
+         WHERE d.actor_kind <> 'resolver'
+         ORDER BY o.id",
         |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         },
-    )? {
-        match scope.as_str() {
-            "title" => library.aliases.push((Kind::Recording, a, b)),
-            "artist" => library.aliases.push((Kind::Artist, a, b)),
-            _ => {}
+    )?;
+    // Track only owner aliases already at `NORMALIZER_VERSION` so a resolver
+    // observation never prevents an owner alias from upgrading in place. If
+    // another owner row already holds the recomputed pair at the current
+    // normaliser version, the alias still takes effect in memory without
+    // creating a duplicate current owner row.
+    let mut current_owner_aliases: HashSet<(String, String, String)> = owner_aliases
+        .iter()
+        .filter(|(_, _, _, _, _, _, ver)| *ver == NORMALIZER_VERSION)
+        .map(|(_, scope, a, b, ..)| (scope.clone(), a.clone(), b.clone()))
+        .collect();
+    for (id, scope, a, b, sa, sb, ver) in owner_aliases {
+        let kind = match scope.as_str() {
+            "title" => Kind::Recording,
+            "artist" => Kind::Artist,
+            _ => continue,
+        };
+        if ver == NORMALIZER_VERSION {
+            library.aliases.push((kind, a, b));
+            continue;
+        }
+        let (Some(sa), Some(sb)) = (sa, sb) else {
+            continue;
+        };
+        let (na, nb) = (normalize(&sa), normalize(&sb));
+        if na.is_empty() || nb.is_empty() || na == nb {
+            continue;
+        }
+        let (name_a, name_b, spelling_a, spelling_b) = if na < nb {
+            (na, nb, sa, sb)
+        } else {
+            (nb, na, sb, sa)
+        };
+        library.aliases.push((kind, name_a.clone(), name_b.clone()));
+        if current_owner_aliases.insert((scope, name_a.clone(), name_b.clone())) {
+            shown
+                .stale_aliases
+                .push((id, name_a, name_b, spelling_a, spelling_b));
         }
     }
     // Active edits follow redirects through `canonical_id` where the kind has
@@ -581,6 +618,9 @@ pub(crate) struct Plan {
     /// Stale `artist_key` name rows (`(artist_id, old_key_value)`) to remove
     /// before inserting updated keys for the current normaliser version.
     stale_artist_key_deletes: Vec<(i64, String)>,
+    /// Owner `alias_observation` rows recomputed from their raw spellings for
+    /// the current normaliser version.
+    rekeyed_aliases: Vec<(i64, String, String, String, String)>,
     versions: bool,
     /// The version of the policy that made the resolution, which its
     /// decisions record.
@@ -848,6 +888,7 @@ impl Plan {
             rekeyed,
             artist_key_writes,
             stale_artist_key_deletes,
+            rekeyed_aliases: shown.stale_aliases.clone(),
             canonical: library.recording_canonical.clone(),
             artists,
             recordings,
@@ -898,6 +939,7 @@ impl Plan {
             && self.rekeyed.is_empty()
             && self.artist_key_writes.is_empty()
             && self.stale_artist_key_deletes.is_empty()
+            && self.rekeyed_aliases.is_empty()
     }
 
     /// Writes what differs, in the write's transaction.
@@ -1221,6 +1263,25 @@ impl Plan {
                 .execute([row])?;
         }
 
+        for (id, name_a, name_b, spelling_a, spelling_b) in &self.rekeyed_aliases {
+            connection
+                .prepare_cached(
+                    "UPDATE alias_observation
+                     SET name_a = ?2, name_b = ?3, spelling_a = ?4, spelling_b = ?5,
+                         normalizer_version = ?6, rev = ?7
+                     WHERE id = ?1",
+                )?
+                .execute((
+                    id,
+                    name_a,
+                    name_b,
+                    spelling_a,
+                    spelling_b,
+                    NORMALIZER_VERSION,
+                    rev,
+                ))?;
+        }
+
         // Bindings: a decision and an assignment for each item whose result
         // differs. The row it replaces is superseded, never updated.
         for out in resolution.items.iter().filter(|out| out.changed) {
@@ -1295,19 +1356,31 @@ impl Plan {
                     self.canonical.get(&bound).copied().unwrap_or(bound),
                     rev,
                 ))?;
-            for (kind, a, b) in &decision.aliases {
-                let scope = if *kind == Kind::Artist {
+            for alias in &decision.aliases {
+                let scope = if alias.kind == Kind::Artist {
                     "artist"
                 } else {
                     "title"
                 };
                 connection.prepare_cached(
-                    "INSERT INTO alias_observation (scope, name_a, name_b, normalizer_version, decision_id, observed_at_ms, rev)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                    "INSERT INTO alias_observation
+                       (scope, name_a, name_b, spelling_a, spelling_b, normalizer_version,
+                        decision_id, observed_at_ms, rev)
+                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
                      WHERE NOT EXISTS (SELECT 1 FROM alias_observation
-                                       WHERE scope = ?1 AND name_a = ?2 AND name_b = ?3 AND normalizer_version = ?4)",
+                                       WHERE scope = ?1 AND name_a = ?2 AND name_b = ?3 AND normalizer_version = ?6)",
                 )?
-                .execute((scope, a, b, NORMALIZER_VERSION, decided, now_ms, rev))?;
+                .execute((
+                    scope,
+                    &alias.name_a,
+                    &alias.name_b,
+                    &alias.spelling_a,
+                    &alias.spelling_b,
+                    NORMALIZER_VERSION,
+                    decided,
+                    now_ms,
+                    rev,
+                ))?;
             }
             done.assignments += 1;
         }

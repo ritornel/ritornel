@@ -329,6 +329,23 @@ pub struct Withheld {
     pub recording: Option<Ref>,
 }
 
+/// A pair of differing names a binding showed to be the same thing, carrying
+/// both the normalised keys (`name_a < name_b`) and the raw spellings they
+/// came from so a future normaliser version can recompute the keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedAlias {
+    /// Whether the pair is of titles ([`Kind::Recording`]) or artists ([`Kind::Artist`]).
+    pub kind: Kind,
+    /// Normalised key (lesser of the pair).
+    pub name_a: String,
+    /// Normalised key (greater of the pair).
+    pub name_b: String,
+    /// Raw spelling that produced `name_a`.
+    pub spelling_a: String,
+    /// Raw spelling that produced `name_b`.
+    pub spelling_b: String,
+}
+
 /// One decision, with the full score shape. See decision 8.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
@@ -345,8 +362,8 @@ pub struct Decision {
     /// Whether the owner should look at it.
     pub needs_review: bool,
     /// Pairs of differing normalised names this binding showed to be the
-    /// same thing.
-    pub aliases: Vec<(Kind, String, String)>,
+    /// same thing, with the raw spellings they came from.
+    pub aliases: Vec<LearnedAlias>,
 }
 
 /// What the resolver decided for one item.

@@ -215,14 +215,24 @@ struct Wanted {
     rule: Rule,
 }
 
-/// What the matcher says of a subject's text.
+/// Why the matcher did not bind a subject item (recorded on an `unbind`
+/// decision when an earlier binding is released).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnbindReason {
+    verdict: &'static str,
+    doubt: Option<&'static str>,
+    candidates: usize,
+}
+
+/// What the matcher says of a subject's text: either a binding or why it
+/// leaves the item unbound.
 fn wanted(
     catalog: &Catalog,
     except: &HashSet<i64>,
     artist: &str,
     album: Option<&str>,
     title: &str,
-) -> Option<Wanted> {
+) -> Result<Wanted, UnbindReason> {
     match catalog.judge_except(
         Scrobbled {
             artist,
@@ -236,13 +246,22 @@ fn wanted(
             appearance,
             candidates,
             rule,
-        } => Some(Wanted {
+        } => Ok(Wanted {
             recording,
             appearance,
             candidates,
             rule,
         }),
-        Verdict::Doubtful { .. } | Verdict::Absent => None,
+        Verdict::Doubtful { candidates, doubt } => Err(UnbindReason {
+            verdict: "doubtful",
+            doubt: Some(doubt.as_str()),
+            candidates: candidates.len(),
+        }),
+        Verdict::Absent => Err(UnbindReason {
+            verdict: "absent",
+            doubt: None,
+            candidates: 0,
+        }),
     }
 }
 
@@ -315,19 +334,21 @@ fn holds(
 
 /// Binds a subject item as the matcher says: a binding in force that
 /// differs is superseded, and a new one is a decision of its own, the
-/// assignment and the item's cached recording. With nothing wanted the item
-/// is left unbound. Returns whether its binding changed.
+/// assignment and the item's cached recording. With nothing wanted an
+/// existing binding is superseded and recorded with an `unbind` decision.
+/// Returns whether its binding changed.
 fn settle(
     write: &Write<'_>,
     item: i64,
     text: (&str, Option<&str>, &str),
-    wanted: Option<Wanted>,
+    outcome: Result<Wanted, UnbindReason>,
 ) -> Result<bool, Error> {
     let connection = write.connection();
     // The owner may have bound it since it was judged.
     let Ok(now) = current(connection, item)? else {
         return Ok(false);
     };
+    let wanted = outcome.ok();
     if holds(
         connection,
         now.map(|(_, recording, appearance)| (recording, appearance)),
@@ -340,15 +361,42 @@ fn settle(
             .prepare_cached("UPDATE assignment SET superseded_at_ms = ?2, rev = ?3 WHERE id = ?1")?
             .execute((old, write.now_ms(), write.rev()))?;
     }
-    let Some(wanted) = wanted else {
-        connection
-            .prepare_cached(
-                "UPDATE source_item SET current_recording_id = NULL, rev = ?2 WHERE id = ?1",
-            )?
-            .execute((item, write.rev()))?;
-        return Ok(true);
-    };
     let (artist, album, title) = text;
+    let wanted = match outcome {
+        Ok(wanted) => wanted,
+        Err(reason) => {
+            let evidence = serde_json::json!({
+                "matcher": MATCHER_VERSION,
+                "artist": artist,
+                "album": album,
+                "title": title,
+                "verdict": reason.verdict,
+                "doubt": reason.doubt,
+                "candidates": reason.candidates,
+            });
+            connection
+                .prepare_cached(
+                    "INSERT INTO identity_decision
+                       (action, source_item_id, method, resolver_version, normalizer_version,
+                        score, evidence_json, needs_review, actor_kind, decided_at_ms, rev)
+                     VALUES ('unbind', ?1, 'scrobble_text', ?2, ?3, NULL, ?4, 0, 'resolver', ?5, ?6)",
+                )?
+                .execute(rusqlite::params![
+                    item,
+                    MATCHER_VERSION,
+                    NORMALIZER_VERSION,
+                    evidence.to_string(),
+                    write.now_ms(),
+                    write.rev(),
+                ])?;
+            connection
+                .prepare_cached(
+                    "UPDATE source_item SET current_recording_id = NULL, rev = ?2 WHERE id = ?1",
+                )?
+                .execute((item, write.rev()))?;
+            return Ok(true);
+        }
+    };
     let evidence = serde_json::json!({
         "matcher": MATCHER_VERSION,
         "artist": artist,
@@ -909,7 +957,7 @@ impl LibraryStore {
             for (subject, now) in judged_subjects(connection, rows.instance)? {
                 let (_, artist, album, title) = &subject;
                 let except = except.get(&subject.0).unwrap_or(&none);
-                let wanted = wanted(&catalog, except, artist, album.as_deref(), title);
+                let wanted = wanted(&catalog, except, artist, album.as_deref(), title).ok();
                 if !holds(connection, now, wanted)? {
                     differ.push(subject);
                 }
