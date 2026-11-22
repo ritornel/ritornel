@@ -2902,14 +2902,20 @@ fn an_ineligible_copy_cannot_hide_a_recordings_eligible_runner_up() {
     };
     let mut world = World::default();
     world.add(song("A/1.flac", 1, "Long Field", 200, Some("rec-a")));
-    world.add(song("B/1.flac", 2, "Long Field", 207, Some("rec-b")));
+    let runner = world.add(song("B/1.flac", 2, "Long Field", 207, Some("rec-b")));
     world.add(song("C/1.flac", 3, "Other Shores", 201, Some("rec-b")));
     let probe = world.add(song("D/1.flac", 4, "Long Field", 200, None));
     let old = catalog::resolve(&world.library, &Policy::v2());
     assert_eq!(decision(&old, probe).method, Method::TagsDuration);
     let r = world.settle();
     assert_eq!(decision(&r, probe).method, Method::New);
-    assert!(decision(&r, probe).needs_review);
+    let review = decision(&r, probe);
+    assert!(review.needs_review);
+    let [best, next] = &review.evidence.candidates[..] else {
+        panic!("expected the two eligible copies");
+    };
+    assert_eq!(next.item, runner);
+    assert_eq!(review.runner_up_gap, Some(next.distance - best.distance));
 }
 
 #[test]

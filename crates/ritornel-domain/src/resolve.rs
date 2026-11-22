@@ -972,15 +972,6 @@ impl<'a> Fold<'a> {
             candidates.sort_by(order);
             bindable.sort_by(order);
         }
-        let listed: Vec<Candidate> = candidates
-            .iter()
-            .take(5)
-            .map(|weighed| Candidate {
-                item: weighed.item,
-                distance: weighed.distance,
-                penalties: Some(weighed.penalties),
-            })
-            .collect();
         let gap_of = |list: &[Weighed]| match (list.first(), list.get(1)) {
             (Some(best), Some(next)) => Some(next.distance - best.distance),
             _ => None,
@@ -991,7 +982,29 @@ impl<'a> Fold<'a> {
                     && gap_of(list).is_none_or(|gap| gap >= policy.min_gap)
             })
         };
-        if let Some(best) = binds(&bindable) {
+        let binding = binds(&bindable);
+        // When an eligible runner-up prevents a binding, show the copies
+        // whose distances actually decided the outcome.
+        let compared = if policy.version >= 3
+            && binding.is_none()
+            && bindable
+                .first()
+                .is_some_and(|best| best.distance <= policy.bind_max)
+        {
+            &bindable
+        } else {
+            &candidates
+        };
+        let listed: Vec<Candidate> = compared
+            .iter()
+            .take(5)
+            .map(|weighed| Candidate {
+                item: weighed.item,
+                distance: weighed.distance,
+                penalties: Some(weighed.penalties),
+            })
+            .collect();
+        if let Some(best) = binding {
             return Outcome::Bind {
                 rec: best.rec,
                 decision: Decision {
@@ -1022,7 +1035,7 @@ impl<'a> Fold<'a> {
         // release, or on another album at another length. It is held back
         // whatever the runner-up: when several albums carry the song, a
         // policy that never binds across them finds each of them close.
-        let withheld = candidates
+        let withheld = compared
             .first()
             .copied()
             .filter(|best| !best.may_bind(policy) && best.distance <= policy.bind_max);
@@ -1037,7 +1050,7 @@ impl<'a> Fold<'a> {
             decision: Decision {
                 method: Method::New,
                 score: 0.0,
-                runner_up_gap: gap_of(&candidates),
+                runner_up_gap: gap_of(compared),
                 penalties: None,
                 needs_review: doubtful || !contradictions.is_empty() || withheld.is_some(),
                 evidence: Evidence {
