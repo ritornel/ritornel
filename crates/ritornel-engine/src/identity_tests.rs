@@ -2168,3 +2168,505 @@ fn where_edit_rating_and_play_land_after_release_split_and_regrouping() {
     assert_eq!(plays_after[0].recording, Some(rec2_pid));
     assert_eq!(plays_after[0].appearance, Some(new_app2_pid));
 }
+
+#[test]
+fn learned_alias_stores_raw_spellings_and_owner_aliases_recompute_on_normalizer_bump() {
+    use ritornel_domain::normalize::NORMALIZER_VERSION;
+
+    let mut rig = Rig::new();
+    rig.put(FLAC, "a.flac");
+    rig.put(COPY, "a.mp3");
+    rig.scan();
+    // Give the two same-audio files distinct artist spellings so the resolver
+    // learns an alias from their shared audio.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.sameAudioSpellings",
+                command: None,
+                client: None,
+            },
+            |write| {
+                let c = write.connection();
+                let flac: i64 = c.query_row(
+                    "SELECT id FROM source_item WHERE provider_key = ?1",
+                    [FLAC],
+                    |row| row.get(0),
+                )?;
+                let copy: i64 = c.query_row(
+                    "SELECT id FROM source_item WHERE provider_key = ?1",
+                    [COPY],
+                    |row| row.get(0),
+                )?;
+                let audio: i64 = c.query_row(
+                    "SELECT sr.audio_asset_id FROM source_item si
+                     JOIN source_item_revision sr ON sr.id = si.current_revision_id
+                     WHERE si.id = ?1",
+                    [flac],
+                    |row| row.get(0),
+                )?;
+                let flac_rev: i64 = c.query_row(
+                    "SELECT current_revision_id FROM source_item WHERE id = ?1",
+                    [flac],
+                    |row| row.get(0),
+                )?;
+                let copy_rev: i64 = c.query_row(
+                    "SELECT current_revision_id FROM source_item WHERE id = ?1",
+                    [copy],
+                    |row| row.get(0),
+                )?;
+                // Put COPY on the same audio_asset via a new revision so both
+                // files share audio (same_audio learns the artist alias).
+                c.execute(
+                    "INSERT INTO source_item_revision
+                       (source_item_id, revision_no, payload_hash, payload_json, audio_asset_id, observed_at_ms, rev)
+                     SELECT ?1, 2, randomblob(32), payload_json, ?2, 2, ?3
+                     FROM source_item_revision WHERE id = ?4",
+                    (copy, audio, write.rev(), copy_rev),
+                )?;
+                let copy_rev2 = c.last_insert_rowid();
+                c.execute(
+                    "UPDATE source_item SET current_revision_id = ?2, rev = ?3 WHERE id = ?1",
+                    (copy, copy_rev2, write.rev()),
+                )?;
+                let src_id: i64 = c.query_row(
+                    "SELECT id FROM metadata_source WHERE kind = 'file_tags'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                c.execute(
+                    "DELETE FROM metadata_claim WHERE source_item_id IN (?1, ?2)",
+                    (flac, copy),
+                )?;
+                c.execute(
+                    "DELETE FROM identifier_claim WHERE source_item_id IN (?1, ?2)",
+                    (flac, copy),
+                )?;
+                for (item, rev_id, artist) in [(flac, flac_rev, "Ne$ta"), (copy, copy_rev2, "Nesta")]
+                {
+                    for (scope, field, value) in [
+                        ("recording", "title", "Glass Pier"),
+                        ("recording", "artist", artist),
+                    ] {
+                        c.execute(
+                            "INSERT INTO metadata_claim
+                               (source_item_id, revision_id, extractor_version, scope, field, value,
+                                ordinal, metadata_source_id, rev)
+                             VALUES (?1, ?2, 1, ?3, ?4, ?5, 0, ?6, ?7)",
+                            (item, rev_id, scope, field, value, src_id, write.rev()),
+                        )?;
+                    }
+                }
+                // Force a fresh binding decision on COPY so same_audio runs now.
+                c.execute(
+                    "UPDATE assignment SET superseded_at_ms = 2, rev = ?2
+                     WHERE source_item_id = ?1 AND superseded_at_ms IS NULL",
+                    (copy, write.rev()),
+                )?;
+                c.execute(
+                    "UPDATE source_item SET current_recording_id = NULL, rev = ?2 WHERE id = ?1",
+                    (copy, write.rev()),
+                )?;
+                let _ = copy_rev;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.learnAlias",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    let learned: (String, String, Option<String>, Option<String>, i64) = rig
+        .library
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT name_a, name_b, spelling_a, spelling_b, normalizer_version
+                 FROM alias_observation WHERE scope = 'artist' LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        learned,
+        (
+            "nesta".to_owned(),
+            "neta".to_owned(),
+            Some("Nesta".to_owned()),
+            Some("Ne$ta".to_owned()),
+            NORMALIZER_VERSION,
+        )
+    );
+
+    // Now seed an owner alias written under an older normaliser version (v1)
+    // with raw spellings. On resolve, its normalised keys are recomputed from
+    // `spelling_a`/`spelling_b` for the current normaliser version, upgraded in
+    // `alias_observation`, and used to match two files that differ by that alias.
+    rig.put("AliasCheck/1.ogg", "a.retagged.ogg");
+    rig.put("AliasCheck/2.ogg", "a.retagged.ogg");
+    rig.scan();
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.seedStaleOwnerAlias",
+                command: None,
+                client: None,
+            },
+            |write| {
+                let c = write.connection();
+                let i1: i64 = c.query_row(
+                    "SELECT id FROM source_item WHERE provider_key = 'AliasCheck/1.ogg'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let i2: i64 = c.query_row(
+                    "SELECT id FROM source_item WHERE provider_key = 'AliasCheck/2.ogg'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let r1: i64 = c.query_row(
+                    "SELECT current_revision_id FROM source_item WHERE id = ?1",
+                    [i1],
+                    |row| row.get(0),
+                )?;
+                let r2: i64 = c.query_row(
+                    "SELECT current_revision_id FROM source_item WHERE id = ?1",
+                    [i2],
+                    |row| row.get(0),
+                )?;
+                // Give each its own distinct audio_asset and two unrelated
+                // artist spellings so only the owner alias can join them.
+                for (idx, (item, rev_id, artist)) in
+                    [(i1, r1, "Kestrel-9"), (i2, r2, "R. V. Oakhaven")]
+                        .into_iter()
+                        .enumerate()
+                {
+                    c.execute(
+                        "INSERT INTO audio_asset
+                           (public_id, hash_scheme, audio_hash, codec, sample_rate_hz,
+                            channel_layout, lossless, duration_ms, rev)
+                         VALUES (randomblob(16), 1, ?1, 'ogg', 44100, 'stereo', 0, 180000, ?2)",
+                        (vec![0x90 + idx as u8; 32], write.rev()),
+                    )?;
+                    let asset = c.last_insert_rowid();
+                    c.execute(
+                        "INSERT INTO source_item_revision
+                           (source_item_id, revision_no, payload_hash, payload_json, audio_asset_id, observed_at_ms, rev)
+                         SELECT ?1, 2, randomblob(32), payload_json, ?2, 3, ?3
+                         FROM source_item_revision WHERE id = ?4",
+                        (item, asset, write.rev(), rev_id),
+                    )?;
+                    let new_rev = c.last_insert_rowid();
+                    c.execute(
+                        "UPDATE source_item SET current_revision_id = ?2, current_recording_id = NULL, rev = ?3
+                         WHERE id = ?1",
+                        (item, new_rev, write.rev()),
+                    )?;
+                    c.execute(
+                        "UPDATE assignment SET superseded_at_ms = 3, rev = ?2
+                         WHERE source_item_id = ?1 AND superseded_at_ms IS NULL",
+                        (item, write.rev()),
+                    )?;
+                    let src_id: i64 = c.query_row(
+                        "SELECT id FROM metadata_source WHERE kind = 'file_tags'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    c.execute("DELETE FROM metadata_claim WHERE source_item_id = ?1", [item])?;
+                    c.execute("DELETE FROM identifier_claim WHERE source_item_id = ?1", [item])?;
+                    for (field, value) in [
+                        ("title", "Harbour Fog"),
+                        ("artist", artist),
+                        ("duration_ms", "180000"),
+                    ] {
+                        c.execute(
+                            "INSERT INTO metadata_claim
+                               (source_item_id, revision_id, extractor_version, scope, field, value,
+                                ordinal, metadata_source_id, rev)
+                             VALUES (?1, ?2, 1, 'recording', ?3, ?4, 0, ?5, ?6)",
+                            (item, new_rev, field, value, src_id, write.rev()),
+                        )?;
+                    }
+                    let _ = rev_id;
+                }
+                c.execute(
+                    "INSERT INTO identity_decision
+                       (action, source_item_id, method, resolver_version, normalizer_version,
+                        evidence_json, actor_kind, decided_at_ms, rev)
+                     VALUES ('bind', ?1, 'user', 1, 1, '{}', 'person', 1, ?2)",
+                    (i1, write.rev()),
+                )?;
+                let decision_id = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO alias_observation
+                       (scope, name_a, name_b, spelling_a, spelling_b, normalizer_version,
+                        decision_id, observed_at_ms, rev)
+                     VALUES ('artist', 'kestrel-9', 'r. v. oakhaven', 'Kestrel-9', 'R. V. Oakhaven',
+                             1, ?1, 1, ?2)",
+                    (decision_id, write.rev()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // First verify that without the owner alias, the two unrelated artist
+    // names do NOT match; dry_run with the stale alias reports a pending write
+    // without advancing the library revision.
+    let rev_before_dry = rig.revision();
+    let dry_before = rig.library.dry_run(&DryRunParams::default()).unwrap();
+    assert!(dry_before.would_write);
+    assert_eq!(rig.revision(), rev_before_dry);
+
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolveWithStaleAlias",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+
+    // The owner alias row was recomputed and upgraded to the current normaliser version.
+    let upgraded: (String, String, Option<String>, Option<String>, i64) = rig
+        .library
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT o.name_a, o.name_b, o.spelling_a, o.spelling_b, o.normalizer_version
+                 FROM alias_observation o
+                 JOIN identity_decision d ON d.id = o.decision_id
+                 WHERE d.actor_kind = 'person'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        upgraded,
+        (
+            "kestrel 9".to_owned(),
+            "r v oakhaven".to_owned(),
+            Some("Kestrel-9".to_owned()),
+            Some("R. V. Oakhaven".to_owned()),
+            NORMALIZER_VERSION,
+        )
+    );
+    // And the two tracks matched into the same recording via the recomputed owner alias.
+    assert_eq!(
+        rig.one(
+            "SELECT count(DISTINCT current_recording_id) FROM source_item
+             WHERE provider_key IN ('AliasCheck/1.ogg', 'AliasCheck/2.ogg')"
+        ),
+        "1"
+    );
+    // A subsequent dry run sees everything settled.
+    assert!(
+        !rig.library
+            .dry_run(&DryRunParams::default())
+            .unwrap()
+            .would_write
+    );
+
+    // An alias-only upgrade (nothing else dirty) is also detected by dry_run
+    // without advancing rev, and upgraded cleanly on resolve.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.seedAliasOnlyStale",
+                command: None,
+                client: None,
+            },
+            |write| {
+                let c = write.connection();
+                let i1: i64 = c.query_row(
+                    "SELECT id FROM source_item WHERE provider_key = 'AliasCheck/1.ogg'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                c.execute(
+                    "INSERT INTO identity_decision
+                       (action, source_item_id, method, resolver_version, normalizer_version,
+                        evidence_json, actor_kind, decided_at_ms, rev)
+                     VALUES ('bind', ?1, 'user', 1, 1, '{}', 'person', 1, ?2)",
+                    (i1, write.rev()),
+                )?;
+                let decision_id = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO alias_observation
+                       (scope, name_a, name_b, spelling_a, spelling_b, normalizer_version,
+                        decision_id, observed_at_ms, rev)
+                     VALUES ('artist', 'a. one', 'b-two', 'A. One', 'B-Two', 1, ?1, 1, ?2)",
+                    (decision_id, write.rev()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    let rev_before = rig.revision();
+    assert!(
+        rig.library
+            .dry_run(&DryRunParams::default())
+            .unwrap()
+            .would_write
+    );
+    assert_eq!(rig.revision(), rev_before);
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolveAliasOnly",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    assert!(
+        !rig.library
+            .dry_run(&DryRunParams::default())
+            .unwrap()
+            .would_write
+    );
+}
+
+#[test]
+fn migration_0006_preserves_decisions_and_enforces_alias_spellings_and_unbind() {
+    let scratch = crate::testing::Scratch::new();
+    let db = scratch.path().join("library.db");
+    let (decisions_before, aliases_before): (i64, Vec<(String, String, String)>) = {
+        let mut connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        crate::migrate::run(
+            &mut connection,
+            &crate::migrate::LIBRARY[..2],
+            &crate::testing::FixedClock::at(1_794_780_000_000),
+        )
+        .unwrap();
+        connection
+            .execute_batch(include_str!("../saved/library/0002.sql"))
+            .unwrap();
+        let decisions: i64 = connection
+            .query_row("SELECT count(*) FROM identity_decision", [], |r| r.get(0))
+            .unwrap();
+        let mut stmt = connection
+            .prepare("SELECT scope, name_a, name_b FROM alias_observation ORDER BY id")
+            .unwrap();
+        let aliases: Vec<(String, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        (decisions, aliases)
+    };
+    assert!(decisions_before > 0);
+    assert!(!aliases_before.is_empty());
+
+    let clock = std::sync::Arc::new(crate::testing::FixedClock::at(1_794_780_000_000));
+    let entropy = std::sync::Arc::new(crate::testing::CountingEntropy::default());
+    let library =
+        crate::LibraryStore::open(&db, crate::Id::from_bytes([0x01; 16]), clock, entropy).unwrap();
+    assert_eq!(library.schema_version(), crate::LIBRARY_SCHEMA_VERSION);
+    let decisions_after: i64 = library
+        .read(|c| Ok(c.query_row("SELECT count(*) FROM identity_decision", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(decisions_after, decisions_before);
+    type AliasRow = (String, String, String, Option<String>, Option<String>);
+    let aliases_after: Vec<AliasRow> = library
+        .read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT scope, name_a, name_b, spelling_a, spelling_b
+                 FROM alias_observation ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        aliases_after,
+        aliases_before
+            .into_iter()
+            .map(|(s, a, b)| (s, a, b, None, None))
+            .collect::<Vec<_>>()
+    );
+    library
+        .write(
+            WriteRequest {
+                method: "test.checkConstraints",
+                command: None,
+                client: None,
+            },
+            |write| {
+                let c = write.connection();
+                // Immutability triggers on `identity_decision` survive the rebuild.
+                assert!(
+                    c.execute("UPDATE identity_decision SET rationale = 'x' WHERE id = 1", [])
+                        .is_err()
+                );
+                assert!(
+                    c.execute("DELETE FROM identity_decision WHERE id = 1", [])
+                        .is_err()
+                );
+                let item: i64 =
+                    c.query_row("SELECT id FROM source_item LIMIT 1", [], |r| r.get(0))?;
+                // Valid `unbind` decision succeeds.
+                c.execute(
+                    "INSERT INTO identity_decision
+                       (action, source_item_id, method, resolver_version, normalizer_version,
+                        score, evidence_json, needs_review, actor_kind, decided_at_ms, rev)
+                     VALUES ('unbind', ?1, 'scrobble_text', 1, 2, NULL, '{}', 0, 'resolver', 1, ?2)",
+                    (item, write.rev()),
+                )?;
+                let dec = c.last_insert_rowid();
+                // `unbind` with a non-null score fails the CHECK.
+                assert!(
+                    c.execute(
+                        "INSERT INTO identity_decision
+                           (action, source_item_id, method, resolver_version, normalizer_version,
+                            score, evidence_json, needs_review, actor_kind, decided_at_ms, rev)
+                         VALUES ('unbind', ?1, 'scrobble_text', 1, 2, 0.5, '{}', 0, 'resolver', 1, ?2)",
+                        (item, write.rev()),
+                    )
+                    .is_err()
+                );
+                // Leading NUL raw spelling still satisfies `octet_length(...) > 0`.
+                c.execute(
+                    "INSERT INTO alias_observation
+                       (scope, name_a, name_b, spelling_a, spelling_b, normalizer_version,
+                        decision_id, observed_at_ms, rev)
+                     VALUES ('title', 'alpha', 'beta', ?1, 'Beta', 2, ?2, 1, ?3)",
+                    ("\0Alpha", dec, write.rev()),
+                )?;
+                // Partial raw spelling on `alias_observation` fails the CHECK.
+                assert!(
+                    c.execute(
+                        "INSERT INTO alias_observation
+                           (scope, name_a, name_b, spelling_a, spelling_b, normalizer_version,
+                            decision_id, observed_at_ms, rev)
+                         VALUES ('artist', 'a', 'b', 'A', NULL, 2, ?1, 1, ?2)",
+                        (dec, write.rev()),
+                    )
+                    .is_err()
+                );
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+}

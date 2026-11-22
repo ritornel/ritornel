@@ -21,8 +21,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::extract::Facts;
 use crate::library::{
-    AcrossAlbums, Candidate, Decision, Evidence, Item, Kind, Library, Method, Penalties, Withheld,
-    WithheldCause,
+    AcrossAlbums, Candidate, Decision, Evidence, Item, Kind, LearnedAlias, Library, Method,
+    Penalties, Withheld, WithheldCause,
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -298,6 +298,10 @@ pub(crate) struct Folded {
 struct Ev {
     item: i64,
     rec: usize,
+    raw_title: Option<String>,
+    raw_artist: Option<String>,
+    norm_title: Option<String>,
+    norm_artist: Option<String>,
     full: Option<String>,
     core: Option<String>,
     artist: Option<String>,
@@ -452,17 +456,26 @@ impl Ev {
                 key
             }
         };
-        let full = facts.title.as_deref().map(normalize).map(key);
+        let raw_title = facts.title.clone();
+        let raw_artist = facts.artist_text();
+        let norm_title = raw_title.as_deref().map(normalize);
+        let norm_artist = raw_artist.as_deref().map(normalize);
+        let full = norm_title.clone().map(key);
+        let artist = norm_artist.clone().map(key);
         let album_full = facts.album.as_deref().map(normalize).map(key);
         Self {
             item,
             rec: usize::MAX,
+            raw_title,
+            raw_artist,
+            norm_title,
+            norm_artist,
             core: facts
                 .title
                 .as_deref()
                 .map(|text| policy.title_core(text))
                 .map(key),
-            artist: facts.artist_text().as_deref().map(normalize).map(key),
+            artist,
             album_core: facts
                 .album
                 .as_deref()
@@ -775,8 +788,9 @@ impl<'a> Fold<'a> {
     }
 
     /// The names a binding by audio or by identifier showed to be the same
-    /// thing, where they differ.
-    fn aliases_from(&mut self, probe: &Ev, rec: usize) -> Vec<(Kind, String, String)> {
+    /// thing, where they differ, carrying both the normalised keys and the raw
+    /// spellings they came from.
+    fn aliases_from(&mut self, probe: &Ev, rec: usize) -> Vec<LearnedAlias> {
         let Some(first) = self.recs.get(rec).and_then(|rec| rec.first_ev) else {
             return Vec::new();
         };
@@ -784,23 +798,58 @@ impl<'a> Fold<'a> {
             return Vec::new();
         };
         let mut pairs = Vec::new();
-        let (title, artist) = (ev.full.clone(), ev.artist.clone());
-        for (kind, mine, theirs) in [
-            (Kind::Recording, &probe.full, title),
-            (Kind::Artist, &probe.artist, artist),
-        ] {
-            if let (Some(a), Some(b)) = (mine, theirs)
-                && *a != b
+        let mut learned = Vec::new();
+        let candidates = [
+            (
+                Kind::Recording,
+                probe.full.as_deref(),
+                ev.full.as_deref(),
+                probe.norm_title.as_deref(),
+                ev.norm_title.as_deref(),
+                probe.raw_title.as_deref(),
+                ev.raw_title.as_deref(),
+            ),
+            (
+                Kind::Artist,
+                probe.artist.as_deref(),
+                ev.artist.as_deref(),
+                probe.norm_artist.as_deref(),
+                ev.norm_artist.as_deref(),
+                probe.raw_artist.as_deref(),
+                ev.raw_artist.as_deref(),
+            ),
+        ];
+        for (kind, folded_a, folded_b, norm_a, norm_b, raw_a, raw_b) in candidates {
+            if let (Some(fa), Some(fb)) = (folded_a, folded_b)
+                && fa != fb
             {
-                let (a, b) = if *a < b {
-                    (a.clone(), b)
+                learned.push((kind, fa.to_owned(), fb.to_owned()));
+            }
+            // Persisted alias observations store unfolded `normalize()` keys
+            // alongside the raw spellings (earlier rows at v2 without spellings
+            // stored folded keys); in-memory matching folds per policy on load.
+            if let (Some(na), Some(nb), Some(sa), Some(sb)) = (norm_a, norm_b, raw_a, raw_b)
+                && !na.is_empty()
+                && !nb.is_empty()
+                && na != nb
+                && !sa.is_empty()
+                && !sb.is_empty()
+            {
+                let (name_a, name_b, spelling_a, spelling_b) = if na < nb {
+                    (na.to_owned(), nb.to_owned(), sa.to_owned(), sb.to_owned())
                 } else {
-                    (b, a.clone())
+                    (nb.to_owned(), na.to_owned(), sb.to_owned(), sa.to_owned())
                 };
-                pairs.push((kind, a, b));
+                pairs.push(LearnedAlias {
+                    kind,
+                    name_a,
+                    name_b,
+                    spelling_a,
+                    spelling_b,
+                });
             }
         }
-        for (kind, a, b) in &pairs {
+        for (kind, a, b) in &learned {
             match kind {
                 Kind::Recording => learn(&mut self.title_alias, a, b),
                 _ => learn(&mut self.artist_alias, a, b),

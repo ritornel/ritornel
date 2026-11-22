@@ -806,4 +806,105 @@ fn the_matcher_never_writes_over_the_owners_binding() {
         .unwrap();
     assert_eq!(changed.result_json, "0");
     assert_eq!(rig.bound(), ["Paper Kites -> Lanternfish"]);
+    assert_eq!(
+        rig.one("SELECT count(*) FROM identity_decision WHERE action = 'unbind'"),
+        "0"
+    );
+}
+
+#[test]
+fn releasing_a_scrobble_binding_records_an_unbind_decision() {
+    let rig = rig();
+    rig.ingest(&batch(
+        vec![record(T0 - HOUR, "Moss Arcade", "Paper Kites", 0)],
+        T0 - 2 * HOUR,
+        T0,
+    ));
+    assert_eq!(rig.bound(), ["Paper Kites -> Paper Kites"]);
+    assert_eq!(
+        rig.one("SELECT count(*) FROM identity_decision WHERE action = 'unbind'"),
+        "0"
+    );
+
+    // Add a second distinct recording with the same artist and title so the
+    // scrobble text becomes doubtful and its binding is released.
+    rig.exec(
+        "INSERT INTO recording
+           (id, public_id, canonical_id, display_title, display_artist_credit_id, rev)
+         SELECT 990, randomblob(16), 990, display_title, display_artist_credit_id, ?1
+         FROM recording WHERE id = 1;
+         INSERT INTO track_appearance
+           (id, public_id, recording_id, release_id, canonical_id, display_title,
+            display_artist_credit_id, rev)
+         SELECT 990, randomblob(16), 990, release_id, 990, display_title,
+                display_artist_credit_id, ?1
+         FROM track_appearance WHERE id = 1;
+         INSERT INTO source_item
+           (id, public_id, source_instance_id, provider_key, item_kind, current_recording_id,
+            first_seen_at_ms, rev)
+         SELECT 990, randomblob(16), source_instance_id, 'extra/paper-kites-2.flac', 'file', 990, 1, ?1
+         FROM source_item WHERE item_kind = 'file' LIMIT 1;
+         INSERT INTO identity_decision
+           (id, action, source_item_id, method, resolver_version, normalizer_version,
+            evidence_json, actor_kind, decided_at_ms, rev)
+         VALUES (990, 'bind', 990, 'tags_duration', 2, 2, '{}', 'resolver', 1, ?1);
+         INSERT INTO assignment
+           (source_item_id, recording_id, appearance_id, decision_id, effective_from_ms, rev)
+         VALUES (990, 990, 990, 990, 1, ?1);",
+    );
+
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 1);
+    assert_eq!(rig.bound(), ["Paper Kites -> -"]);
+    assert_eq!(rig.one(PLAYED), "-");
+
+    let (method, score, actor_kind, evidence_json): (String, Option<f64>, String, String) = rig
+        .library
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT method, score, actor_kind, evidence_json
+                 FROM identity_decision
+                 WHERE action = 'unbind'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(method, "scrobble_text");
+    assert_eq!(score, None);
+    assert_eq!(actor_kind, "resolver");
+    let evidence: serde_json::Value = serde_json::from_str(&evidence_json).unwrap();
+    assert_eq!(evidence["verdict"], "doubtful");
+    assert_eq!(evidence["doubt"], "several");
+    assert_eq!(evidence["candidates"], 2);
+    assert_eq!(evidence["artist"], "Moss Arcade");
+    assert_eq!(evidence["title"], "Paper Kites");
+
+    // Re-running the matcher writes nothing more and adds no duplicate unbind decision.
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(
+        rig.one("SELECT count(*) FROM identity_decision WHERE action = 'unbind'"),
+        "1"
+    );
+
+    // Also test an `absent` verdict unbind (recording excluded -> doubt is null, candidates is 0).
+    let rig2 = self::rig();
+    rig2.ingest(&batch(
+        vec![record(T0 - HOUR, "Moss Arcade", "Paper Kites", 0)],
+        T0 - 2 * HOUR,
+        T0,
+    ));
+    assert_eq!(rig2.bound(), ["Paper Kites -> Paper Kites"]);
+    rig2.exec(
+        "INSERT INTO identity_exclusion (source_item_id, recording_id, actor_kind, created_at_ms, rev)
+         SELECT id, 1, 'person', 1, ?1 FROM source_item WHERE item_kind = 'scrobble_subject';",
+    );
+    assert_eq!(rig2.library.match_scrobbles(rig2.account).unwrap(), 1);
+    assert_eq!(rig2.bound(), ["Paper Kites -> -"]);
+    assert_eq!(rig2.one(PLAYED), "-");
+    let absent_json: String =
+        rig2.one("SELECT evidence_json FROM identity_decision WHERE action = 'unbind'");
+    let absent: serde_json::Value = serde_json::from_str(&absent_json).unwrap();
+    assert_eq!(absent["verdict"], "absent");
+    assert!(absent["doubt"].is_null());
+    assert_eq!(absent["candidates"], 0);
 }
