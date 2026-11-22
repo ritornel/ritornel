@@ -646,3 +646,212 @@ fn an_artists_records_show_no_plays_and_their_other_songs_do() {
     };
     assert!(open(&library, ListKind::Songs, &loose).shows_plays());
 }
+
+/// When every file of a record is retagged to join another that the
+/// library has, the record they left keeps its rows, for whatever named
+/// them, and is on no wall, in no search and not in what the scrobble
+/// matcher reads.
+#[test]
+fn a_record_whose_files_joined_another_is_on_no_wall() {
+    let mut rig = crate::scan_tests::Rig::new();
+    rig.put("Moss Arcade/Tin Weather/05.flac", "b.flac");
+    rig.put("Moss Arcade/Tin Weather/07.flac", "b.compilation.flac");
+    rig.scan();
+    let open = |rig: &crate::scan_tests::Rig, kind: ListKind, query: &Query| {
+        let view = rig.library.list_open(kind, query).unwrap();
+        let rows = rig.library.list_rows(kind, &view.ids).unwrap();
+        (view, rows)
+    };
+    let mut before = titles(&open(&rig, ListKind::Albums, &Query::default()).1);
+    before.sort();
+    assert_eq!(before, ["Night Drives", "Tin Weather"]);
+    let artists = titles(&open(&rig, ListKind::Artists, &Query::default()).1);
+    assert_eq!(artists, ["Moss Arcade", "Various Artists"]);
+
+    // The compilation's only file is retagged as the artist's own record's
+    // copy of the song, so the two releases are one.
+    rig.put("Moss Arcade/Tin Weather/07.flac", "b.flac");
+    rig.scan();
+    // The release no file reaches, and its song.
+    let reached =
+        "EXISTS (SELECT 1 FROM assignment a JOIN source_item si ON si.id = a.source_item_id
+                    WHERE a.appearance_id = ta.id AND a.superseded_at_ms IS NULL
+                      AND si.item_kind = 'file' AND si.retired_at_ms IS NULL)";
+    let ghost = rig.one(&format!(
+        "SELECT r.id, rg.public_id, ta.id FROM release r
+         JOIN release_group rg ON rg.id = r.release_group_id
+         JOIN track_appearance ta ON ta.release_id = r.id
+         WHERE r.redirect_to_id IS NULL AND ta.redirect_to_id IS NULL AND NOT {reached}"
+    ));
+    let [release, group, song] = ghost.split('|').collect::<Vec<_>>()[..] else {
+        panic!("{ghost}")
+    };
+    let (release, song): (i64, i64) = (release.parse().unwrap(), song.parse().unwrap());
+
+    let (albums, rows) = open(&rig, ListKind::Albums, &Query::default());
+    assert_eq!(titles(&rows), ["Tin Weather"]);
+    assert!(!albums.ids.contains(&-release), "{:?}", albums.ids);
+    let (_, artists) = open(&rig, ListKind::Artists, &Query::default());
+    assert_eq!(titles(&artists), ["Moss Arcade"]);
+    let Row::Artist(artist) = &artists[0] else {
+        panic!("{artists:?}")
+    };
+    assert_eq!((artist.album_count, artist.track_count), (1, 1));
+    // The artist's page: their records, and those they are on a song of.
+    let theirs = Query {
+        filter: Some(Filter {
+            version: FILTER_VERSION,
+            predicate: Predicate::WithArtist {
+                artist_id: artist.artist_id,
+            },
+        }),
+        ..query(SortKey::Discography)
+    };
+    assert_eq!(
+        titles(&open(&rig, ListKind::Albums, &theirs).1),
+        ["Tin Weather"]
+    );
+    let (songs, rows) = open(&rig, ListKind::Songs, &Query::default());
+    assert!(!songs.ids.contains(&song), "{:?}", songs.ids);
+    assert_eq!(titles(&rows), ["Paper Kites"]);
+    for typed in ["night", "paper"] {
+        let found = rig.library.search(typed, 10).unwrap();
+        assert!(
+            found
+                .albums
+                .iter()
+                .all(|album| album.title.as_deref() == Some("Tin Weather")),
+            "{typed}: {:?}",
+            found.albums
+        );
+        assert!(found.songs.len() <= 1, "{typed}: {:?}", found.songs);
+    }
+    let group: Vec<u8> = (0..group.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&group[at..at + 2], 16).unwrap())
+        .collect();
+    let page = rig
+        .library
+        .album_page(ritornel_contract::AlbumRef::ReleaseGroup {
+            id: ritornel_contract::Id::from_bytes(group.try_into().unwrap()),
+        })
+        .unwrap();
+    // The record's own group has no other version: it has no page.
+    assert!(page.is_none(), "{page:#?}");
+    // Nor do portraits come for its artist.
+    let pictured = rig
+        .library
+        .read(crate::artist_pictures::artist_names)
+        .unwrap();
+    assert_eq!(pictured, [Some("Moss Arcade".to_owned())]);
+
+    // Nor is it played: not from a view opened before, nor by its ID, nor
+    // as a record.
+    assert_eq!(rig.library.song_ids(&[song]).unwrap(), [None]);
+    let id = rig.one(&format!(
+        "SELECT public_id FROM track_appearance WHERE id = {song}"
+    ));
+    let id: Vec<u8> = (0..id.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&id[at..at + 2], 16).unwrap())
+        .collect();
+    let id = ritornel_contract::Id::from_bytes(id.try_into().unwrap());
+    assert_eq!(rig.library.unknown_appearance(&[id]).unwrap(), Some(id));
+    let public = rig.one(&format!(
+        "SELECT public_id FROM release WHERE id = {release}"
+    ));
+    let public: Vec<u8> = (0..public.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&public[at..at + 2], 16).unwrap())
+        .collect();
+    let public = ritornel_contract::Id::from_bytes(public.try_into().unwrap());
+    let tracks = rig.library.release_tracks(public).unwrap();
+    assert!(tracks.as_ref().is_some_and(Vec::is_empty), "{tracks:?}");
+    let page = rig
+        .library
+        .album_page(ritornel_contract::AlbumRef::Release { id: public })
+        .unwrap();
+    assert!(page.is_none(), "{page:#?}");
+
+    // A group set to show the release, beside one a file reaches, shows
+    // and is found by the one a file reaches.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.group",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let connection = write.connection();
+                connection.execute(
+                    "UPDATE release SET release_group_id =
+                       (SELECT release_group_id FROM release WHERE id <> ?1 AND display_title = 'Tin Weather')
+                     WHERE id = ?1",
+                    [release],
+                )?;
+                connection.execute(
+                    "UPDATE release_group SET display_release_id = ?1
+                     WHERE id = (SELECT release_group_id FROM release WHERE id = ?1)",
+                    [release],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    let (albums, rows) = open(&rig, ListKind::Albums, &query(SortKey::Title));
+    assert_eq!(titles(&rows), ["Tin Weather"]);
+    assert_eq!(
+        rig.library.list_locate_prefix(&albums, "tin").unwrap(),
+        Some(0)
+    );
+    let Row::Album(tile) = &rows[0] else {
+        panic!("{rows:?}")
+    };
+    let page = rig.library.album_page(tile.album).unwrap().unwrap();
+    assert!(page.versions.is_empty(), "{:#?}", page.versions);
+    assert_eq!(page.tracks.len(), 1);
+
+    // A file that is missing still reaches its record; one retired, when
+    // another song took its path, does not.
+    let set = |sql: &'static str| {
+        rig.library
+            .write(
+                WriteRequest {
+                    method: "test.items",
+                    command: None,
+                    client: None,
+                },
+                move |write| {
+                    write.connection().execute(sql, [])?;
+                    Ok(String::new())
+                },
+            )
+            .unwrap();
+    };
+    set("UPDATE source_item SET missing_since_ms = 1 WHERE item_kind = 'file'");
+    assert_eq!(
+        titles(&open(&rig, ListKind::Albums, &Query::default()).1),
+        ["Tin Weather"]
+    );
+    set("UPDATE source_item SET retired_at_ms = 1 WHERE item_kind = 'file'");
+    assert!(open(&rig, ListKind::Albums, &Query::default()).1.is_empty());
+    assert!(open(&rig, ListKind::Songs, &Query::default()).1.is_empty());
+    set(
+        "UPDATE source_item SET retired_at_ms = NULL, missing_since_ms = NULL
+         WHERE item_kind = 'file'",
+    );
+
+    // The matcher reads only what a file reaches.
+    let recordings = rig
+        .library
+        .read(crate::import_store::catalog_recordings)
+        .unwrap();
+    assert!(!recordings.is_empty());
+    for recording in &recordings {
+        assert!(!recording.appearances.is_empty(), "{recording:?}");
+        for appearance in &recording.appearances {
+            assert_ne!(appearance.appearance, song, "{recording:?}");
+        }
+    }
+}

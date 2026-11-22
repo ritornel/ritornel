@@ -278,6 +278,15 @@ struct Artist {
     mbid: Option<String>,
 }
 
+/// The names of [`artists`], for tests.
+#[cfg(test)]
+pub(crate) fn artist_names(connection: &Connection) -> Result<Vec<Option<String>>, Error> {
+    Ok(artists(connection)?
+        .into_iter()
+        .map(|artist| artist.name)
+        .collect())
+}
+
 /// Each artist with a record, with their name and ID.
 fn artists(connection: &Connection) -> Result<Vec<Artist>, Error> {
     let mbids = artist_mbids(connection)?;
@@ -295,17 +304,21 @@ fn artists(connection: &Connection) -> Result<Vec<Artist>, Error> {
             }
         }
     }
+    // As the Artists list has them: by a record a file reaches.
     let found = rows(
         connection,
-        "SELECT a.id, a.display_name FROM artist a
-         WHERE a.redirect_to_id IS NULL
-           AND a.id IN (
-             SELECT ca.canonical_id
-             FROM release r
-             CROSS JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
-             CROSS JOIN artist ca ON ca.id = acn.artist_id
-             WHERE r.redirect_to_id IS NULL)
-         ORDER BY a.id",
+        &format!(
+            "SELECT a.id, a.display_name FROM artist a
+             WHERE a.redirect_to_id IS NULL
+               AND a.id IN (
+                 SELECT ca.canonical_id
+                 FROM release r
+                 CROSS JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
+                 CROSS JOIN artist ca ON ca.id = acn.artist_id
+                 WHERE r.redirect_to_id IS NULL AND {})
+             ORDER BY a.id",
+            crate::list::REACHED_RELEASE_R
+        ),
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
     )?;
     Ok(found

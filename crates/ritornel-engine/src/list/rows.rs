@@ -125,7 +125,8 @@ fn artists(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
     let mut records: HashMap<i64, Records> = HashMap::new();
     for_each_in(
         connection,
-        "SELECT ca.canonical_id, r.id, r.release_group_id, rg.presentation,
+        concat!(
+            "SELECT ca.canonical_id, r.id, r.release_group_id, rg.presentation,
                 rg.display_release_id, coalesce(rg.display_first_year, r.display_year),
                 r.display_title, p.public_id
          FROM artist ca
@@ -133,7 +134,9 @@ fn artists(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
          JOIN release r ON r.display_artist_credit_id = acn.artist_credit_id
          JOIN release_group rg ON rg.id = r.release_group_id
          LEFT JOIN picture p ON p.id = r.display_picture_id
-         WHERE r.redirect_to_id IS NULL AND ca.canonical_id IN ({})",
+         WHERE r.redirect_to_id IS NULL AND ca.canonical_id IN ({}) AND ",
+            reached_release!("r")
+        ),
         &live,
         |row| {
             let artist: i64 = row.get(0)?;
@@ -251,9 +254,12 @@ pub(super) fn track_counts(
     let mut counts = HashMap::new();
     for_each_in(
         connection,
-        "SELECT release_id, count(*), total(display_duration_ms) FROM track_appearance
-         WHERE redirect_to_id IS NULL AND release_id IN ({})
-         GROUP BY release_id",
+        concat!(
+            "SELECT release_id, count(*), total(display_duration_ms) FROM track_appearance
+             WHERE redirect_to_id IS NULL AND release_id IN ({}) AND ",
+            reached!("track_appearance"),
+            " GROUP BY release_id"
+        ),
         releases,
         |row| {
             let duration: f64 = row.get(2)?;
@@ -301,8 +307,11 @@ fn albums(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
     let mut release_rows: HashMap<i64, (Id, i64)> = HashMap::new();
     for_each_in(
         connection,
-        "SELECT id, public_id, release_group_id FROM release
-         WHERE id IN ({}) AND redirect_to_id IS NULL",
+        concat!(
+            "SELECT id, public_id, release_group_id FROM release
+             WHERE id IN ({}) AND redirect_to_id IS NULL AND ",
+            reached_release!("release")
+        ),
         &expanded,
         |row| {
             release_rows.insert(row.get(0)?, (id(row.get(1)?), row.get(2)?));
@@ -319,8 +328,11 @@ fn albums(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
     let mut versions: HashMap<i64, Vec<i64>> = HashMap::new();
     for_each_in(
         connection,
-        "SELECT release_group_id, id FROM release
-         WHERE redirect_to_id IS NULL AND release_group_id IN ({})",
+        concat!(
+            "SELECT release_group_id, id FROM release
+             WHERE redirect_to_id IS NULL AND release_group_id IN ({}) AND ",
+            reached_release!("release")
+        ),
         &all_groups,
         |row| {
             versions.entry(row.get(0)?).or_default().push(row.get(1)?);
@@ -377,8 +389,11 @@ fn albums(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
     let mut tracks: HashMap<i64, (u64, u64)> = HashMap::new();
     for_each_in(
         connection,
-        "SELECT id, release_id, display_duration_ms FROM track_appearance
-         WHERE redirect_to_id IS NULL AND release_id IN ({})",
+        concat!(
+            "SELECT id, release_id, display_duration_ms FROM track_appearance
+             WHERE redirect_to_id IS NULL AND release_id IN ({}) AND ",
+            reached!("track_appearance")
+        ),
         &shown_keys,
         |row| {
             let release: i64 = row.get(1)?;
@@ -537,7 +552,8 @@ fn songs(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
     let mut found: HashMap<i64, Appearance> = HashMap::new();
     for_each_in(
         connection,
-        "SELECT ta.id, ta.public_id, crc.id, crc.public_id, r.public_id, ta.display_title,
+        concat!(
+            "SELECT ta.id, ta.public_id, crc.id, crc.public_id, r.public_id, ta.display_title,
                 ta.display_artist_credit_id, r.display_title, ta.display_disc_number,
                 ta.display_track_number, r.display_year, ta.display_duration_ms,
                 ta.display_added_at_ms
@@ -545,7 +561,9 @@ fn songs(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
          JOIN recording rc ON rc.id = ta.recording_id
          JOIN recording crc ON crc.id = rc.canonical_id
          LEFT JOIN release r ON r.id = ta.release_id
-         WHERE ta.id IN ({}) AND ta.redirect_to_id IS NULL",
+         WHERE ta.id IN ({}) AND ta.redirect_to_id IS NULL AND ",
+            reached!("ta")
+        ),
         keys,
         |row| {
             found.insert(

@@ -171,7 +171,7 @@ fn artists(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Sectio
     // Those who have a record: the artists a release's credit names. A
     // name that only appears in a song's credit ("Drake feat. Rihanna",
     // which is never split) is not filed among them.
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(concat!(
         "SELECT a.id, a.display_name, a.display_sort_name
          FROM artist a
          WHERE a.redirect_to_id IS NULL
@@ -180,9 +180,10 @@ fn artists(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Sectio
              FROM release r
              CROSS JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
              CROSS JOIN artist ca ON ca.id = acn.artist_id
-             WHERE r.redirect_to_id IS NULL
-           )",
-    )?;
+             WHERE r.redirect_to_id IS NULL AND ",
+        reached_release!("r"),
+        ")"
+    ))?;
     let mut entries = Vec::new();
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
@@ -247,9 +248,10 @@ pub(super) struct Release {
     pub(super) marks: Option<String>,
 }
 
-/// Live releases with their group and what each is filed under. `?1` is
-/// the artist a filter asks for, or null.
-const RELEASES: &str = "SELECT r.id, r.release_group_id, rg.presentation, rg.display_release_id,
+/// Live releases a file reaches, with their group and what each is filed
+/// under. `?1` is the artist a filter asks for, or null.
+const RELEASES: &str = concat!(
+    "SELECT r.id, r.release_group_id, rg.presentation, rg.display_release_id,
         rg.display_first_year, r.display_year, r.display_title, ac.display_text,
         (SELECT a.display_sort_name
            FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
@@ -265,7 +267,9 @@ const RELEASES: &str = "SELECT r.id, r.release_group_id, rg.presentation, rg.dis
  FROM release r
  JOIN release_group rg ON rg.id = r.release_group_id
  LEFT JOIN artist_credit ac ON ac.id = r.display_artist_credit_id
- WHERE r.redirect_to_id IS NULL";
+ WHERE r.redirect_to_id IS NULL AND ",
+    reached_release!("r")
+);
 
 /// Every live release with its group and what it is filed under.
 pub(super) fn releases(
@@ -361,14 +365,16 @@ fn release(row: &rusqlite::Row<'_>) -> Result<Release, Error> {
 /// whole), and the releases of those credits by
 /// `release_display_artist_credit`.
 fn releases_by(connection: &Connection, artist: i64) -> Result<Vec<i64>, Error> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(concat!(
         "SELECT r.id FROM release r
          WHERE r.redirect_to_id IS NULL
            AND r.display_artist_credit_id IN (
              SELECT acn.artist_credit_id
              FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
-             WHERE a.canonical_id = ?1)",
-    )?;
+             WHERE a.canonical_id = ?1)
+           AND ",
+        reached_release!("r")
+    ))?;
     let mut found = Vec::new();
     let mut rows = statement.query([artist])?;
     while let Some(row) = rows.next()? {
@@ -381,14 +387,16 @@ fn releases_by(connection: &Connection, artist: i64) -> Result<Vec<i64>, Error> 
 /// this key. There is no index on a song's credit, so this reads every
 /// song: measured at 100,000 records in the report of the pages' work.
 fn releases_crediting(connection: &Connection, artist: i64) -> Result<HashSet<i64>, Error> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(concat!(
         "SELECT DISTINCT ta.release_id FROM track_appearance ta
          WHERE ta.redirect_to_id IS NULL AND ta.release_id IS NOT NULL
            AND ta.display_artist_credit_id IN (
              SELECT acn.artist_credit_id
              FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
-             WHERE a.canonical_id = ?1)",
-    )?;
+             WHERE a.canonical_id = ?1)
+           AND ",
+        reached!("ta")
+    ))?;
     let mut found = HashSet::new();
     let mut rows = statement.query([artist])?;
     while let Some(row) = rows.next()? {
@@ -480,11 +488,12 @@ fn shown_of(releases: &[Release], members: &[usize], display: Option<i64>) -> us
 
 /// When each release came into the library: the oldest of its tracks.
 fn added(connection: &Connection) -> Result<HashMap<i64, i64>, Error> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(concat!(
         "SELECT release_id, min(display_added_at_ms) FROM track_appearance
-         WHERE redirect_to_id IS NULL AND release_id IS NOT NULL
-         GROUP BY release_id",
-    )?;
+         WHERE redirect_to_id IS NULL AND release_id IS NOT NULL AND ",
+        reached!("track_appearance"),
+        " GROUP BY release_id"
+    ))?;
     let mut added = HashMap::new();
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
@@ -775,14 +784,17 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
         Some(needle) => Some(matching(connection, needle)?),
         None => None,
     };
-    let all = "SELECT ta.id, ta.release_id, rc.canonical_id, ta.display_title,
+    let all = concat!(
+        "SELECT ta.id, ta.release_id, rc.canonical_id, ta.display_title,
                       ta.display_disc_number, ta.display_track_number,
                       ?1 IS NULL OR EXISTS (
                         SELECT 1 FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
                          WHERE acn.artist_credit_id = ta.display_artist_credit_id
                            AND a.canonical_id = ?1)
                FROM track_appearance ta JOIN recording rc ON rc.id = ta.recording_id
-               WHERE ta.redirect_to_id IS NULL";
+               WHERE ta.redirect_to_id IS NULL AND ",
+        reached!("ta")
+    );
     // Songs on no record are found by `track_appearance_release`.
     let loose = format!("{all} AND ta.release_id IS NULL");
     let columns = if plan.no_record { loose.as_str() } else { all };
@@ -1004,12 +1016,19 @@ fn filed_under(
         }
         (ListKind::Songs, _) => "SELECT release_id FROM track_appearance WHERE id = ?1",
         (ListKind::Albums, _) if key < 0 => "SELECT ?1 * -1",
-        (ListKind::Albums, _) => {
+        // The release the tile shows, as `tiles` chooses it.
+        (ListKind::Albums, _) => concat!(
             "SELECT coalesce(
                (SELECT r.id FROM release r JOIN release_group rg ON rg.id = r.release_group_id
-                 WHERE rg.id = ?1 AND r.id = rg.display_release_id AND r.redirect_to_id IS NULL),
-               (SELECT min(r.id) FROM release r WHERE r.release_group_id = ?1 AND r.redirect_to_id IS NULL))"
-        }
+                 WHERE rg.id = ?1 AND r.id = rg.display_release_id AND r.redirect_to_id IS NULL
+                   AND ",
+            reached_release!("r"),
+            "),
+               (SELECT min(r.id) FROM release r
+                 WHERE r.release_group_id = ?1 AND r.redirect_to_id IS NULL AND ",
+            reached_release!("r"),
+            "))"
+        ),
     };
     let release: Option<i64> = connection
         .query_row(sql, [key], |row| row.get(0))

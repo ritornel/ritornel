@@ -188,11 +188,15 @@ impl LibraryStore {
         })
     }
 
-    /// Which of `appearances` the library does not have, if any.
+    /// Which of `appearances` the library does not have, if any: a song
+    /// no file reaches, through redirects, is not had.
     pub(crate) fn unknown_appearance(&self, appearances: &[Id]) -> Result<Option<Id>, Error> {
         self.read(|connection| {
-            let mut statement =
-                connection.prepare_cached("SELECT 1 FROM track_appearance WHERE public_id = ?1")?;
+            let mut statement = connection.prepare_cached(&format!(
+                "SELECT 1 FROM track_appearance x JOIN track_appearance ta ON ta.id = x.canonical_id
+                 WHERE x.public_id = ?1 AND {}",
+                crate::list::REACHED_TA
+            ))?;
             for appearance in appearances {
                 if !statement.exists([appearance.as_bytes()])? {
                     return Ok(Some(*appearance));
@@ -302,10 +306,13 @@ impl LibraryStore {
             let Some(canonical) = canonical else {
                 return Ok(None);
             };
+            // Only the tracks a file reaches, as the album's page lists.
             let mut statement = connection.prepare(&format!(
                 "SELECT {DISPLAY_COLUMNS} {DISPLAY_JOINS}
                  WHERE ta.redirect_to_id IS NULL
-                   AND ta.release_id IN (SELECT id FROM release WHERE canonical_id = ?1)"
+                   AND ta.release_id IN (SELECT id FROM release WHERE canonical_id = ?1)
+                   AND {}",
+                crate::list::REACHED_TA
             ))?;
             let mut tracks: Vec<(TrackDisplay, String)> = statement
                 .query_map([canonical], display)?

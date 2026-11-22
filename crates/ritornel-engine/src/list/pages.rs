@@ -76,11 +76,12 @@ type Version = (i64, Id, Option<String>, Option<i64>);
 /// The live releases of a group, oldest first: by year, those with none
 /// last, then by when they came into the catalogue.
 fn versions(connection: &Connection, group: i64) -> Result<Vec<Version>, Error> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(concat!(
         "SELECT id, public_id, display_title, display_year FROM release
-         WHERE release_group_id = ?1 AND redirect_to_id IS NULL
-         ORDER BY display_year IS NULL, display_year, id",
-    )?;
+         WHERE release_group_id = ?1 AND redirect_to_id IS NULL AND ",
+        reached_release!("release"),
+        " ORDER BY display_year IS NULL, display_year, id"
+    ))?;
     let mut found = Vec::new();
     let mut rows = statement.query([group])?;
     while let Some(row) = rows.next()? {
@@ -165,12 +166,13 @@ pub(super) fn album(connection: &Connection, album: AlbumRef) -> Result<Option<A
 
     // Its tracks, in disc and track order; a track with no number after
     // those with one.
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(concat!(
         "SELECT id FROM track_appearance
-         WHERE release_id = ?1 AND redirect_to_id IS NULL
-         ORDER BY display_disc_number IS NULL, display_disc_number,
-                  display_track_number IS NULL, display_track_number, id",
-    )?;
+         WHERE release_id = ?1 AND redirect_to_id IS NULL AND ",
+        reached!("track_appearance"),
+        " ORDER BY display_disc_number IS NULL, display_disc_number,
+                    display_track_number IS NULL, display_track_number, id"
+    ))?;
     let mut keys = Vec::new();
     let mut found = statement.query([release_key])?;
     while let Some(row) = found.next()? {
@@ -195,8 +197,11 @@ pub(super) fn album(connection: &Connection, album: AlbumRef) -> Result<Option<A
     let mut release_of = std::collections::HashMap::new();
     for_each_in(
         connection,
-        "SELECT id, release_id FROM track_appearance
-         WHERE redirect_to_id IS NULL AND release_id IN ({})",
+        concat!(
+            "SELECT id, release_id FROM track_appearance
+             WHERE redirect_to_id IS NULL AND release_id IN ({}) AND ",
+            reached!("track_appearance")
+        ),
         &others,
         |row| {
             release_of.insert(row.get::<_, i64>(0)?, row.get::<_, i64>(1)?);
