@@ -302,10 +302,13 @@ impl LibraryStore {
             let Some(canonical) = canonical else {
                 return Ok(None);
             };
+            // Only the tracks a file reaches, as the album's page lists.
             let mut statement = connection.prepare(&format!(
                 "SELECT {DISPLAY_COLUMNS} {DISPLAY_JOINS}
                  WHERE ta.redirect_to_id IS NULL
-                   AND ta.release_id IN (SELECT id FROM release WHERE canonical_id = ?1)"
+                   AND ta.release_id IN (SELECT id FROM release WHERE canonical_id = ?1)
+                   AND ta.id IN ({})",
+                crate::list::REACHED
             ))?;
             let mut tracks: Vec<(TrackDisplay, String)> = statement
                 .query_map([canonical], display)?

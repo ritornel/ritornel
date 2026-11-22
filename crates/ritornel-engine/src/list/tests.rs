@@ -743,6 +743,56 @@ fn a_record_whose_files_joined_another_is_on_no_wall() {
         "{page:#?}"
     );
 
+    // Nor is it played: not from a view opened before, nor as a record.
+    assert_eq!(rig.library.song_ids(&[song]).unwrap(), [None]);
+    let public = rig.one(&format!(
+        "SELECT public_id FROM release WHERE id = {release}"
+    ));
+    let public: Vec<u8> = (0..public.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&public[at..at + 2], 16).unwrap())
+        .collect();
+    let tracks = rig
+        .library
+        .release_tracks(ritornel_contract::Id::from_bytes(
+            public.try_into().unwrap(),
+        ))
+        .unwrap();
+    assert!(tracks.as_ref().is_some_and(Vec::is_empty), "{tracks:?}");
+
+    // A group set to show the release, beside one a file reaches, shows
+    // and is found by the one a file reaches.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.group",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let connection = write.connection();
+                connection.execute(
+                    "UPDATE release SET release_group_id =
+                       (SELECT release_group_id FROM release WHERE id <> ?1 AND display_title = 'Tin Weather')
+                     WHERE id = ?1",
+                    [release],
+                )?;
+                connection.execute(
+                    "UPDATE release_group SET display_release_id = ?1
+                     WHERE id = (SELECT release_group_id FROM release WHERE id = ?1)",
+                    [release],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    let (albums, rows) = open(&rig, ListKind::Albums, &query(SortKey::Title));
+    assert_eq!(titles(&rows), ["Tin Weather"]);
+    assert_eq!(
+        rig.library.list_locate_prefix(&albums, "tin").unwrap(),
+        Some(0)
+    );
+
     // The matcher reads only what a file reaches.
     let recordings = rig
         .library

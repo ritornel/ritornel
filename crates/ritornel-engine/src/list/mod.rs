@@ -205,9 +205,12 @@ impl LibraryStore {
             // A long view is most of the table, which one scan reads faster
             // than a lookup a row.
             if keys.len() > 4 * CHUNK {
-                let mut statement = connection.prepare(
-                    "SELECT id, public_id FROM track_appearance WHERE redirect_to_id IS NULL",
-                )?;
+                let mut statement = connection.prepare(concat!(
+                    "SELECT id, public_id FROM track_appearance
+                     WHERE redirect_to_id IS NULL AND id IN (",
+                    reached!(),
+                    ")"
+                ))?;
                 let mut rows = statement.query([])?;
                 while let Some(row) = rows.next()? {
                     each(row)?;
@@ -215,8 +218,12 @@ impl LibraryStore {
             } else {
                 for_each_in(
                     connection,
-                    "SELECT id, public_id FROM track_appearance
-                     WHERE id IN ({}) AND redirect_to_id IS NULL",
+                    concat!(
+                        "SELECT id, public_id FROM track_appearance
+                         WHERE id IN ({}) AND redirect_to_id IS NULL AND id IN (",
+                        reached!(),
+                        ")"
+                    ),
                     keys,
                     each,
                 )?;

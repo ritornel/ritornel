@@ -1020,12 +1020,19 @@ fn filed_under(
         }
         (ListKind::Songs, _) => "SELECT release_id FROM track_appearance WHERE id = ?1",
         (ListKind::Albums, _) if key < 0 => "SELECT ?1 * -1",
-        (ListKind::Albums, _) => {
+        // The release the tile shows, as `tiles` chooses it.
+        (ListKind::Albums, _) => concat!(
             "SELECT coalesce(
                (SELECT r.id FROM release r JOIN release_group rg ON rg.id = r.release_group_id
-                 WHERE rg.id = ?1 AND r.id = rg.display_release_id AND r.redirect_to_id IS NULL),
-               (SELECT min(r.id) FROM release r WHERE r.release_group_id = ?1 AND r.redirect_to_id IS NULL))"
-        }
+                 WHERE rg.id = ?1 AND r.id = rg.display_release_id AND r.redirect_to_id IS NULL
+                   AND r.id IN (",
+            reached_releases!(),
+            ")),
+               (SELECT min(r.id) FROM release r
+                 WHERE r.release_group_id = ?1 AND r.redirect_to_id IS NULL AND r.id IN (",
+            reached_releases!(),
+            ")))"
+        ),
     };
     let release: Option<i64> = connection
         .query_row(sql, [key], |row| row.get(0))
