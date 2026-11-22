@@ -66,6 +66,7 @@ impl Core {
             account: None,
             sign_in_again: false,
             scrobbling_since: None,
+            waiting_for_import_since: None,
             deliveries: Vec::new(),
             imported: 0,
             zones_set: false,
@@ -195,10 +196,10 @@ mod enabled {
         ) -> Result<LastfmStatus, RpcError> {
             let lastfm = self.lastfm_or_refuse()?;
             let session = stores.server().service_session(SERVICE).map_err(refused)?;
-            let (deliveries, imported, zones_set) = Self::library(stores, |library| {
+            let (deliveries, imported, zones_set, held) = Self::library(stores, |library| {
                 let zones_set = zones_set(library)?;
                 let Some(session) = &session else {
-                    return Ok((Vec::new(), 0, zones_set));
+                    return Ok((Vec::new(), 0, zones_set, None));
                 };
                 Ok((
                     library
@@ -212,15 +213,25 @@ mod enabled {
                         .collect(),
                     unsigned(library.imported_count(session.account).map_err(refused)?),
                     zones_set,
+                    library.held_for_import().map_err(refused)?,
                 ))
             })
             .unwrap_or_default();
+            let scrobbling_since = session.as_ref().and_then(|s| s.scrobble_from_ms);
             Ok(LastfmStatus {
                 available: true,
                 configured: lastfm.configured(),
                 account: session.as_ref().map(|s| s.account_name.clone()),
                 sign_in_again: session.as_ref().is_some_and(|s| s.sign_in_again),
-                scrobbling_since: session.as_ref().and_then(|s| s.scrobble_from_ms),
+                scrobbling_since,
+                // Said only while it holds something back: not while a new
+                // sign-in holds everything back anyway.
+                waiting_for_import_since: held
+                    .filter(|_| {
+                        scrobbling_since.is_some()
+                            && !session.as_ref().is_some_and(|s| s.sign_in_again)
+                    })
+                    .and_then(|held| held.since_ms),
                 deliveries,
                 imported,
                 zones_set,
@@ -381,11 +392,16 @@ mod enabled {
         ) -> Result<SignInFinished, RpcError> {
             let lastfm = self.lastfm_or_refuse()?;
             let account = lastfm.finish_sign_in(params.sign_in, |account| {
+                let _change = lastfm.hold();
                 Self::library(stores, |library| {
                     keep_session(stores.server(), library, account).map_err(refused)
                 })
                 .map(|_| ())
             })?;
+            // Signed in again to the same account, the plays waiting go.
+            if account.is_some() {
+                self.wake_scrobbler();
+            }
             Ok(SignInFinished {
                 receipt: receipt(
                     params.idempotency_key,
@@ -404,10 +420,13 @@ mod enabled {
             stores: &Stores,
             params: &KeyParams,
         ) -> Result<SignedOut, RpcError> {
+            // Once this answers, nothing more is sent as the session ended.
+            let change = self.lastfm().map(Lastfm::hold);
             let was_signed_in = stores
                 .server()
                 .remove_service_session(SERVICE)
                 .map_err(refused)?;
+            drop(change);
             Ok(SignedOut {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Done),
                 was_signed_in,
@@ -444,10 +463,13 @@ mod enabled {
             params: &ScrobblingParams,
         ) -> Result<ScrobblingSet, RpcError> {
             Self::session(stores)?;
+            // Turned off, nothing more is sent once this answers.
+            let change = self.lastfm().map(Lastfm::hold);
             let session = stores
                 .server()
                 .set_scrobbling(SERVICE, params.on)
                 .map_err(refused)?;
+            drop(change);
             self.wake_scrobbler();
             Ok(ScrobblingSet {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Done),

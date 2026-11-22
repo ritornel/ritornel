@@ -204,6 +204,20 @@ pub(super) fn render(
             ),
         ]))
         .children(model.problems.get(&Group::Scrobbling).cloned().map(problem))
+        .children(status.waiting_for_import_since.map(|since| {
+            note(format!(
+                "Nothing has been sent since {}, when this library was restored from a backup: \
+                 Last.fm may already have plays sent after it was taken. {}",
+                when(since, clock),
+                if status.zones_set {
+                    "The next import checks, and the plays waiting go once it has. Import Now \
+                     runs it straight away."
+                } else {
+                    "An import checks, and the plays waiting go once it has: add where you \
+                     listened below, then Import Now."
+                }
+            ))
+        }))
         .child(note(
             "Sends each play to Last.fm from the moment you turn this on, and shows there what is playing now. Plays from before are never sent.",
         ));

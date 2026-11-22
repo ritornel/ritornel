@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ritornel_contract::{BackupReason, Id};
-use ritornel_engine::backup::{Database, Pending, copy_database, pending_migrations};
+use ritornel_engine::backup::{Database, Pending, copy_database, hold_sending, pending_migrations};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -56,6 +56,15 @@ library names the server that may write it, and that server is the one in
 server.db.
 
 To look inside without changing anything: sqlite3 -readonly library.db
+";
+
+/// What the README adds when the library copied had plays waiting to be
+/// sent to Last.fm.
+const HELD: &str = "
+This library had plays waiting to be sent to Last.fm. A server started on
+it scrobbles nothing to Last.fm until it has imported from there, which it
+does by itself: Last.fm may already have taken some of them after the
+backup was taken.
 ";
 
 /// A backup that could not be taken.
@@ -416,6 +425,7 @@ fn fill(
     about: About,
 ) -> Result<(), BackupError> {
     let mut files = Vec::new();
+    let mut held = false;
     for (name, source) in [
         ("server.db", dir.server_db()),
         ("library.db", dir.library_db()),
@@ -440,6 +450,10 @@ fn fill(
         }
         let copy = into.join(name);
         copy_database(&source, &copy).map_err(|error| BackupError::Copy(name, error))?;
+        if name == "library.db" {
+            // Put back, it holds plays Last.fm may have taken since.
+            held = hold_sending(&copy, at_ms).map_err(|error| BackupError::Copy(name, error))?;
+        }
         // SQLite makes a file anyone may read, and server.db holds this
         // server's signing key.
         close_to_others(&copy).map_err(io("close", &copy))?;
@@ -468,7 +482,12 @@ fn fill(
     });
     let text = serde_json::to_string_pretty(&manifest).unwrap_or_default();
     write_synced(&into.join("backup.json"), text.as_bytes())?;
-    write_synced(&into.join("README.txt"), README.as_bytes())
+    let readme = if held {
+        format!("{README}{HELD}")
+    } else {
+        README.to_owned()
+    };
+    write_synced(&into.join("README.txt"), readme.as_bytes())
 }
 
 /// Whether there is a file with something in it at `path`. One whose
@@ -572,6 +591,54 @@ mod tests {
         }));
         // And nothing was written in the data directory.
         assert!(!dir.backups().exists());
+    }
+
+    #[test]
+    fn a_backup_of_a_library_with_nothing_waiting_to_be_sent_holds_nothing_back() {
+        use ritornel_engine::{LibraryStore, WriteRequest};
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let store = ServerStore::open(&dir.server_db(), Arc::new(SystemClock), Arc::new(OsEntropy))
+            .unwrap();
+        let (identity, _) = store.ensure_identity("desk").unwrap();
+        let open = |path: &Path| {
+            LibraryStore::open(
+                path,
+                identity.server_id,
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+            )
+            .unwrap()
+        };
+        drop(
+            LibraryStore::create(
+                &dir.library_db(),
+                &identity,
+                WriteRequest {
+                    method: "library.create",
+                    command: None,
+                    client: None,
+                },
+                |_| String::new(),
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+            )
+            .unwrap(),
+        );
+        let place = elsewhere(&scratch);
+        let taken = backup(&dir, &place, About::default()).unwrap();
+        // With nothing waiting to be sent there is nothing to hold back:
+        // which copy is held, when something waits, is the engine's to test.
+        assert_eq!(open(&dir.library_db()).held_for_import().unwrap(), None);
+        assert_eq!(
+            open(&taken.path.join("library.db"))
+                .held_for_import()
+                .unwrap(),
+            None
+        );
+        let readme = std::fs::read_to_string(taken.path.join("README.txt")).unwrap();
+        // Nor does its README say scrobbling waits.
+        assert!(!readme.contains("scrobbles nothing"), "{readme}");
     }
 
     #[test]

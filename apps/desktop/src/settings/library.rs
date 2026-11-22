@@ -136,7 +136,7 @@ fn record(
 const WORDS: record::Words<'static> = record::Words {
     dismiss: "Dismiss",
     restart: "quit and reopen Ritornel",
-    sign_in: "Sign in again in Settings → Last.fm, then turn scrobbling back on there.",
+    sign_in: "Sign in again in Settings → Last.fm.",
 };
 
 pub(super) fn render(

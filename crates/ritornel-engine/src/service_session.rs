@@ -82,8 +82,11 @@ impl ServerStore {
         })
     }
 
-    /// Keeps a new session at `service`, in place of any before it.
-    /// Scrobbling starts off.
+    /// Keeps a new session at `service`, in place of any before it. For
+    /// another account scrobbling starts off. Signed in again to the same
+    /// account, as after the service refused the session, scrobbling stays
+    /// as it was, from the time it was turned on, so the plays waiting to
+    /// be sent are sent.
     pub fn save_service_session(
         &self,
         service: &str,
@@ -105,7 +108,9 @@ impl ServerStore {
                  ON CONFLICT (service) DO UPDATE SET
                    account_pid = excluded.account_pid, account_name = excluded.account_name,
                    session_key = excluded.session_key, subscriber = excluded.subscriber,
-                   signed_in_at_ms = excluded.signed_in_at_ms, scrobble_from_ms = NULL,
+                   signed_in_at_ms = excluded.signed_in_at_ms,
+                   scrobble_from_ms = CASE WHEN account_pid = excluded.account_pid
+                                           THEN scrobble_from_ms END,
                    sign_in_again = 0",
                 rusqlite::params![service, account.as_bytes(), name, key, subscriber, now_ms],
             )?;
@@ -223,5 +228,45 @@ mod tests {
         );
         assert!(store.remove_service_session("lastfm").unwrap());
         assert_eq!(store.service_session("lastfm").unwrap(), None);
+    }
+
+    #[test]
+    fn signing_in_again_to_the_same_account_keeps_scrobbling_on_and_another_account_does_not() {
+        let clock = Arc::new(FixedClock::at(1_000));
+        let store =
+            ServerStore::open_in_memory(clock.clone(), Arc::new(CountingEntropy::default()))
+                .unwrap();
+        let (someone, another) = (Id::from_bytes([7; 16]), Id::from_bytes([8; 16]));
+        let sign_in = |account, name, key| {
+            store
+                .save_service_session("lastfm", account, name, &ServiceKey::new(key), false)
+                .unwrap();
+            store.service_session("lastfm").unwrap().unwrap()
+        };
+        sign_in(someone, "someone", "KEY_1");
+        clock.set(5_000);
+        store.set_scrobbling("lastfm", true).unwrap();
+        store.refuse_service_session("lastfm", "KEY_1").unwrap();
+
+        // The same account, with a new key: on as before, from when it was
+        // turned on, and no longer refused.
+        clock.set(9_000);
+        let again = sign_in(someone, "someone", "KEY_2");
+        assert_eq!(
+            (
+                again.scrobble_from_ms,
+                again.sign_in_again,
+                again.key.expose()
+            ),
+            (Some(5_000), false, "KEY_2")
+        );
+        // Another account starts off.
+        let other = sign_in(another, "another", "KEY_3");
+        assert_eq!(other.scrobble_from_ms, None);
+        // Off by the listener's choice, it stays off through a sign-in to
+        // the same account.
+        store.set_scrobbling("lastfm", true).unwrap();
+        store.set_scrobbling("lastfm", false).unwrap();
+        assert_eq!(sign_in(another, "another", "KEY_4").scrobble_from_ms, None);
     }
 }

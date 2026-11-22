@@ -109,6 +109,23 @@ pub fn copy_database(from: &Path, to: &Path) -> Result<(), Error> {
     }
 }
 
+/// Holds back scrobbling in `copy`, a backup's copy of a library taken at
+/// `taken_at_ms`, if it has plays waiting to be sent: a server that opens
+/// it sends nothing until an import has brought back what the service took
+/// after the backup. The library copied is not changed. The copy is synced
+/// again, as [`copy_database`] leaves it. Whether it was held.
+pub fn hold_sending(copy: &Path, taken_at_ms: i64) -> Result<bool, Error> {
+    let connection = Location::File(copy.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let held = crate::delivery_store::hold_sending(&connection, taken_at_ms)?;
+    drop(connection);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(copy)
+        .and_then(|file| file.sync_all())
+        .map_err(Error::Io)?;
+    Ok(held)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -185,6 +202,76 @@ mod tests {
         let path = scratch.0.join("library.db");
         std::os::unix::fs::symlink(&path, &path).unwrap();
         assert!(pending_migrations(&path, Database::Library).is_err());
+    }
+
+    #[test]
+    fn a_library_put_back_from_a_backup_scrobbles_nothing_until_an_import_has_run() {
+        use crate::{Held, LibraryStore, WriteRequest};
+        let scratch = Scratch::new("held");
+        let clock = Arc::new(FixedClock::at(1_763_000_000_000));
+        let server = open(&scratch.0.join("server.db"));
+        let (identity, _) = server.ensure_identity("desk").unwrap();
+        let path = scratch.0.join("library.db");
+        let (library, _) = LibraryStore::create(
+            &path,
+            &identity,
+            WriteRequest {
+                method: "library.create",
+                command: None,
+                client: None,
+            },
+            |_| String::new(),
+            clock.clone(),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        // With nothing waiting to be sent, a copy is not held.
+        let idle = scratch.0.join("idle.db");
+        copy_database(&path, &idle).unwrap();
+        assert!(!hold_sending(&idle, 1_762_000_000_000).unwrap());
+        // A play waiting to be sent, written straight into the file: what
+        // made it does not matter here.
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.pragma_update(None, "foreign_keys", false).unwrap();
+        raw.execute(
+            "INSERT INTO history_delivery (observation_id, endpoint_id, state, sent_timestamp_s,
+                                           artist, title, created_at_ms, updated_at_ms, rev)
+             VALUES (1, 1, 'pending', 1762000000, 'Invented Artist', 'Invented Song', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(raw);
+        let copy = scratch.0.join("copy.db");
+        copy_database(&path, &copy).unwrap();
+        assert!(hold_sending(&copy, 1_762_000_000_000).unwrap());
+        // The library copied is not held.
+        assert_eq!(library.held_for_import().unwrap(), None);
+        drop(library);
+
+        // Put back and opened, it is held from then on, and opened again
+        // it keeps that time.
+        let restored = LibraryStore::open(
+            &copy,
+            identity.server_id,
+            clock.clone(),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        let held = Some(Held {
+            taken_at_ms: 1_762_000_000_000,
+            since_ms: Some(1_763_000_000_000),
+        });
+        assert_eq!(restored.opened_restored().unwrap(), held);
+        clock.set(1_763_000_500_000);
+        assert_eq!(restored.opened_restored().unwrap(), held);
+        assert_eq!(restored.held_for_import().unwrap(), held);
+        // An import lifts it, once.
+        let account = restored
+            .ensure_service_account("lastfm", "someone")
+            .unwrap();
+        assert!(restored.release_hold(account).unwrap());
+        assert!(!restored.release_hold(account).unwrap());
+        assert_eq!(restored.opened_restored().unwrap(), None);
     }
 
     #[test]

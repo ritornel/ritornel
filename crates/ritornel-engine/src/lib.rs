@@ -91,7 +91,7 @@ pub use artist_pictures::{
 };
 pub use clock::{Clock, SystemClock};
 pub use delivery_store::{
-    DELIVERY_METHOD, Due, ELIGIBILITY_VERSION, Playing, SEND_WITHIN_MS, Settled,
+    DELIVERY_METHOD, Due, ELIGIBILITY_VERSION, Held, Playing, SEND_WITHIN_MS, Settled,
 };
 pub use entropy::{Entropy, OsEntropy};
 pub use error::Error;
