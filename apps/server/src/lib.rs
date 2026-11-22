@@ -33,6 +33,7 @@ mod credential;
 mod data_dir;
 mod dispatch;
 mod error;
+mod hub_catalog;
 mod invent;
 mod jobs;
 mod lastfm;

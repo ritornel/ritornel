@@ -12,7 +12,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Id, ServerRole, hex};
+use crate::{Id, ServerRole, TrackSummary, hex};
 
 /// The params of `link.invite`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +113,80 @@ pub struct SatelliteStatus {
     pub name: String,
     /// When it joined, as Unix milliseconds.
     pub linked_at_ms: i64,
+}
+
+/// The params of `link.tracks`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkTracksParams {
+    /// Track appearances, each answered in its place.
+    #[serde(default)]
+    pub appearances: Vec<Id>,
+    /// A release, whose tracks are answered after them, in disc and track
+    /// order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release: Option<Id>,
+}
+
+/// The result of `link.tracks`: what a satellite's player reads of the
+/// library.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkTracks {
+    /// Each appearance asked for, in order: `null` for one the library
+    /// does not have.
+    pub tracks: Vec<Option<TrackSummary>>,
+    /// The release's tracks, when one was asked for and the library has
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release: Option<Vec<TrackSummary>>,
+    /// The library's first listener: whom a new player plays for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub listener: Option<Id>,
+}
+
+/// The params of `link.copies`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkCopiesParams {
+    /// The track appearance.
+    pub appearance: Id,
+}
+
+/// The result of `link.copies`: the masters of a track the hub holds, best
+/// first, each fetched from `GET /v1/audio/{appearanceId}/{sourceItemId}/
+/// {revision}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkCopies {
+    /// The copies, best first.
+    pub copies: Vec<HubCopy>,
+}
+
+/// One master a hub holds of a track.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HubCopy {
+    /// The master's source item: what a listen names.
+    pub source_item_id: Id,
+    /// The revision of it the scan last read.
+    pub revision: i64,
+    /// The audio asset it plays as.
+    pub asset_id: Id,
+    /// Its length, as the scan read it. 0 when unknown.
+    pub duration_ms: i64,
+    /// Its size in bytes.
+    pub size_bytes: u64,
+    /// The file's extension, in lower case, which a decoder may go by.
+    pub extension: String,
 }
 
 /// What a satellite sends to `POST /v1/link` to join: the invite's secret

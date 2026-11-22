@@ -32,6 +32,9 @@ ritornel-contract.workspace = true
 ritornel-engine = { workspace = true, default-features = false }
 ritornel-lastfm = { workspace = true, optional = true }
 ritornel-source = { workspace = true, optional = true }
+# Sends a master to a satellite as it is read, as a stream of chunks. It
+# is already in the lock file, under the client.
+futures-util = { version = "0.3.34", default-features = false }
 # The listener: HTTP routing and the WebSocket upgrade, over hyper and
 # tungstenite. Only what a loopback HTTP/1 listener needs is switched on.
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }

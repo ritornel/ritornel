@@ -4,6 +4,7 @@
 //! written straight into the library. See docs/internals/playback.md and
 //! docs/internals/history.md.
 
+use crate::playback::Catalog;
 use std::sync::Arc;
 
 use ritornel_domain::history::ContextKind;
@@ -2395,7 +2396,8 @@ impl Rig {
                     let (Some(entry), request) = (on, self.request("playback.skip")) else {
                         continue;
                     };
-                    let (server, library) = (&self.server, Some(&self.library));
+                    let (server, library): (_, Option<&dyn Catalog>) =
+                        (&self.server, Some(&self.library));
                     self.player
                         .skip(request, entry, direction, server, library)
                         .unwrap();
@@ -2416,7 +2418,8 @@ impl Rig {
                         continue;
                     };
                     let request = self.request("queue.edit");
-                    let (server, library) = (&self.server, Some(&self.library));
+                    let (server, library): (_, Option<&dyn Catalog>) =
+                        (&self.server, Some(&self.library));
                     if matches!(step, Step::Jump(_)) {
                         self.player.jump(request, *entry, server, library).unwrap();
                     } else {

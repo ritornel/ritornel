@@ -253,10 +253,7 @@ fn unreadable(error: &std::io::Error) -> RenderError {
 /// What the file's handle says of it now: its size and time.
 fn facts_of(file: &File) -> Result<FileFacts, RenderError> {
     let metadata = file.metadata().map_err(|error| unreadable(&error))?;
-    Ok(FileFacts {
-        size_bytes: metadata.len(),
-        mtime_ms: crate::walk::mtime_ms(&metadata),
-    })
+    Ok(FileFacts::of(&metadata))
 }
 
 fn changed(path: &Path) -> RenderError {

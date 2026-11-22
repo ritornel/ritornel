@@ -14,9 +14,10 @@ use ritornel_domain::history::{ContextKind, EndReason, StartReason};
 
 use super::{Done, Player, PlayerEvent, Request, Status, Summary, no_library};
 use crate::id::new_ids;
+use crate::playback::catalog::Catalog;
 use crate::playback::queue::{Queue, QueueWrite, Random, Repeat, Where};
 use crate::playback::store::{Change, Entry, Wrote};
-use crate::{Error, Id, LibraryStore, ServerStore};
+use crate::{Error, Id, ServerStore};
 
 /// Where `add` puts what it adds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +196,7 @@ impl Player {
         &mut self,
         reason: StartReason,
         server: &ServerStore,
-        library: &LibraryStore,
+        library: &dyn Catalog,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
         if self.queue.shuffled() && self.queue.len() > 1 {
@@ -268,7 +269,7 @@ impl Player {
 
     /// Reads again what the listener has said of the track the player is
     /// on, after a rating was set. Whether it changed.
-    pub fn said_again(&mut self, library: &LibraryStore) -> Result<bool, Error> {
+    pub fn said_again(&mut self, library: &dyn Catalog) -> Result<bool, Error> {
         let Some(display) = &mut self.display else {
             return Ok(false);
         };
@@ -361,7 +362,7 @@ impl Player {
         request: Request,
         entry: Id,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<Done, Error> {
         if let Some(done) = Self::replayed(server, &request)? {
             return Ok(done);
@@ -393,7 +394,7 @@ impl Player {
         expected: Option<i64>,
         what: AddTracks,
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<Done, Error> {
         if let Some(done) = Self::replayed(server, &request)? {
             return Ok(done);
@@ -481,7 +482,7 @@ impl Player {
         expected: Option<i64>,
         entries: &[Id],
         server: &ServerStore,
-        library: Option<&LibraryStore>,
+        library: Option<&dyn Catalog>,
     ) -> Result<Done, Error> {
         if let Some(done) = Self::replayed(server, &request)? {
             return Ok(done);

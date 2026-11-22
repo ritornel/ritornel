@@ -16,17 +16,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ritornel_client::contract::methods::{
-    LibraryStats, LinkInvite, LinkJoin, LinkStatusCall, RatingsSet, SourcesAdd,
+    LibraryStats, LinkInvite, LinkJoin, LinkStatusCall, PlaybackPlay, QueueWindow, RatingsSet,
+    SourcesAdd,
 };
 use ritornel_client::contract::{
     CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink, LinkInviteParams,
-    LinkJoinParams, LinkRequest, LinkStatus, ListKind, ListOpenParams, NoParams, Query,
-    RatingSetParams, Row, ServerRole, SourcesAddParams, Topic, Window, capability, hex,
-    link_request_proof, route,
+    LinkJoinParams, LinkRequest, LinkStatus, ListKind, ListOpenParams, NoParams, PlaySource,
+    PlaybackPlayParams, PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole,
+    SourcesAddParams, Topic, Window, capability, hex, link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
-use ritornel_server::{HeldDir, Listen, Server};
+use ritornel_server::{Bounds, HeldDir, Listen, Output, PlaybackRun, Run, Server};
 
 /// How long a test may take before it is failed.
 const WAIT: Duration = Duration::from_secs(60);
@@ -72,6 +73,26 @@ async fn start_on(scratch: &Scratch, name: &str, listen: Listen) -> Server {
         listen,
         Arc::new(SystemClock),
         Arc::new(OsEntropy),
+    )
+    .await
+    .unwrap()
+}
+
+/// A server with a player on the null output, a hundred times real time.
+async fn start_playing(scratch: &Scratch, name: &str) -> Server {
+    Server::start_run(
+        HeldDir::take(scratch.data_dir(name)).unwrap(),
+        Listen::on_port(0),
+        Arc::new(SystemClock),
+        Arc::new(OsEntropy),
+        Bounds::default(),
+        Run {
+            playback: PlaybackRun {
+                output: Some(Output::Null { speed: 100 }),
+                ..PlaybackRun::default()
+            },
+            ..Run::default()
+        },
     )
     .await
     .unwrap()
@@ -620,6 +641,140 @@ async fn while_the_hub_is_away_a_satellite_says_so_and_comes_back_with_it() {
         let hub_status = desk_client.status().await.unwrap().hub.unwrap();
         assert_eq!(hub_status.answers, Some(true));
         drop(hub);
+    })
+    .await;
+}
+
+/// A hub with the album scanned, and a satellite with a player linked to
+/// it, with a client of each.
+async fn linked_player(scratch: &Scratch) -> (Server, Client, Server, Client) {
+    let hub = start(scratch, "hub").await;
+    let mut hub_client = client(scratch, "hub", &hub).await;
+    hub_client.create_library(key()).await.unwrap();
+    scan(scratch, &mut hub_client).await;
+    let desk = start_playing(scratch, "desk").await;
+    let desk_client = client(scratch, "desk", &desk).await;
+    join(&desk_client, &invite(&hub, &hub_client).await)
+        .await
+        .unwrap();
+    (hub, hub_client, desk, desk_client)
+}
+
+/// Plays `source` on the satellite and waits until the player has stopped
+/// at the end of it.
+async fn play_to_the_end(client: &mut Client, source: PlaySource) {
+    client.subscribe(&[Topic::Playback]).await.unwrap();
+    client
+        .call::<PlaybackPlay>(&PlaybackPlayParams {
+            idempotency_key: key(),
+            source,
+            start: None,
+            context: None,
+            shuffle: None,
+        })
+        .await
+        .unwrap();
+    let mut played = false;
+    loop {
+        if let Event::Playback(event) = client.next_event().await.unwrap() {
+            played |= event.state.status == PlaybackStatus::Playing;
+            if played && event.state.status == PlaybackStatus::Stopped {
+                break;
+            }
+        }
+    }
+    client.unsubscribe(&[Topic::Playback]).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_plays_the_hubs_music_from_copies_it_pulls() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, _hub_client, _desk, mut desk_client) = linked_player(&scratch).await;
+        let songs = desk_client.list_open(&songs()).await.unwrap();
+        let ids: Vec<_> = songs
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Song(song) => Some(song.appearance_id),
+                _ => None,
+            })
+            .collect();
+        assert!(!ids.is_empty());
+        play_to_the_end(&mut desk_client, PlaySource::Tracks { ids: ids.clone() }).await;
+
+        // Each master was pulled whole into the satellite's own cache.
+        let kept = std::fs::read_dir(scratch.data_dir("desk").join("cache").join("audio"))
+            .unwrap()
+            .count();
+        assert_eq!(kept, ids.len());
+        // And the queue shows what the hub says of each track.
+        let window = desk_client
+            .call::<QueueWindow>(&QueueWindowParams {
+                offset: 0,
+                limit: None,
+                order: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(window.entries.len(), ids.len());
+        assert!(
+            window
+                .entries
+                .iter()
+                .all(|entry| entry.track.title.is_some() && entry.failed_reason.is_none()),
+            "{window:?}"
+        );
+
+        // An album, and a view held at the hub, play as well.
+        let Row::Song(song) = &songs.rows[0] else {
+            panic!("not a song")
+        };
+        play_to_the_end(
+            &mut desk_client,
+            PlaySource::Release {
+                id: song.release_id.unwrap(),
+            },
+        )
+        .await;
+        play_to_the_end(&mut desk_client, PlaySource::View { view: songs.view }).await;
+        // A view of albums is not a list of songs, there as here.
+        let albums = desk_client
+            .list_open(&ListOpenParams {
+                kind: ListKind::Albums,
+                ..self::songs()
+            })
+            .await
+            .unwrap();
+        let refused = desk_client
+            .call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::View { view: albums.view },
+                start: None,
+                context: None,
+                shuffle: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Invalid), "{refused}");
+
+        // A master is read by a satellite's link session alone: not by a
+        // client of the hub, and not by anyone without a credential.
+        let path = format!(
+            "{}/{}/{}/1",
+            route::AUDIO,
+            song.appearance_id,
+            song.appearance_id
+        );
+        let token = std::fs::read_to_string(scratch.data_dir("hub").join("credential")).unwrap();
+        let local = ritornel_client::get(hub.endpoint(), &path, Some(&Credential::new(token)))
+            .await
+            .unwrap();
+        assert_eq!(local.status, 403);
+        let stranger = ritornel_client::get(hub.endpoint(), &path, None)
+            .await
+            .unwrap();
+        assert_eq!(stranger.status, 401);
     })
     .await;
 }

@@ -488,6 +488,17 @@ methods! {
     /// satellites, if it is a hub.
     LinkStatusCall: "link.status", Query, needs_full: true,
     NoParams => LinkStatus;
+
+    /// `link.tracks`: on a hub, what a satellite's player reads of the
+    /// library: what tracks show, a release's tracks in order, and whom a
+    /// player plays for.
+    LinkTracksCall: "link.tracks", Query, needs_full: true,
+    LinkTracksParams => LinkTracks;
+
+    /// `link.copies`: on a hub, the masters of a track, best first, for a
+    /// satellite to fetch and play.
+    LinkCopiesCall: "link.copies", Query, needs_full: true,
+    LinkCopiesParams => LinkCopies;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -570,7 +581,9 @@ mod tests {
                 "record.dismiss",
                 "link.invite",
                 "link.join",
-                "link.status"
+                "link.status",
+                "link.tracks",
+                "link.copies"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -616,7 +629,9 @@ mod tests {
                 "record.dismiss",
                 "link.invite",
                 "link.join",
-                "link.status"
+                "link.status",
+                "link.tracks",
+                "link.copies"
             ]
         );
         // Everything but reading the library and controlling playback

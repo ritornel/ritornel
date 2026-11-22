@@ -128,6 +128,8 @@ export const METHODS = {
   "link.invite": { kind: "session", needsFull: true },
   "link.join": { kind: "command", needsFull: true },
   "link.status": { kind: "query", needsFull: true },
+  "link.tracks": { kind: "query", needsFull: true },
+  "link.copies": { kind: "query", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -201,6 +203,8 @@ export type MethodMap = {
   "link.invite": { params: LinkInviteParams; result: LinkInvite };
   "link.join": { params: LinkJoinParams; result: LinkStatus };
   "link.status": { params: NoParams; result: LinkStatus };
+  "link.tracks": { params: LinkTracksParams; result: LinkTracks };
+  "link.copies": { params: LinkCopiesParams; result: LinkCopies };
 };
 
 /** The name of a method. */
@@ -1454,6 +1458,36 @@ export type HistoryStream = {
 };
 
 /**
+ * One master a hub holds of a track.
+ */
+export type HubCopy = {
+  /**
+   * The master's source item: what a listen names.
+   */
+  sourceItemId: string,
+  /**
+   * The revision of it the scan last read.
+   */
+  revision: number,
+  /**
+   * The audio asset it plays as.
+   */
+  assetId: string,
+  /**
+   * Its length, as the scan read it. 0 when unknown.
+   */
+  durationMs: number,
+  /**
+   * Its size in bytes.
+   */
+  sizeBytes: number,
+  /**
+   * The file's extension, in lower case, which a decoder may go by.
+   */
+  extension: string,
+};
+
+/**
  * A satellite's hub, as the satellite knows it.
  */
 export type HubStatus = {
@@ -2175,6 +2209,28 @@ export type Limits = {
 };
 
 /**
+ * The result of `link.copies`: the masters of a track the hub holds, best
+ * first, each fetched from `GET /v1/audio/{appearanceId}/{sourceItemId}/
+ * {revision}`.
+ */
+export type LinkCopies = {
+  /**
+   * The copies, best first.
+   */
+  copies: Array<HubCopy>,
+};
+
+/**
+ * The params of `link.copies`.
+ */
+export type LinkCopiesParams = {
+  /**
+   * The track appearance.
+   */
+  appearance: string,
+};
+
+/**
  * The result of `link.invite`.
  */
 export type LinkInvite = {
@@ -2231,6 +2287,42 @@ export type LinkStatus = {
    * On a hub, the satellites linked to it, oldest first.
    */
   satellites: Array<SatelliteStatus>,
+};
+
+/**
+ * The result of `link.tracks`: what a satellite's player reads of the
+ * library.
+ */
+export type LinkTracks = {
+  /**
+   * Each appearance asked for, in order: `null` for one the library
+   * does not have.
+   */
+  tracks: Array<TrackSummary | null>,
+  /**
+   * The release's tracks, when one was asked for and the library has
+   * it.
+   */
+  release?: Array<TrackSummary>,
+  /**
+   * The library's first listener: whom a new player plays for.
+   */
+  listener?: string,
+};
+
+/**
+ * The params of `link.tracks`.
+ */
+export type LinkTracksParams = {
+  /**
+   * Track appearances, each answered in its place.
+   */
+  appearances: Array<string>,
+  /**
+   * A release, whose tracks are answered after them, in disc and track
+   * order.
+   */
+  release?: string,
 };
 
 /**
