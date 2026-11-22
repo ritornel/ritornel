@@ -167,17 +167,20 @@ struct View {
 
 impl View {
     fn fail(&mut self) {
+        self.hits.clear();
+        self.selected = 0;
         self.settled = true;
         self.failed = true;
         self.waiting = false;
     }
 
     fn start(&mut self, text: String) {
-        *self = Self {
-            text,
-            open: true,
-            ..Self::default()
-        };
+        self.text = text;
+        self.open = true;
+        self.selected = 0;
+        self.settled = false;
+        self.failed = false;
+        self.waiting = false;
     }
 }
 
@@ -381,6 +384,9 @@ impl SearchBox {
 
     /// The arrows: moves the choice, staying within the results.
     fn move_by(&mut self, by: i32, cx: &mut Context<Self>) {
+        if !self.view.settled {
+            return;
+        }
         let Some(last) = self.view.hits.len().checked_sub(1) else {
             return;
         };
@@ -542,7 +548,8 @@ impl SearchBox {
     /// The dropdown: a raised card 440 points wide at the field's right
     /// edge, its rows 50 points with a 36-point picture in each.
     fn dropdown(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.view.open || !(self.view.settled || !self.view.hits.is_empty()) {
+        if !self.view.open || (!self.view.settled && self.view.hits.is_empty()) {
+            self.drop_bounds.set(None);
             return None;
         }
         let size = window.viewport_size();
@@ -630,13 +637,14 @@ impl SearchBox {
     ) -> AnyElement {
         let (title, sub, art, key, round) = Self::shown(hit);
         let asked = self.asked;
-        let lit = index == self.view.selected;
+        let settled = self.view.settled;
+        let lit = settled && index == self.view.selected;
         let picture = art.and_then(|art| self.pictures.get(&art));
         let scale = window.scale_factor();
         let soft = (art.is_none())
             .then(|| theme::soft_cached(&format!("{title}{sub}"), (36. * scale).ceil() as u32));
         let song = matches!(hit, Hit::Song(_));
-        let playing = self.hovered_song == Some(index) && song;
+        let playing = settled && self.hovered_song == Some(index) && song;
         let arts = Rc::clone(&self.arts);
         let radius = if round { 18. } else { 6. };
         let mut face = div()
@@ -712,19 +720,24 @@ impl SearchBox {
             .items_center()
             .gap(px(12.))
             .when(lit, |row| row.bg(theme::fill()))
-            .on_mouse_move(cx.listener(move |search, _, _, cx| {
-                let hovered = song.then_some(index);
-                if search.view.selected != index || search.hovered_song != hovered {
-                    search.view.selected = index;
-                    search.hovered_song = hovered;
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(move |search, _, _, cx| {
-                if search.asked == asked {
-                    search.pick(index, cx);
-                }
-            }))
+            .when(settled, |row| {
+                row.on_mouse_move(cx.listener(move |search, _, _, cx| {
+                    if search.asked != asked {
+                        return;
+                    }
+                    let hovered = song.then_some(index);
+                    if search.view.selected != index || search.hovered_song != hovered {
+                        search.view.selected = index;
+                        search.hovered_song = hovered;
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(move |search, _, _, cx| {
+                    if search.asked == asked {
+                        search.pick(index, cx);
+                    }
+                }))
+            })
             .child(face)
             .child(
                 div()
@@ -856,7 +869,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_new_query_starts_without_a_selection_or_hits() {
+    fn previous_hits_stay_visible_until_the_next_search_fails() {
         let mut view = View {
             text: "Harbour".to_owned(),
             hits: vec![Hit::Artist(ArtistRow {
@@ -873,7 +886,7 @@ mod tests {
             ..View::default()
         };
         view.start("North".to_owned());
-        assert!(view.hits.is_empty());
+        assert_eq!(view.hits.len(), 1);
         assert_eq!(view.selected, 0);
         assert!(!view.settled);
         view.waiting = true;

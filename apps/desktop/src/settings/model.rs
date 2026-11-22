@@ -166,7 +166,7 @@ fn scanned(job: &Job) -> Option<Id> {
 }
 
 /// A start reply and a jobs list can both arrive after a newer event.
-fn keep_scan(scans: &mut HashMap<Id, Job>, source: Id, job: Job) {
+fn keep_scan(scans: &mut HashMap<Id, Job>, source: Id, job: Job, previous: Option<Id>) {
     let progress = |job: &Job| {
         let phase = match job.state {
             JobState::Queued => 0,
@@ -174,21 +174,32 @@ fn keep_scan(scans: &mut HashMap<Id, Job>, source: Id, job: Job) {
             JobState::Cancelling => 2,
             _ => 3,
         };
-        (job.created_at, job.job_id, phase, job.done, job.bytes)
+        (phase, job.done, job.bytes, job.skipped, job.failed)
     };
-    if scans
-        .get(&source)
-        .is_none_or(|kept| progress(&job) >= progress(kept))
-    {
-        scans.insert(source, job);
+    if let Some(kept) = scans.get(&source) {
+        if job.job_id == kept.job_id {
+            if progress(&job) < progress(kept) {
+                return;
+            }
+        } else if job.created_at < kept.created_at
+            || (job.created_at == kept.created_at && previous != Some(kept.job_id))
+        {
+            return;
+        }
     }
+    scans.insert(source, job);
 }
 
 impl Model {
     /// Starts reading from the app's connection, now and each time it connects again.
     pub(crate) fn new(link: Entity<Link>, quiet: bool, cx: &mut Context<Self>) -> Self {
         let followed = cx.subscribe(&link, |model, _, event: &LinkEvent, cx| match event {
-            LinkEvent::Connected(_) => model.read_all(cx),
+            LinkEvent::Connected(_) => {
+                model.scans.clear();
+                model.busy.clear();
+                model.read_all(cx);
+                cx.notify();
+            }
             LinkEvent::Server(Event::Jobs(event)) => model.heard_job(event.job.clone(), cx),
             LinkEvent::Away | LinkEvent::Server(_) => cx.notify(),
         });
@@ -252,18 +263,28 @@ impl Model {
         F: Future<Output = Result<T, Error>> + 'static,
     {
         let Some(net) = self.net(cx) else { return };
-        let work = work(net);
+        let work = work(Arc::clone(&net));
         cx.spawn(async move |model, cx| {
             let found = work.await;
             let _ = model.update(cx, |model, cx| {
-                then(model, found, cx);
-                cx.notify();
+                if model
+                    .net(cx)
+                    .is_some_and(|current| Arc::ptr_eq(&net, &current))
+                {
+                    then(model, found, cx);
+                    cx.notify();
+                }
             });
         })
         .detach();
     }
 
     pub(crate) fn read_sources(&mut self, cx: &mut Context<Self>) {
+        let previous: HashMap<_, _> = self
+            .scans
+            .iter()
+            .map(|(id, job)| (*id, job.job_id))
+            .collect();
         self.reading(
             cx,
             |net| {
@@ -273,13 +294,21 @@ impl Model {
                 );
                 async move { Ok((sources.await?, jobs.await?)) }
             },
-            |model, found, _| match found {
+            move |model, found, _| match found {
                 Ok((sources, jobs)) => {
                     model.sources = Some(sources.sources);
                     // Newest first: the first scan of each source is its last.
-                    for job in jobs.jobs.into_iter().rev() {
-                        if let Some(source) = scanned(&job) {
-                            keep_scan(&mut model.scans, source, job);
+                    let mut seen = HashSet::new();
+                    for job in jobs.jobs {
+                        if let Some(source) = scanned(&job)
+                            && seen.insert(source)
+                        {
+                            keep_scan(
+                                &mut model.scans,
+                                source,
+                                job,
+                                previous.get(&source).copied(),
+                            );
                         }
                     }
                 }
@@ -344,14 +373,11 @@ impl Model {
 
     fn heard_job(&mut self, job: Job, cx: &mut Context<Self>) {
         if let Some(source) = scanned(&job) {
-            let was_running = self.scans.get(&source).is_some_and(|was| !is_ended(was));
+            let previous = self.scans.get(&source).map(|kept| kept.job_id);
             let ended = is_ended(&job);
-            keep_scan(&mut self.scans, source, job);
-            if ended && was_running {
-                self.read_sources(cx);
-            }
-            // A rescan the server started on its own shows in the status.
+            keep_scan(&mut self.scans, source, job, previous);
             if ended {
+                self.read_sources(cx);
                 self.read_status(cx);
             }
         } else if job.kind == SYNC_JOB && is_ended(&job) {
@@ -386,11 +412,17 @@ impl Model {
         self.busy.insert(busy);
         self.problems.remove(&group);
         cx.notify();
-        let work = work(net);
+        let work = work(Arc::clone(&net));
         cx.spawn(async move |model, cx| {
             let found = work.await;
             model
                 .update(cx, |model, cx| {
+                    if model
+                        .net(cx)
+                        .is_none_or(|current| !Arc::ptr_eq(&net, &current))
+                    {
+                        return false;
+                    }
                     model.busy.remove(&busy);
                     cx.notify();
                     match found {
@@ -421,6 +453,7 @@ impl Model {
             .map(|source| source.source_id)
             .collect();
         for source_id in here {
+            let previous = self.scans.get(&source_id).map(|job| job.job_id);
             self.reading(
                 cx,
                 |net| async move {
@@ -432,7 +465,7 @@ impl Model {
                 },
                 move |model, started, _| match started {
                     Ok(started) => {
-                        keep_scan(&mut model.scans, source_id, started.job);
+                        keep_scan(&mut model.scans, source_id, started.job, previous);
                     }
                     Err(error) => {
                         model.problems.insert(Group::Library, trouble(&error));
@@ -527,8 +560,11 @@ impl Model {
                 Ok((added, started.job))
             },
             |model, (source, job), _| {
-                keep_scan(&mut model.scans, source.source_id, job);
-                model.sources.get_or_insert_with(Vec::new).push(source);
+                keep_scan(&mut model.scans, source.source_id, job, None);
+                let sources = model.sources.get_or_insert_with(Vec::new);
+                if !sources.iter().any(|row| row.source_id == source.source_id) {
+                    sources.push(source);
+                }
             },
         )
     }
@@ -892,14 +928,24 @@ mod tests {
         let mut scans = HashMap::new();
         let mut done = queued.clone();
         done.state = JobState::Succeeded;
-        keep_scan(&mut scans, id, done);
-        keep_scan(&mut scans, id, queued.clone());
+        keep_scan(&mut scans, id, done, None);
+        keep_scan(&mut scans, id, queued.clone(), None);
         assert!(scans.get(&id).is_some_and(is_ended));
-        let mut next = queued;
+        let mut next = queued.clone();
         next.job_id = Id::from_bytes([2; 16]);
-        next.created_at += 1;
-        keep_scan(&mut scans, id, next);
-        assert!(scans.get(&id).is_some_and(|job| !is_ended(job)));
+        keep_scan(&mut scans, id, next.clone(), Some(id));
+        keep_scan(&mut scans, id, queued, Some(id));
+        assert_eq!(scans.get(&id), Some(&next));
+
+        let mut running = next.clone();
+        running.state = JobState::Running;
+        running.skipped = 4;
+        running.failed = 1;
+        keep_scan(&mut scans, id, running.clone(), None);
+        let mut late = running.clone();
+        late.failed = 0;
+        keep_scan(&mut scans, id, late, None);
+        assert_eq!(scans.get(&id), Some(&running));
         Ok(())
     }
 }

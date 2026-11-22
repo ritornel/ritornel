@@ -137,8 +137,7 @@ pub(crate) struct Album {
     /// The display's scale the large cover and the face were read for: on
     /// another display they are read again, sharp there.
     pictured_scale: f32,
-    /// The last read of the large cover and of the face asked for: an
-    /// earlier one coming late, for another display, is let go.
+    /// Each picture retries separately and ignores replies for old artwork or scales.
     large_read: PictureRead,
     face_read: PictureRead,
     blur_read: PictureRead,
@@ -599,8 +598,7 @@ impl Album {
         }
     }
 
-    /// The face of a record with no cover: its soft colours. A read of a
-    /// face still to come is let go.
+    /// Shows the record's soft colours until a cover is available.
     fn soft_face(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let face = theme::soft_cached(&self.soft_name(), (28. * self.pictured_scale).ceil() as u32);
         if let Some(old) = self.face.replace(face) {
