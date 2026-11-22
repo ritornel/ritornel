@@ -1374,7 +1374,7 @@ impl Churn {
                     for appearance in appearances {
                         connection.execute(
                             "UPDATE search_text SET album = ?1 WHERE rowid = ?2",
-                            (crate::list::fold::fold(&title), appearance),
+                            (crate::list::fold::fold(title), appearance),
                         )?;
                     }
                 }
