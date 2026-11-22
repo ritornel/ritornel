@@ -90,7 +90,7 @@ pub(crate) struct PlayerBar {
     retries: crate::covers::Retries,
     /// When the song playing changed, for its cover to settle into place.
     arrived: Option<(Id, Instant)>,
-    /// Where the pointer holds the seek bar, from 0 to 1, while it does.
+    /// The entry and position held by the pointer.
     held: Option<SeekDrag>,
     /// Where the seek bar is, as last drawn.
     seek_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,

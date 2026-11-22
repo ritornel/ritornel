@@ -584,10 +584,7 @@ impl LeanBack {
         matches!(self.stage, Stage::Open)
     }
 
-    /// Follows the player: a new song is read at once; a new record starts
-    /// again from its first fact, and shows none of the last record's
-    /// meanwhile. What plays next is read again when the queue moves.
-    /// Nothing left to play, nothing to lean back on.
+    /// A new song gets its own facts. A new record starts at the first one.
     fn follow(&mut self, cx: &mut Context<Self>) {
         let player = self.player.read(cx);
         let Some(state) = player.state.clone() else {

@@ -143,29 +143,53 @@ fn said(error: &Error) -> Option<&'static str> {
     })
 }
 
-/// Edits still waiting for their reply, keyed by recording.
+/// Pending clicks take precedence over a receipt, then the stars in the row.
 #[derive(Default)]
-struct PendingRatings(HashMap<Id, (Id, Option<u32>)>);
+struct Ratings {
+    pending: HashMap<Id, (Id, Option<u32>)>,
+    confirmed: Option<(Id, Option<u32>)>,
+    revision: u64,
+}
 
-impl PendingRatings {
+impl Ratings {
     fn start(&mut self, recording: Id, key: Id, rating: Option<u32>) {
-        self.0.insert(recording, (key, rating));
+        self.pending.insert(recording, (key, rating));
     }
 
     fn own(&self, recording: Id, saved: Option<u32>) -> Option<u32> {
-        self.0.get(&recording).map_or(saved, |(_, rating)| *rating)
+        if let Some((_, rating)) = self.pending.get(&recording) {
+            return *rating;
+        }
+        self.confirmed
+            .filter(|(id, _)| *id == recording)
+            .map_or(saved, |(_, rating)| rating)
     }
 
     fn finish(&mut self, recording: Id, key: Id) -> bool {
         if self
-            .0
+            .pending
             .get(&recording)
             .is_some_and(|(pending, _)| *pending == key)
         {
-            self.0.remove(&recording);
+            self.pending.remove(&recording);
             true
         } else {
             false
+        }
+    }
+
+    /// The receipt can arrive on either side of its own library event.
+    fn confirmed(&mut self, recording: Id, rating: Option<u32>, revision: u64) {
+        if revision >= self.revision {
+            self.revision = revision;
+            self.confirmed = Some((recording, rating));
+        }
+    }
+
+    fn changed(&mut self, revision: u64) {
+        if revision > self.revision {
+            self.revision = revision;
+            self.confirmed = None;
         }
     }
 }
@@ -191,7 +215,7 @@ pub(crate) struct Player {
     /// they have been moving: they hold while it is paused.
     eq_base: f32,
     eq_since: Option<Instant>,
-    rated: PendingRatings,
+    rated: Ratings,
     /// What is being said, and since when.
     pub toast: Option<(SharedString, Instant)>,
     toast_ends: Option<Task<()>>,
@@ -209,13 +233,13 @@ impl Player {
         let followed = cx.subscribe(link, |player, _, event: &LinkEvent, cx| match event {
             LinkEvent::Connected(net) => {
                 player.state = None;
-                player.rated = PendingRatings::default();
+                player.rated = Ratings::default();
                 player.net = Some(Arc::clone(net));
                 player.read(cx);
             }
             LinkEvent::Away => {
                 player.net = None;
-                player.rated = PendingRatings::default();
+                player.rated = Ratings::default();
                 player.state = None;
                 player.tick.playing = false;
                 player.ticker = None;
@@ -228,13 +252,16 @@ impl Player {
                 player.ticked(event, cx);
             }
             LinkEvent::Server(ritornel_contract::Event::Library(event))
-                if player.open
-                    && (event.changed.is_empty()
-                        || event
-                            .changed
-                            .contains(&ritornel_contract::LibraryChange::Ratings)) =>
+                if event.changed.is_empty()
+                    || event
+                        .changed
+                        .contains(&ritornel_contract::LibraryChange::Ratings) =>
             {
-                player.read_up_next(cx);
+                player.rated.changed(event.library_revision);
+                if player.open {
+                    player.read_up_next(cx);
+                }
+                cx.notify();
             }
             LinkEvent::Server(ritornel_contract::Event::Queue(_)) => {
                 if player.open {
@@ -254,7 +281,7 @@ impl Player {
             ticker: None,
             eq_base: 0.,
             eq_since: None,
-            rated: PendingRatings::default(),
+            rated: Ratings::default(),
             toast: None,
             toast_ends: None,
             up_next: None,
@@ -744,6 +771,7 @@ impl Player {
     /// Sets a recording's stars, or takes them away with `None`.
     pub(crate) fn rate(&mut self, recording: Id, rating: Option<u32>, cx: &mut Context<Self>) {
         let Some(key) = self.key(cx) else { return };
+        let session = self.net.clone();
         self.rated.start(recording, key, rating);
         cx.notify();
         let sent = self.send::<RatingsSet>(
@@ -755,14 +783,24 @@ impl Player {
             cx,
         );
         cx.spawn(async move |this, cx| {
-            let failed = sent.await.is_none();
+            let answer = sent.await;
             this.update(cx, |player, cx| {
-                if player.rated.finish(recording, key) {
-                    if failed {
-                        player.say("The stars could not be saved", cx);
+                let current_edit = player.rated.finish(recording, key);
+                if let Some(set) = answer {
+                    if session
+                        .as_ref()
+                        .zip(player.net.as_ref())
+                        .is_some_and(|(from, current)| Arc::ptr_eq(from, current))
+                        && let Some(revision) = set.receipt.revision
+                    {
+                        player
+                            .rated
+                            .confirmed(set.recording_id, set.rating, revision);
                     }
-                    cx.notify();
+                } else if current_edit {
+                    player.say("The stars could not be saved", cx);
                 }
+                cx.notify();
             })
             .ok();
         })
@@ -936,13 +974,33 @@ mod tests {
     #[test]
     fn rating_replies_only_retire_their_own_edit() {
         let [song, first, second] = [1, 2, 3].map(|n| Id::from_bytes([n; 16]));
-        let mut ratings = PendingRatings::default();
+        let mut ratings = Ratings::default();
         ratings.start(song, first, Some(80));
         ratings.start(song, second, None);
         assert!(!ratings.finish(song, first));
         assert_eq!(ratings.own(song, Some(40)), None);
         assert!(ratings.finish(song, second));
         assert_eq!(ratings.own(song, Some(40)), Some(40));
+    }
+
+    #[test]
+    fn a_receipt_bridges_the_row_refresh_until_a_newer_rating_change() {
+        let [song, edit] = [1, 2].map(|n| Id::from_bytes([n; 16]));
+        for event_first in [true, false] {
+            let mut ratings = Ratings::default();
+            ratings.start(song, edit, Some(80));
+            if event_first {
+                ratings.changed(5);
+            }
+            assert!(ratings.finish(song, edit));
+            ratings.confirmed(song, Some(80), 5);
+            ratings.changed(5);
+            assert_eq!(ratings.own(song, Some(20)), Some(80));
+            assert_eq!(clicked(4, ratings.own(song, Some(20))), None);
+            ratings.changed(6);
+            ratings.confirmed(song, Some(80), 5);
+            assert_eq!(ratings.own(song, Some(40)), Some(40));
+        }
     }
 
     #[test]
