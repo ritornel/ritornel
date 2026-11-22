@@ -107,9 +107,11 @@ pub(crate) enum Page {
         from: Option<Came>,
         _events: Subscription,
     },
-    /// An artist's page.
+    /// An artist's page, and whether it was opened from their tile on the
+    /// wall, for their picture to travel back to.
     Artist {
         artist: Entity<Artist>,
+        from_wall: bool,
         _events: Subscription,
     },
     /// History: the picture of your listening life.
@@ -565,6 +567,9 @@ impl Shell {
         let album_ref = match row.subject {
             crate::wall::Subject::Album(album) => album,
             crate::wall::Subject::Artist(artist) => {
+                // An artist with no picture, only their initial, has nothing
+                // to carry: their tile stays as it is.
+                let flight = flight.filter(|_| row.art.is_some());
                 self.open_artist_from(artist, row.title.clone(), small, flight, window, cx);
                 return;
             }
@@ -753,6 +758,13 @@ impl Shell {
         let left = self.shown();
         let left_top = left.top(cx);
         let carried = self.carry_cover_from(&left, cx);
+        let from_wall = matches!(
+            &takeoff,
+            Some(Takeoff {
+                came: Came::Wall(_),
+                ..
+            })
+        );
         let flies = match takeoff {
             Some(Takeoff {
                 came: Came::Wall(index),
@@ -781,6 +793,7 @@ impl Shell {
         };
         self.pages.go(Page::Artist {
             artist: page,
+            from_wall,
             _events: events,
         });
         if !flies {
@@ -805,11 +818,23 @@ impl Shell {
     /// Back to the wall from an artist's page, their portrait travels to
     /// their circle on the wall, the circle coming in over it on the way:
     /// when the portrait is shown, the banner whole, and their tile read.
-    fn carry_portrait_home(&mut self, left: &Shown, cx: &mut Context<Self>) -> bool {
+    fn carry_portrait_home(
+        &mut self,
+        left: &Shown,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Shown::Artist(page) = left else {
             return false;
         };
-        if crate::platform::reduce_motion() {
+        let from_wall = matches!(
+            self.pages.current(),
+            Page::Artist {
+                from_wall: true,
+                ..
+            }
+        );
+        if crate::platform::reduce_motion() || !from_wall {
             return false;
         }
         let (artist, top, portrait) = {
@@ -819,8 +844,14 @@ impl Shell {
         let Some(portrait) = portrait.filter(|_| top < 8.) else {
             return false;
         };
+        // Only to a tile that can be seen where the wall was left.
+        let bottom = f32::from(window.viewport_size().height) - PLAYER_BAR;
         let found = self.wall.update(cx, |wall, _| {
             let index = wall.index_of(artist)?;
+            let tile = wall.art_bounds(index)?;
+            if !moves::seen(tile, TITLE_BAR, bottom) {
+                return None;
+            }
             let row = wall.row(index)?;
             let image = row.art.and_then(|art| wall.covers.image(art));
             let ground = row
@@ -1088,7 +1119,7 @@ impl Shell {
     /// Back: the page before, exactly as it was left. From an album, its
     /// cover travels home: to its tile on the wall, or its record on the
     /// page before.
-    pub(crate) fn back(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Out of Lean back, while it is open.
         if self.close_lean(cx) {
             return;
@@ -1103,7 +1134,7 @@ impl Shell {
         let leaving_artist = self.artist_page().map(|page| page.read(cx).artist_id);
         let back_to_wall = matches!(self.pages.previous(), Some(Page::Library));
         let mut carried = self.carry_cover_from(&left, cx);
-        let flies_home = back_to_wall && self.carry_portrait_home(&left, cx);
+        let flies_home = back_to_wall && self.carry_portrait_home(&left, window, cx);
         self.pages.back();
         // Back on the wall from an artist's page, theirs settles into place,
         // unless their picture flies home to it.
@@ -1629,7 +1660,20 @@ impl Render for Shell {
         let mut flying: Option<AnyElement> = None;
         let settled = self.arrival.settled_at();
         let mut done = false;
+        // Where it is going, read again each frame: the wall lays itself out
+        // again on the frame it comes back, after the cover was aimed, and
+        // a window resized meanwhile moves the banner's picture.
+        let retarget = match self.carry.as_ref().map(|carry| &carry.target) {
+            Some(Target::Wall(index)) => self.wall.read(cx).art_bounds(*index),
+            Some(Target::Portrait(_)) => Some(Self::portrait_bounds(width, 0.)),
+            _ => None,
+        };
         if let Some(carry) = &mut self.carry {
+            if let (Some(bounds), Phase::Flying { to, .. } | Phase::Holding { to }) =
+                (retarget, &mut carry.phase)
+            {
+                *to = bounds;
+            }
             carry.frames.push(now);
             animating = true;
             let (bounds, opacity, ended) = moves::flight_at(carry.phase, carry.from, now);
@@ -1678,11 +1722,18 @@ impl Render for Shell {
                             ))
                             .children(image.map(|image| img(image).size(px(d)).rounded_full()))
                     } else {
+                        // At its own shape, as tall as the box and centred
+                        // across it, as the round one is.
+                        let shape = image.as_ref().map_or(w / h.max(1.), |image| {
+                            let size = image.size(0);
+                            size.width.0.max(1) as f32 / size.height.0.max(1) as f32
+                        });
+                        let across = h * shape;
                         div()
                             .absolute()
                             .top_0()
-                            .left_0()
-                            .w(px(w))
+                            .left(px((w - across) / 2.))
+                            .w(px(across))
                             .h(px(h))
                             .opacity(shown)
                             .children(image.map(|image| {
@@ -1890,8 +1941,10 @@ impl Render for Shell {
                     .child(div().flex_1().min_h_0().child(content))
                     .child(self.bar.clone()),
             )
-            .children(card)
+            // A picture on its way goes under Up next's card, as the banner's
+            // picture it lands on or leaves does.
             .children(flying)
+            .children(card)
             .children(self.lean.as_ref().map(|(lean, _)| lean.clone()))
             .children(toast)
             .children(crate::drawn::layer(window, cx))

@@ -196,6 +196,9 @@ pub(crate) struct Artist {
     melted: Option<((u32, u32), Arc<RenderImage>, Instant)>,
     /// Whether the portrait is away while a copy of it travels.
     pub portrait_away: bool,
+    /// Whether the banner's picture could not be read: then there is none
+    /// to wait for, or to land on.
+    picture_failed: bool,
     /// Whether a portrait is being made now: one at a time.
     melting: bool,
     /// The size its box has now, in device pixels: what is made next.
@@ -265,6 +268,7 @@ impl Artist {
             melted: None,
             melting: false,
             portrait_away: false,
+            picture_failed: false,
             wanted: None,
             blur: None,
             banner_blur: None,
@@ -524,6 +528,7 @@ impl Artist {
         self.pictured_for = Some((art, wants_portrait));
         // A portrait of another picture, or of none, is not kept meanwhile.
         self.forget_portrait(Some(window), cx);
+        self.picture_failed = false;
         let scale = window.scale_factor();
         let (width, viewport) = viewport_of(window);
         let banner_radius = crate::blur::radius(crate::blur::BANNER.0, width + 120.);
@@ -552,18 +557,20 @@ impl Artist {
             });
             self.fetches.push(read.abort_handle());
             cx.spawn(async move |this, cx| {
-                if let Ok(Some(source)) = read.await {
-                    this.update(cx, |page, cx| {
-                        // Too late: the page shows another picture now.
-                        if page.pictured_for.map(|(at, _)| at) != Some(Some(art)) {
-                            return;
-                        }
-                        page.forget_portrait(None, cx);
-                        page.portrait = Some(Arc::new(source));
-                        cx.notify();
-                    })
-                    .ok();
-                }
+                let source = read.await.ok().flatten();
+                this.update(cx, |page, cx| {
+                    // Too late: the page shows another picture now.
+                    if page.pictured_for.map(|(at, _)| at) != Some(Some(art)) {
+                        return;
+                    }
+                    page.forget_portrait(None, cx);
+                    match source {
+                        Some(source) => page.portrait = Some(Arc::new(source)),
+                        None => page.picture_failed = true,
+                    }
+                    cx.notify();
+                })
+                .ok();
             })
             .detach();
         }
@@ -634,7 +641,7 @@ impl Artist {
     pub(crate) fn ready(&self) -> bool {
         self.page.as_ref().is_some_and(|page| {
             (page.artist.art_id.is_none() || self.blur.is_some())
-                && (page.artist.art_id.is_none() || self.melted.is_some())
+                && (page.artist.art_id.is_none() || self.melted.is_some() || self.picture_failed)
         }) || self.problem
     }
 
@@ -644,6 +651,7 @@ impl Artist {
         self.page
             .as_ref()
             .is_some_and(|page| page.artist.art_id.is_some())
+            && !self.picture_failed
     }
 
     /// The portrait as the banner shows it, once it is made.
