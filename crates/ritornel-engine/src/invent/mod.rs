@@ -654,14 +654,30 @@ impl Rows {
         }
         let (artist, credit) = (self.key("artist"), self.key("artist_credit"));
         let public_id = self.public_id();
+        let match_name = ritornel_domain::normalize::normalize(name);
         statements.artist.execute((
             artist,
             public_id,
             name,
             sort_name,
-            name.to_lowercase(),
+            &match_name,
             write.rev(),
         ))?;
+        if !match_name.is_empty() {
+            write
+                .connection()
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO artist_key
+                       (key_kind, key_value, artist_id, normalizer_version, decision_id, rev)
+                     VALUES ('name', ?1, ?2, ?3, NULL, ?4)",
+                )?
+                .execute((
+                    &match_name,
+                    artist,
+                    ritornel_domain::NORMALIZER_VERSION,
+                    write.rev(),
+                ))?;
+        }
         statements
             .artist_credit
             .execute((credit, name, write.rev()))?;

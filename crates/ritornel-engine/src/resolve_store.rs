@@ -10,8 +10,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ritornel_domain::library::{
-    Current, Evidence, ExistingCredit, ExistingRelease, Item, Kind, Library, Method, Ref,
-    Resolution,
+    ArtistKeyKind, Current, Evidence, ExistingArtistKey, ExistingCredit, ExistingRelease, Item,
+    Kind, Library, Method, Ref, Resolution,
 };
 use ritornel_domain::normalize::normalize;
 use ritornel_domain::{
@@ -47,6 +47,7 @@ type AppearanceShown = (
 #[derive(Debug, Default)]
 pub(crate) struct Shown {
     artists: HashMap<i64, (Text, Text, Text)>,
+    artist_keys: HashMap<(ArtistKeyKind, String), (i64, Option<i64>)>,
     recordings: HashMap<i64, (Text, Option<i64>)>,
     groups: HashMap<i64, GroupShown>,
     releases: HashMap<i64, ReleaseShown>,
@@ -92,50 +93,15 @@ pub(crate) fn rows<T>(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// The ID each artist row is known by: the one the files whose credits
-/// name it claim at its place in the credit, counted only where a file
-/// claims as many IDs as the credit has names, which is when the credit
-/// was made from the IDs. The most claimed wins, then the least.
+/// The MusicBrainz ID each artist row owns in `artist_key`.
 pub(crate) fn artist_mbids(connection: &Connection) -> Result<HashMap<i64, String>, Error> {
-    let mut votes: HashMap<i64, HashMap<String, i64>> = HashMap::new();
-    for (row, mbid, count) in rows(
-        connection,
-        "WITH placed AS (
-           SELECT a.source_item_id AS item, ta.display_artist_credit_id AS credit, 'mb_artist' AS namespace
-           FROM assignment a JOIN track_appearance ta ON ta.id = a.appearance_id
-           WHERE a.superseded_at_ms IS NULL
-           UNION ALL
-           SELECT a.source_item_id, rel.display_artist_credit_id, 'mb_album_artist'
-           FROM assignment a JOIN track_appearance ta ON ta.id = a.appearance_id
-           JOIN release rel ON rel.id = ta.release_id
-           WHERE a.superseded_at_ms IS NULL)
-         SELECT n.artist_id, c.value, count(*)
-         FROM placed p
-         JOIN artist_credit_name n ON n.artist_credit_id = p.credit
-         JOIN identifier_claim c ON c.source_item_id = p.item AND c.namespace = p.namespace
-              AND c.ordinal = n.position
-         WHERE (SELECT count(*) FROM identifier_claim o
-                WHERE o.source_item_id = p.item AND o.namespace = p.namespace)
-             = (SELECT count(*) FROM artist_credit_name o WHERE o.artist_credit_id = p.credit)
-         GROUP BY 1, 2",
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        },
-    )? {
-        votes.entry(row).or_default().insert(mbid, count);
-    }
     let mut mbids = HashMap::new();
-    for (row, counted) in votes {
-        if let Some((mbid, _)) = counted
-            .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-        {
-            mbids.insert(row, mbid);
-        }
+    for (artist, mbid) in rows(
+        connection,
+        "SELECT artist_id, key_value FROM artist_key WHERE key_kind = 'mbid' ORDER BY id",
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+    )? {
+        mbids.entry(artist).or_insert(mbid);
     }
     Ok(mbids)
 }
@@ -370,10 +336,10 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
         library.groups.insert(id, preferred);
         shown.groups.insert(id, display);
     }
-    // A row is found by the key the normaliser made of its names. When the
-    // library was last resolved by another normaliser, the stored keys are
-    // that one's, and the resolver looks rows up by them instead, or an
-    // artist with no ID would take a new row and a new public ID.
+    // A row is found by its durable key in `artist_key`. When the library was
+    // last resolved by another normaliser, stored name keys from that version
+    // are migrated through `artist_keys_by` so an artist with no ID keeps its
+    // row and public ID.
     library.artist_keys_by = connection
         .query_row(
             "SELECT json_extract(value_json, '$.normalizer') FROM library_setting WHERE key = ?1",
@@ -383,27 +349,48 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
         .optional()?
         .flatten()
         .filter(|stored| *stored != NORMALIZER_VERSION);
-    for (id, redirected, name, sort, match_name) in rows(
+    for (id, canonical, name, sort, match_name) in rows(
         connection,
-        "SELECT id, redirect_to_id IS NOT NULL, display_name, display_sort_name, match_name
+        "SELECT id, canonical_id, display_name, display_sort_name, match_name
          FROM artist ORDER BY id",
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, bool>(1)?,
+                row.get::<_, i64>(1)?,
                 row.get::<_, Text>(2)?,
                 row.get::<_, Text>(3)?,
                 row.get::<_, Text>(4)?,
             ))
         },
     )? {
-        // A row given no key is still found by its ID.
-        if !redirected {
-            library
-                .artists
-                .push((id, match_name.clone().unwrap_or_default()));
+        if canonical != id {
+            library.artist_canonical.insert(id, canonical);
         }
         shown.artists.insert(id, (name, sort, match_name));
+    }
+    for (kind, value, artist, normalizer_version) in rows(
+        connection,
+        "SELECT key_kind, key_value, artist_id, normalizer_version
+         FROM artist_key ORDER BY id",
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        },
+    )? {
+        let kind = ArtistKeyKind::parse(&kind).ok_or(Error::Corrupt("an artist key's kind"))?;
+        shown
+            .artist_keys
+            .insert((kind, value.clone()), (artist, normalizer_version));
+        library.artist_keys.push(ExistingArtistKey {
+            kind,
+            value,
+            artist,
+            normalizer_version,
+        });
     }
     let mut credits: HashMap<i64, ExistingCredit> = HashMap::new();
     for (id, text) in rows(
@@ -439,8 +426,6 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
     }
     library.credits = credits.into_values().collect();
     library.credits.sort_by_key(|credit| credit.id);
-
-    library.artist_mbids = artist_mbids(connection)?;
 
     library.exclusions = rows(
         connection,
@@ -551,6 +536,12 @@ pub(crate) struct Plan {
     /// changed, so that their key is today's when their files return, or
     /// given none.
     rekeyed: Vec<(i64, Option<String>)>,
+    /// Durable artist keys (`artist_key`) to register for resolved artists
+    /// (index into `resolution.artists`, key kind, key value).
+    artist_key_writes: Vec<(usize, ArtistKeyKind, String)>,
+    /// Stale `artist_key` name rows (`(artist_id, old_key_value)`) to remove
+    /// before inserting updated keys for the current normaliser version.
+    stale_artist_key_deletes: Vec<(i64, String)>,
     versions: bool,
     /// The version of the policy that made the resolution, which its
     /// decisions record.
@@ -706,39 +697,84 @@ impl Plan {
             .copied()
             .collect();
         unsearchable.sort_unstable();
+        // Durable `artist_key` writes for resolved artists, and removal of any
+        // stale earlier-normaliser name keys on those rows.
+        let mut artist_key_writes: Vec<(usize, ArtistKeyKind, String)> = Vec::new();
+        let mut stale_artist_key_deletes: Vec<(i64, String)> = Vec::new();
+        let mut reached_keyed_rows: HashSet<i64> = HashSet::new();
+        for (idx, out) in resolution.artists.iter().enumerate() {
+            let Some((kind, value)) = &out.key else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            let expected_ver = (*kind == ArtistKeyKind::Name).then_some(NORMALIZER_VERSION);
+            let already = as_row(out.r).is_some_and(|row| {
+                shown.artist_keys.get(&(*kind, value.clone())) == Some(&(row, expected_ver))
+            });
+            if !already {
+                artist_key_writes.push((idx, *kind, value.clone()));
+            }
+            if let Ref::Row(row) = out.r {
+                reached_keyed_rows.insert(row);
+            }
+        }
+        for entry in &library.artist_keys {
+            if entry.kind == ArtistKeyKind::Name
+                && reached_keyed_rows.contains(&entry.artist)
+                && entry.normalizer_version != Some(NORMALIZER_VERSION)
+            {
+                stale_artist_key_deletes.push((entry.artist, entry.value.clone()));
+            }
+        }
+
         // After the normaliser changed, a row with no ID that the
-        // resolution does not reach is keyed again from its name, so its
-        // files find it when they return. It is given no key, and is never
-        // found again, when that is not safe: its name is the owner's edit,
-        // which its files never gave, or the key is one an artist of the
+        // resolution does not reach with a key is keyed again from its name,
+        // so its files find it when they return. It is given no key, and is
+        // never found again, when that is not safe: its name is the owner's
+        // edit, which its files never gave, or the key is one an artist of the
         // resolution holds, or another such row would take it too.
         let mut rekeyed: Vec<(i64, Option<String>)> = Vec::new();
-        if library.artist_keys_by.is_some() {
-            let reached: HashSet<i64> = resolution
+        let has_stale_name_keys = library.artist_keys.iter().any(|entry| {
+            entry.kind == ArtistKeyKind::Name
+                && entry.normalizer_version != Some(NORMALIZER_VERSION)
+        });
+        if has_stale_name_keys {
+            let mut held: HashSet<&str> = resolution
                 .artists
                 .iter()
-                .filter_map(|out| as_row(out.r))
-                .collect();
-            let held: HashSet<&str> = resolution
-                .artists
-                .iter()
+                .filter(|out| out.key.is_some())
                 .map(|out| out.match_name.as_str())
                 .collect();
+            for entry in &library.artist_keys {
+                if entry.kind == ArtistKeyKind::Name
+                    && entry.normalizer_version == Some(NORMALIZER_VERSION)
+                {
+                    held.insert(entry.value.as_str());
+                }
+            }
             // A name is trusted only when it gives back the key the row
             // holds: an edit, in force or withdrawn, gives another.
-            let version = library.artist_keys_by;
             let left: Vec<(i64, &String, Option<String>)> = library
-                .artists
+                .artist_keys
                 .iter()
-                .filter(|(row, _)| !reached.contains(row))
-                .map(|(row, stored)| {
+                .filter(|entry| {
+                    entry.kind == ArtistKeyKind::Name
+                        && !reached_keyed_rows.contains(&entry.artist)
+                        && entry.normalizer_version != Some(NORMALIZER_VERSION)
+                })
+                .map(|entry| {
+                    let row = entry.artist;
+                    let stored = &entry.value;
+                    let version = entry.normalizer_version.or(library.artist_keys_by);
                     let edited =
                         library
                             .edits
-                            .contains_key(&(Kind::Artist, *row, "name".to_owned()));
+                            .contains_key(&(Kind::Artist, row, "name".to_owned()));
                     let name = shown
                         .artists
-                        .get(row)
+                        .get(&row)
                         .and_then(|(name, _, _)| name.as_deref())
                         .filter(|name| {
                             !edited
@@ -749,7 +785,7 @@ impl Plan {
                                     .as_ref()
                                     == Some(stored)
                         });
-                    (*row, stored, name.map(normalize))
+                    (row, stored, name.map(normalize))
                 })
                 .collect();
             let mut wanted: HashMap<&str, usize> = HashMap::new();
@@ -759,18 +795,20 @@ impl Plan {
                 }
             }
             for (row, stored, key) in &left {
+                stale_artist_key_deletes.push((*row, (*stored).clone()));
                 let key = key.as_ref().filter(|key| {
-                    !held.contains(key.as_str()) && wanted.get(key.as_str()) == Some(&1)
+                    !key.is_empty()
+                        && !held.contains(key.as_str())
+                        && wanted.get(key.as_str()) == Some(&1)
                 });
-                let now = Some(*stored).filter(|stored| !stored.is_empty());
-                if key != now {
-                    rekeyed.push((*row, key.cloned()));
-                }
+                rekeyed.push((*row, key.cloned()));
             }
         }
         let mut plan = Self {
             unsearchable,
             rekeyed,
+            artist_key_writes,
+            stale_artist_key_deletes,
             canonical: library.recording_canonical.clone(),
             artists,
             recordings,
@@ -819,6 +857,8 @@ impl Plan {
             && self.search.iter().all(Option::is_none)
             && self.unsearchable.is_empty()
             && self.rekeyed.is_empty()
+            && self.artist_key_writes.is_empty()
+            && self.stale_artist_key_deletes.is_empty()
     }
 
     /// Writes what differs, in the write's transaction.
@@ -869,10 +909,38 @@ impl Plan {
             };
             artist_rows.push(row);
         }
+        for (row, old_value) in &self.stale_artist_key_deletes {
+            connection
+                .prepare_cached(
+                    "DELETE FROM artist_key
+                     WHERE key_kind = 'name' AND artist_id = ?1 AND key_value = ?2",
+                )?
+                .execute((row, old_value))?;
+        }
+        for (idx, kind, value) in &self.artist_key_writes {
+            let row = artist_rows.get(*idx).copied().ok_or_else(missing)?;
+            let normalizer_version = (*kind == ArtistKeyKind::Name).then_some(NORMALIZER_VERSION);
+            connection
+                .prepare_cached(
+                    "INSERT INTO artist_key
+                       (key_kind, key_value, artist_id, normalizer_version, decision_id, rev)
+                     VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+                )?
+                .execute((kind.as_str(), value, row, normalizer_version, rev))?;
+        }
         for (row, key) in &self.rekeyed {
             connection
                 .prepare_cached("UPDATE artist SET match_name = ?2, rev = ?3 WHERE id = ?1")?
                 .execute((row, key, rev))?;
+            if let Some(key) = key {
+                connection
+                    .prepare_cached(
+                        "INSERT INTO artist_key
+                           (key_kind, key_value, artist_id, normalizer_version, decision_id, rev)
+                         VALUES ('name', ?1, ?2, ?3, NULL, ?4)",
+                    )?
+                    .execute((key, row, NORMALIZER_VERSION, rev))?;
+            }
         }
 
         let mut credit_rows = Vec::with_capacity(resolution.credits.len());
@@ -1328,6 +1396,142 @@ impl LibraryStore {
         let written = self.write(request, move |write| {
             let resolved = plan.apply(write)?;
             // Plays follow their source items' new bindings.
+            crate::history_store::rebind(write)?;
+            Ok(serde_json::to_string(&resolved)?)
+        })?;
+        let resolved = serde_json::from_str(&written.result_json)?;
+        Ok((written, resolved))
+    }
+
+    /// Clears every derived display column on live catalog rows and the search
+    /// index, then re-projects the whole catalog from claims, edits, durable
+    /// keys and redirects in one transaction. Rows reachable only through
+    /// retired/unreadable files or history keep their last-known display.
+    pub fn rebuild_display(&self, request: WriteRequest) -> Result<(Written, Resolved), Error> {
+        let written = self.write(request, move |write| {
+            let connection = write.connection();
+            let rev = write.rev();
+            let policy = Policy::current();
+
+            // Migrate any stale earlier-normaliser artist keys BEFORE wiping
+            // display columns, so unreached rows still have their stored
+            // display_name for safe rekeying.
+            {
+                let (library, mut shown) = load_in(connection)?;
+                let has_stale = library.artist_keys_by.is_some()
+                    || library.artist_keys.iter().any(|entry| {
+                        entry.kind == ArtistKeyKind::Name
+                            && entry.normalizer_version != Some(NORMALIZER_VERSION)
+                    });
+                if has_stale {
+                    shown.revision = rev - 1;
+                    let resolution = ritornel_domain::resolve(&library, &policy);
+                    let plan = Plan::new(resolution, &library, &shown, policy.version);
+                    if !plan.is_empty() {
+                        plan.apply(write)?;
+                    }
+                }
+            }
+
+            // Clear derived display columns only on entities reached by live,
+            // readable files (including canonical merge targets of those
+            // artists and releases), leaving history-only and retired-file
+            // rows intact.
+            let live_apps = "SELECT a.appearance_id
+                FROM assignment a
+                JOIN source_item si ON si.id = a.source_item_id
+                JOIN source_item_revision sr ON sr.id = si.current_revision_id
+                WHERE a.superseded_at_ms IS NULL
+                  AND si.item_kind = 'file'
+                  AND si.retired_at_ms IS NULL
+                  AND sr.audio_asset_id IS NOT NULL
+                  AND a.appearance_id IS NOT NULL";
+            let live_rels = format!(
+                "SELECT ta.release_id FROM track_appearance ta
+                 WHERE ta.id IN ({live_apps}) AND ta.release_id IS NOT NULL
+                 UNION
+                 SELECT rel.canonical_id FROM track_appearance ta
+                 JOIN release rel ON rel.id = ta.release_id
+                 WHERE ta.id IN ({live_apps})"
+            );
+            connection.execute(
+                &format!(
+                    "UPDATE artist
+                     SET display_name = NULL, display_sort_name = NULL, match_name = NULL, rev = ?1
+                     WHERE id IN (
+                       SELECT acn.artist_id FROM artist_credit_name acn
+                       WHERE acn.artist_credit_id IN (
+                         SELECT ta.display_artist_credit_id FROM track_appearance ta WHERE ta.id IN ({live_apps})
+                         UNION
+                         SELECT rel.display_artist_credit_id FROM release rel WHERE rel.id IN ({live_rels})
+                       )
+                       UNION
+                       SELECT a.canonical_id FROM artist a
+                       JOIN artist_credit_name acn ON acn.artist_id = a.id
+                       WHERE acn.artist_credit_id IN (
+                         SELECT ta.display_artist_credit_id FROM track_appearance ta WHERE ta.id IN ({live_apps})
+                         UNION
+                         SELECT rel.display_artist_credit_id FROM release rel WHERE rel.id IN ({live_rels})
+                       )
+                     )"
+                ),
+                [rev],
+            )?;
+            connection.execute(
+                "UPDATE recording
+                 SET display_title = NULL, display_artist_credit_id = NULL, rev = ?1
+                 WHERE EXISTS (
+                   SELECT 1 FROM assignment a
+                   JOIN source_item si ON si.id = a.source_item_id
+                   JOIN source_item_revision sr ON sr.id = si.current_revision_id
+                   JOIN recording r ON r.id = a.recording_id
+                   WHERE a.superseded_at_ms IS NULL
+                     AND si.item_kind = 'file'
+                     AND si.retired_at_ms IS NULL
+                     AND sr.audio_asset_id IS NOT NULL
+                     AND r.canonical_id = recording.id
+                 )",
+                [rev],
+            )?;
+            connection.execute(
+                &format!(
+                    "UPDATE release_group
+                     SET display_primary_type = NULL, display_secondary_types_json = '[]',
+                         display_first_date = NULL, display_first_year = NULL,
+                         display_release_id = NULL, rev = ?1
+                     WHERE id IN (
+                       SELECT release_group_id FROM release WHERE id IN ({live_rels})
+                     )"
+                ),
+                [rev],
+            )?;
+            connection.execute(
+                &format!(
+                    "UPDATE release
+                     SET display_title = NULL, display_artist_credit_id = NULL,
+                         display_date = NULL, display_year = NULL,
+                         display_picture_id = NULL, rev = ?1
+                     WHERE id IN ({live_rels})"
+                ),
+                [rev],
+            )?;
+            connection.execute(
+                &format!(
+                    "UPDATE track_appearance
+                     SET display_title = NULL, display_artist_credit_id = NULL,
+                         display_disc_number = NULL, display_track_number = NULL,
+                         display_duration_ms = NULL, display_added_at_ms = NULL, rev = ?1
+                     WHERE id IN ({live_apps})"
+                ),
+                [rev],
+            )?;
+            connection.execute("DELETE FROM search_text", [])?;
+
+            let (library, mut shown) = load_in(connection)?;
+            shown.revision = rev - 1;
+            let resolution = ritornel_domain::resolve(&library, &policy);
+            let plan = Plan::new(resolution, &library, &shown, policy.version);
+            let resolved = plan.apply(write)?;
             crate::history_store::rebind(write)?;
             Ok(serde_json::to_string(&resolved)?)
         })?;

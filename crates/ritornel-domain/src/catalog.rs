@@ -19,10 +19,10 @@ pub const CATALOG_VERSION: i64 = 2;
 
 use crate::extract::{Facts, parse_date};
 use crate::library::{
-    AppearanceOut, ArtistOut, CreditOut, GroupOut, Item, ItemOut, Kind, Library, RecordingOut, Ref,
-    ReleaseOut, Resolution,
+    AppearanceOut, ArtistKeyKind, ArtistOut, CreditOut, GroupOut, Item, ItemOut, Kind, Library,
+    RecordingOut, Ref, ReleaseOut, Resolution,
 };
-use crate::normalize::{core, normalize, normalize_by};
+use crate::normalize::{NORMALIZER_VERSION, core, normalize, normalize_by};
 use crate::resolve::{Policy, RecKey, fold};
 
 /// The name of the album artist of an album whose tracks have different
@@ -689,6 +689,71 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             }
         }
     }
+    // Build lookups from durable `artist_key` ownership rows, including rows
+    // whose artist currently redirects to another after a merge.
+    let mut mbid_owner: HashMap<&str, i64> = HashMap::new();
+    let mut name_owner_current: HashMap<&str, i64> = HashMap::new();
+    let mut old_name_owners: BTreeMap<i64, HashMap<&str, VecDeque<i64>>> = BTreeMap::new();
+    for entry in &library.artist_keys {
+        match entry.kind {
+            ArtistKeyKind::Mbid => {
+                mbid_owner
+                    .entry(entry.value.as_str())
+                    .or_insert(entry.artist);
+            }
+            ArtistKeyKind::Name => {
+                let stale_version = entry
+                    .normalizer_version
+                    .filter(|&version| version != NORMALIZER_VERSION)
+                    .or(library.artist_keys_by);
+                match stale_version {
+                    Some(version) => {
+                        old_name_owners
+                            .entry(version)
+                            .or_default()
+                            .entry(entry.value.as_str())
+                            .or_default()
+                            .push_back(entry.artist);
+                    }
+                    None => {
+                        name_owner_current
+                            .entry(entry.value.as_str())
+                            .or_insert(entry.artist);
+                    }
+                }
+            }
+        }
+    }
+
+    // A name that already has a durable owner in `artist_key` keeps that owner
+    // across rescans, merges, unmerges, and retags rather than being folded
+    // into another artist by `credited_under` or `by_sort` (unless
+    // `credited_under` maps to an MBID owned by that exact same artist row).
+    let mut protected_owners: HashMap<&ArtistKey, i64> = HashMap::new();
+    for (key, entry) in &seen {
+        let ArtistKey::Name(name) = key else {
+            continue;
+        };
+        if let Some(&row) = name_owner_current.get(name.as_str()) {
+            protected_owners.insert(key, row);
+            continue;
+        }
+        if !old_name_owners.is_empty() {
+            'outer: for (&ver, map) in &old_name_owners {
+                for spelling in &entry.names {
+                    if let Some(old) = normalize_by(ver, spelling)
+                        && let Some(rows) = map.get(old.as_str())
+                        && let Some(&row) = rows.front()
+                    {
+                        protected_owners.insert(key, row);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    let protected_owner = |key: &ArtistKey| -> Option<i64> { protected_owners.get(key).copied() };
+
     // A name with no ID is the artist an ID is credited under that name:
     // the most credited of them, when there are several.
     let mut under: HashMap<String, Vec<(usize, &str)>> = HashMap::new();
@@ -708,6 +773,11 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             && let Some(ids) = under.get(name)
             && let Some((_, mbid)) = ids.iter().max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(a.1)))
         {
+            if let Some(protected) = protected_owner(key)
+                && mbid_owner.get(*mbid) != Some(&protected)
+            {
+                return None;
+            }
             return Some(ArtistKey::Mbid((*mbid).to_owned()));
         }
         None
@@ -743,7 +813,10 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         let ArtistKey::Name(name) = key else {
             return None;
         };
-        if !on_tracks.contains(key) || seen.get(key).is_some_and(|entry| !entry.sorts.is_empty()) {
+        if protected_owner(key).is_some()
+            || !on_tracks.contains(key)
+            || seen.get(key).is_some_and(|entry| !entry.sorts.is_empty())
+        {
             return None;
         }
         match sorted_as.get(name)?.iter().collect::<Vec<_>>().as_slice() {
@@ -779,78 +852,65 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
     }
     let mut artist_keys: Vec<(&ArtistKey, &Seen)> = merged.iter().collect();
     artist_keys.sort_by(|a, b| a.1.first.cmp(&b.1.first).then(a.0.cmp(b.0)));
-    // An artist with an ID keeps the row that has its ID. One with no ID
-    // takes a row by its normalised name, among the rows with no ID: so
-    // two namesakes never swap rows, and a renamed artist keeps its own.
-    let mut id_rows: HashMap<&str, VecDeque<i64>> = HashMap::new();
-    let mut free_rows: HashMap<&str, VecDeque<i64>> = HashMap::new();
-    for (row, match_name) in &library.artists {
-        match library.artist_mbids.get(row) {
-            Some(mbid) => id_rows.entry(mbid.as_str()).or_default().push_back(*row),
-            // A row given no key is found by no name.
-            None if match_name.is_empty() => {}
-            None => free_rows
-                .entry(match_name.as_str())
-                .or_default()
-                .push_back(*row),
-        }
-    }
-    // After the normaliser changed, the rows hold the keys the earlier
-    // version made of their files' names, and an artist with no ID is
-    // found by those alone: today's key of one artist may be another's old
-    // one. First each takes the row of a spelling whose key did not
-    // change, then the others take rows by the old key most of their files
-    // give.
+
+    // After the normaliser changed, stored name keys hold what the earlier
+    // version made of their files' names, and an artist with no ID is found
+    // by those alone: today's key of one artist may be another's old one.
+    // First each takes the row of a spelling whose key did not change, then
+    // the others take rows by the old key most of their files give.
     let mut migrated: HashMap<&ArtistKey, i64> = HashMap::new();
-    if let Some(version) = library.artist_keys_by {
+    if !old_name_owners.is_empty() {
         let unnamed: Vec<(&ArtistKey, &Seen)> = artist_keys
             .iter()
             .copied()
-            .filter(|(key, _)| matches!(key, ArtistKey::Name(_)))
+            .filter(|(key, _)| {
+                matches!(key, ArtistKey::Name(own) if !name_owner_current.contains_key(own.as_str()))
+            })
             .collect();
-        for (key, entry) in &unnamed {
-            let ArtistKey::Name(own) = key else { continue };
-            let unchanged = entry
-                .names
-                .iter()
-                .any(|spelling| normalize_by(version, spelling).as_deref() == Some(own.as_str()));
-            if let Some(row) = unchanged
-                .then(|| {
-                    free_rows
-                        .get_mut(own.as_str())
-                        .and_then(VecDeque::pop_front)
-                })
-                .flatten()
-            {
-                migrated.insert(key, row);
-            }
-        }
-        for (key, entry) in &unnamed {
-            if migrated.contains_key(key) {
-                continue;
-            }
-            let mut votes: Vec<(String, usize, usize)> = Vec::new();
-            for (at, spelling) in entry.names.iter().enumerate() {
-                let Some(old) = normalize_by(version, spelling) else {
+        for (&version, old_rows) in &mut old_name_owners {
+            for (key, entry) in &unnamed {
+                if migrated.contains_key(key) {
                     continue;
-                };
-                match votes.iter_mut().find(|(key, _, _)| *key == old) {
-                    Some(vote) => vote.1 += 1,
-                    None => votes.push((old, 1, at)),
+                }
+                let ArtistKey::Name(own) = key else { continue };
+                let unchanged = entry.names.iter().any(|spelling| {
+                    normalize_by(version, spelling).as_deref() == Some(own.as_str())
+                });
+                if let Some(row) = unchanged
+                    .then(|| old_rows.get_mut(own.as_str()).and_then(VecDeque::pop_front))
+                    .flatten()
+                {
+                    migrated.insert(key, row);
                 }
             }
-            votes.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
-            if let Some(row) = votes.iter().find_map(|(old, _, _)| {
-                free_rows
-                    .get_mut(old.as_str())
-                    .and_then(VecDeque::pop_front)
-            }) {
-                migrated.insert(key, row);
+            for (key, entry) in &unnamed {
+                if migrated.contains_key(key) {
+                    continue;
+                }
+                let mut votes: Vec<(String, usize, usize)> = Vec::new();
+                for (at, spelling) in entry.names.iter().enumerate() {
+                    let Some(old) = normalize_by(version, spelling) else {
+                        continue;
+                    };
+                    match votes.iter_mut().find(|(key, _, _)| *key == old) {
+                        Some(vote) => vote.1 += 1,
+                        None => votes.push((old, 1, at)),
+                    }
+                }
+                votes.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+                if let Some(row) = votes.iter().find_map(|(old, _, _)| {
+                    old_rows.get_mut(old.as_str()).and_then(VecDeque::pop_front)
+                }) {
+                    migrated.insert(key, row);
+                }
             }
         }
     }
+
     let mut artists: Vec<ArtistOut> = Vec::new();
     let mut artist_index: HashMap<ArtistKey, usize> = HashMap::new();
+    let mut row_to_index: HashMap<i64, usize> = HashMap::new();
+    let mut redirected_claims: BTreeMap<i64, (Vec<String>, Vec<String>)> = BTreeMap::new();
     for (key, entry) in artist_keys {
         let Some(name) = pick(entry.names.iter().cloned()) else {
             continue;
@@ -861,30 +921,69 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             ArtistKey::Name(own) => own.clone(),
             ArtistKey::Mbid(_) => normalize(&name),
         };
-        let (row, mbid) = match key {
+        let (row, mbid, durable_key) = match key {
             ArtistKey::Mbid(mbid) => (
-                id_rows.get_mut(mbid.as_str()).and_then(VecDeque::pop_front),
+                mbid_owner.get(mbid.as_str()).copied(),
                 Some(mbid.clone()),
+                (ArtistKeyKind::Mbid, mbid.clone()),
             ),
-            ArtistKey::Name(_) => {
-                let row = match library.artist_keys_by {
-                    Some(_) => migrated.get(key).copied(),
-                    None => free_rows
-                        .get_mut(match_name.as_str())
-                        .and_then(VecDeque::pop_front),
-                };
-                (row, None)
+            ArtistKey::Name(own) => {
+                let row = name_owner_current
+                    .get(own.as_str())
+                    .copied()
+                    .or_else(|| migrated.get(key).copied());
+                (row, None, (ArtistKeyKind::Name, own.clone()))
             }
         };
+        if let Some(row_id) = row
+            && let Some(&canon) = library.artist_canonical.get(&row_id)
+        {
+            let claims = redirected_claims.entry(canon).or_default();
+            claims.0.extend(entry.names.iter().cloned());
+            claims.1.extend(entry.sorts.iter().cloned());
+        }
+        if let Some(row_id) = row
+            && let Some(&existing_at) = row_to_index.get(&row_id)
+        {
+            artist_index.insert(key.clone(), existing_at);
+            continue;
+        }
         let r = row.map_or(Ref::New(artists.len()), Ref::Row);
         let name = edit(Kind::Artist, r, "name").unwrap_or(name);
-        artist_index.insert(key.clone(), artists.len());
+        let at = artists.len();
+        artist_index.insert(key.clone(), at);
+        if let Some(row_id) = row {
+            row_to_index.insert(row_id, at);
+        }
         artists.push(ArtistOut {
             r,
             sort_name: pick(entry.sorts.iter().cloned()).unwrap_or_else(|| name.clone()),
             name,
             match_name,
             mbid,
+            key: Some(durable_key),
+        });
+    }
+    // If a canonical merge target has no direct files of its own, still
+    // project its display from its edit or the claims of rows redirecting to
+    // it so a display rebuild never leaves it blank.
+    for (canon, (names, sorts)) in redirected_claims {
+        if row_to_index.contains_key(&canon) {
+            continue;
+        }
+        let r = Ref::Row(canon);
+        let Some(name) = edit(Kind::Artist, r, "name").or_else(|| pick(names)) else {
+            continue;
+        };
+        let sort_name = pick(sorts).unwrap_or_else(|| name.clone());
+        let match_name = normalize(&name);
+        artists.push(ArtistOut {
+            r,
+            name,
+            sort_name,
+            match_name,
+            mbid: None,
+            key: None,
         });
     }
 

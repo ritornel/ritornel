@@ -122,6 +122,49 @@ pub struct ExistingRelease {
     pub group: i64,
 }
 
+/// What kind of durable key an artist row owns (`artist_key.key_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ArtistKeyKind {
+    /// A MusicBrainz artist ID.
+    Mbid,
+    /// A mechanically normalised artist name.
+    Name,
+}
+
+impl ArtistKeyKind {
+    /// The kind as the schema writes it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mbid => "mbid",
+            Self::Name => "name",
+        }
+    }
+
+    /// The kind the schema writes as `text`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "mbid" => Some(Self::Mbid),
+            "name" => Some(Self::Name),
+            _ => None,
+        }
+    }
+}
+
+/// One durable artist key ownership row (`artist_key`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingArtistKey {
+    /// Whether `value` is a MusicBrainz ID or a normalised name.
+    pub kind: ArtistKeyKind,
+    /// The MBID or normalised name.
+    pub value: String,
+    /// The artist row that owns this key, which may redirect to another via
+    /// [`Library::artist_canonical`].
+    pub artist: i64,
+    /// The normaliser version that made `value` when `kind` is
+    /// [`ArtistKeyKind::Name`]; `None` for [`ArtistKeyKind::Mbid`].
+    pub normalizer_version: Option<i64>,
+}
+
 /// A credit that exists: its text, and each artist with the name as
 /// credited and the join phrase after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,16 +206,13 @@ pub struct Library {
     pub releases: HashMap<i64, ExistingRelease>,
     /// Each release group, with the owner's preferred release.
     pub groups: HashMap<i64, Option<i64>>,
-    /// Each artist's row and match name, in the order of their keys.
-    pub artists: Vec<(i64, String)>,
-    /// The version of the normaliser the match names were made by, when it
-    /// is not this one's: an artist with no ID is then looked for by the key
-    /// that version makes of its names, and by no other. An empty match
-    /// name is a row found by its ID alone.
+    /// Each durable artist key and the artist row that owns it, in row order.
+    pub artist_keys: Vec<ExistingArtistKey>,
+    /// Each merged artist and the end of its redirect chain.
+    pub artist_canonical: HashMap<i64, i64>,
+    /// The version of the normaliser the stored name keys were made by, when
+    /// it is not this one's.
     pub artist_keys_by: Option<i64>,
-    /// The MusicBrainz ID of each artist row that has one: the ID the
-    /// claims of the files credited to it give it.
-    pub artist_mbids: HashMap<i64, String>,
     /// Each credit.
     pub credits: Vec<ExistingCredit>,
     /// Each "this item is not that recording".
@@ -332,6 +372,10 @@ pub struct ArtistOut {
     pub match_name: String,
     /// Its MusicBrainz ID, when it is known by one.
     pub mbid: Option<String>,
+    /// The durable key (`artist_key`) this artist row owns. `None` only for
+    /// a canonical merge-target row emitted solely so its display is kept
+    /// when it has no direct files of its own.
+    pub key: Option<(ArtistKeyKind, String)>,
 }
 
 /// A credit the catalog should have.
