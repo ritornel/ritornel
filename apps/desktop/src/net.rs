@@ -132,12 +132,7 @@ impl Net {
 
     /// The bucket a cover drawn `px` pixels wide is asked for at.
     pub(crate) fn bucket(&self, px: u32) -> u32 {
-        self.art_sizes
-            .iter()
-            .copied()
-            .find(|size| *size >= px)
-            .or_else(|| self.art_sizes.last().copied())
-            .unwrap_or(256)
+        bucket_in(&self.art_sizes, px)
     }
 }
 
@@ -198,6 +193,17 @@ impl ArtHttp {
         }
         ok.then(|| body.to_vec())
     }
+}
+
+/// The smallest of the server's sizes `sizes` that is at least `px`, or its
+/// largest.
+pub(crate) fn bucket_in(sizes: &[u32], px: u32) -> u32 {
+    sizes
+        .iter()
+        .copied()
+        .find(|size| *size >= px)
+        .or_else(|| sizes.last().copied())
+        .unwrap_or(256)
 }
 
 #[cfg(test)]

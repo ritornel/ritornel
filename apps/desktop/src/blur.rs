@@ -37,20 +37,34 @@ pub(crate) fn wash_tone(dark: bool) -> (f32, f32) {
     if dark { (WASH.1, 1.) } else { (1.25, 1.18) }
 }
 
-/// A JPEG cover, blurred.
+/// A JPEG cover, blurred, for a banner: drawn square over the banner 30% of
+/// the way down (`background-position: center 30%`), it is cut square the
+/// same way first, so that a picture that is not square is not squashed.
 pub(crate) fn jpeg(bytes: &[u8], radius: usize, saturation: f32) -> Option<RenderImage> {
-    jpeg_toned(bytes, radius, saturation, 1.)
+    blurred(bytes, 0.3, radius, saturation, 1.)
 }
 
-/// A JPEG cover, blurred, saturated and brightened.
+/// A JPEG cover, blurred, saturated and brightened, for the window's wash or
+/// Lean back: drawn square over the window's middle, it is cut square at
+/// its middle first.
 pub(crate) fn jpeg_toned(
     bytes: &[u8],
     radius: usize,
     saturation: f32,
     brightness: f32,
 ) -> Option<RenderImage> {
+    blurred(bytes, 0.5, radius, saturation, brightness)
+}
+
+fn blurred(
+    bytes: &[u8],
+    down: f32,
+    radius: usize,
+    saturation: f32,
+    brightness: f32,
+) -> Option<RenderImage> {
     let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).ok()?;
-    let rgba = decoded
+    let rgba = crate::covers::squared(decoded, down)
         .resize_exact(SIDE, SIDE, image::imageops::FilterType::Triangle)
         .into_rgba8();
     Some(toned(&rgba, radius, saturation, brightness))
@@ -135,6 +149,57 @@ fn box_blur(source: &[[f32; 3]], w: usize, h: usize, radius: usize, across: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A JPEG of three bands down it, green, red and blue, each a third.
+    fn banded(w: u32, h: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_fn(w, h, |_, y| match 3 * y / h {
+            0 => image::Rgb([0, 255, 0]),
+            1 => image::Rgb([255, 0, 0]),
+            _ => image::Rgb([0, 0, 255]),
+        });
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 95)
+            .encode_image(&image)
+            .unwrap_or_default();
+        bytes
+    }
+
+    #[test]
+    fn a_tall_picture_is_cut_square_before_it_is_blurred() {
+        // Blurred hardly at all: a banner's is cut 30% down, rows 60 to 160
+        // of 300, so green at its top; the wash's at the middle, rows 100
+        // to 200, red throughout. Squashed, both would start green and end
+        // blue.
+        let top = |image: Option<RenderImage>| -> Option<[u8; 4]> {
+            let image = image?;
+            let bytes = image.as_bytes(0)?;
+            let at = (2 * SIDE as usize + SIDE as usize / 2) * 4;
+            bytes.get(at..at + 4)?.try_into().ok()
+        };
+        let foot = |image: Option<RenderImage>| -> Option<[u8; 4]> {
+            let image = image?;
+            let bytes = image.as_bytes(0)?;
+            let at = ((SIDE as usize - 3) * SIDE as usize + SIDE as usize / 2) * 4;
+            bytes.get(at..at + 4)?.try_into().ok()
+        };
+        let bytes = banded(100, 300);
+        // BGRA.
+        let banner = top(jpeg(&bytes, 0, 1.));
+        assert!(
+            matches!(banner, Some([_, g, r, _]) if g > 200 && r < 80),
+            "{banner:?}"
+        );
+        let wash = top(jpeg_toned(&bytes, 0, 1., 1.));
+        assert!(
+            matches!(wash, Some([_, g, r, _]) if r > 200 && g < 80),
+            "{wash:?}"
+        );
+        let wash = foot(jpeg_toned(&bytes, 0, 1., 1.));
+        assert!(
+            matches!(wash, Some([b, _, r, _]) if r > 200 && b < 80),
+            "{wash:?}"
+        );
+    }
 
     #[test]
     fn the_radius_follows_how_large_the_picture_is_drawn() {

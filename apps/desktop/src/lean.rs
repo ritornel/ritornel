@@ -890,11 +890,10 @@ impl LeanBack {
     ) -> impl std::future::Future<Output = Option<RenderImage>> + 'static {
         let px = (COVER * window.scale_factor()).ceil() as u32;
         let read = art.zip(self.net.clone()).map(|(art, net)| {
-            let bucket = net.bucket(px);
+            let sizes = net.art_sizes.clone();
             let http = Arc::clone(&net.art);
             net.rt().spawn(async move {
-                let bytes = http.get(art, bucket).await?;
-                crate::covers::decode(move || crate::covers::decode_cover(&bytes, px))
+                crate::covers::fetch_square(&http, &sizes, art, px)
                     .await
                     .map(|(image, _, _)| image)
             })
