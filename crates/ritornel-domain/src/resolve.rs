@@ -182,6 +182,7 @@ impl Policy {
         Self::v3()
     }
 
+    /// Policy 3 also reads fullwidth brackets as title-note delimiters.
     pub(crate) fn title_core(&self, text: &str) -> String {
         core_with_fullwidth(text, self.version >= 3)
     }

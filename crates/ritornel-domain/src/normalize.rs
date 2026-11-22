@@ -250,11 +250,14 @@ pub fn core(text: &str) -> String {
     core_with_fullwidth(text, true)
 }
 
+/// Earlier file policies recognise only ASCII brackets around notes.
 pub(crate) fn core_with_fullwidth(text: &str, fullwidth: bool) -> String {
     let mut outside = String::with_capacity(text.len());
     // A bracket of symbols alone, as "(+)", is kept: it is no note.
     let mut inside = String::new();
     let mut depth = 0_u32;
+    // Read the original brackets before NFKC turns an enclosed numeral
+    // such as ⑴ into "(1)", which would look like a note.
     for c in text.chars() {
         match c {
             '(' | '[' | '{' | '（' | '［' | '｛' if fullwidth || c.is_ascii() => depth += 1,
