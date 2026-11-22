@@ -18,8 +18,8 @@ use ritornel_contract::methods::{
     IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall,
     LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
     LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkCopiesCall,
-    LinkInvite, LinkJoin, LinkStatusCall, LinkTracksCall, ListClose, ListLocate, ListOpen,
-    ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet, PlaybackJump,
+    LinkInvite, LinkJoin, LinkListen, LinkStatusCall, LinkTracksCall, ListClose, ListLocate,
+    ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet, PlaybackJump,
     PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet, PlaybackSkip,
     PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow, RatingsSet,
     RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList, SourcesAdd,
@@ -872,6 +872,9 @@ impl Core {
             }
             LinkCopiesCall::NAME => {
                 run::<LinkCopiesCall>(params, |params| self.link_copies(stores, &params))
+            }
+            LinkListen::NAME => {
+                run::<LinkListen>(params, |params| self.link_listen(stores, session, params))
             }
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {

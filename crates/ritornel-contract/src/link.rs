@@ -189,6 +189,47 @@ pub struct HubCopy {
     pub extension: String,
 }
 
+/// The params of `link.listen`: one listen a satellite's player recorded,
+/// as its outbox sends it, with the stamps of this send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkListenParams {
+    /// The listen's ID, which is also its source key at the hub: sent
+    /// again, it is taken in once.
+    pub idempotency_key: Id,
+    /// The listen record, as the playing server staged it.
+    pub record: serde_json::Value,
+    /// The satellite's wall clock when it sent this.
+    pub sent_at_ms: i64,
+    /// Its monotonic clock then.
+    pub sent_mono_ms: i64,
+    /// The boot that clock counts from.
+    pub sent_boot: Id,
+}
+
+/// What became of a listen a satellite sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ListenTaken {
+    /// It is in the record now.
+    Stored,
+    /// The record had it already: this was a resend.
+    Duplicate,
+    /// The record has another listen under its ID, and kept that one.
+    Conflict,
+}
+
+/// The result of `link.listen`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkListened {
+    /// What became of it.
+    pub taken: ListenTaken,
+}
+
 /// What a satellite sends to `POST /v1/link` to join: the invite's secret
 /// and who it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

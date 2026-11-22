@@ -95,8 +95,8 @@ pub use library::{
 };
 pub use link::{
     HubCopy, HubStatus, InviteLink, LinkCopies, LinkCopiesParams, LinkGranted, LinkInvite,
-    LinkInviteParams, LinkJoinParams, LinkRequest, LinkStatus, LinkTracks, LinkTracksParams,
-    SatelliteStatus, link_request_proof,
+    LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened, LinkRequest, LinkStatus,
+    LinkTracks, LinkTracksParams, ListenTaken, SatelliteStatus, link_request_proof,
 };
 pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,

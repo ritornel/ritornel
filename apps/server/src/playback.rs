@@ -199,11 +199,7 @@ impl Workers {
         }
         self.core.shutdown_player();
         let (clock, run_id) = (ritornel_engine::SystemClock, self.run_id);
-        let delivered = self.core.with_library(|server, library| {
-            deliver_listens(server, library, &clock, &|| stamps(&clock, run_id), &|| {
-                Ok(())
-            })
-        });
+        let delivered = deliver_now(&self.core, &clock, run_id, &|| Ok(()));
         if let Some(Err(failed)) = delivered {
             warn!(error = %failed, "listens could not be delivered before the stop; the next run will");
         }
@@ -229,6 +225,21 @@ fn stamps(clock: &dyn Clock, run_id: Id) -> SendStamps {
         sent_mono_ms: SystemTimekeeper.mono_ms(),
         sent_boot: clock_boot(&SystemTimekeeper, run_id),
     }
+}
+
+/// Delivers the listens whose turn has come: into the library, on a hub,
+/// or to the hub, on a satellite. `None` on a server with neither.
+fn deliver_now(
+    core: &Core,
+    clock: &dyn Clock,
+    run_id: Id,
+    after_ingest: &dyn Fn() -> Result<(), EngineError>,
+) -> Option<Result<ritornel_engine::playback::Delivered, EngineError>> {
+    let stamps = || stamps(clock, run_id);
+    core.with_library(|server, library| {
+        deliver_listens(server, library, clock, &stamps, after_ingest)
+    })
+    .or_else(|| core.deliver_to_hub(clock, &stamps, after_ingest))
 }
 
 fn tick(core: &Core, stop: &AtomicBool) {
@@ -257,15 +268,7 @@ fn deliver(core: &Core, stop: &AtomicBool, run_id: Id, fail_after_ingest: bool) 
             }
             Ok(())
         };
-        let done = core.with_library(|server, library| {
-            deliver_listens(
-                server,
-                library,
-                &clock,
-                &|| stamps(&clock, run_id),
-                &after_ingest,
-            )
-        });
+        let done = deliver_now(core, &clock, run_id, &after_ingest);
         let wait = match done {
             Some(Ok(done)) => {
                 if !done.delivered.is_empty() {
@@ -274,7 +277,7 @@ fn deliver(core: &Core, stop: &AtomicBool, run_id: Id, fail_after_ingest: bool) 
                     info!(
                         delivered = done.delivered.len(),
                         sent_again = done.duplicates,
-                        "listens delivered to history"
+                        "listens delivered"
                     );
                 }
                 for (listen, reason) in &done.failed {
@@ -289,7 +292,8 @@ fn deliver(core: &Core, stop: &AtomicBool, run_id: Id, fail_after_ingest: bool) 
                 error!(error = %failed, "delivering listens failed");
                 IDLE
             }
-            // No library: nothing can be delivered until there is one.
+            // No library and no hub: nothing can be delivered until there
+            // is one.
             None => IDLE,
         };
         core.deliveries().wait(wait);

@@ -16,14 +16,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ritornel_client::contract::methods::{
-    LibraryStats, LinkInvite, LinkJoin, LinkStatusCall, PlaybackPlay, QueueWindow, RatingsSet,
-    SourcesAdd,
+    LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkStatusCall, PlaybackPlay, QueueWindow,
+    RatingsSet, SourcesAdd,
 };
 use ritornel_client::contract::{
     CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink, LinkInviteParams,
-    LinkJoinParams, LinkRequest, LinkStatus, ListKind, ListOpenParams, NoParams, PlaySource,
-    PlaybackPlayParams, PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole,
-    SourcesAddParams, Topic, Window, capability, hex, link_request_proof, route,
+    LinkJoinParams, LinkListenParams, LinkRequest, LinkStatus, ListKind, ListOpenParams,
+    ListenTaken, NoParams, PlaySource, PlaybackPlayParams, PlaybackStatus, Query,
+    QueueWindowParams, RatingSetParams, Row, ServerRole, SourcesAddParams, Topic, Window,
+    capability, hex, link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -78,8 +79,8 @@ async fn start_on(scratch: &Scratch, name: &str, listen: Listen) -> Server {
     .unwrap()
 }
 
-/// A server with a player on the null output, a hundred times real time.
-async fn start_playing(scratch: &Scratch, name: &str) -> Server {
+/// A server with a player on the null output, `speed` times real time.
+async fn start_playing_at(scratch: &Scratch, name: &str, speed: u32) -> Server {
     Server::start_run(
         HeldDir::take(scratch.data_dir(name)).unwrap(),
         Listen::on_port(0),
@@ -88,7 +89,7 @@ async fn start_playing(scratch: &Scratch, name: &str) -> Server {
         Bounds::default(),
         Run {
             playback: PlaybackRun {
-                output: Some(Output::Null { speed: 100 }),
+                output: Some(Output::Null { speed }),
                 ..PlaybackRun::default()
             },
             ..Run::default()
@@ -648,11 +649,17 @@ async fn while_the_hub_is_away_a_satellite_says_so_and_comes_back_with_it() {
 /// A hub with the album scanned, and a satellite with a player linked to
 /// it, with a client of each.
 async fn linked_player(scratch: &Scratch) -> (Server, Client, Server, Client) {
+    linked_player_at(scratch, 100).await
+}
+
+/// As [`linked_player`], with the satellite playing at `speed` times real
+/// time.
+async fn linked_player_at(scratch: &Scratch, speed: u32) -> (Server, Client, Server, Client) {
     let hub = start(scratch, "hub").await;
     let mut hub_client = client(scratch, "hub", &hub).await;
     hub_client.create_library(key()).await.unwrap();
     scan(scratch, &mut hub_client).await;
-    let desk = start_playing(scratch, "desk").await;
+    let desk = start_playing_at(scratch, "desk", speed).await;
     let desk_client = client(scratch, "desk", &desk).await;
     join(&desk_client, &invite(&hub, &hub_client).await)
         .await
@@ -775,6 +782,207 @@ async fn a_satellite_plays_the_hubs_music_from_copies_it_pulls() {
             .await
             .unwrap();
         assert_eq!(stranger.status, 401);
+    })
+    .await;
+}
+
+/// The listens the hub's record holds from the player of `satellite`, by
+/// their IDs, read from its library as it stands.
+fn at_hub(scratch: &Scratch, satellite: ritornel_client::contract::Id) -> Vec<Vec<u8>> {
+    let db = rusqlite::Connection::open(scratch.data_dir("hub").join("library.db")).unwrap();
+    let mut statement = db
+        .prepare(
+            "SELECT o.source_key FROM history_observation o
+             JOIN history_endpoint e ON e.id = o.endpoint_id
+             JOIN server s ON s.id = e.server_id
+             WHERE e.kind = 'player' AND s.public_id = ?1 ORDER BY o.id",
+        )
+        .unwrap();
+    statement
+        .query_map([satellite.as_bytes()], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The listens a satellite has staged and not yet seen the hub take: its
+/// outbox, read from its `server.db`.
+fn waiting(scratch: &Scratch) -> usize {
+    let db = rusqlite::Connection::open(scratch.data_dir("desk").join("server.db")).unwrap();
+    db.query_row("SELECT count(*) FROM outbox", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|count| usize::try_from(count).unwrap())
+    .unwrap()
+}
+
+/// The listens a satellite has staged in all, delivered or not.
+fn staged(scratch: &Scratch) -> usize {
+    let db = rusqlite::Connection::open(scratch.data_dir("desk").join("server.db")).unwrap();
+    db.query_row("SELECT count(*) FROM listen_staging", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|count| usize::try_from(count).unwrap())
+    .unwrap()
+}
+
+/// Waits until the satellite's outbox is empty.
+async fn delivered(scratch: &Scratch) {
+    while waiting(scratch) > 0 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn song_ids(rows: &[Row]) -> Vec<ritornel_client::contract::Id> {
+    rows.iter()
+        .filter_map(|row| match row {
+            Row::Song(song) => Some(song.appearance_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellites_listens_reach_the_hubs_record_once() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (_hub, _hub_client, desk, mut desk_client) = linked_player(&scratch).await;
+        let ids = song_ids(&desk_client.list_open(&songs()).await.unwrap().rows);
+        play_to_the_end(&mut desk_client, PlaySource::Tracks { ids: ids.clone() }).await;
+        delivered(&scratch).await;
+        let taken = at_hub(&scratch, desk.server_id());
+        assert_eq!(taken.len(), ids.len());
+        // The satellite keeps nothing once the hub has them.
+        assert_eq!(staged(&scratch), 0);
+
+        // Played again, they are new listens, and each is taken once.
+        play_to_the_end(&mut desk_client, PlaySource::Tracks { ids: ids.clone() }).await;
+        delivered(&scratch).await;
+        let mut taken = at_hub(&scratch, desk.server_id());
+        assert_eq!(taken.len(), 2 * ids.len());
+        taken.sort();
+        taken.dedup();
+        assert_eq!(taken.len(), 2 * ids.len());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn listens_wait_while_the_hub_is_away_and_arrive_once_when_it_is_back() {
+    bounded(async {
+        let scratch = Scratch::new();
+        // In real time: a track lasts half a second.
+        let (hub, hub_client, desk, mut desk_client) = linked_player_at(&scratch, 1).await;
+        let ids = song_ids(&desk_client.list_open(&songs()).await.unwrap().rows);
+
+        // The hub goes while the track plays from the copy pulled for it.
+        desk_client.subscribe(&[Topic::Playback]).await.unwrap();
+        desk_client
+            .call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::Tracks { ids: vec![ids[0]] },
+                start: None,
+                context: None,
+                shuffle: None,
+            })
+            .await
+            .unwrap();
+        let port = hub.endpoint().port();
+        drop(hub_client);
+        hub.stop().await.unwrap();
+        let mut played = false;
+        loop {
+            if let Event::Playback(event) = desk_client.next_event().await.unwrap() {
+                played |= event.state.status == PlaybackStatus::Playing;
+                if played && event.state.status == PlaybackStatus::Stopped {
+                    break;
+                }
+            }
+        }
+        // The track played to its end, and its listen waits.
+        assert_eq!(waiting(&scratch), 1);
+
+        // The hub comes back where it was, and takes the listen once.
+        let _hub = start_on(&scratch, "hub", Listen::on_port(port)).await;
+        delivered(&scratch).await;
+        assert_eq!(at_hub(&scratch, desk.server_id()).len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listen_sent_again_is_taken_once_and_only_from_its_own_player() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, _hub_client, desk, mut desk_client) = linked_player(&scratch).await;
+        let ids = song_ids(&desk_client.list_open(&songs()).await.unwrap().rows);
+        play_to_the_end(&mut desk_client, PlaySource::Tracks { ids: vec![ids[0]] }).await;
+        delivered(&scratch).await;
+        // The listen as the hub stored it, as a satellite whose
+        // acknowledgement was lost would send it again.
+        let hub_db =
+            rusqlite::Connection::open(scratch.data_dir("hub").join("library.db")).unwrap();
+        let payload: String = hub_db
+            .query_row(
+                "SELECT payload_json FROM history_observation WHERE kind = 'listen' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let record: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let listen_id: ritornel_client::contract::Id =
+            record["listenId"].as_str().unwrap().parse().unwrap();
+
+        let token = {
+            let db =
+                rusqlite::Connection::open(scratch.data_dir("desk").join("server.db")).unwrap();
+            db.query_row("SELECT token FROM hub_link", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+        };
+        let linked = Client::connect(hub.endpoint(), &Credential::new(&token))
+            .await
+            .unwrap();
+        linked
+            .hello(&HelloParams {
+                name: "desk".to_owned(),
+                kind: ClientKind::Server,
+                version: "1".to_owned(),
+                contract_version: CONTRACT_VERSION,
+            })
+            .await
+            .unwrap();
+        let send = |record: serde_json::Value, id| LinkListenParams {
+            idempotency_key: id,
+            record,
+            sent_at_ms: 1,
+            sent_mono_ms: 1,
+            sent_boot: id,
+        };
+        let again = linked
+            .call::<LinkListen>(&send(record.clone(), listen_id))
+            .await
+            .unwrap();
+        assert_eq!(again.taken, ListenTaken::Duplicate);
+        assert_eq!(at_hub(&scratch, desk.server_id()).len(), 1);
+
+        // A listen of another server's player is not this satellite's to
+        // report.
+        let mut forged = record.clone();
+        forged["playedOnServer"] = serde_json::json!(hub.server_id().to_string());
+        let refused = linked
+            .call::<LinkListen>(&send(forged, listen_id))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
+        // Nor does a client of the hub report listens at all.
+        let hub_client = client(&scratch, "hub", &hub).await;
+        let refused = hub_client
+            .call::<LinkListen>(&send(record, listen_id))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
     })
     .await;
 }

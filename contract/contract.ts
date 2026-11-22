@@ -130,6 +130,7 @@ export const METHODS = {
   "link.status": { kind: "query", needsFull: true },
   "link.tracks": { kind: "query", needsFull: true },
   "link.copies": { kind: "query", needsFull: true },
+  "link.listen": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -205,6 +206,7 @@ export type MethodMap = {
   "link.status": { params: NoParams; result: LinkStatus };
   "link.tracks": { params: LinkTracksParams; result: LinkTracks };
   "link.copies": { params: LinkCopiesParams; result: LinkCopies };
+  "link.listen": { params: LinkListenParams; result: LinkListened };
 };
 
 /** The name of a method. */
@@ -2272,6 +2274,44 @@ export type LinkJoinParams = {
 };
 
 /**
+ * The params of `link.listen`: one listen a satellite's player recorded,
+ * as its outbox sends it, with the stamps of this send.
+ */
+export type LinkListenParams = {
+  /**
+   * The listen's ID, which is also its source key at the hub: sent
+   * again, it is taken in once.
+   */
+  idempotencyKey: string,
+  /**
+   * The listen record, as the playing server staged it.
+   */
+  record: JsonValue,
+  /**
+   * The satellite's wall clock when it sent this.
+   */
+  sentAtMs: number,
+  /**
+   * Its monotonic clock then.
+   */
+  sentMonoMs: number,
+  /**
+   * The boot that clock counts from.
+   */
+  sentBoot: string,
+};
+
+/**
+ * The result of `link.listen`.
+ */
+export type LinkListened = {
+  /**
+   * What became of it.
+   */
+  taken: ListenTaken,
+};
+
+/**
  * The result of `link.status`, and of `link.join`.
  */
 export type LinkStatus = {
@@ -2517,6 +2557,11 @@ export type ListWindowParams = {
    */
   limit: number,
 };
+
+/**
+ * What became of a listen a satellite sent.
+ */
+export type ListenTaken = "stored" | "duplicate" | "conflict";
 
 /**
  * The result of `media.token`: what a page puts in the query string of a

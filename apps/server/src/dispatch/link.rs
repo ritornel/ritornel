@@ -7,14 +7,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::PoisonError;
 
+use ritornel_contract::methods::{LinkListen, Method};
 use ritornel_contract::{
     CONTRACT_VERSION, ErrorCode, HubCopy, HubStatus, Id, InviteLink, LinkCopies, LinkCopiesParams,
-    LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkRequest, LinkStatus, LinkTracks,
-    LinkTracksParams, MAX_CLIENT_TEXT, RpcError, SatelliteStatus, ServerRole, hex,
-    link_request_proof,
+    LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened,
+    LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken, MAX_CLIENT_TEXT, RpcError,
+    SatelliteStatus, ServerRole, hex, link_request_proof,
 };
-use ritornel_engine::HubLink;
-use ritornel_engine::playback::{Catalog, FileFacts};
+use ritornel_engine::playback::{Catalog, Delivered, FileFacts, deliver_listens_to};
+use ritornel_engine::{Clock, HubLink, Ingested, ListenRecord, SendStamps};
 use tracing::{info, warn};
 
 use super::{Core, Stores, lock};
@@ -24,6 +25,11 @@ use crate::session::Session;
 /// The most tracks one `link.tracks` answers for, so that no answer
 /// outgrows a frame.
 const MAX_TRACKS_ASKED: usize = 1000;
+
+/// How long a listen waits before it is sent again to a hub that did not
+/// take it. The hub not answering is the usual reason, and it is soon
+/// back, so a satellite tries more often than a hub retries its own disk.
+const HUB_BACKOFF_MS: i64 = 30_000;
 
 /// Where a call is answered on a satellite.
 pub(super) enum Route {
@@ -470,6 +476,106 @@ impl Core {
             .into_iter()
             .find(|copy| copy.source_item() == source_item && copy.revision_no() == revision)
             .and_then(|copy| Some((copy.path(&roots)?, copy.facts())))
+    }
+
+    /// `link.listen`, on a hub: one listen from a satellite's outbox, taken
+    /// in as the hub's own player's are. A satellite reports listens for
+    /// its own player only.
+    pub(super) fn link_listen(
+        &self,
+        stores: &Stores,
+        session: &Session,
+        params: LinkListenParams,
+    ) -> Result<LinkListened, RpcError> {
+        let Some(peer) = session.peer() else {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "link.listen is for a satellite's link session",
+            ));
+        };
+        let record: ListenRecord = serde_json::from_value(params.record).map_err(|error| {
+            RpcError::new(ErrorCode::Invalid, format!("that is not a listen: {error}"))
+        })?;
+        if record.played_on_server != peer || record.listen_id != params.idempotency_key {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "a satellite reports the listens of its own player, each under its own ID",
+            ));
+        }
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let library = library.as_ref().ok_or_else(not_a_hub)?;
+        let ingested = library
+            .ingest_listen(
+                &record,
+                SendStamps {
+                    sent_at_ms: params.sent_at_ms,
+                    sent_mono_ms: params.sent_mono_ms,
+                    sent_boot: params.sent_boot,
+                },
+            )
+            .map_err(internal)?;
+        let taken = match ingested {
+            Ingested::Stored(_) => {
+                // A play that counts may now be scrobbled, here.
+                self.wake_scrobbler();
+                ListenTaken::Stored
+            }
+            Ingested::Duplicate => ListenTaken::Duplicate,
+            Ingested::Conflict => {
+                warn!(
+                    listen_id = %record.listen_id,
+                    satellite = %peer,
+                    "a satellite sent a listen the record holds otherwise"
+                );
+                ListenTaken::Conflict
+            }
+        };
+        Ok(LinkListened { taken })
+    }
+
+    /// On a satellite, delivers the listens whose turn has come to its hub,
+    /// with `link.listen` on the server's own connection, as
+    /// [`deliver_listens`](ritornel_engine::playback::deliver_listens)
+    /// delivers to a library. `None` on any other server.
+    pub(crate) fn deliver_to_hub(
+        &self,
+        clock: &dyn Clock,
+        stamps: &dyn Fn() -> SendStamps,
+        after_ingest: &dyn Fn() -> Result<(), ritornel_engine::Error>,
+    ) -> Option<Result<Delivered, ritornel_engine::Error>> {
+        let uplink = self.uplink()?;
+        let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
+        let stores = stores.as_ref()?;
+        let send = |record: &ListenRecord, stamps: SendStamps| {
+            let params = LinkListenParams {
+                idempotency_key: record.listen_id,
+                record: serde_json::to_value(record)?,
+                sent_at_ms: stamps.sent_at_ms,
+                sent_mono_ms: stamps.sent_mono_ms,
+                sent_boot: stamps.sent_boot,
+            };
+            let answer = uplink
+                .call(LinkListen::NAME, serde_json::to_value(params)?)
+                .map_err(|error| ritornel_engine::Error::Playback(error.message))?;
+            let listened: LinkListened = serde_json::from_value(answer)?;
+            Ok(match listened.taken {
+                // The hub's revision is the hub's: nothing here reads it.
+                ListenTaken::Stored => Ingested::Stored(0),
+                ListenTaken::Duplicate => Ingested::Duplicate,
+                ListenTaken::Conflict => Ingested::Conflict,
+            })
+        };
+        Some(deliver_listens_to(
+            &stores.server,
+            &send,
+            clock,
+            stamps,
+            after_ingest,
+            HUB_BACKOFF_MS,
+        ))
     }
 
     /// `link.status`.
