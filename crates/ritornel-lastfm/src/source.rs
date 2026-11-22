@@ -234,7 +234,20 @@ async fn scan(
 }
 
 /// Only a complete list may replace the saved loved tracks.
-fn loved_page_complete(read: u64, total: u64, empty: bool, last: bool) -> Result<bool, Error> {
+fn loved_page_complete(
+    read: u64,
+    total: u64,
+    empty: bool,
+    last: bool,
+    number: u32,
+    per_page: u32,
+) -> Result<bool, Error> {
+    let expected = total.min(u64::from(number) * u64::from(per_page));
+    if read != expected {
+        return Err(Error::source(format!(
+            "Last.fm's loved-track page {number} accounts for {read} tracks, expected {expected}"
+        )));
+    }
     if read == total && last && (!empty || total == 0) {
         return Ok(true);
     }
@@ -272,10 +285,11 @@ async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Ve
         }
         let total = page.total();
         let pages = page.total_pages();
-        let (expected_total, expected_pages) = *first_paging.get_or_insert((total, pages));
-        if (total, pages) != (expected_total, expected_pages) {
+        let paging = (total, pages, page.per_page());
+        let expected = *first_paging.get_or_insert(paging);
+        if paging != expected {
             return Err(Error::source(format!(
-                "Last.fm's loved-track list changed on page {page_number}: expected {expected_total} tracks in {expected_pages} pages, found {total} in {pages}"
+                "Last.fm's loved-track list changed on page {page_number}: the total, page count or page size differs from the first page"
             )));
         }
         let rows = page.len();
@@ -284,11 +298,18 @@ async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Ve
             title: row.track().name().to_owned(),
             loved_at_ms: seconds_to_ms(row.loved_at()),
         }));
-        if loved_page_complete(loves.len() as u64, total, rows == 0, page_number >= pages)? {
+        if loved_page_complete(
+            loves.len() as u64,
+            total,
+            rows == 0,
+            page_number >= pages,
+            page_number,
+            page.per_page(),
+        )? {
             let mut seen = HashSet::new();
             if !loves
                 .iter()
-                .all(|row| seen.insert((&row.artist, &row.title, row.loved_at_ms)))
+                .all(|row| seen.insert((&row.artist, &row.title)))
             {
                 return Err(Error::source(
                     "Last.fm repeated a loved track while reading the list",
@@ -315,10 +336,20 @@ impl LastfmSource<'_> {
             Some(read_before) if !full => read_before.min(now).saturating_sub(settings.recent_s),
             _ => 0,
         };
+        if sink.stopping() {
+            return Ok(Synced {
+                stopped: true,
+                ..Synced::default()
+            });
+        }
         let mut synced = Synced {
             source_total: Some(count(client, user, 0, now).await.map_err(|e| failed(&e))?),
             ..Synced::default()
         };
+        if sink.stopping() {
+            synced.stopped = true;
+            return Ok(synced);
+        }
         let to_read = if start == 0 {
             synced.source_total
         } else {

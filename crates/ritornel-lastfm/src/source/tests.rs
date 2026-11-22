@@ -361,13 +361,14 @@ fn cancelling_between_pages_discards_the_incomplete_span_or_loved_list() {
 
 #[test]
 fn a_partial_last_page_cannot_replace_loved_tracks() {
-    assert!(loved_page_complete(1, 2, false, true).is_err());
-    assert!(loved_page_complete(1, 2, true, false).is_err());
-    assert!(loved_page_complete(2, 2, true, true).is_err());
-    assert!(loved_page_complete(2, 1, false, true).is_err());
-    assert!(loved_page_complete(0, 0, true, true).unwrap());
-    assert!(!loved_page_complete(1, 2, false, false).unwrap());
-    assert!(loved_page_complete(2, 2, false, true).unwrap());
+    assert!(loved_page_complete(1, 4, false, false, 1, 2).is_err());
+    assert!(loved_page_complete(1, 2, false, true, 1, 1).is_err());
+    assert!(loved_page_complete(1, 2, true, false, 1, 1).is_err());
+    assert!(loved_page_complete(2, 2, true, true, 2, 1).is_err());
+    assert!(loved_page_complete(2, 1, false, true, 2, 1).is_err());
+    assert!(loved_page_complete(0, 0, true, true, 1, 1).unwrap());
+    assert!(!loved_page_complete(1, 2, false, false, 1, 1).unwrap());
+    assert!(loved_page_complete(2, 2, false, true, 2, 1).unwrap());
 }
 
 #[test]
@@ -402,6 +403,7 @@ fn a_change_between_pages_cannot_clear_a_different_track() {
                             .collect();
                         if same_total {
                             updated.rotate_right(1);
+                            updated[1000].2 += 1;
                         } else {
                             updated.remove(0);
                         }
@@ -420,4 +422,24 @@ fn a_change_between_pages_cannot_clear_a_different_track() {
         assert_eq!(sink.loves.len(), 1);
         assert_eq!(sink.loves[0].title, format!("Invented Song {held}"));
     }
+}
+
+#[test]
+fn cancellation_after_the_first_count_stops_an_incremental_import() {
+    let fake = std::sync::Arc::new(FakeLastfm::start("someone", history(1)));
+    let mut sink = Memory {
+        cursor: Some(cursor(NOW)),
+        on_stop_check: Some(Box::new({
+            let fake = fake.clone();
+            move || !fake.seen().is_empty()
+        })),
+        ..Memory::default()
+    };
+    let synced = lastfm(&fake, 10)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut sink, false)
+        .unwrap();
+    assert!(synced.stopped);
+    assert_eq!(fake.seen().len(), 1);
 }
