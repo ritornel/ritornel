@@ -49,13 +49,15 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use ritornel_contract::route::{self, Health, HealthStatus};
-use ritornel_contract::{ART_SIZES, Id, MEDIA_TOKEN_PARAM, SessionKind, TICKET_PARAM};
+use ritornel_contract::{
+    ART_SIZES, Id, MEDIA_TOKEN_PARAM, NONCE_PARAM, SessionKind, TICKET_PARAM, hex,
+};
 use ritornel_engine::SessionToken;
 use serde::Serialize;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::dispatch::{Core, MAX_MESSAGE_BYTES};
 use crate::ticket::Tickets;
@@ -77,6 +79,10 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 /// checks" in docs/internals/contract.md). This string is all the server
 /// knows of the desktop's shell.
 const DESKTOP_ORIGIN: &str = "tauri://localhost";
+
+/// The shortest and the longest nonce the descriptor signs, in bytes.
+const MIN_NONCE_BYTES: usize = 16;
+const MAX_NONCE_BYTES: usize = 64;
 
 /// Where a request carried what let it in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,12 +133,13 @@ impl Listening {
         core: Arc<Core>,
         tickets: Tickets,
         listener: TcpListener,
+        listen: Listen,
         bounds: Bounds,
     ) -> Result<Self, Error> {
         let endpoint = listener.local_addr().map_err(Error::Runtime)?;
         let (stopping, stopped) = watch::channel(false);
         let router = router(core, Arc::new(tickets));
-        let task = tokio::spawn(accept(listener, router, stopped, bounds));
+        let task = tokio::spawn(accept(listener, listen, router, stopped, bounds));
         Ok(Self {
             endpoint,
             stopping,
@@ -143,6 +150,12 @@ impl Listening {
     /// The address and the port really bound.
     pub(crate) fn endpoint(&self) -> SocketAddr {
         self.endpoint
+    }
+
+    /// Where a client on this machine reaches it: the loopback address,
+    /// on the port really bound, whatever interfaces it is bound to.
+    pub(crate) fn local_endpoint(&self) -> SocketAddr {
+        (std::net::Ipv4Addr::LOCALHOST, self.endpoint.port()).into()
     }
 
     /// Stops accepting connections and ends the ones there are: each gets
@@ -177,6 +190,7 @@ async fn stopped(stopping: &mut watch::Receiver<bool>) {
 /// not send one is closed after `bounds.header_wait`.
 async fn accept(
     listener: TcpListener,
+    listen: Listen,
     router: Router,
     mut stopping: watch::Receiver<bool>,
     bounds: Bounds,
@@ -199,6 +213,11 @@ async fn accept(
             accepted = listener.accept() => accepted,
         };
         match accepted {
+            // Closed at once, before a byte is read: a peer from outside
+            // the networks this server listens to is told nothing.
+            Ok((_, peer)) if !listen.admits(peer.ip()) => {
+                debug!(%peer, "a connection from outside the private network is closed");
+            }
             Ok((stream, _)) => {
                 connections.spawn(serve(
                     stream,
@@ -374,8 +393,21 @@ fn json<T: Serialize>(body: &T) -> Response {
     }
 }
 
-async fn descriptor(State(core): State<Arc<Core>>) -> Response {
-    json(&core.public_descriptor())
+/// The public descriptor. With `?nonce=` it carries the server's proof
+/// that it holds its key, signed for that nonce.
+async fn descriptor(State(core): State<Arc<Core>>, request: Request) -> Response {
+    let nonce = request.uri().query().and_then(|query| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(NONCE_PARAM)?.strip_prefix('='))
+    });
+    match nonce.map(hex::decode) {
+        None => json(&core.public_descriptor(None)),
+        Some(Some(nonce)) if (MIN_NONCE_BYTES..=MAX_NONCE_BYTES).contains(&nonce.len()) => {
+            json(&core.public_descriptor(Some(&nonce)))
+        }
+        Some(_) => (StatusCode::BAD_REQUEST, "a nonce is 32 to 128 hex digits\n").into_response(),
+    }
 }
 
 async fn health() -> Response {

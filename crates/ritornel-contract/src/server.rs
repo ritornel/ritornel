@@ -134,6 +134,33 @@ pub struct PublicDescriptor {
     /// that serves no covers.
     #[serde(default)]
     pub art_sizes: Vec<u32>,
+    /// The server's Ed25519 public key, as 64 hex digits: what a client or
+    /// a peer pins. Left out by a server that has none to give.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub public_key: Option<String>,
+    /// The signature, as 128 hex digits, of [`descriptor_proof`] for the
+    /// nonce the caller sent as `?nonce=`: proof that the answer came from
+    /// the holder of `public_key`. Left out when no nonce was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub proof: Option<String>,
+}
+
+/// The query parameter that carries a nonce to [`route::DESCRIPTOR`]
+/// (crate::route): 32 to 128 hex digits.
+pub const NONCE_PARAM: &str = "nonce";
+
+/// What a server signs to prove it holds its key: a fixed label, its ID and
+/// the caller's nonce, so a signature made for one question answers no
+/// other.
+pub fn descriptor_proof(server_id: Id, nonce: &[u8]) -> Vec<u8> {
+    const LABEL: &[u8] = b"ritornel descriptor proof v1\0";
+    let mut message = Vec::with_capacity(LABEL.len() + 16 + nonce.len());
+    message.extend_from_slice(LABEL);
+    message.extend_from_slice(server_id.as_bytes());
+    message.extend_from_slice(nonce);
+    message
 }
 
 impl PublicDescriptor {
@@ -708,6 +735,8 @@ mod tests {
             },
             lists: Vec::new(),
             art_sizes: vec![64, 128],
+            public_key: None,
+            proof: None,
         }
     }
 

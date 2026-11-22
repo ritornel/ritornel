@@ -32,7 +32,7 @@ use ritornel_client::contract::{
     ART_SIZES, CONTRACT_VERSION, ClientKind, Descriptor, ErrorCode, Event, HelloParams, Id,
     JobState, JobTarget, LibraryStatus, Limits, ListSupport, PublicDescriptor, Receipt,
     ReceiptStatus, ServerInfo, ServerRole, SessionKind, SourceKind, Topic, WatchingParams,
-    capability, route,
+    capability, descriptor_proof, hex, route,
 };
 use ritornel_client::{Client, Credential, NotRunning, local};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -209,6 +209,8 @@ impl Running {
             },
             lists: ListSupport::all(),
             art_sizes: ART_SIZES.to_vec(),
+            public_key: Some(self.server.public_key()),
+            proof: None,
         }
     }
 
@@ -355,6 +357,7 @@ async fn hello_answers_with_the_descriptor(via: Via) {
             "limits",
             "lists",
             "name",
+            "publicKey",
             "role",
             "serverId",
             "sessionKind"
@@ -1279,6 +1282,60 @@ async fn the_descriptor_is_the_only_route_that_needs_no_credential() {
         // The socket's route without an upgrade is not a way in.
         let plain = status_of(endpoint, route::WS, Some(&credential)).await;
         assert!((400..500).contains(&plain), "{plain}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_descriptor_signs_a_nonce_with_the_key_it_gives() {
+    bounded(async {
+        let running = Running::start().await;
+        let endpoint = running.endpoint();
+        let nonce = [0x5a_u8; 16];
+        let path = format!("{}?nonce={}", route::DESCRIPTOR, hex::encode(&nonce));
+        let answer = ritornel_client::get(endpoint, &path, None).await.unwrap();
+        assert_eq!(answer.status, 200);
+        let descriptor: PublicDescriptor = serde_json::from_slice(&answer.body).unwrap();
+        let key: [u8; 32] = hex::decode_array(descriptor.public_key.as_deref().unwrap()).unwrap();
+        let proof: [u8; 64] = hex::decode_array(descriptor.proof.as_deref().unwrap()).unwrap();
+        assert_eq!(hex::encode(&key), running.server.public_key());
+        let message = descriptor_proof(running.server.server_id(), &nonce);
+        assert!(ritornel_engine::verify_signature(&key, &message, &proof));
+        // It proves this nonce, and no other.
+        let other = descriptor_proof(running.server.server_id(), &[0xa5; 16]);
+        assert!(!ritornel_engine::verify_signature(&key, &other, &proof));
+        // Without a nonce it proves nothing, and a nonce too short, too long
+        // or not hex is refused.
+        assert_eq!(
+            ritornel_client::descriptor(endpoint).await.unwrap().proof,
+            None
+        );
+        for nonce in ["00".repeat(15), "00".repeat(65), "zz".repeat(16)] {
+            let path = format!("{}?nonce={nonce}", route::DESCRIPTOR);
+            assert_eq!(status_of(endpoint, &path, None).await, 400, "{nonce}");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_server_on_the_private_network_is_found_on_loopback() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let server = start_on(&scratch.data_dir(), Listen::private_on_port(0))
+            .await
+            .unwrap();
+        assert!(server.endpoint().ip().is_unspecified());
+        // A client on this machine is told the loopback address, which
+        // every system connects to.
+        let found = local::find(&scratch.data_dir()).await.unwrap();
+        assert_eq!(
+            found.endpoint,
+            SocketAddr::from(([127, 0, 0, 1], server.endpoint().port()))
+        );
+        assert_eq!(found.descriptor.server_id, server.server_id());
+        drop(found);
+        server.stop().await.unwrap();
     })
     .await;
 }

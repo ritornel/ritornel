@@ -78,6 +78,47 @@ impl fmt::Debug for SigningKey {
     }
 }
 
+/// What a running server signs with: its signing key, read once from
+/// `server.db` so that a signature needs neither the file nor the database.
+/// It proves to a client or a peer that it reached the holder of the key it
+/// pinned (docs/design/linking.md, "Identity and the hub role").
+pub struct Signer(SigningKey);
+
+impl Signer {
+    pub(crate) fn new(seed: [u8; 32]) -> Self {
+        Self(SigningKey(seed))
+    }
+
+    /// The Ed25519 signature of `message`.
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer as _;
+        ed25519_dalek::SigningKey::from_bytes(self.0.expose())
+            .sign(message)
+            .to_bytes()
+    }
+
+    /// The public half: what clients and peers pin.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.0.public_key()
+    }
+}
+
+impl fmt::Debug for Signer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Signer(<redacted>)")
+    }
+}
+
+/// Whether `signature` is the signature of `message` by the holder of
+/// `public_key`. A key that is not a point on the curve verifies nothing.
+pub fn verify_signature(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    VerifyingKey::from_bytes(public_key).is_ok_and(|key| {
+        key.verify_strict(message, &Signature::from_bytes(signature))
+            .is_ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +171,21 @@ mod tests {
         let signature = ed25519_dalek::SigningKey::from_bytes(key.expose()).sign(b"nonce");
         let public = VerifyingKey::from_bytes(&key.public_key()).unwrap();
         public.verify(b"nonce", &signature).unwrap();
+    }
+
+    #[test]
+    fn a_signer_signs_what_its_public_key_verifies_and_nothing_else() {
+        let key = SigningKey::generate(&CountingEntropy::default()).unwrap();
+        let signer = Signer::new(*key.expose());
+        let signature = signer.sign(b"nonce");
+        assert!(verify_signature(&signer.public_key(), b"nonce", &signature));
+        assert!(!verify_signature(
+            &signer.public_key(),
+            b"other",
+            &signature
+        ));
+        let other = Signer::new([0x5a; 32]);
+        assert!(!verify_signature(&other.public_key(), b"nonce", &signature));
+        assert_eq!(format!("{signer:?}"), "Signer(<redacted>)");
     }
 }

@@ -51,7 +51,10 @@ Options:
                         one is taken. A port given here is used or the
                         server does not start, and port 0 asks the system
                         for one. Clients read the port from server.json in
-                        the data directory
+                        the data directory. private and a port, such as
+                        private:4747, listens on every interface and takes
+                        connections from private networks only, for other
+                        machines' servers to link to this one
   --owned               Stop when standard input closes. A program that
                         starts the server holds the other end of that pipe,
                         so the server cannot outlive it
@@ -434,8 +437,9 @@ mod tests {
         assert_eq!(out, "");
         assert_eq!(
             err,
-            "ritornel-server: --listen must be 127.0.0.1 and a port, such as 127.0.0.1:4747: \
-             the server listens on loopback only\n"
+            "ritornel-server: --listen must be 127.0.0.1 and a port, such as 127.0.0.1:4747, \
+             or private and a port, such as private:4747: the server listens on loopback or \
+             the private network only\n"
         );
         assert!(!scratch.path().join("server.json").exists());
         assert!(!scratch.path().join("server.db-wal").exists());
