@@ -10,6 +10,7 @@
 --   0004_observation_recording_correction  f500fbf7eb27851be43e1fc97395fa05818b4bd0186480758c6161fafd92059a
 --   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
+--   0007_delivery_sender  e2c3de41853e7648ac743d931cd1113c889d8e71d7ad133bb649d493c9203b06
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -703,7 +704,7 @@ CREATE TABLE history_delivery (
   next_attempt_at_ms  INTEGER,            -- when a pending row is next due
   created_at_ms       INTEGER NOT NULL,
   updated_at_ms       INTEGER NOT NULL,
-  rev                 INTEGER NOT NULL,
+  rev                 INTEGER NOT NULL, sent_by_server_id INTEGER REFERENCES server(id),
   UNIQUE (observation_id, endpoint_id),
   CHECK ((state = 'accepted') = (accepted_artist IS NOT NULL AND accepted_title IS NOT NULL)),
   CHECK ((state = 'ignored') = (ignored_code IS NOT NULL))

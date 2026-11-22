@@ -1073,6 +1073,13 @@ fn a_counted_listen_is_recorded_before_it_is_sent_once_and_its_echo_joins_its_pl
     );
     assert_eq!(sent.timestamp_s, start / 1000);
     assert_eq!(sent.duration_ms, Some(240_000));
+    // The row says who sent it: this server, the hub.
+    assert_eq!(
+        at.count(
+            "SELECT count(*) FROM history_delivery d JOIN library_meta m ON m.hub_server_id = d.sent_by_server_id"
+        ),
+        1
+    );
     // Taken once, it is not taken again.
     assert!(
         at.library
