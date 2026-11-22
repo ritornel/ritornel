@@ -96,6 +96,9 @@ ritornel-client.workspace = true
 # credential, or with an `Origin`, and a message over the limit.
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 tokio-tungstenite = "0.29.0"
+# To leave a library as an older build would have: in rollback-journal
+# mode, a migration behind.
+rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled"] }
 
 [lints]
 workspace = true

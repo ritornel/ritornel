@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::migrate::{self, Migrated};
@@ -358,12 +358,9 @@ impl LibraryStore {
         clock: Arc<dyn Clock>,
         entropy: Arc<dyn Entropy>,
     ) -> Result<Self, Error> {
-        sqlite::assert_version()?;
-        // SQLite would make the file, and a library is never made by
-        // looking for one.
-        if !path.try_exists().unwrap_or(true) {
-            return Err(Error::NoLibrary);
-        }
+        // Starting the writer sets the journal mode, so the pointer is read
+        // first on a connection that writes nothing.
+        Self::check(path, server_id)?;
         let location = Location::File(path.to_owned());
         let writer = Writer::start(&location, "library.db writer")?;
         let (migrated, library_id) = {
@@ -389,6 +386,26 @@ impl LibraryStore {
             hub: server_id,
             on_commit: OnCommit::default(),
         })
+    }
+
+    /// What `library_meta` says in the library at `path`, if the server
+    /// `server_id` may write it. It refuses with [`Error::NotTheHub`] and
+    /// [`Error::NoLibrary`] as [`open`](Self::open) does, and reads on a
+    /// read-only connection, so nothing in the file changes, its journal
+    /// mode included.
+    pub fn check(path: &Path, server_id: Id) -> Result<LibraryMeta, Error> {
+        sqlite::assert_version()?;
+        // SQLite would make the file, and a library is never made by
+        // looking for one.
+        if !path.try_exists().unwrap_or(true) {
+            return Err(Error::NoLibrary);
+        }
+        let connection = Location::File(path.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let meta = read_meta(&connection)?.ok_or(Error::NoLibrary)?;
+        if meta.hub != Some(server_id) {
+            return Err(not_the_hub(&meta, server_id));
+        }
+        Ok(meta)
     }
 
     /// The library's ID.
@@ -1403,7 +1420,9 @@ mod tests {
         let library = store.library_id();
         store.close().unwrap();
 
-        // A server other than the one the pointer names.
+        // A server other than the one the pointer names, on a library in
+        // rollback-journal mode, which opening it for writing would change.
+        tamper_file(&path, "PRAGMA journal_mode = DELETE");
         let before = std::fs::read(&path).unwrap();
         let refused = open_on_disk(&path, id(0x22));
         let Err(Error::NotTheHub {

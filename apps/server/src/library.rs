@@ -35,13 +35,19 @@ pub(crate) fn open(
     let opened = || LibraryStore::open(&path, identity.server_id, clock.clone(), entropy.clone());
     let (identity, library) = match identity.role {
         Role::Hub => {
-            let library = opened().map_err(Error::Library)?;
-            if identity.library_id != Some(library.library_id()) {
+            // Checked before the library is opened for writing, which would
+            // set its journal mode and migrate it: a library refused here is
+            // left exactly as it was.
+            let found = LibraryStore::check(&path, identity.server_id)
+                .map_err(Error::Library)?
+                .library_id;
+            if identity.library_id != Some(found) {
                 return Err(Error::AnotherLibrary {
                     claimed: identity.library_id,
-                    found: library.library_id(),
+                    found,
                 });
             }
+            let library = opened().map_err(Error::Library)?;
             (identity, library)
         }
         Role::Unassigned => match opened() {
@@ -267,6 +273,58 @@ mod tests {
         );
     }
 
+    /// Puts the library at `path` back as an older build would have left
+    /// it: in rollback-journal mode, and a migration behind.
+    fn as_an_older_build_left_it(path: &Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA journal_mode = DELETE;
+                 DELETE FROM schema_migration
+                 WHERE version = (SELECT max(version) FROM schema_migration);",
+            )
+            .unwrap();
+    }
+
+    /// Asserts that the library at `path` holds `before`, and that nothing
+    /// was opened for writing beside it.
+    fn untouched(path: &Path, before: &[u8]) {
+        assert!(
+            std::fs::read(path).unwrap() == before,
+            "library.db was written"
+        );
+        for log in ["library.db-wal", "library.db-shm", "library.db-journal"] {
+            assert!(!path.with_file_name(log).exists(), "{log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hub_refuses_another_library_before_writing_anything_in_it() {
+        let scratch = Scratch::new();
+        let data_dir = scratch.path().join("data");
+        let server = start(&data_dir).await.unwrap();
+        let this = server.server_id();
+        client(&server)
+            .await
+            .create_library(key(0xc0))
+            .await
+            .unwrap();
+        server.stop().await.unwrap();
+
+        // A library this server may write, and not the one it holds, left
+        // by an older build.
+        let library_db = data_dir.join("library.db");
+        std::fs::remove_file(&library_db).unwrap();
+        library_of(this, &library_db);
+        as_an_older_build_left_it(&library_db);
+        let before = std::fs::read(&library_db).unwrap();
+
+        let refused = start(&data_dir).await.unwrap_err();
+        assert!(matches!(refused, Error::AnotherLibrary { .. }), "{refused}");
+        // Neither migrated nor switched to write-ahead logging.
+        untouched(&library_db, &before);
+    }
+
     #[tokio::test]
     async fn a_creation_cut_short_between_the_two_files_is_finished_at_the_next_start() {
         let scratch = Scratch::new();
@@ -299,12 +357,13 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let library_db = data_dir.join("library.db");
         library_of(key(0x22), &library_db);
+        as_an_older_build_left_it(&library_db);
         let before = std::fs::read(&library_db).unwrap();
 
         let server = start(&data_dir).await.unwrap();
         let found = status(&server).await;
         assert_eq!((found.role, found.library), (ServerRole::Unassigned, None));
         server.stop().await.unwrap();
-        assert_eq!(std::fs::read(&library_db).unwrap(), before);
+        untouched(&library_db, &before);
     }
 }
