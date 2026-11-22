@@ -67,6 +67,10 @@ pub(crate) fn dim() -> Rgba {
 pub(crate) fn faint() -> Rgba {
     pick(0x8d8e97ff, 0x616979ff)
 }
+/// What went wrong: `--warn`.
+pub(crate) fn warn() -> Rgba {
+    pick(0xe59a6cff, 0xb4572aff)
+}
 pub(crate) fn acc() -> Rgba {
     pick(0x8fb4d9ff, 0x5a61d6ff)
 }

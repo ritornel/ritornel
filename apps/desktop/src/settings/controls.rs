@@ -43,10 +43,6 @@ pub(crate) fn row_line() -> Rgba {
 pub(crate) fn chosen() -> Rgba {
     pick(0xffffff1a, 0x1c223017)
 }
-/// What went wrong: `--warn`.
-pub(crate) fn warn() -> Rgba {
-    pick(0xe59a6cff, 0xb4572aff)
-}
 /// A folder's colour: `color-mix(in srgb, var(--acc) 70%, var(--dim))`.
 pub(crate) fn folder() -> Rgba {
     theme::mix(theme::dim(), theme::acc(), 0.7)
@@ -184,7 +180,7 @@ pub(crate) fn problem(text: impl Into<SharedString>) -> Div {
         .mx(px(2.))
         .text_size(px(11.))
         .line_height(px(SMALL_LINE))
-        .text_color(warn())
+        .text_color(theme::warn())
         .child(text.into())
 }
 
