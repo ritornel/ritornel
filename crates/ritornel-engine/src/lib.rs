@@ -123,7 +123,7 @@ pub use ritornel_contract::Id;
 pub use ritornel_domain::history::{LocalTime, known_zone, local_time, start_of_day_ms};
 pub use scan::{ScanRun, ScanSettings, run_scan, scan_summary};
 pub use scan_store::Source;
-pub use secret::SessionToken;
+pub use secret::{SessionToken, Signer, verify_signature};
 pub use server_store::{
     BackupFailed, BackupTaken, Changed, Role, ServerIdentity, ServerStore, SettingChange,
 };

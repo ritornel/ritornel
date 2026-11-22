@@ -846,6 +846,17 @@ export type Descriptor = {
    * that serves no covers.
    */
   artSizes: Array<number>,
+  /**
+   * The server's Ed25519 public key, as 64 hex digits: what a client or
+   * a peer pins. Left out by a server that has none to give.
+   */
+  publicKey?: string,
+  /**
+   * The signature, as 128 hex digits, of [`descriptor_proof`] for the
+   * nonce the caller sent as `?nonce=`: proof that the answer came from
+   * the holder of `public_key`. Left out when no nonce was sent.
+   */
+  proof?: string,
 };
 
 /**
@@ -3205,6 +3216,17 @@ export type PublicDescriptor = {
    * that serves no covers.
    */
   artSizes: Array<number>,
+  /**
+   * The server's Ed25519 public key, as 64 hex digits: what a client or
+   * a peer pins. Left out by a server that has none to give.
+   */
+  publicKey?: string,
+  /**
+   * The signature, as 128 hex digits, of [`descriptor_proof`] for the
+   * nonce the caller sent as `?nonce=`: proof that the answer came from
+   * the holder of `public_key`. Left out when no nonce was sent.
+   */
+  proof?: string,
 };
 
 /**

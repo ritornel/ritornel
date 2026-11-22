@@ -592,6 +592,8 @@ mod tests {
                 },
                 lists: Vec::new(),
                 art_sizes: Vec::new(),
+                public_key: None,
+                proof: None,
             },
         );
         // It holds the lock and has said where it is, as a running server

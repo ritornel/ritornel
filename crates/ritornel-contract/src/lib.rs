@@ -41,6 +41,7 @@ mod command;
 mod error;
 mod event;
 mod frame;
+pub mod hex;
 mod history;
 mod id;
 mod identity;
@@ -115,10 +116,10 @@ pub use search::{MAX_SEARCH_RESULTS, SearchParams, SearchResults, SongFound};
 pub use server::{
     AutoRun, AutoTrigger, BackedUp, BackupFailure, BackupMade, BackupParams, BackupReason,
     BackupStatus, ClientKind, Descriptor, DismissParams, Dismissed, FreeDisk, HelloParams,
-    LibraryStatus, Limits, MAX_CLIENT_TEXT, NoParams, PublicDescriptor, RecordProblem,
+    LibraryStatus, Limits, MAX_CLIENT_TEXT, NONCE_PARAM, NoParams, PublicDescriptor, RecordProblem,
     RecordProblemKind, RecordStatus, ServerInfo, ServerRole, ServerStatus, ServersList,
     SessionKind, Versions, WatchState, WatchStatus, WatchedFolder, WatchedKind, WatchingParams,
-    WatchingSet,
+    WatchingSet, descriptor_proof,
 };
 pub use ticket::{SocketTicket, TICKET_PARAM};
 

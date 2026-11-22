@@ -185,8 +185,14 @@ impl Server {
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
         core.set_watch(run.watch);
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
-        let listening = Listening::start(Arc::clone(&core), tickets, listener, bounds)?;
+        let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
+        if listen.is_private() {
+            warn!(
+                "listening on the private network: what is sent is plain HTTP, which anyone on \
+                 the same network can read"
+            );
+        }
         let worker = Worker::start(Arc::clone(&core), boot_id, run.scan).map_err(Error::Runtime)?;
         let playback = playback::Workers::start(Arc::clone(&core), run.playback, boot_id)
             .map_err(Error::Runtime)?;
@@ -195,8 +201,11 @@ impl Server {
         let watcher = crate::watch::Watcher::start(Arc::clone(&core)).map_err(Error::Runtime)?;
 
         // The server answers, so a client may be told where it is.
-        let server_json =
-            ServerJson::publish(&dir.server_json(), listening.endpoint(), identity.server_id)?;
+        let server_json = ServerJson::publish(
+            &dir.server_json(),
+            listening.local_endpoint(),
+            identity.server_id,
+        )?;
         Ok(Self {
             transports: Transports(Arc::clone(&core)),
             worker,
@@ -214,6 +223,12 @@ impl Server {
     /// The server's ID.
     pub fn server_id(&self) -> Id {
         self.core.server_id()
+    }
+
+    /// The server's public key, as 64 hex digits: what a client or a peer
+    /// pins.
+    pub fn public_key(&self) -> String {
+        self.core.public_key()
     }
 
     /// The server's display name.

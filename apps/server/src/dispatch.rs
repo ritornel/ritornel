@@ -28,7 +28,7 @@ use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
     LibraryCreateParams, LibraryCreated, LibraryStatus, Limits, ListSupport, MAX_CLIENT_TEXT,
     PublicDescriptor, Receipt, ReceiptStatus, Response, RpcError, ServerInfo, ServerRole,
-    ServersEvent, SessionKind, Versions, capability,
+    ServersEvent, SessionKind, Versions, capability, descriptor_proof, hex,
 };
 use ritornel_engine::{
     Client, Clock, Command, Entropy, Fingerprint, LibraryStore, Role, SQLITE_VERSION,
@@ -114,6 +114,8 @@ pub(crate) struct Core {
     stores: RwLock<Option<Stores>>,
     /// What a presented credential is checked against.
     local_credential: Verifier,
+    /// What the descriptor's proof is signed with.
+    signer: ritornel_engine::Signer,
     /// What a library created here takes its times and its IDs from.
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
@@ -206,6 +208,13 @@ impl Core {
         {
             lists::hook(library, &fanout);
         }
+        let signer = stores
+            .server
+            .signer()
+            .map_err(Error::Store)?
+            .ok_or(Error::Store(ritornel_engine::Error::Corrupt(
+                "a running server with no identity",
+            )))?;
         let cache = dir.cache()?;
         let covers = ritornel_engine::covers::Covers::new(&cache).map_err(|error| Error::Io {
             doing: "prepare",
@@ -219,6 +228,7 @@ impl Core {
             cover_pool: CoverPool::start(COVER_THREADS),
             job_events: Mutex::default(),
             local_credential,
+            signer,
             clock,
             entropy,
             bounds,
@@ -249,6 +259,11 @@ impl Core {
         self.server_id
     }
 
+    /// This server's public key, as 64 hex digits.
+    pub(crate) fn public_key(&self) -> String {
+        hex::encode(&self.signer.public_key())
+    }
+
     pub(crate) fn name(&self) -> String {
         lock(&self.this).name.clone()
     }
@@ -273,8 +288,9 @@ impl Core {
             .then_some(SessionKind::Full)
     }
 
-    /// What the server says about itself to anyone who asks.
-    pub(crate) fn public_descriptor(&self) -> PublicDescriptor {
+    /// What the server says about itself to anyone who asks. With a
+    /// nonce, it proves it holds its key by signing it.
+    pub(crate) fn public_descriptor(&self, nonce: Option<&[u8]>) -> PublicDescriptor {
         let this = lock(&self.this);
         let mut capabilities = [
             capability::EVENTS_SERVERS,
@@ -301,6 +317,10 @@ impl Core {
             },
             lists: ListSupport::all(),
             art_sizes: ART_SIZES.to_vec(),
+            public_key: Some(self.public_key()),
+            proof: nonce.map(|nonce| {
+                hex::encode(&self.signer.sign(&descriptor_proof(self.server_id, nonce)))
+            }),
         }
     }
 
@@ -792,7 +812,7 @@ impl Core {
             lastfm.client_opened();
         }
         Ok(Descriptor {
-            server: self.public_descriptor(),
+            server: self.public_descriptor(None),
             session_kind: session.kind(),
         })
     }
@@ -1086,6 +1106,7 @@ mod tests {
                 },
                 "lists": serde_json::to_value(ListSupport::all()).unwrap(),
                 "artSizes": ART_SIZES,
+                "publicKey": core.public_key(),
                 "sessionKind": "limited",
             })
         );
@@ -1391,7 +1412,7 @@ mod tests {
             status["library"],
             json!({ "libraryId": library_id, "revision": 1 })
         );
-        assert_eq!(core.public_descriptor().role, ServerRole::Hub);
+        assert_eq!(core.public_descriptor(None).role, ServerRole::Hub);
         let list = call(&core, &session, "servers.list", None).unwrap();
         assert_eq!(list["servers"][0]["role"], "hub");
         assert_eq!(list["servers"][0]["revision"], 2);
@@ -1676,7 +1697,7 @@ mod tests {
         );
         with_player(&core);
         assert_eq!(
-            core.public_descriptor().capabilities,
+            core.public_descriptor(None).capabilities,
             [
                 "events.servers",
                 "events.library",

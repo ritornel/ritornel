@@ -9,7 +9,7 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -30,25 +30,50 @@ pub(crate) const BACKUP_DIR_VAR: &str = "RITORNEL_BACKUP_DIR";
 /// The port a server listens on when nobody has said and it is free.
 pub(crate) const DEFAULT_PORT: u16 = 4747;
 
-/// Where the server listens. It is always the loopback address 127.0.0.1;
-/// this type cannot name anything else ("Listener and transport boundaries"
-/// in docs/internals/linking.md).
+/// Where the server listens: on loopback, the default, or on the private
+/// network. Nothing else can be named, so the server never binds a public
+/// address ("Listener and transport boundaries" in
+/// docs/internals/linking.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Listen(Option<u16>);
+pub struct Listen {
+    port: Option<u16>,
+    private: bool,
+}
 
 impl Listen {
-    /// What a server does when nobody has said: the default port, or a
-    /// port the system picks if that one is taken. A local client reads
-    /// the port from `server.json` and never assumes it.
-    pub const DEFAULT: Self = Self(None);
+    /// What a server does when nobody has said: loopback, on the default
+    /// port, or a port the system picks if that one is taken. A local
+    /// client reads the port from `server.json` and never assumes it.
+    pub const DEFAULT: Self = Self {
+        port: None,
+        private: false,
+    };
 
-    /// This port and no other. Port 0 asks the system to pick one.
+    /// Loopback, on this port and no other. Port 0 asks the system to pick
+    /// one.
     pub const fn on_port(port: u16) -> Self {
-        Self(Some(port))
+        Self {
+            port: Some(port),
+            private: false,
+        }
     }
 
-    /// The setting as text: `127.0.0.1` and a port.
+    /// Every interface, on this port and no other, taking connections only
+    /// from loopback and private addresses: the mode a hub runs in for its
+    /// satellites to reach it. Port 0 asks the system to pick one.
+    pub const fn private_on_port(port: u16) -> Self {
+        Self {
+            port: Some(port),
+            private: true,
+        }
+    }
+
+    /// The setting as text: `127.0.0.1` and a port, or `private` and a
+    /// port.
     fn parse(text: &str) -> Option<Self> {
+        if let Some(port) = text.strip_prefix("private:") {
+            return port.parse().ok().map(Self::private_on_port);
+        }
         match text.parse() {
             Ok(SocketAddr::V4(address)) if *address.ip() == Ipv4Addr::LOCALHOST => {
                 Some(Self::on_port(address.port()))
@@ -57,15 +82,52 @@ impl Listen {
         }
     }
 
+    /// Whether this listens beyond loopback.
+    pub(crate) fn is_private(self) -> bool {
+        self.private
+    }
+
     /// The address to try first.
     pub(crate) fn address(self) -> SocketAddr {
-        (Ipv4Addr::LOCALHOST, self.0.unwrap_or(DEFAULT_PORT)).into()
+        let ip = if self.private {
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            Ipv4Addr::LOCALHOST
+        };
+        (ip, self.port.unwrap_or(DEFAULT_PORT)).into()
     }
 
     /// The address to fall back to if the first is taken: none when
     /// someone chose the port.
     pub(crate) fn fallback(self) -> Option<SocketAddr> {
-        self.0.is_none().then(|| (Ipv4Addr::LOCALHOST, 0).into())
+        self.port.is_none().then(|| (Ipv4Addr::LOCALHOST, 0).into())
+    }
+
+    /// Whether a connection from `peer` is served. On loopback only
+    /// loopback can connect at all. In private mode a peer must be on
+    /// loopback, a private or link-local network, or a tailnet. This is no
+    /// firewall: behind a proxy or a container's bridge every peer looks
+    /// private.
+    pub(crate) fn admits(self, peer: IpAddr) -> bool {
+        let peer = match peer {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            v4 @ IpAddr::V4(_) => v4,
+        };
+        match peer {
+            IpAddr::V4(v4) => {
+                let [a, b, ..] = v4.octets();
+                // 100.64.0.0/10, the shared address space a tailnet uses.
+                let tailnet = a == 100 && (64..128).contains(&b);
+                v4.is_loopback()
+                    || (self.private && (v4.is_private() || v4.is_link_local() || tailnet))
+            }
+            IpAddr::V6(v6) => {
+                let first = v6.segments()[0];
+                // fc00::/7, unique local, and fe80::/10, link-local.
+                let local = (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80;
+                v6.is_loopback() || (self.private && local)
+            }
+        }
     }
 }
 
@@ -129,7 +191,8 @@ pub enum ConfigError {
     File(toml::de::Error),
     /// The log level is not one of the five.
     LogLevel(Origin),
-    /// The listen address is not 127.0.0.1 and a port.
+    /// The listen address is not 127.0.0.1 and a port, or private and a
+    /// port.
     Listen(Origin),
     /// The backup folder is not an absolute path.
     BackupRelative(Origin),
@@ -149,8 +212,9 @@ impl fmt::Display for ConfigError {
             ),
             Self::Listen(origin) => write!(
                 f,
-                "{} must be 127.0.0.1 and a port, such as 127.0.0.1:{DEFAULT_PORT}: the server \
-                 listens on loopback only",
+                "{} must be 127.0.0.1 and a port, such as 127.0.0.1:{DEFAULT_PORT}, or private \
+                 and a port, such as private:{DEFAULT_PORT}: the server listens on loopback or \
+                 the private network only",
                 origin.place("--listen", LISTEN_VAR, "listen")
             ),
             Self::BackupRelative(origin) => write!(
@@ -448,12 +512,16 @@ mod tests {
             "127.0.0.1",
             "4747",
             "private",
+            "private:",
+            "private:http",
+            "public:4747",
             "",
         ] {
             assert_eq!(
                 listen(Some(wrong), None, None).unwrap_err(),
-                "--listen must be 127.0.0.1 and a port, such as 127.0.0.1:4747: the server \
-                 listens on loopback only",
+                "--listen must be 127.0.0.1 and a port, such as 127.0.0.1:4747, or private and \
+                 a port, such as private:4747: the server listens on loopback or the private \
+                 network only",
                 "{wrong}"
             );
         }
@@ -467,6 +535,41 @@ mod tests {
                 .unwrap_err()
                 .starts_with("listen in config.toml must be 127.0.0.1 and a port")
         );
+    }
+
+    #[test]
+    fn private_listens_on_every_interface_and_admits_only_private_peers() {
+        let private = listen(Some("private:4848"), None, None).unwrap();
+        assert_eq!(private, Listen::private_on_port(4848));
+        assert_eq!(private.address().to_string(), "0.0.0.0:4848");
+        assert_eq!(private.fallback(), None);
+        assert!(private.is_private() && !Listen::DEFAULT.is_private());
+        for peer in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.20",
+            "169.254.3.4",
+            "100.101.7.3",
+            "::1",
+            "fd7a:115c:a1e0::1",
+            "fe80::1",
+            "::ffff:192.168.1.20",
+        ] {
+            assert!(private.admits(peer.parse().unwrap()), "{peer}");
+        }
+        for peer in [
+            "8.8.8.8",
+            "100.128.0.1",
+            "172.32.0.1",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(!private.admits(peer.parse().unwrap()), "{peer}");
+        }
+        // On loopback, only loopback.
+        assert!(Listen::DEFAULT.admits("127.0.0.1".parse().unwrap()));
+        assert!(!Listen::DEFAULT.admits("192.168.1.20".parse().unwrap()));
     }
 
     fn backup_dir(

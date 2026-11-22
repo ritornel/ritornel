@@ -251,6 +251,20 @@ impl ServerStore {
         })
     }
 
+    /// What this server signs with. `None` before it has an identity.
+    pub fn signer(&self) -> Result<Option<crate::Signer>, Error> {
+        self.reader.call(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT signing_key FROM server_identity WHERE id = 1",
+                    [],
+                    |row| row.get::<_, [u8; 32]>(0),
+                )
+                .optional()?
+                .map(crate::Signer::new))
+        })
+    }
+
     /// Changes the server's display name, and returns the identity as it
     /// now is: `None` if the server has none yet. The ID and the key never
     /// change. What a name may be is for the call that takes one from a

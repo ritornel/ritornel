@@ -14,11 +14,11 @@ Every RPC call is defined once in `crates/ritornel-contract/src/methods.rs` as a
 
 ## Transport, routes, and authentication
 
-The server exposes a single loopback HTTP/1.1 listener (`apps/server/src/listener.rs`) with bounded concurrent connections (`Bounds::max_connections`), header read timeout (`Bounds::header_wait`), and a 16 KiB request header cap (`MAX_HEAD_BYTES`).
+The server exposes a single HTTP/1.1 listener (`apps/server/src/listener.rs`), on loopback or, with `--listen private:<port>`, on the private network (see "Process lifecycle" in docs/internals/server.md), with bounded concurrent connections (`Bounds::max_connections`), header read timeout (`Bounds::header_wait`), and a 16 KiB request header cap (`MAX_HEAD_BYTES`).
 
 | Route | Method | Auth | Purpose |
 |---|---|---|---|
-| `/v1/descriptor` | `GET` | None | Returns `PublicDescriptor` so a client can verify server identity before sending a credential. |
+| `/v1/descriptor` | `GET` | None | Returns `PublicDescriptor` so a client can verify server identity before sending a credential. It carries the server's Ed25519 `publicKey`, and with `?nonce=` (16 to 64 bytes as hex) a `proof`: the signature of `descriptor_proof(serverId, nonce)`, so a caller that pinned the key knows the holder answered. |
 | `/v1/health` | `GET` | Bearer | Returns `{ "status": "ok" }`. |
 | `/v1/ticket` | `POST` | Bearer (no `Origin`) | Exchanges a credential for a single-use `SocketTicket` (`Cache-Control: no-store`). |
 | `/v1/ws` | `GET` | Bearer or `?ticket=` | WebSocket upgrade carrying JSON-RPC 2.0 text frames. |

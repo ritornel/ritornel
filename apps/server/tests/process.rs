@@ -657,14 +657,16 @@ fn a_start_that_fails_exits_with_1_and_leaves_the_directory_free() {
     assert_eq!(
         refused.stderr,
         "ritornel-server: RITORNEL_LISTEN must be 127.0.0.1 and a port, such as \
-         127.0.0.1:4747: the server listens on loopback only\n"
+         127.0.0.1:4747, or private and a port, such as private:4747: the server listens on \
+         loopback or the private network only\n"
     );
     let refused = run(without_listen_flag(&data_dir, &[]));
     assert_eq!(refused.code, Some(1), "{refused:?}");
     assert_eq!(
         refused.stderr,
         "ritornel-server: listen in config.toml must be 127.0.0.1 and a port, such as \
-         127.0.0.1:4747: the server listens on loopback only\n"
+         127.0.0.1:4747, or private and a port, such as private:4747: the server listens on \
+         loopback or the private network only\n"
     );
     assert!(!data_dir.join("server.json").exists());
 
