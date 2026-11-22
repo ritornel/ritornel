@@ -1385,6 +1385,32 @@ fn replaced_audio_keeps_its_item_only_if_it_lands_on_the_same_recording() {
 }
 
 #[test]
+fn a_rerip_can_gain_or_lose_a_disc_marker_in_its_album_title() {
+    for (before, after) in [
+        ("Long Field - Disc 2", "Long Field"),
+        ("Long Field", "Long Field - Disc 2"),
+    ] {
+        let mut world = World::default();
+        let song = |album, seconds| {
+            file("A/1.flac", 1)
+                .song("Glass Pier", "Ninefold", seconds)
+                .on(album, None, 1)
+        };
+        world.add(song(before, 200));
+        world.settle();
+        let replacement = Replacement {
+            index: 0,
+            audio: None,
+            facts: song(after, 201).facts,
+        };
+        assert_eq!(
+            judge_replacements(&world.library, &[replacement], &Policy::v2()),
+            [true]
+        );
+    }
+}
+
+#[test]
 fn a_retag_moves_the_appearance_and_keeps_the_recording_made_for_the_file() {
     let mut world = World::default();
     let id = world.add(file("A/1.flac", 1).song("Glass Pier", "Ninefold", 200).on(

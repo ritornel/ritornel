@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::extract::parse_date;
+use crate::extract::{Facts, parse_date};
 use crate::library::Library;
 use crate::normalize::{core, normalize};
 use crate::resolve::Policy;
@@ -163,6 +163,16 @@ fn disc_of_folder(name: &str) -> Option<i64> {
 /// The library with the disc numbers the switches imply, or `None` when
 /// neither is on.
 pub(crate) fn apply(library: &Library, policy: &Policy) -> Option<Library> {
+    apply_with_probes(library, policy, &mut [])
+}
+
+/// Read the titles of replacement probes by the same rules as their library.
+/// The probes have no release assignment or folder position of their own.
+pub(crate) fn apply_with_probes(
+    library: &Library,
+    policy: &Policy,
+    probes: &mut [Facts],
+) -> Option<Library> {
     if !policy.disc_from_album_title && !policy.discs_from_folders {
         return None;
     }
@@ -170,28 +180,32 @@ pub(crate) fn apply(library: &Library, policy: &Policy) -> Option<Library> {
     if policy.disc_from_album_title {
         // A title one file's disc tag contradicts is a title for every file
         // that carries it, or the discs of one set would part.
-        let contradicted: BTreeSet<String> = library
+        let contradiction = |facts: &Facts| {
+            let album = facts.album.as_deref()?;
+            let (_, disc) = disc_in_title(album)?;
+            let claimed = facts.disc?;
+            (claimed != 1 && claimed != disc).then(|| album.to_owned())
+        };
+        let mut contradicted: BTreeSet<String> = library
             .items
             .iter()
-            .filter_map(|item| {
-                let album = item.facts.album.as_deref()?;
-                let (_, disc) = disc_in_title(album)?;
-                let claimed = item.facts.disc?;
-                (claimed != 1 && claimed != disc).then(|| album.to_owned())
-            })
+            .filter_map(|item| contradiction(&item.facts))
             .collect();
-        for item in &mut library.items {
-            let facts = &mut item.facts;
-            let Some(album) = facts.album.as_deref() else {
-                continue;
-            };
-            if contradicted.contains(album) {
-                continue;
-            }
-            if let Some((title, disc)) = disc_in_title(album) {
+        let apply_title = |facts: &mut Facts, contradicted: &BTreeSet<String>| {
+            if let Some(album) = &facts.album
+                && !contradicted.contains(album)
+                && let Some((title, disc)) = disc_in_title(album)
+            {
                 facts.album = Some(title);
                 facts.disc = Some(disc);
             }
+        };
+        for item in &mut library.items {
+            apply_title(&mut item.facts, &contradicted);
+        }
+        contradicted.extend(probes.iter().filter_map(contradiction));
+        for facts in probes {
+            apply_title(facts, &contradicted);
         }
     }
     if policy.discs_from_folders {

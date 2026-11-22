@@ -1178,11 +1178,14 @@ pub fn judge_replacements(
     replacements: &[Replacement],
     policy: &Policy,
 ) -> Vec<bool> {
-    let mut fold = Fold::new(library, policy);
+    let mut probes: Vec<Facts> = replacements.iter().map(|r| r.facts.clone()).collect();
+    let implied = crate::discs::apply_with_probes(library, policy, &mut probes);
+    let mut fold = Fold::new(implied.as_ref().unwrap_or(library), policy);
     let bounds = fold.run();
     replacements
         .iter()
-        .map(|replacement| {
+        .zip(probes)
+        .map(|(replacement, facts)| {
             let Some(had) = bounds.get(replacement.index).and_then(|bound| bound.rec) else {
                 // There was no song at the path before.
                 return true;
@@ -1197,7 +1200,7 @@ pub fn judge_replacements(
                 retired: false,
                 first_seen_ms: i64::MAX,
                 cover: None,
-                facts: replacement.facts.clone(),
+                facts,
                 current: None,
             };
             let probe = Ev::of(as_new.id, &as_new.facts, policy, None);
