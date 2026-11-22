@@ -202,6 +202,7 @@ fn main() {
                 Some(found.id())
             }
         };
+        cx.set_global(TestDisplay(display));
         let first = Opening {
             display,
             width: args.width,
@@ -260,6 +261,12 @@ fn main() {
         }
     });
 }
+
+/// The display no one sees that a test runs on (`RITORNEL_TEST_DISPLAY`),
+/// where every window of the app opens, or `None` outside a test.
+pub(crate) struct TestDisplay(pub Option<gpui::DisplayId>);
+
+impl gpui::Global for TestDisplay {}
 
 /// How the main window opens.
 struct Opening {

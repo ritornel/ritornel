@@ -185,9 +185,14 @@ fn open_window(model: Entity<Model>, quiet: bool, cx: &mut App) {
     let Some(section) = cx.global_mut::<Opener>().opening.take() else {
         return;
     };
-    let bounds = Bounds::centered(None, size(px(WIDTH), px(FIRST_HEIGHT)), cx);
+    // In a test, on its display no one sees, as the main window is.
+    let display = cx
+        .try_global::<crate::TestDisplay>()
+        .and_then(|test| test.0);
+    let bounds = Bounds::centered(display, size(px(WIDTH), px(FIRST_HEIGHT)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
+        display_id: display,
         titlebar: Some(TitlebarOptions {
             title: Some(section.title().into()),
             appears_transparent: true,
