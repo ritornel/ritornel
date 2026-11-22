@@ -17,12 +17,13 @@ use gpui::{
     RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task,
     Window, canvas, div, img, prelude::FluentBuilder, px,
 };
-use ritornel_contract::{Id, Repeat, SkipDirection};
+use ritornel_contract::{Id, OutputProblem, Repeat, SkipDirection};
 
 use crate::icons::icon;
 use crate::link::{Link, LinkEvent};
 use crate::net::NoArt;
 use crate::player::{Player, stars_of};
+use crate::settings::words::{Clock, Style, when};
 use crate::theme;
 use crate::wall::PLAYER_BAR;
 
@@ -102,6 +103,8 @@ pub(crate) struct PlayerBar {
     pub washed: bool,
     /// Whether the cover is hidden while a copy of it travels (Lean back's).
     pub cover_away: bool,
+    /// How the locale writes a time, for when the output stopped working.
+    style: Style,
     _player: Subscription,
     _link: Subscription,
 }
@@ -138,6 +141,9 @@ impl PlayerBar {
             album_hovered: false,
             washed: false,
             cover_away: false,
+            style: Style::of_locale(
+                &crate::platform::locale().unwrap_or_else(|| "en-US".to_owned()),
+            ),
             _player: followed,
             _link: session,
         }
@@ -294,6 +300,17 @@ impl Render for PlayerBar {
             0.
         };
         let live = on && duration > 0;
+        // While the sound output isn't working, the words under the title
+        // say so in place of the artist, or of the hint with nothing on.
+        let trouble = state.as_ref().and_then(|state| {
+            let problem = state.output.problem.as_ref()?;
+            let clock = Clock {
+                now: now_ms(),
+                zone: jiff::tz::TimeZone::system(),
+                style: self.style,
+            };
+            Some(output_trouble(&state.output.name, problem, on, &clock))
+        });
 
         if let Some(entry) = entry
             && self.arrived.as_ref().is_none_or(|(id, _)| *id != entry)
@@ -518,13 +535,16 @@ impl Render for PlayerBar {
                             .flex()
                             .flex_col()
                             .child(div().truncate().font_weight(FontWeight(600.)).child(title))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .text_color(theme::dim())
-                                    .child(line),
-                            ),
+                            .map(|words| match trouble {
+                                Some(trouble) => words.children(trouble_lines(trouble)),
+                                None => words.child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(13.))
+                                        .text_color(theme::dim())
+                                        .child(line),
+                                ),
+                            }),
                     )
                     .child(div().ml(px(10.)).mr(px(4.)).child(stars))
                     .into_any_element()
@@ -541,12 +561,15 @@ impl Render for PlayerBar {
                         .text_color(theme::dim())
                         .child("Nothing playing"),
                 )
-                .child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(theme::faint())
-                        .child("Double-click a song, or press Play"),
-                )
+                .map(|words| match trouble {
+                    Some(trouble) => words.children(trouble_lines(trouble)),
+                    None => words.child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(theme::faint())
+                            .child("Double-click a song, or press Play"),
+                    ),
+                })
                 .into_any_element(),
         };
 
@@ -832,6 +855,59 @@ impl Render for PlayerBar {
     }
 }
 
+/// What the bar says while the sound output isn't working, in two lines
+/// short enough for the bar: what is wrong and since when, with the
+/// system's words for it last, where they can be cut short; then what to
+/// do. On a song, Play tries the output again.
+fn output_trouble(
+    name: &str,
+    problem: &OutputProblem,
+    on: bool,
+    clock: &Clock,
+) -> (String, String) {
+    let what = match name {
+        "" | "default" => "Sound output",
+        name => name,
+    };
+    let mut wrong = format!("{what} isn’t working since {}", when(problem.since, clock));
+    let detail = problem.detail.trim();
+    if !detail.is_empty() {
+        wrong = format!("{wrong}: {detail}");
+    }
+    let then = if on {
+        "Check that it’s connected, then press Play"
+    } else {
+        "Check that it’s connected, then play a song"
+    };
+    (wrong, then.to_owned())
+}
+
+/// The two lines of [`output_trouble`], set close enough that with the
+/// title they stand no taller than the cover.
+fn trouble_lines((wrong, then): (String, String)) -> [gpui::Div; 2] {
+    [
+        div()
+            .truncate()
+            .text_size(px(13.))
+            .line_height(px(16.))
+            .text_color(theme::warn())
+            .child(wrong),
+        div()
+            .truncate()
+            .text_size(px(11.5))
+            .line_height(px(14.))
+            .text_color(theme::faint())
+            .child(then),
+    ]
+}
+
+/// Now, in Unix milliseconds.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| i64::try_from(since.as_millis()).unwrap_or(0))
+}
+
 /// The notice over the player bar: a pill in the page's ink, centred, that
 /// comes up a short hop and goes by itself (`frame/Toast.svelte`).
 pub(crate) fn toast(
@@ -885,5 +961,41 @@ mod tests {
         assert_eq!(drag.position(), 15_000);
         assert!(!drag.for_entry(Some(Id::from_bytes([2; 16]))));
         assert!(!drag.for_entry(None));
+    }
+
+    #[test]
+    fn an_output_that_is_not_working_says_what_since_when_and_what_to_do() {
+        // 15 November 2026, 21:00 UTC, and the hour after.
+        let since = 1_794_776_400_000;
+        let clock = Clock {
+            now: since + 3_600_000,
+            zone: jiff::tz::TimeZone::UTC,
+            style: Style {
+                hour12: true,
+                month_first: true,
+            },
+        };
+        let mut problem = OutputProblem {
+            since,
+            detail: "no device is there".to_owned(),
+        };
+        assert_eq!(
+            output_trouble("default", &problem, true, &clock),
+            (
+                "Sound output isn’t working since today at 9:00 PM: no device is there".to_owned(),
+                "Check that it’s connected, then press Play".to_owned()
+            )
+        );
+        // A device by its name; with nothing on, Play has nothing to go on with.
+        let (wrong, then) = output_trouble("Desk Speakers", &problem, false, &clock);
+        assert!(
+            wrong.starts_with("Desk Speakers isn’t working since"),
+            "{wrong}"
+        );
+        assert_eq!(then, "Check that it’s connected, then play a song");
+        // With no words from the system, no colon hangs at the end.
+        problem.detail = " ".to_owned();
+        let (wrong, _) = output_trouble("", &problem, true, &clock);
+        assert_eq!(wrong, "Sound output isn’t working since today at 9:00 PM");
     }
 }

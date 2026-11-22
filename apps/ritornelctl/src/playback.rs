@@ -86,15 +86,32 @@ fn render(state: &PlaybackState) -> String {
     let output = &state.output;
     lines.push((
         "Output",
-        if output.sample_rate_hz == 0 {
-            format!("{} (not opened yet)", output.name)
-        } else {
-            format!(
+        match &output.problem {
+            Some(problem) => format!(
+                "{} isn’t working, since {}: {}",
+                output.name,
+                crate::lastfm::utc(problem.since),
+                problem.detail
+            ),
+            None if output.sample_rate_hz == 0 => format!("{} (not opened yet)", output.name),
+            None => format!(
                 "{}, shared, {} Hz, {} channels",
                 output.name, output.sample_rate_hz, output.channels
-            )
+            ),
         },
     ));
+    if output.problem.is_some() {
+        lines.push((
+            "",
+            if state.status == PlaybackStatus::Paused {
+                "Playback is paused where it was. Check that the sound device is connected and \
+                 on, then `ritornelctl resume`."
+            } else {
+                "Check that the sound device is connected and on, then play again."
+            }
+            .to_owned(),
+        ));
+    }
     lines.push((
         "Volume",
         format!(
@@ -419,13 +436,16 @@ pub(crate) fn queue(
     out: &mut dyn Write,
 ) -> Result<(), Error> {
     let window = server::ask(args, env, async |client| {
-        client
-            .call::<QueueWindowMethod>(&QueueWindowParams {
-                offset: 0,
-                limit: Some(500),
-                order: None,
-            })
-            .await
+        whole_queue(async |offset| {
+            client
+                .call::<QueueWindowMethod>(&QueueWindowParams {
+                    offset,
+                    limit: Some(500),
+                    order: None,
+                })
+                .await
+        })
+        .await
     })?;
     server::print(
         args,
@@ -436,9 +456,123 @@ pub(crate) fn queue(
     )
 }
 
+/// The whole queue, read a window at a time from `offset`. A change while
+/// it is read starts it again, so that every entry is from one revision.
+async fn whole_queue<E>(
+    window: impl AsyncFn(u32) -> Result<QueueWindow, E>,
+) -> Result<QueueWindow, E> {
+    'again: loop {
+        let mut whole = window(0).await?;
+        while (whole.entries.len() as u64) < whole.total {
+            let offset = u32::try_from(whole.entries.len()).unwrap_or(u32::MAX);
+            let next = window(offset).await?;
+            if next.queue_revision != whole.queue_revision {
+                continue 'again;
+            }
+            if next.entries.is_empty() {
+                break;
+            }
+            whole.entries.extend(next.entries);
+        }
+        return Ok(whole);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A queue of `total` invented entries at `revision`, read from
+    /// `offset` at most 500 at a time.
+    fn window(total: u32, revision: u64, offset: u32) -> QueueWindow {
+        let entries = (offset..total.min(offset.saturating_add(500)))
+            .map(|n| {
+                serde_json::from_value(serde_json::json!({
+                    "entryId": Id::from_bytes([0; 16]).to_string(),
+                    "track": {
+                        "appearanceId": Id::from_bytes([0; 16]).to_string(),
+                        "title": format!("Song {n}"),
+                    },
+                }))
+                .unwrap()
+            })
+            .collect();
+        QueueWindow {
+            queue_revision: revision,
+            total: u64::from(total),
+            current_index: Some(total - 1),
+            entries,
+        }
+    }
+
+    fn read(windows: impl AsyncFn(u32) -> Result<QueueWindow, ()>) -> Result<QueueWindow, ()> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(whole_queue(windows))
+    }
+
+    #[test]
+    fn the_queue_is_read_whole_and_marks_the_last_entry_current() {
+        let whole = read(async |offset| Ok(window(501, 7, offset))).unwrap();
+        assert_eq!(whole.entries.len(), 501);
+        let shown = render_queue(&whole);
+        assert_eq!(shown.lines().count(), 501);
+        assert!(
+            shown.lines().last().unwrap().starts_with("> 501"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_queue_that_changes_while_it_is_read_is_read_again() {
+        let reads = std::cell::Cell::new(0);
+        let whole = read(async |offset| {
+            reads.set(reads.get() + 1);
+            // The second read finds the queue grown by one.
+            let (total, revision) = if reads.get() < 2 { (501, 7) } else { (502, 8) };
+            Ok(window(total, revision, offset))
+        })
+        .unwrap();
+        assert_eq!((whole.queue_revision, whole.entries.len()), (8, 502));
+        assert_eq!(reads.get(), 4);
+    }
+
+    #[test]
+    fn an_output_that_is_not_working_is_said_with_since_when_and_what_to_do() {
+        let mut state: PlaybackState = serde_json::from_value(serde_json::json!({
+            "revision": 3,
+            "status": "paused",
+            "positionMs": 61_000,
+            "volume": 1.0,
+            "muted": false,
+            "shuffle": false,
+            "repeat": "off",
+            "output": {
+                "name": "default",
+                "mode": "shared",
+                "sampleRateHz": 0,
+                "channels": 0,
+                "problem": { "since": 1_794_776_400_000_i64, "detail": "no device is there" },
+            },
+            "queueRevision": 1,
+            "queueLength": 2,
+        }))
+        .unwrap();
+        let shown = render(&state);
+        assert!(
+            shown.contains("default isn’t working, since 2026-11-15 21:00 UTC: no device is there"),
+            "{shown}"
+        );
+        assert!(shown.contains("then `ritornelctl resume`"), "{shown}");
+        // Stopped since, it does not promise a place to resume from.
+        state.status = PlaybackStatus::Stopped;
+        let shown = render(&state);
+        assert!(!shown.contains("resume"), "{shown}");
+        assert!(shown.contains("then play again"), "{shown}");
+        state.output.problem = None;
+        assert!(render(&state).contains("default (not opened yet)"));
+    }
 
     #[test]
     fn a_volume_is_a_percentage_or_mute_or_unmute() {

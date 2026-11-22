@@ -611,7 +611,9 @@ impl Player {
     }
 
     /// Adds `source` to the queue at `place`. With nothing in the queue it
-    /// plays it. With the card closed, the window says where it went.
+    /// plays it: the server decides that, as it adds, for this window may
+    /// not have heard of the queue yet. With the card closed, the window
+    /// says where it went, unless it seemed to start playing.
     pub(crate) fn add(
         &mut self,
         source: PlaySource,
@@ -620,12 +622,13 @@ impl Player {
         context: Option<PlayContext>,
         cx: &mut Context<Self>,
     ) -> Task<bool> {
-        if self.state.as_ref().map_or(0, |state| state.queue_length) == 0 {
-            return self.play(source, None, context, false, cx);
-        }
         let Some(key) = self.key(cx) else {
             return Task::ready(false);
         };
+        let seemed_empty = self
+            .state
+            .as_ref()
+            .is_none_or(|state| state.queue_length == 0);
         let sent = self.send::<QueueAdd>(
             QueueAddParams {
                 idempotency_key: key,
@@ -633,12 +636,13 @@ impl Player {
                 place,
                 context,
                 expected_revision: None,
+                play_if_empty: Some(true),
             },
             cx,
         );
         cx.spawn(async move |this, cx| {
             let done = sent.await.is_some();
-            if done {
+            if done && !seemed_empty {
                 let words = if matches!(place, QueuePlace::Next) {
                     format!("{name} plays next")
                 } else {

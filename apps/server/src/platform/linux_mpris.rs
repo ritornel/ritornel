@@ -357,15 +357,16 @@ fn seek_in(shown: &Shown, position: i64) -> Option<Key> {
 }
 
 /// What `Seek` asks for: an offset from where the player is now. Past the
-/// end is the next track, as the specification says; before the start is
-/// the start.
+/// end is the next track, as the specification says, from the track shown
+/// only, so that a seek that arrives once the next has begun does not skip
+/// that one too; before the start is the start.
 fn seek_by(shown: &Shown, now: i64, offset: i64) -> Option<Key> {
     if !shown.can_seek() {
         return None;
     }
     let to = now.saturating_add(offset).max(0);
     if shown.length.is_some_and(|length| to > length) {
-        return Some(Key::Next);
+        return Some(Key::NextFrom(shown.entry?));
     }
     seek_in(shown, to)
 }
@@ -605,6 +606,7 @@ mod tests {
             volume: 0.5,
             muted: false,
             seeks: 0,
+            output_failing: None,
         }
     }
 
@@ -721,7 +723,12 @@ mod tests {
         };
         assert_eq!(seek_by(&shown, 10_000_000, 5_000_000), seek(15_000));
         assert_eq!(seek_by(&shown, 10_000_000, -60_000_000), seek(0));
-        assert_eq!(seek_by(&shown, 10_000_000, 500_000_000), Some(Key::Next));
+        // Past the end is the next from this entry only, so that a seek
+        // that arrives once the next has begun does not skip that one too.
+        assert_eq!(
+            seek_by(&shown, 10_000_000, 500_000_000),
+            Some(Key::NextFrom(id(1)))
+        );
         // The seek names the entry it was asked of, so that it lands
         // nowhere if a next goes before it.
         assert_eq!(

@@ -14,12 +14,12 @@ use ritornel_contract::methods::{
     PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove,
 };
 use ritornel_contract::{
-    ContextKind, CopyInUse, ErrorCode, Event, Id, ListKind, OutputInfo, OutputMode, PlaySource,
-    PlaybackChanged, PlaybackCommandParams, PlaybackEvent, PlaybackJumpParams, PlaybackPlayParams,
-    PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState, PlaybackStatus,
-    ProgressEvent, QueueAddParams, QueueClearParams, QueueEntry, QueueEvent, QueueMoveParams,
-    QueueOrder, QueuePlace, QueueRemoveParams, QueueWindow, QueueWindowParams, Receipt,
-    ReceiptStatus, Repeat, RpcError, SkipDirection, SourceTracks, SourcesTracksParams,
+    ContextKind, CopyInUse, ErrorCode, Event, Id, ListKind, OutputInfo, OutputMode, OutputProblem,
+    PlaySource, PlaybackChanged, PlaybackCommandParams, PlaybackEvent, PlaybackJumpParams,
+    PlaybackPlayParams, PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState,
+    PlaybackStatus, ProgressEvent, QueueAddParams, QueueClearParams, QueueEntry, QueueEvent,
+    QueueMoveParams, QueueOrder, QueuePlace, QueueRemoveParams, QueueWindow, QueueWindowParams,
+    Receipt, ReceiptStatus, Repeat, RpcError, SkipDirection, SourceTracks, SourcesTracksParams,
     TrackSummary,
 };
 use ritornel_engine::playback::{
@@ -198,6 +198,10 @@ impl Core {
                 mode: OutputMode::Shared,
                 sample_rate_hz: state.output.1,
                 channels: state.output.2,
+                problem: state.output_failing.as_ref().map(|failing| OutputProblem {
+                    since: failing.since_ms,
+                    detail: failing.detail.clone(),
+                }),
             },
             queue_revision: unsigned(state.queue_revision),
             queue_length: state.queue_length as u64,
@@ -271,6 +275,10 @@ impl Core {
 
     /// One tick of the player: what the renderer played, checkpoints, and
     /// the end of a track. `Err(FailPoint)` is the crash test's.
+    ///
+    /// What the tick did is sent before the player is let go, as a
+    /// command's is, so that a command carried out just after cannot be
+    /// sent first and then be overtaken by the older state.
     pub(crate) fn tick_player(&self) -> Result<(), ritornel_engine::Error> {
         let ticked = self.with_stores(|stores| {
             let library = stores
@@ -279,7 +287,7 @@ impl Core {
                 .unwrap_or_else(PoisonError::into_inner);
             let mut player = lock(&self.player);
             let Some(player) = player.as_mut() else {
-                return Ok((Vec::new(), None));
+                return Ok(());
             };
             let ticked = player.tick(&stores.server, library.as_ref());
             // The record's sign follows the player's saves, and nothing
@@ -290,16 +298,11 @@ impl Core {
             }
             let events = ticked?;
             let state = (!events.is_empty()).then(|| player.state());
-            Ok((events, state))
+            drop(library);
+            self.publish_player(events, state);
+            Ok(())
         });
-        match ticked {
-            Some(Ok((events, state))) => {
-                self.publish_player(events, state);
-                Ok(())
-            }
-            Some(Err(error)) => Err(error),
-            None => Ok(()),
-        }
+        ticked.unwrap_or(Ok(()))
     }
 
     /// Stops the player for a clean shutdown: the open listen is closed as
@@ -307,12 +310,20 @@ impl Core {
     pub(crate) fn shutdown_player(&self) {
         let done = self.with_stores(|stores| {
             let mut player = lock(&self.player);
-            player
-                .as_mut()
-                .map(|player| player.shutdown(&stores.server))
+            player.as_mut().map(|player| {
+                player
+                    .shutdown(&stores.server)
+                    .map(|_| player.save_failing().map(str::to_owned))
+            })
         });
-        if let Some(Some(Err(failed))) = done {
-            error!(error = %failed, "the player could not save where it was");
+        match done {
+            Some(Some(Err(failed))) => {
+                error!(error = %failed, "the player could not save where it was");
+            }
+            Some(Some(Ok(Some(why)))) => {
+                error!(error = %why, "the player could not save its listens");
+            }
+            _ => {}
         }
     }
 
@@ -701,6 +712,7 @@ impl Core {
             },
             context: (context_kind(context.0), context.1),
             actor: self.local_credential.session(),
+            play_if_empty: params.play_if_empty.unwrap_or(false),
         };
         let expected = params.expected_revision.map(signed);
         self.command::<QueueAdd>(

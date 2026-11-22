@@ -36,7 +36,7 @@ fn watching(folder: Option<&WatchedFolder>, on: bool, clock: &Clock) -> Option<i
             .child(
                 div()
                     .when(folder.state == WatchState::Offline, |state| {
-                        state.text_color(super::controls::warn())
+                        state.text_color(theme::warn())
                     })
                     .child(watch_state(folder)),
             )
@@ -106,7 +106,7 @@ fn record(
                     grow()
                         .child(
                             div()
-                                .when(*warning, |what| what.text_color(super::controls::warn()))
+                                .when(*warning, |what| what.text_color(theme::warn()))
                                 .child(record::what(problem)),
                         )
                         .child(sub_wraps(said))

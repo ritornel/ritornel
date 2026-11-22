@@ -68,6 +68,8 @@ pub(crate) struct Source {
     pub(crate) info: Format,
     /// Packets that would not decode and were passed over.
     pub(crate) bad_packets: u64,
+    /// Whether any packet decoded to frames.
+    decoded: bool,
     samples: Vec<f32>,
     /// Where in `samples` the frames to hand on begin.
     skip: usize,
@@ -445,6 +447,7 @@ impl Source {
                 duration_ms,
             },
             bad_packets: 0,
+            decoded: false,
             #[cfg(test)]
             fails: opened
                 .path
@@ -524,7 +527,9 @@ impl Source {
     }
 
     /// Decodes the next frames. `false` at the end. A packet that will not
-    /// decode is passed over.
+    /// decode is passed over, but a file that gives no frames at all, from
+    /// its start or through packets that would not decode, is unreadable,
+    /// not over.
     pub(crate) fn next(&mut self) -> Result<bool, RenderError> {
         #[cfg(test)]
         if self.fails {
@@ -536,12 +541,12 @@ impl Source {
         loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(packet)) => packet,
-                Ok(None) => return Ok(false),
+                Ok(None) => return self.over(),
                 // A file cut short ends where it is cut.
                 Err(Symphonia::IoError(error))
                     if error.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
-                    return Ok(false);
+                    return self.over();
                 }
                 Err(error) => return Err(RenderError::new("unreadable", error.to_string())),
             };
@@ -566,6 +571,7 @@ impl Source {
             if frames == 0 || channels == 0 {
                 continue;
             }
+            self.decoded = true;
             if self.channels == 0 {
                 self.channels = channels;
                 self.info.channels = u32::try_from(channels).unwrap_or(0);
@@ -588,6 +594,22 @@ impl Source {
             self.skip = skip * channels;
             return Ok(true);
         }
+    }
+
+    /// The end of the file, once its packets have run out. Read from its
+    /// start, or with packets passed over, a file that gave no frames is
+    /// unreadable; one sought near its end may rightly give none.
+    fn over(&self) -> Result<bool, RenderError> {
+        if !self.decoded && (self.bad_packets > 0 || self.from_frame == 0) {
+            return Err(RenderError::new(
+                "unreadable",
+                format!(
+                    "no audio would decode: {} packets passed over",
+                    self.bad_packets
+                ),
+            ));
+        }
+        Ok(false)
     }
 }
 
@@ -638,7 +660,8 @@ impl Convert {
                 to.channels,
                 FixedSync::Input,
             )
-            .map_err(|error| RenderError::new("output", error.to_string()))?;
+            // A rate it cannot convert is the track's, not the output's.
+            .map_err(|error| RenderError::new("unsupported_format", error.to_string()))?;
             Some(Box::new(fft))
         };
         let delay = resampler.as_ref().map_or(0, |fft| fft.output_delay());

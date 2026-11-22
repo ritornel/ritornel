@@ -1620,3 +1620,24 @@ fn a_next_the_output_has_run_into_cannot_be_let_go_before_the_player_has_heard_o
     let said = renderer.drain();
     assert_eq!(ended(&said, 1), Some((7001, End::Joined { next: 2 })));
 }
+
+#[test]
+fn a_file_none_of_whose_packets_decodes_is_unreadable_and_not_a_track_that_ended() {
+    let scratch = crate::testing::Scratch::new();
+    let mut bytes = std::fs::read(fixture("a.m4a")).unwrap();
+    // Every byte of the audio itself is garbage; the container is whole.
+    let mdat = bytes.windows(4).position(|w| w == b"mdat").unwrap();
+    let size = u32::from_be_bytes(bytes[mdat - 4..mdat].try_into().unwrap()) as usize;
+    let end = (mdat - 4 + size).min(bytes.len());
+    bytes[mdat + 4..end].fill(0x01);
+    let path = scratch.path().join("garbled.m4a");
+    std::fs::write(&path, &bytes).unwrap();
+    let mut source = Source::open(&path, 0).unwrap();
+    // Every packet is tried and passed over, and then it is said.
+    let failed = source.next().unwrap_err();
+    assert_eq!(failed.reason, "unreadable");
+    assert!(source.bad_packets > 0);
+    // A file with no audio in it at all is no different.
+    let mut empty = Source::open(&fixture("no-packets.m4a"), 0).unwrap();
+    assert_eq!(empty.next().unwrap_err().reason, "unreadable");
+}

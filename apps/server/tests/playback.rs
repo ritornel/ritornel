@@ -690,6 +690,7 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
                 place: QueuePlace::Next,
                 context: None,
                 expected_revision: Some(played.queue_revision),
+                play_if_empty: None,
             })
             .await;
         let (code, details) = refusal(stale);
@@ -705,6 +706,7 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
                 place: QueuePlace::Next,
                 context: None,
                 expected_revision: Some(set.queue_revision),
+                play_if_empty: None,
             })
             .await
             .unwrap();
@@ -820,6 +822,7 @@ async fn a_command_from_a_view_sent_again_after_the_view_ended_is_answered_from_
             place: QueuePlace::End,
             context: None,
             expected_revision: None,
+            play_if_empty: None,
         };
         let added = client.call::<QueueAdd>(&add).await.unwrap();
         client

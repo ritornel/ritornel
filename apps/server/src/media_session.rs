@@ -35,6 +35,9 @@ pub(crate) enum Key {
     Play,
     Pause,
     Next,
+    /// To the entry after this one only: nothing if the player has moved
+    /// on from it. Only MPRIS names the entry.
+    NextFrom(Id),
     Previous,
     /// To this position, in milliseconds, in whichever entry the player is
     /// on. Only macOS's seeks name no entry.

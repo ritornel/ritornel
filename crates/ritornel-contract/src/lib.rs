@@ -103,8 +103,8 @@ pub use pages::{
     AlbumGetParams, AlbumPage, AlbumVersion, ArtColor, ArtistGetParams, ArtistPage, RecordType,
 };
 pub use playback::{
-    ContextKind, CopyInUse, OutputInfo, OutputMode, PlayContext, PlaySource, PlaybackChanged,
-    PlaybackCommandParams, PlaybackEvent, PlaybackJumpParams, PlaybackPlayParams,
+    ContextKind, CopyInUse, OutputInfo, OutputMode, OutputProblem, PlayContext, PlaySource,
+    PlaybackChanged, PlaybackCommandParams, PlaybackEvent, PlaybackJumpParams, PlaybackPlayParams,
     PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState, PlaybackStatus,
     ProgressEvent, QueueAddParams, QueueClearParams, QueueEntry, QueueEvent, QueueMoveParams,
     QueueOrder, QueuePlace, QueueRemoveParams, QueueWindow, QueueWindowParams, Repeat,
