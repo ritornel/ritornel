@@ -388,8 +388,12 @@ pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
 /// their results stay as they are.
 pub(crate) fn album_markers_of(album: &str) -> Vec<String> {
     let mut found = markers(Some(album), ALBUM_MARKERS, 2);
-    let acoustics = crate::normalize::joined_words(album)
-        .split(' ')
+    // Read as `markers` reads, between any marks and with marks inside a
+    // word joining it.
+    let lower: String = album.nfkc().flat_map(char::to_lowercase).collect();
+    let acoustics = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .chain(crate::normalize::joined_words(album).split(' '))
         .any(|word| word == "acoustics");
     if acoustics && !found.iter().any(|marker| marker == "acoustic") {
         found.push("acoustic".to_owned());

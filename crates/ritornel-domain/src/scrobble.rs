@@ -899,19 +899,26 @@ mod tests {
             "Undertow",
             &[(71, "Undertow"), (72, "Undertow (Acoustic)")],
         )]);
-        assert_eq!(
-            acoustic.judge(Scrobbled {
-                artist: "Mira Vale",
-                album: Some("Undertow (Acoustics)"),
-                title: "Undertow",
-            }),
-            Verdict::Bind {
-                recording: 7,
-                appearance: Some(72),
-                candidates: 1,
-                rule: Rule::Exact,
-            }
-        );
+        for album in [
+            "Undertow (Acoustics)",
+            "Undertow(Acoustics)",
+            "Undertow (ACOUSTICS)",
+        ] {
+            assert_eq!(
+                acoustic.judge(Scrobbled {
+                    artist: "Mira Vale",
+                    album: Some(album),
+                    title: "Undertow",
+                }),
+                Verdict::Bind {
+                    recording: 7,
+                    appearance: Some(72),
+                    candidates: 1,
+                    rule: Rule::Exact,
+                },
+                "{album}"
+            );
+        }
         // With no album, one recording binds as before.
         assert!(matches!(
             judge("The Quiet Harbour", None, "Lanterns"),

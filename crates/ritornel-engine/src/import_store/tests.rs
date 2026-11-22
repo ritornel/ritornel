@@ -672,6 +672,57 @@ fn a_binding_through_a_merge_is_kept_so_that_undoing_the_merge_is_exact() {
     );
     assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 1);
     assert_eq!(rig.one(bound), "1 1");
+    // And its play counts for the recording it is bound to now.
+    assert_eq!(rig.one(PLAYED), "1 1");
+}
+
+/// The recording and song the play counts for.
+const PLAYED: &str = "SELECT recording_id || ' ' || coalesce(appearance_id, '-') FROM play_event";
+
+#[test]
+fn a_song_whose_own_recording_was_merged_keeps_its_binding() {
+    let rig = rig();
+    // The song is also on another record, as a recording once of its own
+    // and merged into the first by way of a third.
+    rig.exec(
+        "INSERT INTO recording (id, public_id, redirect_to_id, canonical_id, display_title, rev)
+           VALUES (971, randomblob(16), 1, 1, 'Paper Kites', ?1);
+         INSERT INTO recording (id, public_id, redirect_to_id, canonical_id, display_title, rev)
+           VALUES (970, randomblob(16), 971, 1, 'Paper Kites', ?1);
+         INSERT INTO release (id, public_id, release_group_id, canonical_id, display_title, rev)
+           SELECT 970, randomblob(16), release_group_id, 970, 'Night Drives', ?1
+           FROM release WHERE id = (SELECT release_id FROM track_appearance WHERE id = 1);
+         INSERT INTO track_appearance
+           (id, public_id, recording_id, release_id, canonical_id, display_title, rev)
+           VALUES (970, randomblob(16), 970, 970, 970, 'Paper Kites', ?1);
+         INSERT INTO source_item
+           (id, public_id, source_instance_id, item_kind, provider_key, size_bytes, mtime_ms,
+            first_seen_at_ms, rev)
+           SELECT 970, randomblob(16), source_instance_id, 'file', 'Night Drives/07.flac', 1, 0, 0, ?1
+           FROM source_item WHERE item_kind = 'file' LIMIT 1;
+         INSERT INTO identity_decision
+           (id, action, source_item_id, method, resolver_version, normalizer_version,
+            evidence_json, actor_kind, decided_at_ms, rev)
+           VALUES (970, 'bind', 970, 'new', 1, 1, '{}', 'resolver', 0, ?1);
+         INSERT INTO assignment
+           (source_item_id, recording_id, appearance_id, decision_id, effective_from_ms, rev)
+           VALUES (970, 970, 970, 970, 0, ?1);",
+    );
+    let mut there = record(T0 - HOUR, "Moss Arcade", "Paper Kites", 0);
+    there.track.album = Some("Night Drives".to_owned());
+    rig.ingest(&batch(vec![there], T0 - 2 * HOUR, T0));
+    // Bound to that song, whose own recording is the one it was.
+    let bound = "SELECT a.recording_id || ' ' || coalesce(a.appearance_id, '-') FROM assignment a
+                 JOIN source_item si ON si.id = a.source_item_id
+                 WHERE si.item_kind = 'scrobble_subject' AND a.superseded_at_ms IS NULL";
+    assert_eq!(rig.one(bound), "970 970");
+    assert_eq!(rig.one(PLAYED), "1 970");
+    // Judged again, by both passes, it is kept as it is.
+    let before = rig.revision();
+    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.revision(), before);
+    assert_eq!(rig.rematch(), "0");
+    assert_eq!(rig.one(bound), "970 970");
 }
 
 #[test]
@@ -711,9 +762,10 @@ fn a_play_bound_to_a_song_no_file_reaches_is_bound_again() {
     );
     // At the next judgement the play follows the song to the copy a file
     // reaches, and stays on its recording.
+    assert_eq!(rig.one(PLAYED), "1 1");
     assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 1);
     assert_eq!(rig.one(bound), "1 960");
-    assert_eq!(rig.bound(), ["Paper Kites -> Paper Kites"]);
+    assert_eq!(rig.one(PLAYED), "1 960");
     assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
 }
 
