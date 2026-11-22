@@ -1,7 +1,7 @@
 //! The link between a hub and its satellites: the invites a hub holds, the
 //! link sessions it checks, the addresses it offers, and how a satellite
-//! makes sure it has reached its hub. See "The link between the hub and a
-//! satellite" and "Routes" in docs/design/linking.md.
+//! makes sure it has reached its hub. See "Hub and satellites" in
+//! docs/internals/linking.md.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};

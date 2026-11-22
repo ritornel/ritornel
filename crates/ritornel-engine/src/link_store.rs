@@ -1,7 +1,6 @@
 //! The link between a hub and a satellite, as `server.db` keeps it: on a
 //! satellite the one `hub_link` row, and on a hub a session for each
-//! satellite. See "The link between the hub and a satellite" in
-//! docs/design/linking.md.
+//! satellite. See "Hub and satellites" in docs/internals/linking.md.
 
 use rusqlite::{Connection, OptionalExtension};
 

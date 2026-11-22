@@ -1,6 +1,6 @@
 //! `link.invite`, `link.join` and `link.status`, and the hub's side of a
-//! satellite joining. See "The link between the hub and a satellite" in
-//! docs/design/linking.md.
+//! satellite joining. See "Hub and satellites" in
+//! docs/internals/linking.md.
 
 use std::sync::PoisonError;
 

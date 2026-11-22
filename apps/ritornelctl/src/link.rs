@@ -1,6 +1,6 @@
 //! `ritornelctl link`: inviting a satellite on a hub, joining a hub from
-//! another server, and what each knows of the other. See "The link between
-//! the hub and a satellite" in docs/design/linking.md.
+//! another server, and what each knows of the other. See
+//! "Hub and satellites" in docs/internals/linking.md.
 
 use std::io::Write;
 

@@ -1,6 +1,6 @@
 //! The link between a hub and its satellites: inviting one, joining one,
-//! and what each says of the other. See "The link between the hub and a
-//! satellite" in docs/design/linking.md.
+//! and what each says of the other. See "Hub and satellites" in
+//! docs/internals/linking.md.
 //!
 //! A hub invites a satellite with a one-time link that names the hub, its
 //! public key and where it may be reached, and carries a secret. The
