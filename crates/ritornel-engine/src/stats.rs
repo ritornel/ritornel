@@ -93,7 +93,10 @@ fn stats(connection: &Connection) -> Result<LibraryStats, Error> {
             "SELECT count(*) {READABLE} AND sr.audio_asset_id IS NOT NULL AND si.current_recording_id IS NULL"
         ))?,
         artists: live(
-            "SELECT count(DISTINCT n.artist_id) FROM artist_credit_name n WHERE n.artist_credit_id IN (
+            "SELECT count(DISTINCT a.canonical_id)
+             FROM artist_credit_name n
+             JOIN artist a ON a.id = n.artist_id
+             WHERE n.artist_credit_id IN (
                SELECT ta.display_artist_credit_id FROM apps JOIN track_appearance ta ON ta.id = apps.id
                UNION SELECT rel.display_artist_credit_id FROM rels JOIN release rel ON rel.id = rels.id)",
         )?,

@@ -11,9 +11,10 @@ use proptest::prelude::*;
 
 use crate::extract::Facts;
 use crate::library::{
-    AcrossAlbums, Current, Decision, ExistingCredit, ExistingRelease, Item, Kind, Library, Method,
-    Ref, Resolution, WithheldCause,
+    AcrossAlbums, ArtistKeyKind, Current, Decision, ExistingArtistKey, ExistingCredit,
+    ExistingRelease, Item, Kind, Library, Method, Ref, Resolution, WithheldCause,
 };
+use crate::normalize::NORMALIZER_VERSION;
 use crate::resolve::{Policy, Replacement, judge_replacements, markers_of};
 use crate::{catalog, normalize};
 
@@ -120,21 +121,30 @@ impl World {
             .map(|out| self.row(out.r))
             .collect();
         for (out, row) in resolution.artists.iter().zip(&artists) {
-            if matches!(out.r, Ref::New(_)) {
-                self.library.artists.push((*row, out.match_name.clone()));
-            }
-            // What the store reads back from the claims of the files whose
-            // credits name the row.
-            if let Some(mbid) = &out.mbid {
-                self.library.artist_mbids.insert(*row, mbid.clone());
-            }
-            if let Some(entry) = self
-                .library
-                .artists
-                .iter_mut()
-                .find(|(existing, _)| existing == row)
-            {
-                entry.1 = out.match_name.clone();
+            if let Some((kind, value)) = &out.key {
+                let normalizer_version =
+                    (*kind == ArtistKeyKind::Name).then_some(NORMALIZER_VERSION);
+                if *kind == ArtistKeyKind::Name {
+                    self.library.artist_keys.retain(|entry| {
+                        !(entry.artist == *row
+                            && entry.kind == ArtistKeyKind::Name
+                            && entry.normalizer_version != Some(NORMALIZER_VERSION))
+                    });
+                }
+                let exists = self.library.artist_keys.iter().any(|entry| {
+                    entry.kind == *kind
+                        && entry.value == *value
+                        && entry.artist == *row
+                        && entry.normalizer_version == normalizer_version
+                });
+                if !exists {
+                    self.library.artist_keys.push(ExistingArtistKey {
+                        kind: *kind,
+                        value: value.clone(),
+                        artist: *row,
+                        normalizer_version,
+                    });
+                }
             }
             self.shown.insert((Kind::Artist, *row), out.name.clone());
         }
@@ -955,18 +965,32 @@ fn artists_bind_by_id_then_by_exact_normalised_name_and_strings_are_not_parsed()
     world.assert_settled();
 }
 
+fn name_key(artist: i64, value: &str, version: i64) -> ExistingArtistKey {
+    ExistingArtistKey {
+        kind: ArtistKeyKind::Name,
+        value: value.to_owned(),
+        artist,
+        normalizer_version: Some(version),
+    }
+}
+
 #[test]
 fn after_a_change_of_normaliser_an_artist_takes_its_own_row_before_another_s() {
     let mut world = World::default();
     world.add(file("A/1.flac", 1).song("Lanterns", "Tin-Harbour", 200));
     world.add(file("B/1.flac", 2).song("Salt Road", "Tin & Harbour", 200));
     world.settle();
-    let rows: Vec<i64> = world.library.artists.iter().map(|(row, _)| *row).collect();
+    let rows: Vec<i64> = world
+        .library
+        .artist_keys
+        .iter()
+        .map(|entry| entry.artist)
+        .collect();
     // As normaliser 1 keyed them: "tinharbour" and "tin harbour". Today's
     // key of the first is the second's old one.
-    world.library.artists = vec![
-        (rows[0], "tinharbour".to_owned()),
-        (rows[1], "tin harbour".to_owned()),
+    world.library.artist_keys = vec![
+        name_key(rows[0], "tinharbour", 1),
+        name_key(rows[1], "tin harbour", 1),
     ];
     world.library.artist_keys_by = Some(1);
     let resolution = world.settle();
@@ -992,7 +1016,7 @@ fn after_a_change_of_normaliser_no_artist_takes_a_row_by_today_s_key() {
     world.add(file("A/3.flac", 3).song("Three", "Tin & Harbour", 200));
     // As normaliser 1 left them: the first two one artist, "tinharbour",
     // and the third another, "tin harbour".
-    world.library.artists = vec![(1, "tinharbour".to_owned()), (2, "tin harbour".to_owned())];
+    world.library.artist_keys = vec![name_key(1, "tinharbour", 1), name_key(2, "tin harbour", 1)];
     world.next = 10;
     world.library.artist_keys_by = Some(1);
     let resolution = world.settle();
@@ -1021,7 +1045,7 @@ fn after_a_change_of_normaliser_an_artist_first_takes_the_row_of_its_unchanged_s
     world.add(file("A/3.flac", 3).song("Three", "Here'There", 200));
     // Normaliser 1 made the first and third one artist, "herethere", and
     // the second another, "here there". Today the first two are one.
-    world.library.artists = vec![(1, "herethere".to_owned()), (2, "here there".to_owned())];
+    world.library.artist_keys = vec![name_key(1, "herethere", 1), name_key(2, "here there", 1)];
     world.next = 10;
     world.library.artist_keys_by = Some(1);
     let resolution = world.settle();
@@ -1044,11 +1068,11 @@ fn an_artist_with_no_id_keeps_its_row_across_a_change_of_normaliser() {
         let first = world.settle();
         let row = match first.artists[0].r {
             Ref::Row(row) => row,
-            Ref::New(_) => world.library.artists[0].0,
+            Ref::New(_) => world.library.artist_keys[0].artist,
         };
         // As normaliser 1 left it: its key, which joined the letters
         // round the dash, and maybe the owner's name for it.
-        world.library.artists = vec![(row, "tinharbour".to_owned())];
+        world.library.artist_keys = vec![name_key(row, "tinharbour", 1)];
         world.library.artist_keys_by = Some(1);
         if edited {
             world.library.edits.insert(
@@ -1060,7 +1084,7 @@ fn an_artist_with_no_id_keeps_its_row_across_a_change_of_normaliser() {
         assert_eq!(resolution.artists[0].r, Ref::Row(row), "edited: {edited}");
         assert_eq!(resolution.artists[0].match_name, "tin harbour");
         // Without the earlier version named, the row is not found.
-        world.library.artists = vec![(row, "tinharbour".to_owned())];
+        world.library.artist_keys = vec![name_key(row, "tinharbour", NORMALIZER_VERSION)];
         world.library.artist_keys_by = None;
         assert!(matches!(
             catalog::resolve(&world.library, &world.policy).artists[0].r,
@@ -1184,7 +1208,7 @@ fn an_artist_read_through_its_sort_name_keeps_its_row_and_its_name() {
             }),
     );
     world.settle();
-    let row = world.library.artists[0].0;
+    let row = world.library.artist_keys[0].artist;
     // Two more files by the sort name outnumber the one by the name.
     world.add(file("B/1.flac", 2).song("Two", "Vane, Iris", 200));
     world.add(file("B/2.flac", 3).song("Three", "Vane, Iris", 200));
@@ -1527,13 +1551,13 @@ fn an_artist_with_an_id_keeps_its_row_by_the_id_and_never_takes_a_namesakes() {
     let resolution = world.settle();
     assert_eq!(resolution.artists.len(), 2);
     let row = |mbid: &str| {
-        *world
+        world
             .library
-            .artist_mbids
+            .artist_keys
             .iter()
-            .find(|(_, id)| id.as_str() == mbid)
+            .find(|entry| entry.kind == ArtistKeyKind::Mbid && entry.value == mbid)
             .unwrap()
-            .0
+            .artist
     };
     let (x, y) = (row("art-x"), row("art-y"));
     assert_ne!(x, y);
@@ -1550,6 +1574,209 @@ fn an_artist_with_an_id_keeps_its_row_by_the_id_and_never_takes_a_namesakes() {
     assert_eq!(resolution.artists[0].r, Ref::Row(y));
     assert_eq!(resolution.artists[0].name, "Ada Wren-Holt");
     world.assert_settled();
+}
+
+#[test]
+fn a_merged_artist_keeps_its_row_across_rescan_and_projects_its_canonical_target() {
+    let mut world = World::default();
+    world.add(file("A/1.flac", 1).song("Paper Kites", "Moss Arcade", 200));
+    world.add(file("B/1.flac", 2).song("Salt Road", "Moss", 200));
+    world.settle();
+    let row_a = world
+        .library
+        .artist_keys
+        .iter()
+        .find(|entry| entry.value == "moss arcade")
+        .unwrap()
+        .artist;
+    let row_b = world
+        .library
+        .artist_keys
+        .iter()
+        .find(|entry| entry.value == "moss")
+        .unwrap()
+        .artist;
+
+    // Merge B into A: B redirects to A, keeping its durable key in `artist_keys`.
+    world.library.artist_canonical.insert(row_b, row_a);
+    let again = world.settle();
+    assert_eq!(
+        again.artists.iter().map(|out| out.r).collect::<Vec<_>>(),
+        [Ref::Row(row_a), Ref::Row(row_b)]
+    );
+    world.assert_settled();
+
+    // Even if A has no direct files of its own, A is still projected so a
+    // display rebuild never leaves the canonical target blank.
+    world.library.items[0].retired = true;
+    let only_b = world.settle();
+    assert!(only_b.artists.iter().any(|out| out.r == Ref::Row(row_b)));
+    let canon_out = only_b
+        .artists
+        .iter()
+        .find(|out| out.r == Ref::Row(row_a))
+        .expect("canonical target row must still be projected");
+    assert_eq!(canon_out.key, None);
+    assert_eq!(canon_out.name, "Moss");
+
+    // Undo the merge and bring A's file back: both rows come back intact.
+    world.library.artist_canonical.remove(&row_b);
+    world.library.items[0].retired = false;
+    let unmerged = world.settle();
+    assert_eq!(
+        unmerged
+            .artists
+            .iter()
+            .map(|out| (out.r, out.name.as_str()))
+            .collect::<Vec<_>>(),
+        [(Ref::Row(row_a), "Moss Arcade"), (Ref::Row(row_b), "Moss")]
+    );
+    world.assert_settled();
+}
+
+#[test]
+fn retagging_an_artists_name_and_mbid_never_steals_another_artists_row() {
+    let mut world = World::default();
+    world.add(
+        file("A/1.flac", 1)
+            .song("Paper Kites", "Alpha", 200)
+            .with(|facts| facts.artist_mbids = vec!["art-x".to_owned()]),
+    );
+    world.add(file("B/1.flac", 2).song("Salt Road", "Beta", 200));
+    world.settle();
+    let row_alpha = world
+        .library
+        .artist_keys
+        .iter()
+        .find(|entry| entry.value == "art-x")
+        .unwrap()
+        .artist;
+    let row_beta = world
+        .library
+        .artist_keys
+        .iter()
+        .find(|entry| entry.value == "beta")
+        .unwrap()
+        .artist;
+
+    // Retagging Alpha/X to Beta/Y MUST create a brand-new row for Y, leaving
+    // BOTH Alpha's row (with art-x) AND unrelated name-only Beta's row intact.
+    world.library.items[0].facts.artist = vec!["Beta".to_owned()];
+    world.library.items[0].facts.artist_mbids = vec!["art-y".to_owned()];
+    let retagged = world.settle();
+    assert_eq!(retagged.artists.len(), 2);
+    let row_y = world
+        .library
+        .artist_keys
+        .iter()
+        .find(|entry| entry.value == "art-y")
+        .unwrap()
+        .artist;
+    assert_ne!(row_y, row_alpha);
+    assert_ne!(row_y, row_beta);
+    assert!(
+        retagged
+            .artists
+            .iter()
+            .any(|out| out.r == Ref::Row(row_beta))
+    );
+    assert!(world.library.artist_keys.iter().any(|entry| {
+        entry.kind == ArtistKeyKind::Mbid && entry.value == "art-x" && entry.artist == row_alpha
+    }));
+    world.assert_settled();
+
+    // Dropping the MBID from Y's file also leaves Y's row intact on art-y
+    // while using Beta's durable name row for MBID-less "Beta".
+    world.library.items[0].facts.artist_mbids.clear();
+    let dropped = world.settle();
+    assert_eq!(dropped.artists.len(), 1);
+    assert_eq!(dropped.artists[0].r, Ref::Row(row_beta));
+    assert!(world.library.artist_keys.iter().any(|entry| {
+        entry.kind == ArtistKeyKind::Mbid && entry.value == "art-y" && entry.artist == row_y
+    }));
+    world.assert_settled();
+}
+
+#[test]
+fn undoing_an_artist_merge_keeps_the_restored_artists_credits_even_if_target_shares_its_name() {
+    let mut world = World::default();
+    world.add(
+        file("A/1.flac", 1)
+            .song("One", "Target", 200)
+            .with(|facts| facts.artist_mbids = vec!["art-target".to_owned()]),
+    );
+    world.add(file("B/1.flac", 2).song("Two", "Source", 200));
+    world.settle();
+    let row_target = world
+        .library
+        .artist_keys
+        .iter()
+        .find(|entry| entry.value == "art-target")
+        .unwrap()
+        .artist;
+    let row_source = world
+        .library
+        .artist_keys
+        .iter()
+        .find(|entry| entry.value == "source")
+        .unwrap()
+        .artist;
+
+    // Merge Source into Target, and suppose Target also gets a file credited
+    // as "Source" under art-target.
+    world
+        .library
+        .artist_canonical
+        .insert(row_source, row_target);
+    world.add(
+        file("C/1.flac", 3)
+            .song("Three", "Source", 200)
+            .with(|facts| facts.artist_mbids = vec!["art-target".to_owned()]),
+    );
+    world.settle();
+
+    // Undo the merge: Source's durable name key still owns row_source, so its
+    // credits stay on row_source on subsequent resolves.
+    world.library.artist_canonical.remove(&row_source);
+    let after = world.settle();
+    assert!(
+        after
+            .artists
+            .iter()
+            .any(|out| out.r == Ref::Row(row_target))
+    );
+    assert!(
+        after
+            .artists
+            .iter()
+            .any(|out| out.r == Ref::Row(row_source))
+    );
+    world.assert_settled();
+}
+
+#[test]
+fn a_tied_mbid_vote_does_not_create_a_new_artist_on_repeated_resolution() {
+    let mut world = World::default();
+    // Two files of the same song on one album, tagged with different artist
+    // MBIDs ("art-z" first-seen, "art-a" lexicographically smaller).
+    world.add(
+        file("A/1.flac", 1)
+            .song("Paper Kites", "Moss Arcade", 200)
+            .on("Tin Weather", Some(1), 1)
+            .with(|facts| facts.artist_mbids = vec!["art-z".to_owned()]),
+    );
+    world.add(
+        file("A/1.mp3", 2)
+            .song("Paper Kites", "Moss Arcade", 200)
+            .on("Tin Weather", Some(1), 1)
+            .with(|facts| facts.artist_mbids = vec!["art-a".to_owned()]),
+    );
+    let first = world.settle();
+    let count = world.library.artist_keys.len();
+    assert_eq!(first.artists.len(), 2);
+    // Repeated resolution creates no new artist row and is completely settled.
+    world.assert_settled();
+    assert_eq!(world.library.artist_keys.len(), count);
 }
 
 #[test]
@@ -2746,6 +2973,57 @@ fn files() -> impl Strategy<Value = Vec<File>> {
     proptest::collection::vec(one, 1..14)
 }
 
+/// When a name-keyed artist holds a durable `artist_key` from an earlier
+/// normaliser version alongside an MBID artist credited under the same name,
+/// upgrading to the current normaliser version protects the existing owner in
+/// one pass rather than folding it into the MBID artist on pass 1 and back on
+/// pass 2.
+#[test]
+fn a_stale_normalizer_name_key_is_protected_from_credited_under_in_one_pass() {
+    let mut world = World::default();
+    let plain = world.add(file("A/1.flac", 1).song("Salt Road", "Ninefold", 200));
+    let mut tagged = file("B/1.flac", 2).song("Glass Pier", "Ninefold", 200);
+    tagged.facts.artist_mbids = vec!["mbid-ninefold".to_owned()];
+    let with_mbid = world.add(tagged);
+    // Pre-populate durable keys as migration 0003 does on a v1-normalised
+    // database: row 1 owns the v1 name key; row 2 owns the MBID key.
+    world.library.artist_keys = vec![
+        ExistingArtistKey {
+            kind: ArtistKeyKind::Name,
+            value: "ninefold".to_owned(),
+            artist: 1,
+            normalizer_version: Some(1),
+        },
+        ExistingArtistKey {
+            kind: ArtistKeyKind::Mbid,
+            value: "mbid-ninefold".to_owned(),
+            artist: 2,
+            normalizer_version: None,
+        },
+    ];
+    let res = world.settle();
+    let plain_artist = res
+        .appearances
+        .iter()
+        .find(|a| a.title.as_deref() == Some("Salt Road"))
+        .and_then(|a| a.credit)
+        .and_then(|c| res.credits.get(c))
+        .and_then(|c| c.names.first())
+        .map(|(a, _, _)| res.artists[*a].r);
+    let mbid_artist = res
+        .appearances
+        .iter()
+        .find(|a| a.title.as_deref() == Some("Glass Pier"))
+        .and_then(|a| a.credit)
+        .and_then(|c| res.credits.get(c))
+        .and_then(|c| c.names.first())
+        .map(|(a, _, _)| res.artists[*a].r);
+    let _ = (plain, with_mbid);
+    assert_eq!(plain_artist, Some(Ref::Row(1)));
+    assert_eq!(mbid_artist, Some(Ref::Row(2)));
+    world.assert_settled();
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
 
@@ -2859,7 +3137,12 @@ fn an_artist_named_with_a_symbol_keeps_its_row_from_normaliser_2_or_1() {
         let mut world = World::default();
         world.add(file("A/1.flac", 1).song("Lanterns", "Harbour Lights +", 200));
         // The row the earlier normaliser keyed the name to.
-        world.library.artists = vec![(7, old.to_owned())];
+        world.library.artist_keys = vec![ExistingArtistKey {
+            kind: ArtistKeyKind::Name,
+            value: old.to_owned(),
+            artist: 7,
+            normalizer_version: Some(version),
+        }];
         world.next = 10;
         world.library.artist_keys_by = Some(version);
         let resolution = world.settle();
@@ -2871,7 +3154,12 @@ fn an_artist_named_with_a_symbol_keeps_its_row_from_normaliser_2_or_1() {
     let mut world = World::default();
     world.add(file("A/1.flac", 1).song("One", "Harbour Lights", 200));
     world.add(file("B/2.flac", 2).song("Two", "Harbour Lights +", 200));
-    world.library.artists = vec![(7, "harbour lights".to_owned())];
+    world.library.artist_keys = vec![ExistingArtistKey {
+        kind: ArtistKeyKind::Name,
+        value: "harbour lights".to_owned(),
+        artist: 7,
+        normalizer_version: Some(2),
+    }];
     world.next = 10;
     world.library.artist_keys_by = Some(2);
     let resolution = world.settle();

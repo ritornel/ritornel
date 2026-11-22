@@ -8,6 +8,7 @@
 --   0002_fold_search_text  6c46673f3d3da76a0115cc787be0537d9f2ec2660002ca9f579514ff617b498e
 --   0003_claim_and_love_indexes  4247daecea906f0640d8aec80e338886d707b933201711d07a6ad210e0b9efb1
 --   0004_observation_recording_correction  f500fbf7eb27851be43e1fc97395fa05818b4bd0186480758c6161fafd92059a
+--   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -911,3 +912,17 @@ BEFORE DELETE ON correction_recording
 BEGIN
   SELECT RAISE(ABORT, 'correction_recording is immutable: nothing is deleted');
 END;
+
+CREATE TABLE artist_key (
+  id                  INTEGER PRIMARY KEY,
+  key_kind            TEXT NOT NULL CHECK (key_kind IN ('mbid', 'name')),
+  key_value           TEXT NOT NULL CHECK (length(key_value) > 0),
+  artist_id           INTEGER NOT NULL REFERENCES artist(id),
+  normalizer_version  INTEGER,                                             -- NULL for 'mbid'; the normaliser version that made key_value for 'name'
+  decision_id         INTEGER REFERENCES identity_decision(id),            -- set when an owner decision pinned this key
+  rev                 INTEGER NOT NULL,
+  UNIQUE (key_kind, key_value),
+  CHECK ((key_kind = 'mbid') = (normalizer_version IS NULL))
+) STRICT;
+
+CREATE INDEX artist_key_artist ON artist_key (artist_id);

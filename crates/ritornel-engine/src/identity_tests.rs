@@ -207,28 +207,20 @@ fn an_artist_row_is_known_by_the_id_its_files_claim() {
     rig.put("Loose/tone.ogg", "a.retagged.ogg");
     rig.scan();
     let (library, _) = rig.library.load().unwrap();
-    let named = |mbid: &str| {
-        library
-            .artist_mbids
-            .iter()
-            .filter(|(_, id)| id.as_str() == mbid)
-            .map(|(row, _)| {
-                library
-                    .artists
-                    .iter()
-                    .find(|(artist, _)| artist == row)
-                    .map(|(_, name)| name.clone())
-                    .unwrap()
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        named("12121212-3434-4565-8787-909090909090"),
-        ["moss arcade"]
-    );
-    // The artist with no ID has a row and no ID.
-    assert_eq!(library.artists.len(), 2);
-    assert_eq!(library.artist_mbids.len(), 1);
+    let mbid_keys: Vec<_> = library
+        .artist_keys
+        .iter()
+        .filter(|entry| entry.kind == ritornel_domain::library::ArtistKeyKind::Mbid)
+        .collect();
+    let name_keys: Vec<_> = library
+        .artist_keys
+        .iter()
+        .filter(|entry| entry.kind == ritornel_domain::library::ArtistKeyKind::Name)
+        .collect();
+    assert_eq!(mbid_keys.len(), 1);
+    assert_eq!(mbid_keys[0].value, "12121212-3434-4565-8787-909090909090");
+    // The artist with no ID has a durable name key and no MBID key.
+    assert_eq!(name_keys.len(), 1);
     // And a library resolved again keeps every row where it is.
     let run = rig.library.dry_run(&detail()).unwrap();
     assert_eq!((run.would_change, run.would_write), (0, false));
@@ -671,26 +663,31 @@ fn an_artist_no_file_credits_is_keyed_again_when_the_normaliser_changes() {
                 (902, "Tin/Harbour"),
                 (903, "Moss/Arcade"),
                 (904, "Salt-Road"),
-                (905, "Salt/Road"),
+                (905, "Salt Road"),
             ] {
+                let key = ritornel_domain::normalize::normalize_by(1, name).unwrap();
                 connection.execute(
                     "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
                      VALUES (?1, ?2, ?1, ?3, ?3, ?4, ?5)",
-                    (
-                        row,
-                        write.new_id()?.as_bytes(),
-                        name,
-                        ritornel_domain::normalize::normalize_by(1, name),
-                        write.rev(),
-                    ),
+                    (row, write.new_id()?.as_bytes(), name, &key, write.rev()),
+                )?;
+                connection.execute(
+                    "INSERT INTO artist_key (key_kind, key_value, artist_id, normalizer_version, decision_id, rev)
+                     VALUES ('name', ?1, ?2, 1, NULL, ?3)",
+                    (&key, row, write.rev()),
                 )?;
             }
             // A row whose name was an edit since withdrawn: its name and
             // its key disagree.
             connection.execute(
                 "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
-                 VALUES (906, ?1, 906, 'Salt Harbour', 'Salt Harbour', 'tinharbour', ?2)",
+                 VALUES (906, ?1, 906, 'Salt Harbour', 'Salt Harbour', 'saltharbor', ?2)",
                 (write.new_id()?.as_bytes(), write.rev()),
+            )?;
+            connection.execute(
+                "INSERT INTO artist_key (key_kind, key_value, artist_id, normalizer_version, decision_id, rev)
+                 VALUES ('name', 'saltharbor', 906, 1, NULL, ?1)",
+                [write.rev()],
             )?;
             connection.execute(
                 "INSERT INTO metadata_edit (entity_kind, entity_id, field, value, actor_kind, edited_at_ms, rev)
@@ -768,14 +765,16 @@ fn an_artist_keyed_by_normaliser_2_is_keyed_again_with_its_symbol() {
             },
             move |write| {
                 let connection = write.connection();
+                let key = ritornel_domain::normalize::normalize_by(2, "Harbour Lights +").unwrap();
                 connection.execute(
                     "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
                      VALUES (911, ?1, 911, 'Harbour Lights +', 'Harbour Lights +', ?2, ?3)",
-                    (
-                        write.new_id()?.as_bytes(),
-                        ritornel_domain::normalize::normalize_by(2, "Harbour Lights +"),
-                        write.rev(),
-                    ),
+                    (write.new_id()?.as_bytes(), &key, write.rev()),
+                )?;
+                connection.execute(
+                    "INSERT INTO artist_key (key_kind, key_value, artist_id, normalizer_version, decision_id, rev)
+                     VALUES ('name', ?1, 911, 2, NULL, ?2)",
+                    (&key, write.rev()),
                 )?;
                 let versions: String = connection.query_row(
                     "SELECT value_json FROM library_setting WHERE key = 'identity.versions'",
@@ -821,5 +820,430 @@ fn an_artist_keyed_by_normaliser_2_is_keyed_again_with_its_symbol() {
             })
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn a_merged_artist_survives_rescan_and_rebuild_display_and_undoing_gives_both_back() {
+    let mut rig = Rig::new();
+    rig.put(FLAC, "a.flac");
+    rig.put("Other/track.ogg", "a.retagged.ogg");
+    rig.scan();
+
+    assert_eq!(rig.library.stats().unwrap().artists, 2);
+    let ids: Vec<(i64, String)> = rig
+        .library
+        .read(|connection| {
+            let mut stmt = connection.prepare("SELECT id, display_name FROM artist ORDER BY id")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(ids.len(), 2);
+    let (row_a, row_b) = (ids[0].0, ids[1].0);
+
+    // Merge artist B into artist A.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.mergeArtist",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE artist SET redirect_to_id = ?2, canonical_id = ?2 WHERE id = ?1",
+                    (row_b, row_a),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    assert_eq!(rig.library.stats().unwrap().artists, 1);
+
+    // Rescan / re-resolve changes nothing and keeps the merge intact.
+    let run = rig.library.dry_run(&detail()).unwrap();
+    assert_eq!((run.would_change, run.would_write), (0, false));
+    assert!(
+        rig.library
+            .resolve(WriteRequest {
+                method: "test.resolve",
+                command: None,
+                client: None,
+            })
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(rig.library.stats().unwrap().artists, 1);
+    assert_eq!(rig.one("SELECT count(*) FROM artist"), "2");
+
+    // rebuild_display wipes display columns and re-projects; merge still holds
+    // and no duplicate artist row is created.
+    rig.library
+        .rebuild_display(WriteRequest {
+            method: "library.rebuildDisplay",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    assert_eq!(rig.library.stats().unwrap().artists, 1);
+    assert_eq!(rig.one("SELECT count(*) FROM artist"), "2");
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_name FROM artist WHERE id = {row_a}"
+        )),
+        ids[0].1
+    );
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_name FROM artist WHERE id = {row_b}"
+        )),
+        ids[1].1
+    );
+    let after_rebuild = rig.library.dry_run(&detail()).unwrap();
+    assert_eq!(
+        (after_rebuild.would_change, after_rebuild.would_write),
+        (0, false)
+    );
+
+    // Undo the merge: both artists are back immediately with their original
+    // rows, display names, and credits.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.unmergeArtist",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE artist SET redirect_to_id = NULL, canonical_id = id WHERE id = ?1",
+                    [row_b],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    assert_eq!(rig.library.stats().unwrap().artists, 2);
+    let after_undo = rig.library.dry_run(&detail()).unwrap();
+    assert_eq!(
+        (after_undo.would_change, after_undo.would_write),
+        (0, false)
+    );
+}
+
+#[test]
+fn retagging_an_artists_name_and_mbid_keeps_the_old_artist_row_and_public_id() {
+    let mut rig = Rig::new();
+    rig.put(FLAC, "a.flac");
+    rig.scan();
+    let (old_id, old_pid): (i64, Vec<u8>) = rig
+        .library
+        .read(|connection| {
+            Ok(
+                connection.query_row("SELECT id, public_id FROM artist", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?,
+            )
+        })
+        .unwrap();
+
+    // Simulate retagging the file's artist name AND MusicBrainz ID.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.retagArtist",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let c = write.connection();
+                c.execute(
+                    "UPDATE metadata_claim SET value = 'New Band' WHERE field IN ('artist', 'album_artist')",
+                    [],
+                )?;
+                c.execute(
+                    "UPDATE identifier_claim
+                     SET value = '99999999-8888-7777-6666-555555555555'
+                     WHERE namespace IN ('mb_artist', 'mb_album_artist')",
+                    [],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolve",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+
+    // A brand-new artist row was created for the new MBID; the old row keeps
+    // its public ID, display name, and durable MBID key.
+    assert_eq!(rig.one("SELECT count(*) FROM artist"), "2");
+    let (kept_pid, kept_mbid): (Vec<u8>, String) = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT a.public_id, ak.key_value
+                 FROM artist a
+                 JOIN artist_key ak ON ak.artist_id = a.id AND ak.key_kind = 'mbid'
+                 WHERE a.id = ?1",
+                [old_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(kept_pid, old_pid);
+    assert_eq!(kept_mbid, "12121212-3434-4565-8787-909090909090");
+}
+
+#[test]
+fn a_tied_mbid_vote_on_one_credit_never_creates_a_new_artist_on_rescan() {
+    let mut rig = Rig::new();
+    // Two files bound to the same recording and appearance.
+    rig.put(FLAC, "a.flac");
+    rig.put(COPY, "a.mp3");
+    rig.scan();
+
+    // Give the two files competing artist MBIDs: the second has a
+    // lexicographically smaller MBID than the first.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.tiedMbid",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let c = write.connection();
+                let copy_item: i64 = c.query_row(
+                    "SELECT id FROM source_item WHERE provider_key = ?1",
+                    [COPY],
+                    |row| row.get(0),
+                )?;
+                let rev_id: i64 = c.query_row(
+                    "SELECT current_revision_id FROM source_item WHERE id = ?1",
+                    [copy_item],
+                    |row| row.get(0),
+                )?;
+                let src_id: i64 = c.query_row(
+                    "SELECT id FROM metadata_source WHERE kind = 'file_tags'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                c.execute(
+                    "DELETE FROM identifier_claim
+                     WHERE source_item_id = ?1 AND namespace IN ('mb_artist', 'mb_album_artist')",
+                    [copy_item],
+                )?;
+                c.execute(
+                    "INSERT INTO identifier_claim
+                       (source_item_id, revision_id, extractor_version, scope, namespace, value,
+                        ordinal, metadata_source_id, rev)
+                     VALUES (?1, ?2, 1, 'artist', 'mb_artist',
+                             '00000000-0000-0000-0000-000000000001', 0, ?3, ?4)",
+                    (copy_item, rev_id, src_id, write.rev()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // First resolve settles the second MBID; subsequent resolves must do
+    // nothing and never mint extra artist rows.
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolve1",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    let artists_after_first = rig.one("SELECT count(*) FROM artist");
+    assert!(
+        rig.library
+            .resolve(WriteRequest {
+                method: "test.resolve2",
+                command: None,
+                client: None,
+            })
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(rig.one("SELECT count(*) FROM artist"), artists_after_first);
+}
+
+#[test]
+fn migrating_a_saved_schema_1_library_backfills_artist_keys() {
+    let scratch = crate::testing::Scratch::new();
+    let path = scratch.path().join("library.db");
+    {
+        let mut connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        crate::migrate::run(
+            &mut connection,
+            &crate::migrate::LIBRARY[..2],
+            &crate::testing::FixedClock::at(1_794_780_000_000),
+        )
+        .unwrap();
+        connection
+            .execute_batch(include_str!("../saved/library/0002.sql"))
+            .unwrap();
+    }
+    let clock = std::sync::Arc::new(crate::testing::FixedClock::at(1_794_780_000_000));
+    let entropy = std::sync::Arc::new(crate::testing::CountingEntropy::default());
+    let store = crate::LibraryStore::open(&path, crate::Id::from_bytes([0x01; 16]), clock, entropy)
+        .unwrap();
+
+    // Artist 1 got its MBID key, artist 2 its name key, and redirected artist
+    // 3 kept its name key too.
+    let keys: Vec<(String, String, i64, Option<i64>)> = store
+        .read(|connection| {
+            let mut stmt = connection.prepare(
+                "SELECT key_kind, key_value, artist_id, normalizer_version
+                 FROM artist_key ORDER BY artist_id, key_kind",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        keys,
+        [
+            (
+                "mbid".to_owned(),
+                "12121212-3434-4565-8787-909090909090".to_owned(),
+                1,
+                None,
+            ),
+            ("name".to_owned(), "glass harbor".to_owned(), 2, Some(1)),
+            ("name".to_owned(), "moss".to_owned(), 3, Some(1)),
+        ]
+    );
+
+    // Resolving after migration preserves artist rows and redirects and
+    // upgrades normaliser-1 name keys cleanly.
+    store
+        .resolve(WriteRequest {
+            method: "test.resolveAfterMigrate",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    let artists_after: Vec<(i64, Option<i64>)> = store
+        .read(|connection| {
+            let mut stmt =
+                connection.prepare("SELECT id, redirect_to_id FROM artist ORDER BY id")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(artists_after, [(1, None), (2, None), (3, Some(1))]);
+    assert!(
+        store
+            .resolve(WriteRequest {
+                method: "test.resolveAgain",
+                command: None,
+                client: None,
+            })
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn rebuild_display_preserves_retired_rows_and_migrates_stale_keys_safely() {
+    let mut rig = Rig::new();
+    rig.put(FLAC, "a.flac");
+    rig.put("Other/track.ogg", "a.retagged.ogg");
+    rig.scan();
+
+    // Retire the second file so its release, appearance, and artist are only
+    // referenced historically; also add an unreached v1 artist row and a
+    // merge target with a stale v1 key colliding with a live artist.
+    let retired_artist_id: i64 = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT a.id FROM artist a
+                 WHERE a.display_name <> 'Moss Arcade'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    let retired_name = rig.one(&format!(
+        "SELECT display_name FROM artist WHERE id = {retired_artist_id}"
+    ));
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.setupRebuild",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let c = write.connection();
+                c.execute(
+                    "UPDATE source_item SET retired_at_ms = ?1, rev = ?2
+                     WHERE provider_key = 'Other/track.ogg'",
+                    (write.now_ms(), write.rev()),
+                )?;
+                // An unreached artist with a stale v1 key that should safely
+                // rekey to "lanterns 42" rather than being wiped to NULL.
+                c.execute(
+                    "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
+                     VALUES (950, ?1, 950, 'Lanterns-42', 'Lanterns-42', 'lanterns42', ?2)",
+                    (write.new_id()?.as_bytes(), write.rev()),
+                )?;
+                c.execute(
+                    "INSERT INTO artist_key (key_kind, key_value, artist_id, normalizer_version, decision_id, rev)
+                     VALUES ('name', 'lanterns42', 950, 1, NULL, ?1)",
+                    [write.rev()],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    rig.library
+        .rebuild_display(WriteRequest {
+            method: "library.rebuildDisplay",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+
+    // The retired file's artist and appearance kept their last-known display.
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT display_name FROM artist WHERE id = {retired_artist_id}"
+        )),
+        retired_name
+    );
+    assert_ne!(
+        rig.one(
+            "SELECT coalesce(ta.display_title, '') FROM source_item si
+             JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+             JOIN track_appearance ta ON ta.id = a.appearance_id
+             WHERE si.provider_key = 'Other/track.ogg'"
+        ),
+        ""
+    );
+    // The unreached v1 artist row was safely migrated to v2 before the wipe.
+    assert_eq!(
+        rig.one("SELECT key_value FROM artist_key WHERE artist_id = 950"),
+        "lanterns 42"
+    );
+    // Live artist display was rebuilt cleanly.
+    assert_eq!(
+        rig.one("SELECT display_name FROM artist WHERE display_name = 'Moss Arcade'"),
+        "Moss Arcade"
     );
 }
