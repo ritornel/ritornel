@@ -38,6 +38,7 @@ mod tests {
         let refused = ApiCredentials::find(none, &dir).unwrap_err();
         assert!(refused.contains("chmod 600"), "{refused}");
         assert!(!refused.contains("SENTINEL"), "{refused}");
+        // The permissions error must precede any attempt to decode these bytes.
         std::fs::write(&path, [0xff]).unwrap();
         let refused = ApiCredentials::find(none, &dir).unwrap_err();
         assert!(refused.contains("chmod 600"), "{refused}");
