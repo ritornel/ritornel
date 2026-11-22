@@ -402,16 +402,16 @@ impl Uplink {
                     client
                 }
             };
-            let sent = self
-                .runtime
-                .block_on(client.call_raw(method, params.clone()));
+            let (sent, again) = self.ask(&client, method, params.clone());
             let lost =
                 matches!(&sent, Err(error) if !matches!(error, ritornel_client::Error::Call(_)));
             result = Some(sent);
-            if !lost {
+            if lost {
+                *lock(&self.own) = None;
+            }
+            if !(lost && again) {
                 break;
             }
-            *lock(&self.own) = None;
         }
         match result {
             Some(result) => self.answer(result),
