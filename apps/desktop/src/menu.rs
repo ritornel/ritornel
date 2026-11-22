@@ -319,7 +319,7 @@ fn shell(cx: &App) -> Option<gpui::Entity<crate::shell::Shell>> {
     cx.try_global::<Here>()?.0.upgrade()
 }
 
-fn player(cx: &App) -> Option<gpui::Entity<crate::player::Player>> {
+pub(crate) fn player(cx: &App) -> Option<gpui::Entity<crate::player::Player>> {
     Some(shell(cx)?.read(cx).player.clone())
 }
 
