@@ -70,6 +70,8 @@ struct State {
     /// Plays sent to `track.scrobble`.
     scrobbled: Vec<FakeScrobble>,
     seen: Vec<Seen>,
+    reply_timestamp: Option<(usize, u64)>,
+    now_playing_error: Option<u32>,
 }
 
 /// A fake Last.fm, serving until it is dropped.
@@ -149,6 +151,16 @@ impl FakeLastfm {
             .filter(|seen| seen.method == "track.updateNowPlaying")
             .map(|seen| seen.params.clone())
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn change_reply_timestamp(&self, index: usize, timestamp: u64) {
+        lock(&self.state).reply_timestamp = Some((index, timestamp));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refuse_now_playing(&self, code: u32) {
+        lock(&self.state).now_playing_error = Some(code);
     }
 
     /// Every request answered, in order.
@@ -292,7 +304,7 @@ fn respond(state: &Mutex<State>, params: HashMap<String, String>) -> (u16, Value
                     "track": {"corrected": "0", "#text": title},
                     "albumArtist": {"corrected": "0", "#text": ""},
                     "ignoredMessage": {"code": "0", "#text": ""},
-                    "timestamp": at,
+                    "timestamp": state.reply_timestamp.filter(|(index, _)| *index == i).map_or(at, |(_, timestamp)| timestamp.to_string()),
                 }));
             }
             let accepted = rows.len();
@@ -302,6 +314,9 @@ fn respond(state: &Mutex<State>, params: HashMap<String, String>) -> (u16, Value
             )
         }
         "track.updatenowplaying" => {
+            if let Some(code) = state.now_playing_error {
+                return error(code, "Authentication failed");
+            }
             if params.get("sk").map(String::as_str) != Some(SESSION_KEY) {
                 return error(9, "Invalid session key");
             }

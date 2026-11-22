@@ -39,6 +39,8 @@ pub const DAILY_LIMIT: u32 = scrobl::model::IgnoredCode::DAILY_LIMIT.get();
 /// What Last.fm did with one play.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
+    /// The reply did not identify a unique outcome for this timestamp.
+    Unknown,
     /// It is recorded, under these names, which are those sent unless
     /// Last.fm corrected them.
     Accepted {
@@ -142,7 +144,12 @@ impl Lastfm {
         }
         match self.block(query.send()) {
             Ok(_) => Ok(()),
-            Err(error) if error.api_code() == Some(ApiErrorCode::INVALID_SESSION_KEY) => {
+            Err(error)
+                if matches!(
+                    error.api_code(),
+                    Some(ApiErrorCode::INVALID_SESSION_KEY | ApiErrorCode::AUTHENTICATION_FAILED)
+                ) =>
+            {
                 Err(NotShown::SignInAgain(error.to_string()))
             }
             Err(error) => Err(NotShown::Failed(error.to_string())),
@@ -167,24 +174,20 @@ impl Lastfm {
                     (Some(Delivery::Unknown), _) => Unsent::Unknown(message),
                     (_, Retry::AfterReauthentication) => Unsent::SignInAgain(message),
                     _ if revoked => Unsent::SignInAgain(message),
-                    (Some(Delivery::NotSent), _) | (_, Retry::Later | Retry::AfterBackoff) => {
-                        Unsent::Later(message)
-                    }
+                    (_, Retry::Later | Retry::AfterBackoff) => Unsent::Later(message),
                     _ => Unsent::Refused(message),
                 });
             }
         };
-        let mut outcomes: Vec<Option<&scrobl::model::Outcome>> =
-            report.outcomes().iter().map(Some).collect();
         let mut sent = Vec::with_capacity(plays.len());
         for scrobble in plays {
-            let found = outcomes.iter_mut().find(|outcome| {
-                outcome.is_some_and(|outcome| outcome.timestamp() == Some(scrobble.timestamp_s))
-            });
-            let Some(outcome) = found.and_then(Option::take) else {
-                return Err(Unsent::Unknown(
-                    "Last.fm's answer does not account for every play".to_owned(),
-                ));
+            let mut matching = report
+                .outcomes()
+                .iter()
+                .filter(|outcome| outcome.timestamp() == Some(scrobble.timestamp_s));
+            let (Some(outcome), None) = (matching.next(), matching.next()) else {
+                sent.push(Outcome::Unknown);
+                continue;
             };
             sent.push(match outcome.ignored() {
                 Some(ignored) => Outcome::Ignored {

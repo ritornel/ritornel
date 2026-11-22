@@ -38,7 +38,7 @@ mod source;
 use std::future::Future;
 use std::time::Duration;
 
-use scrobl::{ApiKey, ApiSecret, Client};
+use scrobl::Client;
 
 pub use credentials::{ApiCredentials, CREDENTIALS_FILE, KEY_VARIABLE, SECRET_VARIABLE};
 pub use scrobble::{DAILY_LIMIT, MAX_BATCH, NotShown, Outcome, Playing, Sent, ToScrobble, Unsent};
@@ -173,24 +173,17 @@ impl Lastfm {
             .enable_all()
             .build()
             .map_err(|error| Error(format!("cannot start Last.fm's runtime: {error}")))?;
-        let builder = |key: ApiKey, secret: ApiSecret| {
-            let builder = Client::builder(key)
-                .secret(secret)
-                .user_agent(USER_AGENT)
-                .min_interval(settings.min_interval);
-            match &settings.base_url {
-                Some(url) => builder.base_url(url.clone()),
-                None => builder,
-            }
-        };
         let (key, secret) = credentials.into_parts();
-        let client = builder(key.clone(), secret.clone())
-            .build()
-            .map_err(|error| Error::of(&error))?;
-        // The one place this program asks to write: scrobbling.
-        let writer = builder(key, secret)
-            .build_writer()
-            .map_err(|error| Error::of(&error))?;
+        let mut builder = Client::builder(key)
+            .secret(secret)
+            .user_agent(USER_AGENT)
+            .min_interval(settings.min_interval);
+        if let Some(url) = &settings.base_url {
+            builder = builder.base_url(url.clone());
+        }
+        let writer = builder.build_writer().map_err(|error| Error::of(&error))?;
+        // The read-only client inside the writer shares its pacing clock.
+        let client = Client::clone(&writer);
         Ok(Self {
             runtime: Some(runtime),
             client,
@@ -329,6 +322,54 @@ mod tests {
             .unwrap_err();
         assert!(matches!(refused, Unsent::SignInAgain(_)), "{refused:?}");
         assert_eq!(fake.scrobbled().len(), 2);
+        fake.change_reply_timestamp(0, 42);
+        let partial = lastfm
+            .scrobble(&SessionKey::new(SESSION_KEY), &plays)
+            .unwrap();
+        assert!(matches!(&partial[1], Outcome::Accepted { title, .. } if title == "Second"));
+        assert!(matches!(partial[0], Outcome::Unknown));
+        fake.change_reply_timestamp(0, plays[1].timestamp_s);
+        let ambiguous = lastfm
+            .scrobble(&SessionKey::new(SESSION_KEY), &plays)
+            .unwrap();
+        assert_eq!(ambiguous, [Outcome::Unknown, Outcome::Unknown]);
+    }
+
+    #[test]
+    fn a_batch_rejected_before_sending_is_not_retried() {
+        let fake = FakeLastfm::start("someone", Vec::new());
+        let result = lastfm(&fake).scrobble(&SessionKey::new(SESSION_KEY), &[]);
+        assert!(matches!(result, Err(Unsent::Refused(_))), "{result:?}");
+        assert!(fake.seen().is_empty());
+    }
+
+    #[test]
+    fn reads_and_writes_observe_one_interval() {
+        let fake = FakeLastfm::start("someone", Vec::new());
+        let interval = Duration::from_millis(200);
+        let service = Lastfm::new(
+            ApiCredentials::new(API_KEY, API_SECRET),
+            Settings {
+                base_url: Some(fake.base_url()),
+                min_interval: interval,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        service.begin_sign_in().unwrap();
+        let play = Playing {
+            artist: "Invented".into(),
+            title: "One".into(),
+            album: None,
+            album_artist: None,
+            track_number: None,
+            duration_ms: None,
+        };
+        service
+            .now_playing(&SessionKey::new(SESSION_KEY), &play)
+            .unwrap();
+        assert!(started.elapsed() >= interval);
     }
 
     #[test]
@@ -362,6 +403,12 @@ mod tests {
             .now_playing(&SessionKey::new("WRONG"), &playing)
             .unwrap_err();
         assert!(matches!(refused, NotShown::SignInAgain(_)), "{refused:?}");
-        assert_eq!(fake.now_playing().len(), 2, "sent once, never again");
+        fake.refuse_now_playing(4);
+        let revoked = lastfm.now_playing(&SessionKey::new(SESSION_KEY), &playing);
+        assert!(
+            matches!(revoked, Err(NotShown::SignInAgain(_))),
+            "{revoked:?}"
+        );
+        assert_eq!(fake.now_playing().len(), 3, "sent once, never again");
     }
 }
