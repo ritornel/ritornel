@@ -239,7 +239,8 @@ pub struct RecordStatus {
     pub notes: Vec<RecordProblem>,
 }
 
-/// One thing that has stopped the record advancing, and since when.
+/// A warning, one thing that has stopped the record advancing, or a note,
+/// one thing that happened that no one can act on; and since when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -259,7 +260,7 @@ pub struct RecordProblem {
     pub dismissable: bool,
 }
 
-/// What has stopped the record advancing.
+/// What a warning or a note is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -678,6 +679,12 @@ pub struct ServerInfo {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_record_from_a_server_that_gives_no_notes_has_none() {
+        let record: super::RecordStatus = serde_json::from_str(r#"{"problems":[]}"#).unwrap();
+        assert!(record.notes.is_empty());
+    }
+
     use serde_json::json;
 
     use super::*;

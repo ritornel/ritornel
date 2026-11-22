@@ -1,8 +1,8 @@
 //! What a client says of the listening record: for each warning, what is
 //! wrong and what the person can do about it; for each note, what happened
 //! and what Ritornel does about it. Every client says the same words; each
-//! says since when in its own way, and names its own ways to dismiss and
-//! to restart the server.
+//! says since when in its own way, and names its own ways to dismiss, to
+//! restart the server and to sign in to Last.fm again.
 
 use ritornel_contract::{RecordProblem, RecordProblemKind};
 
@@ -14,8 +14,8 @@ pub struct Words<'a> {
     pub dismiss: &'a str,
     /// "restart the server", or "quit and reopen Ritornel".
     pub restart: &'a str,
-    /// Where to sign in to Last.fm again: "in Settings → Last.fm", or a
-    /// command to run.
+    /// How to sign in to Last.fm again and turn scrobbling back on, as
+    /// whole sentences: where in Settings, or the commands to run.
     pub sign_in: &'a str,
 }
 
@@ -78,30 +78,29 @@ pub fn then(problem: &RecordProblem, words: Words<'_>) -> String {
             .to_owned(),
         RecordProblemKind::ScrobblesUnknown if one => format!(
             "The play is still in your history here. If the next import from Last.fm finds it \
-             there, this note clears; Ritornel doesn’t send it again. {dismiss} sets this note \
-             aside."
+             there, this note clears; Ritornel doesn’t send it again. {dismiss} sets every \
+             scrobble note and warning aside."
         ),
         RecordProblemKind::ScrobblesUnknown => format!(
             "The plays are still in your history here. Those the next import from Last.fm finds \
-             there clear; Ritornel doesn’t send the others again. {dismiss} sets this note aside."
+             there clear; Ritornel doesn’t send the others again. {dismiss} sets every scrobble note and warning aside."
         ),
         RecordProblemKind::ScrobblesWithdrawn if one => format!(
             "It’s still in your history here. Ritornel chose not to send it, for the reason \
-             given. {dismiss} sets this note aside."
+             given. {dismiss} sets every scrobble note and warning aside."
         ),
         RecordProblemKind::ScrobblesWithdrawn => format!(
             "They’re still in your history here. Ritornel chose not to send them, for the \
-             reason given for the latest. {dismiss} sets this note aside."
+             reason given for the latest. {dismiss} sets every scrobble note and warning aside."
         ),
         RecordProblemKind::ScrobblesRefused => format!(
             "Check the API key and secret Ritornel uses, in lastfm.env in its data folder, then \
              {restart}. It clears by itself once Last.fm takes a scrobble again. Refused \
-             scrobbles aren’t sent again; {dismiss} sets them aside."
+             scrobbles aren’t sent again; {dismiss} sets every scrobble note and warning aside."
         ),
         RecordProblemKind::SignInNeeded => format!(
-            "Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. Sign in \
-             again {sign_in}, then turn scrobbling back on. Plays from before then stay in your \
-             history here."
+            "Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. {sign_in} \
+             Plays from before then stay in your history here."
         ),
         RecordProblemKind::ImportFailed => format!(
             "Ritornel tries again at the next import. If it keeps failing, check the internet \
@@ -145,7 +144,7 @@ mod tests {
     const APP: Words<'static> = Words {
         dismiss: "Dismiss",
         restart: "quit and reopen Ritornel",
-        sign_in: "in Settings → Last.fm",
+        sign_in: "Sign in again in Settings → Last.fm, then turn scrobbling back on there.",
     };
 
     #[test]
@@ -171,15 +170,24 @@ mod tests {
             refused.contains("then quit and reopen Ritornel."),
             "{refused}"
         );
-        assert!(refused.ends_with("Dismiss sets them aside."), "{refused}");
+        assert!(
+            refused.ends_with("Dismiss sets every scrobble note and warning aside."),
+            "{refused}"
+        );
         let cli = Words {
             dismiss: "`ritornelctl status --dismiss`",
             restart: "restart the server",
-            sign_in: "with `ritornelctl lastfm signin`",
+            sign_in: "Sign in again with `ritornelctl lastfm signin`, then turn scrobbling back \
+                      on with `ritornelctl lastfm scrobbling on`.",
         };
         assert!(
             then(&problem(RecordProblemKind::Unreadable, 1), cli)
                 .ends_with("then restart the server.")
+        );
+        let sign_in = then(&problem(RecordProblemKind::SignInNeeded, 1), cli);
+        assert!(
+            sign_in.contains("`ritornelctl lastfm scrobbling on`. Plays from before"),
+            "{sign_in}"
         );
     }
 
@@ -192,7 +200,10 @@ mod tests {
             for count in [1, 2] {
                 let said = then(&problem(kind, count), APP);
                 assert!(said.contains("still in your history here"), "{said}");
-                assert!(said.ends_with("Dismiss sets this note aside."), "{said}");
+                assert!(
+                    said.ends_with("Dismiss sets every scrobble note and warning aside."),
+                    "{said}"
+                );
             }
         }
     }

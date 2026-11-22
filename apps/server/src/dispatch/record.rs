@@ -217,7 +217,7 @@ impl Core {
         RecordStatus { problems, notes }
     }
 
-    /// `record.dismiss`: the scrobbles that ended unknown or withdrawn by
+    /// `record.dismiss`: the scrobbles that ended unknown, withdrawn or refused by
     /// the library's revision now are set aside. The same command again
     /// changes nothing, so a retry hides nothing that ended since, and the
     /// receipt is made and not stored.

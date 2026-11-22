@@ -372,7 +372,8 @@ enum Command {
 /// What `status` takes.
 #[derive(Debug, Default, PartialEq, Eq, Args)]
 pub(crate) struct StatusArgs {
-    /// Set aside the scrobbles that ended unknown or withdrawn, first.
+    /// Set aside every scrobble note and warning first: the scrobbles that
+    /// ended unknown, withdrawn or refused.
     #[arg(long)]
     pub(crate) dismiss: bool,
     #[command(flatten)]

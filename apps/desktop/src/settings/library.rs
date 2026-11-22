@@ -8,7 +8,9 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use ritornel_client::record;
-use ritornel_contract::{RecordProblem, RecordStatus, WatchState, WatchedFolder, WatchedKind};
+use ritornel_contract::{
+    RecordProblem, RecordProblemKind, RecordStatus, WatchState, WatchedFolder, WatchedKind,
+};
 
 use super::act;
 use super::controls::{
@@ -50,7 +52,26 @@ fn record(
     model: &Model,
     entity: &Entity<Model>,
     clock: &Clock,
+    cx: &App,
 ) -> impl IntoElement {
+    // Quitting restarts the server only when the app started it; asked
+    // only when something says to restart it.
+    let restarts = record.problems.iter().any(|problem| {
+        matches!(
+            problem.kind,
+            RecordProblemKind::ScrobblesRefused
+                | RecordProblemKind::ImportFailed
+                | RecordProblemKind::Unreadable
+        )
+    });
+    let words = if restarts && !model.link(cx).quitting_stops_the_server() {
+        record::Words {
+            restart: "restart Ritornel’s server",
+            ..WORDS
+        }
+    } else {
+        WORDS
+    };
     let mut rows = Vec::new();
     if record.problems.is_empty() {
         rows.push(
@@ -78,7 +99,7 @@ fn record(
             Some(detail) => format!("{since}: {detail}"),
             None => since,
         };
-        let then = record::then(problem, WORDS);
+        let then = record::then(problem, words);
         rows.push(
             row()
                 .child(
@@ -101,14 +122,8 @@ fn record(
                 }),
         );
     }
-    let said = match (record.problems.is_empty(), dismiss_at.is_some()) {
-        (false, true) => Some(
-            "Music plays on while the record has stopped. One Dismiss sets every scrobble row aside.",
-        ),
-        (false, false) => Some("Music plays on while the record has stopped."),
-        (true, true) => Some("One Dismiss sets every scrobble row aside."),
-        (true, false) => None,
-    };
+    let said =
+        (!record.problems.is_empty()).then_some("Music plays on while the record has stopped.");
     group(true)
         .child(heading("Listening record"))
         .child(boxed(rows))
@@ -121,7 +136,7 @@ fn record(
 const WORDS: record::Words<'static> = record::Words {
     dismiss: "Dismiss",
     restart: "quit and reopen Ritornel",
-    sign_in: "in Settings → Last.fm",
+    sign_in: "Sign in again in Settings → Last.fm, then turn scrobbling back on there.",
 };
 
 pub(super) fn render(
@@ -129,7 +144,7 @@ pub(super) fn render(
     entity: &Entity<Model>,
     clock: &Clock,
     active: bool,
-    _cx: &App,
+    cx: &App,
 ) -> impl IntoElement {
     let sources = model.sources.as_deref().unwrap_or_default();
     let here = sources
@@ -282,7 +297,7 @@ pub(super) fn render(
         .status
         .as_ref()
         .and_then(|status| status.record.as_ref())
-        .map(|found| record(found, model, entity, clock));
+        .map(|found| record(found, model, entity, clock, cx));
     let music = group(record.is_none())
         .child(heading("Music folders"))
         .child(boxed(rows))
