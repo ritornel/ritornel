@@ -6,8 +6,8 @@
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
-/// The version of [`normalize`] and [`core`]. A stored key is only
-/// comparable with one made by the same version.
+/// The version of stored name keys made by [`normalize`]. A title core
+/// is computed when comparing candidates and is never stored as a name key.
 ///
 /// 2: a mark is kept wherever NFKC leaves it, so a virama or a tone mark
 /// keeps two names apart; punctuation that parts words (a dash, a slash, a
@@ -16,9 +16,7 @@ use unicode_normalization::char::is_combining_mark;
 /// 3: a symbol at either end of a name, such as the plus of "Night Drives
 /// +", is a word of its key, so a record named apart by one is not the
 /// same record.
-///
-/// 4: a compatibility bracket delimits the same title note as its ASCII form.
-pub const NORMALIZER_VERSION: i64 = 4;
+pub const NORMALIZER_VERSION: i64 = 3;
 
 /// Whether a mark between two words parts them as a space does: dashes,
 /// slashes and the like. Everything else that is not a letter, a digit or a
@@ -210,7 +208,7 @@ pub fn normalize_by(version: i64, text: &str) -> Option<String> {
     match version {
         1 => Some(normalize_v1(text)),
         2 => Some(normalize_with(text, false)),
-        3 | NORMALIZER_VERSION => Some(normalize(text)),
+        NORMALIZER_VERSION => Some(normalize(text)),
         _ => None,
     }
 }
