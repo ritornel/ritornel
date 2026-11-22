@@ -172,12 +172,12 @@ impl View {
         self.waiting = false;
     }
 
-    fn asking(text: String) -> Self {
-        Self {
+    fn start(&mut self, text: String) {
+        *self = Self {
             text,
             open: true,
             ..Self::default()
-        }
+        };
     }
 }
 
@@ -265,7 +265,7 @@ impl SearchBox {
         if !self.view.open {
             self.dropped = Some(Instant::now());
         }
-        self.view = View::asking(text.clone());
+        self.view.start(text.clone());
         self.hovered_song = None;
         let asked = self.asked;
         self.asking = Some(cx.spawn(async move |this, cx| {
@@ -629,6 +629,7 @@ impl SearchBox {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (title, sub, art, key, round) = Self::shown(hit);
+        let asked = self.asked;
         let lit = index == self.view.selected;
         let picture = art.and_then(|art| self.pictures.get(&art));
         let scale = window.scale_factor();
@@ -693,8 +694,10 @@ impl SearchBox {
                         cx.listener(move |search, _, window, cx| {
                             window.prevent_default();
                             cx.stop_propagation();
-                            search.close(cx);
-                            cx.emit(SearchEvent::Play(appearance));
+                            if search.asked == asked {
+                                search.close(cx);
+                                cx.emit(SearchEvent::Play(appearance));
+                            }
                         }),
                     )
                     .child(icon("play", 14., gpui::rgb(0xffffff))),
@@ -717,7 +720,11 @@ impl SearchBox {
                     cx.notify();
                 }
             }))
-            .on_click(cx.listener(move |search, _, _, cx| search.pick(index, cx)))
+            .on_click(cx.listener(move |search, _, _, cx| {
+                if search.asked == asked {
+                    search.pick(index, cx);
+                }
+            }))
             .child(face)
             .child(
                 div()
@@ -850,7 +857,22 @@ mod tests {
 
     #[test]
     fn a_new_query_starts_without_a_selection_or_hits() {
-        let mut view = View::asking("North".to_owned());
+        let mut view = View {
+            text: "Harbour".to_owned(),
+            hits: vec![Hit::Artist(ArtistRow {
+                artist_id: Id::from_bytes([1; 16]),
+                name: Some("Harbour".to_owned()),
+                sort_name: None,
+                album_count: 1,
+                track_count: 1,
+                art_id: None,
+                portrait: false,
+            })],
+            settled: true,
+            open: true,
+            ..View::default()
+        };
+        view.start("North".to_owned());
         assert!(view.hits.is_empty());
         assert_eq!(view.selected, 0);
         assert!(!view.settled);
