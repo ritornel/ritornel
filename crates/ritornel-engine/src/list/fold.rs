@@ -10,6 +10,7 @@ use unicode_normalization::UnicodeNormalization;
 /// and "Royksopp", fold the same while a mark that makes another letter in
 /// another script stays.
 pub(crate) fn fold(text: &str) -> String {
+    // FTS5 treats NUL as the end of a MATCH expression, even inside quotes.
     if text.contains('\0') {
         return fold(&text.replace('\0', ""));
     }
@@ -105,6 +106,7 @@ pub(crate) fn rank(sort_text: &str) -> u8 {
 
 /// What was typed, read for matching: folded, and trimmed.
 pub(crate) fn needle(typed: &str) -> String {
+    // Trim ignored NULs along with spaces so neither can hide the other.
     fold(typed.trim_matches(|c: char| c.is_whitespace() || c == '\0'))
 }
 

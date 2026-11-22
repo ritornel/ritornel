@@ -642,9 +642,9 @@ pub fn assumed_zone(listener: i64, at_ms: i64, periods: &[ZonePeriod]) -> Option
         .max_by_key(|period| (period.from_ms, period.to_ms.map(|to| -to)))
 }
 
-/// The zone a play's local date is read in, and where it came from. A
-/// zone the sender captured wins, unless it says nothing (UTC); then the
-/// listener's zone for that date is assumed; then the captured UTC stands.
+/// Prefer a recognised zone from the sender. When it is missing, unknown
+/// or UTC, use the listener's zone for that date. A captured UTC is the
+/// fallback when the listener has no zone for the date.
 fn zone_of(
     listen: &Listen,
     event_at_ms: i64,
