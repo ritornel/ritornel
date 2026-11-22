@@ -80,10 +80,10 @@ pub(crate) fn stars_of(rating: Option<u32>, loved: bool) -> u32 {
     }
 }
 
-/// What a click on star `star` sets: that many stars, or none when the song
-/// has exactly that many of its own.
+/// What a click on star `star` sets: that many stars, or none when it is the
+/// last star lit by the song's own (`stars_of`).
 pub(crate) fn clicked(star: u32, own: Option<u32>) -> Option<u32> {
-    (own != Some(star * 20)).then_some(star * 20)
+    (own.map(|own| stars_of(Some(own), false)) != Some(star)).then_some(star * 20)
 }
 
 /// What the card shows once `moving` has gone to `place`: at the top,
@@ -972,5 +972,8 @@ mod tests {
         assert_eq!(clicked(3, None), Some(60));
         assert_eq!(clicked(3, Some(80)), Some(60));
         assert_eq!(clicked(3, Some(60)), None);
+        // Three and a half stars show as four: the fourth is the lit one.
+        assert_eq!(clicked(4, Some(70)), None);
+        assert_eq!(clicked(3, Some(70)), Some(60));
     }
 }
