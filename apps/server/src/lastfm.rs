@@ -75,6 +75,10 @@ pub(crate) struct Lastfm {
     /// The track to show as playing now, until the scrobbler takes it.
     #[cfg(feature = "lastfm")]
     playing: Slot,
+    /// Until when nothing is scrobbled, because Last.fm said the daily
+    /// limit was reached: the plays it held back go first when it lifts.
+    #[cfg(feature = "lastfm")]
+    paused_until: std::sync::Mutex<Option<i64>>,
 }
 
 /// Where a sign-in has got to.
@@ -150,6 +154,7 @@ impl Lastfm {
                 problem,
                 sign_ins: std::sync::Mutex::default(),
                 playing: Slot::default(),
+                paused_until: std::sync::Mutex::default(),
             }
         }
         #[cfg(not(feature = "lastfm"))]
@@ -794,6 +799,18 @@ mod enabled {
                 }
             },
             now: &|| ritornel_engine::Clock::now_ms(&ritornel_engine::SystemClock),
+            paused_until: &|| {
+                *lastfm
+                    .paused_until
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            },
+            pause_until: &|until| {
+                *lastfm
+                    .paused_until
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(until);
+            },
         });
     }
 
@@ -818,6 +835,10 @@ mod enabled {
         pub(crate) refuse: &'a dyn Fn(),
         /// The time now.
         pub(crate) now: &'a dyn Fn() -> i64,
+        /// Until when nothing is sent, after the daily limit was met.
+        pub(crate) paused_until: &'a dyn Fn() -> Option<i64>,
+        /// Sends nothing until then.
+        pub(crate) pause_until: &'a dyn Fn(i64),
     }
 
     /// Sends what is due, a batch at a time, until nothing is due. Before
@@ -827,6 +848,12 @@ mod enabled {
     pub(crate) fn send_due(sending: &Sending<'_>) {
         loop {
             if (sending.stopping)() {
+                return;
+            }
+            // The daily limit was met: nothing goes until it may have
+            // lifted, and then the plays it held back go first, being the
+            // oldest due.
+            if (sending.paused_until)().is_some_and(|until| (sending.now)() < until) {
                 return;
             }
             let Some(session) = (sending.session)() else {
@@ -872,6 +899,10 @@ mod enabled {
                             )
                         })
                         .collect();
+                    if limited {
+                        warn!("Last.fm's daily limit is reached: nothing is scrobbled for an hour");
+                        (sending.pause_until)(now + DAILY_LIMIT_RETRY_MS);
+                    }
                     (settled, limited)
                 }
                 Err(unsent) => {
@@ -1039,6 +1070,8 @@ mod enabled {
                 settle: &|_| true,
                 refuse: &|| {},
                 now: &|| 0,
+                paused_until: &|| None,
+                pause_until: &|_| {},
             });
             sent.into_inner()
         }
@@ -1047,10 +1080,12 @@ mod enabled {
         fn a_play_over_the_daily_limit_is_sent_again_later_and_one_too_old_is_not() {
             let sent = Cell::new(0);
             let settled = RefCell::new(Vec::new());
-            send_due(&Sending {
+            let paused = Cell::new(None);
+            let now = Cell::new(1_000);
+            let sending = Sending {
                 session: &|| Some(session("KEY_A", true)),
                 stopping: &|| false,
-                take: &|_, _| (sent.get() < 3).then(|| batch(100)),
+                take: &|_, _| Some(batch(100)),
                 send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
                     sent.set(sent.get() + 1);
                     Ok(plays
@@ -1067,18 +1102,30 @@ mod enabled {
                     true
                 },
                 refuse: &|| {},
-                now: &|| 1_000,
-            });
-            // The limit is reached: nothing more is sent until later.
+                now: &|| now.get(),
+                paused_until: &|| paused.get(),
+                pause_until: &|until| paused.set(Some(until)),
+            };
+            send_due(&sending);
+            // The limit is reached: nothing more is sent, now or until an
+            // hour has passed, however often it is woken.
             assert_eq!(sent.get(), 1);
-            let settled = settled.into_inner();
-            assert!(matches!(&settled[0].1, Settled::Ignored { code: 3, .. }));
-            for (_, over) in &settled[1..] {
+            let first = std::mem::take(&mut *settled.borrow_mut());
+            assert_eq!(first.len(), 50);
+            assert!(matches!(&first[0].1, Settled::Ignored { code: 3, .. }));
+            for (_, over) in &first[1..] {
                 assert!(
                     matches!(over, Settled::Later { at_ms, .. } if *at_ms == 1_000 + DAILY_LIMIT_RETRY_MS),
                     "{over:?}"
                 );
             }
+            now.set(1_000 + DAILY_LIMIT_RETRY_MS - 1);
+            send_due(&sending);
+            assert_eq!(sent.get(), 1);
+            // An hour on, it is tried again.
+            now.set(1_000 + DAILY_LIMIT_RETRY_MS);
+            send_due(&sending);
+            assert_eq!(sent.get(), 2);
         }
 
         #[test]

@@ -110,21 +110,19 @@ impl Core {
             server.failing_deliveries().map_err(text),
             false,
         );
-        // The imports of the account signed in now: one signed out of is
-        // not this server's to import.
-        let imports = server
+        // The account signed in now: its imports and its refusals are the
+        // ones there is to put right.
+        let signed_in = server
             .service_session(SERVICE)
             .map_err(text)
-            .and_then(|session| {
-                session.map_or(Ok(None), |session| {
-                    server
-                        .failing_jobs(
-                            crate::lastfm::SYNC_JOB,
-                            &session.account_name.to_lowercase(),
-                        )
-                        .map_err(text)
-                })
-            });
+            .map(|session| session.map(|session| session.account_name));
+        let imports = signed_in.clone().and_then(|account| {
+            account.map_or(Ok(None), |account| {
+                server
+                    .failing_jobs(crate::lastfm::SYNC_JOB, &account.to_lowercase())
+                    .map_err(text)
+            })
+        });
         add(
             &mut problems,
             &mut unread,
@@ -141,7 +139,12 @@ impl Core {
                 .record_dismissal()
                 .map_err(text)
                 .map(|dismissal| dismissal.map_or(i64::MIN, |held| held.through_revision))
-                .and_then(|after| library.lost_scrobbles(after).map_err(text));
+                .and_then(|after| {
+                    let account = signed_in.clone()?;
+                    library
+                        .lost_scrobbles(after, account.as_deref())
+                        .map_err(text)
+                });
             match lost {
                 Ok(lost) => {
                     add(

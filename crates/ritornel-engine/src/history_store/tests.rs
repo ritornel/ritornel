@@ -1705,7 +1705,9 @@ fn scrobbles_that_ended_unknown_or_withdrawn_are_counted_from_when_they_ended_un
         at.send(listen, PlayRule::V1);
     }
     assert_eq!(
-        at.library.lost_scrobbles(i64::MIN).unwrap(),
+        at.library
+            .lost_scrobbles(i64::MIN, Some("someone"))
+            .unwrap(),
         crate::LostScrobbles::default()
     );
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 2);
@@ -1724,7 +1726,10 @@ fn scrobbles_that_ended_unknown_or_withdrawn_are_counted_from_when_they_ended_un
             .is_empty()
     );
 
-    let lost = at.library.lost_scrobbles(i64::MIN).unwrap();
+    let lost = at
+        .library
+        .lost_scrobbles(i64::MIN, Some("someone"))
+        .unwrap();
     let unknown = lost.unknown.unwrap();
     assert_eq!((unknown.count, unknown.since_ms), (1, start + 20 * MINUTE));
     assert_eq!(
@@ -1737,7 +1742,10 @@ fn scrobbles_that_ended_unknown_or_withdrawn_are_counted_from_when_they_ended_un
 
     // The first's echo comes back with the next import: it arrived after
     // all, and is not lost.
-    let echoed = at.library.lost_scrobbles(i64::MIN).unwrap();
+    let echoed = at
+        .library
+        .lost_scrobbles(i64::MIN, Some("someone"))
+        .unwrap();
     assert!(echoed.unknown.is_some());
     scrobble_of(
         &at,
@@ -1746,19 +1754,25 @@ fn scrobbles_that_ended_unknown_or_withdrawn_are_counted_from_when_they_ended_un
         &due[0].artist,
         &due[0].title,
     );
-    let echoed = at.library.lost_scrobbles(i64::MIN).unwrap();
+    let echoed = at
+        .library
+        .lost_scrobbles(i64::MIN, Some("someone"))
+        .unwrap();
     assert_eq!(echoed.unknown, None);
     assert_eq!(echoed.withdrawn.unwrap().count, 1);
 
     // Set aside by the revision after the first: only the second is
     // left, whatever the clock says.
     at.clock.set(T0);
-    let lost = at.library.lost_scrobbles(after_unknown).unwrap();
+    let lost = at
+        .library
+        .lost_scrobbles(after_unknown, Some("someone"))
+        .unwrap();
     assert_eq!(lost.withdrawn.unwrap().count, 1);
     // And by the revision now, nothing.
     assert_eq!(
         at.library
-            .lost_scrobbles(at.library.meta().unwrap().revision)
+            .lost_scrobbles(at.library.meta().unwrap().revision, Some("someone"))
             .unwrap(),
         crate::LostScrobbles::default()
     );
@@ -1787,7 +1801,7 @@ fn scrobbles_refused_with_their_request_count_until_the_account_takes_one_again(
         .unwrap();
     let refused = at
         .library
-        .lost_scrobbles(i64::MIN)
+        .lost_scrobbles(i64::MIN, Some("someone"))
         .unwrap()
         .refused
         .unwrap();
@@ -1795,6 +1809,16 @@ fn scrobbles_refused_with_their_request_count_until_the_account_takes_one_again(
         (refused.count, refused.detail.as_deref()),
         (1, Some("Invalid API key"))
     );
+    // Not the signed-in account's, or none signed in: nothing to put right.
+    for signed_in in [Some("someone else"), None] {
+        assert_eq!(
+            at.library
+                .lost_scrobbles(i64::MIN, signed_in)
+                .unwrap()
+                .refused,
+            None
+        );
+    }
     // Put right: the next is taken, and the refusal is over.
     let second = at.library.take_due_deliveries(account, 0, 1).unwrap();
     at.library
@@ -1806,5 +1830,11 @@ fn scrobbles_refused_with_their_request_count_until_the_account_takes_one_again(
             },
         )])
         .unwrap();
-    assert_eq!(at.library.lost_scrobbles(i64::MIN).unwrap().refused, None);
+    assert_eq!(
+        at.library
+            .lost_scrobbles(i64::MIN, Some("someone"))
+            .unwrap()
+            .refused,
+        None
+    );
 }

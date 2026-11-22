@@ -202,18 +202,33 @@ pub struct LostScrobbles {
 }
 
 impl LibraryStore {
-    /// The scrobbles that ended unknown or withdrawn after the library
-    /// revision `after`, and
-    /// whose echo has not come back.
-    pub fn lost_scrobbles(&self, after: i64) -> Result<LostScrobbles, Error> {
+    /// The scrobbles that ended unknown, withdrawn or refused after the
+    /// library revision `after`, and whose echo has not come back. Those
+    /// refused are only of the account `signed_in`, the one there is to put
+    /// right; with none signed in there are none.
+    pub fn lost_scrobbles(
+        &self,
+        after: i64,
+        signed_in: Option<&str>,
+    ) -> Result<LostScrobbles, Error> {
+        let signed_in = signed_in.map(str::to_owned);
         self.read(move |connection| {
             let mut statement = connection.prepare(
                 "WITH lost AS (
                    SELECT d.id, d.updated_at_ms, d.detail FROM history_delivery d
+                   LEFT JOIN (
+                     -- The last each account took, found once and not for each row.
+                     SELECT endpoint_id, max(rev) AS rev FROM history_delivery
+                     WHERE ?1 = 'refused' AND state = 'accepted' GROUP BY endpoint_id) taken
+                     ON taken.endpoint_id = d.endpoint_id
                    WHERE d.state = ?1 AND d.rev > ?2 AND coalesce(d.detail, '') <> ?3
-                     AND (d.state <> 'refused' OR d.rev > coalesce(
-                       (SELECT max(taken.rev) FROM history_delivery taken
-                        WHERE taken.endpoint_id = d.endpoint_id AND taken.state = 'accepted'), 0))
+                     -- A refusal is the signed-in account's, since the last it
+                     -- took; another account's is not its to put right.
+                     AND (d.state <> 'refused' OR (
+                       d.endpoint_id = (SELECT endpoint_id FROM service_account
+                                        WHERE service = 'lastfm'
+                                          AND account_name = ?4 COLLATE NOCASE)
+                       AND d.rev > coalesce(taken.rev, 0)))
                      -- Its echo, imported from the account it was sent to, joined its play.
                      AND NOT EXISTS (
                        SELECT 1 FROM play_event_observation mine
@@ -227,7 +242,12 @@ impl LibraryStore {
             )?;
             let mut of = |state: &str| -> Result<Option<Failing>, Error> {
                 let (n, since, detail): (i64, Option<i64>, Option<String>) = statement.query_row(
-                    (state, after, crate::delivery_store::ALREADY_SCROBBLED),
+                    (
+                        state,
+                        after,
+                        crate::delivery_store::ALREADY_SCROBBLED,
+                        signed_in.as_deref(),
+                    ),
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
                 Ok(since.map(|since_ms| Failing {
