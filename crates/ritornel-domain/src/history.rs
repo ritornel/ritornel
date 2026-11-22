@@ -309,6 +309,8 @@ text_enum! {
         Join => "join",
         /// The endpoint's clock was off.
         SetClockOffset => "set_clock_offset",
+        /// The targeted observations were of another recording, or of none.
+        SetRecording => "set_recording",
         /// Undo another correction.
         Revoke => "revoke",
     }
@@ -377,6 +379,8 @@ pub struct Listen {
 pub struct Import {
     /// The observation's row.
     pub observation: i64,
+    /// The endpoint that reported it.
+    pub endpoint: i64,
     /// Whose play it is, as claimed at ingest.
     pub listener: i64,
     /// The text-only source item that stands for what it was of.
@@ -412,6 +416,41 @@ pub struct ZonePeriod {
     pub to_ms: Option<i64>,
 }
 
+/// A time window on one endpoint, optionally narrowed to one source item.
+/// Bounds are half-open `[from_ms, to_ms)` compared against the time the
+/// observation's own source reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    /// The endpoint whose observations the window covers.
+    pub endpoint: i64,
+    /// Earliest reported instant, inclusive. `None` is open.
+    pub from_ms: Option<i64>,
+    /// Latest reported instant, exclusive. `None` is open.
+    pub to_ms: Option<i64>,
+    /// Narrow to observations of this source item, when set.
+    pub source_item: Option<i64>,
+}
+
+impl Window {
+    /// Whether an observation reported on `endpoint` for `source_item` at
+    /// `reported_at_ms` falls in this window.
+    pub fn matches(&self, endpoint: i64, source_item: i64, reported_at_ms: i64) -> bool {
+        self.endpoint == endpoint
+            && self.source_item.is_none_or(|item| item == source_item)
+            && self.from_ms.is_none_or(|from| reported_at_ms >= from)
+            && self.to_ms.is_none_or(|to| reported_at_ms < to)
+    }
+}
+
+/// What a `set_recording` correction says its target observations were of:
+/// `Some(binding)` binds them to that canonical recording (and optional
+/// canonical appearance); `None` leaves them unbound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingOverride {
+    /// The binding in force for the matched observations.
+    pub binding: Option<Binding>,
+}
+
 /// One correction: an observation of its own, with what it targets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Correction {
@@ -422,6 +461,10 @@ pub struct Correction {
     /// The observations it targets: for `revoke`, the corrections it
     /// undoes.
     pub targets: Vec<i64>,
+    /// A target by endpoint and time range, when not listed in `targets`.
+    pub window: Option<Window>,
+    /// For `set_recording`, the recording override it applies.
+    pub recording: Option<RecordingOverride>,
 }
 
 /// Everything derivation reads.
@@ -714,12 +757,11 @@ fn play_time(head: &Listen, periods: &[ZonePeriod]) -> PlayTime {
     }
 }
 
-/// The observations that active `exclude` corrections target. A correction
-/// is active unless an active `revoke` targets it, so revoking a revoke
-/// restores what it revoked. A revoke can only name a correction that
-/// exists before it, so going from the newest down settles each one before
-/// anything it could undo.
-pub fn excluded(corrections: &[Correction]) -> BTreeSet<i64> {
+/// The corrections that are active: a correction is active unless an active
+/// `revoke` targets it, so revoking a revoke restores what it revoked. A
+/// revoke can only name a correction that exists before it, so going from
+/// the newest down settles each one before anything it could undo.
+pub fn active_corrections(corrections: &[Correction]) -> BTreeSet<i64> {
     let mut by_newest: Vec<&Correction> = corrections.iter().collect();
     by_newest.sort_by_key(|correction| std::cmp::Reverse(correction.observation));
     let mut revoked = BTreeSet::new();
@@ -733,12 +775,93 @@ pub fn excluded(corrections: &[Correction]) -> BTreeSet<i64> {
             revoked.extend(correction.targets.iter().copied());
         }
     }
+    active
+}
+
+/// The observations that active `exclude` corrections target.
+pub fn excluded(corrections: &[Correction]) -> BTreeSet<i64> {
+    let active = active_corrections(corrections);
     corrections
         .iter()
         .filter(|correction| correction.verb == Verb::Exclude)
         .filter(|correction| active.contains(&correction.observation))
         .flat_map(|correction| correction.targets.iter().copied())
         .collect()
+}
+
+/// Active `set_recording` corrections, newest first, so the first match
+/// wins.
+pub fn active_recording_overrides(corrections: &[Correction]) -> Vec<&Correction> {
+    let active = active_corrections(corrections);
+    let mut overrides: Vec<&Correction> = corrections
+        .iter()
+        .filter(|correction| {
+            correction.verb == Verb::SetRecording
+                && correction.recording.is_some()
+                && active.contains(&correction.observation)
+        })
+        .collect();
+    overrides.sort_by_key(|correction| std::cmp::Reverse(correction.observation));
+    overrides
+}
+
+/// Indexed active `set_recording` overrides: O(1) lookup for explicit
+/// observation targets, plus active window corrections newest first.
+#[derive(Debug)]
+pub struct RecordingOverrides<'a> {
+    by_target: HashMap<i64, (i64, RecordingOverride)>,
+    windows: Vec<&'a Correction>,
+}
+
+impl<'a> RecordingOverrides<'a> {
+    /// Builds the lookup index once from all corrections.
+    pub fn build(corrections: &'a [Correction]) -> Self {
+        let overrides = active_recording_overrides(corrections);
+        let mut by_target: HashMap<i64, (i64, RecordingOverride)> = HashMap::new();
+        let mut windows = Vec::new();
+        for correction in overrides {
+            let Some(chosen) = correction.recording else {
+                continue;
+            };
+            // `overrides` is sorted newest first, so the first entry for a
+            // target wins.
+            for &target in &correction.targets {
+                by_target
+                    .entry(target)
+                    .or_insert((correction.observation, chosen));
+            }
+            if correction.window.is_some() {
+                windows.push(correction);
+            }
+        }
+        Self { by_target, windows }
+    }
+
+    /// The newest active `set_recording` correction that matches an
+    /// observation, returning `(correction_observation_id, override)`.
+    pub fn for_observation(
+        &self,
+        observation: i64,
+        endpoint: i64,
+        source_item: i64,
+        reported_at_ms: i64,
+    ) -> Option<(i64, RecordingOverride)> {
+        let mut best = self.by_target.get(&observation).copied();
+        for correction in &self.windows {
+            if best.is_some_and(|(best_id, _)| best_id >= correction.observation) {
+                break;
+            }
+            if correction
+                .window
+                .is_some_and(|window| window.matches(endpoint, source_item, reported_at_ms))
+                && let Some(chosen) = correction.recording
+            {
+                best = Some((correction.observation, chosen));
+                break;
+            }
+        }
+        best
+    }
 }
 
 /// When a listen began and ended, on a timeline that does not take the
@@ -906,7 +1029,8 @@ pub fn judge(rule: &PlayRule, ms_played: i64, track_ms: i64, ended: EndReason) -
 /// as a play of its own.
 pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
     let excluded = excluded(inputs.corrections);
-    let mut plays = derive_listens(inputs, &excluded);
+    let overrides = RecordingOverrides::build(inputs.corrections);
+    let (mut plays, mut override_ids) = derive_listens(inputs, &excluded, &overrides);
     let by_listen: HashMap<i64, usize> = plays
         .iter()
         .enumerate()
@@ -916,6 +1040,12 @@ pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
     imports.sort_by_key(|import| import.observation);
     let mut echoed = BTreeSet::new();
     for import in imports {
+        let import_override = overrides.for_observation(
+            import.observation,
+            import.endpoint,
+            import.source_item,
+            import.played_at_ms,
+        );
         let joins = import
             .echo_of
             .and_then(|listen| by_listen.get(&listen).map(|at| (listen, *at)))
@@ -926,9 +1056,25 @@ pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
             play.observations
                 .push((import.observation, Role::Corroborating));
             play.excluded |= excluded.contains(&import.observation);
+            if let Some((corr_id, chosen)) = import_override
+                && override_ids
+                    .get(at)
+                    .copied()
+                    .flatten()
+                    .is_none_or(|prev| corr_id > prev)
+            {
+                play.recording = chosen.binding.map(|binding| binding.recording);
+                play.appearance = chosen.binding.and_then(|binding| binding.appearance);
+                if let Some(slot) = override_ids.get_mut(at) {
+                    *slot = Some(corr_id);
+                }
+            }
             continue;
         }
-        let binding = inputs.bindings.get(&import.source_item);
+        let binding = match import_override {
+            Some((_, chosen)) => chosen.binding,
+            None => inputs.bindings.get(&import.source_item).copied(),
+        };
         plays.push(Play {
             observations: vec![(import.observation, Role::Primary)],
             listener: import.listener,
@@ -952,58 +1098,80 @@ pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
     plays
 }
 
-/// The plays of the listens: one for each chain.
-fn derive_listens(inputs: &Inputs<'_>, excluded: &BTreeSet<i64>) -> Vec<Play> {
-    chains(inputs.listens)
-        .into_iter()
-        .filter_map(|chain| {
-            let listens: Vec<&Listen> = chain
-                .iter()
-                .filter_map(|index| inputs.listens.get(*index))
-                .collect();
-            let (&head, &last) = (listens.first()?, listens.last()?);
-            let ms_played = listens.iter().fold(0_i64, |total, listen| {
-                total.saturating_add(listen.ms_played.max(0))
-            });
-            let (counts, outcome) = judge(
-                &inputs.rule,
-                ms_played,
-                head.track_duration_ms,
-                last.end_reason,
-            );
-            let binding = inputs.bindings.get(&head.source_item);
-            Some(Play {
-                observations: listens
-                    .iter()
-                    .enumerate()
-                    .map(|(at, listen)| {
-                        let role = if at == 0 {
-                            Role::Primary
-                        } else {
-                            Role::Corroborating
-                        };
-                        (listen.observation, role)
-                    })
-                    .collect(),
-                listener: head.listener,
-                recording: binding.map(|binding| binding.recording),
-                appearance: binding.and_then(|binding| binding.appearance),
-                source_item: head.source_item,
-                time: play_time(head, inputs.zone_periods),
-                ms_played: Some(ms_played),
-                track_duration_ms: Some(head.track_duration_ms),
-                outcome,
-                counts,
-                count_basis: CountBasis::PlayRule,
-                play_rule_version: inputs.rule.version,
-                grouper_version: GROUPER_VERSION,
-                excluded: listens
-                    .iter()
-                    .any(|listen| excluded.contains(&listen.observation)),
-                context_kind: Some(head.context_kind),
-                context_ref: head.context_ref,
-                shuffle: Some(head.shuffle),
+/// The plays of the listens: one for each chain, paired with the newest
+/// `set_recording` correction ID that applied to each play, if any.
+fn derive_listens(
+    inputs: &Inputs<'_>,
+    excluded: &BTreeSet<i64>,
+    overrides: &RecordingOverrides<'_>,
+) -> (Vec<Play>, Vec<Option<i64>>) {
+    let mut plays = Vec::new();
+    let mut override_ids = Vec::new();
+    for chain in chains(inputs.listens) {
+        let listens: Vec<&Listen> = chain
+            .iter()
+            .filter_map(|index| inputs.listens.get(*index))
+            .collect();
+        let (Some(&head), Some(&last)) = (listens.first(), listens.last()) else {
+            continue;
+        };
+        let ms_played = listens.iter().fold(0_i64, |total, listen| {
+            total.saturating_add(listen.ms_played.max(0))
+        });
+        let (counts, outcome) = judge(
+            &inputs.rule,
+            ms_played,
+            head.track_duration_ms,
+            last.end_reason,
+        );
+        let chain_override = listens
+            .iter()
+            .filter_map(|listen| {
+                overrides.for_observation(
+                    listen.observation,
+                    listen.endpoint,
+                    listen.source_item,
+                    listen.started_at_ms,
+                )
             })
-        })
-        .collect()
+            .max_by_key(|(corr_id, _)| *corr_id);
+        let binding = match chain_override {
+            Some((_, chosen)) => chosen.binding,
+            None => inputs.bindings.get(&head.source_item).copied(),
+        };
+        plays.push(Play {
+            observations: listens
+                .iter()
+                .enumerate()
+                .map(|(at, listen)| {
+                    let role = if at == 0 {
+                        Role::Primary
+                    } else {
+                        Role::Corroborating
+                    };
+                    (listen.observation, role)
+                })
+                .collect(),
+            listener: head.listener,
+            recording: binding.map(|binding| binding.recording),
+            appearance: binding.and_then(|binding| binding.appearance),
+            source_item: head.source_item,
+            time: play_time(head, inputs.zone_periods),
+            ms_played: Some(ms_played),
+            track_duration_ms: Some(head.track_duration_ms),
+            outcome,
+            counts,
+            count_basis: CountBasis::PlayRule,
+            play_rule_version: inputs.rule.version,
+            grouper_version: GROUPER_VERSION,
+            excluded: listens
+                .iter()
+                .any(|listen| excluded.contains(&listen.observation)),
+            context_kind: Some(head.context_kind),
+            context_ref: head.context_ref,
+            shuffle: Some(head.shuffle),
+        });
+        override_ids.push(chain_override.map(|(corr_id, _)| corr_id));
+    }
+    (plays, override_ids)
 }

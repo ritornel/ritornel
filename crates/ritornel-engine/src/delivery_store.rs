@@ -152,20 +152,67 @@ fn not_eligible(
     from_ms: i64,
     now_ms: i64,
 ) -> Result<Option<&'static str>, Error> {
-    let play: Option<(bool, bool, Option<i64>, String, String, bool)> = connection
-        .prepare_cached(
+    struct PlayNow {
+        counts: bool,
+        excluded: bool,
+        at: Option<i64>,
+        clock: String,
+        evidence: String,
+        account_has_it: bool,
+        recording_id: Option<i64>,
+        title: Option<String>,
+        artist: Option<String>,
+        album: Option<String>,
+        album_artist: Option<String>,
+        track_number: Option<i64>,
+    }
+    let play: Option<PlayNow> = connection
+        .prepare_cached(&format!(
             "SELECT pe.counts, pe.excluded, pe.event_at_utc_ms, pe.clock_basis,
                     pe.evidence_class,
                     EXISTS (SELECT 1 FROM play_event_observation x
                             JOIN history_observation xo ON xo.id = x.observation_id
-                            WHERE x.play_event_id = pe.id AND xo.endpoint_id = ?2)
+                            WHERE x.play_event_id = pe.id AND xo.endpoint_id = ?2),
+                    pe.recording_id, {NAMES}
              FROM history_delivery d
              JOIN play_event_observation peo
                ON peo.observation_id = d.observation_id AND peo.role = 'primary'
              JOIN play_event pe ON pe.id = peo.play_event_id
-             WHERE d.id = ?1",
-        )?
+             LEFT JOIN recording r ON r.id = pe.recording_id
+             LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
+             {NAME_JOINS}
+             WHERE d.id = ?1"
+        ))?
         .query_row((delivery, endpoint), |row| {
+            Ok(PlayNow {
+                counts: row.get(0)?,
+                excluded: row.get(1)?,
+                at: row.get(2)?,
+                clock: row.get(3)?,
+                evidence: row.get(4)?,
+                account_has_it: row.get(5)?,
+                recording_id: row.get(6)?,
+                title: row.get(7)?,
+                artist: row.get(8)?,
+                album: row.get(9)?,
+                album_artist: row.get(10)?,
+                track_number: row.get(11)?,
+            })
+        })
+        .optional()?;
+    let (seconds, artist, title, album, album_artist, track_number): (
+        i64,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    ) = connection
+        .prepare_cached(
+            "SELECT sent_timestamp_s, artist, title, album, album_artist, track_number
+             FROM history_delivery WHERE id = ?1",
+        )?
+        .query_row([delivery], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -174,32 +221,33 @@ fn not_eligible(
                 row.get(4)?,
                 row.get(5)?,
             ))
-        })
-        .optional()?;
-    let (seconds, artist, title): (i64, String, String) = connection
-        .prepare_cached(
-            "SELECT sent_timestamp_s, artist, title FROM history_delivery WHERE id = ?1",
-        )?
-        .query_row([delivery], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
     if already_scrobbled(connection, endpoint, seconds, &artist, &title)? {
         return Ok(Some(ALREADY_SCROBBLED));
     }
-    let Some((counts, excluded, at, clock, evidence, account_has_it)) = play else {
+    let Some(play) = play else {
         return Ok(Some("its play is no longer derived from this listen"));
     };
-    let Some(at) = at else {
+    let Some(at) = play.at else {
         return Ok(Some("its play has no date"));
     };
-    Ok(if !counts {
+    Ok(if !play.counts {
         Some("its play no longer counts")
-    } else if excluded {
+    } else if play.excluded {
         Some("its play is excluded")
-    } else if clock != "hub_age" || evidence != "observed" {
+    } else if play.clock != "hub_age" || play.evidence != "observed" {
         Some("its play is not dated by a trusted clock")
-    } else if account_has_it {
+    } else if play.account_has_it {
         Some("the account already has this play")
+    } else if play.recording_id.is_none() {
+        Some("its play is no longer bound to a recording")
+    } else if play.artist.as_deref() != Some(artist.as_str())
+        || play.title.as_deref() != Some(title.as_str())
+        || play.album != album
+        || play.album_artist != album_artist
+        || play.track_number != track_number
+    {
+        Some("its play's track changed since it was queued")
     } else if at < now_ms - SEND_WITHIN_MS {
         Some("its play is too old for Last.fm to take")
     } else if at < from_ms {
