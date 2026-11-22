@@ -165,6 +165,11 @@ pub struct Library {
     pub groups: HashMap<i64, Option<i64>>,
     /// Each artist's row and match name, in the order of their keys.
     pub artists: Vec<(i64, String)>,
+    /// The version of the normaliser the match names were made by, when it
+    /// is not this one's: an artist with no ID is then looked for by the key
+    /// that version makes of its names, and by no other. An empty match
+    /// name is a row found by its ID alone.
+    pub artist_keys_by: Option<i64>,
     /// The MusicBrainz ID of each artist row that has one: the ID the
     /// claims of the files credited to it give it.
     pub artist_mbids: HashMap<i64, String>,

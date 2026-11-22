@@ -507,8 +507,9 @@ fn a_library_resolved_by_policy_1_is_resolved_by_policy_2_at_the_next_scan() {
     assert_eq!(
         rig.one("SELECT value_json FROM library_setting WHERE key = 'identity.versions'"),
         format!(
-            r#"{{"extractor":{},"resolver":2,"normalizer":1}}"#,
-            ritornel_domain::EXTRACTOR_VERSION
+            r#"{{"extractor":{},"resolver":2,"normalizer":{}}}"#,
+            ritornel_domain::EXTRACTOR_VERSION,
+            ritornel_domain::NORMALIZER_VERSION
         )
     );
     // The evidence names the cause, the file it nearly matched and that
@@ -594,4 +595,162 @@ fn policy_2_binds_across_albums_at_an_equal_length_and_says_so() {
     let run = rig.library.dry_run(&strict).unwrap();
     assert_eq!(run.policy.across_albums_within_ms, 0);
     assert_eq!((run.would_change, run.reviews_added), (1, 1));
+}
+
+#[test]
+fn an_alias_the_owner_taught_under_another_normaliser_is_not_read_as_a_key() {
+    let rig = scanned();
+    let request = WriteRequest {
+        method: "test.alias",
+        command: None,
+        client: None,
+    };
+    rig.library
+        .write(request, move |write| {
+            let connection = write.connection();
+            let item: i64 = connection.query_row(
+                "SELECT id FROM source_item WHERE provider_key = ?1",
+                [FLAC],
+                |row| row.get(0),
+            )?;
+            connection.execute(
+                "INSERT INTO identity_decision
+                   (action, source_item_id, method, resolver_version, normalizer_version, evidence_json,
+                    actor_kind, decided_at_ms, rev)
+                 VALUES ('bind', ?1, 'user', 1, 1, '{}', 'person', ?2, ?3)",
+                (item, write.now_ms(), write.rev()),
+            )?;
+            let decision = connection.last_insert_rowid();
+            // The first key was made by normaliser 1, which joined the
+            // letters round a dash: it cannot be compared with a key of
+            // today's.
+            for (a, b, version) in [
+                ("moss arcade", "mossarcade", 1),
+                ("moss arcade", "the moss arcade", ritornel_domain::NORMALIZER_VERSION),
+            ] {
+                connection.execute(
+                    "INSERT INTO alias_observation
+                       (scope, name_a, name_b, normalizer_version, decision_id, observed_at_ms, rev)
+                     VALUES ('artist', ?1, ?2, ?3, ?4, ?5, ?6)",
+                    (a, b, version, decision, write.now_ms(), write.rev()),
+                )?;
+            }
+            Ok(String::new())
+        })
+        .unwrap();
+    let (library, _) = rig.library.load().unwrap();
+    assert_eq!(
+        library.aliases,
+        [(
+            ritornel_domain::library::Kind::Artist,
+            "moss arcade".to_owned(),
+            "the moss arcade".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn an_artist_no_file_credits_is_keyed_again_when_the_normaliser_changes() {
+    let rig = scanned();
+    // Two rows no file credits, as normaliser 1 keyed them; the owner
+    // renamed the second.
+    let request = WriteRequest {
+        method: "test.normaliser",
+        command: None,
+        client: None,
+    };
+    rig.library
+        .write(request, move |write| {
+            let connection = write.connection();
+            // The third is the scanned artist under another spelling, which
+            // today's normaliser joins to it.
+            // The fourth and fifth would share a key.
+            for (row, name) in [
+                (901, "Lanterns-42"),
+                (902, "Tin/Harbour"),
+                (903, "Moss/Arcade"),
+                (904, "Salt-Road"),
+                (905, "Salt/Road"),
+            ] {
+                connection.execute(
+                    "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
+                     VALUES (?1, ?2, ?1, ?3, ?3, ?4, ?5)",
+                    (
+                        row,
+                        write.new_id()?.as_bytes(),
+                        name,
+                        ritornel_domain::normalize::normalize_by(1, name),
+                        write.rev(),
+                    ),
+                )?;
+            }
+            // A row whose name was an edit since withdrawn: its name and
+            // its key disagree.
+            connection.execute(
+                "INSERT INTO artist (id, public_id, canonical_id, display_name, display_sort_name, match_name, rev)
+                 VALUES (906, ?1, 906, 'Salt Harbour', 'Salt Harbour', 'tinharbour', ?2)",
+                (write.new_id()?.as_bytes(), write.rev()),
+            )?;
+            connection.execute(
+                "INSERT INTO metadata_edit (entity_kind, entity_id, field, value, actor_kind, edited_at_ms, rev)
+                 VALUES ('artist', 902, 'name', 'Tin/Harbour', 'person', ?1, ?2)",
+                (write.now_ms(), write.rev()),
+            )?;
+            let versions: String = connection.query_row(
+                "SELECT value_json FROM library_setting WHERE key = 'identity.versions'",
+                [],
+                |row| row.get(0),
+            )?;
+            let old = versions.replace(
+                &format!("\"normalizer\":{}", ritornel_domain::NORMALIZER_VERSION),
+                "\"normalizer\":1",
+            );
+            assert_ne!(old, versions);
+            connection.execute(
+                "UPDATE library_setting SET value_json = ?1 WHERE key = 'identity.versions'",
+                [old],
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let (library, _) = rig.library.load().unwrap();
+    assert_eq!(library.artist_keys_by, Some(1));
+    rig.library
+        .resolve(WriteRequest {
+            method: "test.resolve",
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    // The first has today's key, so its files find it when they return.
+    // The others have none, and are never found: the renamed one, whose
+    // files' names are not known; the one whose key today is the scanned
+    // artist's; the two that would share a key; and the one whose name its
+    // key does not come from.
+    assert_eq!(
+        rig.rows(
+            "SELECT id || '|' || coalesce(match_name, '-') FROM artist WHERE id > 900 ORDER BY id"
+        ),
+        [
+            "901|lanterns 42",
+            "902|-",
+            "903|-",
+            "904|-",
+            "905|-",
+            "906|-"
+        ]
+    );
+    // A second resolution changes nothing.
+    assert!(
+        rig.library
+            .resolve(WriteRequest {
+                method: "test.resolve",
+                command: None,
+                client: None,
+            })
+            .unwrap()
+            .is_none()
+    );
+    let (library, _) = rig.library.load().unwrap();
+    assert_eq!(library.artist_keys_by, None);
 }

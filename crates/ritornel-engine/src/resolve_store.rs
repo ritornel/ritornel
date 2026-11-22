@@ -7,12 +7,13 @@
 //! with what the rows hold and keeps only what differs, so a resolution
 //! that changes nothing writes nothing, and takes no library revision.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ritornel_domain::library::{
     Current, Evidence, ExistingCredit, ExistingRelease, Item, Kind, Library, Method, Ref,
     Resolution,
 };
+use ritornel_domain::normalize::normalize;
 use ritornel_domain::{
     Claim, EXTRACTOR_VERSION, Facts, NORMALIZER_VERSION, Policy, RESOLVER_VERSION, Scope, Source,
 };
@@ -368,6 +369,19 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
         library.groups.insert(id, preferred);
         shown.groups.insert(id, display);
     }
+    // A row is found by the key the normaliser made of its names. When the
+    // library was last resolved by another normaliser, the stored keys are
+    // that one's, and the resolver looks rows up by them instead, or an
+    // artist with no ID would take a new row and a new public ID.
+    library.artist_keys_by = connection
+        .query_row(
+            "SELECT json_extract(value_json, '$.normalizer') FROM library_setting WHERE key = ?1",
+            [VERSIONS_SETTING],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten()
+        .filter(|stored| *stored != NORMALIZER_VERSION);
     for (id, redirected, name, sort, match_name) in rows(
         connection,
         "SELECT id, redirect_to_id IS NOT NULL, display_name, display_sort_name, match_name
@@ -382,8 +396,11 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
             ))
         },
     )? {
-        if let (false, Some(match_name)) = (redirected, &match_name) {
-            library.artists.push((id, match_name.clone()));
+        // A row given no key is still found by its ID.
+        if !redirected {
+            library
+                .artists
+                .push((id, match_name.clone().unwrap_or_default()));
         }
         shown.artists.insert(id, (name, sort, match_name));
     }
@@ -432,11 +449,17 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
     .into_iter()
     .collect();
     // Pairs the owner's own actions linked. What the resolver learned it
-    // learns again, in the order it learned it.
+    // learns again, in the order it learned it. A pair is of keys, and a key
+    // made by another version of the normaliser is not comparable with
+    // today's, so such a pair is not read: the call that teaches one keeps
+    // its spellings, to make its keys again.
     for (scope, a, b) in rows(
         connection,
-        "SELECT o.scope, o.name_a, o.name_b FROM alias_observation o
-         JOIN identity_decision d ON d.id = o.decision_id WHERE d.actor_kind <> 'resolver'",
+        &format!(
+            "SELECT o.scope, o.name_a, o.name_b FROM alias_observation o
+             JOIN identity_decision d ON d.id = o.decision_id
+             WHERE d.actor_kind <> 'resolver' AND o.normalizer_version = {NORMALIZER_VERSION}"
+        ),
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -523,6 +546,10 @@ pub(crate) struct Plan {
     search: Vec<Option<(String, String, String)>>,
     /// Appearances in the search index that no file is bound to any more.
     unsearchable: Vec<i64>,
+    /// Artist rows no file credits now, keyed again after the normaliser
+    /// changed, so that their key is today's when their files return, or
+    /// given none.
+    rekeyed: Vec<(i64, Option<String>)>,
     versions: bool,
     /// The version of the policy that made the resolution, which its
     /// decisions record.
@@ -676,8 +703,71 @@ impl Plan {
             .copied()
             .collect();
         unsearchable.sort_unstable();
+        // After the normaliser changed, a row with no ID that the
+        // resolution does not reach is keyed again from its name, so its
+        // files find it when they return. It is given no key, and is never
+        // found again, when that is not safe: its name is the owner's edit,
+        // which its files never gave, or the key is one an artist of the
+        // resolution holds, or another such row would take it too.
+        let mut rekeyed: Vec<(i64, Option<String>)> = Vec::new();
+        if library.artist_keys_by.is_some() {
+            let reached: HashSet<i64> = resolution
+                .artists
+                .iter()
+                .filter_map(|out| as_row(out.r))
+                .collect();
+            let held: HashSet<&str> = resolution
+                .artists
+                .iter()
+                .map(|out| out.match_name.as_str())
+                .collect();
+            // A name is trusted only when it gives back the key the row
+            // holds: an edit, in force or withdrawn, gives another.
+            let version = library.artist_keys_by;
+            let left: Vec<(i64, &String, Option<String>)> = library
+                .artists
+                .iter()
+                .filter(|(row, _)| !reached.contains(row))
+                .map(|(row, stored)| {
+                    let edited =
+                        library
+                            .edits
+                            .contains_key(&(Kind::Artist, *row, "name".to_owned()));
+                    let name = shown
+                        .artists
+                        .get(row)
+                        .and_then(|(name, _, _)| name.as_deref())
+                        .filter(|name| {
+                            !edited
+                                && version
+                                    .and_then(|version| {
+                                        ritornel_domain::normalize::normalize_by(version, name)
+                                    })
+                                    .as_ref()
+                                    == Some(stored)
+                        });
+                    (*row, stored, name.map(normalize))
+                })
+                .collect();
+            let mut wanted: HashMap<&str, usize> = HashMap::new();
+            for (_, _, key) in &left {
+                if let Some(key) = key {
+                    *wanted.entry(key.as_str()).or_default() += 1;
+                }
+            }
+            for (row, stored, key) in &left {
+                let key = key.as_ref().filter(|key| {
+                    !held.contains(key.as_str()) && wanted.get(key.as_str()) == Some(&1)
+                });
+                let now = Some(*stored).filter(|stored| !stored.is_empty());
+                if key != now {
+                    rekeyed.push((*row, key.cloned()));
+                }
+            }
+        }
         let mut plan = Self {
             unsearchable,
+            rekeyed,
             canonical: library.recording_canonical.clone(),
             artists,
             recordings,
@@ -725,6 +815,7 @@ impl Plan {
             && none(&self.appearances)
             && self.search.iter().all(Option::is_none)
             && self.unsearchable.is_empty()
+            && self.rekeyed.is_empty()
     }
 
     /// Writes what differs, in the write's transaction.
@@ -774,6 +865,11 @@ impl Plan {
                 }
             };
             artist_rows.push(row);
+        }
+        for (row, key) in &self.rekeyed {
+            connection
+                .prepare_cached("UPDATE artist SET match_name = ?2, rev = ?3 WHERE id = ?1")?
+                .execute((row, key, rev))?;
         }
 
         let mut credit_rows = Vec::with_capacity(resolution.credits.len());
@@ -1098,7 +1194,8 @@ impl Plan {
                 connection.prepare_cached(
                     "INSERT INTO alias_observation (scope, name_a, name_b, normalizer_version, decision_id, observed_at_ms, rev)
                      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-                     WHERE NOT EXISTS (SELECT 1 FROM alias_observation WHERE scope = ?1 AND name_a = ?2 AND name_b = ?3)",
+                     WHERE NOT EXISTS (SELECT 1 FROM alias_observation
+                                       WHERE scope = ?1 AND name_a = ?2 AND name_b = ?3 AND normalizer_version = ?4)",
                 )?
                 .execute((scope, a, b, NORMALIZER_VERSION, decided, now_ms, rev))?;
             }

@@ -956,6 +956,120 @@ fn artists_bind_by_id_then_by_exact_normalised_name_and_strings_are_not_parsed()
 }
 
 #[test]
+fn after_a_change_of_normaliser_an_artist_takes_its_own_row_before_another_s() {
+    let mut world = World::default();
+    world.add(file("A/1.flac", 1).song("Lanterns", "Tin-Harbour", 200));
+    world.add(file("B/1.flac", 2).song("Salt Road", "Tin & Harbour", 200));
+    world.settle();
+    let rows: Vec<i64> = world.library.artists.iter().map(|(row, _)| *row).collect();
+    // As normaliser 1 keyed them: "tinharbour" and "tin harbour". Today's
+    // key of the first is the second's old one.
+    world.library.artists = vec![
+        (rows[0], "tinharbour".to_owned()),
+        (rows[1], "tin harbour".to_owned()),
+    ];
+    world.library.artist_keys_by = Some(1);
+    let resolution = world.settle();
+    let found: Vec<(Ref, &str)> = resolution
+        .artists
+        .iter()
+        .map(|out| (out.r, out.name.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (Ref::Row(rows[0]), "Tin-Harbour"),
+            (Ref::Row(rows[1]), "Tin & Harbour")
+        ]
+    );
+}
+
+#[test]
+fn after_a_change_of_normaliser_no_artist_takes_a_row_by_today_s_key() {
+    let mut world = World::default();
+    world.add(file("A/1.flac", 1).song("One", "Tin'Harbour", 200));
+    world.add(file("A/2.flac", 2).song("Two", "Tin-Harbour", 200));
+    world.add(file("A/3.flac", 3).song("Three", "Tin & Harbour", 200));
+    // As normaliser 1 left them: the first two one artist, "tinharbour",
+    // and the third another, "tin harbour".
+    world.library.artists = vec![(1, "tinharbour".to_owned()), (2, "tin harbour".to_owned())];
+    world.next = 10;
+    world.library.artist_keys_by = Some(1);
+    let resolution = world.settle();
+    let found: Vec<(Ref, &str)> = resolution
+        .artists
+        .iter()
+        .map(|out| (out.r, out.name.as_str()))
+        .collect();
+    // Today the first two are two artists; the second takes a row of its
+    // own, not the third's, whose today's key is the third's old one.
+    assert_eq!(
+        found,
+        [
+            (Ref::Row(1), "Tin'Harbour"),
+            (Ref::New(1), "Tin-Harbour"),
+            (Ref::Row(2), "Tin & Harbour")
+        ]
+    );
+}
+
+#[test]
+fn after_a_change_of_normaliser_an_artist_first_takes_the_row_of_its_unchanged_spelling() {
+    let mut world = World::default();
+    world.add(file("A/1.flac", 1).song("One", "Here/There", 200));
+    world.add(file("A/2.flac", 2).song("Two", "Here / There", 200));
+    world.add(file("A/3.flac", 3).song("Three", "Here'There", 200));
+    // Normaliser 1 made the first and third one artist, "herethere", and
+    // the second another, "here there". Today the first two are one.
+    world.library.artists = vec![(1, "herethere".to_owned()), (2, "here there".to_owned())];
+    world.next = 10;
+    world.library.artist_keys_by = Some(1);
+    let resolution = world.settle();
+    let found: Vec<(Ref, &str)> = resolution
+        .artists
+        .iter()
+        .map(|out| (out.r, out.match_name.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [(Ref::Row(2), "here there"), (Ref::Row(1), "herethere")]
+    );
+}
+
+#[test]
+fn an_artist_with_no_id_keeps_its_row_across_a_change_of_normaliser() {
+    for edited in [false, true] {
+        let mut world = World::default();
+        world.add(file("A/1.flac", 1).song("Lanterns", "Tin-Harbour", 200));
+        let first = world.settle();
+        let row = match first.artists[0].r {
+            Ref::Row(row) => row,
+            Ref::New(_) => world.library.artists[0].0,
+        };
+        // As normaliser 1 left it: its key, which joined the letters
+        // round the dash, and maybe the owner's name for it.
+        world.library.artists = vec![(row, "tinharbour".to_owned())];
+        world.library.artist_keys_by = Some(1);
+        if edited {
+            world.library.edits.insert(
+                (Kind::Artist, row, "name".to_owned()),
+                "Harbour of Tin".to_owned(),
+            );
+        }
+        let resolution = world.settle();
+        assert_eq!(resolution.artists[0].r, Ref::Row(row), "edited: {edited}");
+        assert_eq!(resolution.artists[0].match_name, "tin harbour");
+        // Without the earlier version named, the row is not found.
+        world.library.artists = vec![(row, "tinharbour".to_owned())];
+        world.library.artist_keys_by = None;
+        assert!(matches!(
+            catalog::resolve(&world.library, &world.policy).artists[0].r,
+            Ref::New(_)
+        ));
+    }
+}
+
+#[test]
 fn the_owners_assignment_is_kept_and_an_exclusion_removes_a_candidate() {
     let mut world = World::default();
     let first = world.add(file("A/1.flac", 1).song("Glass Pier", "Ninefold", 200));
@@ -1901,6 +2015,9 @@ fn policy_2_reads_every_spelling_of_a_cappella_and_part_numbers_as_markers() {
     ] {
         assert!(two(title).is_empty(), "{title}");
     }
+    // A marker written across punctuation inside a word is still one.
+    assert_eq!(two("Lantern (Re-recorded)"), ["rerecorded"]);
+    assert_eq!(two("Lantern (Re-Recorded Version)"), ["rerecorded"]);
     // Policy 1's list is as it was: two spellings are two markers, and a
     // part is none.
     assert_eq!(markers_of("Lantern (Acapella)", 1), ["acapella"]);

@@ -334,7 +334,7 @@ fn markers(text: Option<&str>, words: &'static [&'static str], list: u8) -> Vec<
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect();
-    let key = normalize(text);
+    let key = crate::normalize::joined_words(text);
     let joined = key.split(' ');
     let mut found: Vec<String> = Vec::new();
     let mut add = |marker: String| {
