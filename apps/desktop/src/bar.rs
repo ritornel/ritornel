@@ -125,12 +125,11 @@ impl PlayerBar {
             return;
         };
         let px = (50. * window.scale_factor()).ceil() as u32;
-        let bucket = net.bucket(px);
+        let sizes = net.art_sizes.clone();
         let http = Arc::clone(&net.art);
-        let read = net.rt().spawn(async move {
-            let bytes = http.get(art, bucket).await?;
-            crate::covers::decode(move || crate::covers::decode_cover(&bytes, px)).await
-        });
+        let read = net
+            .rt()
+            .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
         let task = cx.spawn(async move |this, cx| {
             let image = read.await.ok().flatten();
             this.update(cx, |bar, cx| {

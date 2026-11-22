@@ -37,20 +37,34 @@ pub(crate) fn wash_tone(dark: bool) -> (f32, f32) {
     if dark { (WASH.1, 1.) } else { (1.25, 1.18) }
 }
 
-/// A JPEG cover, blurred.
+/// A JPEG cover, blurred, for a banner: drawn square over the banner 30% of
+/// the way down (`background-position: center 30%`), it is cut square the
+/// same way first, so that a picture that is not square is not squashed.
 pub(crate) fn jpeg(bytes: &[u8], radius: usize, saturation: f32) -> Option<RenderImage> {
-    jpeg_toned(bytes, radius, saturation, 1.)
+    blurred(bytes, 0.3, radius, saturation, 1.)
 }
 
-/// A JPEG cover, blurred, saturated and brightened.
+/// A JPEG cover, blurred, saturated and brightened, for the window's wash or
+/// Lean back: drawn square over the window's middle, it is cut square at
+/// its middle first.
 pub(crate) fn jpeg_toned(
     bytes: &[u8],
     radius: usize,
     saturation: f32,
     brightness: f32,
 ) -> Option<RenderImage> {
+    blurred(bytes, 0.5, radius, saturation, brightness)
+}
+
+fn blurred(
+    bytes: &[u8],
+    down: f32,
+    radius: usize,
+    saturation: f32,
+    brightness: f32,
+) -> Option<RenderImage> {
     let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).ok()?;
-    let rgba = decoded
+    let rgba = crate::covers::squared(decoded, down)
         .resize_exact(SIDE, SIDE, image::imageops::FilterType::Triangle)
         .into_rgba8();
     Some(toned(&rgba, radius, saturation, brightness))

@@ -433,11 +433,11 @@ impl Artist {
         took: impl FnOnce(&mut Self, Arc<RenderImage>) + 'static,
     ) {
         let http = Arc::clone(&self.net.art);
-        let bucket = self.net.bucket(px);
-        let read = self.net.rt().spawn(async move {
-            let bytes = http.get(art, bucket).await?;
-            crate::covers::decode(move || crate::covers::decode_cover(&bytes, px)).await
-        });
+        let sizes = self.net.art_sizes.clone();
+        let read = self
+            .net
+            .rt()
+            .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
         self.fetches.push(read.abort_handle());
         cx.spawn(async move |this, cx| {
             if let Ok(Some((image, _, _))) = read.await {

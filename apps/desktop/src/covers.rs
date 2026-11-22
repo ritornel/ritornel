@@ -271,6 +271,27 @@ impl Loader {
                     bytes
                 }
             };
+            // Not square, and too short once cut square: once more, larger.
+            let bytes = match sharper(&bytes, px, bucket, &net.art_sizes) {
+                Some(larger) => {
+                    let key = (art, larger);
+                    let held = compressed.lock().ok().and_then(|held| held.get(key));
+                    match held {
+                        Some(bytes) => bytes,
+                        None => match net.art.get(art, larger).await {
+                            Some(again) => {
+                                let again = Arc::new(again);
+                                if let Ok(mut held) = compressed.lock() {
+                                    held.put(key, Arc::clone(&again));
+                                }
+                                again
+                            }
+                            None => bytes,
+                        },
+                    }
+                }
+                None => bytes,
+            };
             let Ok(permit) = Arc::clone(&decode).acquire_owned().await else {
                 return art;
             };
@@ -390,19 +411,61 @@ pub(crate) fn decode_picture(jpeg: &[u8]) -> Option<image::RgbaImage> {
     )
 }
 
-/// A picture cut square as `object-fit: cover; object-position: center
-/// 30%` shows it in a square: at the middle across, and 30% of the way down,
-/// as the artist's banner cuts their portrait, so that a tall portrait keeps
-/// its face in the wall's circle.
-fn squared(image: image::DynamicImage) -> image::DynamicImage {
+/// A picture cut square as `object-fit: cover` shows it in a square: at the
+/// middle across, and `down` of the way down (0.3 for `center 30%`, as the
+/// artist's banner cuts their portrait, so that a tall portrait keeps its
+/// face in the wall's circle; 0.5 for the middle).
+pub(crate) fn squared(image: image::DynamicImage, down: f32) -> image::DynamicImage {
     let (w, h) = (image.width(), image.height());
     if w > h {
         image.crop_imm((w - h) / 2, 0, h, h)
     } else if h > w {
-        image.crop_imm(0, ((h - w) as f32 * 0.3).round() as u32, w, w)
+        image.crop_imm(0, ((h - w) as f32 * down).round() as u32, w, w)
     } else {
         image
     }
+}
+
+/// Where a picture is cut square for its tile (`squared`).
+const TILE_DOWN: f32 = 0.3;
+
+/// The size to ask for again when a picture fetched at `bucket`, `jpeg`, is
+/// not square and so too short once cut square for a slot `px` pixels: the
+/// server sizes a picture by its longer side. `None` when it is square, when
+/// it is sharp enough already, or when the server sent it smaller than it
+/// asked, so it has no larger one.
+pub(crate) fn sharper(jpeg: &[u8], px: u32, bucket: u32, sizes: &[u32]) -> Option<u32> {
+    let (w, h) =
+        image::ImageReader::with_format(std::io::Cursor::new(jpeg), image::ImageFormat::Jpeg)
+            .into_dimensions()
+            .ok()?;
+    let (short, long) = (w.min(h).max(1), w.max(h));
+    if short >= px || long < bucket {
+        return None;
+    }
+    let wanted = (u64::from(px) * u64::from(long)).div_ceil(u64::from(short));
+    let wanted = u32::try_from(wanted).unwrap_or(u32::MAX);
+    let next = crate::net::bucket_in(sizes, wanted);
+    (next > bucket).then_some(next)
+}
+
+/// A picture for a square slot `px` pixels: fetched at the size the slot
+/// asks for, and once more at a larger one when it is not square and so too
+/// short once cut square (`sharper`); then decoded (`decode_cover`).
+pub(crate) async fn fetch_square(
+    http: &crate::net::ArtHttp,
+    sizes: &[u32],
+    art: Id,
+    px: u32,
+) -> Option<(RenderImage, Rgba, usize)> {
+    let bucket = crate::net::bucket_in(sizes, px);
+    let mut bytes = http.get(art, bucket).await?;
+    if let Some(larger) = sharper(&bytes, px, bucket, sizes)
+        && let Some(again) = http.get(art, larger).await
+    {
+        bytes = again;
+    }
+    decode(move || decode_cover(&bytes, px)).await
 }
 
 /// Decodes a JPEG, cuts it square as it is shown (`squared`), resizes it
@@ -413,7 +476,7 @@ pub(crate) fn decode_cover(jpeg: &[u8], px: u32) -> Option<(RenderImage, Rgba, u
     // A picture larger than `px` either way is made `px` square, as it was
     // before it was cut, so that a thin one is not left a few pixels wide.
     let larger = decoded.width() > px || decoded.height() > px;
-    let decoded = squared(decoded);
+    let decoded = squared(decoded, TILE_DOWN);
     let decoded = if larger {
         decoded.resize_exact(px, px, image::imageops::FilterType::Triangle)
     } else {
@@ -845,6 +908,23 @@ mod shape_tests {
                 at(&image, 50, x, 25)
             );
         }
+    }
+
+    #[test]
+    fn a_picture_too_short_once_cut_square_is_asked_for_again_larger() {
+        let sizes = [64, 96, 128, 192, 256, 384, 512, 768, 1024];
+        // Tall, sent at 384 on its longer side: 192 wide, short of a 300
+        // slot; 600 wanted along its longer side, so 768.
+        assert_eq!(sharper(&banded(192, 384), 300, 384, &sizes), Some(768));
+        // Wide, the same.
+        assert_eq!(sharper(&banded(384, 192), 300, 384, &sizes), Some(768));
+        // Square, or wide enough already: none.
+        assert_eq!(sharper(&banded(384, 384), 300, 384, &sizes), None);
+        assert_eq!(sharper(&banded(320, 384), 300, 384, &sizes), None);
+        // Sent smaller than asked: the server has no larger one.
+        assert_eq!(sharper(&banded(100, 200), 300, 384, &sizes), None);
+        // At the largest size already: none larger.
+        assert_eq!(sharper(&banded(512, 1024), 760, 1024, &sizes), None);
     }
 
     #[test]
