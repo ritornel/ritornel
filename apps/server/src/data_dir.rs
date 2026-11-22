@@ -56,14 +56,16 @@ impl DataDir {
     /// What it creates, only the OS user can read: the directory holds the
     /// local credential, and `server.db` holds the server's signing key. A
     /// directory that already exists keeps the permissions it has, so
-    /// `server.db` is closed too, whether this call creates it or finds it:
-    /// a database restored from a backup may arrive open to everyone.
+    /// `server.db` is closed too, whether this call creates it or finds it,
+    /// and `library.db` if it is there: a database restored from a backup
+    /// may arrive open to everyone.
     pub(crate) fn prepare(root: PathBuf) -> Result<Self, Error> {
         let dir = Self { root };
         for path in [dir.root.clone(), dir.logs()] {
             create_private_dir(&path)?;
         }
         close_database(&dir.server_db())?;
+        close_if_there(&dir.library_db())?;
         Ok(dir)
     }
 
@@ -136,15 +138,20 @@ fn close_database(database: &Path) -> Result<(), Error> {
     create_owner_only(&mut options);
     options
         .open(database)
-        .and_then(|_| close_to_others(database))
         .map_err(io_error("create", database))?;
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar = database.to_owned().into_os_string();
-        sidecar.push(suffix);
-        let sidecar = PathBuf::from(sidecar);
-        match close_to_others(&sidecar) {
+    close_if_there(database)
+}
+
+/// Closes the database file at `path` to everyone but the OS user, with any
+/// log left beside it, if they are there.
+fn close_if_there(database: &Path) -> Result<(), Error> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = database.to_owned().into_os_string();
+        file.push(suffix);
+        let file = PathBuf::from(file);
+        match close_to_others(&file) {
             Err(error) if error.kind() != ErrorKind::NotFound => {
-                return Err(io_error("close", &sidecar)(error));
+                return Err(io_error("close", &file)(error));
             }
             _ => {}
         }
@@ -255,16 +262,31 @@ mod tests {
         // database and a log left beside it can all be read by anyone.
         let root = scratch.path().join("data");
         std::fs::create_dir(&root).unwrap();
-        for name in ["server.db", "server.db-wal", "server.db-shm"] {
+        let names = [
+            "server.db",
+            "server.db-wal",
+            "server.db-shm",
+            "library.db",
+            "library.db-wal",
+            "library.db-shm",
+        ];
+        for name in names {
             std::fs::write(root.join(name), "").unwrap();
             open_to_others(&root.join(name));
             assert!(!private(&root.join(name)));
         }
 
-        let dir = DataDir::prepare(root.clone()).unwrap();
-        assert!(private(&dir.server_db()));
-        assert!(private(&root.join("server.db-wal")));
-        assert!(private(&root.join("server.db-shm")));
+        DataDir::prepare(root.clone()).unwrap();
+        for name in names {
+            assert!(private(&root.join(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_server_with_no_library_is_not_given_a_library_file() {
+        let scratch = Scratch::new();
+        let dir = DataDir::prepare(scratch.path().join("data")).unwrap();
+        assert!(!dir.library_db().exists());
     }
 
     #[test]

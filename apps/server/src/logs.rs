@@ -23,6 +23,7 @@ use tracing::{Event, Level, Metadata, Subscriber};
 
 use crate::Error;
 use crate::error::io_error;
+use crate::platform::{close_to_others, create_owner_only};
 
 /// The keys every line has. A field of an event that uses one of these names
 /// is written as `field.<name>`.
@@ -206,8 +207,15 @@ impl DailyFile {
             Some(open) if open.0 == date => open,
             // Another day's file, if there was one, is closed here.
             _ => {
+                // A log names the library's folders and files, so only the
+                // OS user may read it, and a file that was there already
+                // is closed too: it may have been restored open to others.
                 let path = self.path(date);
-                let file = OpenOptions::new().append(true).create(true).open(path)?;
+                let mut options = OpenOptions::new();
+                options.append(true).create(true);
+                create_owner_only(&mut options);
+                let file = options.open(&path)?;
+                close_to_others(&path)?;
                 (date.to_owned(), file)
             }
         };
@@ -385,6 +393,24 @@ mod tests {
         assert_eq!(second[0]["ts"], "2026-11-16T22:33:02.123Z");
         // One run, one boot ID, whichever file a line is in.
         assert_eq!(first[0]["boot_id"], second[1]["boot_id"]);
+    }
+
+    #[test]
+    fn a_days_log_is_closed_to_other_users_whether_it_is_new_or_was_there() {
+        use crate::platform::{open_to_others, path_is_private as private};
+        let scratch = Scratch::new();
+        let first = scratch.path().join("server.2026-11-15.jsonl");
+        let second = scratch.path().join("server.2026-11-16.jsonl");
+        // As after a restore that did not keep modes.
+        std::fs::write(&first, "").unwrap();
+        open_to_others(&first);
+        logging(scratch.path(), Level::INFO, |clock| {
+            info!("before midnight");
+            clock.0.store(T0 + DAY, Ordering::SeqCst);
+            info!("the next day");
+        });
+        assert!(private(&first));
+        assert!(private(&second));
     }
 
     #[test]
