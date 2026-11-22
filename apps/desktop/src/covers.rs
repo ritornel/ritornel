@@ -272,7 +272,10 @@ impl Loader {
                 }
             };
             // Not square, and too short once cut square: once more, larger.
-            let bytes = match sharper(&bytes, px, bucket, &net.art_sizes) {
+            let larger = sharper(&bytes, px, bucket, &net.art_sizes)
+                // Not if the wall has moved on meanwhile.
+                .filter(|_| wanted.borrow().ids.contains(&art));
+            let bytes = match larger {
                 Some(larger) => {
                     let key = (art, larger);
                     let held = compressed.lock().ok().and_then(|held| held.get(key));
@@ -280,6 +283,9 @@ impl Loader {
                         Some(bytes) => bytes,
                         None => match net.art.get(art, larger).await {
                             Some(again) => {
+                                if let Ok(mut counts) = counts.lock() {
+                                    counts.fetched += 1;
+                                }
                                 let again = Arc::new(again);
                                 if let Ok(mut held) = compressed.lock() {
                                     held.put(key, Arc::clone(&again));
@@ -925,6 +931,10 @@ mod shape_tests {
         assert_eq!(sharper(&banded(100, 200), 300, 384, &sizes), None);
         // At the largest size already: none larger.
         assert_eq!(sharper(&banded(512, 1024), 760, 1024, &sizes), None);
+        // Thinner than the largest size can cover: the largest.
+        assert_eq!(sharper(&banded(96, 384), 300, 384, &sizes), Some(1024));
+        // A slot larger than every size: none larger to ask for.
+        assert_eq!(sharper(&banded(512, 1024), 1200, 1024, &sizes), None);
     }
 
     #[test]
