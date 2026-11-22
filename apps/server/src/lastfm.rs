@@ -546,59 +546,6 @@ mod enabled {
         SourceError::sink(error.to_string())
     }
 
-    #[cfg(test)]
-    #[test]
-    fn a_sync_observes_cancellation_between_progress_saves() {
-        use ritornel_engine::{Command, Fingerprint, NewJob};
-        let (core, scratch) = crate::dispatch::tests::core();
-        let lastfm = Lastfm::new(Default::default(), scratch.path());
-        let id = |n| Id::from_bytes([n; 16]);
-        let command = |n, method| Command {
-            id: id(n),
-            fingerprint: Fingerprint::of(method, b"{}"),
-        };
-        let job = core
-            .with_stores(|stores| {
-                let store = stores.server();
-                store
-                    .start_job(
-                        command(1, "lastfm.sync"),
-                        "lastfm.sync",
-                        NewJob {
-                            kind: "lastfm.sync",
-                            dedupe_key: "someone".into(),
-                            target: id(2),
-                            params_json: "{}".into(),
-                            session: None,
-                        },
-                    )
-                    .unwrap();
-                store.claim_job(id(3)).unwrap().unwrap()
-            })
-            .unwrap();
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let sink = JobSink {
-            core: &core,
-            lastfm: &lastfm,
-            account: id(2),
-            job: &job,
-            stop: &stop,
-            batches: 0,
-            summary: Default::default(),
-            saved: Instant::now(),
-        };
-        assert!(!sink.stopping());
-        core.with_stores(|stores| {
-            stores
-                .server()
-                .cancel_job(command(4, "jobs.cancel"), "jobs.cancel", job.public_id)
-                .unwrap()
-                .unwrap()
-        })
-        .unwrap();
-        assert!(sink.stopping());
-    }
-
     impl JobSink<'_> {
         fn cancellation_requested(&self) -> bool {
             self.job.cancel_requested || self.core.with_stores(|stores| {
@@ -1059,9 +1006,61 @@ mod enabled {
         use ritornel_lastfm::{Outcome, Sent, SessionKey, ToScrobble, Unsent};
 
         use super::{
-            Began, DAILY_LIMIT_RETRY_MS, DAILY_LIMIT_WAIT, REFUSED_WAIT, SETTLE, STALE, Sending,
-            Slot, Taken, send_due,
+            Began, DAILY_LIMIT_RETRY_MS, DAILY_LIMIT_WAIT, Instant, JobSink, Lastfm, REFUSED_WAIT,
+            SETTLE, STALE, Sending, Sink, Slot, Taken, send_due,
         };
+
+        #[test]
+        fn a_sync_observes_cancellation_between_progress_saves() {
+            use ritornel_engine::{Command, Fingerprint, NewJob};
+            let (core, scratch) = crate::testing::core();
+            let lastfm = Lastfm::new(Default::default(), scratch.path());
+            let id = |n| Id::from_bytes([n; 16]);
+            let command = |n, method| Command {
+                id: id(n),
+                fingerprint: Fingerprint::of(method, b"{}"),
+            };
+            let job = core
+                .with_stores(|stores| {
+                    let store = stores.server();
+                    store
+                        .start_job(
+                            command(1, "lastfm.sync"),
+                            "lastfm.sync",
+                            NewJob {
+                                kind: "lastfm.sync",
+                                dedupe_key: "someone".into(),
+                                target: id(2),
+                                params_json: "{}".into(),
+                                session: None,
+                            },
+                        )
+                        .unwrap();
+                    store.claim_job(id(3)).unwrap().unwrap()
+                })
+                .unwrap();
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let sink = JobSink {
+                core: &core,
+                lastfm: &lastfm,
+                account: id(2),
+                job: &job,
+                stop: &stop,
+                batches: 0,
+                summary: Default::default(),
+                saved: Instant::now(),
+            };
+            assert!(!sink.stopping());
+            core.with_stores(|stores| {
+                stores
+                    .server()
+                    .cancel_job(command(4, "jobs.cancel"), "jobs.cancel", job.public_id)
+                    .unwrap()
+                    .unwrap()
+            })
+            .unwrap();
+            assert!(sink.stopping());
+        }
 
         #[test]
         fn of_tracks_skipped_through_only_the_last_is_shown_once_it_settles() {
