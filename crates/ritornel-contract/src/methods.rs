@@ -394,7 +394,9 @@ methods! {
 
     /// `lastfm.signInFinish`: once the listener has approved the sign-in,
     /// exchanges it for a session and keeps it. Before that it answers
-    /// `accepted`, and is called again.
+    /// `accepted`, and is called again. The sign-in it names, not its key,
+    /// is what makes sending it again safe: once finished, it answers with
+    /// the same account, and its receipt is made and not stored.
     LastfmSignInFinish: "lastfm.signInFinish", Command, needs_full: true,
     SignInFinishParams => SignInFinished;
 

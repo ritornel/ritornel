@@ -438,7 +438,8 @@ mod enabled {
                         service: SERVICE.to_owned(),
                     },
                 )
-                .map_err(refused)?;
+                .map_err(refused)?
+                .found;
             drop(change);
             Ok(SignedOut {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Done),
@@ -483,7 +484,7 @@ mod enabled {
             // after a newer change, a sign-out included, it changes nothing,
             // and answers with scrobbling as it is.
             let change = self.lastfm().map(Lastfm::hold);
-            stores
+            let changed = stores
                 .server()
                 .change_once(
                     command,
@@ -498,7 +499,9 @@ mod enabled {
                     other => refused(other),
                 })?;
             drop(change);
-            self.wake_scrobbler();
+            if changed.now {
+                self.wake_scrobbler();
+            }
             let session = stores.server().service_session(SERVICE).map_err(refused)?;
             Ok(ScrobblingSet {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Done),

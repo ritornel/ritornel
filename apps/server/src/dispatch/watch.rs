@@ -329,7 +329,7 @@ impl Core {
             id: params.idempotency_key,
             fingerprint: super::fingerprint::<LibrarySetWatching>(params)?,
         };
-        stores
+        let changed = stores
             .server()
             .change_once(
                 command,
@@ -338,7 +338,9 @@ impl Core {
             )
             .map_err(crate::Error::Store)
             .map_err(super::failed)?;
-        self.watching_set(params.on);
+        if changed.now {
+            self.watching_set(params.on);
+        }
         Ok(WatchingSet {
             receipt: Receipt {
                 command_id: params.idempotency_key,

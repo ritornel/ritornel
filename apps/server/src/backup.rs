@@ -22,9 +22,10 @@
 //! while it is taken. The two are copied one after the other, not at one
 //! moment: a listen open in the copy of `server.db` may already be in the
 //! copy of `library.db`, which keeps its own and records the other as a
-//! conflict when the listen is delivered after a restore. The folder is written under a name that begins with
-//! a dot and is renamed once everything in it is whole, so a folder with
-//! the plain name is a backup that finished.
+//! conflict when the listen is delivered after a restore. The folder is
+//! written under a name that begins with a dot and is renamed once
+//! everything in it is whole, so a folder with the plain name is a backup
+//! that finished.
 
 use std::fmt;
 use std::path::{Path, PathBuf};

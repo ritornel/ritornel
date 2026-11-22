@@ -47,6 +47,17 @@ pub enum SettingChange {
     },
 }
 
+/// What [`ServerStore::change_once`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Changed {
+    /// Whether the change was made now: `false` for a command carried out
+    /// before, which changed nothing this time.
+    pub now: bool,
+    /// What the change found the first time: for a sign-out, whether there
+    /// was a session; for the others, `true`.
+    pub found: bool,
+}
+
 fn set_watching(connection: &Connection, on: bool) -> Result<(), Error> {
     connection.execute(
         "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
@@ -297,20 +308,21 @@ impl ServerStore {
     /// Carries out a command that changes a setting of this machine, once:
     /// the change and its receipt are written together. The same command
     /// again changes nothing, so a retry that arrives after a newer command
-    /// never undoes it; the same ID with other params is refused. Returns
-    /// what the change found the first time: for a sign-out, whether there
-    /// was a session; for the others, `true`. Scrobbling with no session to
-    /// turn it on or off for is refused as [`Error::NotFound`], and nothing
-    /// is kept of the command.
+    /// never undoes it; the same ID with other params is refused. Scrobbling
+    /// with no session to turn it on or off for is refused as
+    /// [`Error::NotFound`], and nothing is kept of the command.
     pub fn change_once(
         &self,
         command: crate::Command,
         method: &'static str,
         change: SettingChange,
-    ) -> Result<bool, Error> {
+    ) -> Result<Changed, Error> {
         self.transact(move |transaction, now_ms, _| {
             if let Some(stored) = crate::jobs::receipt(transaction, &command)? {
-                return Ok(stored == "true");
+                return Ok(Changed {
+                    now: false,
+                    found: stored == "true",
+                });
             }
             let found = match &change {
                 SettingChange::Watching(on) => set_watching(transaction, *on).map(|()| true)?,
@@ -331,7 +343,7 @@ impl ServerStore {
                 if found { "true" } else { "false" },
                 now_ms,
             )?;
-            Ok(found)
+            Ok(Changed { now: true, found })
         })
     }
 

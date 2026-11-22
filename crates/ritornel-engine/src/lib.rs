@@ -125,7 +125,7 @@ pub use scan::{ScanRun, ScanSettings, run_scan, scan_summary};
 pub use scan_store::Source;
 pub use secret::SessionToken;
 pub use server_store::{
-    BackupFailed, BackupTaken, Role, ServerIdentity, ServerStore, SettingChange,
+    BackupFailed, BackupTaken, Changed, Role, ServerIdentity, ServerStore, SettingChange,
 };
 pub use service_session::{ServiceKey, ServiceSession};
 pub use sqlite::SQLITE_VERSION;
