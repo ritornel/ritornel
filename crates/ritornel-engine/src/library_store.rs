@@ -495,6 +495,16 @@ impl LibraryStore {
         self.reader.call(work)
     }
 
+    /// Runs a read of several queries on the read connection, in one read
+    /// transaction, so that they all see the library as of one commit.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        work: impl FnOnce(&Connection) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.reader
+            .call(|connection| crate::sqlite::snapshot(connection, work))
+    }
+
     /// The server whose library this is: this one.
     pub(crate) fn hub(&self) -> Id {
         self.hub

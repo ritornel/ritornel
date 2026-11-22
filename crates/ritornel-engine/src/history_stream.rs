@@ -237,12 +237,7 @@ impl LibraryStore {
     /// `listener`'s whole history as the History tab draws it, up to the
     /// month of `today`.
     pub fn history_stream(&self, listener: Id, today: Today) -> Result<HistoryStream, Error> {
-        self.read(move |connection| {
-            connection.execute_batch("BEGIN")?;
-            let read = stream(connection, listener, today);
-            let _ = connection.execute_batch("COMMIT");
-            read
-        })
+        self.read_snapshot(move |connection| stream(connection, listener, today))
     }
 }
 

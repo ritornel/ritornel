@@ -1409,7 +1409,7 @@ impl LibraryStore {
     ) -> Result<Vec<PlayRow>, Error> {
         let at = after.and_then(|cursor| cursor.at_ms);
         let id = after.map(|cursor| cursor.play_id.as_bytes().to_vec());
-        self.read(|connection| {
+        self.read_snapshot(|connection| {
             play_rows(
                 connection,
                 "WHERE pe.listener_id = (SELECT id FROM listener WHERE public_id = ?1)
@@ -1475,7 +1475,7 @@ impl LibraryStore {
     /// The plays of `listener` that count, are not excluded and fell on
     /// `month_day` (MMDD) of any year, newest first.
     pub fn plays_on_this_day(&self, listener: Id, month_day: i64) -> Result<Vec<PlayRow>, Error> {
-        self.read(|connection| {
+        self.read_snapshot(|connection| {
             play_rows(
                 connection,
                 "WHERE pe.listener_id = (SELECT id FROM listener WHERE public_id = ?1)

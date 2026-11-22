@@ -224,6 +224,28 @@ impl Reader {
     }
 }
 
+/// Runs `work` in one read transaction on `connection`, so that every
+/// query in it sees the database as of one commit. Each statement outside
+/// a transaction reads the newest commit, and a write between two of them,
+/// such as a rebuild that numbers the plays again, would join rows of two
+/// different databases. The transaction ends however `work` does, a panic
+/// included, so it never holds the log after.
+pub(crate) fn snapshot<T>(
+    connection: &Connection,
+    work: impl FnOnce(&Connection) -> Result<T, Error>,
+) -> Result<T, Error> {
+    struct End<'a>(&'a Connection);
+    impl Drop for End<'_> {
+        fn drop(&mut self) {
+            // A read changes nothing, so ending it cannot lose anything.
+            let _ = self.0.execute_batch("COMMIT");
+        }
+    }
+    connection.execute_batch("BEGIN")?;
+    let _end = End(connection);
+    work(connection)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +446,72 @@ mod tests {
         // SQLite removes an empty log when the last connection closes.
         assert!(!wal.exists());
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
+    }
+
+    fn notes(connection: &Connection) -> Result<i64, Error> {
+        Ok(connection.query_row("SELECT count(*) FROM note", [], |row| row.get(0))?)
+    }
+
+    #[test]
+    fn a_snapshot_reads_one_commit_throughout_and_a_read_outside_one_does_not() {
+        let scratch = Scratch::new();
+        let location = Location::File(scratch.path().join("test.db"));
+        let writer = Writer::start(&location, "test writer").unwrap();
+        writer
+            .call(|connection| Ok(connection.execute_batch("CREATE TABLE note (body)")?))
+            .unwrap();
+        let reader = Reader::open(&location).unwrap();
+        let write = || {
+            writer
+                .call(|connection| Ok(connection.execute_batch("INSERT INTO note VALUES ('x')")?))
+                .unwrap();
+        };
+        let outside = reader
+            .call(|connection| {
+                let first = notes(connection)?;
+                write();
+                Ok((first, notes(connection)?))
+            })
+            .unwrap();
+        assert_eq!(outside, (0, 1));
+        let inside = reader
+            .call(|connection| {
+                snapshot(connection, |connection| {
+                    let first = notes(connection)?;
+                    write();
+                    Ok((first, notes(connection)?))
+                })
+            })
+            .unwrap();
+        assert_eq!(inside, (1, 1));
+    }
+
+    #[test]
+    fn a_read_that_panics_in_a_snapshot_leaves_no_transaction_open() {
+        let scratch = Scratch::new();
+        let location = Location::File(scratch.path().join("test.db"));
+        let writer = Writer::start(&location, "test writer").unwrap();
+        writer
+            .call(|connection| Ok(connection.execute_batch("CREATE TABLE note (body)")?))
+            .unwrap();
+        let reader = Reader::open(&location).unwrap();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reader.call(|connection| {
+                snapshot(connection, |connection| -> Result<(), Error> {
+                    notes(connection)?;
+                    panic!("a read that panics");
+                })
+            })
+        }));
+        assert!(panicked.is_err());
+        writer
+            .call(|connection| {
+                connection.execute_batch("INSERT INTO note VALUES ('x')")?;
+                Ok(connection.busy_timeout(Duration::ZERO)?)
+            })
+            .unwrap();
+        // Unlike a read left open, it holds nothing that stops the close.
+        writer.close().unwrap();
     }
 
     #[test]

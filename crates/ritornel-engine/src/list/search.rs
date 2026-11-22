@@ -510,12 +510,7 @@ impl LibraryStore {
     /// match `text`, read in one transaction.
     pub fn search(&self, text: &str, limit: usize) -> Result<SearchResults, Error> {
         let typed = Typed::of(text);
-        self.read(move |connection| {
-            connection.execute_batch("BEGIN")?;
-            let found = search(connection, &typed, limit);
-            let _ = connection.execute_batch("COMMIT");
-            found
-        })
+        self.read_snapshot(move |connection| search(connection, &typed, limit))
     }
 }
 

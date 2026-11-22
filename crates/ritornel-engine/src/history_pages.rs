@@ -255,23 +255,8 @@ pub(crate) fn listener_key(connection: &Connection, listener: Id) -> Result<i64,
 /// Reads the plays `sql` selects (each its instant, its local date and the
 /// release group it was heard from) for the listener `?1`, with `subject`
 /// as `?2`, into what a page says, with the listener's whole history beside
-/// them.
+/// them. It is run in one read transaction with the lookup of `subject`.
 fn history_of(
-    connection: &Connection,
-    listener: Id,
-    subject: i64,
-    sql: &str,
-    today: Today,
-    records: bool,
-) -> Result<HistoryOf, Error> {
-    connection.execute_batch("BEGIN")?;
-    let read = read_history(connection, listener, subject, sql, today, records);
-    // A read changes nothing, so ending it cannot lose anything.
-    let _ = connection.execute_batch("COMMIT");
-    read
-}
-
-fn read_history(
     connection: &Connection,
     listener: Id,
     subject: i64,
@@ -397,7 +382,7 @@ impl LibraryStore {
         artist: Id,
         today: Today,
     ) -> Result<Option<HistoryOf>, Error> {
-        self.read(move |connection| {
+        self.read_snapshot(move |connection| {
             let key: Option<i64> = connection
                 .query_row(
                     "SELECT canonical_id FROM artist WHERE public_id = ?1",
@@ -419,7 +404,7 @@ impl LibraryStore {
         album: AlbumRef,
         today: Today,
     ) -> Result<Option<HistoryOf>, Error> {
-        self.read(move |connection| {
+        self.read_snapshot(move |connection| {
             let group: Option<i64> = match album {
                 AlbumRef::ReleaseGroup { id } => connection
                     .query_row(
