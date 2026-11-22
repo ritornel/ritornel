@@ -27,7 +27,7 @@ mod unix;
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod launchd;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
 mod service;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod systemd;

@@ -295,7 +295,7 @@ mod fallback {
         prompt: String,
         _message: String,
         cx: &mut AsyncApp,
-    ) -> Option<PathBuf> {
+    ) -> Result<Option<PathBuf>, String> {
         let chosen = cx.update(|cx| {
             cx.prompt_for_paths(PathPromptOptions {
                 files: false,
@@ -304,7 +304,15 @@ mod fallback {
                 prompt: Some(prompt.into()),
             })
         });
-        chosen.await.ok()?.ok()??.into_iter().next()
+        picked_folder(chosen.await.map_err(|err| err.to_string())?)
+    }
+
+    fn picked_folder(
+        chosen: gpui::Result<Option<Vec<PathBuf>>>,
+    ) -> Result<Option<PathBuf>, String> {
+        chosen
+            .map(|paths| paths.and_then(|paths| paths.into_iter().next()))
+            .map_err(|err| err.to_string())
     }
 
     /// The language the system prefers, as a BCP 47 tag, from the
@@ -350,6 +358,19 @@ mod fallback {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }
+    #[cfg(test)]
+    mod picker_tests {
+        use super::*;
+
+        #[test]
+        fn cancelling_is_quiet_and_a_failed_picker_keeps_its_reason() {
+            assert_eq!(picked_folder(Ok(None)), Ok(None));
+            assert_eq!(
+                picked_folder(Err(std::io::Error::other("portal unavailable").into())),
+                Err("portal unavailable".into())
+            );
+        }
     }
 }
 

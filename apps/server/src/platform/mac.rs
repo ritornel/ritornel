@@ -9,9 +9,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use super::launchd::{LABEL, bootout, plist, running_pid, served_dir, uninstall};
+use super::launchd::{LABEL, install, plist, running_pid, served_dir, uninstall};
 use super::service::{installed, prepare};
-use crate::error::io_error;
 use crate::{Env, Error};
 
 #[cfg(not(feature = "media-session"))]
@@ -29,7 +28,6 @@ pub(crate) const MEDIA_SESSION_ON_RUNTIME: bool = false;
 
 /// Where the agent's plist is, and the job launchd knows it as.
 struct Agent {
-    agents: PathBuf,
     path: PathBuf,
     domain: String,
     job: String,
@@ -44,39 +42,23 @@ impl Agent {
         let path = agents.join(format!("{LABEL}.plist"));
         let domain = format!("gui/{}", rustix::process::getuid().as_raw());
         let job = format!("{domain}/{LABEL}");
-        Ok(Self {
-            agents,
-            path,
-            domain,
-            job,
-        })
+        Ok(Self { path, domain, job })
     }
 }
 
 /// Registers the agent that serves `data_dir` and starts it, replacing one
 /// registered before, and says what was done.
 pub(crate) fn install_service(data_dir: Option<&Path>, env: Env<'_>) -> Result<String, Error> {
-    let Agent {
-        agents,
-        path,
-        domain,
-        job,
-    } = Agent::of(env)?;
+    let Agent { path, domain, job } = Agent::of(env)?;
     // The log directory must be there before launchd opens the log in it.
     let (dir, program) = prepare(data_dir, env)?;
-    // One registered before goes first, and its server stops.
-    bootout(&job, &launchctl)?;
-    std::fs::create_dir_all(&agents).map_err(io_error("create", &agents))?;
-    let staged = path.with_extension("plist.new");
-    std::fs::write(&staged, plist(&program, dir.root())).map_err(io_error("write", &staged))?;
-    std::fs::rename(&staged, &path).map_err(io_error("write", &path))?;
-    let booted = launchctl(&["bootstrap".as_ref(), domain.as_ref(), path.as_os_str()])?;
-    if !booted.status.success() {
-        return Err(Error::Service(format!(
-            "launchctl bootstrap failed: {}",
-            String::from_utf8_lossy(&booted.stderr).trim()
-        )));
-    }
+    install(
+        &job,
+        &domain,
+        &path,
+        &plist(&program, dir.root()),
+        &launchctl,
+    )?;
     Ok(installed(&program, &dir))
 }
 

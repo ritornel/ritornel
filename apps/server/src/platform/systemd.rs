@@ -192,6 +192,66 @@ pub(crate) fn stop(systemctl: Systemctl<'_>) -> Result<bool, Error> {
     }
 }
 
+pub(crate) fn install(path: &Path, contents: &str, systemctl: Systemctl<'_>) -> Result<(), Error> {
+    let replacement = super::service::Replacement::install(path, contents)?;
+    let query = systemctl(&[
+        "show".as_ref(),
+        "--property=ActiveState,UnitFileState".as_ref(),
+        UNIT.as_ref(),
+    ]);
+    let (active, enabled) = match query {
+        Ok(out) if out.status.success() => {
+            let state = String::from_utf8_lossy(&out.stdout);
+            let Some(active) = state
+                .lines()
+                .find_map(|line| line.strip_prefix("ActiveState="))
+                .filter(|value| !value.is_empty())
+            else {
+                let error = Error::Service("systemd did not report the service state. Check systemctl --user status before installing.".into());
+                return Err(replacement.rollback(error, || Ok(())));
+            };
+            (
+                matches!(active, "active" | "activating" | "reloading"),
+                state.lines().any(|line| line == "UnitFileState=enabled"),
+            )
+        }
+        Ok(out) if out.status.code() == Some(4) => (false, false),
+        Ok(out) => return Err(replacement.rollback(failed("show", &out), || Ok(()))),
+        Err(err) => return Err(replacement.rollback(err, || Ok(()))),
+    };
+    let replacement = replacement.protect_running(active)?;
+    let reload = || must(systemctl, &["daemon-reload".as_ref()]);
+    let run = |verb: &str| must(systemctl, &[verb.as_ref(), UNIT.as_ref()]);
+    if let Err(error) = reload() {
+        return Err(replacement.rollback(error, || Ok(())));
+    }
+    let start = run("restart").and_then(|()| {
+        if enabled {
+            return Ok(());
+        }
+        run("enable").map_err(|error| match run("disable") {
+            Ok(()) => error,
+            Err(cleanup) => Error::Service(format!(
+                "{error}. Removing the new login setting failed ({cleanup}). \
+                 Check it with systemctl --user is-enabled {UNIT}."
+            )),
+        })
+    });
+    if let Err(error) = start {
+        return Err(replacement.rollback(error, || {
+            if !active {
+                stop(systemctl)?;
+            }
+            reload()?;
+            if active {
+                run("restart")?;
+            }
+            Ok(())
+        }));
+    }
+    Ok(())
+}
+
 /// Stops the unit, disables it and removes its file, and says what was
 /// done. The file stays if the unit could not be stopped, so that it
 /// can be tried again.
@@ -294,13 +354,13 @@ WantedBy=default.target
             "show",
             printed("LoadState=not-found\nActiveState=inactive\nMainPID=0\n"),
         )]);
-        let said = status(&file.0, Some("[Unit]\n"), &|args| fake.run(args)).unwrap();
+        let said = status(&file.path, Some("[Unit]\n"), &|args| fake.run(args)).unwrap();
         assert!(said.ends_with("Not registered with systemd"), "{said}");
         let fake = Fake::new(vec![(
             "show",
             printed("LoadState=loaded\nActiveState=active\nMainPID=4312\n"),
         )]);
-        let said = status(&file.0, Some("[Unit]\n"), &|args| fake.run(args)).unwrap();
+        let said = status(&file.path, Some("[Unit]\n"), &|args| fake.run(args)).unwrap();
         assert!(said.ends_with("Running: pid 4312"), "{said}");
     }
 
@@ -311,7 +371,7 @@ WantedBy=default.target
             "show",
             output(1, "Failed to connect to user scope bus via local transport"),
         )]);
-        let failed = status(&file.0, Some("[Unit]\n"), &|args| fake.run(args)).unwrap_err();
+        let failed = status(&file.path, Some("[Unit]\n"), &|args| fake.run(args)).unwrap_err();
         assert_eq!(
             failed.to_string(),
             "the background service: systemctl show failed: Failed to connect to user scope \
@@ -319,7 +379,7 @@ WantedBy=default.target
         );
         // Nor is a show that says nothing of the unit.
         let fake = Fake::new(vec![("show", printed(""))]);
-        assert!(status(&file.0, None, &|args| fake.run(args)).is_err());
+        assert!(status(&file.path, None, &|args| fake.run(args)).is_err());
     }
 
     fn output(code: i32, stderr: &str) -> Output {
@@ -354,23 +414,94 @@ WantedBy=default.target
         }
     }
 
-    struct UnitFile(std::path::PathBuf);
+    struct UnitFile {
+        path: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
 
     impl UnitFile {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "ritornel-service-{}-{name}.service",
-                std::process::id()
-            ));
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{name}.service"));
             std::fs::write(&path, "[Unit]\n").unwrap();
-            Self(path)
+            Self { path, _dir: dir }
         }
     }
 
-    impl Drop for UnitFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+    #[test]
+    fn failed_registration_puts_the_running_definition_back() {
+        let file = UnitFile::new("rollback");
+        let fake = Fake::new(vec![
+            ("show", printed("ActiveState=active")),
+            ("daemon-reload", output(0, "")),
+            ("restart", output(1, "bad unit")),
+            ("daemon-reload", output(0, "")),
+            ("restart", output(0, "")),
+        ]);
+        assert!(install(&file.path, "new unit", &|args| fake.run(args)).is_err());
+        assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "[Unit]\n");
+        assert!(fake.answers.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_install_requires_the_current_service_state() {
+        let file = UnitFile::new("unknown-state");
+        let fake = Fake::new(vec![("show", printed(""))]);
+        assert!(install(&file.path, "new unit", &|args| fake.run(args)).is_err());
+        assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "[Unit]\n");
+        assert!(fake.answers.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_failed_initial_reload_keeps_the_original_without_restarting_it() {
+        let file = UnitFile::new("reload-error");
+        let fake = Fake::new(vec![
+            ("show", printed("ActiveState=active")),
+            ("daemon-reload", output(1, "manager unavailable")),
+        ]);
+        let error = install(&file.path, "new unit", &|args| fake.run(args)).unwrap_err();
+        assert!(error.to_string().contains("manager unavailable"));
+        assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "[Unit]\n");
+        assert!(fake.answers.borrow().is_empty());
+    }
+
+    #[test]
+    fn failed_enable_restores_an_inactive_disabled_unit() {
+        let file = UnitFile::new("enable-error");
+        let fake = Fake::new(vec![
+            (
+                "show",
+                printed("ActiveState=inactive\nUnitFileState=disabled"),
+            ),
+            ("daemon-reload", output(0, "")),
+            ("restart", output(0, "")),
+            ("enable", output(1, "cannot enable")),
+            ("disable", output(0, "")),
+            ("stop", output(0, "")),
+            ("daemon-reload", output(0, "")),
+        ]);
+        assert!(install(&file.path, "new unit", &|args| fake.run(args)).is_err());
+        assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "[Unit]\n");
+        assert!(fake.answers.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_running_service_with_no_saved_definition_is_left_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing");
+        let fake = Fake::new(vec![("show", printed("ActiveState=active"))]);
+        let error = install(&path, "new unit", &|args| fake.run(args)).unwrap_err();
+        assert!(error.to_string().contains("no saved definition"));
+        assert!(!path.exists());
+        assert!(fake.answers.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_failed_stage_leaves_the_manager_alone() {
+        let file = UnitFile::new("stage-error");
+        let path = file.path.join("not-a-directory");
+        let fake = Fake::new(vec![]);
+        assert!(install(&path, "new unit", &|args| fake.run(args)).is_err());
     }
 
     #[test]
@@ -381,19 +512,19 @@ WantedBy=default.target
             ("disable", output(0, "")),
             ("daemon-reload", output(0, "")),
         ]);
-        let said = uninstall(&file.0, &|args| fake.run(args)).unwrap();
+        let said = uninstall(&file.path, &|args| fake.run(args)).unwrap();
         assert_eq!(said, "Removed the background service");
-        assert!(!file.0.exists());
+        assert!(!file.path.exists());
         assert_eq!(*fake.calls.borrow(), ["stop", "disable", "daemon-reload"]);
     }
 
     #[test]
     fn a_unit_that_is_not_there_is_not_an_error() {
         let file = UnitFile::new("absent");
-        std::fs::remove_file(&file.0).unwrap();
+        std::fs::remove_file(&file.path).unwrap();
         let not_loaded = || output(NOT_LOADED, "Unit dev.ritornel.server.service not loaded.");
         let fake = Fake::new(vec![("stop", not_loaded())]);
-        let said = uninstall(&file.0, &|args| fake.run(args)).unwrap();
+        let said = uninstall(&file.path, &|args| fake.run(args)).unwrap();
         assert_eq!(said, "The background service is not installed");
     }
 
@@ -404,12 +535,12 @@ WantedBy=default.target
             "stop",
             output(1, "Failed to connect to bus: No medium found"),
         )]);
-        let failed = uninstall(&file.0, &|args| fake.run(args)).unwrap_err();
+        let failed = uninstall(&file.path, &|args| fake.run(args)).unwrap_err();
         assert_eq!(
             failed.to_string(),
             "the background service: systemctl stop failed: Failed to connect to bus: No \
              medium found"
         );
-        assert!(file.0.exists());
+        assert!(file.path.exists());
     }
 }

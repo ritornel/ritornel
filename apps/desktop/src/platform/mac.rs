@@ -112,11 +112,11 @@ pub(crate) async fn choose_folder(
     prompt: String,
     message: String,
     cx: &mut AsyncApp,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>, String> {
     let ns = window
         .update(cx, |_, window, _| ns_window(window))
-        .ok()
-        .flatten()?;
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "the window closed".to_owned())?;
     super::mac_window::choose_folder(ns, prompt, message).await
 }
 

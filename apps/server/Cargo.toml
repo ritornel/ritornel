@@ -66,6 +66,8 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 # ask for either without unsafe code.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.6", features = ["fs", "process"] }
+# Stages replacement service definitions on the same filesystem.
+tempfile = "3.27.0"
 
 # The same on Windows, and what Windows has in place of the rest of Unix: a
 # lock on one byte, owner-only access lists, a folder's identity, and the

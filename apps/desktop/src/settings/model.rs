@@ -457,11 +457,16 @@ impl Model {
                 cx,
             )
             .await;
-            if let Some(path) = path {
-                let _ = model.update(cx, |model, cx| {
-                    model.add_folder(path.display().to_string(), cx).detach();
-                });
-            }
+            let _ = model.update(cx, |model, cx| match path {
+                Ok(Some(path)) => { model.add_folder(path.display().to_string(), cx).detach(); }
+                Ok(None) => {}
+                Err(error) => {
+                    model.problems.insert(Group::Library, format!(
+                        "The folder chooser failed ({error}). Try again or run ritornelctl scan with the folder path."
+                    ));
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }
@@ -581,11 +586,16 @@ impl Model {
                 cx,
             )
             .await;
-            if let Some(path) = path {
-                let _ = model.update(cx, |model, cx| {
-                    model.import_pictures(Some(path.display().to_string()), cx);
-                });
-            }
+            let _ = model.update(cx, |model, cx| match path {
+                Ok(Some(path)) => { model.import_pictures(Some(path.display().to_string()), cx); }
+                Ok(None) => {}
+                Err(error) => {
+                    model.problems.insert(Group::Pictures, format!(
+                        "The folder chooser failed ({error}). Try again or run ritornelctl artists pictures with the folder path."
+                    ));
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }

@@ -2091,6 +2091,7 @@ dependencies = [
  "serde_json",
  "souvlaki",
  "subtle",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
  "toml",

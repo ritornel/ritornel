@@ -9,7 +9,7 @@ Ritornel is a music player for a collection you own: a server, `ritornel-server`
 - `mise run check` runs everything CI runs.
 - `mise run test` runs the tests. Some run `ritornelctl` against `ritornel-server` and take the server from the whole workspace's build, which `cargo test --package` alone does not rebuild.
 - `mise run schema` writes `schema/` again after a migration is added, and `mise run contract` writes `contract/contract.ts` again after a call or a wire type changes. A test fails when either is out of date.
-- `mise run desktop:run` runs the desktop app on an invented library. `scripts/desktop.sh tones` runs it on a small one that plays. On Windows, `scripts/desktop.ps1 run`, `tones` and `app` do the same, building the server too.
+- `mise run desktop:run` runs the desktop app on an invented library. `scripts/desktop.sh tones` runs it on a small one that plays. On Windows, use PowerShell 7 or later. `pwsh -File scripts/desktop.ps1 run`, `tones` and `app` do the same, building the server too.
 
 ## Good to know
 

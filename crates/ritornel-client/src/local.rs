@@ -166,6 +166,11 @@ pub struct LocalServer {
 }
 
 impl LocalServer {
+    /// The process that held the directory lock when this server was found.
+    pub fn pid(&self) -> u32 {
+        self.named.pid
+    }
+
     /// Opens a connection with the local credential. The first call must
     /// then be [`Client::hello`].
     ///
