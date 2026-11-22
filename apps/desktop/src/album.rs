@@ -96,6 +96,13 @@ pub(crate) struct Album {
     pub small: Option<Arc<RenderImage>>,
     large: Option<(Arc<RenderImage>, Instant)>,
     face: Option<Arc<RenderImage>>,
+    /// The display's scale the large cover and the face were read for: on
+    /// another display they are read again, sharp there.
+    pictured_scale: f32,
+    /// The last read of the large cover and of the face asked for: an
+    /// earlier one coming late, for another display, is let go.
+    large_read: u64,
+    face_read: u64,
     /// The cover blurred for the wash, and for the banner.
     pub blur: Option<(Arc<RenderImage>, Instant)>,
     banner_blur: Option<(Arc<RenderImage>, Instant)>,
@@ -160,6 +167,9 @@ impl Album {
             small,
             large: None,
             face: None,
+            pictured_scale: 0.,
+            large_read: 0,
+            face_read: 0,
             blur: None,
             banner_blur: None,
             top: 0.,
@@ -357,21 +367,8 @@ impl Album {
         }
     }
 
-    /// Reads a cover at `px` pixels, and gives it to `took`.
-    fn fetch(
-        &mut self,
-        art: Id,
-        px: u32,
-        cx: &mut Context<Self>,
-        took: impl FnOnce(&mut Self, Arc<RenderImage>) + 'static,
-    ) {
-        self.fetch_opt(art, px, cx, move |page, image, _| {
-            if let Some(image) = image {
-                took(page, image);
-            }
-        });
-    }
-
+    /// Reads a cover at `px` pixels, and gives it to `took`, or `None`
+    /// when it cannot be read.
     fn fetch_opt(
         &mut self,
         art: Id,
@@ -405,22 +402,18 @@ impl Album {
     /// banner and the wash; for a record with no cover, its soft colours.
     fn pictures(&mut self, window: &Window, cx: &mut Context<Self>) {
         let scale = window.scale_factor();
+        self.pictured_scale = scale;
         let (width, viewport) = viewport_of(window);
         let banner_radius = crate::blur::radius(crate::blur::BANNER.0, width + 120.);
         let wash_radius =
             crate::blur::radius(crate::blur::WASH.0, width.max(viewport + 128.) + 180.);
         let Some(art) = self.row.art else {
-            self.soft_pictures(banner_radius, wash_radius, scale);
+            self.soft_pictures(banner_radius, wash_radius, None, cx);
             return;
         };
         let room = width - crate::upnext::rail(cx);
         let side = album_columns(content_width(room)).cover as f32;
-        self.fetch(art, (side * scale).ceil() as u32, cx, |page, image| {
-            page.large = Some((image, Instant::now()));
-        });
-        self.fetch(art, (28. * scale).ceil() as u32, cx, |page, image| {
-            page.face = Some(image);
-        });
+        self.sharp_pictures(art, side, scale, cx);
         let http = Arc::clone(&self.net.art);
         let tone = crate::blur::wash_tone(theme::dark());
         let blurs = self.net.rt().spawn(async move {
@@ -446,7 +439,7 @@ impl Album {
                     // A cover the server cannot make (one in a format it
                     // does not read) is no cover: the page takes the soft
                     // colours of a record with none, rather than no colour.
-                    None => page.soft_pictures(banner_radius, wash_radius, scale),
+                    None => page.soft_pictures(banner_radius, wash_radius, None, cx),
                 }
                 cx.notify();
             })
@@ -455,14 +448,91 @@ impl Album {
         .detach();
     }
 
-    /// For a record with no cover, the soft colours made from its title and
-    /// artist: the face, and the blurs for the banner and the wash.
-    fn soft_pictures(&mut self, banner_radius: usize, wash_radius: usize, scale: f32) {
-        let name = self
-            .row
+    /// The large cover and the face, read for the display's `scale`. Each
+    /// shown is kept until the one read for it comes, without fading in again.
+    fn sharp_pictures(&mut self, art: Id, side: f32, scale: f32, cx: &mut Context<Self>) {
+        self.large_read += 1;
+        let large_read = self.large_read;
+        self.fetch_opt(
+            art,
+            (side * scale).ceil() as u32,
+            cx,
+            move |page, image, cx| {
+                // Asked for before the last, for a display the window has
+                // left since.
+                let Some(image) = image.filter(|_| page.large_read == large_read) else {
+                    return;
+                };
+                let at = page
+                    .large
+                    .as_ref()
+                    .map_or_else(Instant::now, |large| large.1);
+                if let Some((old, _)) = page.large.replace((image, at)) {
+                    crate::covers::drop_unshared(old, None, cx);
+                }
+            },
+        );
+        self.face_read += 1;
+        let face_read = self.face_read;
+        self.fetch_opt(
+            art,
+            (28. * scale).ceil() as u32,
+            cx,
+            move |page, image, cx| {
+                let Some(image) = image.filter(|_| page.face_read == face_read) else {
+                    return;
+                };
+                if let Some(old) = page.face.replace(image) {
+                    crate::covers::drop_unshared(old, None, cx);
+                }
+            },
+        );
+    }
+
+    /// Moved to a display of another scale: the large cover and the face read
+    /// again for it. The blurs do not depend on the scale.
+    fn sharpen(&mut self, side: f32, scale: f32, window: &mut Window, cx: &mut Context<Self>) {
+        self.pictured_scale = scale;
+        // A soft face, as with no cover or one that cannot be read, is made
+        // again for it; a cover's is read again, and replaces it.
+        if self.face.as_ref().is_some_and(theme::soft_holds) {
+            self.soft_face(Some(window), cx);
+        }
+        if let Some(art) = self.row.art {
+            self.sharp_pictures(art, side, scale, cx);
+        }
+    }
+
+    /// The face of a record with no cover: its soft colours. A read of a
+    /// face still to come is let go.
+    fn soft_face(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        self.face_read += 1;
+        let face = theme::soft_cached(&self.soft_name(), (28. * self.pictured_scale).ceil() as u32);
+        if let Some(old) = self.face.replace(face) {
+            crate::covers::drop_unshared(old, window, cx);
+        }
+    }
+
+    /// What a record with no cover takes its soft colours from.
+    fn soft_name(&self) -> String {
+        self.row
             .no_cover
             .clone()
-            .unwrap_or_else(|| format!("{}{}", self.row.title, self.row.artist));
+            .unwrap_or_else(|| format!("{}{}", self.row.title, self.row.artist))
+    }
+
+    /// For a record with no cover, the soft colours made from its title and
+    /// artist: the face, and the blurs for the banner and the wash.
+    /// While the window draws, it is handed `window`, to let go of the face
+    /// this replaces.
+    fn soft_pictures(
+        &mut self,
+        banner_radius: usize,
+        wash_radius: usize,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self.soft_name();
         let soft = theme::soft_pixels(&name, crate::blur::SIDE);
         let tone = crate::blur::wash_tone(theme::dark());
         let now = Instant::now();
@@ -478,7 +548,7 @@ impl Album {
             Arc::new(crate::blur::toned(&soft, wash_radius, tone.0, tone.1)),
             now,
         ));
-        self.face = Some(theme::soft_cached(&name, (28. * scale).ceil() as u32));
+        self.soft_face(window, cx);
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -871,6 +941,9 @@ impl Render for Album {
         let content = content_width(width - rail);
         let AlbumColumns { beside, cover } = album_columns(content);
         let side = cover as f32;
+        if self.pictured_scale != window.scale_factor() {
+            self.sharpen(side, window.scale_factor(), window, cx);
+        }
         let max = (self.height.get() - viewport).max(0.);
         self.menued = crate::menu::marked(window, cx);
         if self.bring

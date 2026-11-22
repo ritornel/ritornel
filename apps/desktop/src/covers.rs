@@ -382,6 +382,11 @@ pub(crate) fn drop_unshared(
     window: Option<&mut gpui::Window>,
     cx: &mut App,
 ) {
+    // The soft-colour cache lets go of its own pictures (`theme::flush_soft`);
+    // held here too, neither would ever hold the last copy.
+    if crate::theme::soft_holds(&image) {
+        return;
+    }
     if Arc::strong_count(&image) == 1 {
         cx.drop_image(image, window);
     } else {
