@@ -204,8 +204,8 @@ pub(crate) struct Artist {
     /// The size its box has now, in device pixels: what is made next.
     wanted: Option<(u32, u32)>,
     /// Their picture blurred for the wash, and for the banner.
-    pub blur: Option<(Arc<RenderImage>, Instant)>,
-    banner_blur: Option<(Arc<RenderImage>, Instant)>,
+    pub blur: crate::blur::Shown,
+    banner_blur: crate::blur::Shown,
     /// The picture the page's pictures were made from, and whether it is
     /// their portrait: a portrait added or taken away can keep the picture's
     /// ID, when it is the same as a cover's.
@@ -717,7 +717,7 @@ impl Artist {
     /// With no picture, soft colour from their name: the face, and the
     /// blurs for the banner and the wash.
     /// While the window draws, it is handed `window`, to let go of the face
-    /// this replaces.
+    /// and the blurs this replaces.
     fn soft_pictures(
         &mut self,
         banner_radius: usize,

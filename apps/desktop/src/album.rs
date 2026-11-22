@@ -102,8 +102,8 @@ pub(crate) struct Album {
     large_read: u64,
     face_read: u64,
     /// The cover blurred for the wash, and for the banner.
-    pub blur: Option<(Arc<RenderImage>, Instant)>,
-    banner_blur: Option<(Arc<RenderImage>, Instant)>,
+    pub blur: crate::blur::Shown,
+    banner_blur: crate::blur::Shown,
     pub top: f32,
     /// The stretch past either end.
     elastic: crate::elastic::Elastic,
@@ -520,7 +520,7 @@ impl Album {
     /// For a record with no cover, the soft colours made from its title and
     /// artist: the face, and the blurs for the banner and the wash.
     /// While the window draws, it is handed `window`, to let go of the face
-    /// this replaces.
+    /// and the blurs this replaces.
     fn soft_pictures(
         &mut self,
         banner_radius: usize,
