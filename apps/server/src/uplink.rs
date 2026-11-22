@@ -48,6 +48,16 @@ struct Reach {
     failed_at_ms: Option<i64>,
 }
 
+/// The longest a call waits for the hub's answer. The longest call a
+/// client makes through a satellite, such as a history page, takes a
+/// fraction of this on a hub, and the satellite must say the hub is away
+/// before its own clients give up on it: `ritornelctl` waits ten seconds.
+const CALL_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The longest a connection to the hub may take on one route, the proof
+/// and the hello included. On a home network it takes milliseconds.
+const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
 /// How long after a failed try a call is answered at once, without trying
 /// again: a client that calls ten times a second while the hub is away is
 /// not kept waiting on each.
@@ -211,7 +221,11 @@ impl Uplink {
                     .map_err(|error| error.to_string())?;
                 Ok::<_, String>(client)
             };
-            match opened.await {
+            let opened = match tokio::time::timeout(CONNECT_WAIT, opened).await {
+                Ok(opened) => opened,
+                Err(_) => Err(format!("no answer in {} seconds", CONNECT_WAIT.as_secs())),
+            };
+            match opened {
                 Ok(client) => {
                     self.answered(route);
                     return Ok(client);
@@ -258,20 +272,48 @@ impl Uplink {
         let mut result = None;
         for _ in 0..2 {
             let client = self.session_client(session, false)?;
-            let sent = self
-                .runtime
-                .block_on(client.call_raw(method, params.clone()));
+            let (sent, again) = self.ask(&client, method, params.clone());
             let lost =
                 matches!(&sent, Err(error) if !matches!(error, ritornel_client::Error::Call(_)));
             result = Some(sent);
-            if !lost {
+            if lost {
+                lock(&self.sessions).remove(&session.id());
+            }
+            if !(lost && again) {
                 break;
             }
-            lock(&self.sessions).remove(&session.id());
         }
         match result {
             Some(result) => self.answer(result),
             None => Err(self.unreachable()),
+        }
+    }
+
+    /// Makes one call on a connection and waits for its answer, for at
+    /// most [`CALL_WAIT`]. A connection whose hub has gone without closing
+    /// it, as one does when the network drops, would otherwise be waited on
+    /// for good. Also says whether the call may be sent again at once on a
+    /// new connection: not after a wait that ran out, which would double it.
+    fn ask(
+        &self,
+        client: &Client,
+        method: &str,
+        params: Value,
+    ) -> (Result<Value, ritornel_client::Error>, bool) {
+        // The timer is made inside the runtime: a caller may be a thread
+        // of the server's own, outside it, such as the outbox's.
+        let asked = self.runtime.block_on(async {
+            tokio::time::timeout(CALL_WAIT, client.call_raw(method, params)).await
+        });
+        match asked {
+            Ok(answer) => (answer, true),
+            Err(_) => (
+                Err(ritornel_client::Error::Transport(format!(
+                    "no answer in {} seconds",
+                    CALL_WAIT.as_secs()
+                ))),
+                false,
+            ),
         }
     }
 
@@ -311,8 +353,8 @@ impl Uplink {
             }
         };
         if subscribe && !topics.is_empty() {
-            let subscribed = self.runtime.block_on(client.subscribe(&topics));
-            if let Err(error) = subscribed {
+            let params = serde_json::json!({ "topics": topics });
+            if let (Err(error), _) = self.ask(&client, "events.subscribe", params) {
                 warn!(%error, "the hub's events could not be subscribed to");
             }
         }
