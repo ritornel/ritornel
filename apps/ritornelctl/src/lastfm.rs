@@ -136,7 +136,7 @@ fn render_status(status: &LastfmStatus) -> String {
     server::facts(&lines)
 }
 
-fn render_summary(summary: &SyncSummary) -> String {
+pub(crate) fn render_summary(summary: &SyncSummary) -> String {
     let mut lines = vec![
         ("Read", summary.read.to_string()),
         ("New", summary.new.to_string()),
@@ -292,6 +292,7 @@ pub(crate) fn lastfm(
     command: &LastfmCommand,
     env: local::Env<'_>,
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) -> Result<(), Error> {
     match command {
         LastfmCommand::Status(args) => {
@@ -307,17 +308,21 @@ pub(crate) fn lastfm(
             )
         }
         LastfmCommand::Signin(args) => {
-            let quiet = args.json;
             let account = server::ask_for(args, env, Some(SIGN_IN_WAIT), async |client| {
                 let started = client.call::<LastfmSignInStart>(&NoParams {}).await?;
-                if !quiet {
-                    let _ = writeln!(
+                let printed = if args.json {
+                    writeln!(err, "{}", started.approval_url).and_then(|()| err.flush())
+                } else {
+                    writeln!(
                         out,
                         "Open this address, sign in to Last.fm there and allow access:\n\n  {}\n\n\
                          Waiting for Last.fm to say it is allowed…",
                         started.approval_url
                     )
-                    .and_then(|()| out.flush());
+                    .and_then(|()| out.flush())
+                };
+                if let Err(error) = printed {
+                    return Ok(Err(Error::Output(error)));
                 }
                 loop {
                     let finished = client
@@ -327,11 +332,11 @@ pub(crate) fn lastfm(
                         })
                         .await?;
                     if finished.receipt.status == ReceiptStatus::Done {
-                        return Ok(finished);
+                        return Ok(Ok(finished));
                     }
                     tokio::time::sleep(ASK_EVERY).await;
                 }
-            })?;
+            })??;
             server::print(args, out, &account, serde_json::to_string_pretty, |done| {
                 format!(
                     "Signed in to Last.fm as {}.\n",
@@ -364,36 +369,41 @@ pub(crate) fn lastfm(
         LastfmCommand::Sync(args) => {
             let (full, wait, quiet) = (args.full, !args.no_wait, args.server.json);
             let mut last = String::new();
-            let job = server::ask_for(&args.server, env, None, async |client| {
-                let mut job = client
-                    .call::<LastfmSync>(&LastfmSyncParams {
-                        idempotency_key: ritornel_client::idempotency_key()?,
-                        full,
-                    })
-                    .await?
-                    .job;
-                while wait && !job.state.ended() {
-                    tokio::time::sleep(LOOK_EVERY).await;
-                    job = client
-                        .call::<JobsGet>(&JobGetParams { job_id: job.job_id })
+            let job = server::ask_for(
+                &args.server,
+                env,
+                args.no_wait.then_some(server::ANSWER_WAIT),
+                async |client| {
+                    let mut job = client
+                        .call::<LastfmSync>(&LastfmSyncParams {
+                            idempotency_key: ritornel_client::idempotency_key()?,
+                            full,
+                        })
                         .await?
                         .job;
-                    let total = job
-                        .total
-                        .map_or_else(|| "?".to_owned(), |total| total.to_string());
-                    let line = format!(
-                        "{}: {} of {total} read  {}\n",
-                        job.state.as_str(),
-                        job.done,
-                        job.label.as_deref().unwrap_or("")
-                    );
-                    if !quiet && line != last {
-                        let _ = out.write_all(line.as_bytes()).and_then(|()| out.flush());
-                        last = line;
+                    while wait && !job.state.ended() {
+                        tokio::time::sleep(LOOK_EVERY).await;
+                        job = client
+                            .call::<JobsGet>(&JobGetParams { job_id: job.job_id })
+                            .await?
+                            .job;
+                        let total = job
+                            .total
+                            .map_or_else(|| "?".to_owned(), |total| total.to_string());
+                        let line = format!(
+                            "{}: {} of {total} read  {}\n",
+                            job.state.as_str(),
+                            job.done,
+                            job.label.as_deref().unwrap_or("")
+                        );
+                        if !quiet && line != last {
+                            let _ = out.write_all(line.as_bytes()).and_then(|()| out.flush());
+                            last = line;
+                        }
                     }
-                }
-                Ok(job)
-            })?;
+                    Ok(job)
+                },
+            )?;
             server::print(
                 &args.server,
                 out,

@@ -14,7 +14,7 @@ use crate::cli::{Error, ServerArgs};
 
 /// How long a whole command may take. A server on this machine answers in
 /// milliseconds.
-const ANSWER_WAIT: Duration = Duration::from_secs(10);
+pub(crate) const ANSWER_WAIT: Duration = Duration::from_secs(10);
 
 /// Finds the server the arguments name, says hello, and makes one call.
 pub(crate) fn ask<T>(

@@ -71,29 +71,36 @@ pub(crate) fn scan(args: &ScanArgs, env: local::Env<'_>, out: &mut dyn Write) ->
             .to_owned(),
     };
     let quiet = args.server.json;
-    let wait = (!args.no_wait).then_some(());
     let mut last = String::new();
-    let detail = server::ask_for(&args.server, env, None, async |client| {
-        let job = start(client, path, &name).await?;
-        let mut detail = JobDetail {
-            job,
-            failed_items: Vec::new(),
-        };
-        while wait.is_some() {
-            detail = client.job(detail.job.job_id).await?;
-            let line = progress(&detail.job);
-            if !quiet && line != last {
-                // Nothing useful can be done if the terminal is gone.
-                let _ = out.write_all(line.as_bytes()).and_then(|()| out.flush());
-                last = line;
+    let detail = server::ask_for(
+        &args.server,
+        env,
+        args.no_wait.then_some(server::ANSWER_WAIT),
+        async |client| {
+            let job = start(client, path, &name).await?;
+            let mut detail = JobDetail {
+                job,
+                failed_items: Vec::new(),
+            };
+            if args.no_wait {
+                return Ok(detail);
             }
-            if detail.job.state.ended() {
-                break;
+            loop {
+                detail = client.job(detail.job.job_id).await?;
+                let line = progress(&detail.job);
+                if !quiet && line != last {
+                    // Nothing useful can be done if the terminal is gone.
+                    let _ = out.write_all(line.as_bytes()).and_then(|()| out.flush());
+                    last = line;
+                }
+                if detail.job.state.ended() {
+                    break;
+                }
+                tokio::time::sleep(LOOK_EVERY).await;
             }
-            tokio::time::sleep(LOOK_EVERY).await;
-        }
-        Ok(detail)
-    })?;
+            Ok(detail)
+        },
+    )?;
     server::print(
         &args.server,
         out,

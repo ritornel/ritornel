@@ -197,41 +197,39 @@ fn target(args: &PlayArgs) -> Result<Target, Error> {
 }
 
 pub(crate) fn play(args: &PlayArgs, env: local::Env<'_>, out: &mut dyn Write) -> Result<(), Error> {
-    let (source, context) = match target(args)? {
-        Target::Tracks(ids) => (PlaySource::Tracks { ids }, None),
-        Target::Release(id) => (PlaySource::Release { id }, None),
-        Target::Folder(path) => {
-            let found = server::ask(&args.server, env, async |client| {
-                client
-                    .call::<SourcesTracks>(&SourcesTracksParams { path })
-                    .await
-            })?;
-            if found.tracks.is_empty() {
-                return Err(Error::Nothing(
-                    "nothing there is a track the library knows: scan the folder first",
-                ));
-            }
-            // A folder that is one album is played as that album.
-            let releases: std::collections::BTreeSet<Option<Id>> =
-                found.tracks.iter().map(|track| track.release_id).collect();
-            let context = match releases.into_iter().collect::<Vec<_>>().as_slice() {
-                [Some(release)] => Some(PlayContext {
-                    kind: ContextKind::Album,
-                    reference: Some(*release),
-                }),
-                _ => None,
-            };
-            let ids = found
-                .tracks
-                .iter()
-                .map(|track| track.appearance_id)
-                .collect();
-            (PlaySource::Tracks { ids }, context)
-        }
-    };
-    let start = args.start.map(|start| start.saturating_sub(1));
+    let target = target(args)?;
+    let start = args.start.map(|start| start - 1);
     let (follow, quiet) = (args.follow, args.server.json);
-    let state = server::ask_for(&args.server, env, None, async |client| {
+    let limit = (!follow).then_some(server::ANSWER_WAIT);
+    let state = server::ask_for(&args.server, env, limit, async |client| {
+        let (source, context) = match target {
+            Target::Tracks(ids) => (PlaySource::Tracks { ids }, None),
+            Target::Release(id) => (PlaySource::Release { id }, None),
+            Target::Folder(path) => {
+                let found = client
+                    .call::<SourcesTracks>(&SourcesTracksParams { path })
+                    .await?;
+                if found.tracks.is_empty() {
+                    return Ok(None);
+                }
+                // A folder that is one album is played as that album.
+                let releases: std::collections::BTreeSet<Option<Id>> =
+                    found.tracks.iter().map(|track| track.release_id).collect();
+                let context = match releases.into_iter().collect::<Vec<_>>().as_slice() {
+                    [Some(release)] => Some(PlayContext {
+                        kind: ContextKind::Album,
+                        reference: Some(*release),
+                    }),
+                    _ => None,
+                };
+                let ids = found
+                    .tracks
+                    .iter()
+                    .map(|track| track.appearance_id)
+                    .collect();
+                (PlaySource::Tracks { ids }, context)
+            }
+        };
         client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
                 idempotency_key: key()?,
@@ -243,7 +241,7 @@ pub(crate) fn play(args: &PlayArgs, env: local::Env<'_>, out: &mut dyn Write) ->
             .await?;
         let mut now = state(client).await?;
         if !follow {
-            return Ok(now);
+            return Ok(Some(now));
         }
         let mut seen: Option<Id> = None;
         loop {
@@ -258,12 +256,15 @@ pub(crate) fn play(args: &PlayArgs, env: local::Env<'_>, out: &mut dyn Write) ->
                 }
             }
             if now.status == PlaybackStatus::Stopped {
-                return Ok(now);
+                return Ok(Some(now));
             }
             tokio::time::sleep(LOOK_EVERY).await;
             now = state(client).await?;
         }
-    })?;
+    })?
+    .ok_or(Error::Nothing(
+        "nothing there is a track the library knows: scan the folder first",
+    ))?;
     server::print(
         &args.server,
         out,
@@ -319,13 +320,17 @@ pub(crate) fn skip(
 
 /// A position: seconds, or minutes and seconds as `m:ss`.
 fn position(text: &str) -> Option<u64> {
-    match text.split_once(':') {
+    let seconds = match text.split_once(':') {
         Some((minutes, seconds)) => {
             let (minutes, seconds): (u64, u64) = (minutes.parse().ok()?, seconds.parse().ok()?);
-            (seconds < 60).then_some((minutes * 60 + seconds) * 1000)
+            if seconds >= 60 {
+                return None;
+            }
+            minutes.checked_mul(60)?.checked_add(seconds)?
         }
-        None => text.parse::<u64>().ok().map(|seconds| seconds * 1000),
-    }
+        None => text.parse::<u64>().ok()?,
+    };
+    seconds.checked_mul(1000)
 }
 
 pub(crate) fn seek(args: &SeekArgs, env: local::Env<'_>, out: &mut dyn Write) -> Result<(), Error> {
@@ -452,6 +457,10 @@ mod tests {
         assert_eq!(position("0:05"), Some(5_000));
         assert_eq!(position("1:75"), None);
         assert_eq!(position("soon"), None);
+        assert_eq!(position(&u64::MAX.to_string()), None);
+        assert_eq!(position(&format!("{}:30", u64::MAX)), None);
+        let last = u64::MAX / 1000;
+        assert_eq!(position(&last.to_string()), Some(last * 1000));
         assert_eq!(clock(272_500), "4:32");
     }
 }

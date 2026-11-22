@@ -95,8 +95,14 @@ pub(crate) fn render(detail: &JobDetail) -> String {
         let tenths = (finished - started).max(0) / 100;
         lines.push(("Took", format!("{}.{} s", tenths / 10, tenths % 10)));
     }
-    lines.push(("Files read", counted(job)));
-    lines.push(("Bytes read", size(job.bytes)));
+    if job.kind == "lastfm.sync" {
+        if job.sync.is_none() {
+            lines.push(("Scrobbles read", counted(job)));
+        }
+    } else {
+        lines.push(("Files read", counted(job)));
+        lines.push(("Bytes read", size(job.bytes)));
+    }
     if let Some(scan) = &job.scan {
         lines.extend([
             ("Files found", scan.files.to_string()),
@@ -114,6 +120,9 @@ pub(crate) fn render(detail: &JobDetail) -> String {
         ]);
     }
     let mut text = server::facts(&lines);
+    if let Some(summary) = &job.sync {
+        text.push_str(&crate::lastfm::render_summary(summary));
+    }
     if !detail.failed_items.is_empty() {
         text.push_str("\nCould not be read:\n");
         for item in &detail.failed_items {
@@ -128,6 +137,41 @@ pub(crate) mod tests {
     use ritornel_client::contract::{JobItem, JobState, JobTarget, ScanSummary};
 
     use super::*;
+
+    #[test]
+    fn a_sync_job_reports_its_scrobbles() {
+        let mut job = job();
+        job.kind = "lastfm.sync".into();
+        job.scan = None;
+        let running = render(&JobDetail {
+            job: Job {
+                state: JobState::Running,
+                ..job.clone()
+            },
+            failed_items: vec![],
+        });
+        assert!(
+            running.contains("Scrobbles read") && running.contains("1500 of 14000"),
+            "{running}"
+        );
+        job.sync = Some(ritornel_client::contract::SyncSummary {
+            read: 12,
+            new: 3,
+            ..Default::default()
+        });
+        let text = render(&JobDetail {
+            job,
+            failed_items: vec![],
+        });
+        assert!(
+            !text.contains("Scrobbles read") && !text.contains("Bytes read"),
+            "{text}"
+        );
+        assert!(
+            text.contains("12") && text.contains("New") && !text.contains("Files read"),
+            "{text}"
+        );
+    }
 
     /// A scan that has ended, as the server reports it.
     pub(crate) fn job() -> Job {
