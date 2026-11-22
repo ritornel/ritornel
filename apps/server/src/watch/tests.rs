@@ -674,13 +674,19 @@ fn a_server_that_is_not_the_hub_watches_nothing() {
 fn watching_turned_off_stops_and_a_run_that_does_not_watch_says_so() {
     let rig = Rig::new();
     assert_eq!(rig.core.watch_off(), None);
-    rig.core.set_watching(false).unwrap();
+    rig.core
+        .with_stores(|stores| rig.core.set_watching(stores, false))
+        .unwrap()
+        .unwrap();
     assert_eq!(
         rig.core.watch_off().as_deref(),
         Some("watching is turned off")
     );
     assert_eq!(rig.status()["on"], false);
-    rig.core.set_watching(true).unwrap();
+    rig.core
+        .with_stores(|stores| rig.core.set_watching(stores, true))
+        .unwrap()
+        .unwrap();
     assert_eq!(rig.core.watch_off(), None);
 }
 

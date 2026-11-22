@@ -1756,4 +1756,46 @@ mod tests {
         // Closing twice is fine.
         core.close_store().unwrap();
     }
+
+    #[test]
+    fn turning_watching_off_while_the_server_stops_does_not_hang() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // Leaked, so that a call that hangs does not hold the test up.
+        let (core, scratch) = core();
+        let core: &'static Core = Box::leak(Box::new(core));
+        Box::leak(Box::new(scratch));
+        let session = greeted(core, SessionKind::Full);
+        let (reading, read) = mpsc::channel();
+        let (go, gone) = mpsc::channel::<()>();
+        let (done, answered) = mpsc::channel();
+        std::thread::spawn(move || {
+            // A call holds the databases for as long as it runs, as
+            // `dispatch` does.
+            let stores = core.stores.read().unwrap();
+            reading.send(()).unwrap();
+            gone.recv().unwrap();
+            let params = ritornel_contract::WatchingParams {
+                idempotency_key: Id::from_bytes([0xd0; 16]),
+                on: false,
+            };
+            let set = core.library_set_watching(stores.as_ref().unwrap(), &params);
+            done.send(set.is_ok()).unwrap();
+        });
+        read.recv().unwrap();
+        // The server stops while the call is running: closing waits for it,
+        // and a new read waits behind the close.
+        std::thread::spawn(move || core.close_store());
+        let queued = std::time::Instant::now();
+        while core.stores.try_read().is_ok() {
+            assert!(
+                queued.elapsed() < Duration::from_secs(5),
+                "the close never waited"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        go.send(()).unwrap();
+        assert_eq!(answered.recv_timeout(Duration::from_secs(5)), Ok(true));
+        drop(session);
+    }
 }
