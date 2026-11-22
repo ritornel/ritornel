@@ -27,9 +27,9 @@ pub(super) enum Route {
     Refused(&'static str),
 }
 
-/// Where `method` is answered on a satellite. See decision 10 in
-/// docs/design/linking.md: library calls go to the hub; playback, output
-/// and pairing are local.
+/// Where `method` is answered on a satellite: library calls go to the
+/// hub; playback, output and pairing are local. See "Hub and satellites"
+/// in docs/internals/linking.md.
 pub(super) fn on_a_satellite(method: &str) -> Route {
     const FOLDERS: &str = "the library's folders are on its hub's machine: do this on the hub";
     match method {

@@ -1,7 +1,7 @@
 //! A satellite's link to its hub, while it runs: how it reaches the hub,
 //! the connections it holds there, and what it knows of whether the hub
-//! answers. See "The link between the hub and a satellite" and "When the
-//! hub is unreachable" in docs/design/linking.md.
+//! answers. See "Hub and satellites" in docs/internals/linking.md and
+//! "Satellites" in docs/internals/contract.md.
 //!
 //! Each client session that makes a library call gets a connection of its
 //! own to the hub, opened on its first such call and closed with it. Its

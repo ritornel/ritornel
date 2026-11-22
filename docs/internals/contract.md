@@ -41,6 +41,12 @@ A hub links a satellite with a one-time invite (`link.invite`): an `InviteLink` 
 
 A link session is a `full` session that knows its satellite (`Session::peer`). It authenticates on the socket upgrade with the bearer token, never with a ticket, and the hub refuses it the calls that name the hub's own folders, backups and links (`kept_from_a_link`). A satellite joining again closes the sockets of its previous session.
 
+### Satellites
+
+A satellite (`apps/server/src/uplink.rs`) answers its own status, events, player and queue, link and backups, and forwards every other call to its hub unchanged, on a hub connection of the client session's own, with the client's request IDs. That connection is opened on the session's first forwarded call or subscription, subscribed to the hub's `library` and `jobs` topics the session holds, and closed with the session; the hub's `library`, `list` and `jobs` events on it go to that session alone. Calls that name the hub's folders are refused with `unsupported` and the reason `on_the_hub`. Covers are fetched from the hub with the link session, on the route where the hub last proved its key, and kept in the satellite's cover cache.
+
+Each connection walks the hub's routes in order (at most eight), checking the descriptor `proof` before presenting the link session. A connection gets four seconds a route and a call eight; a lost connection is replaced once at once, but not after a wait ran out. While the hub does not answer, a forwarded call fails with `unavailable`, reason `hub_unreachable`, the hub's name and `sinceMs`, and for two seconds after a failed try without trying again. `server.status` on a satellite reports the hub's library ID as its `library` and a `hub` (`HubStatus`) with `answers`, `sinceMs`, `route` and `problem`. A satellite says hello to its hub with `ClientKind::Server`.
+
 ### Transport-neutral dispatcher
 
 `Core::dispatch` takes a decoded `Frame` and a `Session` and returns an `Option<Frame>` without knowing anything about sockets. Both the WebSocket transport (`listener.rs`) and the in-memory test transport (`apps/server/src/memory.rs`) run through `Core::receive`, enforcing `MAX_MESSAGE_BYTES` (1 MiB) and full JSON text encoding/decoding (`Frame::encode` / `Frame::decode`). Production clients always connect over HTTP/WebSocket; the in-memory channel is used only by tests.
