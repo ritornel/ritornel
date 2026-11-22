@@ -539,7 +539,7 @@ impl Artist {
         let scale = window.scale_factor();
         if self.pictured_for == Some((art, wants_portrait)) {
             if self.pictured_scale != scale {
-                self.sharpen(art, scale, cx);
+                self.sharpen(art, scale, window, cx);
             }
             return;
         }
@@ -553,7 +553,7 @@ impl Artist {
         let wash_radius =
             crate::blur::radius(crate::blur::WASH.0, width.max(viewport + 128.) + 180.);
         let Some(art) = art else {
-            self.soft_pictures(banner_radius, wash_radius, cx);
+            self.soft_pictures(banner_radius, wash_radius, Some(window), cx);
             return;
         };
         self.read_face(art, scale, cx);
@@ -574,6 +574,10 @@ impl Artist {
         cx.spawn(async move |this, cx| {
             let blurs = blurs.await.ok().flatten();
             this.update(cx, |page, cx| {
+                // Too late: the page shows another picture now.
+                if page.pictured_for.map(|(at, _)| at) != Some(Some(art)) {
+                    return;
+                }
                 match blurs {
                     Some((banner, wash)) => {
                         let now = Instant::now();
@@ -583,7 +587,7 @@ impl Artist {
                     // A picture the server cannot make (one in a format it
                     // does not read) is no picture: the page takes its
                     // colour from their name, rather than no colour.
-                    None => page.soft_pictures(banner_radius, wash_radius, cx),
+                    None => page.soft_pictures(banner_radius, wash_radius, None, cx),
                 }
                 cx.notify();
             })
@@ -595,13 +599,21 @@ impl Artist {
     /// Moved to a display of another scale: the face read again for it, and
     /// the portrait when the server has it larger. Each shown is kept until
     /// its sharper one comes; the blurs do not depend on the scale.
-    fn sharpen(&mut self, art: Option<Id>, scale: f32, cx: &mut Context<Self>) {
+    fn sharpen(
+        &mut self,
+        art: Option<Id>,
+        scale: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let before = self.pictured_scale;
         self.pictured_scale = scale;
-        let Some(art) = art else {
-            self.soft_face(cx);
-            return;
-        };
+        // A soft face, as with no picture or one that cannot be read, is
+        // made again for it; a picture's is read again, and replaces it.
+        if self.face.as_ref().is_some_and(theme::soft_holds) {
+            self.soft_face(Some(window), cx);
+        }
+        let Some(art) = art else { return };
         self.read_face(art, scale, cx);
         let portrait_px = |scale: f32| self.net.bucket((2. * 380. * scale).ceil() as u32);
         if !self.picture_failed && portrait_px(before) != portrait_px(scale) {
@@ -611,11 +623,11 @@ impl Artist {
 
     /// The face that stands in for a picture: soft colour from their name.
     /// A read of a face still to come is let go.
-    fn soft_face(&mut self, cx: &mut Context<Self>) {
+    fn soft_face(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.face_read += 1;
         let face = theme::soft_cached(&self.name, (28. * self.pictured_scale).ceil() as u32);
         if let Some(old) = self.face.replace(face) {
-            crate::covers::drop_unshared(old, None, cx);
+            crate::covers::drop_unshared(old, window, cx);
         }
     }
 
@@ -695,7 +707,15 @@ impl Artist {
 
     /// With no picture, soft colour from their name: the face, and the
     /// blurs for the banner and the wash.
-    fn soft_pictures(&mut self, banner_radius: usize, wash_radius: usize, cx: &mut Context<Self>) {
+    /// While the window draws, it is handed `window`, to let go of the face
+    /// this replaces.
+    fn soft_pictures(
+        &mut self,
+        banner_radius: usize,
+        wash_radius: usize,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         let soft = theme::soft_pixels(&self.name, crate::blur::SIDE);
         let tone = crate::blur::wash_tone(theme::dark());
         let now = Instant::now();
@@ -711,7 +731,7 @@ impl Artist {
             Arc::new(crate::blur::toned(&soft, wash_radius, tone.0, tone.1)),
             now,
         ));
-        self.soft_face(cx);
+        self.soft_face(window, cx);
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
