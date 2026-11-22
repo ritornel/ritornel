@@ -48,10 +48,6 @@ server.db and library.db are whole SQLite databases, each a consistent copy
 of the database as it was when the backup began. backup.json says when it
 was taken, why, and what each file is.
 
-A server started on this library scrobbles nothing to Last.fm until it has
-imported from there, which it does by itself: Last.fm may already have
-plays sent after the backup was taken.
-
 To restore it, stop the server, and put server.db, library.db and, if it is
 here, config.toml into an empty data directory: on a Mac
 ~/Library/Application Support/Ritornel unless you chose another. Then start
@@ -60,6 +56,15 @@ library names the server that may write it, and that server is the one in
 server.db.
 
 To look inside without changing anything: sqlite3 -readonly library.db
+";
+
+/// What the README adds when the library copied had plays waiting to be
+/// sent to Last.fm.
+const HELD: &str = "
+This library had plays waiting to be sent to Last.fm. A server started on
+it scrobbles nothing to Last.fm until it has imported from there, which it
+does by itself: Last.fm may already have taken some of them after the
+backup was taken.
 ";
 
 /// A backup that could not be taken.
@@ -420,6 +425,7 @@ fn fill(
     about: About,
 ) -> Result<(), BackupError> {
     let mut files = Vec::new();
+    let mut held = false;
     for (name, source) in [
         ("server.db", dir.server_db()),
         ("library.db", dir.library_db()),
@@ -446,7 +452,7 @@ fn fill(
         copy_database(&source, &copy).map_err(|error| BackupError::Copy(name, error))?;
         if name == "library.db" {
             // Put back, it holds plays Last.fm may have taken since.
-            hold_sending(&copy, at_ms).map_err(|error| BackupError::Copy(name, error))?;
+            held = hold_sending(&copy, at_ms).map_err(|error| BackupError::Copy(name, error))?;
         }
         // SQLite makes a file anyone may read, and server.db holds this
         // server's signing key.
@@ -476,7 +482,12 @@ fn fill(
     });
     let text = serde_json::to_string_pretty(&manifest).unwrap_or_default();
     write_synced(&into.join("backup.json"), text.as_bytes())?;
-    write_synced(&into.join("README.txt"), README.as_bytes())
+    let readme = if held {
+        format!("{README}{HELD}")
+    } else {
+        README.to_owned()
+    };
+    write_synced(&into.join("README.txt"), readme.as_bytes())
 }
 
 /// Whether there is a file with something in it at `path`. One whose
@@ -626,10 +637,8 @@ mod tests {
             None
         );
         let readme = std::fs::read_to_string(taken.path.join("README.txt")).unwrap();
-        assert!(
-            readme.contains("scrobbles nothing to Last.fm until"),
-            "{readme}"
-        );
+        // Nor does its README say scrobbling waits.
+        assert!(!readme.contains("scrobbles nothing"), "{readme}");
     }
 
     #[test]
