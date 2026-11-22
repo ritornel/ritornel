@@ -124,13 +124,34 @@ impl ServerStore {
         })
     }
 
-    /// The last dismissal of the scrobbles that ended unknown or
-    /// withdrawn: none that ended by its revision count against the record.
+    /// Since when the service has refused this server's session, while it
+    /// does: nothing is scrobbled until a new sign-in.
+    pub fn session_refused(&self, service: &str) -> Result<Option<i64>, Error> {
+        let service = service.to_owned();
+        self.read(move |connection| {
+            let refused: Option<(bool, Option<String>)> = connection
+                .query_row(
+                    "SELECT s.sign_in_again, t.value_json FROM service_session s
+                     LEFT JOIN server_setting t ON t.key = s.service || '.refused_at_ms'
+                     WHERE s.service = ?1",
+                    [&service],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            Ok(match refused {
+                Some((true, at)) => Some(at.and_then(|at| at.parse().ok()).unwrap_or(0)),
+                _ => None,
+            })
+        })
+    }
+
+    /// The last dismissal of the scrobbles that ended unknown,
+    /// withdrawn or refused: none that ended by its revision count against the record.
     pub fn record_dismissal(&self) -> Result<Option<Dismissal>, Error> {
         self.read(|connection| Ok(held_dismissal(connection)?.map(|held| held.dismissal())))
     }
 
-    /// Sets aside every scrobble that ended unknown or withdrawn by the
+    /// Sets aside every scrobble that ended unknown, withdrawn or refused by the
     /// library revision of `dismissal`, and answers the dismissal in force.
     /// A command already seen changes nothing, so a client that sends one
     /// again for want of an answer, however late, hides nothing that ended
@@ -389,6 +410,38 @@ mod tests {
                 .map(|failing| (failing.since_ms, failing.count)),
             Some((4_000, 1))
         );
+    }
+
+    #[test]
+    fn a_refused_session_is_said_from_when_it_was_first_refused_until_a_new_sign_in() {
+        let store = store();
+        assert_eq!(store.session_refused("lastfm").unwrap(), None);
+        let save = || {
+            store
+                .save_service_session(
+                    "lastfm",
+                    crate::Id::from_bytes([7; 16]),
+                    "someone",
+                    &crate::ServiceKey::new("invented"),
+                    false,
+                )
+                .unwrap();
+        };
+        save();
+        assert_eq!(store.session_refused("lastfm").unwrap(), None);
+        store.refuse_service_session("lastfm").unwrap();
+        assert_eq!(
+            store.session_refused("lastfm").unwrap(),
+            Some(1_794_776_400_000)
+        );
+        // Refused again, it is still since the first time.
+        store.refuse_service_session("lastfm").unwrap();
+        assert_eq!(
+            store.session_refused("lastfm").unwrap(),
+            Some(1_794_776_400_000)
+        );
+        save();
+        assert_eq!(store.session_refused("lastfm").unwrap(), None);
     }
 
     #[test]

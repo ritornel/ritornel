@@ -130,6 +130,22 @@ impl Core {
             imports,
             false,
         );
+        add(
+            &mut problems,
+            &mut unread,
+            RecordProblemKind::SignInNeeded,
+            server
+                .session_refused(SERVICE)
+                .map(|since| {
+                    since.map(|since_ms| Failing {
+                        since_ms,
+                        count: 1,
+                        detail: None,
+                    })
+                })
+                .map_err(text),
+            false,
+        );
         let library = stores
             .library
             .read()
@@ -224,7 +240,7 @@ impl Core {
                 .map_err(super::failed)?;
             info!(
                 revision,
-                "the scrobbles that ended unknown or withdrawn so far are dismissed"
+                "the scrobbles that ended unknown, withdrawn or refused so far are dismissed"
             );
         }
         Ok(Dismissed {

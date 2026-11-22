@@ -1809,6 +1809,14 @@ fn scrobbles_refused_with_their_request_count_until_the_account_takes_one_again(
         (refused.count, refused.detail.as_deref()),
         (1, Some("Invalid API key"))
     );
+    // Dismissed: set aside.
+    assert_eq!(
+        at.library
+            .lost_scrobbles(at.library.meta().unwrap().revision, Some("someone"))
+            .unwrap()
+            .refused,
+        None
+    );
     // Not the signed-in account's, or none signed in: nothing to put right.
     for signed_in in [Some("someone else"), None] {
         assert_eq!(

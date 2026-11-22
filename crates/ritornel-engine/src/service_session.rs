@@ -141,14 +141,23 @@ impl ServerStore {
         self.service_session(service)
     }
 
-    /// Records that the service refused the session.
+    /// Records that the service refused the session, and when it first
+    /// did, for the record's sign to say.
     pub fn refuse_service_session(&self, service: &str) -> Result<(), Error> {
         let service = service.to_owned();
-        self.transact(move |transaction, _, _| {
-            transaction.execute(
-                "UPDATE service_session SET sign_in_again = 1 WHERE service = ?1",
-                [service],
+        self.transact(move |transaction, now_ms, _| {
+            let refused = transaction.execute(
+                "UPDATE service_session SET sign_in_again = 1
+                 WHERE service = ?1 AND sign_in_again = 0",
+                [&service],
             )?;
+            if refused > 0 {
+                transaction.execute(
+                    "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+                    (format!("{service}.refused_at_ms"), now_ms.to_string()),
+                )?;
+            }
             Ok(())
         })
     }

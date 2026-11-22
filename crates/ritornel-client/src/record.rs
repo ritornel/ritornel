@@ -33,6 +33,7 @@ pub fn what(problem: &RecordProblem) -> String {
             many("scrobble wasn’t", "scrobbles weren’t")
         ),
         RecordProblemKind::ScrobblesRefused => "Last.fm is refusing scrobbles".to_owned(),
+        RecordProblemKind::SignInNeeded => "Last.fm needs you to sign in again".to_owned(),
         RecordProblemKind::ImportFailed if n == 1 => "Importing from Last.fm failed".to_owned(),
         RecordProblemKind::ImportFailed => {
             format!(
@@ -67,15 +68,18 @@ pub fn what_to_do(kind: RecordProblemKind, dismiss: &str) -> String {
              they could be sent. They stay in your history here. {dismiss} sets them aside."
         ),
         RecordProblemKind::ScrobblesRefused => format!(
-            "Check the API key and secret in lastfm.env in Ritornel’s data folder, then restart \
-             the server; or sign in to Last.fm again, in Settings → Last.fm or with `ritornelctl \
-             lastfm signin`. Refused scrobbles aren’t sent again; once it’s fixed, {dismiss} sets \
-             them aside."
+            "Check the API key and secret Ritornel uses, in lastfm.env in its data folder, then \
+             restart the server. It clears by itself once Last.fm takes a scrobble again. \
+             Refused scrobbles aren’t sent again; {dismiss} sets them aside."
         ),
+        RecordProblemKind::SignInNeeded => "Last.fm no longer accepts Ritornel’s sign-in, so \
+             nothing is scrobbled. Sign in again, in Settings → Last.fm or with `ritornelctl \
+             lastfm signin`, then turn scrobbling back on. Plays from before then stay in your \
+             history here."
+            .to_owned(),
         RecordProblemKind::ImportFailed => "Ritornel tries again at the next import. If it \
              keeps failing, check the internet connection, and the API key and secret in \
-             lastfm.env (then restart the server); or sign in to Last.fm again, in Settings → \
-             Last.fm or with `ritornelctl lastfm signin`."
+             lastfm.env in Ritornel’s data folder, then restart the server."
             .to_owned(),
         RecordProblemKind::Unreadable => "Check that the disk Ritornel’s data is on is \
              connected and has free space, then restart the server."
@@ -130,7 +134,7 @@ mod tests {
     fn what_to_do_names_this_clients_way_to_dismiss() {
         assert!(
             what_to_do(RecordProblemKind::ScrobblesRefused, "Dismiss")
-                .ends_with("once it’s fixed, Dismiss sets them aside.")
+                .ends_with("aren’t sent again; Dismiss sets them aside.")
         );
         assert!(
             what_to_do(

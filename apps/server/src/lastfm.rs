@@ -927,8 +927,12 @@ mod enabled {
                                 true,
                             )
                         }
+                        // Last.fm refuses the request itself: every batch
+                        // would be, so nothing more goes for a while.
                         Unsent::Refused(detail) => {
-                            (Box::new(move || Settled::Refused(detail.clone())), false)
+                            warn!("Last.fm refused the request: nothing is scrobbled for an hour");
+                            (sending.pause_until)(now + DAILY_LIMIT_RETRY_MS);
+                            (Box::new(move || Settled::Refused(detail.clone())), true)
                         }
                         Unsent::Unknown(detail) => {
                             (Box::new(move || Settled::Unknown(detail.clone())), false)
@@ -1126,6 +1130,28 @@ mod enabled {
             now.set(1_000 + DAILY_LIMIT_RETRY_MS);
             send_due(&sending);
             assert_eq!(sent.get(), 2);
+        }
+
+        #[test]
+        fn a_request_refused_whole_stops_the_sending_and_pauses_it() {
+            let sent = Cell::new(0);
+            let paused = Cell::new(None);
+            send_due(&Sending {
+                session: &|| Some(session("KEY_A", true)),
+                stopping: &|| false,
+                take: &|_, _| Some(batch(100)),
+                send: &|_: &SessionKey, _: &[ToScrobble]| -> Result<Sent, Unsent> {
+                    sent.set(sent.get() + 1);
+                    Err(Unsent::Refused("Invalid API key".to_owned()))
+                },
+                settle: &|_| true,
+                refuse: &|| {},
+                now: &|| 1_000,
+                paused_until: &|| paused.get(),
+                pause_until: &|until| paused.set(Some(until)),
+            });
+            assert_eq!(sent.get(), 1);
+            assert_eq!(paused.get(), Some(1_000 + DAILY_LIMIT_RETRY_MS));
         }
 
         #[test]

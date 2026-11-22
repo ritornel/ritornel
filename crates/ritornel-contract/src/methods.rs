@@ -449,8 +449,8 @@ methods! {
     HistoryExport: "history.export", Command, needs_full: true,
     HistoryExportParams => HistoryExported;
 
-    /// `record.dismiss`: sets aside the scrobbles that ended unknown or
-    /// withdrawn until now, so that the status stops saying the record has
+    /// `record.dismiss`: sets aside the scrobbles that ended unknown,
+    /// withdrawn or refused until now, so that the status stops saying the record has
     /// stopped for them. A new one says it again. What else stops the
     /// record ends only when it is put right.
     RecordDismiss: "record.dismiss", Command, needs_full: true,

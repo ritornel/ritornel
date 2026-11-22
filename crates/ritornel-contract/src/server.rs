@@ -277,6 +277,9 @@ pub enum RecordProblemKind {
     /// or on `record.dismiss`. A play the service declines alone, in a
     /// request it took, is not this: no one can do anything about that.
     ScrobblesRefused,
+    /// The service no longer accepts this server's sign-in, so nothing is
+    /// scrobbled until someone signs in again.
+    SignInNeeded,
     /// Importing the service's history failed, and has not worked since.
     ImportFailed,
     /// What would say whether the record advances could not be read, so
@@ -293,6 +296,7 @@ impl RecordProblemKind {
             Self::ScrobblesUnknown => "scrobbles_unknown",
             Self::ScrobblesWithdrawn => "scrobbles_withdrawn",
             Self::ScrobblesRefused => "scrobbles_refused",
+            Self::SignInNeeded => "sign_in_needed",
             Self::ImportFailed => "import_failed",
             Self::Unreadable => "unreadable",
         }

@@ -373,6 +373,7 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
                         Some("Invalid API key"),
                         true
                     ),
+                    problem(RecordProblemKind::SignInNeeded, 1, None, false),
                     problem(
                         RecordProblemKind::ImportFailed,
                         1,
@@ -391,9 +392,11 @@ Record            The listen playing can’t be saved, since 2025-11-21 17:01 UT
                   2 scrobbles weren’t sent to Last.fm, since 2025-11-21 17:01 UTC: its play is excluded
                   Nothing to do: their plays stopped counting, or grew too old for Last.fm, before they could be sent. They stay in your history here. `ritornelctl status --dismiss` sets them aside.
                   Last.fm is refusing scrobbles, since 2025-11-21 17:01 UTC: Invalid API key
-                  Check the API key and secret in lastfm.env in Ritornel’s data folder, then restart the server; or sign in to Last.fm again, in Settings → Last.fm or with `ritornelctl lastfm signin`. Refused scrobbles aren’t sent again; once it’s fixed, `ritornelctl status --dismiss` sets them aside.
+                  Check the API key and secret Ritornel uses, in lastfm.env in its data folder, then restart the server. It clears by itself once Last.fm takes a scrobble again. Refused scrobbles aren’t sent again; `ritornelctl status --dismiss` sets them aside.
+                  Last.fm needs you to sign in again, since 2025-11-21 17:01 UTC
+                  Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. Sign in again, in Settings → Last.fm or with `ritornelctl lastfm signin`, then turn scrobbling back on. Plays from before then stay in your history here.
                   Importing from Last.fm failed, since 2025-11-21 17:01 UTC: Last.fm did not answer
-                  Ritornel tries again at the next import. If it keeps failing, check the internet connection, and the API key and secret in lastfm.env (then restart the server); or sign in to Last.fm again, in Settings → Last.fm or with `ritornelctl lastfm signin`.
+                  Ritornel tries again at the next import. If it keeps failing, check the internet connection, and the API key and secret in lastfm.env in Ritornel’s data folder, then restart the server.
 "
         );
     }
@@ -428,7 +431,7 @@ Record            The listen playing can’t be saved, since 2025-11-21 17:01 UT
             record,
             "\
 Record            Importing from Last.fm failed 3 times in a row, since 2025-11-21 17:01 UTC
-                  Ritornel tries again at the next import. If it keeps failing, check the internet connection, and the API key and secret in lastfm.env (then restart the server); or sign in to Last.fm again, in Settings → Last.fm or with `ritornelctl lastfm signin`.
+                  Ritornel tries again at the next import. If it keeps failing, check the internet connection, and the API key and secret in lastfm.env in Ritornel’s data folder, then restart the server.
                   Ritornel can’t tell whether every listen is being recorded, since 2025-11-21 17:01 UTC: disk I/O error
                   Check that the disk Ritornel’s data is on is connected and has free space, then restart the server.
 "
