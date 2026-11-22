@@ -147,8 +147,8 @@ pub struct PublicDescriptor {
     pub proof: Option<String>,
 }
 
-/// The query parameter that carries a nonce to [`route::DESCRIPTOR`]
-/// (crate::route): 32 to 128 hex digits.
+/// The query parameter that carries a nonce to
+/// [`route::DESCRIPTOR`](crate::route::DESCRIPTOR): 32 to 128 hex digits.
 pub const NONCE_PARAM: &str = "nonce";
 
 /// What a server signs to prove it holds its key: a fixed label, its ID and

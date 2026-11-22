@@ -81,7 +81,7 @@ impl fmt::Debug for SigningKey {
 /// What a running server signs with: its signing key, read once from
 /// `server.db` so that a signature needs neither the file nor the database.
 /// It proves to a client or a peer that it reached the holder of the key it
-/// pinned (docs/design/linking.md, "Identity and the hub role").
+/// pinned ("Server identity and hub role" in docs/internals/linking.md).
 pub struct Signer(SigningKey);
 
 impl Signer {

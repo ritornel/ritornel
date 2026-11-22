@@ -8,9 +8,9 @@ A local client resolves the data directory in order—`--data-dir`, `RITORNEL_DA
 
 1. Read `server.json` and request the server's public descriptor. If the server ID in `server.json` matches the descriptor, connect and stop here.
 2. Otherwise spawn `ritornel-server serve --data-dir <dir>` (when the client is allowed to launch a server).
-3. On startup, the server takes the exclusive OS lock on `server.lock`, loads configuration, initializes daily JSON-line logs under a fresh `boot_id`, opens and migrates `server.db` (and `library.db` on a hub), requeues jobs left by any earlier boot ID, binds its loopback listener, atomically writes `server.json` (temp file then rename), and prints one ready line to standard output.
+3. On startup, the server takes the exclusive OS lock on `server.lock`, loads configuration, initializes daily JSON-line logs under a fresh `boot_id`, opens and migrates `server.db` (and `library.db` on a hub), requeues jobs left by any earlier boot ID, binds its listener, atomically writes `server.json` (temp file then rename), and prints one ready line to standard output.
 
-By default the server tries `127.0.0.1:4747` and falls back to an OS-assigned loopback port if taken. An explicit `--listen` address (or `RITORNEL_LISTEN` / `listen` in `config.toml`) binds that exact loopback port or fails startup (`127.0.0.1:0` asks the OS for an ephemeral port). Non-loopback addresses are refused. `server.json` records literal `127.0.0.1`, never `localhost`.
+By default the server tries `127.0.0.1:4747` and falls back to an OS-assigned loopback port if taken. An explicit `--listen` address (or `RITORNEL_LISTEN` / `listen` in `config.toml`) binds that exact loopback port or fails startup (`127.0.0.1:0` asks the OS for an ephemeral port). `private:<port>` binds every IPv4 interface on that port and closes, before reading a byte, any connection whose peer is not loopback, private (RFC 1918 or IPv6 unique-local), link-local, or in the tailnet range `100.64.0.0/10` (`Listen::admits`); it logs a warning that traffic is plain HTTP. No other address can be named, so a public address is never bound. `server.json` records literal `127.0.0.1` in either mode, never `localhost`.
 
 `ritornelctl` only finds a running server; if none answers, it exits with an error rather than starting one that would die when the command finishes.
 
@@ -145,7 +145,7 @@ Settings resolve in order: **CLI flag → `RITORNEL_*` environment variable → 
 
 | Setting | Flag | Env var | Default |
 |---|---|---|---|
-| Listen address | `--listen` | `RITORNEL_LISTEN` | `127.0.0.1:4747` (fallback: OS port) |
+| Listen address | `--listen` | `RITORNEL_LISTEN` | `127.0.0.1:4747` (fallback: OS port); or `private:<port>` |
 | Log level | `--log-level` | `RITORNEL_LOG_LEVEL` | `info` |
 | Backup folder | `--backup-dir` | `RITORNEL_BACKUP_DIR` | None (backups disabled until set) |
 
