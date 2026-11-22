@@ -489,6 +489,8 @@ impl LeanBack {
                     lean.read_next(cx);
                 }
                 LinkEvent::Away => lean.net = None,
+                // The same session: nothing it read has changed.
+                LinkEvent::Restated(net) => lean.net = Some(Arc::clone(net)),
                 LinkEvent::Server(Event::Library(event)) => {
                     if let Some(appearance) = lean.appearance
                         && lean

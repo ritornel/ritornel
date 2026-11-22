@@ -18,8 +18,9 @@ use gpui::{
     StatefulInteractiveElement, Styled, TouchPhase, Window, canvas, div, img, linear_color_stop,
     linear_gradient, point, prelude::FluentBuilder, px, size,
 };
+use ritornel_contract::methods::LibraryStats;
 use ritornel_contract::{
-    AlbumRef, Id, ListKind, ListOpenParams, Query, Row, ServerRole, Sort, SortKey,
+    AlbumRef, Id, ListKind, ListOpenParams, NoParams, Query, Row, ServerRole, Sort, SortKey,
 };
 use tokio::sync::watch;
 
@@ -315,6 +316,9 @@ pub(crate) struct Wall {
     failed: bool,
     view: Option<HeldView>,
     total: usize,
+    /// How many songs the library has, read when the wall opens empty:
+    /// whether the library is empty, or only the wall.
+    songs: Option<u64>,
     sections: Vec<(String, usize)>,
     pages: HashMap<usize, Page>,
     pages_in_flight: usize,
@@ -408,6 +412,7 @@ impl Wall {
         let budget = cover_budget();
         let followed = cx.subscribe(&link, |wall, _, event: &LinkEvent, cx| match event {
             LinkEvent::Connected(net) => wall.start(Arc::clone(net), cx),
+            LinkEvent::Restated(net) => wall.restated(Arc::clone(net), cx),
             LinkEvent::Away => wall.end(cx),
             LinkEvent::Server(ritornel_contract::Event::List(event)) => wall.heard(event, cx),
             // A change made while no view was held names no view, but its
@@ -452,6 +457,7 @@ impl Wall {
             failed: false,
             view: None,
             total: 0,
+            songs: None,
             sections: Vec::new(),
             pages: HashMap::new(),
             pages_in_flight: 0,
@@ -511,6 +517,7 @@ impl Wall {
     /// A session began: the covers are loaded through it, and the view is
     /// opened again. Where the wall was is kept.
     fn start(&mut self, net: Arc<Net>, cx: &mut Context<Self>) {
+        let net_holds = net.holds;
         let (wants, mut arrived, loader) = covers::start(Arc::clone(&net));
         self.arrivals = Some(cx.spawn(async move |this, cx| {
             while let Some(first) = arrived.next().await {
@@ -550,8 +557,23 @@ impl Wall {
         self.pages.clear();
         self.pages_in_flight = 0;
         self.failed = false;
-        self.open(cx);
+        // A server with no library has no wall to open until it has one.
+        if net_holds {
+            self.open(cx);
+        }
         cx.notify();
+    }
+
+    /// The server says something new of itself. A library it did not hold
+    /// when the session began is opened at once.
+    fn restated(&mut self, net: Arc<Net>, cx: &mut Context<Self>) {
+        let opens = net.holds && !self.net.as_ref().is_some_and(|held| held.holds);
+        if opens {
+            self.start(net, cx);
+        } else {
+            self.net = Some(net);
+            cx.notify();
+        }
     }
 
     /// The session ended: what was read is let go, and the covers already
@@ -1292,7 +1314,8 @@ impl Wall {
                     .and_then(|located| located.index),
                 None => None,
             };
-            Ok::<_, ritornel_client::Error>((held, opened, sections, near, found))
+            let songs = songs_if_empty(&client, opened.total).await;
+            Ok::<_, ritornel_client::Error>((held, opened, sections, near, found, songs))
         });
         cx.spawn(async move |wall, cx| {
             let answer = replaced.await;
@@ -1302,8 +1325,9 @@ impl Wall {
                     return;
                 }
                 wall.replacing = None;
-                if let Ok(Ok((held, opened, sections, near, found))) = answer {
+                if let Ok(Ok((held, opened, sections, near, found, songs))) = answer {
                     wall.total = opened.total as usize;
+                    wall.songs = songs;
                     wall.sections = sections
                         .sections
                         .into_iter()
@@ -1420,7 +1444,7 @@ impl Wall {
         self.opening += 1;
         let asked = self.opening;
         let opened = net.rt().spawn(async move {
-            HeldView::open(
+            let (held, opened, sections) = HeldView::open(
                 &client,
                 &ListOpenParams {
                     kind,
@@ -1435,7 +1459,9 @@ impl Wall {
                     replaces: None,
                 },
             )
-            .await
+            .await?;
+            let songs = songs_if_empty(&client, opened.total).await;
+            Ok::<_, ritornel_client::Error>((held, opened, sections, songs))
         });
         cx.spawn(async move |this, cx| {
             let answer = opened.await;
@@ -1446,8 +1472,9 @@ impl Wall {
                     return;
                 }
                 match answer {
-                    Ok(Ok((held, opened, sections))) => {
+                    Ok(Ok((held, opened, sections, songs))) => {
                         wall.total = opened.total as usize;
+                        wall.songs = songs;
                         wall.sections = sections
                             .sections
                             .into_iter()
@@ -1810,18 +1837,29 @@ impl Wall {
         let scale = window.scale_factor();
         let px_size = (TILE * scale).ceil() as u32;
 
-        // Nothing to show yet, or nothing to show: the page says why.
+        // Nothing to show yet, or nothing to show: the page says why. An
+        // empty wall keeps its controls, so that the other can be chosen.
         if let Some(blank) = self.blank(cx) {
+            let controls = self.view.is_some() && self.total == 0 && !self.failed;
+            let (top, header) = if controls {
+                (
+                    HEADER,
+                    self.header(gutter(width), gutter(width) + rail, 20., cx),
+                )
+            } else {
+                let name = name_row(gutter(width), gutter(width) + rail, 20., None);
+                (HEADER - 66., name.into_any_element())
+            };
             return div()
                 .id("wall")
                 .relative()
                 .size_full()
                 .overflow_hidden()
-                .child(name_row(gutter(width), gutter(width) + rail, 20., None))
+                .child(header)
                 .child(
                     div()
                         .absolute()
-                        .top(px(HEADER - 66.))
+                        .top(px(top))
                         .left_0()
                         .right_0()
                         .child(blank.render(viewport)),
@@ -2323,8 +2361,8 @@ impl Wall {
             let (title, is, then) = match net.role {
                 ServerRole::Unassigned => (
                     "No library yet.",
-                    "which has no library and is linked to none.",
-                    "When it has one, your artists and albums will be here.",
+                    "which holds no library.",
+                    "Add the folder your music is in under Settings › Library, and your artists and albums will be here.",
                 ),
                 ServerRole::Hub => (
                     "Your library is on this server.",
@@ -2339,6 +2377,14 @@ impl Wall {
             };
             let mut blank = Blank::new(title, format!("Connected to {}, {is} {then}", net.name));
             blank.bold = Some(net.name.clone().into());
+            if net.role == ServerRole::Unassigned {
+                blank.button = Some((
+                    "Open Settings".into(),
+                    Box::new(|_, _, cx| {
+                        crate::settings::open(Some(crate::settings::Section::Library), cx);
+                    }),
+                ));
+            }
             blank.facts = net.versions.as_ref().map(|versions| {
                 format!(
                     "Server {} · Contract {} · SQLite {} · Schema {}",
@@ -2363,10 +2409,11 @@ impl Wall {
             return Some(blank);
         }
         if self.view.is_some() && self.total == 0 {
+            let (title, then) = empty_words(self.songs);
             let mut blank = Blank::new(
-                "Your library is empty.",
+                title,
                 format!(
-                    "Connected to {}, which holds your library. There is no music in it yet: when a folder of music has been scanned, your artists and albums will be here.",
+                    "Connected to {}, which holds your library. {then}",
                     net.name
                 ),
             );
@@ -2405,10 +2452,11 @@ impl Wall {
                     .child(label)
             }
         };
-        let count = (self.view.is_some()).then(|| self.kind.count(self.total));
+        let count = (self.view.is_some() && self.total > 0).then(|| self.kind.count(self.total));
         let choices = orders(self.kind);
         let order = self.order;
-        let sort = (choices.len() > 1).then(|| {
+        let empty = self.view.is_some() && self.total == 0;
+        let sort = (choices.len() > 1 && !empty).then(|| {
             div()
                 .flex()
                 .items_center()
@@ -2737,6 +2785,32 @@ impl Wall {
     }
 }
 
+/// How many songs the library has, asked only when a wall opens empty:
+/// whether the library is empty too.
+async fn songs_if_empty(client: &ritornel_client::Client, total: u64) -> Option<u64> {
+    if total > 0 {
+        return None;
+    }
+    let stats = client.call::<LibraryStats>(&NoParams {}).await;
+    stats.ok().map(|stats| stats.recordings)
+}
+
+/// What an empty wall says, by how many songs the library has: that the
+/// library is empty, or that its songs name no album and so are on no wall.
+fn empty_words(songs: Option<u64>) -> (&'static str, &'static str) {
+    if songs.is_some_and(|songs| songs > 0) {
+        (
+            "No albums yet.",
+            "Its songs name no album, so there are no artists or albums to show. Search finds them.",
+        )
+    } else {
+        (
+            "Your library is empty.",
+            "There is no music in it yet: when a folder of music has been scanned, your artists and albums will be here.",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2793,5 +2867,12 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), server).await???;
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_wall_says_the_library_is_empty_only_when_it_has_no_songs() {
+        assert_eq!(empty_words(Some(0)).0, "Your library is empty.");
+        assert_eq!(empty_words(None).0, "Your library is empty.");
+        assert_eq!(empty_words(Some(12)).0, "No albums yet.");
     }
 }

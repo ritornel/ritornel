@@ -239,6 +239,8 @@ impl Player {
                 player.net = Some(Arc::clone(net));
                 player.read(cx);
             }
+            // The same session: nothing it read has changed.
+            LinkEvent::Restated(net) => player.net = Some(Arc::clone(net)),
             LinkEvent::Away => {
                 player.net = None;
                 player.rated = Ratings::default();
