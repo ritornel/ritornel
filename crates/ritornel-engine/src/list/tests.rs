@@ -745,8 +745,18 @@ fn a_record_whose_files_joined_another_is_on_no_wall() {
         .unwrap();
     assert_eq!(pictured, [Some("Moss Arcade".to_owned())]);
 
-    // Nor is it played: not from a view opened before, nor as a record.
+    // Nor is it played: not from a view opened before, nor by its ID, nor
+    // as a record.
     assert_eq!(rig.library.song_ids(&[song]).unwrap(), [None]);
+    let id = rig.one(&format!(
+        "SELECT public_id FROM track_appearance WHERE id = {song}"
+    ));
+    let id: Vec<u8> = (0..id.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&id[at..at + 2], 16).unwrap())
+        .collect();
+    let id = ritornel_contract::Id::from_bytes(id.try_into().unwrap());
+    assert_eq!(rig.library.unknown_appearance(&[id]).unwrap(), Some(id));
     let public = rig.one(&format!(
         "SELECT public_id FROM release WHERE id = {release}"
     ));

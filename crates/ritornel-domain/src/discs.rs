@@ -399,6 +399,7 @@ mod tests {
             "Night Drives (Part II) [Deluxe]",
             "Night Drives (Vol. 2)",
             "Night Drives [Part 2]",
+            "Night Drives (Vol. 2) [Deluxe]",
         ] {
             assert_eq!(disc_in_title(title), None, "{title}");
         }
@@ -407,6 +408,11 @@ mod tests {
             disc_in_title("Night Drives, Vol. 2 (Disc 1)"),
             Some(("Night Drives, Vol. 2".to_owned(), 1))
         );
+        assert_eq!(
+            disc_in_title("Night Drives, Vol. 2 (Disc 1) [Deluxe]"),
+            Some(("Night Drives, Vol. 2 [Deluxe]".to_owned(), 1))
+        );
+        assert_eq!(disc_of_folder("Vol. 2 (Disc 1)"), Some(1));
         for folder in [
             "Vol. 1",
             "Vol 2",

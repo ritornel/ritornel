@@ -385,12 +385,14 @@ WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0";
 /// The songs of a record's versions, each with its title on the record and
 /// its plays wherever heard, the version playing first. `?2` is the
 /// record's release group and `?3` the release playing. A song on several
-/// versions comes once for each.
+/// versions comes once for each. The last column says whether a file reaches the song there: only one
+/// that does is the record's song played most.
 const RECORD_SONGS: &str = "
 SELECT r.canonical_id, coalesce(ta.display_title, cr.display_title),
        (SELECT count(*) FROM play_event pe
         WHERE pe.listener_id = ?1 AND pe.recording_id = r.canonical_id
-          AND pe.counts = 1 AND pe.excluded = 0)
+          AND pe.counts = 1 AND pe.excluded = 0),
+       ta.redirect_to_id IS NULL AND rel.redirect_to_id IS NULL AND {reached}
 FROM release rel
 JOIN track_appearance ta ON ta.release_id = rel.id
 JOIN recording r ON r.id = ta.recording_id
@@ -439,18 +441,19 @@ fn read_record(
         ))?
         .query_row([release], |row| row.get(0))?;
     record.size = count(size);
-    let mut statement = connection.prepare_cached(RECORD_SONGS)?;
+    let mut statement =
+        connection.prepare_cached(&RECORD_SONGS.replace("{reached}", crate::list::REACHED_TA))?;
     let mut rows = statement.query(params![listener, group, release])?;
     while let Some(row) = rows.next()? {
-        let (song, title, plays): (i64, Option<String>, i64) =
-            (row.get(0)?, row.get(1)?, row.get(2)?);
+        let (song, title, plays, reached): (i64, Option<String>, i64, bool) =
+            (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?);
         // A song is named as the version playing names it, and counted once.
         if record.titles.contains_key(&song) {
             continue;
         }
         let plays = count(plays);
         let title = title.unwrap_or_else(|| "Untitled".to_owned());
-        if record.top.as_ref().is_none_or(|(_, most)| plays > *most) {
+        if reached && record.top.as_ref().is_none_or(|(_, most)| plays > *most) {
             record.top = Some((title.clone(), plays));
         }
         record.titles.insert(song, title);
