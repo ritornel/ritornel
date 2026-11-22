@@ -20,7 +20,7 @@ use gpui::{
 use ritornel_contract::{Id, Repeat, SkipDirection};
 
 use crate::icons::icon;
-use crate::link::Link;
+use crate::link::{Link, LinkEvent};
 use crate::net::NoArt;
 use crate::player::{Player, stars_of};
 use crate::theme;
@@ -86,11 +86,21 @@ pub(crate) struct PlayerBar {
     /// Whether the cover is hidden while a copy of it travels (Lean back's).
     pub cover_away: bool,
     _player: Subscription,
+    _link: Subscription,
 }
 
 impl PlayerBar {
     pub(crate) fn new(link: Entity<Link>, player: Entity<Player>, cx: &mut Context<Self>) -> Self {
         let followed = cx.observe(&player, |_, _, cx| cx.notify());
+        // A new session: the cover is asked for again at once, and a read
+        // through the session before is let go.
+        let session = cx.subscribe(&link, |bar: &mut Self, _, event: &LinkEvent, cx| {
+            if let LinkEvent::Connected(_) = event {
+                bar.reading = None;
+                bar.retries = crate::covers::Retries::default();
+                cx.notify();
+            }
+        });
         cx.on_release(|bar, cx| {
             if let Some((_, image, _)) = bar.cover.take() {
                 crate::covers::drop_unshared(image, None, cx);
@@ -112,6 +122,7 @@ impl PlayerBar {
             washed: false,
             cover_away: false,
             _player: followed,
+            _link: session,
         }
     }
 
@@ -124,6 +135,10 @@ impl PlayerBar {
             self.reading = None;
             return;
         };
+        // A read for the song before is let go: it would land in its place.
+        if self.reading.as_ref().is_some_and(|(id, _)| *id != art) {
+            self.reading = None;
+        }
         if self.cover.as_ref().is_some_and(|(id, _, _)| *id == art)
             || self.reading.as_ref().is_some_and(|(id, _)| *id == art)
             || self.missing == Some(art)

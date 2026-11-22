@@ -1287,10 +1287,10 @@ impl MoreCovers {
     /// the row has left since, coming after the one for its size now, is not
     /// kept; never drawn, it has nothing in the atlas to let go.
     fn took(&mut self, art: Id, px: u32, image: Arc<RenderImage>) -> Option<Arc<RenderImage>> {
-        self.retries.read(art);
         if px != self.px {
             return None;
         }
+        self.retries.read(art);
         self.covers.insert(art, image)
     }
 
@@ -1375,9 +1375,14 @@ mod tests {
         assert!(more.failed(failing, 100, later).is_some());
         more.again();
         assert!(more.ask(failing, later));
-        // A failure for a size the row has left asks nothing more.
+        // A failure for a size the row has left asks nothing more, and a
+        // read for it does not end the wait at the size it has now.
         more.size(200);
         assert_eq!(more.failed(failing, 100, later), None);
+        assert!(more.ask(failing, later));
+        assert!(more.failed(failing, 200, later).is_some());
+        assert!(more.took(failing, 100, tiny()).is_none());
+        assert!(!more.ask(failing, later));
     }
 
     #[test]

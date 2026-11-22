@@ -481,8 +481,12 @@ impl Artist {
                 Err(NoArt::Missing) => {}
                 Err(NoArt::Failed) => {
                     page.asked.remove(&(art, px));
-                    let wait = page.retries.failed(art, Instant::now());
-                    crate::covers::notify_after(wait, cx);
+                    // Shown at two sizes, it fails twice: the wait grows once.
+                    let now = Instant::now();
+                    if !page.retries.waits(art, now) {
+                        let wait = page.retries.failed(art, now);
+                        crate::covers::notify_after(wait, cx);
+                    }
                 }
             });
         }

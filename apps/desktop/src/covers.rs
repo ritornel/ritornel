@@ -310,8 +310,12 @@ impl Loader {
                         return;
                     }
                 }
-                Some(done) = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Ok((art, read)) = done {
+                Some(done) = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                    // One aborted after it ended, for a cover asked for
+                    // again since, says nothing of the fetch now running.
+                    if let Ok((id, (art, read))) = done
+                        && running.get(&art).is_some_and(|handle| handle.id() == id)
+                    {
                         running.remove(&art);
                         match read {
                             Read::Done => {
