@@ -10,6 +10,7 @@ Ritornel was built on macOS first. Linux and Windows came early, while the code 
 | Sound | CoreAudio | ALSA's `default` device (PipeWire or PulseAudio on a desktop) | WASAPI, shared mode | None (`--output null` plays into nothing) |
 | Media keys and Now Playing | Now Playing | MPRIS | Not yet | None |
 | Background service | launchd user agent | systemd user unit | Not yet | Any service manager running `serve` |
+| A hub kept from idle sleep | `caffeinate -i` | `systemd-inhibit --what=idle` | Not yet | As Linux |
 | Desktop app | Yes | Wayland or X11 | Yes | None |
 | App menus | The menu bar | A button in the title bar | A button in the title bar | None |
 | Data directory | `~/Library/Application Support/Ritornel` | `$XDG_DATA_HOME/ritornel` | `%LOCALAPPDATA%\Ritornel` | As Linux |

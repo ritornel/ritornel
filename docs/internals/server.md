@@ -37,6 +37,14 @@ On `SIGINT`, `SIGTERM`, a polite Windows stop (`taskkill /PID` via the hidden wi
 
 Runtime bounds (`apps/server/src/bounds.rs`) keep resource usage bounded: `MAX_CONNECTIONS = 128` concurrent HTTP connections, `MAX_SESSIONS = 64` open WebSocket/in-memory sessions, `HEADER_WAIT = 10s`, `STOP_GRACE = 5s`, and `TICKET_LIFE = 10s` for single-use socket tickets.
 
+### Server name
+
+A server is named after its computer (`platform::computer_name`), so a hub's satellites and a satellite's hub say which machine each is: the computer name on macOS, `PRETTY_HOSTNAME` in `/etc/machine-info` or else the hostname on Linux, and `COMPUTERNAME` on Windows. A server still carrying the first-start name `DEFAULT_NAME` takes its computer's name at start, and a name someone chose is kept. `RITORNEL_TEST_COMPUTER_NAME` stands in for the computer's name in tests.
+
+### Keeping a hub awake
+
+A sleeping hub is one its satellites cannot reach. Once a satellite is linked, at start or when one joins, a hub asks the system to keep it from idle sleep (`Core::stay_awake_while_linked`, `platform::stay_awake`) until the server stops. The display may still sleep. Where the system refuses or has no way to ask, the server logs a warning and runs on. [`platforms.md`](platforms.md) says how each system is asked.
+
 ## Data directory
 
 ```text
