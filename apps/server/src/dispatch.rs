@@ -127,10 +127,8 @@ pub(crate) struct Core {
     covers: ritornel_engine::covers::Covers,
     /// The threads that make covers.
     cover_pool: CoverPool,
-    /// The jobs whose end has been sent. Several threads write a job and
-    /// then send it, in no set order, so a copy written before the end can
-    /// be sent after it; it is not.
-    ended_jobs: Mutex<std::collections::HashSet<Id>>,
+    /// Orders a job's state check and publication against other publishers.
+    job_events: Mutex<()>,
     /// The player, on a server with an audio output.
     player: Mutex<Option<ritornel_engine::playback::Player>>,
     /// Whether there is one, read without waiting on it.
@@ -217,7 +215,7 @@ impl Core {
             media_tokens: MediaTokens::default(),
             covers,
             cover_pool: CoverPool::start(COVER_THREADS),
-            ended_jobs: Mutex::default(),
+            job_events: Mutex::default(),
             local_credential,
             clock,
             entropy,
@@ -578,6 +576,14 @@ impl Core {
                 })
             }),
             EventsSubscribe::NAME => run::<EventsSubscribe>(params, |params| {
+                if session.kind() != SessionKind::Full
+                    && params.topics.contains(&ritornel_contract::Topic::Jobs)
+                {
+                    return Err(RpcError::new(
+                        ErrorCode::Forbidden,
+                        "Job events need a full session. Subscribe without the jobs topic.",
+                    ));
+                }
                 Ok(ritornel_contract::Subscriptions {
                     topics: session.subscribe(&params.topics),
                 })
@@ -1217,6 +1223,20 @@ mod tests {
                 Err((ErrorCode::Forbidden, json!({})))
             );
         }
+        assert_eq!(
+            call(&core, &limited, "jobs.list", None),
+            Err((ErrorCode::Forbidden, json!({})))
+        );
+        assert_eq!(
+            call(
+                &core,
+                &limited,
+                "events.subscribe",
+                Some(json!({"topics":["library","jobs"]}))
+            ),
+            Err((ErrorCode::Forbidden, json!({})))
+        );
+        assert!(limited.subscribe(&[]).is_empty());
         assert!(!scratch.path().join("data/library.db").exists());
         call(&core, &limited, "servers.list", None).unwrap();
         call(
@@ -1472,27 +1492,28 @@ mod tests {
         let subscribed = greeted(&core, SessionKind::Full);
         let subscribe = Some(json!({ "topics": ["jobs"] }));
         call(&core, &subscribed, "events.subscribe", subscribe).unwrap();
-        let copy = |state: ritornel_engine::JobState| ritornel_engine::Job {
-            id: 1,
-            public_id: Id::from_bytes([0xd1; 16]),
-            kind: "scan".to_owned(),
-            target: None,
-            params_json: "{}".to_owned(),
-            state,
-            step: 0,
-            checkpoint_json: None,
-            cancel_requested: true,
-            done: 0,
-            total: None,
-            bytes: 0,
-            failed: 0,
-            skipped: 0,
-            label: None,
-            error: None,
-            created_at_ms: 0,
-            started_at_ms: None,
-            finished_at_ms: None,
-        };
+        let (queued, running) = core
+            .with_stores(|stores| {
+                let cmd = Command {
+                    id: Id::from_bytes([0xd1; 16]),
+                    fingerprint: Fingerprint::of("test.scan", b"{}"),
+                };
+                let new = ritornel_engine::NewJob {
+                    kind: "scan",
+                    dedupe_key: "music".into(),
+                    target: Id::from_bytes([1; 16]),
+                    params_json: "{}".into(),
+                    session: None,
+                };
+                let (queued, _) = stores.server.start_job(cmd, "test.scan", new).unwrap();
+                let running = stores
+                    .server
+                    .claim_job(Id::from_bytes([2; 16]))
+                    .unwrap()
+                    .unwrap();
+                (queued, running)
+            })
+            .unwrap();
         let sent = |session: &Session| {
             let Some(Frame::Notification(sent)) = now(session.next()) else {
                 panic!("an event was queued");
@@ -1500,13 +1521,27 @@ mod tests {
             sent.params.unwrap()["job"]["state"].clone()
         };
 
-        // The worker ends the job a call has asked to stop, and the call,
-        // a moment behind, sends the copy it wrote before that: before the
-        // end was sent, and after.
-        core.publish_job(&copy(ritornel_engine::JobState::Cancelled));
-        core.publish_job(&copy(ritornel_engine::JobState::Cancelling));
+        core.publish_job(&running);
+        core.publish_job(&queued);
+        assert_eq!(sent(&subscribed), json!("running"));
+
+        let ended = core
+            .with_stores(|stores| {
+                stores
+                    .server
+                    .finish_job(queued.id, ritornel_engine::JobState::Cancelled, None)
+                    .unwrap()
+            })
+            .unwrap();
+        // A late snapshot is already stale before the worker sends the end.
+        core.publish_job(&queued);
+        subscribed.reply(marker());
+        assert_eq!(now(subscribed.next()), Some(marker()));
+
+        core.publish_job(&ended);
+        core.publish_job(&queued);
         assert_eq!(sent(&subscribed), json!("cancelled"));
-        core.publish_job(&copy(ritornel_engine::JobState::Cancelling));
+        core.publish_job(&queued);
         subscribed.reply(marker());
         assert_eq!(now(subscribed.next()), Some(marker()));
     }

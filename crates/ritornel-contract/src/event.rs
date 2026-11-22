@@ -22,7 +22,7 @@ pub enum Topic {
     /// One server's full status, whenever it changes.
     Servers,
     /// One job's full summary, whenever it changes: at most four times a
-    /// second for one job.
+    /// second for one job. Subscribing requires a full session.
     Jobs,
     /// The library changed: a hint to read again what is on screen that is
     /// not a view.

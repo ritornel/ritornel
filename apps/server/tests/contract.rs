@@ -1117,6 +1117,7 @@ async fn a_limited_session_may_not_ask_for_the_status_or_change_anything() {
             refused(client.add_source(key(), "main", "/srv/invented").await),
             refused(client.start_scan(key(), key()).await),
             refused(client.jobs().await),
+            refused(client.subscribe(&[Topic::Servers, Topic::Jobs]).await),
             refused(client.job(key()).await),
             refused(client.cancel_job(key(), key()).await),
             refused(client.call::<IdentityDryRun>(&Default::default()).await),
@@ -1128,7 +1129,7 @@ async fn a_limited_session_may_not_ask_for_the_status_or_change_anything() {
         // library is, though there is none here to read.
         client.servers().await.unwrap();
         client
-            .subscribe(&[Topic::Servers, Topic::Jobs, Topic::Library])
+            .subscribe(&[Topic::Servers, Topic::Library])
             .await
             .unwrap();
         let (code, ..) = refused(client.library_stats().await);
