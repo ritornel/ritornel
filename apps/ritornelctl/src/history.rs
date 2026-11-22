@@ -10,13 +10,13 @@ use std::io::Write;
 
 use ritornel_client::contract::methods::{
     HistoryAlbum, HistoryArtist, HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones,
-    HistoryZones, ListClose, ListOpen,
+    HistoryZones,
 };
 use ritornel_client::contract::{
     AlbumGetParams, AlbumRef, ArtistGetParams, ErrorCode, HistoryOf, HistoryRebuildParams,
     HistoryRebuilt, HistoryRecentParams, Id, ListKind, ListOpenParams, NoParams, OnThisDay,
-    OnThisDayParams, Play, PlayOutcome, Query, RecentPlays, Row, SetZonesParams, ViewParams,
-    Window, ZonePeriod, ZonePeriods, ZonesSet,
+    OnThisDayParams, Play, PlayOutcome, Query, RecentPlays, Row, SetZonesParams, Window,
+    ZonePeriod, ZonePeriods, ZonesSet,
 };
 use ritornel_client::{Client, local};
 
@@ -214,14 +214,13 @@ fn render_of(of: &HistoryOf) -> String {
     text
 }
 
-/// How many rows a name is looked up among.
+/// How many search results to fetch at a time.
 const LOOKUP: u64 = 50;
 
-/// What a name or an ID finds: the one it names, or the rows it may mean,
-/// one a line, each with its ID.
+/// A single match, or the IDs and labels offered for disambiguation.
 enum Named {
     One(Id),
-    Choose(String),
+    Choose(Vec<(Id, String)>),
 }
 
 /// Finds an artist or an album by its ID, or by its name: the one whose
@@ -235,7 +234,7 @@ async fn named(
         return Ok(Named::One(id));
     }
     let opened = client
-        .call::<ListOpen>(&ListOpenParams {
+        .list_open(&ListOpenParams {
             kind,
             query: Query {
                 text: Some(name.to_owned()),
@@ -248,44 +247,71 @@ async fn named(
             replaces: None,
         })
         .await?;
-    let _ = client
-        .call::<ListClose>(&ViewParams {
-            view: opened.view.clone(),
-        })
-        .await;
-    let found: Vec<(Id, String, String)> = opened
-        .rows
-        .into_iter()
-        .filter_map(|row| match row {
-            Row::Artist(artist) => {
-                let name = artist.name.unwrap_or_default();
-                Some((artist.artist_id, name.clone(), name))
+    let found = async {
+        let mut rows = opened.rows;
+        let mut found = Vec::new();
+        let mut offset = 0;
+        loop {
+            offset += rows.len() as u64;
+            found.extend(rows.into_iter().filter_map(candidate));
+            if offset >= opened.total {
+                break;
             }
-            Row::Album(tile) => {
-                let title = tile.title.unwrap_or_default();
-                let by = tile
-                    .artist_credit
-                    .map(|credit| format!(" — {}", credit.text))
-                    .unwrap_or_default();
-                Some((tile.album.id(), title.clone(), format!("{title}{by}")))
+            let window = client.list_window(&opened.view, offset, LOOKUP).await?;
+            if window.offset != offset || window.rows.is_empty() {
+                return Err(ritornel_client::Error::Protocol(
+                    "incomplete name search results".into(),
+                ));
             }
-            _ => None,
-        })
-        .collect();
+            rows = window.rows;
+        }
+        Ok(found)
+    }
+    .await;
+    let _ = client.list_close(&opened.view).await;
+    let found = found?;
     let wanted = name.to_lowercase();
-    let exact: Vec<&(Id, String, String)> = found
+    let exact: Vec<_> = found
         .iter()
-        .filter(|(_, named, _)| named.to_lowercase() == wanted)
+        .filter(|candidate| candidate.name.to_lowercase() == wanted)
         .collect();
     Ok(match (exact.as_slice(), found.as_slice()) {
-        ([(id, ..)], _) | ([], [(id, ..)]) => Named::One(*id),
-        _ => Named::Choose(
-            found
-                .iter()
-                .map(|(id, _, line)| format!("{id}  {line}\n"))
-                .collect(),
-        ),
+        ([one], _) => Named::One(one.id),
+        ([], [one]) => Named::One(one.id),
+        _ => Named::Choose(found.into_iter().map(|row| (row.id, row.label)).collect()),
     })
+}
+
+struct Candidate {
+    id: Id,
+    name: String,
+    label: String,
+}
+
+fn candidate(row: Row) -> Option<Candidate> {
+    match row {
+        Row::Artist(artist) => {
+            let name = artist.name.unwrap_or_default();
+            Some(Candidate {
+                id: artist.artist_id,
+                name: name.clone(),
+                label: name,
+            })
+        }
+        Row::Album(tile) => {
+            let title = tile.title.unwrap_or_default();
+            let by = tile
+                .artist_credit
+                .map(|credit| format!(" — {}", credit.text))
+                .unwrap_or_default();
+            Some(Candidate {
+                id: tile.album.id(),
+                label: format!("{title}{by}"),
+                name: title,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// What a page says of an artist or an album, named by ID or by name.
@@ -338,7 +364,24 @@ fn history_of(
             render_of,
         ),
         Err(choices) => {
-            out.write_all(choices.as_bytes()).map_err(Error::Output)?;
+            server::print(
+                &args.server,
+                out,
+                &choices,
+                |choices| {
+                    let rows: Vec<_> = choices
+                        .iter()
+                        .map(|(id, label)| serde_json::json!({"id": id, "label": label}))
+                        .collect();
+                    serde_json::to_string_pretty(&serde_json::json!({"choices": rows}))
+                },
+                |choices| {
+                    choices
+                        .iter()
+                        .map(|(id, label)| format!("{id}  {label}\n"))
+                        .collect()
+                },
+            )?;
             Err(Error::Nothing(if album {
                 "that names no one album: name it by one of these IDs"
             } else {
@@ -463,5 +506,45 @@ pub(crate) fn history(
                 render_rebuilt,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn an_exact_artist_on_the_second_page_wins() {
+        let (outgoing, mut requests) = tokio::sync::mpsc::channel::<String>(2);
+        let (replies, incoming) = tokio::sync::mpsc::channel(2);
+        let client = Client::over_memory(outgoing, incoming);
+        let wanted = Id::from_bytes([42; 16]);
+        let artist = |name: &str, id: Id| json!({"type":"artist","artistId":id,"name":name,"albumCount":0,"trackCount":0,"portrait":false});
+        let serve = async {
+            while let Some(text) = requests.recv().await {
+                let call: Value = serde_json::from_str(&text).unwrap();
+                let result = match call["method"].as_str().unwrap() {
+                    "list.open" => {
+                        json!({"view":"artists","total":51,"libraryRevision":1,"offset":0,"rows":vec![artist("A Partial Match", Id::from_bytes([1;16]));50]})
+                    }
+                    "list.window" => {
+                        assert_eq!(call["params"]["offset"], 50);
+                        json!({"view":"artists","offset":50,"rows":[artist("Match", wanted)]})
+                    }
+                    "list.close" => json!({"closed":true}),
+                    method => panic!("unexpected method {method}"),
+                };
+                replies
+                    .send(json!({"jsonrpc":"2.0","id":call["id"],"result":result}).to_string())
+                    .await
+                    .unwrap();
+                if call["method"] == "list.close" {
+                    break;
+                }
+            }
+        };
+        let (found, ()) = tokio::join!(named(&client, ListKind::Artists, "Match"), serve);
+        assert!(matches!(found.unwrap(), Named::One(id) if id == wanted));
     }
 }
