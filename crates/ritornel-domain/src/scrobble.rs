@@ -191,7 +191,18 @@ pub(crate) fn without_featured(text: &str) -> String {
     loop {
         // ASCII lower case keeps every byte where it was.
         let lower = text.to_ascii_lowercase();
-        let Some(at) = FEATURED.iter().filter_map(|word| lower.find(word)).min() else {
+        // "Feat of" is a word, not a featured artist.
+        let Some(at) = FEATURED
+            .iter()
+            .filter_map(|word| {
+                lower.match_indices(word).map(|(at, _)| at).find(|at| {
+                    !lower.get(at + word.len()..).is_some_and(|rest| {
+                        word.trim().ends_with("feat") && rest.starts_with("of ")
+                    })
+                })
+            })
+            .min()
+        else {
             return text;
         };
         let end = match lower.as_bytes().get(at) {
@@ -245,9 +256,10 @@ fn squash(key: &str) -> String {
 fn loose_key(artist: &str, title: &str) -> (String, String) {
     let key = |text: &str| squash(&normalize(&without_featured(text)));
     let mut kept = markers_of(title, 2);
-    // And its numbers, as in "Take 2", but a featured artist's.
+    // And its numbers, as in "Take 2", wherever they are: one in a featured
+    // artist's name may keep a play apart, and never binds a wrong one.
     kept.extend(
-        normalize(&without_featured(title))
+        normalize(title)
             .split(' ')
             .filter(|word| word.chars().all(|c| c.is_ascii_digit()))
             .map(str::to_owned),
@@ -286,9 +298,32 @@ fn album_words(album: &str) -> Vec<String> {
 /// range such as "01 - 09" and "10,000" are not.
 fn album_numbers(album: &str) -> Vec<u32> {
     let album = disc_in_title(album).map_or_else(|| album.to_owned(), |(title, _)| title);
-    let key = normalize(&album);
+    // Each bracketed note is read on its own, so that a year in one does
+    // not hide the number beside it: "Low Tide (2) (2011 Remaster)".
+    let mut segments: Vec<String> = vec![String::new()];
+    for c in album.chars() {
+        match c {
+            '(' | '[' | ')' | ']' => segments.push(String::new()),
+            c => segments
+                .last_mut()
+                .into_iter()
+                .for_each(|segment| segment.push(c)),
+        }
+    }
+    let mut found: Vec<u32> = Vec::new();
+    for segment in &segments {
+        found.extend(segment_numbers(&normalize(segment)));
+    }
+    found.sort_unstable();
+    found
+}
+
+/// The numbers of one part of an album title, as [`album_numbers`] reads
+/// them.
+fn segment_numbers(key: &str) -> Vec<u32> {
     let words: Vec<&str> = key.split(' ').collect();
     let digits = |word: &str| word.starts_with(|c: char| c.is_ascii_digit());
+    let roman = |word: &str| !word.is_empty() && word.chars().all(|c| "ivx".contains(c));
     let mut found: Vec<u32> = Vec::new();
     for (at, word) in words.iter().enumerate() {
         let before = at.checked_sub(1).and_then(|before| words.get(before));
@@ -299,19 +334,20 @@ fn album_numbers(album: &str) -> Vec<u32> {
                 "vol" | "vols" | "volume" | "part" | "pt" | "book" | "chapter"
             )
         });
-        // A volume and its number written as one word: "vol2".
-        let joined = ["vol", "volume", "pt", "part"]
+        // A volume and its number written as one word: "vol2", "volii".
+        let joined = ["volume", "vol", "part", "pt"]
             .iter()
             .find_map(|prefix| word.strip_prefix(prefix))
-            .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
-        // A roman numeral of one letter is a word as often as not.
-        let roman = word.len() > 1 && word.chars().all(|c| "ivx".contains(c));
+            .filter(|rest| {
+                !rest.is_empty() && (rest.chars().all(|c| c.is_ascii_digit()) || roman(rest))
+            });
         let alone = word.chars().all(|c| c.is_ascii_digit())
             && !before.is_some_and(|w| digits(w))
             && !after.is_some_and(|w| digits(w));
+        // A roman numeral of one letter is a word as often as not.
         let number = if let Some(rest) = joined {
-            rest.parse().ok()
-        } else if after_volume || roman {
+            part_number(rest)
+        } else if after_volume || word.len() > 1 && roman(word) {
             part_number(word)
         } else if alone {
             word.parse().ok().filter(|number| *number < 100)
@@ -320,8 +356,22 @@ fn album_numbers(album: &str) -> Vec<u32> {
         };
         found.extend(number);
     }
-    found.sort_unstable();
     found
+}
+
+/// A title's text outside its bracketed notes, as written.
+fn core_text(title: &str) -> String {
+    let mut outside = String::with_capacity(title.len());
+    let mut depth = 0_u32;
+    for c in title.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => outside.push(c),
+            _ => {}
+        }
+    }
+    outside
 }
 
 /// What an album is compared by: [`album_words`] with no spaces.
@@ -412,10 +462,10 @@ impl Album {
             return true;
         }
         let words = album_words(album);
-        let (short, long, written) = if words.len() < self.words.len() {
-            (&words, &self.words, self.written.as_str())
+        let (short, long, written, other) = if words.len() < self.words.len() {
+            (&words, &self.words, self.written.as_str(), album)
         } else {
-            (&self.words, &words, album)
+            (&self.words, &words, album, self.written.as_str())
         };
         let Some(next) = long.get(short.len()) else {
             return false;
@@ -427,11 +477,21 @@ impl Album {
             );
         let rest = long.get(short.len()..).unwrap_or_default();
         let by_artist = squash(&rest.join(" ")) == self.artist;
-        let set_off = by_artist
-            || EDITION.contains(&next.as_str())
-            || [":", " - ", " – ", " — ", ", ", " / "]
-                .iter()
-                .any(|mark| written.contains(mark));
+        // Set off: the longer title, outside its notes, is the shorter one
+        // and then a colon, a dash or a full stop; or both have the same
+        // title before such a mark, and one subtitle runs on from the
+        // other's.
+        let (outside, inside) = (core_text(written), core_text(other));
+        let after_mark = [":", " - ", " – ", " — ", ". "].iter().any(|mark| {
+            outside.split_once(mark).is_some_and(|(head, _)| {
+                let head = album_words(head);
+                head == *short
+                    || inside
+                        .split_once(mark)
+                        .is_some_and(|(shared, _)| !head.is_empty() && album_words(shared) == head)
+            })
+        });
+        let set_off = by_artist || EDITION.contains(&next.as_str()) || after_mark;
         short.len() >= 2 && long.starts_with(short) && !numbered && set_off
     }
 }
@@ -991,18 +1051,42 @@ mod review_cases {
             bound(&catalog, Some("Glass"), "Echo feat. Nia - Take 2"),
             None
         );
-        // A featured artist's numbers are not the title's.
-        let catalog = Catalog::new(vec![on(2, "Mira Vale", "Echo", "Glass")]);
+        // Nor inside the featured artist's part.
+        let catalog = Catalog::new(vec![on(
+            2,
+            "Mira Vale",
+            "Echo (feat. Nia - Take 1)",
+            "Glass",
+        )]);
         assert_eq!(
-            bound(&catalog, Some("Glass"), "Echo (feat. Nia 99)"),
-            Some(2)
+            bound(&catalog, Some("Glass"), "Echo (feat. Nia - Take 2)"),
+            None
+        );
+        let catalog = Catalog::new(vec![on(3, "Mira Vale", "Echo feat. Nia, Take 1", "Glass")]);
+        assert_eq!(
+            bound(&catalog, Some("Glass"), "Echo feat. Nia, Take 2"),
+            None
+        );
+        // "Feat of" is words, not a featured artist.
+        assert_eq!(
+            super::without_featured("A Feat of Strength"),
+            "A Feat of Strength"
         );
     }
 
     #[test]
     fn a_numbered_or_merely_longer_album_is_another() {
         let catalog = Catalog::new(vec![on(1, "Mira Vale", "Echo", "Low Tide")]);
-        for album in ["Low Tide (2)", "Low Tide Vol.2", "Low Tide Strikes Back"] {
+        for album in [
+            "Low Tide (2)",
+            "Low Tide Vol.2",
+            "Low Tide Strikes Back",
+            "Low Tide (2) (2011 Remaster)",
+            "Low Tide (Vol.II)",
+            "Low Tide Strikes Back (Bonus, 2020)",
+            "Low Tide Strikes Back, The",
+            "Low Tide Rising: The Beginning",
+        ] {
             assert_eq!(bound(&catalog, Some(album), "Echo"), None, "{album}");
         }
         for album in [
@@ -1014,6 +1098,43 @@ mod review_cases {
         ] {
             assert_eq!(bound(&catalog, Some(album), "Echo"), Some(1), "{album}");
         }
+    }
+
+    #[test]
+    fn a_numbered_album_fits_its_remaster_and_punctuation_in_a_title_sets_nothing_off() {
+        let catalog = Catalog::new(vec![on(1, "Mira Vale", "Echo", "Low Tide 2")]);
+        assert_eq!(
+            bound(&catalog, Some("Low Tide 2 (2011 Remaster)"), "Echo"),
+            Some(1)
+        );
+        let catalog = Catalog::new(vec![on(2, "Mira Vale", "Echo", "Hello, World")]);
+        assert_eq!(
+            bound(&catalog, Some("Hello, World Strikes Back"), "Echo"),
+            None
+        );
+        assert_eq!(
+            bound(&catalog, Some("Hello, World: Live Sessions"), "Echo"),
+            None
+        );
+        assert_eq!(
+            bound(&catalog, Some("Hello, World: Rarities"), "Echo"),
+            Some(2)
+        );
+        // A subtitle that runs on from the other's, and one after a full
+        // stop.
+        let catalog = Catalog::new(vec![
+            on(3, "Mira Vale", "Salt", "Low Tide: A Benefit for the Coast"),
+            on(4, "Mira Vale", "Road", "Lantern Light. And Then the Dark"),
+        ]);
+        assert_eq!(
+            bound(
+                &catalog,
+                Some("Low Tide: A Benefit for the Coast Fund"),
+                "Salt"
+            ),
+            Some(3)
+        );
+        assert_eq!(bound(&catalog, Some("Lantern Light"), "Road"), Some(4));
     }
 
     #[test]
