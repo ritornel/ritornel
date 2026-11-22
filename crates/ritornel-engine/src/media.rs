@@ -16,6 +16,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 
 use ritornel_domain::payload::{
@@ -630,7 +631,8 @@ pub(crate) fn read_file(
         folder_images,
         error: None,
     };
-    payload.error = read_audio(&crate::walk::under(root, rel_path), &mut payload).err();
+    let path = crate::walk::under(root, rel_path);
+    payload.error = caught(&mut payload, |payload| read_audio(&path, payload)).err();
     if payload
         .error
         .as_ref()
@@ -642,9 +644,64 @@ pub(crate) fn read_file(
     payload
 }
 
+/// Runs `read` on `payload`, and takes a panic in it, as a decoder may
+/// have on a file it cannot make sense of, for a malformed file: the file is
+/// recorded as unreadable, and the scan goes on to the next. What the read
+/// had filled in is dropped.
+fn caught(
+    payload: &mut Payload,
+    read: impl FnOnce(&mut Payload) -> Result<(), ReadError>,
+) -> Result<(), ReadError> {
+    let panicked = match std::panic::catch_unwind(AssertUnwindSafe(|| read(payload))) {
+        Ok(result) => return result,
+        Err(panicked) => panicked,
+    };
+    let why = panicked
+        .downcast_ref::<&str>()
+        .map(|why| (*why).to_owned())
+        .or_else(|| panicked.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no reason given".to_owned());
+    payload.container = None;
+    payload.audio = None;
+    payload.tags.clear();
+    payload.pictures.clear();
+    Err(failed(
+        "malformed",
+        format!("the reader stopped on an error it did not expect: {why}"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reader_that_panics_leaves_the_file_unreadable_and_nothing_half_read() {
+        let mut payload = read_file(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "../../fixtures/audio/a.flac",
+            0,
+            0,
+            Vec::new(),
+        );
+        assert!(payload.audio.is_some() && payload.error.is_none());
+        let panicked = caught(&mut payload, |_| panic!("an index out of bounds"));
+        assert_eq!(
+            panicked,
+            Err(ReadError {
+                kind: "malformed".to_owned(),
+                message: "the reader stopped on an error it did not expect: an index out of bounds"
+                    .to_owned(),
+            })
+        );
+        assert!(payload.audio.is_none() && payload.tags.is_empty());
+        assert_eq!(caught(&mut payload, |_| Ok(())), Ok(()));
+        let malformed = failed("malformed", "no frames");
+        assert_eq!(
+            caught(&mut payload, |_| Err(malformed.clone())),
+            Err(malformed)
+        );
+    }
 
     #[test]
     fn the_size_of_an_image_is_read_from_its_header() {

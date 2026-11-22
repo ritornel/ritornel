@@ -459,7 +459,7 @@ async fn art(State(core): State<Arc<Core>>, Path((art, size)): Path<(String, Str
             | ritornel_engine::covers::CoverError::BadSize,
         )) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        // The server is stopping.
+        // The server is stopping, or making the cover panicked.
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }

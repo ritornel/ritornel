@@ -15,12 +15,14 @@
 //! it starts.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use ritornel_engine::Entropy;
 use subtle::ConstantTimeEq;
+use tracing::warn;
 
 use crate::Error;
 
@@ -233,7 +235,13 @@ fn work(shared: &Shared) {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         };
-        (job.work)();
+        // A cover a decoder panics on is not made, and its request is
+        // answered as failed when its work is dropped. The thread goes on
+        // to the next, so that the pool does not shrink one panic at a time
+        // until no cover is ever made.
+        if std::panic::catch_unwind(AssertUnwindSafe(job.work)).is_err() {
+            warn!("making a cover panicked");
+        }
     }
 }
 
@@ -287,6 +295,24 @@ mod tests {
             .collect();
         assert_eq!(made, ["newest", "middle", "oldest"]);
         assert!(order.recv_timeout(Duration::from_millis(50)).is_err());
+        pool.stop();
+    }
+
+    #[test]
+    fn a_request_that_panics_leaves_its_thread_to_make_the_next() {
+        let pool = CoverPool::start(1);
+        // Holds the one thread until both are queued. The newest is made
+        // first: the one that panics.
+        let (release, held) = mpsc::channel::<()>();
+        let _busy = pool.submit(move || {
+            let _ = held.recv();
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let (done, made) = mpsc::channel();
+        let _second = pool.submit(move || done.send(()).unwrap());
+        let _first = pool.submit(|| panic!("a cover that cannot be made"));
+        release.send(()).unwrap();
+        assert_eq!(made.recv_timeout(Duration::from_secs(10)), Ok(()));
         pool.stop();
     }
 }
