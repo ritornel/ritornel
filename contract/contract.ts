@@ -133,6 +133,7 @@ export const METHODS = {
   "link.tracks": { kind: "query", needsFull: true },
   "link.copies": { kind: "query", needsFull: true },
   "link.listen": { kind: "command", needsFull: true },
+  "link.ping": { kind: "session", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -209,6 +210,7 @@ export type MethodMap = {
   "link.tracks": { params: LinkTracksParams; result: LinkTracks };
   "link.copies": { params: LinkCopiesParams; result: LinkCopies };
   "link.listen": { params: LinkListenParams; result: LinkListened };
+  "link.ping": { params: LinkPingParams; result: LinkPinged };
 };
 
 /** The name of a method. */
@@ -2329,6 +2331,27 @@ export type LinkListened = {
    * What became of it.
    */
   taken: ListenTaken,
+};
+
+/**
+ * What a satellite tells its hub every few seconds with `link.ping`.
+ */
+export type LinkPingParams = {
+  /**
+   * Whether the satellite's player is playing.
+   */
+  playing: boolean,
+};
+
+/**
+ * The result of `link.ping`.
+ */
+export type LinkPinged = {
+  /**
+   * Whether the hub keeps its machine from sleeping for its linked
+   * servers now.
+   */
+  keptAwake: boolean,
 };
 
 /**

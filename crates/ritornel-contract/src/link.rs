@@ -230,6 +230,25 @@ pub struct LinkListened {
     pub taken: ListenTaken,
 }
 
+/// What a satellite tells its hub every few seconds with `link.ping`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPingParams {
+    /// Whether the satellite's player is playing.
+    pub playing: bool,
+}
+
+/// The result of `link.ping`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPinged {
+    /// Whether the hub keeps its machine from sleeping for its linked
+    /// servers now.
+    pub kept_awake: bool,
+}
+
 /// What a satellite sends to `POST /v1/link` to join: the invite's secret
 /// and who it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

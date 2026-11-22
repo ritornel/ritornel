@@ -16,13 +16,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ritornel_client::contract::methods::{
-    LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkStatusCall, PlaybackPlay, QueueWindow,
-    RatingsSet, SourcesAdd,
+    LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, PlaybackPlay,
+    QueueWindow, RatingsSet, SourcesAdd,
 };
 use ritornel_client::contract::{
     CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink, LinkInviteParams,
-    LinkJoinParams, LinkListenParams, LinkRequest, LinkStatus, ListKind, ListOpenParams,
-    ListenTaken, NoParams, PlaySource, PlaybackPlayParams, PlaybackStatus, Query,
+    LinkJoinParams, LinkListenParams, LinkPingParams, LinkRequest, LinkStatus, ListKind,
+    ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackPlayParams, PlaybackStatus, Query,
     QueueWindowParams, RatingSetParams, Row, ServerRole, SourcesAddParams, Topic, Window,
     capability, hex, link_request_proof, route,
 };
@@ -994,6 +994,46 @@ async fn a_listen_sent_again_is_taken_once_and_only_from_its_own_player() {
         let hub_client = client(&scratch, "hub", &hub).await;
         let refused = hub_client
             .call::<LinkListen>(&send(record, listen_id))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_pings_its_hub_and_no_one_else_does() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, _desk, _desk_client) = linked(&scratch).await;
+        let token = {
+            let db =
+                rusqlite::Connection::open(scratch.data_dir("desk").join("server.db")).unwrap();
+            db.query_row("SELECT token FROM hub_link", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+        };
+        let linked = Client::connect(hub.endpoint(), &Credential::new(&token))
+            .await
+            .unwrap();
+        linked
+            .hello(&HelloParams {
+                name: "desk".to_owned(),
+                kind: ClientKind::Server,
+                version: "1".to_owned(),
+                contract_version: CONTRACT_VERSION,
+            })
+            .await
+            .unwrap();
+        // Whether the hub is kept awake is the system's to grant, so only
+        // the answer is looked for here; the rule has tests of its own.
+        linked
+            .call::<LinkPing>(&LinkPingParams { playing: true })
+            .await
+            .unwrap();
+        let refused = hub_client
+            .call::<LinkPing>(&LinkPingParams { playing: true })
             .await
             .unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");

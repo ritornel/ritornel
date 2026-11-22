@@ -506,6 +506,12 @@ methods! {
     /// nothing.
     LinkListen: "link.listen", Command, needs_full: true,
     LinkListenParams => LinkListened;
+
+    /// `link.ping`: on a hub, a satellite's word, every few seconds, that
+    /// it is there and whether it plays. A satellite that plays keeps the
+    /// hub's machine awake; the ping alone does not.
+    LinkPing: "link.ping", Session, needs_full: true,
+    LinkPingParams => LinkPinged;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -591,7 +597,8 @@ mod tests {
                 "link.status",
                 "link.tracks",
                 "link.copies",
-                "link.listen"
+                "link.listen",
+                "link.ping"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -640,7 +647,8 @@ mod tests {
                 "link.status",
                 "link.tracks",
                 "link.copies",
-                "link.listen"
+                "link.listen",
+                "link.ping"
             ]
         );
         // Everything but reading the library and controlling playback

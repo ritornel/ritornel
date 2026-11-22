@@ -43,7 +43,7 @@ A server is named after its computer (`platform::computer_name`), so a hub's sat
 
 ### Keeping a hub awake
 
-A sleeping hub is one its satellites cannot reach. Once a satellite is linked, at start or when one joins, a hub asks the system to keep it from idle sleep (`Core::stay_awake_while_linked`, `platform::stay_awake`) until the server stops. The display may still sleep. Where the system refuses or has no way to ask, the server logs a warning and runs on. [`platforms.md`](platforms.md) says how each system is asked.
+A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so a hub keeps its machine from idle sleep only while a linked server is active: while one plays, or for a window after its last call, 30 minutes unless `awake_minutes` says otherwise. `Activity::keeps_awake` in `apps/server/src/awake.rs` is the rule. Every call on a link session counts but `link.ping`, which a satellite sends every ten seconds to say whether it plays; a word that it plays holds for 30 seconds. The hub asks the system when the rule first holds (`platform::stay_awake`) and lets go when it no longer does, checked on each call and once a minute. The display may still sleep. Where the system refuses, or has no way to ask, the server logs a warning, runs on, and asks again a minute later at the soonest. [`platforms.md`](platforms.md) says how each system is asked.
 
 ## Data directory
 
@@ -156,6 +156,7 @@ Settings resolve in order: **CLI flag → `RITORNEL_*` environment variable → 
 | Listen address | `--listen` | `RITORNEL_LISTEN` | `127.0.0.1:4747` (fallback: OS port); or `private:<port>` |
 | Log level | `--log-level` | `RITORNEL_LOG_LEVEL` | `info` |
 | Backup folder | `--backup-dir` | `RITORNEL_BACKUP_DIR` | None (backups disabled until set) |
+| How long a hub stays awake after a linked server's last call | `--awake-minutes` | `RITORNEL_AWAKE_MINUTES` | 30 |
 
 `--data-dir` / `RITORNEL_DATA_DIR` selects the data directory before `config.toml` is read, and `--output` (`default`, `null`, `none`) selects the audio output mode. All other persistent settings live in `library.db` (library-wide) or `server.db` (machine-local).
 

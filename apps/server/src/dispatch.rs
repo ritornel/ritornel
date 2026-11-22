@@ -18,12 +18,12 @@ use ritornel_contract::methods::{
     IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall,
     LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
     LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkCopiesCall,
-    LinkInvite, LinkJoin, LinkListen, LinkStatusCall, LinkTracksCall, ListClose, ListLocate,
-    ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet, PlaybackJump,
-    PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet, PlaybackSkip,
-    PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow, RatingsSet,
-    RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList, SourcesAdd,
-    SourcesList, SourcesTracks, TracksGet,
+    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall, ListClose,
+    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
+    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
+    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
+    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList,
+    SourcesAdd, SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -131,9 +131,9 @@ pub(crate) struct Core {
     runtime: Option<tokio::runtime::Handle>,
     /// On a satellite, its link to its hub.
     uplink: RwLock<Option<Arc<crate::uplink::Uplink>>>,
-    /// On a hub with satellites linked to it, what keeps the machine from
-    /// sleeping while it serves them.
-    awake: Mutex<Option<crate::platform::Awake>>,
+    /// On a hub, its linked servers' activity, and what keeps the machine
+    /// from sleeping while one is active.
+    awake: Mutex<crate::awake::Awake>,
     /// What a library created here takes its times and its IDs from.
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
@@ -265,7 +265,7 @@ impl Core {
             routes: std::sync::OnceLock::new(),
             runtime,
             uplink: RwLock::new(uplink),
-            awake: Mutex::new(None),
+            awake: Mutex::new(crate::awake::Awake::new(crate::awake::DEFAULT_WINDOW)),
             clock,
             entropy,
             bounds,
@@ -354,26 +354,41 @@ impl Core {
         self.changed(&mut this);
     }
 
-    /// Keeps the machine awake, its screen free to sleep, once a satellite
-    /// is linked to this hub: a sleeping hub is one its satellites cannot
-    /// reach. It holds until the server stops.
-    pub(crate) fn stay_awake_while_linked(&self) {
+    /// How long after a linked server's last call this hub stays awake.
+    /// Set once, before anything is linked.
+    pub(crate) fn set_awake_window(&self, window: std::time::Duration) {
+        *lock(&self.awake) = crate::awake::Awake::new(window);
+    }
+
+    /// The linked server `peer` made a call: the machine stays awake for
+    /// it, its screen free to sleep.
+    pub(crate) fn linked_server_called(&self, peer: Id) {
+        let now = self.clock.now_ms();
         let mut awake = lock(&self.awake);
-        if awake.is_some() || !self.link_sessions.any() {
-            return;
-        }
-        match crate::platform::stay_awake("satellites are linked to this hub") {
-            Ok(held) => {
-                info!(
-                    "satellites are linked: the machine is kept from sleeping while this server runs"
-                );
-                *awake = Some(held);
-            }
-            Err(error) => warn!(
-                %error,
-                "satellites are linked and this machine may sleep: keep it awake by its own settings"
-            ),
-        }
+        awake.activity.called(peer, now);
+        awake.follow_the_rule(now);
+    }
+
+    /// The linked server `peer` said whether it plays. Says whether the
+    /// machine is kept awake now.
+    pub(crate) fn linked_server_pinged(&self, peer: Id, playing: bool) -> bool {
+        let now = self.clock.now_ms();
+        let mut awake = lock(&self.awake);
+        awake.activity.pinged(peer, playing, now);
+        awake.follow_the_rule(now)
+    }
+
+    /// Lets the machine sleep again once no linked server is active.
+    pub(crate) fn check_awake(&self) {
+        let now = self.clock.now_ms();
+        lock(&self.awake).follow_the_rule(now);
+    }
+
+    /// Whether this server's player is playing.
+    pub(crate) fn playing(&self) -> bool {
+        lock(&self.player).as_ref().is_some_and(|player| {
+            player.state().status == ritornel_engine::playback::Status::Playing
+        })
     }
 
     /// Says where other machines reach this server: once, when it starts
@@ -716,6 +731,13 @@ impl Core {
                 ),
             ));
         }
+        // What a linked server asks keeps this hub awake for a while; its
+        // ping only says whether it plays.
+        if let Some(peer) = session.peer()
+            && row.name != LinkPing::NAME
+        {
+            self.linked_server_called(peer);
+        }
         if let Some(uplink) = self.uplink() {
             match link::on_a_satellite(row.name) {
                 link::Route::Here => {}
@@ -910,6 +932,7 @@ impl Core {
             LinkListen::NAME => {
                 run::<LinkListen>(params, |params| self.link_listen(stores, session, params))
             }
+            LinkPing::NAME => run::<LinkPing>(params, |params| self.link_ping(session, params)),
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {
                 run::<HistorySetZones>(params, |params| self.history_set_zones(stores, &params))

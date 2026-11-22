@@ -3,7 +3,7 @@
 //! ```text
 //! ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
 //!                       [--log-level <level>] [--output <output>]
-//!                       [--backup-dir <dir>]
+//!                       [--backup-dir <dir>] [--awake-minutes <minutes>]
 //! ritornel-server service install [--data-dir <dir>]
 //! ritornel-server service uninstall | status
 //! ```
@@ -27,7 +27,7 @@ The Ritornel server. It owns a data directory and the databases in it.
 Usage:
   ritornel-server serve [--data-dir <dir>] [--listen <address>] [--owned]
                         [--log-level <level>] [--output <output>]
-                        [--backup-dir <dir>]
+                        [--backup-dir <dir>] [--awake-minutes <minutes>]
   ritornel-server service install [--data-dir <dir>]
   ritornel-server service uninstall | status
 
@@ -73,6 +73,11 @@ Options:
                         own in it, taken by `ritornelctl backup` and before
                         a database is migrated. With none named there is no
                         backup, and `ritornelctl status` says so
+  --awake-minutes <minutes>
+                        On a hub, how long the machine is kept from
+                        sleeping after a linked server's last call. A
+                        linked server that plays keeps it awake too. The
+                        default is 30
   -h, --help            Show this help
   -V, --version         Show the version
 
@@ -85,6 +90,9 @@ Environment:
   RITORNEL_LISTEN       The listen address, when --listen is not given
   RITORNEL_LOG_LEVEL    The log level, when --log-level is not given
   RITORNEL_BACKUP_DIR   The backup folder, when --backup-dir is not given
+  RITORNEL_AWAKE_MINUTES
+                        How long a hub stays awake, when --awake-minutes is
+                        not given
 
 A setting is read from its flag, then its environment variable, then
 config.toml in the data directory, then its default.
@@ -140,6 +148,8 @@ pub(crate) struct ServeArgs {
     pub(crate) output: Option<String>,
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub(crate) backup_dir: Option<String>,
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub(crate) awake_minutes: Option<String>,
 }
 
 /// What a wrong command line is answered with. The messages are fixed and
@@ -178,6 +188,11 @@ fn usage(error: &clap::Error) -> Error {
             if option.starts_with("--backup-dir") =>
         {
             "--backup-dir needs a folder"
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation
+            if option.starts_with("--awake-minutes") =>
+        {
+            "--awake-minutes needs a number of minutes"
         }
         _ => "the command line is wrong; try `ritornel-server --help`",
     })
@@ -275,6 +290,7 @@ mod tests {
             invent_churn: None,
             output: None,
             backup_dir: None,
+            awake_minutes: None,
         });
         for line in [
             &[

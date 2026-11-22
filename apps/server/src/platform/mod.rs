@@ -81,6 +81,14 @@ pub(crate) fn computer_name() -> Option<String> {
 #[derive(Debug)]
 pub(crate) struct Awake(std::process::Child);
 
+impl Awake {
+    /// Whether the helper still holds the assertion. One the system
+    /// refused has ended.
+    pub(crate) fn holds(&mut self) -> bool {
+        matches!(self.0.try_wait(), Ok(None))
+    }
+}
+
 impl Drop for Awake {
     fn drop(&mut self) {
         // Closing its input ends a helper that waits on it; the rest are

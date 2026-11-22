@@ -467,9 +467,10 @@ const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Follows a satellite's hub for as long as the server runs: tells its
 /// clients, with a `servers` event, each time the hub begins or stops
-/// answering, and asks the hub every [`CHECK_EVERY`] so that a hub that
-/// went while nothing was asked of it is found out. A server that is no
-/// satellite yet is looked at again until it is one.
+/// answering, and pings the hub every [`CHECK_EVERY`] so that a hub that
+/// went while nothing was asked of it is found out. The ping says whether
+/// this server plays, which keeps the hub awake while it does. A server
+/// that is no satellite yet is looked at again until it is one.
 pub(crate) async fn follow(core: std::sync::Arc<crate::dispatch::Core>) {
     loop {
         let Some(uplink) = core.uplink() else {
@@ -487,10 +488,8 @@ pub(crate) async fn follow(core: std::sync::Arc<crate::dispatch::Core>) {
                 }
                 () = tokio::time::sleep(CHECK_EVERY) => {
                     let asked = Arc::clone(&uplink);
-                    let _ = tokio::task::spawn_blocking(move || {
-                        asked.call("servers.list", Value::Object(serde_json::Map::new()))
-                    })
-                    .await;
+                    let ping = serde_json::json!({ "playing": core.playing() });
+                    let _ = tokio::task::spawn_blocking(move || asked.call("link.ping", ping)).await;
                 }
             }
         }

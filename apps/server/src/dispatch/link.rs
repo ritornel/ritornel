@@ -11,8 +11,8 @@ use ritornel_contract::methods::{LinkListen, Method};
 use ritornel_contract::{
     CONTRACT_VERSION, ErrorCode, HubCopy, HubStatus, Id, InviteLink, LinkCopies, LinkCopiesParams,
     LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened,
-    LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken, MAX_CLIENT_TEXT, RpcError,
-    SatelliteStatus, ServerRole, hex, link_request_proof,
+    LinkPingParams, LinkPinged, LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken,
+    MAX_CLIENT_TEXT, RpcError, SatelliteStatus, ServerRole, hex, link_request_proof,
 };
 use ritornel_engine::playback::{Catalog, Delivered, FileFacts, deliver_listens_to};
 use ritornel_engine::{Clock, HubLink, Ingested, LISTEN_RECORD_VERSION, ListenRecord, SendStamps};
@@ -286,7 +286,7 @@ impl Core {
         // Whatever the satellite had open on the session it held before
         // ends with it.
         self.close_linked(asked.server_id);
-        self.stay_awake_while_linked();
+        self.linked_server_called(asked.server_id);
         info!(satellite = %asked.server_id, name = %name, "a satellite joined");
         Ok(LinkGranted {
             token: token.expose().to_owned(),
@@ -498,6 +498,23 @@ impl Core {
     /// `link.listen`, on a hub: one listen from a satellite's outbox, taken
     /// in as the hub's own player's are. A satellite reports listens for
     /// its own player only.
+    /// `link.ping`: a satellite says it is there and whether it plays.
+    pub(super) fn link_ping(
+        &self,
+        session: &Session,
+        params: LinkPingParams,
+    ) -> Result<LinkPinged, RpcError> {
+        let Some(peer) = session.peer() else {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "link.ping is for a satellite's link session",
+            ));
+        };
+        Ok(LinkPinged {
+            kept_awake: self.linked_server_pinged(peer, params.playing),
+        })
+    }
+
     pub(super) fn link_listen(
         &self,
         stores: &Stores,

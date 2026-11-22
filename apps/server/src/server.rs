@@ -35,12 +35,12 @@ impl Drop for Transports {
     }
 }
 
-/// The task that follows a satellite's hub, ended when the server stops or
-/// is dropped, so that it never outlives the server it holds.
+/// A task of the server's own, ended when the server stops or is dropped,
+/// so that it never outlives the server it holds.
 #[derive(Debug)]
-struct Following(tokio::task::JoinHandle<()>);
+struct Task(tokio::task::JoinHandle<()>);
 
-impl Drop for Following {
+impl Drop for Task {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -60,7 +60,10 @@ pub struct Server {
     watcher: crate::watch::Watcher,
     /// What follows a satellite's hub and tells its clients when the hub
     /// is away, or back.
-    hub: Following,
+    hub: Task,
+    /// What lets a hub's machine sleep again once no linked server is
+    /// active.
+    awake: Task,
     transports: Transports,
     listening: Listening,
     bounds: Bounds,
@@ -206,7 +209,7 @@ impl Server {
         if let Some(player) = player {
             core.set_player(player);
         }
-        core.stay_awake_while_linked();
+        core.set_awake_window(run.awake_window.unwrap_or(crate::awake::DEFAULT_WINDOW));
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
         core.set_watch(run.watch);
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
@@ -229,7 +232,8 @@ impl Server {
         let scrobbler =
             crate::lastfm::Scrobbler::start(Arc::clone(&core)).map_err(Error::Runtime)?;
         let watcher = crate::watch::Watcher::start(Arc::clone(&core)).map_err(Error::Runtime)?;
-        let hub = Following(tokio::spawn(crate::uplink::follow(Arc::clone(&core))));
+        let hub = Task(tokio::spawn(crate::uplink::follow(Arc::clone(&core))));
+        let awake = Task(tokio::spawn(crate::awake::check(Arc::clone(&core))));
 
         // The server answers, so a client may be told where it is.
         let server_json = ServerJson::publish(
@@ -244,6 +248,7 @@ impl Server {
             scrobbler,
             watcher,
             hub,
+            awake,
             core,
             listening,
             bounds,
@@ -344,6 +349,7 @@ impl Server {
     /// waits for it to finish.
     pub async fn stop(self) -> Result<(), Error> {
         drop(self.hub);
+        drop(self.awake);
         self.core.close_sessions();
         self.listening.stop().await;
         self.core.end_transports(self.bounds.stop_grace).await;
