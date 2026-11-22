@@ -3559,9 +3559,15 @@ export type RecordProblemKind = "listen_unsaved" | "listens_undelivered" | "scro
  */
 export type RecordStatus = {
   /**
-   * What is wrong now, oldest first. Empty when the record advances.
+   * The warnings: what is wrong now and can be put right, oldest first.
+   * Empty when the record advances.
    */
   problems: Array<RecordProblem>,
+  /**
+   * The notes: what the person should know and can do nothing about,
+   * oldest first. They do not stop the record.
+   */
+  notes: Array<RecordProblem>,
 };
 
 /**

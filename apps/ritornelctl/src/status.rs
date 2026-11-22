@@ -82,18 +82,26 @@ fn render(status: &ServerStatus) -> String {
 fn recording(record: &RecordStatus, lines: &mut Vec<(&str, String)>) {
     if record.problems.is_empty() {
         lines.push(("Record", "advancing".to_owned()));
-        return;
     }
     for (n, problem) in record.problems.iter().enumerate() {
         lines.push((if n == 0 { "Record" } else { "" }, stopped(problem)));
-        lines.push((
-            "",
-            record::what_to_do(problem.kind, "`ritornelctl status --dismiss`"),
-        ));
+        lines.push(("", record::then(problem, WORDS)));
+    }
+    // What happened that no one can act on: told, and quieter.
+    for (n, note) in record.notes.iter().enumerate() {
+        lines.push((if n == 0 { "Note" } else { "" }, stopped(note)));
+        lines.push(("", record::then(note, WORDS)));
     }
 }
 
-/// One thing that stops the record: what, since when and why.
+/// How this program says what the person does.
+const WORDS: record::Words<'static> = record::Words {
+    dismiss: "`ritornelctl status --dismiss`",
+    restart: "restart the server",
+    sign_in: "with `ritornelctl lastfm signin`",
+};
+
+/// One thing that stops the record, or a note: what, since when and why.
 fn stopped(problem: &RecordProblem) -> String {
     let mut line = format!(
         "{}, since {}",
@@ -339,7 +347,10 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
                 .to_owned()
         };
         assert_eq!(
-            tail(RecordStatus { problems: vec![] }),
+            tail(RecordStatus {
+                problems: vec![],
+                notes: vec![]
+            }),
             "Record            advancing\n"
         );
         let at = 1_763_744_462_000;
@@ -360,13 +371,6 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
                         false
                     ),
                     problem(RecordProblemKind::ListensUndelivered, 3, None, false),
-                    problem(RecordProblemKind::ScrobblesUnknown, 1, None, true),
-                    problem(
-                        RecordProblemKind::ScrobblesWithdrawn,
-                        2,
-                        Some("its play is excluded"),
-                        true
-                    ),
                     problem(
                         RecordProblemKind::ScrobblesRefused,
                         4,
@@ -381,23 +385,40 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
                         false
                     ),
                 ],
+                notes: vec![
+                    problem(RecordProblemKind::ScrobblesUnknown, 1, None, true),
+                    problem(
+                        RecordProblemKind::ScrobblesWithdrawn,
+                        2,
+                        Some("its play is excluded"),
+                        true
+                    ),
+                ],
             }),
             "\
 Record            The listen playing can’t be saved, since 2025-11-21 17:01 UTC: disk I/O error
                   Check that the disk Ritornel’s data is on has free space. Ritornel keeps trying, and saves the listen as soon as it can.
                   3 listens haven’t reached your history, since 2025-11-21 17:01 UTC
                   Ritornel keeps trying. If this lasts, check that the disk Ritornel’s data is on has free space, and look in the server’s log.
-                  1 scrobble may not have reached Last.fm, since 2025-11-21 17:01 UTC
-                  Nothing to do yet: the next import from Last.fm clears those that arrived. Ritornel doesn’t send the rest again; they stay in your history here. `ritornelctl status --dismiss` sets them aside.
-                  2 scrobbles weren’t sent to Last.fm, since 2025-11-21 17:01 UTC: its play is excluded
-                  Nothing to do: their plays stopped counting, or grew too old for Last.fm, before they could be sent. They stay in your history here. `ritornelctl status --dismiss` sets them aside.
                   Last.fm is refusing scrobbles, since 2025-11-21 17:01 UTC: Invalid API key
                   Check the API key and secret Ritornel uses, in lastfm.env in its data folder, then restart the server. It clears by itself once Last.fm takes a scrobble again. Refused scrobbles aren’t sent again; `ritornelctl status --dismiss` sets them aside.
                   Last.fm needs you to sign in again, since 2025-11-21 17:01 UTC
-                  Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. Sign in again, in Settings → Last.fm or with `ritornelctl lastfm signin`, then turn scrobbling back on. Plays from before then stay in your history here.
+                  Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. Sign in again with `ritornelctl lastfm signin`, then turn scrobbling back on. Plays from before then stay in your history here.
                   Importing from Last.fm failed, since 2025-11-21 17:01 UTC: Last.fm did not answer
                   Ritornel tries again at the next import. If it keeps failing, check the internet connection, and the API key and secret in lastfm.env in Ritornel’s data folder, then restart the server.
+Note              1 scrobble may not have reached Last.fm, since 2025-11-21 17:01 UTC
+                  The play is still in your history here. Each import from Last.fm clears any that arrived; Ritornel doesn’t send it again. `ritornelctl status --dismiss` sets this note aside.
+                  2 plays weren’t sent to Last.fm, since 2025-11-21 17:01 UTC: its play is excluded
+                  They’re still in your history here. Ritornel didn’t send them because they stopped counting, or grew too old for Last.fm, before their turn came. `ritornelctl status --dismiss` sets this note aside.
 "
+        );
+        // Notes alone: the record advances, and they are said all the same.
+        assert!(
+            tail(RecordStatus {
+                problems: vec![],
+                notes: vec![problem(RecordProblemKind::ScrobblesUnknown, 1, None, true)],
+            })
+            .starts_with("Record            advancing\nNote              1 scrobble")
         );
     }
 
@@ -421,6 +442,7 @@ Record            The listen playing can’t be saved, since 2025-11-21 17:01 UT
                     dismissable: false,
                 },
             ],
+            notes: vec![],
         });
         let shown = render(&status);
         let record = shown

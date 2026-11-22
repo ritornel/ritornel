@@ -206,7 +206,15 @@ impl Core {
         };
         problems.extend(unreadable(&unread, since));
         problems.sort_by_key(|problem| problem.since);
-        RecordStatus { problems }
+        // What no one can act on is not a warning: it is said as a note,
+        // and does not stop the record.
+        let (notes, problems) = problems.into_iter().partition(|problem| {
+            matches!(
+                problem.kind,
+                RecordProblemKind::ScrobblesUnknown | RecordProblemKind::ScrobblesWithdrawn
+            )
+        });
+        RecordStatus { problems, notes }
     }
 
     /// `record.dismiss`: the scrobbles that ended unknown or withdrawn by

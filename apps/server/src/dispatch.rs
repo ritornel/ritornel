@@ -1277,7 +1277,7 @@ mod tests {
                 // No backup folder is named, so there is no backup.
                 "backup": {},
                 // Nothing has stopped the record.
-                "record": { "problems": [] },
+                "record": { "problems": [], "notes": [] },
             })
         );
     }
@@ -1332,7 +1332,7 @@ mod tests {
         call(&core, &session, "library.create", Some(key(0xc1))).unwrap();
         for _ in 0..2 {
             let dismissed = call(&core, &session, "record.dismiss", Some(key(0xd2))).unwrap();
-            assert_eq!(dismissed["record"], json!({ "problems": [] }));
+            assert_eq!(dismissed["record"], json!({ "problems": [], "notes": [] }));
         }
     }
 
@@ -1341,7 +1341,7 @@ mod tests {
         let (core, _scratch) = core();
         let session = greeted(&core, SessionKind::Full);
         let dismissed = call(&core, &session, "record.dismiss", Some(key(0xd1))).unwrap();
-        assert_eq!(dismissed["record"], json!({ "problems": [] }));
+        assert_eq!(dismissed["record"], json!({ "problems": [], "notes": [] }));
     }
 
     /// The params of a command with this byte for every byte of its key.

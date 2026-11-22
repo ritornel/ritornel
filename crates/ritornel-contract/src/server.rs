@@ -230,8 +230,13 @@ pub struct ServerStatus {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct RecordStatus {
-    /// What is wrong now, oldest first. Empty when the record advances.
+    /// The warnings: what is wrong now and can be put right, oldest first.
+    /// Empty when the record advances.
     pub problems: Vec<RecordProblem>,
+    /// The notes: what the person should know and can do nothing about,
+    /// oldest first. They do not stop the record.
+    #[serde(default)]
+    pub notes: Vec<RecordProblem>,
 }
 
 /// One thing that has stopped the record advancing, and since when.
@@ -264,12 +269,12 @@ pub enum RecordProblemKind {
     /// Listens saved on this server have failed to reach history. They are
     /// tried again.
     ListensUndelivered,
-    /// Scrobbles were sent and never answered, and no import has brought
-    /// them back since: the service may not have them. They are not sent
-    /// again. One an import brings back stops counting here.
+    /// A note: scrobbles were sent and never answered, and no import has
+    /// brought them back since, so the service may not have them. They are
+    /// not sent again. One an import brings back stops counting here.
     ScrobblesUnknown,
-    /// Scrobbles were never sent, because their plays stopped being ones
-    /// to send.
+    /// A note: scrobbles were never sent, because their plays stopped being
+    /// ones to send.
     ScrobblesWithdrawn,
     /// The service refuses the requests that carry scrobbles, so none is
     /// taken: a key it no longer accepts, or a request it cannot read.

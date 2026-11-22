@@ -8,7 +8,7 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use ritornel_client::record;
-use ritornel_contract::{RecordStatus, WatchState, WatchedFolder, WatchedKind};
+use ritornel_contract::{RecordProblem, RecordStatus, WatchState, WatchedFolder, WatchedKind};
 
 use super::act;
 use super::controls::{
@@ -60,31 +60,36 @@ fn record(
         );
     }
     let dismissing = model.busy.contains(&Busy::Dismissing);
-    // One button sets every such scrobble aside, so one is shown.
-    let dismiss_at = record
+    // The warnings, then the notes: what no one can act on, said quietly.
+    let all: Vec<(&RecordProblem, bool)> = record
         .problems
         .iter()
-        .position(|problem| problem.dismissable);
-    for (n, problem) in record.problems.iter().enumerate() {
-        // What is wrong, since when and why, and what to do about it, in
-        // the words `ritornelctl status` says too.
+        .map(|problem| (problem, true))
+        .chain(record.notes.iter().map(|note| (note, false)))
+        .collect();
+    // One button sets every such scrobble aside, so one is shown.
+    let dismiss_at = all.iter().position(|(problem, _)| problem.dismissable);
+    for (n, (problem, warning)) in all.iter().enumerate() {
+        // What is wrong or what happened, since when and why, and what to
+        // do or what Ritornel does, in the words `ritornelctl status` says
+        // too.
         let since = format!("Since {}", when(problem.since, clock));
         let said = match &problem.detail {
             Some(detail) => format!("{since}: {detail}"),
             None => since,
         };
-        let to_do = record::what_to_do(problem.kind, "Dismiss");
+        let then = record::then(problem, WORDS);
         rows.push(
             row()
                 .child(
                     grow()
                         .child(
                             div()
-                                .text_color(super::controls::warn())
+                                .when(*warning, |what| what.text_color(super::controls::warn()))
                                 .child(record::what(problem)),
                         )
                         .child(sub_wraps(said))
-                        .child(sub_wraps(to_do)),
+                        .child(sub_wraps(then)),
                 )
                 .when(dismiss_at == Some(n), |row| {
                     row.child(actions().child(push(
@@ -96,18 +101,28 @@ fn record(
                 }),
         );
     }
+    let said = match (record.problems.is_empty(), dismiss_at.is_some()) {
+        (false, true) => Some(
+            "Music plays on while the record has stopped. One Dismiss sets every scrobble row aside.",
+        ),
+        (false, false) => Some("Music plays on while the record has stopped."),
+        (true, true) => Some("One Dismiss sets every scrobble row aside."),
+        (true, false) => None,
+    };
     group(true)
         .child(heading("Listening record"))
         .child(boxed(rows))
         .children(model.problems.get(&Group::Record).cloned().map(problem))
-        .when(!record.problems.is_empty(), |group| {
-            group.child(note(if dismiss_at.is_some() {
-                "Music plays on while the record has stopped. One Dismiss sets every scrobble row aside."
-            } else {
-                "Music plays on while the record has stopped."
-            }))
-        })
+        .children(said.map(note))
 }
+
+/// How the app says what the person does: its own button, and quitting
+/// it, which stops the server it started.
+const WORDS: record::Words<'static> = record::Words {
+    dismiss: "Dismiss",
+    restart: "quit and reopen Ritornel",
+    sign_in: "in Settings → Last.fm",
+};
 
 pub(super) fn render(
     model: &Model,
