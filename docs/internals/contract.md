@@ -48,6 +48,8 @@ A satellite (`apps/server/src/uplink.rs`) answers its own status, events, player
 
 Each connection walks the hub's routes in order (at most eight), checking the descriptor `proof` before presenting the link session. A connection gets four seconds a route and a call eight; a lost connection is replaced once at once, but not after a wait ran out. While the hub does not answer, a forwarded call fails with `unavailable`, reason `hub_unreachable`, the hub's name and `sinceMs`, and for two seconds after a failed try without trying again. `server.status` on a satellite reports the hub's library ID as its `library` and a `hub` (`HubStatus`) with `answers`, `sinceMs`, `route` and `problem`. A satellite says hello to its hub with `ClientKind::Server`.
 
+A satellite's listens reach the hub with `link.listen`, keyed on the satellite's player endpoint and the listen's ID, so a resend is `duplicate` and a differing one is `conflict` and kept beside the first in `history_ingest_conflict`. The hub takes them from a link session only, for that satellite's own player, of the current `LISTEN_RECORD_VERSION`, and with every number within 2^50.
+
 ### Transport-neutral dispatcher
 
 `Core::dispatch` takes a decoded `Frame` and a `Session` and returns an `Option<Frame>` without knowing anything about sockets. Both the WebSocket transport (`listener.rs`) and the in-memory test transport (`apps/server/src/memory.rs`) run through `Core::receive`, enforcing `MAX_MESSAGE_BYTES` (1 MiB) and full JSON text encoding/decoding (`Frame::encode` / `Frame::decode`). Production clients always connect over HTTP/WebSocket; the in-memory channel is used only by tests.
@@ -150,12 +152,12 @@ Clients gate optional behavior on `PublicDescriptor.capabilities` rather than ve
 
 ## Method summary
 
-All 68 methods are registered in `crates/ritornel-contract/src/methods.rs` (see `contract/contract.ts` for exact field types):
+All 69 methods are registered in `crates/ritornel-contract/src/methods.rs` (see `contract/contract.ts` for exact field types):
 
 | Area | Methods |
 |---|---|
 | Session & server | `server.hello`, `server.status`, `servers.list`, `events.subscribe`, `events.unsubscribe`, `server.backup`, `record.dismiss` |
-| Linking | `link.invite`, `link.join`, `link.status`, `link.tracks`, `link.copies` |
+| Linking | `link.invite`, `link.join`, `link.status`, `link.tracks`, `link.copies`, `link.listen` |
 | Library & sources | `library.create`, `sources.list`, `sources.add`, `sources.tracks`, `scan.start`, `library.stats`, `library.setWatching`, `artists.importPictures`, `artists.pictureFolders` |
 | Jobs & identity | `jobs.list`, `jobs.get`, `jobs.cancel`, `identity.dryRun`, `identity.review` |
 | Browse & media | `list.open`, `list.window`, `list.sections`, `list.locate`, `list.close`, `library.search`, `album.get`, `artist.get`, `tracks.get`, `media.token` |

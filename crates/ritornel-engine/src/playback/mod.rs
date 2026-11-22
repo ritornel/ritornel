@@ -23,7 +23,9 @@ pub(crate) mod tests;
 
 pub use audio::{AudioRenderer, OnDemand, Output};
 pub use catalog::{Catalog, Copy, TrackDisplay};
-pub use outbox::{Delivered, SendStamps, deliver_listens};
+pub use outbox::{
+    Delivered, Ingest, MAX_BACKOFF_MS, SendStamps, deliver_listens, deliver_listens_to,
+};
 pub use player::{
     AddTracks, CHECKPOINT_EVERY_MS, Direction, Done, NowPlaying, Order, OutputFailing, Place,
     PlayTracks, Player, PlayerEvent, PlayerSetup, PlayerState, QueuePage, Request, Settings,

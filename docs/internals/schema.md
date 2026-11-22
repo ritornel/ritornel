@@ -73,6 +73,6 @@ Listener ratings and service-reported loves live in `listener_rating`, enforced 
 
 The current schema already carries columns and tables reserved for planned capabilities whose engine or RPC surfaces are not yet complete:
 
-- `library_meta.hub_epoch` (alongside the already-enforced `hub_server_id` write guard and the local `outbox` delivery queue) prepares for transferring hub ownership across servers and delivering listens over a hub link.
+- `library_meta.hub_epoch` (alongside the already-enforced `hub_server_id` write guard) prepares for transferring hub ownership across servers.
 - `library_root.kind = 'cache'`, `manage_tags`, and `manage_layout` prepare for synced caches and opt-in file management (today every root is `'master'` and read-only).
 - `observation_correction`, `correction_target`, and `correction_recording` define the durable correction schema (including `set_recording`), awaiting interactive correction commands and UI.

@@ -499,6 +499,13 @@ methods! {
     /// satellite to fetch and play.
     LinkCopiesCall: "link.copies", Query, needs_full: true,
     LinkCopiesParams => LinkCopies;
+
+    /// `link.listen`: on a hub, takes in one listen a satellite's player
+    /// recorded, from the satellite's link session alone and only for its
+    /// own player. Keyed on the listen's ID, so sent again it changes
+    /// nothing.
+    LinkListen: "link.listen", Command, needs_full: true,
+    LinkListenParams => LinkListened;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -583,7 +590,8 @@ mod tests {
                 "link.join",
                 "link.status",
                 "link.tracks",
-                "link.copies"
+                "link.copies",
+                "link.listen"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -631,7 +639,8 @@ mod tests {
                 "link.join",
                 "link.status",
                 "link.tracks",
-                "link.copies"
+                "link.copies",
+                "link.listen"
             ]
         );
         // Everything but reading the library and controlling playback

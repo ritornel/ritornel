@@ -4,7 +4,8 @@
 //!
 //! A listen is staged in `server.db` and its delivery is an outbox row,
 //! written in the transaction that closed it. Delivering is the one ingest
-//! call, which on a single server is a call into the library here. Only
+//! call: on a hub a call into the library here, and on a satellite a call
+//! to its hub. Only
 //! once the hub has the listen do its staging row and its outbox row go,
 //! so a crash between the two sends it again, and the hub, keyed on the
 //! listen's ID, writes nothing the second time.
@@ -19,8 +20,9 @@ pub use crate::history_store::SendStamps;
 /// The most deliveries one pass makes.
 const PER_PASS: u32 = 100;
 
-/// The longest a failed delivery waits before it is tried again.
-const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
+/// The longest a failed delivery waits before it is tried again, on a
+/// hub.
+pub const MAX_BACKOFF_MS: i64 = 5 * 60 * 1000;
 
 /// What a pass of deliveries did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -93,8 +95,37 @@ pub fn deliver_listens(
     stamps: &dyn Fn() -> SendStamps,
     after_ingest: &dyn Fn() -> Result<(), Error>,
 ) -> Result<Delivered, Error> {
+    deliver_listens_to(
+        server,
+        &|record, stamps| library.ingest_listen(record, stamps),
+        clock,
+        stamps,
+        after_ingest,
+        MAX_BACKOFF_MS,
+    )
+}
+
+/// What takes a listen in: the library's ingest, here or at the hub.
+pub type Ingest<'a> = &'a dyn Fn(&ListenRecord, SendStamps) -> Result<Ingested, Error>;
+
+/// Delivers listens as [`deliver_listens`] does, to whatever `ingest`
+/// sends them to, waiting at most `max_backoff_ms` before a failed one is
+/// tried again.
+pub fn deliver_listens_to(
+    server: &ServerStore,
+    ingest: Ingest<'_>,
+    clock: &dyn Clock,
+    stamps: &dyn Fn() -> SendStamps,
+    after_ingest: &dyn Fn() -> Result<(), Error>,
+    max_backoff_ms: i64,
+) -> Result<Delivered, Error> {
     let now = clock.now_ms();
     let (due, mut next_due_ms) = server.due_deliveries(now, PER_PASS)?;
+    // A full pass may have left more that are due already: the next pass
+    // is due at once.
+    if due.len() >= PER_PASS as usize {
+        next_due_ms = Some(now);
+    }
     let mut done = Delivered::default();
     for delivery in due {
         let sent = server
@@ -109,7 +140,7 @@ pub fn deliver_listens(
                 };
                 record(&staged, actor)
             })
-            .and_then(|record| library.ingest_listen(&record, stamps()));
+            .and_then(|record| ingest(&record, stamps()));
         match sent {
             Ok(ingested) => {
                 after_ingest()?;
@@ -120,7 +151,7 @@ pub fn deliver_listens(
                 done.delivered.push(delivery.listen_id);
             }
             Err(error) => {
-                let wait = (1000_i64 << delivery.attempts.clamp(0, 20)).min(MAX_BACKOFF_MS);
+                let wait = (1000_i64 << delivery.attempts.clamp(0, 20)).min(max_backoff_ms);
                 let at = now.saturating_add(wait);
                 server.delivery_failed(delivery.row, error.to_string(), at)?;
                 next_due_ms = Some(next_due_ms.map_or(at, |next| next.min(at)));
