@@ -8,6 +8,8 @@
 //! emptied: a wall already drawn stays, and one that could not be read
 //! says why in its place.
 
+use ritornel_contract::HubStatus;
+
 use crate::net::Net;
 use crate::settings::words::{Clock, Style, when};
 
@@ -42,11 +44,33 @@ pub(crate) fn now_ms() -> i64 {
 /// The hub of the server `net` talks to, if it has one and it does not
 /// answer.
 pub(crate) fn away(net: &Net) -> Option<Away> {
-    let hub = net.hub.as_ref()?;
+    away_of(net.hub.as_ref())
+}
+
+fn away_of(hub: Option<&HubStatus>) -> Option<Away> {
+    let hub = hub?;
     (hub.answers == Some(false)).then(|| Away {
         hub: hub.name.clone(),
         since_ms: hub.since_ms.unwrap_or(0),
     })
+}
+
+/// What the notice says of `hub` at `now_ms`, if anything, given the
+/// absence it has said already (the time the hub went), and the absence
+/// said after. One absence is said once, however often this is asked, and
+/// its end once.
+pub(crate) fn notice(
+    said: Option<i64>,
+    hub: Option<&HubStatus>,
+    now_ms: i64,
+) -> (Option<String>, Option<i64>) {
+    match away_of(hub) {
+        Some(away) if away.said(now_ms) && said != Some(away.since_ms) => {
+            (Some(away.toast()), Some(away.since_ms))
+        }
+        None if said.is_some() => (hub.map(|hub| back_toast(&hub.name)), None),
+        _ => (None, said),
+    }
 }
 
 /// The same, once it has been away long enough to say so.
@@ -129,5 +153,47 @@ mod tests {
         assert_eq!(away.wait_ms(1_000_000 + 1_000), Some(4_000));
         assert!(away.said(1_000_000 + QUIET_MS));
         assert_eq!(away.wait_ms(1_000_000 + QUIET_MS), None);
+    }
+
+    fn hub(answers: bool, since_ms: i64) -> HubStatus {
+        HubStatus {
+            server_id: ritornel_contract::Id::from_bytes([1; 16]),
+            name: "Studio Mac".to_owned(),
+            library_id: ritornel_contract::Id::from_bytes([2; 16]),
+            epoch: 1,
+            routes: Vec::new(),
+            linked_at_ms: 0,
+            answers: Some(answers),
+            since_ms: Some(since_ms),
+            route: None,
+            problem: None,
+        }
+    }
+
+    #[test]
+    fn one_absence_is_said_once_and_its_end_once_across_reconnecting() {
+        let went = 1_000_000;
+        let later = went + QUIET_MS;
+        let away = hub(false, went);
+        assert_eq!(notice(None, Some(&away), went + 1), (None, None));
+        let (word, said) = notice(None, Some(&away), later);
+        assert_eq!(
+            word.as_deref(),
+            Some("Can’t reach Studio Mac. Waiting for it to come back.")
+        );
+        assert_eq!(said, Some(went));
+        // The app's own connection came back while the hub is still away.
+        assert_eq!(notice(said, Some(&away), later + 1), (None, said));
+        // It came back after the hub did.
+        let back = hub(true, later + 2);
+        let (word, said) = notice(said, Some(&back), later + 3);
+        assert_eq!(word.as_deref(), Some("Studio Mac is back."));
+        assert_eq!(said, None);
+        // Another absence is another word.
+        let again = hub(false, later + 10);
+        assert_eq!(
+            notice(None, Some(&again), later + 10 + QUIET_MS).1,
+            Some(later + 10)
+        );
     }
 }

@@ -221,9 +221,10 @@ pub(crate) struct Player {
     /// What is being said, and since when.
     pub toast: Option<(SharedString, Instant)>,
     toast_ends: Option<Task<()>>,
-    /// Whether the toast has said the hub is away, and not yet that it is
-    /// back.
-    hub_away_said: bool,
+    /// The time the hub went, if the toast has said it is away and not yet
+    /// that it is back. Kept across reconnecting to this app's own server,
+    /// so one absence is said once and its end is not missed.
+    hub_away_said: Option<i64>,
     /// What plays next, while the card is open.
     pub up_next: Option<UpNext>,
     /// Whether Up next's card is open.
@@ -240,7 +241,6 @@ impl Player {
                 player.state = None;
                 player.rated = Ratings::default();
                 player.net = Some(Arc::clone(net));
-                player.hub_away_said = false;
                 player.say_of_hub(net, cx);
                 player.read(cx);
             }
@@ -296,7 +296,7 @@ impl Player {
             eq_since: None,
             rated: Ratings::default(),
             toast: None,
-            hub_away_said: false,
+            hub_away_said: None,
             toast_ends: None,
             up_next: None,
             open: false,
@@ -452,18 +452,11 @@ impl Player {
     /// Says once that the hub has gone, when it has been away long enough
     /// to say so (`crate::away`), and once that it is back.
     fn say_of_hub(&mut self, net: &Net, cx: &mut Context<Self>) {
-        match crate::away::said(net) {
-            Some(away) if !self.hub_away_said => {
-                self.hub_away_said = true;
-                self.say(away.toast(), cx);
-            }
-            None if self.hub_away_said && crate::away::away(net).is_none() => {
-                self.hub_away_said = false;
-                if let Some(hub) = &net.hub {
-                    self.say(crate::away::back_toast(&hub.name), cx);
-                }
-            }
-            _ => {}
+        let (word, said) =
+            crate::away::notice(self.hub_away_said, net.hub.as_ref(), crate::away::now_ms());
+        self.hub_away_said = said;
+        if let Some(word) = word {
+            self.say(word, cx);
         }
     }
 
