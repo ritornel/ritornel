@@ -1,6 +1,7 @@
 //! The HTTP side of the contract: the routes that are not the socket.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use http_body_util::{BodyExt, Empty, Limited};
 use hyper::body::Bytes;
@@ -19,10 +20,12 @@ use crate::{Credential, Error};
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// A local connection, upgrade, or HTTP exchange should answer promptly.
+const IO_WAIT: Duration = Duration::from_secs(10);
+
 pub(crate) async fn within_deadline<T>(
     operation: impl Future<Output = Result<T, Error>>,
 ) -> Result<T, Error> {
-    tokio::time::timeout(std::time::Duration::from_secs(10), operation)
+    tokio::time::timeout(IO_WAIT, operation)
         .await
         .map_err(|_| transport("timed out waiting for the server"))?
 }

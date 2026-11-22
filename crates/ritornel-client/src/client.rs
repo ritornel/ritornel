@@ -22,7 +22,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use crate::error::transport;
-use crate::transport::Transport;
+use crate::transport::{Lost, Transport};
 use crate::{Credential, Error};
 
 type Answer = oneshot::Sender<Result<Value, Error>>;
@@ -40,13 +40,15 @@ fn lock(waiting: &Mutex<Waiting>) -> MutexGuard<'_, Waiting> {
 /// Dropping the calling future releases its reply slot even if the server never answers.
 struct Pending<'a> {
     waiting: &'a Weak<Mutex<Waiting>>,
-    id: i64,
+    id: Option<i64>,
 }
 
 impl Drop for Pending<'_> {
     fn drop(&mut self) {
-        if let Some(waiting) = self.waiting.upgrade() {
-            lock(&waiting).answers.remove(&self.id);
+        if let Some(id) = self.id
+            && let Some(waiting) = self.waiting.upgrade()
+        {
+            lock(&waiting).answers.remove(&id);
         }
     }
 }
@@ -64,7 +66,8 @@ pub struct Client {
     calls: UnboundedSender<String>,
     // The connection task owns pending senders. Its runtime may stop while callers live elsewhere.
     waiting: Weak<Mutex<Waiting>>,
-    _lifetime: oneshot::Sender<()>,
+    // A stalled writer cannot observe the call queue closing.
+    _close_on_drop: oneshot::Sender<()>,
     events: UnboundedReceiver<Event>,
 }
 
@@ -110,7 +113,7 @@ impl Client {
         Self {
             calls,
             waiting: Arc::downgrade(&waiting),
-            _lifetime: lifetime,
+            _close_on_drop: lifetime,
             events: received,
         }
     }
@@ -131,9 +134,9 @@ impl Client {
             waiting.answers.insert(id, answer);
             id
         };
-        let _pending = Pending {
+        let mut pending = Pending {
             waiting: &self.waiting,
-            id,
+            id: Some(id),
         };
         let frame = Frame::Request(Request {
             id: RequestId::Number(id),
@@ -143,9 +146,11 @@ impl Client {
         self.calls
             .send(frame.encode())
             .map_err(|_| transport("the connection closed"))?;
-        answered
+        let reply = answered
             .await
-            .map_err(|_| transport("the connection closed"))?
+            .map_err(|_| transport("the connection closed"))?;
+        pending.id = None;
+        reply
     }
 
     /// Calls a method of the contract, with the params and the result the
@@ -332,23 +337,23 @@ impl Client {
 /// to whoever it is for. It ends when the client is dropped or the
 /// connection is lost.
 async fn run(
-    transport: Transport,
+    connection: Transport,
     mut calls: UnboundedReceiver<String>,
     events: UnboundedSender<Event>,
     waiting: Arc<Mutex<Waiting>>,
     dropped: oneshot::Receiver<()>,
 ) {
-    let (mut writer, mut reader) = transport.split();
+    let (mut writer, mut reader) = connection.split();
     let write = async {
         while let Some(text) = calls.recv().await {
             writer.send(text).await?;
         }
-        Ok::<(), Error>(())
+        Ok::<(), Lost>(())
     };
     let read = async {
         while let Some(text) = reader.receive().await {
             let frame = Frame::decode(&text?).map_err(|_| {
-                Error::Protocol("the server sent something that is not a frame".to_owned())
+                Lost::Protocol("the server sent something that is not a frame".to_owned())
             })?;
             match frame {
                 Frame::Response(Response {
@@ -360,7 +365,7 @@ async fn run(
                     }
                 }
                 Frame::Response(Response { id: None, .. }) => {
-                    return Err(Error::Protocol(
+                    return Err(Lost::Protocol(
                         "the server answered without a request ID".to_owned(),
                     ));
                 }
@@ -372,7 +377,7 @@ async fn run(
                 _ => {}
             }
         }
-        Err::<(), Error>(crate::error::transport("the connection closed"))
+        Err::<(), Lost>(Lost::Transport("the connection closed".into()))
     };
     let lost = tokio::select! {
         result = write => result.err(),
@@ -382,12 +387,7 @@ async fn run(
     calls.close();
     if let Some(lost) = lost {
         for (_, answer) in lock(&waiting).answers.drain() {
-            let error = match &lost {
-                Error::Protocol(why) => Error::Protocol(why.clone()),
-                Error::Transport(why) => Error::Transport(why.clone()),
-                other => crate::error::transport(other),
-            };
-            let _ = answer.send(Err(error));
+            let _ = answer.send(Err(lost.clone().into()));
         }
     } else {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer.close()).await;
@@ -401,6 +401,7 @@ fn known(params: Value) -> Option<Event> {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
     use ritornel_contract::{ClientKind, ErrorCode, Id, RpcError};
     use serde_json::json;
     use tokio::sync::mpsc::{Receiver, Sender};
@@ -627,7 +628,6 @@ mod tests {
         for _ in 0..3 {
             calls.push(client.call_raw("one", json!({})));
         }
-        use futures_util::StreamExt;
         let serve = async {
             let (id, _, _) = sent(&mut requests).await;
             tokio::task::yield_now().await;
@@ -635,7 +635,10 @@ mod tests {
             std::future::pending::<()>().await;
         };
         tokio::select! {
-            reply = tokio::time::timeout(std::time::Duration::from_secs(1), calls.next()) => assert_eq!(reply.unwrap().unwrap().unwrap(), json!(7)),
+            reply = tokio::time::timeout(std::time::Duration::from_secs(1), calls.next()) => {
+                let reply = reply.expect("the reply arrived before the deadline").expect("a call was pending");
+                assert_eq!(reply.unwrap(), json!(7));
+            }
             () = serve => unreachable!(),
         }
     }
@@ -665,6 +668,7 @@ mod tests {
         );
         assert!(matches!(reply, Ok(Err(Error::Protocol(_)))), "{reply:?}");
     }
+
     #[tokio::test]
     async fn cancelling_a_call_releases_its_reply_slot() {
         let (client, mut requests, _replies) = pair();

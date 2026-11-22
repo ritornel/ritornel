@@ -45,8 +45,7 @@ tokio-tungstenite = "0.29.0"
 tokio = { version = "1.54.1", features = ["test-util"] }
 # Not used by a test: it turns on futures-sink's `alloc`, as a program that
 # links `futures` with `std` does (GPUI does), so that the tests build the
-# client as such a program would. With it, `Box<S>` is a `Sink`, and a call
-# on a boxed socket can resolve to `SinkExt` before the socket's own method.
+# client with the same sink implementations as the desktop app.
 futures-sink = { version = "0.3.34", features = ["alloc"] }
 
 # A test holds a data directory's lock as a server on Windows does.

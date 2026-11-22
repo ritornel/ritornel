@@ -79,6 +79,22 @@ impl Transport {
     }
 }
 
+/// The reason every pending call loses its reply when the connection ends.
+#[derive(Clone)]
+pub(crate) enum Lost {
+    Transport(String),
+    Protocol(String),
+}
+
+impl From<Lost> for Error {
+    fn from(lost: Lost) -> Self {
+        match lost {
+            Lost::Transport(message) => Self::Transport(message),
+            Lost::Protocol(message) => Self::Protocol(message),
+        }
+    }
+}
+
 pub(crate) enum Writer {
     Socket(SplitSink<WebSocketStream<TcpStream>, Message>),
     Memory(Sender<String>),
@@ -91,16 +107,16 @@ pub(crate) enum Reader {
 
 impl Writer {
     /// Sends one frame.
-    pub(crate) async fn send(&mut self, text: String) -> Result<(), Error> {
+    pub(crate) async fn send(&mut self, text: String) -> Result<(), Lost> {
         match self {
             Self::Socket(socket) => socket
                 .send(Message::Text(text.into()))
                 .await
-                .map_err(transport),
+                .map_err(|error| Lost::Transport(error.to_string())),
             Self::Memory(outgoing) => outgoing
                 .send(text)
                 .await
-                .map_err(|_| transport("the connection closed")),
+                .map_err(|_| Lost::Transport("the connection closed".into())),
         }
     }
 
@@ -113,7 +129,7 @@ impl Writer {
 
 impl Reader {
     /// The next frame. `None` when the other side has closed.
-    pub(crate) async fn receive(&mut self) -> Option<Result<String, Error>> {
+    pub(crate) async fn receive(&mut self) -> Option<Result<String, Lost>> {
         match self {
             Self::Socket(socket) => loop {
                 return match socket.next().await? {
@@ -121,10 +137,10 @@ impl Reader {
                     // The socket answers a ping by itself.
                     Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => continue,
                     Ok(Message::Close(_)) => None,
-                    Ok(Message::Binary(_)) => Some(Err(Error::Protocol(
+                    Ok(Message::Binary(_)) => Some(Err(Lost::Protocol(
                         "a frame is text, and the server sent bytes".to_owned(),
                     ))),
-                    Err(error) => Some(Err(transport(error))),
+                    Err(error) => Some(Err(Lost::Transport(error.to_string()))),
                 };
             },
             Self::Memory(incoming) => incoming.recv().await.map(Ok),
