@@ -325,16 +325,21 @@ impl AudioRenderer {
                     rate: 48_000,
                     channels: 2,
                 };
-                Self::null(spec, speed, None)
+                Self::null(spec, speed, None, None)
             }
             Output::Default => Self::open_device(Arc::new(Shared::default())),
         }
     }
 
-    fn null(spec: OutputSpec, speed: u32, tap: Option<null::Tap>) -> Result<Self, RenderError> {
+    fn null(
+        spec: OutputSpec,
+        speed: u32,
+        tap: Option<null::Tap>,
+        hold: Option<Arc<null::Hold>>,
+    ) -> Result<Self, RenderError> {
         let shared = Arc::new(Shared::default());
         let (ends, callback) = queues(spec, &shared);
-        let running = null::start(callback, spec, speed.max(1), tap)?;
+        let running = null::start(callback, spec, speed.max(1), tap, hold)?;
         Ok(Self::new(
             "null".to_owned(),
             spec,
@@ -349,7 +354,20 @@ impl AudioRenderer {
     #[cfg(test)]
     pub(crate) fn tapped(spec: OutputSpec, speed: u32) -> Result<(Self, null::Tap), RenderError> {
         let tap = null::Tap::default();
-        Ok((Self::null(spec, speed, Some(Arc::clone(&tap)))?, tap))
+        Ok((Self::null(spec, speed, Some(Arc::clone(&tap)), None)?, tap))
+    }
+
+    /// As [`tapped`](Self::tapped), and the output holds once it has
+    /// handed over `at` frames, until the test lets it go.
+    #[cfg(test)]
+    fn held(
+        spec: OutputSpec,
+        speed: u32,
+        at: u64,
+    ) -> Result<(Self, null::Tap, Arc<null::Hold>), RenderError> {
+        let (tap, hold) = (null::Tap::default(), null::Hold::at(at));
+        let renderer = Self::null(spec, speed, Some(Arc::clone(&tap)), Some(Arc::clone(&hold)))?;
+        Ok((renderer, tap, hold))
     }
 
     #[cfg(all(

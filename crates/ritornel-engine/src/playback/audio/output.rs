@@ -241,6 +241,12 @@ impl Callback {
         }
     }
 
+    /// The samples waiting in the ring it plays, for a test's hold on the
+    /// null output.
+    pub(crate) fn waiting(&self) -> usize {
+        self.feed.as_ref().map_or(0, |feed| feed.ring.slots())
+    }
+
     fn say(&mut self, event: Event) {
         // The queue holds far more than can be in flight.
         let _ = self.events.push(event);

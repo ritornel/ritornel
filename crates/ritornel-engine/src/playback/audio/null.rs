@@ -4,7 +4,7 @@
 //! with no speakers and a silent trial run all use it.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -37,14 +37,56 @@ impl Drop for NullOutput {
 /// What a test reads the frames handed to the null output from.
 pub(super) type Tap = Arc<std::sync::Mutex<Vec<f32>>>;
 
+/// For a test: a hold on the null output. Once the output has handed over
+/// `at` frames it asks for no more, as a device that has stopped would,
+/// until it is let go, and meanwhile it says how many samples wait in the
+/// ring it plays. A test then acts at a frame it chose, however slowly the
+/// machine runs. Held, it takes no messages, so a call that waits for the
+/// output to take one, as a load, a seek or an unload does, waits in vain.
+#[derive(Debug)]
+pub(super) struct Hold {
+    at: u64,
+    let_go: AtomicBool,
+    /// The samples waiting while held; `usize::MAX` until it holds.
+    waiting: AtomicUsize,
+}
+
+impl Hold {
+    #[cfg(test)]
+    pub(super) fn at(frames: u64) -> Arc<Self> {
+        Arc::new(Self {
+            at: frames,
+            let_go: AtomicBool::new(false),
+            waiting: AtomicUsize::new(usize::MAX),
+        })
+    }
+
+    /// The samples waiting in the ring, once the output holds.
+    #[cfg(test)]
+    pub(super) fn waiting(&self) -> Option<usize> {
+        Some(self.waiting.load(Ordering::SeqCst)).filter(|waiting| *waiting != usize::MAX)
+    }
+
+    #[cfg(test)]
+    pub(super) fn let_go(&self) {
+        self.let_go.store(true, Ordering::SeqCst);
+    }
+
+    fn holds(&self, handed: u64) -> bool {
+        handed >= self.at && !self.let_go.load(Ordering::SeqCst)
+    }
+}
+
 /// Starts the null output, which drives `callback` at `speed` times real
 /// time. With a tap, every frame the callback hands over is kept there, for
-/// a test to hold to what was decoded.
+/// a test to hold to what was decoded; with a hold, it stops where the
+/// test says.
 pub(super) fn start(
     mut callback: Callback,
     spec: OutputSpec,
     speed: u32,
     tap: Option<Tap>,
+    hold: Option<Arc<Hold>>,
 ) -> Result<NullOutput, RenderError> {
     let stop = Arc::new(AtomicBool::new(false));
     let thread = {
@@ -54,11 +96,22 @@ pub(super) fn start(
             .spawn(move || {
                 let frames = usize::try_from(spec.rate * PERIOD_MS / 1000).unwrap_or(480);
                 let mut buffer = vec![0.0_f32; frames * spec.channels];
-                let started = Instant::now();
+                let mut started = Instant::now();
                 let mut rendered: u64 = 0;
+                let mut handed: u64 = 0;
                 let per_second = f64::from(spec.rate) * f64::from(speed);
                 while !stop.load(Ordering::SeqCst) {
+                    if let Some(hold) = &hold
+                        && hold.holds(handed)
+                    {
+                        hold.waiting.store(callback.waiting(), Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                        // Paced afresh once let go.
+                        (started, rendered) = (Instant::now(), 0);
+                        continue;
+                    }
                     let written = callback.render(&mut buffer);
+                    handed += written as u64;
                     if let Some(tap) = &tap
                         && let Some(frames) = buffer.get(..written * spec.channels)
                     {
