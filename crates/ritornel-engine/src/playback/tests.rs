@@ -2721,6 +2721,22 @@ fn an_output_that_cannot_be_opened_pauses_in_place_and_blames_no_song() {
     let failing = state.output_failing.unwrap();
     assert_eq!(failing.since_ms, lost_at);
     assert_eq!(failing.detail, "no output device is there");
+    // Once it opens, the song carries on where the output went, as the
+    // listen it cut off.
+    rig.fake.refuse_output(false);
+    rig.resume();
+    assert_eq!(rig.fake.loads().last().unwrap(), &(file(1), 30_000));
+    rig.pass(5_000);
+    let staged = rig.staged();
+    let lost = staged
+        .iter()
+        .find(|listen| listen.ended.is_some())
+        .unwrap()
+        .started
+        .listen_id;
+    assert_eq!(staged.last().unwrap().started.continues, Some(lost));
+    assert_eq!(rig.player.state().output_failing, None);
+    rig.fake.refuse_output(true);
     // A queue played anew waits on its first song, from its start.
     rig.play(2);
     let state = rig.player.state();
@@ -2733,7 +2749,7 @@ fn an_output_that_cannot_be_opened_pauses_in_place_and_blames_no_song() {
         (Status::Paused, 2, 0)
     );
     assert!(rig.queue().iter().all(|(_, _, failed)| failed.is_none()));
-    // Once it opens, the song plays from where it waited, and the sign goes.
+    // Once it opens, the song plays from where it waited.
     rig.fake.refuse_output(false);
     rig.resume();
     let state = rig.player.state();
@@ -2862,4 +2878,56 @@ fn a_song_none_of_which_is_heard_is_marked_at_once_in_the_live_queue() {
             .any(|event| matches!(event, super::PlayerEvent::Queue(_)))
     );
     assert_eq!(rig.queue()[0].2.as_deref(), Some("unreadable"));
+}
+
+#[test]
+fn an_output_that_stops_answering_after_running_on_into_the_next_song_waits_in_that_song() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    rig.pass(239_000);
+    // The seek runs the last second of the first song and a tenth of the
+    // next before the output stops answering.
+    rig.fake.stall_at_seek(1_100);
+    rig.seek(10_000);
+    let state = rig.player.state();
+    assert_eq!(
+        (
+            state.status,
+            state.current.unwrap().index,
+            state.position_ms
+        ),
+        (Status::Paused, 1, 100)
+    );
+    let lost = rig
+        .staged()
+        .into_iter()
+        .find(|listen| {
+            listen.ended.as_ref().is_some_and(|ended| {
+                ended.end_reason == ritornel_domain::history::EndReason::OutputLost
+            })
+        })
+        .unwrap();
+    assert_eq!(lost.started.appearance, rig.tracks[1]);
+    let session = rig.server.playback_session().unwrap();
+    assert_eq!(
+        (session.resume_listen, session.position_ms),
+        (Some(lost.started.listen_id), 100)
+    );
+}
+
+#[test]
+fn a_song_the_output_could_not_open_is_where_a_restart_finds_the_player() {
+    let mut rig = Rig::new();
+    rig.fake.broken(file(0), "missing");
+    rig.fake.refuse_output(true);
+    rig.play(0);
+    // The first is marked and passed over; the second waits on the output.
+    let state = rig.player.state();
+    assert_eq!(
+        (state.status, state.current.unwrap().index),
+        (Status::Paused, 1)
+    );
+    assert!(rig.restart(0xb1).is_empty());
+    assert_eq!(rig.player.state().current.unwrap().index, 1);
 }

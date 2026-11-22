@@ -301,6 +301,9 @@ pub(crate) mod fake {
         lost: bool,
         /// Whether the output cannot be opened.
         refused: bool,
+        /// How long the output plays on during the next seek, before it
+        /// stops answering.
+        stalls: Option<u64>,
         /// Files that are no longer what the catalog says, by path.
         replaced: HashMap<PathBuf, FileFacts>,
         /// Whether the file loaded was written to where it is.
@@ -490,6 +493,12 @@ pub(crate) mod fake {
             self.state().refused = refused;
         }
 
+        /// The next seek plays on for `ms`, as the output did before it
+        /// stopped answering, and then fails as the output's fault.
+        pub(crate) fn stall_at_seek(&self, ms: u64) {
+            self.state().stalls = Some(ms);
+        }
+
         /// The file loaded is written to where it is.
         pub(crate) fn rewrite_loaded(&self) {
             self.state().rewritten = true;
@@ -642,10 +651,12 @@ pub(crate) mod fake {
         ) -> Result<Format, RenderError> {
             self.plays_on();
             let mut state = self.state();
+            // A file that cannot be read says so first, as one whose copy is
+            // nowhere to be reached does before any output is opened.
+            let length = Self::length_of(&state, path, facts)?;
             if state.refused {
                 return Err(RenderError::new("output", "no output device is there"));
             }
-            let length = Self::length_of(&state, path, facts)?;
             let now = stamp(state.now_ms());
             state.let_go(now);
             state.rewritten = false;
@@ -675,6 +686,11 @@ pub(crate) mod fake {
 
         fn seek(&mut self, of: u64, position_ms: u64, span: u64) -> Result<(), RenderError> {
             self.plays_on();
+            let stalls = self.state().stalls.take();
+            if let Some(ms) = stalls {
+                self.advance(ms);
+                return Err(RenderError::new("output", "the output stopped answering"));
+            }
             let mut state = self.state();
             if state.rewritten {
                 return Err(RenderError::new("file_changed", "it was written to"));

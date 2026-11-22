@@ -1637,4 +1637,7 @@ fn a_file_none_of_whose_packets_decodes_is_unreadable_and_not_a_track_that_ended
     let failed = source.next().unwrap_err();
     assert_eq!(failed.reason, "unreadable");
     assert!(source.bad_packets > 0);
+    // A file with no audio in it at all is no different.
+    let mut empty = Source::open(&fixture("no-packets.m4a"), 0).unwrap();
+    assert_eq!(empty.next().unwrap_err().reason, "unreadable");
 }

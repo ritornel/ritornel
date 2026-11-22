@@ -1737,16 +1737,18 @@ mod tests {
     fn a_media_next_from_an_entry_the_player_has_left_skips_nothing() {
         let (core, scratch) = core();
         let session = greeted(&core, SessionKind::Full);
-        let entries = playing(&core, &session, scratch.path(), &["a.flac", "b.flac"]);
+        let files = ["a.flac", "b.flac", "b.compilation.flac"];
+        let entries = playing(&core, &session, scratch.path(), &files);
         let on = || {
             let state = call(&core, &session, "playback.get", None).unwrap();
-            state["entryId"].as_str().unwrap().parse::<Id>().unwrap()
+            let entry = state["entryId"].as_str().unwrap().parse::<Id>().unwrap();
+            (entry, state["status"].clone())
         };
-        assert_eq!(on(), entries[0]);
+        assert_eq!(on(), (entries[0], json!("playing")));
         core.media_key(crate::media_session::Key::NextFrom(entries[0]));
-        assert_eq!(on(), entries[1]);
+        assert_eq!(on(), (entries[1], json!("playing")));
         core.media_key(crate::media_session::Key::NextFrom(entries[0]));
-        assert_eq!(on(), entries[1]);
+        assert_eq!(on(), (entries[1], json!("playing")));
     }
 
     /// `playIfEmpty` plays an empty queue, decided as the server adds, and

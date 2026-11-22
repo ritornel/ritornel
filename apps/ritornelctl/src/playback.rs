@@ -103,9 +103,13 @@ fn render(state: &PlaybackState) -> String {
     if output.problem.is_some() {
         lines.push((
             "",
-            "Playback is paused where it was. Check that the sound device is connected and on, \
-             then `ritornelctl resume`."
-                .to_owned(),
+            if state.status == PlaybackStatus::Paused {
+                "Playback is paused where it was. Check that the sound device is connected and \
+                 on, then `ritornelctl resume`."
+            } else {
+                "Check that the sound device is connected and on, then play again."
+            }
+            .to_owned(),
         ));
     }
     lines.push((
@@ -561,6 +565,11 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("then `ritornelctl resume`"), "{shown}");
+        // Stopped since, it does not promise a place to resume from.
+        state.status = PlaybackStatus::Stopped;
+        let shown = render(&state);
+        assert!(!shown.contains("resume"), "{shown}");
+        assert!(shown.contains("then play again"), "{shown}");
         state.output.problem = None;
         assert!(render(&state).contains("default (not opened yet)"));
     }

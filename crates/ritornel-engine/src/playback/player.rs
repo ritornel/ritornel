@@ -732,16 +732,20 @@ impl Player {
     /// after it, and takes in what the output said of both. A listen cut
     /// off by a shutdown or the output going away is what playing the
     /// entry again continues; any other end leaves nothing to continue.
+    ///
+    /// The track prepared is let go only once that is taken in: should the
+    /// output have run on into it meanwhile, it is the entry left, and the
+    /// place saved is in it.
     fn leave(&mut self, server: &ServerStore, reason: EndReason, events: &mut Vec<PlayerEvent>) {
         let before = self.recorder.last_closed();
         self.recorder.note(reason);
-        self.prepared = None;
         if self.loaded.is_some() {
             self.renderer.unload();
             self.take_in(events);
             self.position_ms = self.position();
             self.loaded = None;
         }
+        self.prepared = None;
         self.ran_out = None;
         match self
             .recorder
@@ -789,7 +793,12 @@ impl Player {
                 }
                 Err(failure) if failure.is_output() => {
                     self.output_failed(&failure, events);
-                    return Ok(());
+                    // Where it waits, should it go down before it plays.
+                    return server.save_place(
+                        self.entry_row(),
+                        self.position_ms,
+                        self.resume_listen,
+                    );
                 }
                 Err(failure) => {
                     events.push(PlayerEvent::Failed {

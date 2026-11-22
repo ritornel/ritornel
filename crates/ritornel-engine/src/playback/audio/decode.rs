@@ -68,7 +68,7 @@ pub(crate) struct Source {
     pub(crate) info: Format,
     /// Packets that would not decode and were passed over.
     pub(crate) bad_packets: u64,
-    /// Whether any packet decoded.
+    /// Whether any packet decoded to frames.
     decoded: bool,
     samples: Vec<f32>,
     /// Where in `samples` the frames to hand on begin.
@@ -527,8 +527,9 @@ impl Source {
     }
 
     /// Decodes the next frames. `false` at the end. A packet that will not
-    /// decode is passed over, but a file none of whose packets decodes is
-    /// unreadable, not over.
+    /// decode is passed over, but a file that gives no frames at all, from
+    /// its start or through packets that would not decode, is unreadable,
+    /// not over.
     pub(crate) fn next(&mut self) -> Result<bool, RenderError> {
         #[cfg(test)]
         if self.fails {
@@ -558,10 +559,7 @@ impl Source {
             }
             let first = self.frame_of(packet.pts.saturating_add(packet.trim_start));
             let decoded = match self.decoder.decode(&packet) {
-                Ok(decoded) => {
-                    self.decoded = true;
-                    decoded
-                }
+                Ok(decoded) => decoded,
                 Err(Symphonia::DecodeError(_) | Symphonia::IoError(_)) => {
                     self.bad_packets += 1;
                     continue;
@@ -573,6 +571,7 @@ impl Source {
             if frames == 0 || channels == 0 {
                 continue;
             }
+            self.decoded = true;
             if self.channels == 0 {
                 self.channels = channels;
                 self.info.channels = u32::try_from(channels).unwrap_or(0);
@@ -597,12 +596,17 @@ impl Source {
         }
     }
 
-    /// The end of the file, once its packets have run out.
+    /// The end of the file, once its packets have run out. Read from its
+    /// start, or with packets passed over, a file that gave no frames is
+    /// unreadable; one sought near its end may rightly give none.
     fn over(&self) -> Result<bool, RenderError> {
-        if self.bad_packets > 0 && !self.decoded {
+        if !self.decoded && (self.bad_packets > 0 || self.from_frame == 0) {
             return Err(RenderError::new(
                 "unreadable",
-                format!("none of its {} packets would decode", self.bad_packets),
+                format!(
+                    "no audio would decode: {} packets passed over",
+                    self.bad_packets
+                ),
             ));
         }
         Ok(false)
