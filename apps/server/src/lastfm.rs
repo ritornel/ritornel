@@ -902,6 +902,9 @@ mod enabled {
                             (
                                 due.delivery,
                                 match outcome {
+                                    Outcome::Unknown => Settled::Unknown(
+                                        "Last.fm's answer did not identify this play".to_owned(),
+                                    ),
                                     Outcome::Accepted { artist, title } => {
                                         Settled::Accepted { artist, title }
                                     }

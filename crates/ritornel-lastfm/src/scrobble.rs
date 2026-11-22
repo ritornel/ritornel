@@ -39,6 +39,8 @@ pub const DAILY_LIMIT: u32 = scrobl::model::IgnoredCode::DAILY_LIMIT.get();
 /// What Last.fm did with one play.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
+    /// The reply did not identify a unique outcome for this play.
+    Unknown,
     /// It is recorded, under these names, which are those sent unless
     /// Last.fm corrected them.
     Accepted {
@@ -122,6 +124,21 @@ fn play(scrobble: &ToScrobble) -> Play {
     play
 }
 
+fn matches_play(outcome: &scrobl::model::Outcome, play: &ToScrobble) -> bool {
+    let agrees = |name: &scrobl::model::Corrected, requested: &str| {
+        name.corrected() || name.name() == requested
+    };
+    let optional_agrees = |reply: Option<&scrobl::model::Corrected>, requested: Option<&str>| {
+        reply
+            .zip(requested)
+            .is_none_or(|(name, sent)| name.name().is_empty() || agrees(name, sent))
+    };
+    agrees(outcome.artist(), &play.artist)
+        && agrees(outcome.track(), &play.title)
+        && optional_agrees(outcome.album(), play.album.as_deref())
+        && optional_agrees(outcome.album_artist(), play.album_artist.as_deref())
+}
+
 impl Lastfm {
     /// Tells Last.fm that the account whose session this is is playing
     /// `playing` now, once.
@@ -142,7 +159,12 @@ impl Lastfm {
         }
         match self.block(query.send()) {
             Ok(_) => Ok(()),
-            Err(error) if error.api_code() == Some(ApiErrorCode::INVALID_SESSION_KEY) => {
+            Err(error)
+                if matches!(
+                    error.api_code(),
+                    Some(ApiErrorCode::INVALID_SESSION_KEY | ApiErrorCode::AUTHENTICATION_FAILED)
+                ) =>
+            {
                 Err(NotShown::SignInAgain(error.to_string()))
             }
             Err(error) => Err(NotShown::Failed(error.to_string())),
@@ -153,6 +175,15 @@ impl Lastfm {
     /// is, once. Their times must differ: Last.fm's answer ties an outcome
     /// to a play by time alone.
     pub fn scrobble(&self, session: &SessionKey, plays: &[ToScrobble]) -> Result<Sent, Unsent> {
+        let mut timestamps = std::collections::HashSet::new();
+        if plays
+            .iter()
+            .any(|play| !timestamps.insert(play.timestamp_s))
+        {
+            return Err(Unsent::Refused(
+                "a scrobble batch needs distinct timestamps".to_owned(),
+            ));
+        }
         let writer = self.writer.with_session(session.clone());
         let batch: Vec<Play> = plays.iter().map(play).collect();
         let report = match self.block(writer.scrobble(&batch).send()) {
@@ -167,25 +198,25 @@ impl Lastfm {
                     (Some(Delivery::Unknown), _) => Unsent::Unknown(message),
                     (_, Retry::AfterReauthentication) => Unsent::SignInAgain(message),
                     _ if revoked => Unsent::SignInAgain(message),
-                    (Some(Delivery::NotSent), _) | (_, Retry::Later | Retry::AfterBackoff) => {
-                        Unsent::Later(message)
-                    }
+                    (_, Retry::Later | Retry::AfterBackoff) => Unsent::Later(message),
                     _ => Unsent::Refused(message),
                 });
             }
         };
-        let mut outcomes: Vec<Option<&scrobl::model::Outcome>> =
-            report.outcomes().iter().map(Some).collect();
         let mut sent = Vec::with_capacity(plays.len());
         for scrobble in plays {
-            let found = outcomes.iter_mut().find(|outcome| {
-                outcome.is_some_and(|outcome| outcome.timestamp() == Some(scrobble.timestamp_s))
-            });
-            let Some(outcome) = found.and_then(Option::take) else {
-                return Err(Unsent::Unknown(
-                    "Last.fm's answer does not account for every play".to_owned(),
-                ));
+            let mut matching = report
+                .outcomes()
+                .iter()
+                .filter(|outcome| outcome.timestamp() == Some(scrobble.timestamp_s));
+            let (Some(outcome), None) = (matching.next(), matching.next()) else {
+                sent.push(Outcome::Unknown);
+                continue;
             };
+            if !matches_play(outcome, scrobble) {
+                sent.push(Outcome::Unknown);
+                continue;
+            }
             sent.push(match outcome.ignored() {
                 Some(ignored) => Outcome::Ignored {
                     code: ignored.code().get(),
