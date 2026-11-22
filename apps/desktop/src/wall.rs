@@ -621,7 +621,6 @@ impl Wall {
         self.layout = None;
         self.top = 0.;
         self.elastic.reset();
-        self.selected = None;
         self.failed = false;
         let mut remembered = crate::remember::load();
         remembered.wall = kind.name().to_owned();
@@ -1225,7 +1224,6 @@ impl Wall {
         // place: the view is opened afresh.
         let Some(layout) = self.layout.clone() else {
             self.forget_asks();
-            self.selected = None;
             self.view = None;
             self.pages.clear();
             self.pages_in_flight = 0;
