@@ -16,6 +16,7 @@ use gpui::{
     StyledImage, Window, div, img, linear_color_stop, linear_gradient, prelude::FluentBuilder, px,
     rgba,
 };
+use image::RgbaImage;
 use ritornel_contract::Phrase;
 
 use crate::frost;
@@ -197,54 +198,32 @@ impl Banner {
             )));
 
         // An artist's portrait stands clear at the right, its left edge
-        // melting into the blur of itself, and fades as the strip comes.
+        // melting into the blur of itself (`melted`), and fades as the strip
+        // comes. Gone, it is not drawn at all.
         if let Some((portrait, at)) = &self.portrait {
             let (shown, going) = came(*at, 300.);
             animating |= going;
-            let wide = (width * 0.4).min(380.);
-            banner = banner.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .w(px(wide))
-                    .h_full()
-                    .opacity(fade(1. - p * 1.25) * shown)
-                    .child(
-                        img(Arc::clone(portrait))
-                            .size_full()
-                            .object_fit(ObjectFit::Cover),
-                    )
-                    .children(frost::piece(
-                        frost::Fill::Picture(Arc::clone(portrait)),
-                        fade(1. - p * 1.25) * shown,
-                    ))
-                    // GPUI has no mask: the melt is the picture's own ground
-                    // laid over its left half, fading to nothing.
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .h_full()
-                            .w(px(wide * 0.52))
-                            .bg(linear_gradient(
-                                90.,
-                                linear_color_stop(rgba(0x17181bff), 0.),
-                                linear_color_stop(rgba(0x17181b00), 1.),
-                            ))
-                            .children(frost::piece(
-                                frost::Fill::Gradient {
-                                    toward: frost::Toward::Right,
-                                    from: rgba(0x17181bff),
-                                    to: rgba(0x17181b00),
-                                    start: 0.,
-                                    end: 1.,
-                                },
-                                fade(1. - p * 1.25) * shown,
-                            )),
-                    ),
-            );
+            let opacity = fade(1. - p * 1.25) * shown;
+            if opacity > 0. {
+                banner = banner.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .w(px(portrait_wide(width)))
+                        .h_full()
+                        .opacity(opacity)
+                        .child(
+                            img(Arc::clone(portrait))
+                                .size_full()
+                                .object_fit(ObjectFit::Fill),
+                        )
+                        .children(frost::piece(
+                            frost::Fill::Picture(Arc::clone(portrait)),
+                            opacity,
+                        )),
+                );
+            }
         }
 
         // An album's cover hangs out of the banner: this is the part of it
@@ -538,6 +517,71 @@ impl Banner {
     }
 }
 
+/// How much of the portrait's width, from its left edge, melts into the
+/// blur (`mask-image: linear-gradient(90deg, transparent, #000 52%)`).
+const MELT: f32 = 0.52;
+
+/// How wide an artist's portrait stands in a banner `width` points across.
+pub(crate) fn portrait_wide(width: f32) -> f32 {
+    (width * 0.4).min(380.)
+}
+
+/// Where a picture `iw` by `ih` lies in a box `w` by `h`, its left and top
+/// and its size: it covers the box, kept at the middle across and 30% down
+/// (`object-fit: cover; object-position: center 30%`).
+fn placed(iw: f32, ih: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let (iw, ih) = (iw.max(1.), ih.max(1.));
+    let scale = (w / iw).max(h / ih);
+    let (dw, dh) = (iw * scale, ih * scale);
+    ((w - dw) * 0.5, (h - dh) * 0.3, dw, dh)
+}
+
+/// An artist's portrait as its box in the banner shows it, `w` by `h`
+/// device pixels: cropped as [`placed`] places it, and its left edge melting
+/// to nothing, the mask's ramp made its alpha. GPUI has no mask, so the
+/// ramp is in the picture, which is drawn whole and exact at any scale. In
+/// BGRA, as GPUI takes it.
+pub(crate) fn melted(source: &RgbaImage, w: u32, h: u32) -> RenderImage {
+    let (w, h) = (w.max(1), h.max(1));
+    let (sw, sh) = (source.width().max(1), source.height().max(1));
+    let (x, y, dw, _) = placed(sw as f32, sh as f32, w as f32, h as f32);
+    // The part of the picture the box shows, in the picture's own pixels,
+    // with a margin for the resampling filter to read past its edge; it is
+    // drawn at its size and the box cut from that, so that where it is cut
+    // is off by half a device pixel at most, and a picture of any shape
+    // costs no more than its box.
+    let scale = dw / sw as f32;
+    let (from_x, from_y) = (-x / scale, -y / scale);
+    let (to_x, to_y) = (from_x + w as f32 / scale, from_y + h as f32 / scale);
+    let margin = 2.;
+    let (left, top) = (
+        ((from_x - margin).floor().max(0.) as u32).min(sw - 1),
+        ((from_y - margin).floor().max(0.) as u32).min(sh - 1),
+    );
+    let (right, bottom) = (
+        ((to_x + margin).ceil() as u32).clamp(left + 1, sw),
+        ((to_y + margin).ceil() as u32).clamp(top + 1, sh),
+    );
+    let part = image::imageops::crop_imm(source, left, top, right - left, bottom - top);
+    let (pw, ph) = (
+        (((right - left) as f32 * scale).round() as u32).max(w),
+        (((bottom - top) as f32 * scale).round() as u32).max(h),
+    );
+    let drawn = image::imageops::resize(&*part, pw, ph, image::imageops::FilterType::Triangle);
+    let (cut_x, cut_y) = (
+        (((from_x - left as f32) * scale).round().max(0.) as u32).min(pw - w),
+        (((from_y - top as f32) * scale).round().max(0.) as u32).min(ph - h),
+    );
+    let mut out = image::imageops::crop_imm(&drawn, cut_x, cut_y, w, h).to_image();
+    let melt = w as f32 * MELT;
+    for (column, _, pixel) in out.enumerate_pixels_mut() {
+        let [r, g, b, a] = pixel.0;
+        let shown = ((column as f32 + 0.5) / melt).min(1.);
+        pixel.0 = [b, g, r, (f32::from(a) * shown).round() as u8];
+    }
+    RenderImage::new(vec![image::Frame::new(out)])
+}
+
 /// The real cover's shadow, in each palette.
 pub(crate) fn cover_shadow() -> Vec<BoxShadow> {
     vec![if theme::dark() {
@@ -545,4 +589,119 @@ pub(crate) fn cover_shadow() -> Vec<BoxShadow> {
     } else {
         theme::css_shadow(16., 40., theme::cover_shadow())
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_portrait_covers_its_box_kept_30_percent_down() {
+        let near = |a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)| {
+            (a.0 - b.0).abs() < 1e-3
+                && (a.1 - b.1).abs() < 1e-3
+                && (a.2 - b.2).abs() < 1e-3
+                && (a.3 - b.3).abs() < 1e-3
+        };
+        // Square, and tall: as wide as the box, cut 30% of the way down.
+        let square = placed(1000., 1000., 380., HEIGHT);
+        assert!(
+            near(square, (0., 0.3 * (HEIGHT - 380.), 380., 380.)),
+            "{square:?}"
+        );
+        let tall = placed(600., 1200., 380., HEIGHT);
+        assert!(
+            near(tall, (0., 0.3 * (HEIGHT - 760.), 380., 760.)),
+            "{tall:?}"
+        );
+        // Wide: as tall as the box, kept at the middle across.
+        let wide = placed(1200., 600., 380., HEIGHT);
+        let across = 2. * HEIGHT;
+        assert!(
+            near(wide, ((380. - across) / 2., 0., across, HEIGHT)),
+            "{wide:?}"
+        );
+    }
+
+    #[test]
+    fn the_melt_is_the_pictures_alpha_from_clear_to_whole() {
+        // Red over blue, its rows cut where CSS cuts them: a square drawn
+        // 760 square, cut from row 100 of 760 (30% of 760 - 428), so the
+        // box's first 280 rows are red and the rest blue. Squashed, or cut
+        // from the top, more of it would be red.
+        let source = RgbaImage::from_fn(380, 380, |_, y| {
+            if y < 190 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let made = melted(&source, 760, 428);
+        let size = made.size(0);
+        assert_eq!((size.width.0, size.height.0), (760, 428));
+        let bytes = made.as_bytes(0).unwrap_or_default();
+        // A pixel missing reads as black, and fails below.
+        let at = |x: usize, y: usize| -> [u8; 4] {
+            bytes
+                .get((y * 760 + x) * 4..(y * 760 + x) * 4 + 4)
+                .and_then(|pixel| <[u8; 4]>::try_from(pixel).ok())
+                .unwrap_or_default()
+        };
+        // In BGRA, red near the top and blue near the foot, either side of
+        // row 280 (blended a little across it).
+        let [b, _, r, _] = at(700, 250);
+        assert!(r > 240 && b < 15, "{r} {b}");
+        let [b, _, r, _] = at(700, 310);
+        assert!(b > 240 && r < 15, "{r} {b}");
+        // The ramp: clear at the left edge, half way at a quarter of the
+        // width (half of 52%), whole from 52% on, and never falling.
+        let alpha = |x: usize| at(x, 0)[3];
+        assert!(alpha(0) <= 1, "{}", alpha(0));
+        let half = (760. * MELT / 2.) as usize;
+        assert!((i32::from(alpha(half)) - 128).abs() <= 2, "{}", alpha(half));
+        let whole = (760. * MELT).ceil() as usize;
+        assert!((whole..760).all(|x| alpha(x) == 255));
+        assert!((1..760).all(|x| alpha(x) >= alpha(x - 1)));
+        // The colour is the picture's, not darkened with the alpha.
+        let [b, _, r, _] = at(half, 250);
+        assert!(r > 240 && b < 15, "{r} {b}");
+    }
+
+    #[test]
+    fn a_picture_of_any_shape_is_made_at_its_box_size() {
+        // A line of a picture either way, and one pixel: made from the part
+        // the box shows, not from the whole picture drawn at its size.
+        for (pw, ph) in [(1, 1024), (1024, 1), (1, 1), (3, 2)] {
+            let made = melted(&RgbaImage::new(pw, ph), 761, 427);
+            let size = made.size(0);
+            assert_eq!((size.width.0, size.height.0), (761, 427), "{pw}x{ph}");
+        }
+    }
+
+    #[test]
+    fn a_wide_portrait_is_cut_at_its_middle_across() {
+        // Three bands across, red, green and blue, 1200 by 400: drawn 428
+        // tall it is 1284 wide, cut 262 in from each side, so the box shows
+        // green between red and blue at its two ends.
+        let source = RgbaImage::from_fn(1200, 400, |x, _| match x {
+            0..400 => image::Rgba([255, 0, 0, 255]),
+            400..800 => image::Rgba([0, 255, 0, 255]),
+            _ => image::Rgba([0, 0, 255, 255]),
+        });
+        let made = melted(&source, 760, 428);
+        let bytes = made.as_bytes(0).unwrap_or_default();
+        let at = |x: usize| -> [u8; 4] {
+            bytes
+                .get((200 * 760 + x) * 4..(200 * 760 + x) * 4 + 4)
+                .and_then(|pixel| <[u8; 4]>::try_from(pixel).ok())
+                .unwrap_or_default()
+        };
+        // In BGRA: red up to 166 (428 - 262), green to 594, then blue.
+        let [b, g, r, _] = at(150);
+        assert!(r > 240 && g < 15 && b < 15, "{r} {g} {b}");
+        let [b, g, r, _] = at(380);
+        assert!(g > 240 && r < 15 && b < 15, "{r} {g} {b}");
+        let [b, g, r, _] = at(620);
+        assert!(b > 240 && r < 15 && g < 15, "{r} {g} {b}");
+    }
 }

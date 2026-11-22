@@ -329,6 +329,9 @@ fn cells(bounds: Bounds<Pixels>) -> (usize, usize) {
 /// A picture small, premultiplied, for sampling.
 struct Small {
     side: (usize, usize),
+    /// The picture's own size, whose shape it is fitted by: the small side
+    /// is that shape only to a whole pixel.
+    full: (f32, f32),
     pixels: Vec<[f32; 4]>,
 }
 
@@ -342,7 +345,15 @@ fn small(image: &RenderImage) -> Option<Rc<Small>> {
     let bytes = image.as_bytes(0)?;
     let full = image.size(0);
     let (iw, ih) = (full.width.0.max(1) as usize, full.height.0.max(1) as usize);
-    let (sw, sh) = (SMALL_SIDE.min(iw), SMALL_SIDE.min(ih));
+    // At most SMALL_SIDE across its longer side, and of its own shape, so
+    // that a picture that is not square is fitted as it is drawn.
+    let (sw, sh) = if iw >= ih {
+        let sw = SMALL_SIDE.min(iw);
+        (sw, (sw * ih / iw).max(1))
+    } else {
+        let sh = SMALL_SIDE.min(ih);
+        ((sh * iw / ih).max(1), sh)
+    };
     let mut sums = vec![[0f32; 4]; sw * sh];
     let mut counts = vec![0f32; sw * sh];
     for (i, pixel) in bytes.as_chunks::<4>().0.iter().enumerate() {
@@ -368,6 +379,7 @@ fn small(image: &RenderImage) -> Option<Rc<Small>> {
         .collect();
     let made = Rc::new(Small {
         side: (sw, sh),
+        full: (iw as f32, ih as f32),
         pixels,
     });
     SMALL.with_borrow_mut(|small| {
@@ -465,7 +477,7 @@ fn lay(
     };
     // A picture covers its box, its middle kept.
     let fit = small.as_ref().map(|small| {
-        let (iw, ih) = (small.side.0 as f32, small.side.1 as f32);
+        let (iw, ih) = small.full;
         let scale = (rw / iw).max(rh / ih);
         let (dw, dh) = (iw * scale, ih * scale);
         (rx + (rw - dw) / 2., ry + (rh - dh) / 2., dw, dh)
@@ -626,6 +638,17 @@ mod tests {
 
     fn at(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+    }
+
+    #[test]
+    fn a_picture_made_small_keeps_its_shape() {
+        let picture =
+            |w: u32, h: u32| RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(w, h))]);
+        let side = |image: &RenderImage| small(image).map(|small| small.side);
+        assert_eq!(side(&picture(1000, 1000)), Some((24, 24)));
+        assert_eq!(side(&picture(760, 428)), Some((24, 13)));
+        assert_eq!(side(&picture(300, 600)), Some((12, 24)));
+        assert_eq!(side(&picture(10, 6)), Some((10, 6)));
     }
 
     #[test]

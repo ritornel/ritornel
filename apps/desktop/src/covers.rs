@@ -380,6 +380,16 @@ pub(crate) fn flush_dropped(window: &mut gpui::Window, cx: &mut App) {
     crate::platform::give_back();
 }
 
+/// Decodes a JPEG whole, keeping its shape, as RGBA: an artist's portrait,
+/// which the banner crops and melts itself (`banner::melted`).
+pub(crate) fn decode_picture(jpeg: &[u8]) -> Option<image::RgbaImage> {
+    Some(
+        image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
+            .ok()?
+            .into_rgba8(),
+    )
+}
+
 /// Decodes a JPEG, resizes it to `px` square when it is larger, swaps it to
 /// BGRA for GPUI and reads its average colour.
 pub(crate) fn decode_cover(jpeg: &[u8], px: u32) -> Option<(RenderImage, Rgba, usize)> {
