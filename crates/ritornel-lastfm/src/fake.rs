@@ -70,7 +70,7 @@ struct State {
     /// Plays sent to `track.scrobble`.
     scrobbled: Vec<FakeScrobble>,
     seen: Vec<Seen>,
-    reply_timestamp: Option<(usize, u64)>,
+    reply_timestamps: HashMap<usize, u64>,
     now_playing_error: Option<u32>,
 }
 
@@ -155,7 +155,7 @@ impl FakeLastfm {
 
     #[cfg(test)]
     pub(crate) fn change_reply_timestamp(&self, index: usize, timestamp: u64) {
-        lock(&self.state).reply_timestamp = Some((index, timestamp));
+        lock(&self.state).reply_timestamps.insert(index, timestamp);
     }
 
     #[cfg(test)]
@@ -304,7 +304,7 @@ fn respond(state: &Mutex<State>, params: HashMap<String, String>) -> (u16, Value
                     "track": {"corrected": "0", "#text": title},
                     "albumArtist": {"corrected": "0", "#text": ""},
                     "ignoredMessage": {"code": "0", "#text": ""},
-                    "timestamp": state.reply_timestamp.filter(|(index, _)| *index == i).map_or(at, |(_, timestamp)| timestamp.to_string()),
+                    "timestamp": state.reply_timestamps.get(&i).map_or(at, u64::to_string),
                 }));
             }
             let accepted = rows.len();

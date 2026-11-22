@@ -160,6 +160,15 @@ impl Lastfm {
     /// is, once. Their times must differ: Last.fm's answer ties an outcome
     /// to a play by time alone.
     pub fn scrobble(&self, session: &SessionKey, plays: &[ToScrobble]) -> Result<Sent, Unsent> {
+        let mut timestamps = std::collections::HashSet::new();
+        if plays
+            .iter()
+            .any(|play| !timestamps.insert(play.timestamp_s))
+        {
+            return Err(Unsent::Refused(
+                "a scrobble batch needs distinct timestamps".to_owned(),
+            ));
+        }
         let writer = self.writer.with_session(session.clone());
         let batch: Vec<Play> = plays.iter().map(play).collect();
         let report = match self.block(writer.scrobble(&batch).send()) {
@@ -189,6 +198,15 @@ impl Lastfm {
                 sent.push(Outcome::Unknown);
                 continue;
             };
+            let agrees = |name: &scrobl::model::Corrected, requested: &str| {
+                name.corrected() || name.name() == requested
+            };
+            if !agrees(outcome.artist(), &scrobble.artist)
+                || !agrees(outcome.track(), &scrobble.title)
+            {
+                sent.push(Outcome::Unknown);
+                continue;
+            }
             sent.push(match outcome.ignored() {
                 Some(ignored) => Outcome::Ignored {
                     code: ignored.code().get(),

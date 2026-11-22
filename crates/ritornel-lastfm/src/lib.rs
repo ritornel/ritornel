@@ -333,6 +333,11 @@ mod tests {
             .scrobble(&SessionKey::new(SESSION_KEY), &plays)
             .unwrap();
         assert_eq!(ambiguous, [Outcome::Unknown, Outcome::Unknown]);
+        fake.change_reply_timestamp(1, 42);
+        let shifted = lastfm
+            .scrobble(&SessionKey::new(SESSION_KEY), &plays)
+            .unwrap();
+        assert_eq!(shifted, [Outcome::Unknown, Outcome::Unknown]);
     }
 
     #[test]
