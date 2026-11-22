@@ -979,12 +979,14 @@ pub(super) fn key_of(
     Ok(found)
 }
 
+enum Filed {
+    Name(String),
+    Loose,
+    Gone,
+}
+
 /// What one row of a view is filed under in its order, for type-to-find.
-fn filed_under(
-    connection: &Connection,
-    resolved: &View,
-    key: i64,
-) -> Result<Option<String>, Error> {
+fn filed_under(connection: &Connection, resolved: &View, key: i64) -> Result<Filed, Error> {
     let sql = match (resolved.kind, resolved.sort) {
         (ListKind::Artists, _) => {
             return Ok(connection
@@ -1000,7 +1002,8 @@ fn filed_under(
                         ))
                     },
                 )
-                .optional()?);
+                .optional()?
+                .map_or(Filed::Gone, Filed::Name));
         }
         (ListKind::Songs, SortKey::Title) => {
             return Ok(connection
@@ -1012,7 +1015,8 @@ fn filed_under(
                         Ok(fold::sort_text(title.as_deref().unwrap_or_default(), None))
                     },
                 )
-                .optional()?);
+                .optional()?
+                .map_or(Filed::Gone, Filed::Name));
         }
         (ListKind::Songs, _) => "SELECT release_id FROM track_appearance WHERE id = ?1",
         (ListKind::Albums, _) if key < 0 => "SELECT ?1 * -1",
@@ -1030,12 +1034,13 @@ fn filed_under(
             "))"
         ),
     };
-    let release: Option<i64> = connection
+    let release: Option<Option<i64>> = connection
         .query_row(sql, [key], |row| row.get(0))
-        .optional()?
-        .flatten();
-    let Some(release) = release else {
-        return Ok(None);
+        .optional()?;
+    let release = match release {
+        Some(Some(key)) => key,
+        Some(None) if resolved.kind == ListKind::Songs => return Ok(Filed::Loose),
+        _ => return Ok(Filed::Gone),
     };
     Ok(connection
         .query_row(
@@ -1064,7 +1069,8 @@ fn filed_under(
                 })
             },
         )
-        .optional()?)
+        .optional()?
+        .map_or(Filed::Gone, Filed::Name))
 }
 
 /// The first row filed at or after `prefix`, found by halving.
@@ -1086,19 +1092,33 @@ pub(super) fn locate_prefix(
         return Ok(None);
     }
     let (mut low, mut high) = (0, resolved.ids.len());
+    let mut found = None;
     while low < high {
         let middle = low + (high - low) / 2;
-        let Some(key) = resolved.ids.get(middle) else {
+        // Look past a row that disappeared since the view opened. A loose
+        // song still exists, and follows every album in this order.
+        let mut at = middle;
+        loop {
+            let Some(key) = resolved.ids.get(at).filter(|_| at < high) else {
+                high = middle;
+                break;
+            };
+            match filed_under(connection, resolved, *key)? {
+                Filed::Gone => {
+                    at += 1;
+                    continue;
+                }
+                Filed::Loose => high = middle,
+                Filed::Name(filed) if by_name(&filed, &target) == Ordering::Less => low = at + 1,
+                Filed::Name(_) => {
+                    found = Some(at as u64);
+                    high = middle;
+                }
+            }
             break;
-        };
-        // A row that has gone since sorts nowhere: step past it.
-        match filed_under(connection, resolved, *key)? {
-            Some(filed) if by_name(&filed, &target) == Ordering::Less => low = middle + 1,
-            Some(_) => high = middle,
-            None => low = middle + 1,
         }
     }
-    Ok((low < resolved.ids.len()).then_some(low as u64))
+    Ok(found)
 }
 
 #[cfg(test)]

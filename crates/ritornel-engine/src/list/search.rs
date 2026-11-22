@@ -220,14 +220,16 @@ fn plays_of(connection: &Connection, recordings: &[i64]) -> Result<HashMap<i64, 
 fn add_plays(
     connection: &Connection,
     found: &mut [Found],
-    pairs: &[(i64, i64)],
+    mut pairs: Vec<(i64, i64)>,
 ) -> Result<(), Error> {
+    pairs.sort_unstable();
+    pairs.dedup();
     let mut recordings: Vec<i64> = pairs.iter().map(|(_, recording)| *recording).collect();
     recordings.sort_unstable();
     recordings.dedup();
     let plays = plays_of(connection, &recordings)?;
     let mut sums: HashMap<i64, u64> = HashMap::new();
-    for (key, recording) in pairs {
+    for (key, recording) in &pairs {
         *sums.entry(*key).or_default() += plays.get(recording).copied().unwrap_or(0);
     }
     for each in found {
@@ -285,11 +287,12 @@ fn artists(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranke
         // In this order, by `release_display_artist_credit` and
         // `track_appearance_release`: left to itself SQLite reads every song.
         concat!(
-            "SELECT a.canonical_id, ta.recording_id
+            "SELECT a.canonical_id, rc.canonical_id
              FROM artist_credit_name acn
              CROSS JOIN artist a ON a.id = acn.artist_id
              CROSS JOIN release r ON r.display_artist_credit_id = acn.artist_credit_id
              CROSS JOIN track_appearance ta ON ta.release_id = r.id
+             JOIN recording rc ON rc.id = ta.recording_id
              WHERE a.canonical_id IN ({})
                AND r.redirect_to_id IS NULL AND ta.redirect_to_id IS NULL AND ",
             reached!("ta")
@@ -300,7 +303,7 @@ fn artists(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranke
             Ok(())
         },
     )?;
-    add_plays(connection, &mut found, &pairs)?;
+    add_plays(connection, &mut found, pairs)?;
     Ok(rank(found, limit))
 }
 
@@ -333,9 +336,10 @@ fn albums(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked
     for_each_in(
         connection,
         concat!(
-            "SELECT release_id, recording_id FROM track_appearance
-             WHERE release_id IN ({}) AND redirect_to_id IS NULL AND ",
-            reached!("track_appearance")
+            "SELECT ta.release_id, rc.canonical_id FROM track_appearance ta
+             JOIN recording rc ON rc.id = ta.recording_id
+             WHERE ta.release_id IN ({}) AND ta.redirect_to_id IS NULL AND ",
+            reached!("ta")
         ),
         &release_keys,
         |row| {
@@ -346,7 +350,7 @@ fn albums(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked
             Ok(())
         },
     )?;
-    add_plays(connection, &mut found, &pairs)?;
+    add_plays(connection, &mut found, pairs)?;
     Ok(rank(found, limit))
 }
 
@@ -393,9 +397,10 @@ fn songs(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked,
         }
         None => {
             let mut statement = connection.prepare(concat!(
-                "SELECT id, display_title, recording_id, release_id IS NULL
-                 FROM track_appearance WHERE redirect_to_id IS NULL AND ",
-                reached!("track_appearance")
+                "SELECT ta.id, ta.display_title, rc.canonical_id, ta.release_id IS NULL
+                 FROM track_appearance ta JOIN recording rc ON rc.id = ta.recording_id
+                 WHERE ta.redirect_to_id IS NULL AND ",
+                reached!("ta")
             ))?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -461,7 +466,7 @@ fn songs(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked,
         .iter()
         .map(|(recording, kept)| (kept.key, *recording))
         .collect();
-    add_plays(connection, &mut found, &pairs)?;
+    add_plays(connection, &mut found, pairs)?;
     Ok(rank(found, limit))
 }
 
@@ -474,9 +479,10 @@ fn live_songs(connection: &Connection, keys: &[i64]) -> Result<HashMap<i64, (i64
         Ok(())
     };
     let columns = concat!(
-        "SELECT id, recording_id, release_id IS NULL FROM track_appearance
-         WHERE redirect_to_id IS NULL AND ",
-        reached!("track_appearance")
+        "SELECT ta.id, rc.canonical_id, ta.release_id IS NULL FROM track_appearance ta
+         JOIN recording rc ON rc.id = ta.recording_id
+         WHERE ta.redirect_to_id IS NULL AND ",
+        reached!("ta")
     );
     // A long list is most of the table, which one pass reads faster.
     if keys.len() > 4 * CHUNK {
@@ -491,7 +497,7 @@ fn live_songs(connection: &Connection, keys: &[i64]) -> Result<HashMap<i64, (i64
     } else {
         for_each_in(
             connection,
-            &format!("{columns} AND id IN ({{}})"),
+            &format!("{columns} AND ta.id IN ({{}})"),
             keys,
             &mut each,
         )?;
@@ -605,6 +611,49 @@ mod tests {
         // A name of no letter or digit is found as it is written.
         assert_eq!(Typed::of("!!!").tier("!!!"), Some(IS));
         assert!(Typed::of("  ").is_empty());
+    }
+
+    #[test]
+    fn the_same_play_counts_once_for_each_result_that_includes_its_recording() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE listener(id); INSERT INTO listener VALUES(1);
+            CREATE TABLE play_event(listener_id, recording_id, counts, excluded);
+            INSERT INTO play_event VALUES(1, 7, 1, 0);",
+        )
+        .unwrap();
+        let mut matches: Vec<_> = [1, 2]
+            .map(|key| Found {
+                key,
+                tier: IS,
+                filed: String::new(),
+                plays: 0,
+            })
+            .into();
+        add_plays(&db, &mut matches, vec![(1, 7), (1, 7), (2, 7)]).unwrap();
+        assert_eq!([matches[0].plays, matches[1].plays], [1, 1]);
+    }
+
+    #[test]
+    fn short_and_indexed_search_return_a_merged_recording_only_once() {
+        let mut rig = crate::scan_tests::Rig::new();
+        rig.put("A/1.flac", "a.flac");
+        rig.put("B/1.flac", "a.retagged.flac");
+        rig.put("Loose/Other Song.wav", "a.wav");
+        rig.scan();
+        rig.library.write(crate::WriteRequest { method: "test.write", command: None, client: None }, |write| {
+            write.connection().execute_batch("UPDATE recording SET canonical_id = (SELECT min(id) FROM recording), redirect_to_id = (SELECT min(id) FROM recording) WHERE id <> (SELECT min(id) FROM recording);
+              UPDATE track_appearance SET display_title = 'Tin Field';
+              UPDATE search_text SET title = 'tin field';")?;
+            Ok(String::new())
+        }).unwrap();
+        for typed in ["ti", "tin"] {
+            assert_eq!(
+                rig.library.search(typed, 10).unwrap().songs.len(),
+                1,
+                "{typed}"
+            );
+        }
     }
 
     #[test]

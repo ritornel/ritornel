@@ -921,3 +921,27 @@ fn a_nul_in_typed_text_is_ignored_by_both_song_searches() {
     assert_eq!(view.ids.len(), 1);
     assert_eq!(rig.library.search(typed, 10).unwrap().songs.len(), 1);
 }
+
+#[test]
+fn loose_songs_after_the_last_album_do_not_hide_it_from_type_to_find() {
+    let mut rig = crate::scan_tests::Rig::new();
+    rig.put("A/1.flac", "a.flac");
+    rig.put("Loose/Tin Field.wav", "a.wav");
+    rig.scan();
+    let mut view = rig
+        .library
+        .list_open(ListKind::Songs, &query(SortKey::Album))
+        .unwrap();
+    assert_eq!(view.ids.len(), 2);
+    assert_eq!(
+        rig.library.list_locate_prefix(&view, "Moss").unwrap(),
+        Some(0)
+    );
+    assert_eq!(rig.library.list_locate_prefix(&view, "Zinc").unwrap(), None);
+    // A view also retains the ID of a row that has since been deleted.
+    view.ids.insert(1, i64::MAX);
+    assert_eq!(
+        rig.library.list_locate_prefix(&view, "Moss").unwrap(),
+        Some(0)
+    );
+}
