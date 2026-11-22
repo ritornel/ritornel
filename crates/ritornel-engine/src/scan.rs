@@ -539,30 +539,33 @@ impl ScanRun {
     /// audio matches exactly one item of this root whose path is gone, or
     /// now holds other audio, the file moved and the item follows it. An
     /// item that leaves a path with other audio in it leaves that audio to
-    /// be placed in its turn, as a file at a new path.
+    /// be placed in its turn, as a file at a new path, and so on along a
+    /// chain of files that each moved into the last one's place.
     fn place(&mut self, payload: Payload, counted: &mut ScanSummary, ops: &mut Vec<RecordOp>) {
-        let moved = payload
-            .audio
-            .as_ref()
-            .and_then(|audio| self.gone_by_audio.get_mut(&audio.hash))
-            .filter(|items| items.len() == 1)
-            .and_then(Vec::pop);
-        let Some(item) = moved else {
-            counted.new += 1;
-            ops.push(RecordOp::New(payload));
-            return;
-        };
-        self.gone.retain(|gone| *gone != item);
-        counted.moved += 1;
-        // The move re-keys the item before anything takes its old path.
-        ops.push(RecordOp::Move { item, payload });
-        if let Some(at) = self
-            .replaced
-            .iter()
-            .position(|(replaced, _)| *replaced == item)
-        {
-            let (_, refill) = self.replaced.remove(at);
-            self.place(refill, counted, ops);
+        let mut next = Some(payload);
+        while let Some(payload) = next.take() {
+            let moved = payload
+                .audio
+                .as_ref()
+                .and_then(|audio| self.gone_by_audio.get_mut(&audio.hash))
+                .filter(|items| items.len() == 1)
+                .and_then(Vec::pop);
+            let Some(item) = moved else {
+                counted.new += 1;
+                ops.push(RecordOp::New(payload));
+                break;
+            };
+            self.gone.retain(|gone| *gone != item);
+            counted.moved += 1;
+            // The move re-keys the item before anything takes its old path.
+            ops.push(RecordOp::Move { item, payload });
+            if let Some(at) = self
+                .replaced
+                .iter()
+                .position(|(replaced, _)| *replaced == item)
+            {
+                next = Some(self.replaced.swap_remove(at).1);
+            }
         }
     }
 

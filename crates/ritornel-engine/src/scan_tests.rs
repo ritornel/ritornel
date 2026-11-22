@@ -798,6 +798,43 @@ fn files_that_move_into_each_others_paths_keep_their_items() {
 }
 
 #[test]
+fn files_each_renamed_into_the_next_ones_place_keep_their_items() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.put("Tin Weather/03.mp3", "a.mp3");
+    rig.scan();
+    let items = |rig: &Rig| {
+        rig.rows(
+            "SELECT si.id, si.provider_key, sr.audio_asset_id FROM source_item si
+             JOIN source_item_revision sr ON sr.id = si.current_revision_id ORDER BY si.id",
+        )
+    };
+    let before = items(&rig);
+    // Each moves up one, the last first: 03 to 04, 02 to 03, 01 to 02.
+    let root = rig.root().join("Tin Weather");
+    std::fs::rename(root.join("03.mp3"), root.join("04.mp3")).unwrap();
+    std::fs::rename(root.join("02.flac"), root.join("03.mp3")).unwrap();
+    std::fs::rename(root.join("01.flac"), root.join("02.flac")).unwrap();
+
+    let summary = rig.scan();
+    assert_eq!(
+        (summary.moved, summary.new, summary.retired, summary.missing),
+        (3, 0, 0, 0)
+    );
+    let after = items(&rig);
+    let renamed = |row: &String, from: &str, to: &str| row.replace(from, to);
+    assert_eq!(
+        after,
+        [
+            renamed(&before[0], "01.flac", "02.flac"),
+            renamed(&before[1], "02.flac", "03.mp3"),
+            renamed(&before[2], "03.mp3", "04.mp3"),
+        ]
+    );
+}
+
+#[test]
 fn a_file_that_vanishes_is_marked_missing_and_reclaims_its_rows_when_it_returns() {
     let mut rig = Rig::new();
     album(&mut rig);
