@@ -247,10 +247,11 @@ fn loved_page_complete(read: u64, total: u64, empty: bool, last: bool) -> Result
 }
 
 /// Every track `user` has loved, as the list stands now, a page at a time.
-/// Nothing ties one page of it to the next, so a track loved during the
-/// read can be missing until the next sync.
+/// Changes during pagination can shift page boundaries. A changed total
+/// invalidates the list before it can clear any previously saved love.
 async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Vec<Love>>, Error> {
     let mut loves = Vec::new();
+    let mut first_total = None;
     let mut page_number = 1;
     loop {
         if sink.stopping() {
@@ -270,6 +271,12 @@ async fn loved(client: &Client, user: &str, sink: &dyn Sink) -> Result<Option<Ve
             ));
         }
         let total = page.total();
+        let expected = *first_total.get_or_insert(total);
+        if total != expected {
+            return Err(Error::source(format!(
+                "Last.fm's loved-track total changed from {expected} to {total} on page {page_number}"
+            )));
+        }
         let rows = page.len();
         loves.extend(page.items().iter().map(|row| Love {
             artist: row.track().artist().name().to_owned(),
@@ -298,8 +305,8 @@ impl LastfmSource<'_> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs())
         });
-        let stored = sink.cursor()?.as_deref().and_then(read_cursor);
-        let start = match stored {
+        let previous_cursor = sink.cursor()?.as_deref().and_then(read_cursor);
+        let start = match previous_cursor {
             Some(read_before) if !full => read_before.min(now).saturating_sub(settings.recent_s),
             _ => 0,
         };
@@ -363,7 +370,7 @@ impl LastfmSource<'_> {
                     from_ms: seconds_to_ms(from),
                     to_ms: seconds_to_ms(to),
                 },
-                cursor: cursor(to.max(stored.unwrap_or(0))),
+                cursor: cursor(to.max(previous_cursor.unwrap_or(0))),
             })?;
             synced.new += stored.new;
             synced.gone += stored.gone;

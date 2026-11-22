@@ -15,9 +15,9 @@ const NOW: u64 = 1_800_000_000;
 /// A sink that keeps what it is handed in memory, as the core would: a
 /// record stored before writes nothing, and a batch with nothing new
 /// writes nothing, its cursor included.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Memory {
-    stop_on_page: Option<(std::sync::Arc<FakeLastfm>, &'static str)>,
+    on_stop_check: Option<Box<dyn Fn() -> bool>>,
     records: BTreeMap<Vec<u8>, ImportRecord>,
     cursor: Option<String>,
     writes: usize,
@@ -76,11 +76,8 @@ impl Sink for Memory {
     fn progress(&mut self, _: Progress) {}
 
     fn stopping(&self) -> bool {
-        self.stop_on_page.as_ref().is_some_and(|(fake, method)| {
-            fake.seen().iter().any(|req| {
-                &req.method == method && req.params.get("limit").is_some_and(|n| n != "1")
-            })
-        }) || self.stop_after.is_some_and(|after| self.batches >= after)
+        self.on_stop_check.as_ref().is_some_and(|check| check())
+            || self.stop_after.is_some_and(|after| self.batches >= after)
     }
 }
 
@@ -330,7 +327,14 @@ fn cancelling_between_pages_discards_the_incomplete_span_or_loved_list() {
         let fake = std::sync::Arc::new(FakeLastfm::start("someone", history(12)));
         fake.set_loved(vec![("Invented", "Song", NOW); 1001]);
         let mut sink = Memory {
-            stop_on_page: Some((fake.clone(), method)),
+            on_stop_check: Some(Box::new({
+                let fake = fake.clone();
+                move || {
+                    fake.seen().iter().any(|req| {
+                        req.method == method && req.params.get("limit").is_some_and(|n| n != "1")
+                    })
+                }
+            })),
             ..Memory::default()
         };
         let synced = lastfm(&fake, 20)
@@ -363,4 +367,50 @@ fn a_partial_last_page_cannot_replace_loved_tracks() {
     assert!(loved_page_complete(0, 0, true, true).unwrap());
     assert!(!loved_page_complete(1, 2, false, false).unwrap());
     assert!(loved_page_complete(2, 2, false, true).unwrap());
+}
+
+#[test]
+fn an_unlove_between_pages_cannot_clear_a_different_track() {
+    let fake = std::sync::Arc::new(FakeLastfm::start("someone", vec![]));
+    let loved: Vec<String> = (0..1002).map(|i| format!("Invented Song {i}")).collect();
+    fake.set_loved(
+        loved
+            .iter()
+            .map(|t| ("Invented Artist", t.as_str(), NOW))
+            .collect(),
+    );
+    let mut sink = Memory {
+        loves: vec![Love {
+            artist: "Invented Artist".into(),
+            title: loved[1000].clone(),
+            loved_at_ms: seconds_to_ms(NOW),
+        }],
+        on_stop_check: Some(Box::new({
+            let fake = fake.clone();
+            move || {
+                if fake
+                    .seen()
+                    .iter()
+                    .any(|req| req.method == "user.getLovedTracks")
+                {
+                    fake.set_loved(
+                        loved
+                            .iter()
+                            .skip(1)
+                            .map(|t| ("Invented Artist", t.as_str(), NOW))
+                            .collect(),
+                    );
+                }
+                false
+            }
+        })),
+        ..Default::default()
+    };
+    let result = lastfm(&fake, 10)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut sink, true);
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(sink.loves.len(), 1);
+    assert_eq!(sink.loves[0].title, "Invented Song 1000");
 }
