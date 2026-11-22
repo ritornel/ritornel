@@ -440,6 +440,15 @@ impl Core {
         Ok(())
     }
 
+    /// Closes every session that is the link of the satellite `peer`.
+    pub(crate) fn close_linked(&self, peer: Id) {
+        for session in lock(&self.sessions).open.values() {
+            if session.peer() == Some(peer) {
+                session.close();
+            }
+        }
+    }
+
     /// Ends a session whose transport has gone.
     pub(crate) fn close_session(&self, session: &Session) {
         session.close();
@@ -630,6 +639,15 @@ impl Core {
             return Err(RpcError::new(
                 ErrorCode::Forbidden,
                 format!("{} needs a full session", row.name),
+            ));
+        }
+        if session.peer().is_some() && link::kept_from_a_link(row.name) {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                format!(
+                    "{} is for this server's own machine, not a satellite",
+                    row.name
+                ),
             ));
         }
         match row.name {

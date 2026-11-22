@@ -7,7 +7,7 @@ use std::sync::PoisonError;
 use ritornel_contract::{
     CONTRACT_VERSION, ErrorCode, HubStatus, InviteLink, LinkGranted, LinkInvite, LinkInviteParams,
     LinkJoinParams, LinkRequest, LinkStatus, MAX_CLIENT_TEXT, RpcError, SatelliteStatus,
-    ServerRole, hex,
+    ServerRole, hex, link_request_proof,
 };
 use ritornel_engine::HubLink;
 use tracing::{info, warn};
@@ -22,6 +22,27 @@ pub(crate) type Refusal = (u16, String);
 
 fn internal(error: impl std::fmt::Display) -> RpcError {
     RpcError::new(ErrorCode::Internal, error.to_string())
+}
+
+/// Whether `method` is kept from a satellite's link session: what names
+/// the hub's own folders, which a satellite cannot see, and what is for the
+/// hub's own machine alone, such as its backups and its links. A satellite
+/// is trusted with the library's calls and its own listens, and no more.
+pub(super) fn kept_from_a_link(method: &str) -> bool {
+    matches!(
+        method,
+        "library.create"
+            | "sources.add"
+            | "scan.start"
+            | "library.setWatching"
+            | "artists.importPictures"
+            | "artists.pictureFolders"
+            | "sources.tracks"
+            | "history.export"
+            | "server.backup"
+            | "link.invite"
+            | "link.join"
+    )
 }
 
 /// A link call made on a satellite's own link session is refused: a
@@ -120,6 +141,21 @@ impl Core {
             ));
         }
         let secret = hex::decode(&asked.secret).unwrap_or_default();
+        // The satellite proves it holds the key it names, for this hub and
+        // this invite, before the invite is spent.
+        let key = hex::decode_array::<32>(&asked.public_key);
+        let proved = key
+            .zip(hex::decode_array::<64>(&asked.proof))
+            .is_some_and(|(key, proof)| {
+                ritornel_engine::verify_signature(
+                    &key,
+                    &link_request_proof(self.server_id, &secret),
+                    &proof,
+                )
+            });
+        let (Some(key), true) = (key, proved) else {
+            return Err(refused(400, "the satellite did not prove it holds its key"));
+        };
         if !self.invites.redeem(&secret) {
             warn!(peer = %asked.server_id, "a satellite offered a secret that is no open invite's");
             return Err(refused(403, "no such invite"));
@@ -150,12 +186,19 @@ impl Core {
             .register_server(asked.server_id, &name)
             .map_err(failed)?;
         let meta = library.meta().map_err(failed)?;
-        let (session, token) = stores
+        let (session, token) = match stores
             .server
-            .issue_link_session(asked.server_id, &name)
-            .map_err(failed)?;
+            .issue_link_session(asked.server_id, key, &name)
+        {
+            Ok(issued) => issued,
+            Err(ritornel_engine::Error::Invalid(why)) => return Err(refused(409, why)),
+            Err(error) => return Err(failed(error)),
+        };
         self.link_sessions
             .add(token.hash(), asked.server_id, session);
+        // Whatever the satellite had open on the session it held before
+        // ends with it.
+        self.close_linked(asked.server_id);
         info!(satellite = %asked.server_id, name = %name, "a satellite joined");
         Ok(LinkGranted {
             token: token.expose().to_owned(),
@@ -208,7 +251,8 @@ impl Core {
                     match link::reach(route, invite.hub, &invite.key, &*self.entropy).await {
                         Ok(descriptor) => {
                             let granted =
-                                link::request(route, &invite, self.server_id, &name).await?;
+                                link::request(route, &invite, self.server_id, &name, &self.signer)
+                                    .await?;
                             return Ok((route, descriptor, granted));
                         }
                         Err(why) => tried.push(format!("{route}: {why}")),

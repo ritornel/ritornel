@@ -108,6 +108,11 @@ pub struct LinkRequest {
     pub server_id: Id,
     /// The satellite's name.
     pub name: String,
+    /// The satellite's public key, as 64 hex digits.
+    pub public_key: String,
+    /// The signature, as 128 hex digits, of [`link_request_proof`] for the
+    /// hub and this secret: proof that the satellite holds its key.
+    pub proof: String,
     /// The [contract version](crate::CONTRACT_VERSION) the satellite
     /// speaks. A hub refuses another.
     pub contract_version: u32,
@@ -123,6 +128,18 @@ pub struct LinkGranted {
     pub library_id: Id,
     /// The hub epoch.
     pub epoch: i64,
+}
+
+/// What a satellite signs to prove it holds its key when it joins: a fixed
+/// label, the hub's ID and the invite's secret, so the signature is good
+/// for this hub and this invite alone.
+pub fn link_request_proof(hub: Id, secret: &[u8]) -> Vec<u8> {
+    const LABEL: &[u8] = b"ritornel link request proof v1\0";
+    let mut message = Vec::with_capacity(LABEL.len() + 16 + secret.len());
+    message.extend_from_slice(LABEL);
+    message.extend_from_slice(hub.as_bytes());
+    message.extend_from_slice(secret);
+    message
 }
 
 /// The scheme of an invite link.

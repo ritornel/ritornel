@@ -18,7 +18,8 @@ use std::time::Duration;
 use ritornel_client::contract::methods::{LinkInvite, LinkJoin, LinkStatusCall};
 use ritornel_client::contract::{
     CONTRACT_VERSION, ClientKind, ErrorCode, HelloParams, InviteLink, LinkInviteParams,
-    LinkJoinParams, LinkRequest, LinkStatus, NoParams, ServerRole, capability, hex, route,
+    LinkJoinParams, LinkRequest, LinkStatus, NoParams, ServerRole, capability, hex,
+    link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -92,6 +93,30 @@ fn code(error: &ritornel_client::Error) -> Option<ErrorCode> {
         ritornel_client::Error::Call(error) => Some(error.kind()),
         _ => None,
     }
+}
+
+/// What a server holding the key made from `seed` sends to join with
+/// `invite`, as the server `server_id`.
+fn request(invite: &InviteLink, server_id: ritornel_client::contract::Id, seed: u8) -> LinkRequest {
+    let signer = ritornel_engine::Signer::from_seed([seed; 32]);
+    LinkRequest {
+        secret: hex::encode(&invite.secret),
+        server_id,
+        name: "invented".to_owned(),
+        public_key: hex::encode(&signer.public_key()),
+        proof: hex::encode(&signer.sign(&link_request_proof(invite.hub, &invite.secret))),
+        contract_version: CONTRACT_VERSION,
+    }
+}
+
+async fn post(hub: &Server, asked: &LinkRequest) -> (u16, String) {
+    let answer = ritornel_client::post(hub.endpoint(), route::LINK, None, asked)
+        .await
+        .unwrap();
+    (
+        answer.status,
+        String::from_utf8_lossy(&answer.body).into_owned(),
+    )
 }
 
 /// An invite from `hub`, offering its loopback address.
@@ -210,24 +235,22 @@ async fn an_invite_works_once_and_only_for_the_hub_it_names() {
         let refused = join(&desk_client, &public.to_string()).await.unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Invalid), "{refused}");
 
-        // The secret is spent by the satellite that uses it first.
+        // A satellite that does not prove it holds the key it names is
+        // refused, and the invite is not spent.
         let parsed = InviteLink::parse(&link).unwrap();
-        let used = |server_id| LinkRequest {
-            secret: hex::encode(&parsed.secret),
-            server_id,
-            name: "thief".to_owned(),
-            contract_version: CONTRACT_VERSION,
-        };
-        let first =
-            ritornel_client::post(hub.endpoint(), route::LINK, None, &used(other.server_id()))
-                .await
-                .unwrap();
-        assert_eq!(first.status, 200);
-        let again =
-            ritornel_client::post(hub.endpoint(), route::LINK, None, &used(other.server_id()))
-                .await
-                .unwrap();
-        assert_eq!(again.status, 403);
+        let mut unproved = request(&parsed, other.server_id(), 1);
+        unproved.proof = request(&parsed, other.server_id(), 2).proof;
+        assert_eq!(post(&hub, &unproved).await.0, 400);
+
+        // The secret is spent by the satellite that uses it first.
+        assert_eq!(
+            post(&hub, &request(&parsed, other.server_id(), 1)).await.0,
+            200
+        );
+        assert_eq!(
+            post(&hub, &request(&parsed, other.server_id(), 1)).await.0,
+            403
+        );
         let refused = join(&desk_client, &link).await.unwrap_err();
         assert!(
             refused.to_string().contains("refused the link"),
@@ -248,25 +271,17 @@ async fn a_satellite_of_another_contract_version_is_refused() {
         let (hub, hub_client, desk, _desk_client) = two(&scratch).await;
         let parsed = InviteLink::parse(&invite(&hub, &hub_client).await).unwrap();
         let asked = LinkRequest {
-            secret: hex::encode(&parsed.secret),
-            server_id: desk.server_id(),
-            name: "desk".to_owned(),
             contract_version: CONTRACT_VERSION + 1,
+            ..request(&parsed, desk.server_id(), 1)
         };
-        let answer = ritornel_client::post(hub.endpoint(), route::LINK, None, &asked)
-            .await
-            .unwrap();
-        assert_eq!(answer.status, 409);
-        assert!(String::from_utf8_lossy(&answer.body).contains("contract version"));
+        let (status, body) = post(&hub, &asked).await;
+        assert_eq!(status, 409);
+        assert!(body.contains("contract version"), "{body}");
         // The invite is not spent by a refusal.
-        let asked = LinkRequest {
-            contract_version: CONTRACT_VERSION,
-            ..asked
-        };
-        let answer = ritornel_client::post(hub.endpoint(), route::LINK, None, &asked)
-            .await
-            .unwrap();
-        assert_eq!(answer.status, 200);
+        assert_eq!(
+            post(&hub, &request(&parsed, desk.server_id(), 1)).await.0,
+            200
+        );
     })
     .await;
 }
@@ -349,11 +364,42 @@ async fn a_satellite_opens_a_socket_at_its_hub_with_its_link_session_and_no_tick
             .await
             .unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Forbidden));
+        // Nor touch what is the hub's own machine's: its folders and its
+        // backups.
+        for method in ["sources.add", "server.backup", "history.export"] {
+            let refused = linked
+                .call_raw(method, serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{method}");
+        }
         // And it is given no ticket.
         assert!(matches!(
             ritornel_client::ticket(hub.endpoint(), &credential).await,
             Err(ritornel_client::Error::Refused { status: 403 })
         ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_does_not_take_over_a_satellite_that_is_linked_already() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, desk, desk_client) = two(&scratch).await;
+        join(&desk_client, &invite(&hub, &hub_client).await)
+            .await
+            .unwrap();
+        // Someone else with an invite names the satellite's ID, with a key
+        // of their own.
+        let parsed = InviteLink::parse(&invite(&hub, &hub_client).await).unwrap();
+        let (status, body) = post(&hub, &request(&parsed, desk.server_id(), 9)).await;
+        assert_eq!(status, 409, "{body}");
+        let at_hub = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(at_hub.satellites.len(), 1);
     })
     .await;
 }

@@ -85,7 +85,8 @@ impl fmt::Debug for SigningKey {
 pub struct Signer(SigningKey);
 
 impl Signer {
-    pub(crate) fn new(seed: [u8; 32]) -> Self {
+    /// The signer of the key made from `seed`: what `server.db` keeps.
+    pub fn from_seed(seed: [u8; 32]) -> Self {
         Self(SigningKey(seed))
     }
 
@@ -176,7 +177,7 @@ mod tests {
     #[test]
     fn a_signer_signs_what_its_public_key_verifies_and_nothing_else() {
         let key = SigningKey::generate(&CountingEntropy::default()).unwrap();
-        let signer = Signer::new(*key.expose());
+        let signer = Signer::from_seed(*key.expose());
         let signature = signer.sign(b"nonce");
         assert!(verify_signature(&signer.public_key(), b"nonce", &signature));
         assert!(!verify_signature(
@@ -184,7 +185,7 @@ mod tests {
             b"other",
             &signature
         ));
-        let other = Signer::new([0x5a; 32]);
+        let other = Signer::from_seed([0x5a; 32]);
         assert!(!verify_signature(&other.public_key(), b"nonce", &signature));
         assert_eq!(format!("{signer:?}"), "Signer(<redacted>)");
     }

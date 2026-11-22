@@ -261,7 +261,7 @@ impl ServerStore {
                     |row| row.get::<_, [u8; 32]>(0),
                 )
                 .optional()?
-                .map(crate::Signer::new))
+                .map(crate::Signer::from_seed))
         })
     }
 

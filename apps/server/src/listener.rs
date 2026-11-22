@@ -466,12 +466,26 @@ async fn ticket(
 /// The largest body a satellite may send to join.
 const MAX_LINK_BODY: usize = 4 * 1024;
 
+/// How long a satellite joining has to send its body.
+const LINK_BODY_WAIT: Duration = Duration::from_secs(5);
+
 /// A satellite joining: `POST /v1/link`, with the invite's secret in a
 /// [`LinkRequest`](ritornel_contract::LinkRequest). It is answered with the
 /// link session's token, or refused with why.
 async fn join(State(core): State<Arc<Core>>, request: Request) -> Response {
-    let Ok(body) = axum::body::to_bytes(request.into_body(), MAX_LINK_BODY).await else {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "the request is too long\n").into_response();
+    // The route takes no credential, so a body that never ends must not
+    // hold a connection's place for long.
+    let body = tokio::time::timeout(
+        LINK_BODY_WAIT,
+        axum::body::to_bytes(request.into_body(), MAX_LINK_BODY),
+    )
+    .await;
+    let Ok(Ok(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the request was too long or too slow\n",
+        )
+            .into_response();
     };
     let Ok(asked) = serde_json::from_slice::<ritornel_contract::LinkRequest>(&body) else {
         return (StatusCode::BAD_REQUEST, "that is not a request to link\n").into_response();

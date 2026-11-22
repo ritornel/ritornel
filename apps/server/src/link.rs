@@ -11,23 +11,20 @@ use std::time::{Duration, Instant};
 use ritornel_contract::route;
 use ritornel_contract::{
     CONTRACT_VERSION, Id, InviteLink, LinkGranted, LinkRequest, NONCE_PARAM, PublicDescriptor,
-    ServerRole, descriptor_proof, hex,
+    ServerRole, descriptor_proof, hex, link_request_proof,
 };
-use ritornel_engine::{Entropy, LinkSession, SessionToken};
+use ritornel_engine::{Entropy, LinkSession, SessionToken, Signer};
 
 use crate::Listen;
 
 /// How long an invite works.
 pub(crate) const INVITE_LIFE: Duration = Duration::from_secs(10 * 60);
 
-/// How many wrong secrets a hub takes before it ends every open invite.
-/// A secret is 256 random bits, so this is not what keeps one from being
-/// guessed; it stops a peer that keeps trying from trying for ever.
-const MAX_WRONG_SECRETS: u32 = 5;
-
 /// The invites a hub has made and not yet seen used. They are kept in
 /// memory only: a restart ends them all, which an invite that lives ten
-/// minutes can bear.
+/// minutes can bear. A secret is 256 random bits, so wrong ones are not
+/// counted: nothing guesses one, and a count would only let a stranger on
+/// the network end the invites someone is about to use.
 #[derive(Debug, Default)]
 pub(crate) struct Invites(Mutex<Open>);
 
@@ -35,7 +32,6 @@ pub(crate) struct Invites(Mutex<Open>);
 struct Open {
     /// The SHA-256 of each secret, with when it stops working.
     invites: Vec<([u8; 32], Instant)>,
-    wrong: u32,
 }
 
 impl Invites {
@@ -51,7 +47,6 @@ impl Invites {
     }
 
     /// Whether `secret` is an open invite's, which it then no longer is.
-    /// After [`MAX_WRONG_SECRETS`] wrong ones every open invite ends.
     pub(crate) fn redeem(&self, secret: &[u8]) -> bool {
         let hash = hash(secret);
         let now = Instant::now();
@@ -59,15 +54,7 @@ impl Invites {
         open.invites.retain(|(_, until)| *until > now);
         let before = open.invites.len();
         open.invites.retain(|(held, _)| *held != hash);
-        if open.invites.len() < before {
-            return true;
-        }
-        open.wrong += 1;
-        if open.wrong >= MAX_WRONG_SECRETS {
-            open.invites.clear();
-            open.wrong = 0;
-        }
-        false
+        open.invites.len() < before
     }
 }
 
@@ -237,11 +224,14 @@ pub(crate) async fn request(
     invite: &InviteLink,
     server_id: Id,
     name: &str,
+    signer: &Signer,
 ) -> Result<LinkGranted, String> {
     let asked = LinkRequest {
         secret: hex::encode(&invite.secret),
         server_id,
         name: name.to_owned(),
+        public_key: hex::encode(&signer.public_key()),
+        proof: hex::encode(&signer.sign(&link_request_proof(invite.hub, &invite.secret))),
         contract_version: CONTRACT_VERSION,
     };
     let answer = ritornel_client::post(route, route::LINK, None, &asked)
@@ -264,7 +254,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_invite_works_once_and_wrong_secrets_end_them_all() {
+    fn an_invite_works_once_and_wrong_secrets_end_none() {
         let invites = Invites::default();
         let entropy = ritornel_engine::OsEntropy;
         let first = invites.issue(&entropy).unwrap();
@@ -272,12 +262,10 @@ mod tests {
         assert!(!invites.redeem(&first));
 
         let second = invites.issue(&entropy).unwrap();
-        // The used one counted as one wrong try.
-        for _ in 0..MAX_WRONG_SECRETS - 2 {
+        for _ in 0..100 {
             assert!(!invites.redeem(&[0; 32]));
         }
-        assert!(!invites.redeem(&[0; 32]));
-        assert!(!invites.redeem(&second));
+        assert!(invites.redeem(&second));
     }
 
     #[test]

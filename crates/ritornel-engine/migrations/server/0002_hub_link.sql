@@ -2,7 +2,7 @@
 -- Ritornel server.db, migration 0002: the link between a hub and a
 -- satellite. On the satellite, the one row that says which hub it is linked
 -- to and how to reach it. On the hub, which satellite each link session
--- belongs to. See "The link between the hub and a satellite" in
+-- belongs to, and the key it proved. See "The link between the hub and a satellite" in
 -- docs/design/linking.md.
 --
 -- This file is never edited once it has shipped: the runner keeps a checksum
@@ -24,5 +24,6 @@ CREATE TABLE hub_link (
   linked_at_ms       INTEGER NOT NULL
 ) STRICT;
 
--- On a hub, the satellite a session of subject kind 'server' is the link of. NULL for every other session.
+-- On a hub, the satellite a session of subject kind 'server' is the link of, and the public key it proved it holds when it joined. A server ID already linked joins again only with the same key. NULL for every other session.
 ALTER TABLE session ADD COLUMN peer_server_pid BLOB CHECK (peer_server_pid IS NULL OR length(peer_server_pid) = 16);
+ALTER TABLE session ADD COLUMN peer_public_key BLOB CHECK (peer_public_key IS NULL OR length(peer_public_key) = 32);

@@ -38,6 +38,8 @@ pub struct LinkSession {
     pub peer: Id,
     /// The satellite's name when it joined. Untrusted text.
     pub label: String,
+    /// The public key the satellite proved it holds when it joined.
+    pub public_key: [u8; 32],
     /// The SHA-256 of the session's token.
     pub token_hash: [u8; 32],
     /// When it was issued, as Unix milliseconds.
@@ -88,14 +90,35 @@ impl ServerStore {
         })
     }
 
-    /// Issues a link session for the satellite `peer`, labelled with its
-    /// name, and returns its public ID and its token. The token is returned
-    /// here only: the database keeps its hash. A session the satellite held
-    /// before is revoked in the same transaction, so a satellite that joins
-    /// again holds one session.
-    pub fn issue_link_session(&self, peer: Id, label: &str) -> Result<(Id, SessionToken), Error> {
+    /// Issues a link session for the satellite `peer`, which proved it
+    /// holds `public_key`, labelled with its name, and returns its public ID
+    /// and its token. The token is returned here only: the database keeps
+    /// its hash. A session the satellite held before is revoked in the same
+    /// transaction, so a satellite that joins again holds one session. A
+    /// server ID that was linked with another key is refused, so an invite
+    /// cannot take over a satellite that is linked already.
+    pub fn issue_link_session(
+        &self,
+        peer: Id,
+        public_key: [u8; 32],
+        label: &str,
+    ) -> Result<(Id, SessionToken), Error> {
         let label = label.to_owned();
         self.transact(move |transaction, now_ms, entropy| {
+            let known: Option<[u8; 32]> = transaction
+                .query_row(
+                    "SELECT peer_public_key FROM session
+                     WHERE peer_server_pid = ?1 AND peer_public_key IS NOT NULL
+                     ORDER BY id DESC LIMIT 1",
+                    [peer.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if known.is_some_and(|known| known != public_key) {
+                return Err(Error::Invalid(
+                    "a server of this ID is linked already, with another key",
+                ));
+            }
             transaction.execute(
                 "UPDATE session SET revoked_at_ms = ?1
                  WHERE peer_server_pid = ?2 AND revoked_at_ms IS NULL",
@@ -105,14 +128,16 @@ impl ServerStore {
             let session = new_id(now_ms, entropy)?;
             transaction.execute(
                 "INSERT INTO session
-                   (public_id, subject_kind, label, kind, token_hash, created_at_ms, peer_server_pid)
-                 VALUES (?1, 'server', ?2, 'full', ?3, ?4, ?5)",
+                   (public_id, subject_kind, label, kind, token_hash, created_at_ms, peer_server_pid,
+                    peer_public_key)
+                 VALUES (?1, 'server', ?2, 'full', ?3, ?4, ?5, ?6)",
                 (
                     session.as_bytes(),
                     &label,
                     token.hash(),
                     now_ms,
                     peer.as_bytes(),
+                    public_key,
                 ),
             )?;
             Ok((session, token))
@@ -123,7 +148,8 @@ impl ServerStore {
     pub fn link_sessions(&self) -> Result<Vec<LinkSession>, Error> {
         self.read(|connection| {
             let mut statement = connection.prepare(
-                "SELECT public_id, peer_server_pid, label, token_hash, created_at_ms
+                "SELECT public_id, peer_server_pid, label, token_hash, created_at_ms,
+                        peer_public_key
                  FROM session
                  WHERE peer_server_pid IS NOT NULL AND revoked_at_ms IS NULL
                  ORDER BY id",
@@ -135,6 +161,7 @@ impl ServerStore {
                     label: row.get(2)?,
                     token_hash: row.get(3)?,
                     created_at_ms: row.get(4)?,
+                    public_key: row.get(5)?,
                 })
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
@@ -304,8 +331,8 @@ mod tests {
     fn a_satellite_holds_one_session_and_only_its_hash_is_kept() {
         let store = store();
         let peer = Id::from_bytes([0x55; 16]);
-        let (first, first_token) = store.issue_link_session(peer, "desk").unwrap();
-        let (second, second_token) = store.issue_link_session(peer, "desk").unwrap();
+        let (first, first_token) = store.issue_link_session(peer, [7; 32], "desk").unwrap();
+        let (second, second_token) = store.issue_link_session(peer, [7; 32], "desk").unwrap();
         assert_ne!(first, second);
         assert_ne!(first_token.expose(), second_token.expose());
         let sessions = store.link_sessions().unwrap();
@@ -313,6 +340,12 @@ mod tests {
         let held = sessions.first().unwrap();
         assert_eq!((held.session, held.peer), (second, peer));
         assert_eq!(held.token_hash, second_token.hash());
+        // Another key does not take the ID over.
+        assert!(matches!(
+            store.issue_link_session(peer, [8; 32], "thief"),
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(store.link_sessions().unwrap().len(), 1);
         // The local credential is not a link session.
         assert!(
             sessions
