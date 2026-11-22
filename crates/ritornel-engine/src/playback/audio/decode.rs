@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Indexing, Resampler};
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
-use symphonia::core::errors::Error as Symphonia;
+use symphonia::core::errors::{Error as Symphonia, SeekErrorKind};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
@@ -63,6 +63,8 @@ pub(crate) struct Source {
     /// The first frame to hand on, in source frames from the start: the
     /// position asked for, after a seek lands before it.
     from_frame: u64,
+    /// Whether a seek went to the end, or past it: nothing is left.
+    at_end: bool,
     pub(crate) info: Format,
     /// Packets that would not decode and were passed over.
     pub(crate) bad_packets: u64,
@@ -76,6 +78,9 @@ pub(crate) struct Source {
     /// For a test: a file named `unreadable-…` fails at its first packet.
     #[cfg(test)]
     fails: bool,
+    /// For a test: the packets read.
+    #[cfg(test)]
+    pub(crate) packets: u64,
 }
 
 /// How far under full scale a gain held by its peak takes that peak: a
@@ -408,6 +413,7 @@ impl Source {
             rate,
             channels,
             from_frame: 0,
+            at_end: false,
             info: Format {
                 codec,
                 sample_rate_hz: rate,
@@ -421,6 +427,8 @@ impl Source {
                 .path
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().starts_with("unreadable-")),
+            #[cfg(test)]
+            packets: 0,
             samples: Vec::new(),
             skip: 0,
             tags,
@@ -448,9 +456,20 @@ impl Source {
                 self.from_frame = self.frame_of(seeked.required_ts);
                 Ok(())
             }
-            // A seek past the end leaves nothing to play.
-            Err(Symphonia::SeekError(_)) => {
-                self.from_frame = u64::MAX;
+            // A seek to the end, or past it, leaves nothing to play, and
+            // nothing to read: a FLAC's reader runs out of file looking for
+            // the frame there, and the others say it is out of range.
+            Err(Symphonia::SeekError(SeekErrorKind::OutOfRange)) => {
+                self.at_end = true;
+                Ok(())
+            }
+            // Running out of file anywhere short of the end the track says
+            // it has is a file cut short, or a reader that lost its place.
+            Err(Symphonia::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+                    && self.info.duration_ms.is_none_or(|end| start_ms >= end) =>
+            {
+                self.at_end = true;
                 Ok(())
             }
             Err(error) => Err(RenderError::new("unreadable", error.to_string())),
@@ -488,6 +507,9 @@ impl Source {
         if self.fails {
             return Err(RenderError::new("unreadable", "the test made it so"));
         }
+        if self.at_end {
+            return Ok(false);
+        }
         loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(packet)) => packet,
@@ -500,6 +522,10 @@ impl Source {
                 }
                 Err(error) => return Err(RenderError::new("unreadable", error.to_string())),
             };
+            #[cfg(test)]
+            {
+                self.packets += 1;
+            }
             if packet.track_id != self.track_id {
                 continue;
             }
