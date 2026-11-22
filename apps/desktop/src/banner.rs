@@ -544,15 +544,16 @@ fn placed(iw: f32, ih: f32, w: f32, h: f32) -> (f32, f32, f32, f32) {
 pub(crate) fn melted(source: &RgbaImage, w: u32, h: u32) -> RenderImage {
     let (w, h) = (w.max(1), h.max(1));
     let (sw, sh) = (source.width().max(1), source.height().max(1));
-    let (x, y, dw, _) = placed(sw as f32, sh as f32, w as f32, h as f32);
-    // The part of the picture the box shows, in the picture's own pixels.
-    let scale = dw / sw as f32;
-    let left = ((-x / scale).round() as u32).min(sw - 1);
-    let top = ((-y / scale).round() as u32).min(sh - 1);
-    let across = ((w as f32 / scale).round() as u32).clamp(1, sw - left);
-    let down = ((h as f32 / scale).round() as u32).clamp(1, sh - top);
-    let part = image::imageops::crop_imm(source, left, top, across, down).to_image();
-    let mut out = image::imageops::resize(&part, w, h, image::imageops::FilterType::Triangle);
+    let (x, y, dw, dh) = placed(sw as f32, sh as f32, w as f32, h as f32);
+    // The whole picture at the size it is drawn, then the box cut from it,
+    // so that where it is cut is off by half a device pixel at most.
+    let (dw, dh) = ((dw.round() as u32).max(w), (dh.round() as u32).max(h));
+    let drawn = image::imageops::resize(source, dw, dh, image::imageops::FilterType::Triangle);
+    let (left, top) = (
+        ((-x).round() as u32).min(dw - w),
+        ((-y).round() as u32).min(dh - h),
+    );
+    let mut out = image::imageops::crop_imm(&drawn, left, top, w, h).to_image();
     let melt = w as f32 * MELT;
     for (column, _, pixel) in out.enumerate_pixels_mut() {
         let [r, g, b, a] = pixel.0;
@@ -605,40 +606,42 @@ mod tests {
 
     #[test]
     fn the_melt_is_the_pictures_alpha_from_clear_to_whole() {
-        // A tall picture, red over blue: the box shows only red, as it is
-        // cut 30% down at its own shape, and squashed square it would not.
-        let source = RgbaImage::from_fn(100, 200, |_, y| {
-            if y < 100 {
+        // Red over blue, its rows cut where CSS cuts them: a square drawn
+        // 760 square, cut from row 100 of 760 (30% of 760 - 428), so the
+        // box's first 280 rows are red and the rest blue. Squashed, or cut
+        // from the top, more of it would be red.
+        let source = RgbaImage::from_fn(380, 380, |_, y| {
+            if y < 190 {
                 image::Rgba([255, 0, 0, 255])
             } else {
                 image::Rgba([0, 0, 255, 255])
             }
         });
-        let made = melted(&source, 380, 214);
+        let made = melted(&source, 760, 428);
         let size = made.size(0);
-        assert_eq!((size.width.0, size.height.0), (380, 214));
+        assert_eq!((size.width.0, size.height.0), (760, 428));
         let bytes = made.as_bytes(0).unwrap_or_default();
-        let at = |x: usize, y: usize| bytes.get((y * 380 + x) * 4..(y * 380 + x) * 4 + 4);
-        let mut before = 0;
-        for x in 0..380 {
-            // A pixel missing reads as black, and fails below.
-            let [b, _, r, a] = at(x, 213)
+        // A pixel missing reads as black, and fails below.
+        let at = |x: usize, y: usize| -> [u8; 4] {
+            bytes
+                .get((y * 760 + x) * 4..(y * 760 + x) * 4 + 4)
                 .and_then(|pixel| <[u8; 4]>::try_from(pixel).ok())
-                .unwrap_or_default();
-            // In BGRA, red, at every row down to the box's foot.
-            assert!(r > 240 && b < 15, "{x}: {r} {b}");
-            assert!(a >= before, "{x}: {a} after {before}");
-            before = a;
-            if x as f32 >= 380. * MELT {
-                assert_eq!(a, 255, "{x}");
-            }
-        }
-        assert!(
-            at(0, 0)
-                .and_then(|pixel| pixel.get(3).copied())
-                .is_some_and(|alpha| alpha <= 2),
-            "{:?}",
-            at(0, 0)
-        );
+                .unwrap_or_default()
+        };
+        // In BGRA, red near the top and blue near the foot, either side of
+        // row 280 (blended a little across it).
+        let [b, _, r, _] = at(700, 250);
+        assert!(r > 240 && b < 15, "{r} {b}");
+        let [b, _, r, _] = at(700, 310);
+        assert!(b > 240 && r < 15, "{r} {b}");
+        // The ramp: clear at the left edge, half way at a quarter of the
+        // width (half of 52%), whole from 52% on, and never falling.
+        let alpha = |x: usize| at(x, 0)[3];
+        assert!(alpha(0) <= 1, "{}", alpha(0));
+        let half = (760. * MELT / 2.) as usize;
+        assert!((i32::from(alpha(half)) - 128).abs() <= 2, "{}", alpha(half));
+        let whole = (760. * MELT).ceil() as usize;
+        assert!((whole..760).all(|x| alpha(x) == 255));
+        assert!((1..760).all(|x| alpha(x) >= alpha(x - 1)));
     }
 }

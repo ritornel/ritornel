@@ -193,8 +193,10 @@ pub(crate) struct Artist {
     /// The portrait made for the banner's box (`banner::melted`): the box's
     /// size in device pixels, the picture, and when the first was shown.
     melted: Option<((u32, u32), Arc<RenderImage>, Instant)>,
-    /// The size a portrait is being made for.
-    melting: Option<(u32, u32)>,
+    /// Whether a portrait is being made now: one at a time.
+    melting: bool,
+    /// The size its box has now, in device pixels: what is made next.
+    wanted: Option<(u32, u32)>,
     /// Their picture blurred for the wash, and for the banner.
     pub blur: Option<(Arc<RenderImage>, Instant)>,
     banner_blur: Option<(Arc<RenderImage>, Instant)>,
@@ -255,7 +257,8 @@ impl Artist {
             face: None,
             portrait: None,
             melted: None,
-            melting: None,
+            melting: false,
+            wanted: None,
             blur: None,
             banner_blur: None,
             pictured_for: None,
@@ -437,34 +440,45 @@ impl Artist {
         .detach();
     }
 
-    /// Makes the portrait for a box `size` device pixels, off the UI thread,
-    /// unless it is made or being made. The one it replaces is let go, so a
-    /// window resized narrow does not leave one behind at every width.
+    /// Makes the portrait for its box, `size` device pixels, off the UI
+    /// thread, one at a time. One made for a size the box no longer has, or
+    /// from a portrait since replaced, is let go and the next is made for the
+    /// size the box has then; so is the one a new one replaces, so a window
+    /// resized narrow does not leave one behind at every width.
     fn melt(&mut self, size: (u32, u32), cx: &mut Context<Self>) {
+        self.wanted = Some(size);
         let Some(source) = &self.portrait else { return };
-        if self.melting == Some(size) || self.melted.as_ref().is_some_and(|made| made.0 == size) {
+        if self.melting || self.melted.as_ref().is_some_and(|made| made.0 == size) {
             return;
         }
-        self.melting = Some(size);
+        self.melting = true;
         let source = Arc::clone(source);
+        let from = Arc::clone(&source);
         let made = self
             .net
             .rt()
             .spawn_blocking(move || crate::banner::melted(&source, size.0, size.1));
         cx.spawn(async move |this, cx| {
-            let Ok(image) = made.await else { return };
+            let made = made.await;
             this.update(cx, |page, cx| {
-                if page.melting != Some(size) {
-                    return;
-                }
-                page.melting = None;
-                let since = page
-                    .melted
+                page.melting = false;
+                let current = page
+                    .portrait
                     .as_ref()
-                    .map_or_else(Instant::now, |made| made.2);
-                if let Some((_, old, _)) = page.melted.replace((size, Arc::new(image), since)) {
-                    cx.drop_image(old, None);
+                    .is_some_and(|portrait| Arc::ptr_eq(portrait, &from));
+                if let Ok(image) = made
+                    && current
+                    && page.wanted == Some(size)
+                {
+                    let since = page
+                        .melted
+                        .as_ref()
+                        .map_or_else(Instant::now, |made| made.2);
+                    if let Some((_, old, _)) = page.melted.replace((size, Arc::new(image), since)) {
+                        cx.drop_image(old, None);
+                    }
                 }
+                // The next render makes the one wanted now, if this was not it.
                 cx.notify();
             })
             .ok();
@@ -472,16 +486,26 @@ impl Artist {
         .detach();
     }
 
+    /// Lets the portrait go, and the one made from it.
+    fn forget_portrait(&mut self, cx: &mut Context<Self>) {
+        self.portrait = None;
+        if let Some((_, old, _)) = self.melted.take() {
+            cx.drop_image(old, None);
+        }
+    }
+
     /// Their picture: the face for the strip, the portrait, and the blurs
     /// for the banner and the wash; with no picture, soft colour from their name.
     fn pictures(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(artist) = &self.page else { return };
         let art = artist.artist.art_id;
-        let portrait = artist.artist.portrait;
         if self.pictured_for == Some(art) {
             return;
         }
         self.pictured_for = Some(art);
+        // A portrait of another picture, or of none, is not kept meanwhile.
+        let wants_portrait = artist.artist.portrait;
+        self.forget_portrait(cx);
         let scale = window.scale_factor();
         let (width, viewport) = viewport_of(window);
         let banner_radius = crate::blur::radius(crate::blur::BANNER.0, width + 120.);
@@ -496,9 +520,12 @@ impl Artist {
         });
         // A portrait stands at most 380 points wide; a cover never stands there.
         // It is kept at its own shape, and cropped to its box as it is made.
-        if portrait {
+        // It is asked for at twice the box's widest, so that a portrait up to
+        // twice as tall as it is wide still covers the box sharply, as far as
+        // the server's largest size allows.
+        if wants_portrait {
             let http = Arc::clone(&self.net.art);
-            let bucket = self.net.bucket((380. * scale).ceil() as u32);
+            let bucket = self.net.bucket((2. * 380. * scale).ceil() as u32);
             let read = self.net.rt().spawn(async move {
                 let bytes = http.get(art, bucket).await?;
                 tokio::task::spawn_blocking(move || crate::covers::decode_picture(&bytes))
@@ -509,11 +536,12 @@ impl Artist {
             cx.spawn(async move |this, cx| {
                 if let Ok(Some(source)) = read.await {
                     this.update(cx, |page, cx| {
-                        page.portrait = Some(Arc::new(source));
-                        page.melting = None;
-                        if let Some((_, old, _)) = page.melted.take() {
-                            cx.drop_image(old, None);
+                        // Too late: the page shows another picture now.
+                        if page.pictured_for != Some(Some(art)) {
+                            return;
                         }
+                        page.forget_portrait(cx);
+                        page.portrait = Some(Arc::new(source));
                         cx.notify();
                     })
                     .ok();

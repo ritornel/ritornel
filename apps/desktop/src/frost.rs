@@ -329,6 +329,9 @@ fn cells(bounds: Bounds<Pixels>) -> (usize, usize) {
 /// A picture small, premultiplied, for sampling.
 struct Small {
     side: (usize, usize),
+    /// The picture's own size, whose shape it is fitted by: the small side
+    /// is that shape only to a whole pixel.
+    full: (f32, f32),
     pixels: Vec<[f32; 4]>,
 }
 
@@ -376,6 +379,7 @@ fn small(image: &RenderImage) -> Option<Rc<Small>> {
         .collect();
     let made = Rc::new(Small {
         side: (sw, sh),
+        full: (iw as f32, ih as f32),
         pixels,
     });
     SMALL.with_borrow_mut(|small| {
@@ -473,7 +477,7 @@ fn lay(
     };
     // A picture covers its box, its middle kept.
     let fit = small.as_ref().map(|small| {
-        let (iw, ih) = (small.side.0 as f32, small.side.1 as f32);
+        let (iw, ih) = small.full;
         let scale = (rw / iw).max(rh / ih);
         let (dw, dh) = (iw * scale, ih * scale);
         (rx + (rw - dw) / 2., ry + (rh - dh) / 2., dw, dh)
