@@ -304,6 +304,7 @@ impl Player {
             _link: followed,
         };
         if let Some(net) = link.read(cx).net() {
+            player.say_of_hub(&net, cx);
             player.net = Some(net);
             player.read(cx);
         }

@@ -1672,9 +1672,8 @@ impl Render for Shell {
             .into_any_element();
         let server = self.link.read(cx).net().map(|net| {
             let away = crate::away::said(&net);
-            let clock = crate::away::clock();
             let card = self.connection_hovered.then(|| match (&away, &net.hub) {
-                (Some(away), _) => Some(away.card(&clock)),
+                (Some(away), _) => Some(away.card(&crate::away::clock())),
                 (None, Some(hub)) => Some(crate::away::fine_card(&hub.name)),
                 (None, None) => None,
             });

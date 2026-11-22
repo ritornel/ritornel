@@ -345,16 +345,22 @@ impl Link {
     /// (`crate::away`). When those end and it is still away, the session is
     /// handed on again as it is, so that what says so is drawn.
     fn say_when_quiet_ends(&self, net: &Arc<Net>, cx: &mut Context<Self>) {
-        let Some(wait) =
-            crate::away::away(net).and_then(|away| away.wait_ms(crate::away::now_ms()))
-        else {
+        let Some(away) = crate::away::away(net) else {
             return;
         };
+        if away.wait_ms(crate::away::now_ms()).is_none() {
+            return;
+        }
         let net = Arc::clone(net);
         cx.spawn(async move |link, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(wait))
-                .await;
+            // The timer keeps time apart from the clock the absence is
+            // dated by, and may end a moment early by it: it waits until
+            // the absence may be said.
+            while let Some(wait) = away.wait_ms(crate::away::now_ms()) {
+                cx.background_executor()
+                    .timer(Duration::from_millis(wait))
+                    .await;
+            }
             let _ = link.update(cx, |link, cx| {
                 if let State::Connected(held) = &link.state
                     && Arc::ptr_eq(held, &net)
