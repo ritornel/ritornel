@@ -207,6 +207,7 @@ impl Shown {
     fn seen(&self, seen: bool, cx: &mut gpui::App) {
         match self {
             Self::Album(album) => album.update(cx, |album, cx| album.seen(seen, cx)),
+            Self::Artist(artist) => artist.update(cx, |artist, cx| artist.seen(seen, cx)),
             Self::History(history) => history.update(cx, |history, cx| history.seen(seen, cx)),
             _ => {}
         }
