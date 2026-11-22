@@ -19,6 +19,9 @@ use tracing::{info, warn};
 
 use crate::uplink::Uplink;
 
+/// The most tracks one `link.tracks` asks for.
+const TRACKS_PER_CALL: usize = 500;
+
 /// The most the cache of pulled masters holds, in bytes. The oldest go
 /// first once it holds more.
 const CACHE_BYTES: u64 = 2 << 30;
@@ -86,16 +89,26 @@ impl HubCatalog {
             .filter(char::is_ascii_alphanumeric)
             .take(8)
             .collect();
-        self.cache.join(format!(
-            "{}-{}.{extension}",
-            copy.source_item_id, copy.revision
-        ))
+        let name = format!("{}-{}", copy.source_item_id, copy.revision);
+        if extension.is_empty() {
+            self.cache.join(name)
+        } else {
+            self.cache.join(format!("{name}.{extension}"))
+        }
     }
 
     /// The master, pulled from the hub if it is not kept here already.
     fn pull(&self, appearance: Id, copy: &HubCopy) -> Result<PathBuf, Error> {
         let kept = self.kept(copy);
         if facts_of(&kept).is_some_and(|facts| facts.size_bytes == copy.size_bytes) {
+            // Played again, so it is the newest to keep.
+            let touched = std::fs::File::options()
+                .append(true)
+                .open(&kept)
+                .and_then(|file| file.set_modified(SystemTime::now()));
+            if let Err(error) = touched {
+                warn!(%error, "a kept master could not be marked as played");
+            }
             return Ok(kept);
         }
         let route_to = self.uplink.route().ok_or(Error::Playback(
@@ -131,7 +144,7 @@ impl HubCatalog {
                     ms = started.elapsed().as_millis(),
                     "a master was pulled from the hub"
                 );
-                self.trim();
+                self.trim(&kept);
                 Ok(kept)
             }
             Ok(bytes) => {
@@ -151,8 +164,9 @@ impl HubCatalog {
     }
 
     /// Lets the oldest kept masters go until the cache holds no more than
-    /// [`CACHE_BYTES`].
-    fn trim(&self) {
+    /// [`CACHE_BYTES`], but never `keep`, the one just pulled, nor one
+    /// being pulled.
+    fn trim(&self, keep: &Path) {
         let Ok(entries) = std::fs::read_dir(&self.cache) else {
             return;
         };
@@ -165,7 +179,14 @@ impl HubCatalog {
             .collect();
         let mut total: u64 = kept.iter().map(|(_, size, _)| size).sum();
         kept.sort();
+        let pulling = |path: &Path| {
+            path.extension()
+                .is_some_and(|extension| extension == "part")
+        };
         for (_, size, path) in kept {
+            if path == keep || pulling(&path) {
+                continue;
+            }
             if total <= CACHE_BYTES {
                 break;
             }
@@ -179,26 +200,47 @@ impl HubCatalog {
 }
 
 impl Catalog for HubCatalog {
+    /// What a track shows, or nothing while the hub does not answer: what
+    /// plays from a copy kept here plays on, untitled, rather than stop.
     fn track(&self, appearance: Id) -> Result<Option<TrackDisplay>, Error> {
-        Ok(self.tracks(&[appearance])?.into_iter().flatten().next())
+        match self.tracks(&[appearance]) {
+            Ok(tracks) => Ok(tracks.into_iter().flatten().next()),
+            Err(error) => {
+                warn!(%error, "what a track shows could not be read from the hub");
+                Ok(None)
+            }
+        }
     }
 
+    /// Asked a few hundred at a time, so no answer outgrows a frame.
     fn tracks(&self, appearances: &[Id]) -> Result<Vec<Option<TrackDisplay>>, Error> {
-        let read = self.read(&LinkTracksParams {
-            appearances: appearances.to_vec(),
-            release: None,
-        })?;
-        Ok(read
-            .tracks
-            .iter()
-            .map(|track| track.as_ref().map(display))
-            .collect())
+        let mut shown = Vec::with_capacity(appearances.len());
+        for chunk in appearances.chunks(TRACKS_PER_CALL) {
+            let read = self.read(&LinkTracksParams {
+                appearances: chunk.to_vec(),
+                release: None,
+            })?;
+            if read.tracks.len() != chunk.len() {
+                return Err(Error::Playback(
+                    "the hub answered for other tracks than were asked".to_owned(),
+                ));
+            }
+            shown.extend(read.tracks.iter().map(|track| track.as_ref().map(display)));
+        }
+        Ok(shown)
     }
 
     /// The first of the hub's copies that can be pulled, kept here. The
-    /// hub has chosen their order.
+    /// hub has chosen their order. While the hub does not answer there is
+    /// none: the track is not played, and what plays now plays on.
     fn copies(&self, appearance: Id, _server: Id) -> Result<Vec<Copy>, Error> {
-        let offered = self.call::<LinkCopiesCall>(&LinkCopiesParams { appearance })?;
+        let offered = match self.call::<LinkCopiesCall>(&LinkCopiesParams { appearance }) {
+            Ok(offered) => offered,
+            Err(error) => {
+                warn!(%error, "a track's copies could not be read from the hub");
+                return Ok(Vec::new());
+            }
+        };
         let LinkCopies { copies } = offered;
         let mut last = None;
         for copy in copies {
@@ -230,13 +272,10 @@ impl Catalog for HubCatalog {
     }
 
     fn unknown_appearance(&self, appearances: &[Id]) -> Result<Option<Id>, Error> {
-        let read = self.read(&LinkTracksParams {
-            appearances: appearances.to_vec(),
-            release: None,
-        })?;
+        let shown = self.tracks(appearances)?;
         Ok(appearances
             .iter()
-            .zip(read.tracks.iter())
+            .zip(shown.iter())
             .find(|(_, track)| track.is_none())
             .map(|(appearance, _)| *appearance))
     }

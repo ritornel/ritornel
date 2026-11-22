@@ -346,25 +346,35 @@ impl Core {
         let (Some(uplink), Some(session)) = (self.uplink(), self.shared(session)) else {
             return Err(expired(view));
         };
-        let mut ids = Vec::new();
-        loop {
+        let (mut ids, mut offset) = (Vec::new(), 0);
+        while offset < MAX_VIEW_FROM_HUB {
             let params = serde_json::json!({
                 "view": view,
-                "offset": ids.len(),
+                "offset": offset,
                 "limit": MAX_WINDOW_ROWS,
             });
             let window: ritornel_contract::ListWindow =
                 serde_json::from_value(uplink.forward(&session, "list.window", Some(params))?)
                     .map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))?;
-            let read = window.rows.len();
-            ids.extend(window.rows.into_iter().filter_map(|row| match row {
-                ritornel_contract::Row::Song(song) => Some(song.appearance_id),
-                _ => None,
-            }));
-            if read < MAX_WINDOW_ROWS || ids.len() >= MAX_VIEW_FROM_HUB {
-                return Ok(ids);
+            if window.rows.is_empty() {
+                break;
+            }
+            offset += window.rows.len();
+            for row in window.rows {
+                match row {
+                    ritornel_contract::Row::Song(song) => ids.push(song.appearance_id),
+                    // A row the library no longer has is left out.
+                    ritornel_contract::Row::Gone(_) => {}
+                    _ => {
+                        return Err(RpcError::new(
+                            ErrorCode::Invalid,
+                            "only a list of songs can be played",
+                        ));
+                    }
+                }
             }
         }
+        Ok(ids)
     }
 
     /// Stops the player for a clean shutdown: the open listen is closed as

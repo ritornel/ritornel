@@ -738,6 +738,25 @@ async fn a_satellite_plays_the_hubs_music_from_copies_it_pulls() {
         )
         .await;
         play_to_the_end(&mut desk_client, PlaySource::View { view: songs.view }).await;
+        // A view of albums is not a list of songs, there as here.
+        let albums = desk_client
+            .list_open(&ListOpenParams {
+                kind: ListKind::Albums,
+                ..self::songs()
+            })
+            .await
+            .unwrap();
+        let refused = desk_client
+            .call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::View { view: albums.view },
+                start: None,
+                context: None,
+                shuffle: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Invalid), "{refused}");
 
         // A master is read by a satellite's link session alone: not by a
         // client of the hub, and not by anyone without a credential.

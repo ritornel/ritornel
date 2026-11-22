@@ -407,7 +407,12 @@ impl Uplink {
                 matches!(&sent, Err(error) if !matches!(error, ritornel_client::Error::Call(_)));
             result = Some(sent);
             if lost {
-                *lock(&self.own) = None;
+                // Only the connection that was lost: another thread may
+                // have opened a new one meanwhile.
+                let mut own = lock(&self.own);
+                if own.as_ref().is_some_and(|held| Arc::ptr_eq(held, &client)) {
+                    *own = None;
+                }
             }
             if !(lost && again) {
                 break;

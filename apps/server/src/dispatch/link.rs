@@ -21,6 +21,10 @@ use super::{Core, Stores, lock};
 use crate::link::{self, INVITE_LIFE};
 use crate::session::Session;
 
+/// The most tracks one `link.tracks` answers for, so that no answer
+/// outgrows a frame.
+const MAX_TRACKS_ASKED: usize = 1000;
+
 /// Where a call is answered on a satellite.
 pub(super) enum Route {
     /// On the satellite: what is its own, such as its player.
@@ -385,6 +389,12 @@ impl Core {
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         let library = library.as_ref().ok_or_else(not_a_hub)?;
+        if params.appearances.len() > MAX_TRACKS_ASKED {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!("ask for at most {MAX_TRACKS_ASKED} tracks at a time"),
+            ));
+        }
         let tracks = library
             .tracks(&params.appearances)
             .map_err(internal)?
