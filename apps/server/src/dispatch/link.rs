@@ -95,6 +95,10 @@ impl Core {
         let routes = if params.routes.is_empty() {
             self.offered_routes()
         } else {
+            // Checked as a satellite will check them, so a link is never
+            // made that no satellite would dial.
+            link::check_routes(&params.routes)
+                .map_err(|why| RpcError::new(ErrorCode::Invalid, why))?;
             params.routes.clone()
         };
         if routes.is_empty() {
@@ -156,12 +160,12 @@ impl Core {
         let (Some(key), true) = (key, proved) else {
             return Err(refused(400, "the satellite did not prove it holds its key"));
         };
+        if asked.server_id == self.server_id {
+            return Err(refused(409, "a server cannot be its own satellite"));
+        }
         if !self.invites.redeem(&secret) {
             warn!(peer = %asked.server_id, "a satellite offered a secret that is no open invite's");
             return Err(refused(403, "no such invite"));
-        }
-        if asked.server_id == self.server_id {
-            return Err(refused(409, "a server cannot be its own satellite"));
         }
         let name = untrusted_name(&asked.name);
         let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
@@ -244,17 +248,12 @@ impl Core {
             )
         })?;
         let name = self.name();
-        let (route, descriptor, granted) = runtime
+        let (route, descriptor) = runtime
             .block_on(async {
                 let mut tried = Vec::new();
                 for route in routes {
                     match link::reach(route, invite.hub, &invite.key, &*self.entropy).await {
-                        Ok(descriptor) => {
-                            let granted =
-                                link::request(route, &invite, self.server_id, &name, &self.signer)
-                                    .await?;
-                            return Ok((route, descriptor, granted));
-                        }
+                        Ok(descriptor) => return Ok((route, descriptor)),
                         Err(why) => tried.push(format!("{route}: {why}")),
                     }
                 }
@@ -262,6 +261,19 @@ impl Core {
             })
             .map_err(|why| {
                 RpcError::new(ErrorCode::Unavailable, why).with_detail("reason", "hub_unreachable")
+            })?;
+        // The hub answered: if it now refuses, that is its answer, not
+        // the network's.
+        let granted = runtime
+            .block_on(link::request(
+                route,
+                &invite,
+                self.server_id,
+                &name,
+                &self.signer,
+            ))
+            .map_err(|why| {
+                RpcError::new(ErrorCode::Conflict, why).with_detail("reason", "refused")
             })?;
         // The route that worked goes first.
         let first = route.to_string();

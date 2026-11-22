@@ -152,8 +152,12 @@ pub(crate) fn is_private_route(ip: IpAddr) -> bool {
 
 /// The routes of an invite as addresses, refusing any that is not private.
 pub(crate) fn routes_of(invite: &InviteLink) -> Result<Vec<SocketAddr>, String> {
-    invite
-        .routes
+    check_routes(&invite.routes)
+}
+
+/// Routes as addresses, refusing any that is not private.
+pub(crate) fn check_routes(routes: &[String]) -> Result<Vec<SocketAddr>, String> {
+    routes
         .iter()
         .map(|route| match route.parse::<SocketAddr>() {
             Ok(address) if is_private_route(address.ip()) => Ok(address),

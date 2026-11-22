@@ -473,6 +473,10 @@ const LINK_BODY_WAIT: Duration = Duration::from_secs(5);
 /// [`LinkRequest`](ritornel_contract::LinkRequest). It is answered with the
 /// link session's token, or refused with why.
 async fn join(State(core): State<Arc<Core>>, request: Request) -> Response {
+    // A server names no origin, and a page in a browser is not let try.
+    if request.headers().contains_key(header::ORIGIN) {
+        return (StatusCode::FORBIDDEN, "a page may not link a server\n").into_response();
+    }
     // The route takes no credential, so a body that never ends must not
     // hold a connection's place for long.
     let body = tokio::time::timeout(

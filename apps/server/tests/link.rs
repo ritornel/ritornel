@@ -256,6 +256,31 @@ async fn an_invite_works_once_and_only_for_the_hub_it_names() {
             refused.to_string().contains("refused the link"),
             "{refused}"
         );
+        // The hub answered, so it is not said to be unreachable.
+        assert_eq!(code(&refused), Some(ErrorCode::Conflict), "{refused}");
+        // And a page in a browser may not try at all.
+        let asked = serde_json::to_vec(&request(&parsed, other.server_id(), 3)).unwrap();
+        let page = tokio::task::spawn_blocking({
+            let endpoint = hub.endpoint();
+            move || {
+                use std::io::{Read, Write};
+                let mut stream = std::net::TcpStream::connect(endpoint).unwrap();
+                write!(
+                    stream,
+                    "POST /v1/link HTTP/1.1\r\nHost: {endpoint}\r\nOrigin: http://example.invalid\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    asked.len()
+                )
+                .unwrap();
+                stream.write_all(&asked).unwrap();
+                let mut answer = String::new();
+                stream.read_to_string(&mut answer).unwrap();
+                answer
+            }
+        })
+        .await
+        .unwrap();
+        assert!(page.starts_with("HTTP/1.1 403"), "{page}");
         assert_eq!(
             desk_client.status().await.unwrap().role,
             ServerRole::Unassigned
