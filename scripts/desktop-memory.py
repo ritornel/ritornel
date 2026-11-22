@@ -20,12 +20,13 @@ import argparse
 import json
 import os
 import platform
-import select
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -274,45 +275,51 @@ def ensure_built_and_invented(root: Path, skip_build: bool) -> tuple[Path, Path,
     return server_bin, gpui_bin, data_dir
 
 
-def start_offscreen_display(root: Path) -> tuple[subprocess.Popen | None, dict[str, str]]:
-    if os.environ.get("RITORNEL_OFFSCREEN") != "1":
-        return None, {}
-    proc = subprocess.Popen(
-        [str(root / "scripts" / "desktop.sh"), "offscreen"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    assert proc.stdout is not None
-    fd = proc.stdout.fileno()
-    deadline = time.monotonic() + 10.0
-    buf = ""
-    while time.monotonic() < deadline:
-        remaining = max(0.0, deadline - time.monotonic())
-        ready, _, _ = select.select([fd], [], [], min(0.25, remaining))
-        if not ready:
-            if proc.poll() is not None:
-                break
-            continue
-        chunk = os.read(fd, 1024).decode("utf-8", errors="replace")
-        if not chunk:
-            break
-        buf += chunk
-        while "\n" in buf:
-            line, buf = buf.split("\n", 1)
-            if line.startswith("offscreen "):
-                parts = line.strip().split()
-                if len(parts) == 4:
-                    return proc, {
-                        "RITORNEL_TEST_DISPLAY": parts[1],
-                        "RITORNEL_TEST_DISPLAY_AT": f"{parts[2]},{parts[3]}",
-                    }
-    proc.terminate()
+def resolve_offscreen_display(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return hidden-display env vars to overlay when RITORNEL_OFFSCREEN=1."""
+    source = os.environ if env is None else env
+    if source.get("RITORNEL_OFFSCREEN") != "1":
+        return {}
+    if source.get("RITORNEL_TEST_DISPLAY"):
+        return {}
+    hidden_display = shutil.which("hidden-display", path=source.get("PATH", ""))
+    if hidden_display is None:
+        raise RuntimeError(
+            "RITORNEL_OFFSCREEN=1: no hidden display available. "
+            "Set RITORNEL_TEST_DISPLAY to a display ID, or install a tool that "
+            "provides one (such as hidden-display)."
+        )
     try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    raise RuntimeError("Failed to start offscreen display for RITORNEL_OFFSCREEN=1")
+        res = subprocess.run(
+            [hidden_display, "ensure"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=None if env is None else dict(env),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("hidden-display ensure timed out") from exc
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout).strip()
+        msg = f"hidden-display ensure failed (exit {res.returncode})"
+        if detail:
+            msg = f"{msg}: {detail}"
+        raise RuntimeError(msg)
+    lines = res.stdout.splitlines()
+    parts = lines[0].split() if len(lines) == 1 else []
+    if (
+        len(parts) != 3
+        or not re.fullmatch(r"[0-9]+", parts[0])
+        or not re.fullmatch(r"-?[0-9]+", parts[1])
+        or not re.fullmatch(r"-?[0-9]+", parts[2])
+    ):
+        raise RuntimeError(
+            f"hidden-display ensure returned unexpected output: {res.stdout.strip()!r}"
+        )
+    return {
+        "RITORNEL_TEST_DISPLAY": parts[0],
+        "RITORNEL_TEST_DISPLAY_AT": f"{parts[1]},{parts[2]}",
+    }
 
 
 def print_summary(result: dict) -> None:
@@ -382,6 +389,12 @@ def main() -> int:
     ap.add_argument("--skip-build", action="store_true", help="Reuse existing release binaries")
     args = ap.parse_args()
 
+    try:
+        display_env = resolve_offscreen_display()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
     server_bin, gpui_bin, data_dir = ensure_built_and_invented(repo_root, args.skip_build)
 
@@ -404,13 +417,10 @@ def main() -> int:
                 )
 
     isolated_home = tempfile.mkdtemp(prefix="ritornel-mem-home-")
-    offscreen_proc = None
     gpui = None
     server = None
     server_log = None
     try:
-        offscreen_proc, display_env = start_offscreen_display(repo_root)
-
         server_env = os.environ.copy()
         server_env["RITORNEL_TEST_NO_MEDIA_SESSION"] = "1"
         server_log = open(server_log_path, "wb")
@@ -458,12 +468,7 @@ def main() -> int:
 
         gpui_env = os.environ.copy()
         gpui_env["HOME"] = isolated_home
-        if display_env:
-            gpui_env.update(display_env)
-        else:
-            gpui_env.pop("RITORNEL_OFFSCREEN", None)
-            gpui_env.pop("RITORNEL_TEST_DISPLAY", None)
-            gpui_env.pop("RITORNEL_TEST_DISPLAY_AT", None)
+        gpui_env.update(display_env)
         gpui_env["RITORNEL_GPUI_DEBUG"] = "1"
 
         gpui_cmd = [
@@ -615,12 +620,6 @@ def main() -> int:
                 server.terminate()
         if server_log is not None:
             server_log.close()
-        if offscreen_proc is not None and offscreen_proc.poll() is None:
-            offscreen_proc.terminate()
-            try:
-                offscreen_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                offscreen_proc.kill()
         shutil.rmtree(isolated_home, ignore_errors=True)
 
 
