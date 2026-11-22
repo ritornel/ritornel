@@ -423,6 +423,7 @@ impl UpNextCard {
         last: bool,
         total: u64,
         own: Option<u32>,
+        ratings_revision: u64,
         arrived: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -464,7 +465,7 @@ impl UpNextCard {
             move |card: &mut Self, star, cx| {
                 let Some(recording) = recording else { return };
                 card.player.update(cx, |player, cx| {
-                    player.click_star(recording, said, star, cx);
+                    player.click_star(recording, said, Some(ratings_revision), star, cx);
                 });
             },
         );
@@ -653,6 +654,7 @@ impl Render for UpNextCard {
             .filter(|state| state.entry_id.is_some())
             .and_then(|state| state.track.clone());
         let up_next = player.up_next.clone();
+        let ratings_revision = up_next.as_ref().map_or(0, |queue| queue.ratings_revision);
         let entries = up_next
             .as_ref()
             .map_or_else(Vec::new, |up_next| up_next.entries.clone());
@@ -680,7 +682,7 @@ impl Render for UpNextCard {
                     .track
                     .recording_id
                     .map_or(entry.track.rating, |recording| {
-                        player.own(recording, entry.track.rating)
+                        player.own(recording, entry.track.rating, Some(ratings_revision))
                     })
             })
             .collect();
@@ -792,7 +794,17 @@ impl Render for UpNextCard {
                 };
                 let own = owns.get(index).copied().flatten();
                 let last = index + 1 == entries.len();
-                list = list.child(self.row(index, entry, last, total, own, shown, window, cx));
+                list = list.child(self.row(
+                    index,
+                    entry,
+                    last,
+                    total,
+                    own,
+                    ratings_revision,
+                    shown,
+                    window,
+                    cx,
+                ));
             }
             body = body.child(list);
             if more > 0 {

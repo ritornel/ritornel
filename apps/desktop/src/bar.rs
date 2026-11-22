@@ -59,6 +59,23 @@ pub(crate) fn cover_bounds(height: f32) -> Bounds<Pixels> {
 
 impl gpui::EventEmitter<BarEvent> for PlayerBar {}
 
+#[derive(Clone, Copy)]
+struct SeekDrag {
+    entry: Id,
+    duration: u64,
+    fraction: f32,
+}
+
+impl SeekDrag {
+    fn position(self) -> u64 {
+        (self.fraction * self.duration as f32).round() as u64
+    }
+
+    fn for_entry(self, entry: Option<Id>) -> bool {
+        Some(self.entry) == entry
+    }
+}
+
 pub(crate) struct PlayerBar {
     link: Entity<Link>,
     player: Entity<Player>,
@@ -73,8 +90,8 @@ pub(crate) struct PlayerBar {
     retries: crate::covers::Retries,
     /// When the song playing changed, for its cover to settle into place.
     arrived: Option<(Id, Instant)>,
-    /// Where the pointer holds the seek bar, from 0 to 1, while it does.
-    held: Option<f32>,
+    /// The entry and position held by the pointer.
+    held: Option<SeekDrag>,
     /// Where the seek bar is, as last drawn.
     seek_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// The star the pointer is on.
@@ -266,18 +283,18 @@ impl Render for PlayerBar {
         let own = track.as_ref().and_then(|track| {
             track
                 .recording_id
-                .map(|recording| player.own(recording, track.rating))
+                .map(|recording| player.own(recording, track.rating, None))
         });
-        let shown_ms = self
-            .held
-            .map_or(position, |held| (held * duration as f32) as u64);
+        let entry = state.as_ref().and_then(|state| state.entry_id);
+        self.held = self.held.filter(|drag| drag.for_entry(entry));
+        let shown_ms = self.held.map_or(position, SeekDrag::position);
         let fraction = if duration > 0 {
             (shown_ms as f32 / duration as f32).min(1.)
         } else {
             0.
         };
         let live = on && duration > 0;
-        let entry = state.as_ref().and_then(|state| state.entry_id);
+
         if let Some(entry) = entry
             && self.arrived.as_ref().is_none_or(|(id, _)| *id != entry)
         {
@@ -434,7 +451,7 @@ impl Render for PlayerBar {
                     move |bar: &mut Self, star, cx| {
                         let Some(recording) = recording else { return };
                         bar.player.update(cx, |player, cx| {
-                            player.click_star(recording, said, star, cx);
+                            player.click_star(recording, said, None, star, cx);
                         });
                     },
                 );
@@ -662,7 +679,13 @@ impl Render for PlayerBar {
                             {
                                 let _ = down.update(cx, |bar, cx| {
                                     if live {
-                                        bar.held = bar.fraction_at(event.position.x);
+                                        bar.held = entry
+                                            .zip(bar.fraction_at(event.position.x))
+                                            .map(|(entry, fraction)| SeekDrag {
+                                                entry,
+                                                duration,
+                                                fraction,
+                                            });
                                         cx.notify();
                                     }
                                 });
@@ -673,8 +696,10 @@ impl Render for PlayerBar {
                             window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                                 if phase.bubble() {
                                     let _ = moved.update(cx, |bar, cx| {
-                                        if bar.held.is_some() {
-                                            bar.held = bar.fraction_at(event.position.x);
+                                        if let Some(at) = bar.fraction_at(event.position.x)
+                                            && let Some(drag) = &mut bar.held
+                                        {
+                                            drag.fraction = at;
                                             cx.notify();
                                         }
                                     });
@@ -684,20 +709,15 @@ impl Render for PlayerBar {
                             window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                                 if phase.bubble() && event.button == MouseButton::Left {
                                     let _ = up.update(cx, |bar, cx| {
-                                        let Some(at) = bar.fraction_at(event.position.x) else {
-                                            bar.held = None;
+                                        let Some(mut drag) = bar.held.take() else {
                                             return;
                                         };
-                                        bar.held = None;
-                                        let duration = bar
-                                            .player
-                                            .read(cx)
-                                            .state
-                                            .as_ref()
-                                            .and_then(|state| state.duration_ms)
-                                            .unwrap_or(0);
-                                        let to = (at * duration as f32).round() as u64;
-                                        bar.player.update(cx, |player, cx| player.seek(to, cx));
+                                        if let Some(at) = bar.fraction_at(event.position.x) {
+                                            drag.fraction = at;
+                                            bar.player.update(cx, |player, cx| {
+                                                player.seek(drag.entry, drag.position(), cx)
+                                            });
+                                        }
                                         cx.notify();
                                     });
                                 }
@@ -847,4 +867,23 @@ pub(crate) fn toast(
                 .shadow(vec![theme::css_shadow(10., 30., gpui::rgba(0x00000059))])
                 .child(text),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_seek_drag_expires_when_its_entry_changes() {
+        let entry = Id::from_bytes([1; 16]);
+        let drag = SeekDrag {
+            entry,
+            duration: 20_000,
+            fraction: 0.75,
+        };
+        assert!(drag.for_entry(Some(entry)));
+        assert_eq!(drag.position(), 15_000);
+        assert!(!drag.for_entry(Some(Id::from_bytes([2; 16]))));
+        assert!(!drag.for_entry(None));
+    }
 }

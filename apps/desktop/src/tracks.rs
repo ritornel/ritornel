@@ -30,6 +30,7 @@ const COLUMN_GAP: f32 = 56.;
 pub(crate) struct Tracks {
     player: Entity<Player>,
     songs: Vec<SongRow>,
+    revision: u64,
     /// The record's own credit: a song credited otherwise names its artist.
     credit: Option<String>,
     /// Why the songs are played from here: the album, or the artist.
@@ -62,6 +63,7 @@ impl Tracks {
         Self {
             player,
             songs: Vec::new(),
+            revision: 0,
             credit: None,
             context: None,
             heading,
@@ -81,11 +83,13 @@ impl Tracks {
     pub(crate) fn set(
         &mut self,
         songs: Vec<SongRow>,
+        revision: u64,
         credit: Option<String>,
         context: PlayContext,
         cx: &mut Context<Self>,
     ) {
         self.songs = songs;
+        self.revision = revision;
         self.credit = credit;
         self.context = Some(context);
         cx.notify();
@@ -161,7 +165,7 @@ impl Tracks {
             return;
         };
         self.player.update(cx, |player, cx| {
-            player.click_star(recording, said, star, cx)
+            player.click_star(recording, said, Some(self.revision), star, cx)
         });
     }
 
@@ -461,7 +465,12 @@ impl Render for Tracks {
         let stars: Vec<u32> = self
             .songs
             .iter()
-            .map(|song| stars_of(player.own(song.recording_id, song.rating), song.loved))
+            .map(|song| {
+                stars_of(
+                    player.own(song.recording_id, song.rating, Some(self.revision)),
+                    song.loved,
+                )
+            })
             .collect();
         let mut animating = false;
         self.menued = crate::menu::marked(window, cx).filter(|(key, _)| key.starts_with("song:"));

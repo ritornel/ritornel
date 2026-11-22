@@ -362,8 +362,9 @@ impl Album {
             reference: Some(read.page.release_id),
         };
         let songs = read.page.tracks.clone();
-        self.tracks
-            .update(cx, |tracks, cx| tracks.set(songs, credit, context, cx));
+        self.tracks.update(cx, |tracks, cx| {
+            tracks.set(songs, read.page.library_revision, credit, context, cx)
+        });
         self.page = Some(read.page);
         self.problem = None;
     }
