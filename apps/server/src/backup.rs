@@ -44,8 +44,11 @@ use crate::platform::{
 /// The version of `backup.json`.
 const MANIFEST_VERSION: u32 = 1;
 
-/// What a backup's folder says about restoring it.
-const README: &str = "\
+/// What a backup's folder says about restoring it, taken from the data
+/// directory `from`.
+fn readme(from: &Path) -> String {
+    format!(
+        "\
 A backup of a Ritornel server, taken by the server itself.
 
 server.db and library.db are whole SQLite databases, each a consistent copy
@@ -57,14 +60,20 @@ it is, and the copy of that listen in server.db is set aside. backup.json
 says when the backup was taken, why, and what each file is.
 
 To restore it, stop the server, and put server.db, library.db and, if it is
-here, config.toml into an empty data directory: on a Mac
-~/Library/Application Support/Ritornel unless you chose another. Then start
-the server on that directory. Keep server.db and library.db together: the
-library names the server that may write it, and that server is the one in
-server.db.
+here, config.toml into an empty data directory, such as the one this backup
+was taken from:
+
+  {}
+
+Then start the server on that directory. Keep server.db and library.db
+together: the library names the server that may write it, and that server
+is the one in server.db.
 
 To look inside without changing anything: sqlite3 -readonly library.db
-";
+",
+        from.display()
+    )
+}
 
 /// What the README adds when the library copied had plays waiting to be
 /// sent to Last.fm.
@@ -490,11 +499,10 @@ fn fill(
     });
     let text = serde_json::to_string_pretty(&manifest).unwrap_or_default();
     write_synced(&into.join("backup.json"), text.as_bytes())?;
-    let readme = if held {
-        format!("{README}{HELD}")
-    } else {
-        README.to_owned()
-    };
+    let mut readme = readme(dir.root());
+    if held {
+        readme.push_str(HELD);
+    }
     write_synced(&into.join("README.txt"), readme.as_bytes())
 }
 
@@ -583,6 +591,13 @@ mod tests {
         // says what that means for a listen heard meanwhile.
         let readme = std::fs::read_to_string(first.path.join("README.txt")).unwrap();
         assert!(readme.contains("server.db first, then"), "{readme}");
+        // It names the data directory it was taken from, whatever the
+        // system.
+        assert!(
+            readme.contains(&format!("\n  {}\n", dir.root().display())),
+            "{readme}"
+        );
+        assert!(!readme.contains("Application Support"), "{readme}");
         assert_eq!(manifest["takenAt"], "2025-11-21T17:01:02.123Z");
 
         // A second in the same second is told apart, and nothing is left
