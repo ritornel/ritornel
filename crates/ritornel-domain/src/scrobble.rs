@@ -237,21 +237,26 @@ pub(crate) fn without_featured(text: &str) -> String {
 /// and no spaces: "&", "+" and "/" between two words are then all one.
 fn squash(key: &str) -> String {
     let key = fold_accents(key);
-    let key = match key.strip_prefix("the ") {
-        Some(rest) if !rest.is_empty() => rest,
-        _ => key.as_str(),
-    };
-    let squashed: String = key.split(' ').filter(|word| *word != "and").collect();
     // A symbol a key keeps at either end, as "⇄" or "+", is passed over
-    // too, unless the key is nothing else.
-    let letters: String = squashed
-        .chars()
-        .filter(|c| c.is_alphanumeric() || unicode_normalization::char::is_combining_mark(*c))
+    // first, unless the key is nothing else.
+    let words: Vec<&str> = key
+        .split(' ')
+        .filter(|word| word.chars().any(char::is_alphanumeric))
         .collect();
-    if letters.chars().any(char::is_alphanumeric) {
-        letters
-    } else if squashed.is_empty() {
-        key.split(' ').collect()
+    if words.is_empty() {
+        return key.split(' ').collect();
+    }
+    let words = match words.as_slice() {
+        ["the", rest @ ..] if !rest.is_empty() => rest,
+        all => all,
+    };
+    let squashed: String = words
+        .iter()
+        .filter(|word| **word != "and")
+        .copied()
+        .collect();
+    if squashed.is_empty() {
+        words.concat()
     } else {
         squashed
     }
@@ -484,7 +489,7 @@ impl Album {
                 "vol" | "volume" | "part" | "pt" | "chapter" | "book"
             );
         let rest = long.get(short.len()..).unwrap_or_default();
-        let by_artist = squash(&rest.join(" ")) == self.artist;
+        let by_artist = album_words(&rest.join(" ")).concat() == self.artist;
         // Set off: the longer title, outside its notes, is the shorter one
         // and then a colon, a dash or a full stop; or both have the same
         // title before such a mark, and one subtitle runs on from the
@@ -508,7 +513,9 @@ impl Album {
 /// normalised keys: what a scrobble this library sent is matched to its
 /// echo by, beside its exact time.
 pub fn same_track(artist: &str, title: &str, other_artist: &str, other_title: &str) -> bool {
-    exact_key(artist, title) == exact_key(other_artist, other_title)
+    // A symbol at either end may come back or not.
+    let key = |text: &str| crate::normalize::words_key(text);
+    (key(artist), key(title)) == (key(other_artist), key(other_title))
 }
 
 impl Catalog {
@@ -935,6 +942,24 @@ mod tests {
     }
 
     #[test]
+    fn an_album_whose_subtitle_is_an_artist_named_with_a_symbol_fits() {
+        let catalog = Catalog::new(vec![recording(
+            12,
+            "Mira Vale +",
+            "Undertow",
+            &[(121, "Blue Water Mira Vale +")],
+        )]);
+        assert!(matches!(
+            catalog.judge(Scrobbled {
+                artist: "Mira Vale +",
+                album: Some("Blue Water"),
+                title: "Undertow",
+            }),
+            Verdict::Bind { recording: 12, .. }
+        ));
+    }
+
+    #[test]
     fn a_symbol_at_either_end_of_a_title_is_passed_over_by_the_loose_rule() {
         let catalog = Catalog::new(vec![
             recording(8, "Mira Vale", "\u{21c4} (Lock and Key)", &[(81, "Glass")]),
@@ -954,6 +979,30 @@ mod tests {
         // The symbol written another way, or left out, is passed over.
         assert_eq!(bound("<===> (Lock and Key)"), Some((8, Rule::Loose)));
         assert_eq!(bound("(Lock and Key)"), Some((8, Rule::Loose)));
+        // A leading "The" behind a symbol is passed over too, and a title
+        // of words never becomes one of symbols alone.
+        let the = Catalog::new(vec![
+            recording(
+                10,
+                "Mira Vale",
+                "\u{21c4} The Lock and Key",
+                &[(101, "Glass")],
+            ),
+            recording(11, "Mira Vale", "The +", &[(111, "Glass")]),
+        ]);
+        let bound_the = |title| match the.judge(Scrobbled {
+            artist: "Mira Vale",
+            album: Some("Glass"),
+            title,
+        }) {
+            Verdict::Bind { recording, .. } => Some(recording),
+            _ => None,
+        };
+        assert_eq!(bound_the("The Lock and Key"), Some(10));
+        assert_eq!(bound_the("+"), None);
+        // An echo of a play this library sent is the same track whether
+        // the symbol came back or not.
+        assert!(same_track("Mira Vale", "Lock +", "Mira Vale", "Lock"));
         // A title of symbols alone is still its symbols.
         assert_eq!(bound("--->"), Some((9, Rule::Exact)));
         assert_eq!(bound("<---"), None);

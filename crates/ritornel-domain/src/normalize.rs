@@ -36,6 +36,18 @@ fn is_symbol(c: char) -> bool {
             | '\u{a2}'..='\u{a6}' | '\u{a9}' | '\u{ac}' | '\u{ae}' | '\u{b0}' | '\u{b1}'
             | '\u{d7}' | '\u{f7}'
             | '\u{20a0}'..='\u{20cf}' | '\u{2100}'..='\u{2bff}' | '\u{1f000}'..='\u{1faff}')
+        // The brackets among them, ornamental and mathematical, are
+        // punctuation.
+        && !matches!(c,
+            '\u{2308}'..='\u{230b}' | '\u{2329}' | '\u{232a}' | '\u{2768}'..='\u{2775}'
+            | '\u{27c5}' | '\u{27c6}' | '\u{27e6}'..='\u{27ef}' | '\u{2983}'..='\u{2998}'
+            | '\u{29d8}'..='\u{29db}' | '\u{29fc}' | '\u{29fd}')
+}
+
+/// Whether a mark only says how the character before it is drawn, as text
+/// or as an emoji: no part of a key from version 3.
+fn is_presentation(c: char) -> bool {
+    matches!(c, '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
 }
 
 /// The symbols in the marks before a name's first letter or digit, or
@@ -55,6 +67,13 @@ fn edge_symbols(marks: impl Iterator<Item = char>) -> String {
 /// names.
 pub fn normalize(text: &str) -> String {
     normalize_with(text, true)
+}
+
+/// The key of a name without the symbols at either end, as version 2 made
+/// it: for telling whether two texts that came back from one place name
+/// the same thing.
+pub fn words_key(text: &str) -> String {
+    normalize_with(text, false)
 }
 
 /// [`normalize`], keeping the symbols at either end or not, as version 2
@@ -87,7 +106,9 @@ fn normalize_with(text: &str, edges: bool) -> String {
     for word in spaced.split_whitespace() {
         let kept: String = word
             .chars()
-            .filter(|c| c.is_alphanumeric() || is_combining_mark(*c))
+            .filter(|c| {
+                (c.is_alphanumeric() || is_combining_mark(*c)) && !(edges && is_presentation(*c))
+            })
             .collect();
         if !kept.chars().any(char::is_alphanumeric) {
             continue;
@@ -164,13 +185,25 @@ fn normalize_v1(text: &str) -> String {
 /// keeps its full key.
 pub fn core(text: &str) -> String {
     let mut outside = String::with_capacity(text.len());
+    // A bracket of symbols alone, as "(+)", is kept: it is no note.
+    let mut inside = String::new();
     let mut depth = 0_u32;
     for c in text.chars() {
         match c {
             '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    if !inside.chars().any(char::is_alphanumeric) && inside.chars().any(is_symbol) {
+                        outside.push(' ');
+                        outside.push_str(&inside);
+                        outside.push(' ');
+                    }
+                    inside.clear();
+                }
+            }
             _ if depth == 0 => outside.push(c),
-            _ => {}
+            _ => inside.push(c),
         }
     }
     let key = normalize(&outside);
@@ -359,6 +392,15 @@ mod tests {
         ] {
             assert_eq!(normalize(spelling), "night drives", "{spelling}");
         }
+        // A symbol in brackets of its own stays in the key without notes
+        // too, and an emoji's presentation is no part of the key.
+        assert_eq!(core("Night Drives (+)"), "night drives +");
+        assert_eq!(core("Night Drives +"), "night drives +");
+        assert_eq!(core("Night Drives (Live)"), "night drives");
+        assert_eq!(normalize("Mira\u{2764}\u{fe0f}"), "mira \u{2764}");
+        assert_eq!(normalize("Mira \u{2764}\u{fe0f}"), "mira \u{2764}");
+        // Ornamental brackets are brackets, not symbols.
+        assert_eq!(normalize("\u{2768}Night Drives\u{2769}"), "night drives");
         // Version 2 dropped it, and its keys can be made again.
         assert_eq!(
             normalize_by(2, "Night Drives +"),
