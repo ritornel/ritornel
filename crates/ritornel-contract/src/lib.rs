@@ -1,5 +1,5 @@
 //! Wire types: calls, events, errors and public IDs. The one schema every
-//! client uses to talk to a server (docs/design/contract.md).
+//! client uses to talk to a server (docs/internals/contract.md).
 //!
 //! - [`Frame`] is a JSON-RPC 2.0 request, response or notification.
 //! - [`methods`] is the method table: each call's name, params and result,
@@ -124,8 +124,8 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 
 /// The version of the contract these types are.
 ///
-/// It is 0 while the contract is unstable (docs/design/contract.md,
-/// decision 20): a client and a server are built from one commit, and a
+/// It is 0 while the contract is unstable ("Session and frames" in
+/// docs/internals/contract.md): a client and a server are built from one commit, and a
 /// server refuses a client whose number is not its own. From 1 on, changes
 /// within a version are additive only and clients gate on capability flags.
 pub const CONTRACT_VERSION: u32 = 0;

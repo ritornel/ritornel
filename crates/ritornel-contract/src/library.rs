@@ -1,9 +1,10 @@
-//! The library calls of M1: sources, scans, jobs and what a scan produced.
-//! See "Playback and jobs" and the M1 "Library" row of the minimum call
-//! list in docs/design/contract.md.
+//! Library calls: sources, scans, jobs and what a scan produced. See
+//! "Commands, playback, and jobs" and "Method summary" in
+//! docs/internals/contract.md.
 //!
-//! A path appears only here, in the calls that manage sources (decision
-//! 5). Everything else a client sees is an identity.
+//! A path appears only here, in the calls that manage sources ("Entities
+//! and identifiers" in docs/internals/contract.md). Everything else a
+//! client sees is an identity.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,6 +1,6 @@
 //! Frames: JSON-RPC 2.0 requests, responses and notifications, one to a
-//! message. Batches are not supported. See decision 3 and "Session and
-//! frames" in docs/design/contract.md.
+//! message. Batches are not supported. See "Session and frames" in
+//! docs/internals/contract.md.
 //!
 //! A frame is text on every transport. The socket carries it as a text
 //! message and the in-memory transport as a string, so both go through
@@ -19,8 +19,9 @@ const VERSION: &str = "2.0";
 /// `null` and a number with a fraction, and discourages both: a `null` ID
 /// reads as a response to a request nobody could name, and a fraction does
 /// not survive every reader. The Model Context Protocol, which is why this
-/// contract uses JSON-RPC framing at all (docs/design/contract.md, decision
-/// 3), requires a string or an integer and forbids `null`. So a request
+/// contract uses JSON-RPC framing at all ("Session and frames" in
+/// docs/internals/contract.md), requires a string or an integer and forbids
+/// `null`. So a request
 /// whose ID is `null`, `1.0` or `1.5` is refused as an invalid request, on
 /// purpose, and a client must not send one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

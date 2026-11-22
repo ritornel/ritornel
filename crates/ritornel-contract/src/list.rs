@@ -1,5 +1,5 @@
-//! Large lists, read through views. See decisions 7 to 10 and "Large lists"
-//! in docs/design/contract.md.
+//! Large lists, read through views. See "Large lists" in
+//! docs/internals/contract.md.
 //!
 //! `list.open` resolves a query once into an ordered list of row IDs held
 //! by the server, and returns a view ID and an exact total. Membership and
@@ -128,8 +128,9 @@ pub struct Sort {
 /// the version it was written in, so a saved one can be read later.
 pub const FILTER_VERSION: u32 = 1;
 
-/// A filter: the versioned query tree of decision 10 in
-/// docs/design/contract.md. Version 1 has one predicate.
+/// A filter: a versioned query tree ("Large lists" in
+/// docs/internals/contract.md). Version 1 supports the [`Predicate`] variants
+/// below.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

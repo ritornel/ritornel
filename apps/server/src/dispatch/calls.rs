@@ -1,5 +1,5 @@
-//! The library calls of M1: sources, scans, jobs and what a scan produced.
-//! See "Playback and jobs" in docs/design/contract.md.
+//! Library calls: sources, scans, jobs and what a scan produced. See
+//! "Commands, playback, and jobs" in docs/internals/contract.md.
 
 use std::path::Path;
 use std::sync::PoisonError;

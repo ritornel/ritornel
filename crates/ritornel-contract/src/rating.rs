@@ -1,6 +1,6 @@
 //! What the listener says of a song: stars, on the recording, so that every
-//! appearance of it shows the same. See flags 5 and 6 in
-//! docs/design/schema.md.
+//! appearance of it shows the same. See "Ratings and loves" in
+//! docs/internals/schema.md.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,6 +1,6 @@
 //! The player's calls: `playback.*`, `queue.*` and `sources.tracks`, and
-//! the events the player sends. See "Playback and jobs" in
-//! docs/design/contract.md and docs/design/playback.md.
+//! the events the player sends. See "Commands, playback, and jobs" in
+//! docs/internals/contract.md and docs/design/playback.md.
 //!
 //! A server with no output has no player, and answers the player's calls
 //! with `unsupported` (docs/design/playback.md, decision 2).

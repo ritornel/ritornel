@@ -1,5 +1,5 @@
 //! The listener's stars and loves, as they stand for each recording. See
-//! flags 5 and 6 in docs/design/schema.md: a row is never changed, the
+//! "Ratings and loves" in docs/internals/schema.md: a row is never changed, the
 //! newest row of each kind from each source is that source's answer, what
 //! is said here names a recording, and what a service reports names a
 //! source item and reaches a recording through its current assignment.

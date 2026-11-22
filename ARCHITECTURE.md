@@ -85,5 +85,8 @@ Detailed guides for shipped subsystems live under `docs/internals/`:
 
 - [`docs/internals/server.md`](docs/internals/server.md) — server lifecycle, data directory, backups, SQLite rules, receipts, jobs, record health, and testing.
 - [`docs/internals/platforms.md`](docs/internals/platforms.md) — macOS, Linux, Windows, and headless hub support, OS boundaries, and platform decisions.
+- [`docs/internals/contract.md`](docs/internals/contract.md) — wire schema, TypeScript generation, HTTP routes and tickets, JSON-RPC framing, list views, events, commands, and cover media.
+- [`docs/internals/schema.md`](docs/internals/schema.md) — two-database split, durable vs. rebuildable tables, immutability triggers, ratings, revision stamping, and migrations.
+- [`docs/internals/plugins.md`](docs/internals/plugins.md) — compiled-in plugin boundary (`ritornel-source`), `ritornel-lastfm`, and Cargo feature gating.
 
-Additional subsystem guides (`contract`, `identity`, `history`, `playback`, `plugins`, `linking`, `desktop`, `schema`) are being moved into `docs/internals/` as each is verified against the current code.
+Additional subsystem guides (`identity`, `history`, `playback`, `linking`, `desktop`) are being moved into `docs/internals/` as each is verified against the current code.

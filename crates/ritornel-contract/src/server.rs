@@ -1,6 +1,6 @@
 //! The session calls and what they return: the handshake and the
 //! descriptor, the status, and the list of servers. See "Session and
-//! frames" in docs/design/contract.md.
+//! frames" in docs/internals/contract.md.
 //!
 //! A field that describes something a server does not have yet is left
 //! out. What a server says of its library is in its status.
@@ -673,7 +673,8 @@ pub struct ServerInfo {
     /// Counts the changes to this status. A client keeps the copy with the
     /// higher revision and drops the other. It counts from when the
     /// answering server started, which is enough: a client that connects
-    /// again reads everything again (docs/design/contract.md, decision 12).
+    /// again reads everything again ("Events and subscriptions" in
+    /// docs/internals/contract.md).
     pub revision: u64,
 }
 

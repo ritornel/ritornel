@@ -58,8 +58,8 @@ export const ART_SIZES = [64, 96, 128, 192, 256, 384, 512, 768, 1024] as const;
 export const FILTER_VERSION = 1;
 
 /**
- * Every method, in the order of the contract's call list: what kind of call
- * it is, and whether it needs a `full` session.
+ * Every method, in the order of the method table: what kind of call it is,
+ * and whether it needs a `full` session.
  */
 export const METHODS = {
   "server.hello": { kind: "session", needsFull: false },
@@ -1112,8 +1112,9 @@ export type FileFacts = {
 };
 
 /**
- * A filter: the versioned query tree of decision 10 in
- * docs/design/contract.md. Version 1 has one predicate.
+ * A filter: a versioned query tree ("Large lists" in
+ * docs/internals/contract.md). Version 1 supports the [`Predicate`] variants
+ * below.
  */
 export type Filter = {
   /**
@@ -3962,7 +3963,8 @@ export type ServerInfo = {
    * Counts the changes to this status. A client keeps the copy with the
    * higher revision and drops the other. It counts from when the
    * answering server started, which is enough: a client that connects
-   * again reads everything again (docs/design/contract.md, decision 12).
+   * again reads everything again ("Events and subscriptions" in
+   * docs/internals/contract.md).
    */
   revision: number,
 };

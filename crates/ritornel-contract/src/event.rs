@@ -1,5 +1,5 @@
-//! Events and subscriptions. See decisions 11 and 12 and "Events and
-//! subscriptions" in docs/design/contract.md.
+//! Events and subscriptions. See "Events and subscriptions" in
+//! docs/internals/contract.md.
 //!
 //! An event is a notification whose method is [`EVENT_METHOD`] and whose
 //! params are an [`Event`]: a `topic`, and what that topic carries. It

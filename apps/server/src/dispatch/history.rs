@@ -1,9 +1,8 @@
 //! The history calls: recent listening, "on this day", and the rebuild.
 //! See "Queries M1 must answer" and "Rebuild" in docs/design/history.md.
 //!
-//! History is meant to be read through `list.open` with `kind: "history"`
-//! (docs/design/contract.md). That arrives with the list views; until then
-//! these two direct calls read it.
+//! Direct history queries serve history reads without opening a list view
+//! (see "Large lists" in docs/internals/contract.md).
 
 use ritornel_contract::methods::{HistoryRebuild, HistorySetZones, Method};
 use ritornel_contract::{

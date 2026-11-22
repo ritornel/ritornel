@@ -1,6 +1,6 @@
 //! Socket tickets: what a page opens the socket with, since it cannot put
-//! the credential in a header. See "Query-string credentials" in
-//! docs/design/contract.md and `ritornel_contract::SocketTicket`.
+//! the credential in a header. See "Query-string credentials and origin
+//! checks" in docs/internals/contract.md and `ritornel_contract::SocketTicket`.
 //!
 //! A ticket is 32 random bytes, written as 64 hex digits. It is never the
 //! session token and says nothing about it. The server keeps the tickets

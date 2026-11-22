@@ -1,5 +1,5 @@
 //! The error model: a JSON-RPC error whose `data` is `{code, retryable,
-//! details}`. See "Errors and capabilities" in docs/design/contract.md.
+//! details}`. See "Errors and capabilities" in docs/internals/contract.md.
 
 use std::fmt;
 
@@ -39,7 +39,8 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// Every code, in the order docs/design/contract.md lists them.
+    /// Every code, in the order "Errors and capabilities" in
+    /// docs/internals/contract.md lists them.
     pub const ALL: &[Self] = &[
         Self::Invalid,
         Self::NotFound,

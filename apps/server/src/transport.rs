@@ -1,8 +1,8 @@
 //! What a session's frames travel on, and the one loop that moves them.
 //! A transport is a [`Wire`]: the socket, or a pair of channels in memory.
 //! Both carry a frame as text and both are run by [`pump`], so whatever is
-//! decided here is decided for every transport. See decision 4 in
-//! docs/design/contract.md.
+//! decided here is decided for every transport. See "Transport-neutral
+//! dispatcher" in docs/internals/contract.md.
 
 use std::future::Future;
 use std::sync::Arc;

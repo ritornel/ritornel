@@ -1,6 +1,7 @@
 //! `ritornelctl jobs`: the server's jobs, or one job in detail. A job is a
 //! durable resource: it is here after the client that started it has gone,
-//! and after it has ended. See decision 17 in docs/design/contract.md.
+//! and after it has ended. See "Commands, playback, and jobs" in
+//! docs/internals/contract.md.
 
 use std::io::Write;
 

@@ -1,6 +1,7 @@
 //! The dispatcher: routing from contract calls to engine methods. It takes
 //! a decoded frame and a session and returns the frame that answers it, and
-//! knows nothing of sockets. See decision 4 in docs/design/contract.md.
+//! knows nothing of sockets. See "Transport-neutral dispatcher" in
+//! docs/internals/contract.md.
 //!
 //! [`Core`] is what every session of a running server shares: the open
 //! databases, who this server is, and the list of sessions that events are

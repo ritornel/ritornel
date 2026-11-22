@@ -6,7 +6,8 @@
 //! to through `ritornel-client`.
 //!
 //! Each test runs twice, joined to the dispatcher by channels in memory
-//! and over a real socket (docs/design/contract.md, decision 4).
+//! and over a real socket ("Transport-neutral dispatcher" in
+//! docs/internals/contract.md).
 
 #![allow(
     clippy::unwrap_used,

@@ -1,7 +1,7 @@
 //! The in-memory transport: a session joined to a pair of channels, for
 //! tests. It carries the same text a socket does, so a test through it
 //! still encodes and decodes every frame. The desktop app never uses it.
-//! See decision 4 in docs/design/contract.md.
+//! See "Transport-neutral dispatcher" in docs/internals/contract.md.
 
 use std::sync::Arc;
 

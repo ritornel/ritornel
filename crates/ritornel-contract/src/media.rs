@@ -1,6 +1,6 @@
 //! Media: covers over plain HTTP, and the token that a request which
-//! cannot carry a header presents. See decision 18 and "Media" in
-//! docs/design/contract.md.
+//! cannot carry a header presents. See "Media" in
+//! docs/internals/contract.md.
 //!
 //! A cover is `GET /v1/art/{artId}/{size}`, where `artId` is a row's art ID
 //! and `size` is one of [`ART_SIZES`], the buckets the descriptor lists. The

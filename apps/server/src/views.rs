@@ -1,5 +1,4 @@
-//! The views a session holds. See "Large lists" in docs/design/contract.md,
-//! steps 10 and 11.
+//! The views a session holds. See "Large lists" in docs/internals/contract.md.
 //!
 //! A view is a resolved query: its row keys in order and its sections, at
 //! about one integer a row. It belongs to its session and ends with it, on

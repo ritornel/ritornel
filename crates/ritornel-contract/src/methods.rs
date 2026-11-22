@@ -1,5 +1,5 @@
-//! The method table: every call of the contract, defined once. See decision
-//! 1 in docs/design/contract.md.
+//! The method table: every call of the contract, defined once. See "Schema
+//! definition and code generation" in docs/internals/contract.md.
 //!
 //! A method is a type in this module that implements [`Method`], named for
 //! its call: [`ServerHello`] is `server.hello`. The server's dispatcher and
@@ -111,8 +111,8 @@ macro_rules! methods {
             }
         )*
 
-        /// Every method of the contract, in the order of
-        /// docs/design/contract.md's call list.
+        /// Every method of the contract. See "Method summary" in
+        /// docs/internals/contract.md.
         pub const METHODS: &[MethodInfo] = &[$(
             MethodInfo {
                 name: $name,
