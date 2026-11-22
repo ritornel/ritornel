@@ -66,6 +66,9 @@ tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "s
 toml = { version = "1.2.1", default-features = false, features = ["std", "parse", "serde"] }
 # What log lines are written through, here and in the libraries to come.
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# This machine's addresses on a tailnet, which an invite offers. The
+# standard library cannot list a machine's addresses.
+if-addrs = "0.15.0"
 
 # Free disk space, for `server.status`, and the user ID that names the
 # login session the background service runs in. The standard library cannot

@@ -56,14 +56,6 @@ struct Reach {
 /// before its own clients give up on it: `ritornelctl` waits ten seconds.
 const CALL_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// The most routes a connection tries, so one to a hub that does not
-/// answer is bounded however many routes the invite named.
-const MAX_ROUTES: usize = 8;
-
-/// The longest a connection to the hub may take on one route, the proof
-/// and the hello included. On a home network it takes milliseconds.
-const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
-
 /// How long after a failed try a call is answered at once, without trying
 /// again: a client that calls ten times a second while the hub is away is
 /// not kept waiting on each.
@@ -207,6 +199,31 @@ impl Uplink {
         reach.problem = Some(why.to_owned());
     }
 
+    /// Opens a connection to the hub at `address`, once it has proved it
+    /// holds the hub's key, and says hello.
+    async fn open(&self, address: SocketAddr) -> Result<Client, String> {
+        link::reach(
+            address,
+            self.link.hub,
+            &self.link.hub_public_key,
+            &*self.entropy,
+        )
+        .await?;
+        let client = Client::connect(address, &self.credential())
+            .await
+            .map_err(|error| error.to_string())?;
+        client
+            .hello(&HelloParams {
+                name: self.name.clone(),
+                kind: ClientKind::Server,
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                contract_version: CONTRACT_VERSION,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(client)
+    }
+
     /// Opens a connection to the hub on the first route that works, and
     /// says hello.
     async fn connect(&self) -> Result<Client, String> {
@@ -219,43 +236,24 @@ impl Uplink {
             }
         }
         let mut tried = Vec::new();
-        let routes = self
-            .link
-            .routes
-            .iter()
-            .filter_map(|route| route.parse::<SocketAddr>().ok())
-            .filter(|route| link::is_private_route(route.ip()))
-            .take(MAX_ROUTES);
-        for route in routes {
+        // Each route is resolved again at each dial, so a hub found by its
+        // name is found wherever its address has moved.
+        for route in self.link.routes.iter().take(link::MAX_ROUTES) {
+            // Each address has its own time, so one that does not answer
+            // leaves the next its chance.
             let opened = async {
-                link::reach(
-                    route,
-                    self.link.hub,
-                    &self.link.hub_public_key,
-                    &*self.entropy,
-                )
-                .await?;
-                let client = Client::connect(route, &self.credential())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                client
-                    .hello(&HelloParams {
-                        name: self.name.clone(),
-                        kind: ClientKind::Server,
-                        version: env!("CARGO_PKG_VERSION").to_owned(),
-                        contract_version: CONTRACT_VERSION,
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok::<_, String>(client)
+                let mut why = Vec::new();
+                for address in link::resolve(route).await? {
+                    match link::within(link::CONNECT_WAIT, self.open(address)).await {
+                        Ok(client) => return Ok((address, client)),
+                        Err(problem) => why.push(format!("{address}: {problem}")),
+                    }
+                }
+                Err(why.join(", "))
             };
-            let opened = match tokio::time::timeout(CONNECT_WAIT, opened).await {
-                Ok(opened) => opened,
-                Err(_) => Err(format!("no answer in {} seconds", CONNECT_WAIT.as_secs())),
-            };
-            match opened {
-                Ok(client) => {
-                    self.answered(Some(route));
+            match opened.await {
+                Ok((address, client)) => {
+                    self.answered(Some(address));
                     return Ok(client);
                 }
                 Err(why) => tried.push(format!("{route}: {why}")),

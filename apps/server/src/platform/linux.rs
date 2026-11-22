@@ -39,6 +39,17 @@ fn units_dir(env: Env<'_>) -> Result<PathBuf, Error> {
     Ok(config.join("systemd/user"))
 }
 
+/// The host name Avahi answers to by multicast DNS, which is the machine's
+/// host name, when Avahi runs: without it, no other machine resolves the
+/// name.
+pub(crate) fn mdns_host() -> Option<String> {
+    if !std::path::Path::new("/run/avahi-daemon/socket").exists() {
+        return None;
+    }
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").ok()?;
+    host.trim().split('.').next().map(str::to_owned)
+}
+
 /// The machine's pretty name if one is set, as `hostnamectl` shows it, or
 /// else its host name.
 pub(crate) fn computer_name() -> Option<String> {

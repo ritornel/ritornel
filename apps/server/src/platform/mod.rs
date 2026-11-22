@@ -74,6 +74,27 @@ pub(crate) fn computer_name() -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
+/// The name this machine answers to on the local network by multicast DNS
+/// (Bonjour), such as `studio-mac.local`, when it answers to one: what an
+/// invite offers first, so that a hub whose address changes is still
+/// found.
+pub(crate) fn mdns_name() -> Option<String> {
+    local_name(&system::mdns_host()?)
+}
+
+/// `host` as a `.local` name, if it is a label multicast DNS answers to:
+/// not `localhost`, which no responder announces.
+fn local_name(host: &str) -> Option<String> {
+    let host = host.trim().to_ascii_lowercase();
+    let host = host.strip_suffix(".local").unwrap_or(&host);
+    let valid = (1..=63).contains(&host.len())
+        && host != "localhost"
+        && !host.starts_with('-')
+        && !host.ends_with('-')
+        && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    valid.then(|| format!("{host}.local"))
+}
+
 /// The machine kept from sleeping when idle, its screen still free to, for
 /// as long as this is held. It is a helper process the system already has,
 /// asked to hold the system's own assertion; dropping this ends it, and so
@@ -107,7 +128,8 @@ mod other_unix {
     #[cfg(feature = "media-session")]
     pub(crate) use super::fallback::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
     pub(crate) use super::fallback::{
-        computer_name, install_service, service_status, stay_awake, uninstall_service, wait,
+        computer_name, install_service, mdns_host, service_status, stay_awake, uninstall_service,
+        wait,
     };
     pub(crate) use super::unix::*;
 }
@@ -151,6 +173,12 @@ mod fallback {
 
     /// The computer's name is not read here yet.
     pub(crate) fn computer_name() -> Option<String> {
+        None
+    }
+
+    /// Whether this machine answers to a name by multicast DNS is not
+    /// known here yet.
+    pub(crate) fn mdns_host() -> Option<String> {
         None
     }
 
@@ -204,6 +232,30 @@ mod tests {
 
     use super::*;
     use crate::testing::Scratch;
+
+    #[test]
+    fn a_local_name_is_one_label_multicast_dns_answers_to() {
+        assert_eq!(
+            local_name("Studio-Mac\n").as_deref(),
+            Some("studio-mac.local")
+        );
+        assert_eq!(
+            local_name("studio-mac.local").as_deref(),
+            Some("studio-mac.local")
+        );
+        let long = "a".repeat(64);
+        for not in [
+            "",
+            "localhost",
+            "-studio",
+            "studio-",
+            "studio mac",
+            "studio.lan",
+            &long,
+        ] {
+            assert_eq!(local_name(not), None, "{not}");
+        }
+    }
 
     #[test]
     fn a_directory_that_exists_has_room_and_one_that_does_not_has_no_answer() {

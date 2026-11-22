@@ -107,36 +107,39 @@ impl LinkSessions {
     }
 }
 
-/// The addresses this machine has on the private network and on a tailnet,
-/// with `port`: what an invite offers when it is not told what to offer.
+/// The routes an invite offers when it is not told what to offer, each
+/// with `port`, best first:
 ///
-/// Each is the address the system would send from toward a far address,
-/// which it says without sending anything: the default route's for the
-/// private network, and the route to the tailnet's own resolver for a
-/// tailnet. Either is left out when it is not private.
+/// - this machine's multicast DNS name, such as `studio-mac.local`, which
+///   still finds the hub after its address changes;
+/// - the address the system sends from on the default route, if private;
+/// - its addresses on a tailnet (`100.64.0.0/10`), read from its network
+///   interfaces, which finds both Tailscale's and NetBird's.
+///
+/// A satellite that cannot resolve the name uses the addresses.
 pub(crate) fn found_routes(port: u16) -> Vec<String> {
-    let toward = [
-        // TEST-NET-1: never answered, so only the default route matters.
-        Ipv4Addr::new(192, 0, 2, 1),
-        // The resolver every tailnet has.
-        Ipv4Addr::new(100, 100, 100, 100),
-    ];
     let mut found = Vec::new();
-    for far in toward {
-        let from = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .and_then(|socket| {
-                socket.connect((far, 9))?;
-                socket.local_addr()
-            })
-            .map(|address| address.ip());
-        if let Ok(ip) = from
-            && !ip.is_loopback()
-            && is_private_route(ip)
-        {
-            let route = SocketAddr::new(ip, port).to_string();
-            if !found.contains(&route) {
-                found.push(route);
-            }
+    if let Some(name) = crate::platform::mdns_name() {
+        found.push(format!("{name}:{port}"));
+    }
+    // TEST-NET-1 is never answered, so only the route toward it matters,
+    // and nothing is sent.
+    let default = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|socket| {
+            socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+            socket.local_addr()
+        })
+        .map(|address| address.ip());
+    let tailnet = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| interface.oper_status != if_addrs::IfOperStatus::Down)
+        .map(|interface| interface.ip())
+        .filter(|ip| matches!(ip, IpAddr::V4(v4) if crate::config::is_tailnet(*v4)));
+    for ip in default.into_iter().chain(tailnet) {
+        let route = SocketAddr::new(ip, port).to_string();
+        if !ip.is_loopback() && is_private_route(ip) && !found.contains(&route) {
+            found.push(route);
         }
     }
     found
@@ -145,29 +148,115 @@ pub(crate) fn found_routes(port: u16) -> Vec<String> {
 /// Whether `ip` is an address a satellite may dial: this machine, or one
 /// on a private or link-local network or a tailnet, never a public
 /// address. What travels on a route is plain HTTP, so it must not leave
-/// home.
+/// home, or must travel inside a tailnet's own encryption.
 pub(crate) fn is_private_route(ip: IpAddr) -> bool {
     !ip.is_unspecified() && Listen::private_on_port(0).admits(ip)
 }
 
-/// The routes of an invite as addresses, refusing any that is not private.
-pub(crate) fn routes_of(invite: &InviteLink) -> Result<Vec<SocketAddr>, String> {
-    check_routes(&invite.routes)
+/// The most routes an invite names, so that a connection to a hub that
+/// does not answer is bounded.
+pub(crate) const MAX_ROUTES: usize = 8;
+
+/// The most addresses of one route's name a satellite tries.
+const MAX_ADDRESSES: usize = 4;
+
+/// The longest a name may take to resolve.
+const RESOLVE_WAIT: Duration = Duration::from_secs(3);
+
+/// The longest a connection to the hub may take at one address, the proof
+/// and the hello included. On a home network it takes milliseconds.
+pub(crate) const CONNECT_WAIT: Duration = Duration::from_secs(4);
+
+/// Checks routes as an invite names them: at most [`MAX_ROUTES`], each a
+/// host and a port, the host an address on a private network or a
+/// tailnet, or a name, such as `studio-mac.local` or a tailnet's name for
+/// the machine. A name is resolved at each dial ([`resolve`]), so a hub
+/// whose address changes is still found.
+pub(crate) fn check_routes(routes: &[String]) -> Result<(), String> {
+    if routes.len() > MAX_ROUTES {
+        return Err(format!("a link names at most {MAX_ROUTES} routes"));
+    }
+    for route in routes {
+        if let Ok(address) = route.parse::<SocketAddr>() {
+            if address.port() == 0 {
+                return Err(format!("{route} is not a host and a port"));
+            }
+            if !is_private_route(address.ip()) {
+                return Err(format!(
+                    "{route} is not on a private network or a tailnet, and a link travels as \
+                     plain HTTP"
+                ));
+            }
+        } else if !is_name_and_port(route) {
+            return Err(format!("{route} is not a host and a port"));
+        }
+    }
+    Ok(())
 }
 
-/// Routes as addresses, refusing any that is not private.
-pub(crate) fn check_routes(routes: &[String]) -> Result<Vec<SocketAddr>, String> {
-    routes
-        .iter()
-        .map(|route| match route.parse::<SocketAddr>() {
-            Ok(address) if is_private_route(address.ip()) => Ok(address),
-            Ok(_) => Err(format!(
-                "{route} is not on a private network or a tailnet, and a link travels as plain \
-                 HTTP"
-            )),
-            Err(_) => Err(format!("{route} is not an address and a port")),
+/// Whether `route` is a DNS name and a port: labels of letters, digits and
+/// inner hyphens, of at most 63 characters, and a final dot allowed.
+fn is_name_and_port(route: &str) -> bool {
+    let Some((host, port)) = route.rsplit_once(':') else {
+        return false;
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
+        && !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         })
-        .collect()
+}
+
+/// `work`, given at most `wait`.
+pub(crate) async fn within<T>(
+    wait: Duration,
+    work: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(wait, work)
+        .await
+        .unwrap_or_else(|_| Err(format!("no answer in {} seconds", wait.as_secs())))
+}
+
+/// The addresses `route` dials now: an address as it is, a name as the
+/// system resolves it at this moment, by DNS or multicast DNS. Only IPv4
+/// addresses on a private network or a tailnet are kept: the hub listens
+/// on IPv4, and what travels is plain HTTP.
+///
+/// A name that answers with another machine, by mistake or by spoofing,
+/// gets nothing from the satellite but a nonce: [`reach`] asks whatever
+/// answers to prove it holds the hub's key first. What the proof cannot
+/// stop is what plain HTTP cannot: someone able to relay traffic on the
+/// network reads what travels, by a name as by an address. That is why a
+/// route must be private, or inside a tailnet's own encryption.
+pub(crate) async fn resolve(route: &str) -> Result<Vec<SocketAddr>, String> {
+    let found: Vec<SocketAddr> = within(RESOLVE_WAIT, async {
+        tokio::net::lookup_host(route)
+            .await
+            .map(Iterator::collect)
+            .map_err(|error| format!("it could not be resolved: {error}"))
+    })
+    .await?;
+    let mut usable = Vec::new();
+    for address in &found {
+        if address.is_ipv4() && is_private_route(address.ip()) && !usable.contains(address) {
+            usable.push(*address);
+        }
+    }
+    usable.truncate(MAX_ADDRESSES);
+    if usable.is_empty() {
+        return Err(if found.is_empty() {
+            "it resolves to no address".to_owned()
+        } else {
+            "it resolves to no IPv4 address on a private network or a tailnet".to_owned()
+        });
+    }
+    Ok(usable)
 }
 
 /// Asks the server at `route` for its descriptor with a fresh nonce, and
@@ -345,17 +434,68 @@ mod tests {
         for not in ["0.0.0.0", "8.8.8.8", "2001:db8::1"] {
             assert!(!is_private_route(not.parse().unwrap()), "{not}");
         }
-        let invite = |route: &str| InviteLink {
-            hub: Id::from_bytes([1; 16]),
-            key: [2; 32],
-            routes: vec![route.to_owned()],
-            secret: [3; 32],
-        };
-        assert!(routes_of(&invite("192.168.1.20:4747")).is_ok());
-        assert!(routes_of(&invite("8.8.8.8:4747")).is_err());
-        assert!(routes_of(&invite("attic:4747")).is_err());
-        for route in found_routes(4747) {
-            assert!(is_private_route(route.parse::<SocketAddr>().unwrap().ip()));
+        let check = |route: &str| check_routes(&[route.to_owned()]);
+        assert!(check("192.168.1.20:4747").is_ok());
+        assert!(check("[fd7a:115c:a1e0::1]:4747").is_ok());
+        assert!(check("8.8.8.8:4747").is_err());
+        // A name is checked when it is dialled, by what it resolves to.
+        assert!(check("studio-mac.local:4747").is_ok());
+        assert!(check("studio.example-overlay.net:4747").is_ok());
+        assert!(check("Studio.Example-Overlay.NET.:4747").is_ok());
+        let long = format!("{}.local:4747", "a".repeat(64));
+        for wrong in [
+            "127.0.0.1:0",
+            "8.8.8.8:+4747",
+            "-studio.local:4747",
+            "studio-.local:4747",
+            long.as_str(),
+        ] {
+            assert!(check(wrong).is_err(), "{wrong}");
         }
+        let nine = vec!["192.168.1.20:4747".to_owned(); MAX_ROUTES + 1];
+        assert!(check_routes(&nine).is_err());
+        for wrong in [
+            "attic",
+            "attic:",
+            "attic:0",
+            ":4747",
+            "http://attic:4747",
+            "at tic:4747",
+        ] {
+            assert!(check(wrong).is_err(), "{wrong}");
+        }
+        for route in found_routes(4747) {
+            if let Ok(address) = route.parse::<SocketAddr>() {
+                assert!(is_private_route(address.ip()), "{route}");
+            } else {
+                assert!(route.ends_with(".local:4747"), "{route}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tailnet_is_the_shared_address_space() {
+        for ip in ["100.64.0.1", "100.100.100.100", "100.127.255.254"] {
+            assert!(crate::config::is_tailnet(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["100.63.255.255", "100.128.0.1", "192.168.1.20"] {
+            assert!(!crate::config::is_tailnet(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_route_resolves_to_its_private_addresses_only() {
+        let resolved = resolve("localhost:4747").await.unwrap();
+        assert!(!resolved.is_empty());
+        assert!(
+            resolved
+                .iter()
+                .all(|address| address.is_ipv4() && address.ip().is_loopback())
+        );
+        assert_eq!(
+            resolve("192.168.1.20:4747").await.unwrap(),
+            vec!["192.168.1.20:4747".parse().unwrap()]
+        );
+        assert!(resolve("8.8.8.8:4747").await.is_err());
     }
 }
