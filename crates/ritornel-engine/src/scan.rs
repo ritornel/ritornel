@@ -93,7 +93,9 @@ pub struct ScanRun {
     dirty: bool,
     walked: Option<Walked>,
     known: HashMap<String, Known>,
-    /// Items whose path the walk did not find, by audio hash and by key.
+    /// Items a file at a new path may have moved from, by audio hash: those
+    /// whose path the walk did not find, and those whose path now holds
+    /// other audio.
     gone_by_audio: HashMap<String, Vec<i64>>,
     gone: Vec<i64>,
     /// The files to read, and how far the reading has got.
@@ -433,6 +435,11 @@ impl ScanRun {
             }
         }
         self.gone.sort_unstable();
+        // Known paths are read first, so that by the time a new path is
+        // recorded, every item whose path now holds other audio is known.
+        let known = &self.known;
+        self.queue
+            .sort_by_key(|file| !known.contains_key(&file.path));
         for (path, why) in &walked.skipped {
             self.failed
                 .push((path.clone(), "skipped", format!("{{\"reason\":\"{why}\"}}")));
@@ -504,28 +511,18 @@ impl ScanRun {
                     });
                 }
                 // Other audio at a known path. Whether it is the same song
-                // is the resolver's to say, once everything is recorded.
-                Some(known) => self.replaced.push((known.id, payload)),
-                None => {
-                    // A new path whose audio matches exactly one item of
-                    // this root whose path is gone: the file moved.
-                    let moved = audio
-                        .as_ref()
-                        .and_then(|audio| self.gone_by_audio.get_mut(audio))
-                        .filter(|items| items.len() == 1)
-                        .and_then(Vec::pop);
-                    match moved {
-                        Some(item) => {
-                            self.gone.retain(|gone| *gone != item);
-                            counted.moved += 1;
-                            ops.push(RecordOp::Move { item, payload });
-                        }
-                        None => {
-                            counted.new += 1;
-                            ops.push(RecordOp::New(payload));
-                        }
+                // is the resolver's to say, once everything is recorded,
+                // unless the item's own file turns up at a new path.
+                Some(known) => {
+                    if let Some(audio) = &known.audio {
+                        self.gone_by_audio
+                            .entry(audio.clone())
+                            .or_default()
+                            .push(known.id);
                     }
+                    self.replaced.push((known.id, payload));
                 }
+                None => self.place(payload, &mut counted, &mut ops),
             }
         }
         self.cursor = (self.cursor + self.settings.batch_files.max(1)).min(self.queue.len());
@@ -540,6 +537,37 @@ impl ScanRun {
             self.committed()?;
         }
         Ok(())
+    }
+
+    /// Records a file at a path the library has no live item at. If its
+    /// audio matches exactly one item of this root whose path is gone, or
+    /// now holds other audio, the file moved and the item follows it. An
+    /// item that leaves a path with other audio in it leaves that audio to
+    /// be placed in its turn, as a file at a new path.
+    fn place(&mut self, payload: Payload, counted: &mut ScanSummary, ops: &mut Vec<RecordOp>) {
+        let moved = payload
+            .audio
+            .as_ref()
+            .and_then(|audio| self.gone_by_audio.get_mut(&audio.hash))
+            .filter(|items| items.len() == 1)
+            .and_then(Vec::pop);
+        let Some(item) = moved else {
+            counted.new += 1;
+            ops.push(RecordOp::New(payload));
+            return;
+        };
+        self.gone.retain(|gone| *gone != item);
+        counted.moved += 1;
+        // The move re-keys the item before anything takes its old path.
+        ops.push(RecordOp::Move { item, payload });
+        if let Some(at) = self
+            .replaced
+            .iter()
+            .position(|(replaced, _)| *replaced == item)
+        {
+            let (_, refill) = self.replaced.remove(at);
+            self.place(refill, counted, ops);
+        }
     }
 
     /// Settles the files whose audio changed at a path the library knew.
