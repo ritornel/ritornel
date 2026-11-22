@@ -35,8 +35,15 @@ pub(crate) struct Known {
     pub(crate) size: i64,
     pub(crate) mtime_ms: i64,
     pub(crate) missing: bool,
-    /// The audio hash of its current revision, as hex.
+    /// The audio hash of its current revision, as hex. `None` if that
+    /// read failed.
     pub(crate) audio: Option<String>,
+    /// If its current revision has no audio, every audio hash, as hex, its
+    /// revisions have had. A file at its path is the item's file read again
+    /// only if this holds no audio but the file's: an item with no
+    /// recording yet keeps whatever replaces its audio, so an item that had
+    /// other audio may have been another song.
+    pub(crate) earlier_audio: Vec<String>,
     /// Its current revision has no audio because reading it failed on I/O:
     /// it is read again, whatever its size and time. A scan before
     /// [`UNAVAILABLE`](crate::media::UNAVAILABLE) recorded such reads.
@@ -440,18 +447,27 @@ impl LibraryStore {
     /// Every live item of a source, by its path.
     pub(crate) fn known_items(&self, source: i64) -> Result<HashMap<String, Known>, Error> {
         self.read(|connection| {
+            // `hex(NULL)` is '', not NULL, so a revision with no audio is
+            // tested for before its hash is read.
             let mut statement = connection.prepare(
                 "SELECT si.provider_key, si.id, si.size_bytes, si.mtime_ms, si.missing_since_ms IS NOT NULL,
-                        lower(hex(aa.audio_hash)), json_extract(sr.payload_json, '$.folder_images'),
+                        CASE WHEN aa.audio_hash IS NOT NULL THEN lower(hex(aa.audio_hash)) END,
+                        CASE WHEN aa.audio_hash IS NULL THEN
+                          (SELECT group_concat(DISTINCT lower(hex(ea.audio_hash)))
+                           FROM source_item_revision er
+                           JOIN audio_asset ea ON ea.id = er.audio_asset_id
+                           WHERE er.source_item_id = si.id)
+                        END,
                         aa.audio_hash IS NULL
-                          AND json_extract(sr.payload_json, '$.error.kind') IN ('io', 'unavailable')
+                          AND json_extract(sr.payload_json, '$.error.kind') IN ('io', 'unavailable'),
+                        json_extract(sr.payload_json, '$.folder_images')
                  FROM source_item si
                  LEFT JOIN source_item_revision sr ON sr.id = si.current_revision_id
                  LEFT JOIN audio_asset aa ON aa.id = sr.audio_asset_id
                  WHERE si.source_instance_id = ?1 AND si.item_kind = 'file' AND si.retired_at_ms IS NULL",
             )?;
             let rows = statement.query_map([source], |row| {
-                let images: Option<String> = row.get(6)?;
+                let images: Option<String> = row.get(8)?;
                 let images: Vec<FolderImage> =
                     images.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default();
                 Ok((
@@ -462,6 +478,10 @@ impl LibraryStore {
                         mtime_ms: row.get::<_, Option<i64>>(3)?.unwrap_or(-1),
                         missing: row.get(4)?,
                         audio: row.get(5)?,
+                        earlier_audio: row
+                            .get::<_, Option<String>>(6)?
+                            .map(|hashes| hashes.split(',').map(str::to_owned).collect())
+                            .unwrap_or_default(),
                         io_failed: row.get::<_, Option<bool>>(7)?.unwrap_or(false),
                         images: images
                             .into_iter()

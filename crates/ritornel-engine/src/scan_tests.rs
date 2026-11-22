@@ -1444,3 +1444,180 @@ fn a_file_an_earlier_scan_recorded_as_unreadable_by_a_failed_read_is_read_again(
     assert_eq!(rig.scan().unchanged, 1);
     assert_eq!(rig.revision(), revision);
 }
+
+#[test]
+fn a_file_that_reads_again_after_a_failed_read_keeps_its_item() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.scan();
+    let item = "SELECT si.id, a.id, a.recording_id FROM source_item si
+                JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+                WHERE si.provider_key = 'Tin Weather/01.flac' AND si.retired_at_ms IS NULL";
+    let before = rig.one(item);
+    // Its read fails: what is at the path is not audio.
+    rig.put("Tin Weather/01.flac", "not-audio.flac");
+    assert_eq!(rig.scan().unreadable, 1);
+    assert_eq!(rig.library.stats().unwrap().files_unreadable, 1);
+
+    // Whole again, with the audio it had: the same item, not a new one.
+    rig.put("Tin Weather/01.flac", "a.flac");
+    let summary = rig.scan();
+    assert_eq!((summary.changed, summary.retired, summary.new), (1, 0, 0));
+    assert_eq!(rig.one(item), before);
+    assert_eq!(rig.one("SELECT count(*) FROM source_item"), "1");
+    assert_eq!(rig.library.stats().unwrap().files_unreadable, 0);
+}
+
+#[test]
+fn a_different_song_that_takes_a_path_after_a_failed_read_gets_a_new_source_item() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.scan();
+    rig.put("Tin Weather/01.flac", "not-audio.flac");
+    assert_eq!(rig.scan().unreadable, 1);
+
+    // Audio the item has never had: judged as a replacement, not taken as
+    // the item's own file read again.
+    rig.put("Tin Weather/01.flac", "b.no-artist.flac");
+    let summary = rig.scan();
+    assert_eq!((summary.retired, summary.changed, summary.new), (1, 0, 0));
+    assert_eq!(
+        rig.rows(
+            "SELECT si.retired_at_ms IS NOT NULL, r.display_title
+             FROM source_item si JOIN assignment a ON a.source_item_id = si.id
+             JOIN recording r ON r.id = a.recording_id
+             WHERE a.superseded_at_ms IS NULL ORDER BY si.id"
+        ),
+        ["1|Paper Kites", "0|Salt Road"]
+    );
+}
+
+#[test]
+fn a_song_an_item_had_before_another_took_its_path_is_judged_after_a_failed_read() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    // Cut off after the file is recorded and before it is resolved, and
+    // unreadable by the time the scan goes on: the item is never given a
+    // recording, so the next audio at its path keeps it.
+    let source = rig.main.clone();
+    let settings = ScanSettings {
+        fail_after_step: Some(1),
+        ..ScanSettings::default()
+    };
+    assert!(matches!(
+        rig.try_scan(&source, settings),
+        Err(Error::FailPoint)
+    ));
+    rig.put("Tin Weather/01.flac", "not-audio.flac");
+    assert_eq!(rig.resume(ScanSettings::default()).unwrap().unreadable, 1);
+    rig.put("Tin Weather/01.flac", "b.no-artist.flac");
+    assert_eq!(rig.scan().changed, 1);
+    rig.put("Tin Weather/01.flac", "not-audio.flac");
+    assert_eq!(rig.scan().unreadable, 1);
+
+    // The first song back is not the item's file read again: the item is
+    // now the second song's, and the first is judged as a replacement.
+    rig.put("Tin Weather/01.flac", "a.flac");
+    let summary = rig.scan();
+    assert_eq!((summary.retired, summary.changed, summary.new), (1, 0, 0));
+    assert_eq!(
+        rig.rows(
+            "SELECT si.retired_at_ms IS NOT NULL, r.display_title
+             FROM source_item si JOIN assignment a ON a.source_item_id = si.id
+             JOIN recording r ON r.id = a.recording_id
+             WHERE a.superseded_at_ms IS NULL ORDER BY si.id"
+        ),
+        ["1|Salt Road", "0|Paper Kites"]
+    );
+}
+
+#[test]
+fn a_file_unreadable_since_its_first_scan_keeps_its_item_when_it_reads() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "not-audio.flac");
+    assert_eq!(rig.scan().unreadable, 1);
+    let item = rig.one("SELECT id FROM source_item");
+
+    rig.put("Tin Weather/01.flac", "a.flac");
+    let summary = rig.scan();
+    assert_eq!((summary.changed, summary.retired, summary.new), (1, 0, 0));
+    assert_eq!(rig.one("SELECT id FROM source_item"), item);
+    assert_eq!(
+        rig.one(
+            "SELECT r.display_title FROM assignment a JOIN recording r ON r.id = a.recording_id"
+        ),
+        "Paper Kites"
+    );
+}
+
+#[test]
+fn a_song_the_item_has_since_left_is_judged_after_a_failed_read() {
+    let mut rig = Rig::new();
+    let path = rig.root().join("Tin Weather/01.flac");
+    let cut_off = ScanSettings {
+        fail_after_step: Some(1),
+        ..ScanSettings::default()
+    };
+    let source = rig.main.clone();
+    // Two songs recorded at the path in turn, each scan cut off before it
+    // is resolved and the file unreadable when it goes on, so the item is
+    // never given a recording and keeps each.
+    rig.put("Tin Weather/01.flac", "a.flac");
+    let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert!(matches!(
+        rig.try_scan(&source, cut_off),
+        Err(Error::FailPoint)
+    ));
+    rig.put("Tin Weather/01.flac", "not-audio.flac");
+    rig.resume(ScanSettings::default()).unwrap();
+    rig.put("Tin Weather/01.flac", "b.no-artist.flac");
+    assert!(matches!(
+        rig.try_scan(&source, cut_off),
+        Err(Error::FailPoint)
+    ));
+    rig.put("Tin Weather/01.flac", "not-audio.flac");
+    rig.resume(ScanSettings::default()).unwrap();
+    // The first file put back as it was: its first revision is current
+    // again, and the item is resolved to its song.
+    rig.put("Tin Weather/01.flac", "a.flac");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(first)
+        .unwrap();
+    rig.scan();
+    // Four revisions, two with audio, and the first one current again.
+    assert_eq!(
+        rig.one(
+            "SELECT count(*), sum(sr.audio_asset_id IS NOT NULL),
+                    si.current_revision_id = min(sr.id)
+             FROM source_item si JOIN source_item_revision sr ON sr.source_item_id = si.id"
+        ),
+        "4|2|1"
+    );
+    assert_eq!(
+        rig.one(
+            "SELECT r.display_title FROM assignment a JOIN recording r ON r.id = a.recording_id
+                 WHERE a.superseded_at_ms IS NULL"
+        ),
+        "Paper Kites"
+    );
+    rig.put("Tin Weather/01.flac", "not-audio.flac");
+    assert_eq!(rig.scan().unreadable, 1);
+
+    // The second song again: its revision is the item's latest with audio,
+    // but the item is no longer that song.
+    rig.put("Tin Weather/01.flac", "b.no-artist.flac");
+    let summary = rig.scan();
+    assert_eq!((summary.retired, summary.changed, summary.new), (1, 0, 0));
+    assert_eq!(
+        rig.rows(
+            "SELECT si.retired_at_ms IS NOT NULL, r.display_title
+             FROM source_item si JOIN assignment a ON a.source_item_id = si.id
+             JOIN recording r ON r.id = a.recording_id
+             WHERE a.superseded_at_ms IS NULL ORDER BY si.id"
+        ),
+        ["1|Paper Kites", "0|Salt Road"]
+    );
+}

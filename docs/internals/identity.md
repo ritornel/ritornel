@@ -22,6 +22,7 @@ Rescans avoid unnecessary work and protect identity across moves, edits, and unm
 - **Missing files:** Files absent from a reachable root set `source_item.missing_since_ms` while keeping all rows and history intact; returning clears `missing_since_ms`.
 - **Moved files:** Known items whose paths vanished (or now hold different audio) are indexed by audio hash in `gone_by_audio`. When a new path has a unique matching audio hash, the existing `source_item` is re-keyed in place (`RecordOp::Move`), preserving its bindings and listening history.
 - **Replaced audio at the same path:** When a known path holds different audio, `judge_replacements` runs the resolver policy to decide whether the new file is the same recording (new revision on the existing item, `RecordOp::Update`) or a different song (retires the old `source_item` via `retired_at_ms` and creates a new item, `RecordOp::Retire`).
+- **Files that read again after a failed read:** A failed read records a revision with no audio and keeps the item and its binding. When the file reads again, it updates the same item if every revision of the item held that audio, or none held audio at all. Otherwise it goes to `judge_replacements` as replaced audio. The check covers every earlier revision, not only the latest, because an item with no recording yet keeps whatever replaces its audio, so an earlier revision may hold another song. Items whose current revision has no audio take no part in move matching.
 
 ## Watching
 
