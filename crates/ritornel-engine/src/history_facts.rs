@@ -430,10 +430,13 @@ fn read_record(
     if record.plays.is_empty() {
         return Ok(record);
     }
+    // Its songs a file reaches, as its page lists them.
     let size: i64 = connection
-        .prepare_cached(
-            "SELECT count(*) FROM track_appearance WHERE release_id = ?1 AND redirect_to_id IS NULL",
-        )?
+        .prepare_cached(&format!(
+            "SELECT count(*) FROM track_appearance ta
+             WHERE ta.release_id = ?1 AND ta.redirect_to_id IS NULL AND {}",
+            crate::list::REACHED_TA
+        ))?
         .query_row([release], |row| row.get(0))?;
     record.size = count(size);
     let mut statement = connection.prepare_cached(RECORD_SONGS)?;

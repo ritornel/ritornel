@@ -736,12 +736,14 @@ fn a_record_whose_files_joined_another_is_on_no_wall() {
             id: ritornel_contract::Id::from_bytes(group.try_into().unwrap()),
         })
         .unwrap();
-    // Its group's page, if the group is live, has only the live version.
-    assert!(
-        page.as_ref()
-            .is_none_or(|page| page.versions.len() <= 1 && page.tracks.len() == 1),
-        "{page:#?}"
-    );
+    // The record's own group has no other version: it has no page.
+    assert!(page.is_none(), "{page:#?}");
+    // Nor do portraits come for its artist.
+    let pictured = rig
+        .library
+        .read(crate::artist_pictures::artist_names)
+        .unwrap();
+    assert_eq!(pictured, [Some("Moss Arcade".to_owned())]);
 
     // Nor is it played: not from a view opened before, nor as a record.
     assert_eq!(rig.library.song_ids(&[song]).unwrap(), [None]);
@@ -752,13 +754,14 @@ fn a_record_whose_files_joined_another_is_on_no_wall() {
         .step_by(2)
         .map(|at| u8::from_str_radix(&public[at..at + 2], 16).unwrap())
         .collect();
-    let tracks = rig
-        .library
-        .release_tracks(ritornel_contract::Id::from_bytes(
-            public.try_into().unwrap(),
-        ))
-        .unwrap();
+    let public = ritornel_contract::Id::from_bytes(public.try_into().unwrap());
+    let tracks = rig.library.release_tracks(public).unwrap();
     assert!(tracks.as_ref().is_some_and(Vec::is_empty), "{tracks:?}");
+    let page = rig
+        .library
+        .album_page(ritornel_contract::AlbumRef::Release { id: public })
+        .unwrap();
+    assert!(page.is_none(), "{page:#?}");
 
     // A group set to show the release, beside one a file reaches, shows
     // and is found by the one a file reaches.
@@ -791,6 +794,42 @@ fn a_record_whose_files_joined_another_is_on_no_wall() {
     assert_eq!(
         rig.library.list_locate_prefix(&albums, "tin").unwrap(),
         Some(0)
+    );
+    let Row::Album(tile) = &rows[0] else {
+        panic!("{rows:?}")
+    };
+    let page = rig.library.album_page(tile.album).unwrap().unwrap();
+    assert!(page.versions.is_empty(), "{:#?}", page.versions);
+    assert_eq!(page.tracks.len(), 1);
+
+    // A file that is missing still reaches its record; one retired, when
+    // another song took its path, does not.
+    let set = |sql: &'static str| {
+        rig.library
+            .write(
+                WriteRequest {
+                    method: "test.items",
+                    command: None,
+                    client: None,
+                },
+                move |write| {
+                    write.connection().execute(sql, [])?;
+                    Ok(String::new())
+                },
+            )
+            .unwrap();
+    };
+    set("UPDATE source_item SET missing_since_ms = 1 WHERE item_kind = 'file'");
+    assert_eq!(
+        titles(&open(&rig, ListKind::Albums, &Query::default()).1),
+        ["Tin Weather"]
+    );
+    set("UPDATE source_item SET retired_at_ms = 1 WHERE item_kind = 'file'");
+    assert!(open(&rig, ListKind::Albums, &Query::default()).1.is_empty());
+    assert!(open(&rig, ListKind::Songs, &Query::default()).1.is_empty());
+    set(
+        "UPDATE source_item SET retired_at_ms = NULL, missing_since_ms = NULL
+         WHERE item_kind = 'file'",
     );
 
     // The matcher reads only what a file reaches.

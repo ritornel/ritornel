@@ -397,10 +397,24 @@ mod tests {
             "Night Drives Part 2",
             "Night Drives, Pt. 1",
             "Night Drives (Part II) [Deluxe]",
+            "Night Drives (Vol. 2)",
+            "Night Drives [Part 2]",
         ] {
             assert_eq!(disc_in_title(title), None, "{title}");
         }
-        for folder in ["Vol. 1", "Vol 2", "Volume 2", "Part 1", "Pt. 2"] {
+        // A disc of a volume is a disc, and the volume stays in the title.
+        assert_eq!(
+            disc_in_title("Night Drives, Vol. 2 (Disc 1)"),
+            Some(("Night Drives, Vol. 2".to_owned(), 1))
+        );
+        for folder in [
+            "Vol. 1",
+            "Vol 2",
+            "Volume 2",
+            "Part 1",
+            "Pt. 2",
+            "Vol. 1 [FLAC]",
+        ] {
             assert_eq!(disc_of_folder(folder), None, "{folder}");
         }
     }

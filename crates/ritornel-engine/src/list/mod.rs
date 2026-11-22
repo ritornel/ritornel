@@ -18,37 +18,49 @@
 //! a leading article set aside, accents and case ignored, names that start
 //! with no letter after Z.
 
-/// The appearances a file reaches, as an `IN` list: those a current
-/// assignment of a file that is not retired names, followed through
-/// redirects. A song or a record no file reaches any more, because its
-/// files were retagged onto another the library has, keeps its rows for
-/// whatever named them (a listen, a rating, a playlist entry), and is on
-/// no wall and in no search until a file reaches it again. A file that is
-/// missing still reaches what it reached.
+/// Whether a file reaches the appearance with this alias: a current
+/// assignment of a file that is not retired names it. A song or a record
+/// no file reaches any more, because its files were retagged onto another
+/// the library has, keeps its rows for whatever named them (a listen, a
+/// rating, a playlist entry), and is on no wall, in no search and in no
+/// queue until a file reaches it again. A file that is missing still
+/// reaches what it reached. Each is one lookup by
+/// `assignment_current_appearance`, so a window of rows costs a lookup a
+/// row. Nothing redirects an appearance or a release yet; merging them,
+/// which keeps each file's assignment where it was, must follow redirects
+/// here.
 macro_rules! reached {
-    () => {
-        "SELECT x.canonical_id FROM assignment asg
-         JOIN source_item si ON si.id = asg.source_item_id
-         JOIN track_appearance x ON x.id = asg.appearance_id
-         WHERE asg.superseded_at_ms IS NULL AND si.item_kind = 'file'
-           AND si.retired_at_ms IS NULL"
+    ($ta:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM assignment asg
+               JOIN source_item si ON si.id = asg.source_item_id
+              WHERE asg.appearance_id = ",
+            $ta,
+            ".id AND asg.superseded_at_ms IS NULL AND si.item_kind = 'file'
+                AND si.retired_at_ms IS NULL)"
+        )
     };
 }
 
-/// The releases a file reaches, as an `IN` list: those of the appearances
-/// in [`reached`].
-macro_rules! reached_releases {
-    () => {
+/// Whether a file reaches the release with this alias: one of its songs
+/// is [`reached`], found by `track_appearance_release`.
+macro_rules! reached_release {
+    ($r:literal) => {
         concat!(
-            "SELECT y.release_id FROM track_appearance y WHERE y.id IN (",
-            reached!(),
+            "EXISTS (SELECT 1 FROM track_appearance y WHERE y.release_id = ",
+            $r,
+            ".id AND y.redirect_to_id IS NULL AND ",
+            reached!("y"),
             ")"
         )
     };
 }
 
-/// [`reached`], for reads outside the lists.
-pub(crate) const REACHED: &str = reached!();
+/// [`reached`] of the appearance `ta`, for reads outside the lists.
+pub(crate) const REACHED_TA: &str = reached!("ta");
+
+/// [`reached_release`] of the release `r`, for reads outside the lists.
+pub(crate) const REACHED_RELEASE_R: &str = reached_release!("r");
 
 mod discography;
 mod fold;
@@ -207,9 +219,8 @@ impl LibraryStore {
             if keys.len() > 4 * CHUNK {
                 let mut statement = connection.prepare(concat!(
                     "SELECT id, public_id FROM track_appearance
-                     WHERE redirect_to_id IS NULL AND id IN (",
-                    reached!(),
-                    ")"
+                     WHERE redirect_to_id IS NULL AND ",
+                    reached!("track_appearance")
                 ))?;
                 let mut rows = statement.query([])?;
                 while let Some(row) = rows.next()? {
@@ -220,9 +231,8 @@ impl LibraryStore {
                     connection,
                     concat!(
                         "SELECT id, public_id FROM track_appearance
-                         WHERE id IN ({}) AND redirect_to_id IS NULL AND id IN (",
-                        reached!(),
-                        ")"
+                         WHERE id IN ({}) AND redirect_to_id IS NULL AND ",
+                        reached!("track_appearance")
                     ),
                     keys,
                     each,

@@ -307,8 +307,8 @@ impl LibraryStore {
                 "SELECT {DISPLAY_COLUMNS} {DISPLAY_JOINS}
                  WHERE ta.redirect_to_id IS NULL
                    AND ta.release_id IN (SELECT id FROM release WHERE canonical_id = ?1)
-                   AND ta.id IN ({})",
-                crate::list::REACHED
+                   AND {}",
+                crate::list::REACHED_TA
             ))?;
             let mut tracks: Vec<(TrackDisplay, String)> = statement
                 .query_map([canonical], display)?

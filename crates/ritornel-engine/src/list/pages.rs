@@ -78,9 +78,9 @@ type Version = (i64, Id, Option<String>, Option<i64>);
 fn versions(connection: &Connection, group: i64) -> Result<Vec<Version>, Error> {
     let mut statement = connection.prepare(concat!(
         "SELECT id, public_id, display_title, display_year FROM release
-         WHERE release_group_id = ?1 AND redirect_to_id IS NULL AND id IN (",
-        reached_releases!(),
-        ") ORDER BY display_year IS NULL, display_year, id"
+         WHERE release_group_id = ?1 AND redirect_to_id IS NULL AND ",
+        reached_release!("release"),
+        " ORDER BY display_year IS NULL, display_year, id"
     ))?;
     let mut found = Vec::new();
     let mut rows = statement.query([group])?;
@@ -168,9 +168,9 @@ pub(super) fn album(connection: &Connection, album: AlbumRef) -> Result<Option<A
     // those with one.
     let mut statement = connection.prepare(concat!(
         "SELECT id FROM track_appearance
-         WHERE release_id = ?1 AND redirect_to_id IS NULL AND id IN (",
-        reached!(),
-        ") ORDER BY display_disc_number IS NULL, display_disc_number,
+         WHERE release_id = ?1 AND redirect_to_id IS NULL AND ",
+        reached!("track_appearance"),
+        " ORDER BY display_disc_number IS NULL, display_disc_number,
                     display_track_number IS NULL, display_track_number, id"
     ))?;
     let mut keys = Vec::new();
@@ -199,9 +199,8 @@ pub(super) fn album(connection: &Connection, album: AlbumRef) -> Result<Option<A
         connection,
         concat!(
             "SELECT id, release_id FROM track_appearance
-             WHERE redirect_to_id IS NULL AND release_id IN ({}) AND id IN (",
-            reached!(),
-            ")"
+             WHERE redirect_to_id IS NULL AND release_id IN ({}) AND ",
+            reached!("track_appearance")
         ),
         &others,
         |row| {

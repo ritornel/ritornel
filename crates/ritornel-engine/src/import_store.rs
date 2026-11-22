@@ -175,8 +175,8 @@ pub(crate) fn catalog_recordings(connection: &Connection) -> Result<Vec<Recordin
          JOIN recording r ON r.id = ta.recording_id
          LEFT JOIN artist_credit ac ON ac.id = ta.display_artist_credit_id
          LEFT JOIN release rel ON rel.id = ta.release_id
-         WHERE ta.redirect_to_id IS NULL AND ta.id IN ({})",
-        crate::list::REACHED
+         WHERE ta.redirect_to_id IS NULL AND {}",
+        crate::list::REACHED_TA
     ))?;
     let rows = statement.query_map([], |row| {
         Ok((

@@ -180,9 +180,9 @@ fn artists(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Sectio
              FROM release r
              CROSS JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
              CROSS JOIN artist ca ON ca.id = acn.artist_id
-             WHERE r.redirect_to_id IS NULL AND r.id IN (",
-        reached_releases!(),
-        "))"
+             WHERE r.redirect_to_id IS NULL AND ",
+        reached_release!("r"),
+        ")"
     ))?;
     let mut entries = Vec::new();
     let mut rows = statement.query([])?;
@@ -267,9 +267,8 @@ const RELEASES: &str = concat!(
  FROM release r
  JOIN release_group rg ON rg.id = r.release_group_id
  LEFT JOIN artist_credit ac ON ac.id = r.display_artist_credit_id
- WHERE r.redirect_to_id IS NULL AND r.id IN (",
-    reached_releases!(),
-    ")"
+ WHERE r.redirect_to_id IS NULL AND ",
+    reached_release!("r")
 );
 
 /// Every live release with its group and what it is filed under.
@@ -373,9 +372,8 @@ fn releases_by(connection: &Connection, artist: i64) -> Result<Vec<i64>, Error> 
              SELECT acn.artist_credit_id
              FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
              WHERE a.canonical_id = ?1)
-           AND r.id IN (",
-        reached_releases!(),
-        ")"
+           AND ",
+        reached_release!("r")
     ))?;
     let mut found = Vec::new();
     let mut rows = statement.query([artist])?;
@@ -396,9 +394,8 @@ fn releases_crediting(connection: &Connection, artist: i64) -> Result<HashSet<i6
              SELECT acn.artist_credit_id
              FROM artist_credit_name acn JOIN artist a ON a.id = acn.artist_id
              WHERE a.canonical_id = ?1)
-           AND ta.id IN (",
-        reached!(),
-        ")"
+           AND ",
+        reached!("ta")
     ))?;
     let mut found = HashSet::new();
     let mut rows = statement.query([artist])?;
@@ -493,9 +490,9 @@ fn shown_of(releases: &[Release], members: &[usize], display: Option<i64>) -> us
 fn added(connection: &Connection) -> Result<HashMap<i64, i64>, Error> {
     let mut statement = connection.prepare(concat!(
         "SELECT release_id, min(display_added_at_ms) FROM track_appearance
-         WHERE redirect_to_id IS NULL AND release_id IS NOT NULL AND id IN (",
-        reached!(),
-        ") GROUP BY release_id"
+         WHERE redirect_to_id IS NULL AND release_id IS NOT NULL AND ",
+        reached!("track_appearance"),
+        " GROUP BY release_id"
     ))?;
     let mut added = HashMap::new();
     let mut rows = statement.query([])?;
@@ -795,9 +792,8 @@ fn songs(connection: &Connection, plan: &Plan) -> Result<(Vec<i64>, Vec<Section>
                          WHERE acn.artist_credit_id = ta.display_artist_credit_id
                            AND a.canonical_id = ?1)
                FROM track_appearance ta JOIN recording rc ON rc.id = ta.recording_id
-               WHERE ta.redirect_to_id IS NULL AND ta.id IN (",
-        reached!(),
-        ")"
+               WHERE ta.redirect_to_id IS NULL AND ",
+        reached!("ta")
     );
     // Songs on no record are found by `track_appearance_release`.
     let loose = format!("{all} AND ta.release_id IS NULL");
@@ -1025,13 +1021,13 @@ fn filed_under(
             "SELECT coalesce(
                (SELECT r.id FROM release r JOIN release_group rg ON rg.id = r.release_group_id
                  WHERE rg.id = ?1 AND r.id = rg.display_release_id AND r.redirect_to_id IS NULL
-                   AND r.id IN (",
-            reached_releases!(),
-            ")),
+                   AND ",
+            reached_release!("r"),
+            "),
                (SELECT min(r.id) FROM release r
-                 WHERE r.release_group_id = ?1 AND r.redirect_to_id IS NULL AND r.id IN (",
-            reached_releases!(),
-            ")))"
+                 WHERE r.release_group_id = ?1 AND r.redirect_to_id IS NULL AND ",
+            reached_release!("r"),
+            "))"
         ),
     };
     let release: Option<i64> = connection

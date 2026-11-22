@@ -247,9 +247,9 @@ fn artists(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranke
              FROM release r
              CROSS JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
              CROSS JOIN artist ca ON ca.id = acn.artist_id
-             WHERE r.redirect_to_id IS NULL AND r.id IN (",
-        reached_releases!(),
-        "))"
+             WHERE r.redirect_to_id IS NULL AND ",
+        reached_release!("r"),
+        ")"
     ))?;
     let mut found = Vec::new();
     let mut rows = statement.query([])?;
@@ -291,9 +291,8 @@ fn artists(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranke
              CROSS JOIN release r ON r.display_artist_credit_id = acn.artist_credit_id
              CROSS JOIN track_appearance ta ON ta.release_id = r.id
              WHERE a.canonical_id IN ({})
-               AND r.redirect_to_id IS NULL AND ta.redirect_to_id IS NULL AND ta.id IN (",
-            reached!(),
-            ")"
+               AND r.redirect_to_id IS NULL AND ta.redirect_to_id IS NULL AND ",
+            reached!("ta")
         ),
         &keys,
         |row| {
@@ -335,9 +334,8 @@ fn albums(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked
         connection,
         concat!(
             "SELECT release_id, recording_id FROM track_appearance
-             WHERE release_id IN ({}) AND redirect_to_id IS NULL AND id IN (",
-            reached!(),
-            ")"
+             WHERE release_id IN ({}) AND redirect_to_id IS NULL AND ",
+            reached!("track_appearance")
         ),
         &release_keys,
         |row| {
@@ -393,9 +391,8 @@ fn songs(connection: &Connection, typed: &Typed, limit: usize) -> Result<Ranked,
         None => {
             let mut statement = connection.prepare(concat!(
                 "SELECT id, display_title, recording_id, release_id IS NULL
-                 FROM track_appearance WHERE redirect_to_id IS NULL AND id IN (",
-                reached!(),
-                ")"
+                 FROM track_appearance WHERE redirect_to_id IS NULL AND ",
+                reached!("track_appearance")
             ))?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -475,9 +472,8 @@ fn live_songs(connection: &Connection, keys: &[i64]) -> Result<HashMap<i64, (i64
     };
     let columns = concat!(
         "SELECT id, recording_id, release_id IS NULL FROM track_appearance
-         WHERE redirect_to_id IS NULL AND id IN (",
-        reached!(),
-        ")"
+         WHERE redirect_to_id IS NULL AND ",
+        reached!("track_appearance")
     );
     // A long list is most of the table, which one pass reads faster.
     if keys.len() > 4 * CHUNK {

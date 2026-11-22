@@ -134,9 +134,8 @@ fn artists(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
          JOIN release r ON r.display_artist_credit_id = acn.artist_credit_id
          JOIN release_group rg ON rg.id = r.release_group_id
          LEFT JOIN picture p ON p.id = r.display_picture_id
-         WHERE r.redirect_to_id IS NULL AND ca.canonical_id IN ({}) AND r.id IN (",
-            reached_releases!(),
-            ")"
+         WHERE r.redirect_to_id IS NULL AND ca.canonical_id IN ({}) AND ",
+            reached_release!("r")
         ),
         &live,
         |row| {
@@ -257,9 +256,9 @@ pub(super) fn track_counts(
         connection,
         concat!(
             "SELECT release_id, count(*), total(display_duration_ms) FROM track_appearance
-             WHERE redirect_to_id IS NULL AND release_id IN ({}) AND id IN (",
-            reached!(),
-            ") GROUP BY release_id"
+             WHERE redirect_to_id IS NULL AND release_id IN ({}) AND ",
+            reached!("track_appearance"),
+            " GROUP BY release_id"
         ),
         releases,
         |row| {
@@ -310,9 +309,8 @@ fn albums(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
         connection,
         concat!(
             "SELECT id, public_id, release_group_id FROM release
-             WHERE id IN ({}) AND redirect_to_id IS NULL AND id IN (",
-            reached_releases!(),
-            ")"
+             WHERE id IN ({}) AND redirect_to_id IS NULL AND ",
+            reached_release!("release")
         ),
         &expanded,
         |row| {
@@ -332,9 +330,8 @@ fn albums(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
         connection,
         concat!(
             "SELECT release_group_id, id FROM release
-             WHERE redirect_to_id IS NULL AND release_group_id IN ({}) AND id IN (",
-            reached_releases!(),
-            ")"
+             WHERE redirect_to_id IS NULL AND release_group_id IN ({}) AND ",
+            reached_release!("release")
         ),
         &all_groups,
         |row| {
@@ -394,9 +391,8 @@ fn albums(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
         connection,
         concat!(
             "SELECT id, release_id, display_duration_ms FROM track_appearance
-             WHERE redirect_to_id IS NULL AND release_id IN ({}) AND id IN (",
-            reached!(),
-            ")"
+             WHERE redirect_to_id IS NULL AND release_id IN ({}) AND ",
+            reached!("track_appearance")
         ),
         &shown_keys,
         |row| {
@@ -565,9 +561,8 @@ fn songs(connection: &Connection, keys: &[i64]) -> Result<Vec<Row>, Error> {
          JOIN recording rc ON rc.id = ta.recording_id
          JOIN recording crc ON crc.id = rc.canonical_id
          LEFT JOIN release r ON r.id = ta.release_id
-         WHERE ta.id IN ({}) AND ta.redirect_to_id IS NULL AND ta.id IN (",
-            reached!(),
-            ")"
+         WHERE ta.id IN ({}) AND ta.redirect_to_id IS NULL AND ",
+            reached!("ta")
         ),
         keys,
         |row| {
