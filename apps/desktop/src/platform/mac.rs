@@ -208,12 +208,16 @@ thread_local! {
 }
 
 thread_local! {
-    /// The swipe across under way, and whether one has asked to go back.
+    /// The swipe across under way, and whether the scroll being handled now
+    /// asks to go back.
     static SWIPE: std::cell::RefCell<crate::swipe::Gesture> = std::cell::RefCell::default();
     static SWIPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether a swipe across has asked to go back since this was last asked.
+/// Whether the scroll being handled asks to go back. The monitor sees every
+/// window's scrolls, and the main window hears only its own, so the answer
+/// holds for that one scroll: a swipe in Settings, or over something that
+/// keeps its scroll, does not wait to send the main window back on the next.
 pub(crate) fn swiped_back() -> bool {
     SWIPED.with(|swiped| swiped.replace(false))
 }
@@ -279,9 +283,7 @@ fn watch_scrolls() {
                 .borrow_mut()
                 .scroll(gesture, right, ns.scrollingDeltaY())
         });
-        if back {
-            SWIPED.with(|swiped| swiped.set(true));
-        }
+        SWIPED.with(|swiped| swiped.set(back));
         event.as_ptr()
     });
     // SAFETY: the block returns the event it was given, a valid pointer.
