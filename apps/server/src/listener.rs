@@ -463,6 +463,9 @@ async fn ticket(
     }
 }
 
+/// The largest cover a satellite takes from its hub.
+const MAX_COVER_BYTES: usize = 16 << 20;
+
 /// The largest body a satellite may send to join.
 const MAX_LINK_BODY: usize = 4 * 1024;
 
@@ -544,8 +547,45 @@ async fn art(State(core): State<Arc<Core>>, Path((art, size)): Path<(String, Str
     // Reading a file waits on the disk, so it is not done on an async
     // worker either.
     let cached = core.cover_path(art, size);
-    if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || std::fs::read(cached)).await {
+    let read = cached.clone();
+    if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || std::fs::read(read)).await {
         return jpeg(bytes);
+    }
+    // A satellite has no pictures: it asks its hub, on the route the hub
+    // last proved itself on, and keeps what it is given beside the covers
+    // it would have made.
+    if let Some(uplink) = core.uplink() {
+        let Some(route) = uplink.route() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let path = format!("{}/{art}/{size}", route::ART);
+        let credential = uplink.credential();
+        return match ritornel_client::get_media(route, &path, Some(&credential), MAX_COVER_BYTES)
+            .await
+        {
+            Ok(answer) if answer.status == 200 => {
+                let body = answer.body.clone();
+                // Written beside it and moved into place, so a reader never
+                // finds half a cover.
+                let kept = tokio::task::spawn_blocking(move || {
+                    if let Some(folder) = cached.parent() {
+                        std::fs::create_dir_all(folder)?;
+                    }
+                    let part = cached.with_extension("part");
+                    std::fs::write(&part, body)?;
+                    std::fs::rename(&part, &cached).inspect_err(|_| {
+                        let _ = std::fs::remove_file(&part);
+                    })
+                })
+                .await;
+                if !matches!(kept, Ok(Ok(()))) {
+                    debug!("a cover from the hub could not be kept");
+                }
+                jpeg(answer.body)
+            }
+            Ok(answer) if answer.status == 404 => StatusCode::NOT_FOUND.into_response(),
+            _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     }
     let (send, made) = tokio::sync::oneshot::channel();
     let worker = Arc::clone(&core);

@@ -10,15 +10,18 @@
 )]
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ritornel_client::contract::methods::{LinkInvite, LinkJoin, LinkStatusCall};
+use ritornel_client::contract::methods::{
+    LibraryStats, LinkInvite, LinkJoin, LinkStatusCall, RatingsSet, SourcesAdd,
+};
 use ritornel_client::contract::{
-    CONTRACT_VERSION, ClientKind, ErrorCode, HelloParams, InviteLink, LinkInviteParams,
-    LinkJoinParams, LinkRequest, LinkStatus, NoParams, ServerRole, capability, hex,
+    CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink, LinkInviteParams,
+    LinkJoinParams, LinkRequest, LinkStatus, ListKind, ListOpenParams, NoParams, Query,
+    RatingSetParams, Row, ServerRole, SourcesAddParams, Topic, Window, capability, hex,
     link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
@@ -60,14 +63,84 @@ impl Drop for Scratch {
 }
 
 async fn start(scratch: &Scratch, name: &str) -> Server {
+    start_on(scratch, name, Listen::on_port(0)).await
+}
+
+async fn start_on(scratch: &Scratch, name: &str, listen: Listen) -> Server {
     Server::start(
         HeldDir::take(scratch.data_dir(name)).unwrap(),
-        Listen::on_port(0),
+        listen,
         Arc::new(SystemClock),
         Arc::new(OsEntropy),
     )
     .await
     .unwrap()
+}
+
+fn key() -> ritornel_client::contract::Id {
+    ritornel_client::idempotency_key().unwrap()
+}
+
+/// An album of three tracks from the audio fixtures, in the scratch
+/// directory.
+fn album(scratch: &Scratch) -> PathBuf {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio");
+    let folder = scratch.0.join("music");
+    for (to, fixture) in [
+        ("Tin Weather/01.flac", "a.flac"),
+        ("Tin Weather/02.flac", "b.flac"),
+        ("Tin Weather/03.mp3", "a.mp3"),
+    ] {
+        let to = folder.join(to);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(fixtures.join(fixture), to).unwrap();
+    }
+    folder.canonicalize().unwrap()
+}
+
+/// Adds the album to the hub's library and scans it, and waits for the
+/// scan to end.
+async fn scan(scratch: &Scratch, hub: &mut Client) {
+    let folder = album(scratch);
+    let source = hub
+        .add_source(key(), "music", folder.to_str().unwrap())
+        .await
+        .unwrap()
+        .source;
+    hub.subscribe(&[Topic::Jobs]).await.unwrap();
+    let job = hub.start_scan(key(), source.source_id).await.unwrap().job;
+    loop {
+        if let Event::Jobs(event) = hub.next_event().await.unwrap()
+            && event.job.job_id == job.job_id
+            && event.job.state.ended()
+        {
+            break;
+        }
+    }
+    hub.unsubscribe(&[Topic::Jobs]).await.unwrap();
+}
+
+/// A hub with the album scanned, and a satellite linked to it, with a
+/// client of each.
+async fn linked(scratch: &Scratch) -> (Server, Client, Server, Client) {
+    let (hub, mut hub_client, desk, desk_client) = two(scratch).await;
+    scan(scratch, &mut hub_client).await;
+    join(&desk_client, &invite(&hub, &hub_client).await)
+        .await
+        .unwrap();
+    (hub, hub_client, desk, desk_client)
+}
+
+fn songs() -> ListOpenParams {
+    ListOpenParams {
+        kind: ListKind::Songs,
+        query: Query::default(),
+        window: Some(Window {
+            offset: 0,
+            limit: 100,
+        }),
+        replaces: None,
+    }
 }
 
 /// A client of `server` with the local credential, that has said hello.
@@ -424,6 +497,129 @@ async fn an_invite_does_not_take_over_a_satellite_that_is_linked_already() {
             .await
             .unwrap();
         assert_eq!(at_hub.satellites.len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_reads_the_hubs_library_through_its_link() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (_hub, hub_client, _desk, desk_client) = linked(&scratch).await;
+        let at_hub = hub_client.call::<LibraryStats>(&NoParams {}).await.unwrap();
+        let through = desk_client
+            .call::<LibraryStats>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(through, at_hub);
+
+        let at_hub = hub_client.list_open(&songs()).await.unwrap();
+        let through = desk_client.list_open(&songs()).await.unwrap();
+        assert!(through.total > 0);
+        assert_eq!(through.total, at_hub.total);
+        assert_eq!(through.rows, at_hub.rows);
+        // The view is held at the hub for the satellite's client, and read
+        // through it.
+        let window = desk_client.list_window(&through.view, 0, 10).await.unwrap();
+        assert_eq!(window.rows, at_hub.rows);
+
+        // The satellite says whose library it reads, and that it answers.
+        let status = desk_client.status().await.unwrap();
+        let library = hub_client.status().await.unwrap().library.unwrap();
+        assert_eq!(status.library.unwrap().library_id, library.library_id);
+        let hub = status.hub.unwrap();
+        assert_eq!(hub.answers, Some(true));
+        assert!(hub.since_ms.is_some() && hub.problem.is_none());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_hubs_library_events_reach_a_satellites_client() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (_hub, hub_client, _desk, mut desk_client) = linked(&scratch).await;
+        desk_client.subscribe(&[Topic::Library]).await.unwrap();
+        let Row::Song(song) = hub_client.list_open(&songs()).await.unwrap().rows[0].clone() else {
+            panic!("not a song");
+        };
+        // A change made at the hub, by any client.
+        hub_client
+            .call::<RatingsSet>(&RatingSetParams {
+                idempotency_key: key(),
+                recording_id: song.recording_id,
+                rating: Some(80),
+            })
+            .await
+            .unwrap();
+        loop {
+            if let Event::Library(_) = desk_client.next_event().await.unwrap() {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn what_names_the_hubs_folders_is_done_on_the_hub() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (_hub, _hub_client, _desk, desk_client) = linked(&scratch).await;
+        let refused = desk_client
+            .call::<SourcesAdd>(&SourcesAddParams {
+                idempotency_key: key(),
+                name: "music".to_owned(),
+                path: "/music".to_owned(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Unsupported), "{refused}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn while_the_hub_is_away_a_satellite_says_so_and_comes_back_with_it() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, _desk, desk_client) = linked(&scratch).await;
+        desk_client
+            .call::<LibraryStats>(&NoParams {})
+            .await
+            .unwrap();
+        let port = hub.endpoint().port();
+        drop(hub_client);
+        hub.stop().await.unwrap();
+
+        let refused = desk_client
+            .call::<LibraryStats>(&NoParams {})
+            .await
+            .unwrap_err();
+        let ritornel_client::Error::Call(error) = &refused else {
+            panic!("{refused}");
+        };
+        assert_eq!(error.kind(), ErrorCode::Unavailable);
+        assert_eq!(error.data.details["reason"], "hub_unreachable");
+        assert!(error.data.details.contains_key("sinceMs"));
+        let hub_status = desk_client.status().await.unwrap().hub.unwrap();
+        assert_eq!(hub_status.answers, Some(false));
+        assert!(hub_status.problem.is_some());
+        // Its library is still the hub's: nothing says it is gone.
+        assert!(desk_client.status().await.unwrap().library.is_some());
+
+        // The hub comes back where it was, and the satellite reads it
+        // again, on the same session.
+        let hub = start_on(&scratch, "hub", Listen::on_port(port)).await;
+        loop {
+            match desk_client.call::<LibraryStats>(&NoParams {}).await {
+                Ok(_) => break,
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+        let hub_status = desk_client.status().await.unwrap().hub.unwrap();
+        assert_eq!(hub_status.answers, Some(true));
+        drop(hub);
     })
     .await;
 }

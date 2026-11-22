@@ -128,6 +128,8 @@ pub(crate) struct Core {
     /// The runtime the server runs on, for the calls that go out to
     /// another server. `None` in the dispatcher's own tests.
     runtime: Option<tokio::runtime::Handle>,
+    /// On a satellite, its link to its hub.
+    uplink: RwLock<Option<Arc<crate::uplink::Uplink>>>,
     /// What a library created here takes its times and its IDs from.
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
@@ -229,6 +231,17 @@ impl Core {
             )))?;
         let link_sessions =
             crate::link::LinkSessions::new(stores.server.link_sessions().map_err(Error::Store)?);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let uplink = match (stores.server.hub_link().map_err(Error::Store)?, &runtime) {
+            (Some(link), Some(runtime)) => Some(Arc::new(crate::uplink::Uplink::new(
+                link,
+                identity.name.clone(),
+                runtime.clone(),
+                Arc::clone(&clock),
+                Arc::clone(&entropy),
+            ))),
+            _ => None,
+        };
         let cache = dir.cache()?;
         let covers = ritornel_engine::covers::Covers::new(&cache).map_err(|error| Error::Io {
             doing: "prepare",
@@ -246,7 +259,8 @@ impl Core {
             invites: crate::link::Invites::default(),
             link_sessions,
             routes: std::sync::OnceLock::new(),
-            runtime: tokio::runtime::Handle::try_current().ok(),
+            runtime,
+            uplink: RwLock::new(uplink),
             clock,
             entropy,
             bounds,
@@ -311,6 +325,20 @@ impl Core {
         self.link_sessions
             .peer(token)
             .map(|peer| (SessionKind::Full, Some(peer)))
+    }
+
+    /// On a satellite, its link to its hub.
+    pub(crate) fn uplink(&self) -> Option<Arc<crate::uplink::Uplink>> {
+        self.uplink
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The open session `session` is, shared: what a forwarded call hands
+    /// the hub's events to.
+    fn shared(&self, session: &Session) -> Option<Arc<Session>> {
+        lock(&self.sessions).open.get(&session.id()).cloned()
     }
 
     /// Says where other machines reach this server: once, when it starts
@@ -455,6 +483,9 @@ impl Core {
         self.fanout.remove(session.id());
         self.media_tokens.revoke(session.id());
         lock(&self.sessions).open.remove(&session.id());
+        if let Some(uplink) = self.uplink() {
+            uplink.forget(session.id());
+        }
     }
 
     /// Stops taking calls: every session is closed, which makes its
@@ -650,6 +681,21 @@ impl Core {
                 ),
             ));
         }
+        if let Some(uplink) = self.uplink() {
+            match link::on_a_satellite(row.name) {
+                link::Route::Here => {}
+                link::Route::Hub => {
+                    let session = self.shared(session).ok_or_else(|| {
+                        RpcError::new(ErrorCode::Unavailable, "the session has closed")
+                    })?;
+                    return uplink.forward(&session, row.name, params);
+                }
+                link::Route::Refused(why) => {
+                    return Err(RpcError::new(ErrorCode::Unsupported, why)
+                        .with_detail("reason", "on_the_hub"));
+                }
+            }
+        }
         match row.name {
             ServerHello::NAME => run::<ServerHello>(params, |hello| self.hello(session, &hello)),
             ServerStatus::NAME => run::<ServerStatus>(params, |_| self.status(stores)),
@@ -667,9 +713,17 @@ impl Core {
                         "Job events need a full session. Subscribe without the jobs topic.",
                     ));
                 }
-                Ok(ritornel_contract::Subscriptions {
-                    topics: session.subscribe(&params.topics),
-                })
+                let topics = session.subscribe(&params.topics);
+                if let Some(uplink) = self.uplink()
+                    && params
+                        .topics
+                        .iter()
+                        .any(|topic| crate::uplink::HUB_TOPICS.contains(topic))
+                    && let Some(session) = self.shared(session)
+                {
+                    uplink.subscribe(&session);
+                }
+                Ok(ritornel_contract::Subscriptions { topics })
             }),
             EventsUnsubscribe::NAME => run::<EventsUnsubscribe>(params, |params| {
                 Ok(ritornel_contract::Subscriptions {
@@ -899,7 +953,16 @@ impl Core {
                 };
                 (Some(library.schema_version()), Some(status))
             }
-            None => (None, None),
+            // A satellite reads the hub's library. Its revision is the
+            // hub's to say, and is not asked for here: a status must
+            // answer at once, whether the hub does or not.
+            None => (
+                None,
+                self.uplink().map(|uplink| LibraryStatus {
+                    library_id: uplink.library_id(),
+                    revision: 0,
+                }),
+            ),
         };
         let watch = self.watch_status(stores);
         let this = lock(&self.this);
@@ -922,6 +985,7 @@ impl Core {
             watch: Some(watch),
             backup: Some(self.backup_status(stores)),
             record: Some(self.record_status(stores)),
+            hub: self.uplink().map(|uplink| uplink.status()),
         })
     }
 

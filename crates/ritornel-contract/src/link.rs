@@ -82,6 +82,24 @@ pub struct HubStatus {
     pub routes: Vec<String>,
     /// When the satellite joined, as Unix milliseconds.
     pub linked_at_ms: i64,
+    /// Whether the hub answered the last time the satellite tried it. Left
+    /// out until it has tried, which it does when it is first asked for
+    /// something only the hub has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub answers: Option<bool>,
+    /// Since when it has, or has not, as Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub since_ms: Option<i64>,
+    /// The route the satellite last reached it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub route: Option<String>,
+    /// Why the last try failed, while it does not answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub problem: Option<String>,
 }
 
 /// A satellite, as its hub knows it.

@@ -56,6 +56,7 @@ mod session;
 mod testing;
 mod ticket;
 mod transport;
+mod uplink;
 mod views;
 mod watch;
 

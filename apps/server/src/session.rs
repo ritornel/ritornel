@@ -163,6 +163,11 @@ impl Session {
         state.topics.iter().copied().collect()
     }
 
+    /// The topics the session is subscribed to.
+    pub(crate) fn topics(&self) -> Vec<Topic> {
+        self.state().topics.iter().copied().collect()
+    }
+
     /// Removes topics and drops the unsent events on them, and returns
     /// every topic the session then has. Whatever is queued after this is
     /// sent after every event on those topics that the session will ever
@@ -254,6 +259,11 @@ impl Session {
         drop(state);
         self.wake.notify_one();
         self.shut.send_replace(true);
+    }
+
+    /// Whether the session has closed.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state().closed
     }
 
     /// Resolves once the session has closed. A transport waits on this

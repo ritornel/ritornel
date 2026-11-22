@@ -51,7 +51,38 @@ pub async fn get(
     credential: Option<&Credential>,
 ) -> Result<Answer, Error> {
     let stream = connect(endpoint).await?;
-    send(stream, endpoint, Method::GET, path, credential, None).await
+    send(
+        stream,
+        endpoint,
+        Method::GET,
+        path,
+        credential,
+        None,
+        MAX_BODY_BYTES,
+    )
+    .await
+}
+
+/// Sends `GET <path>` to `endpoint` as [`get`] does, and reads an answer of
+/// up to `max_bytes`: for media, such as a cover, which may be larger than
+/// what the other routes answer.
+pub async fn get_media(
+    endpoint: SocketAddr,
+    path: &str,
+    credential: Option<&Credential>,
+    max_bytes: usize,
+) -> Result<Answer, Error> {
+    let stream = connect(endpoint).await?;
+    send(
+        stream,
+        endpoint,
+        Method::GET,
+        path,
+        credential,
+        None,
+        max_bytes,
+    )
+    .await
 }
 
 /// Sends `POST <path>` to `endpoint` with `body` as JSON, with the
@@ -65,7 +96,16 @@ pub async fn post(
     let body = serde_json::to_vec(body)
         .map_err(|error| Error::Protocol(format!("a body for POST {path}: {error}")))?;
     let stream = connect(endpoint).await?;
-    send(stream, endpoint, Method::POST, path, credential, Some(body)).await
+    send(
+        stream,
+        endpoint,
+        Method::POST,
+        path,
+        credential,
+        Some(body),
+        MAX_BODY_BYTES,
+    )
+    .await
 }
 
 /// Sends one request on a connection that is already made, with the
@@ -78,6 +118,7 @@ async fn send(
     path: &str,
     credential: Option<&Credential>,
     json: Option<Vec<u8>>,
+    max_bytes: usize,
 ) -> Result<Answer, Error> {
     within_deadline(async {
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -102,7 +143,7 @@ async fn send(
             .map_err(transport)?;
         let response = sender.send_request(request).await.map_err(transport)?;
         let status = response.status().as_u16();
-        let body = Limited::new(response.into_body(), MAX_BODY_BYTES)
+        let body = Limited::new(response.into_body(), max_bytes)
             .collect()
             .await
             .map_err(|_| {
@@ -189,6 +230,7 @@ pub(crate) async fn ticket_over(
         route::TICKET,
         Some(credential),
         None,
+        MAX_BODY_BYTES,
     )
     .await?;
     let path = route::TICKET;

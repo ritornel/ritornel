@@ -721,7 +721,7 @@ export type Binding = {
  * What sort of program a client is. It is for logs and for display, and
  * never decides access: the session does.
  */
-export type ClientKind = "desktop" | "browser" | "phone" | "cli" | "agent";
+export type ClientKind = "desktop" | "browser" | "phone" | "cli" | "agent" | "server";
 
 /**
  * Why tracks were queued: a kind, and what it refers to.
@@ -1481,6 +1481,24 @@ export type HubStatus = {
    * When the satellite joined, as Unix milliseconds.
    */
   linkedAtMs: number,
+  /**
+   * Whether the hub answered the last time the satellite tried it. Left
+   * out until it has tried, which it does when it is first asked for
+   * something only the hub has.
+   */
+  answers?: boolean,
+  /**
+   * Since when it has, or has not, as Unix milliseconds.
+   */
+  sinceMs?: number,
+  /**
+   * The route the satellite last reached it on.
+   */
+  route?: string,
+  /**
+   * Why the last try failed, while it does not answer.
+   */
+  problem?: string,
 };
 
 /**
@@ -4161,6 +4179,11 @@ export type ServerStatus = {
    * if not. Left out by a server that does not say.
    */
   record?: RecordStatus,
+  /**
+   * On a satellite, its hub and whether it answers. Its `library` is
+   * then the hub's. Left out on any other server.
+   */
+  hub?: HubStatus,
 };
 
 /**

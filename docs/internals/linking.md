@@ -30,6 +30,7 @@ A hub owns `library.db`. A satellite is another server that plays and records th
 
 - **Invite and join:** `link.invite` on the hub makes a one-time invite naming the hub's ID, its public key, and the private routes it listens on. `link.join` on the other server dials those routes in order, checks the descriptor proof against the key in the invite, and proves its own key over the invite's secret. The secret travels after `#`, so it is never part of a route or a log line.
 - **What each side keeps:** The hub registers the satellite in `library.db`'s `server` table and issues it a link session in `server.db` (`SubjectKind::Server`, with the satellite's ID and the public key it proved). The satellite keeps one `hub_link` row in `server.db`: the hub's ID and pinned key, its name, the routes, and the link session's token. It takes `Role::Satellite` and the hub's library ID.
+- **Forwarding:** A satellite answers its own status, player, queue, output, link and backups, and forwards library calls to its hub on a connection of the client session's own (`apps/server/src/uplink.rs`, `on_a_satellite`). The player, the queue and the outbox are the satellite's own. ["Satellites" in `docs/internals/contract.md`](contract.md#satellites) has the routes, deadlines and the `hub_unreachable` error.
 - **Status:** `link.status` reports the link from either side: on a hub its satellites, on a satellite its hub.
 
 ## Decisions

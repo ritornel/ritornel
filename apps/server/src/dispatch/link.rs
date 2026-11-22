@@ -16,6 +16,43 @@ use super::{Core, Stores, lock};
 use crate::link::{self, INVITE_LIFE};
 use crate::session::Session;
 
+/// Where a call is answered on a satellite.
+pub(super) enum Route {
+    /// On the satellite: what is its own, such as its player.
+    Here,
+    /// At the hub, forwarded unchanged: reading and changing the library.
+    Hub,
+    /// Nowhere: it names folders on the hub's machine, which a satellite
+    /// cannot see. It is made on the hub.
+    Refused(&'static str),
+}
+
+/// Where `method` is answered on a satellite: library calls go to the
+/// hub; playback, output and pairing are local. See "Hub and satellites"
+/// in docs/internals/linking.md.
+pub(super) fn on_a_satellite(method: &str) -> Route {
+    const FOLDERS: &str = "the library's folders are on its hub's machine: do this on the hub";
+    match method {
+        "server.hello" | "server.status" | "servers.list" | "events.subscribe"
+        | "events.unsubscribe" | "media.token" | "server.backup" => Route::Here,
+        _ if method.starts_with("playback.")
+            || method.starts_with("queue.")
+            || method.starts_with("link.") =>
+        {
+            Route::Here
+        }
+        "library.create"
+        | "sources.add"
+        | "scan.start"
+        | "library.setWatching"
+        | "artists.importPictures"
+        | "artists.pictureFolders"
+        | "sources.tracks"
+        | "history.export" => Route::Refused(FOLDERS),
+        _ => Route::Hub,
+    }
+}
+
 /// Why a satellite was refused at `POST /v1/link`: the HTTP status and what
 /// it is told.
 pub(crate) type Refusal = (u16, String);
@@ -299,6 +336,16 @@ impl Core {
             })
             .map_err(internal)?;
         info!(hub = %invite.hub, library_id = %granted.library_id, %route, "linked to a hub");
+        if let Some(link) = stores.server.hub_link().map_err(internal)? {
+            *self.uplink.write().unwrap_or_else(PoisonError::into_inner) =
+                Some(std::sync::Arc::new(crate::uplink::Uplink::new(
+                    link,
+                    name,
+                    runtime.clone(),
+                    std::sync::Arc::clone(&self.clock),
+                    std::sync::Arc::clone(&self.entropy),
+                )));
+        }
         {
             let mut this = lock(&self.this);
             this.role = super::role(identity.role);
@@ -309,18 +356,25 @@ impl Core {
 
     /// `link.status`.
     pub(super) fn link_status(&self, stores: &Stores) -> Result<LinkStatus, RpcError> {
-        let hub = stores
-            .server
-            .hub_link()
-            .map_err(internal)?
-            .map(|link| HubStatus {
-                server_id: link.hub,
-                name: link.hub_name,
-                library_id: link.library_id,
-                epoch: link.hub_epoch,
-                routes: link.routes,
-                linked_at_ms: link.linked_at_ms,
-            });
+        let hub = match self.uplink() {
+            Some(uplink) => Some(uplink.status()),
+            None => stores
+                .server
+                .hub_link()
+                .map_err(internal)?
+                .map(|link| HubStatus {
+                    server_id: link.hub,
+                    name: link.hub_name,
+                    library_id: link.library_id,
+                    epoch: link.hub_epoch,
+                    routes: link.routes,
+                    linked_at_ms: link.linked_at_ms,
+                    answers: None,
+                    since_ms: None,
+                    route: None,
+                    problem: None,
+                }),
+        };
         let satellites = stores
             .server
             .link_sessions()

@@ -66,6 +66,8 @@ pub enum ClientKind {
     Cli,
     /// The agent adapter.
     Agent,
+    /// Another Ritornel server: a satellite, through its link.
+    Server,
 }
 
 impl ClientKind {
@@ -77,6 +79,7 @@ impl ClientKind {
             Self::Phone => "phone",
             Self::Cli => "cli",
             Self::Agent => "agent",
+            Self::Server => "server",
         }
     }
 }
@@ -250,6 +253,11 @@ pub struct ServerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub record: Option<RecordStatus>,
+    /// On a satellite, its hub and whether it answers. Its `library` is
+    /// then the hub's. Left out on any other server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub hub: Option<crate::HubStatus>,
 }
 
 /// Whether the listening record is advancing: each listen saved and taken
@@ -863,6 +871,7 @@ mod tests {
             watch: None,
             backup: None,
             record: None,
+            hub: None,
         };
         let mut wire = json!({
             "serverId": "11111111-1111-1111-1111-111111111111",
