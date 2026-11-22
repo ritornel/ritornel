@@ -253,6 +253,9 @@ impl Artist {
             let plays_only = match event {
                 LinkEvent::Connected(net) => {
                     page.net = Arc::clone(net);
+                    // Revisions are the server's: another may count from
+                    // lower.
+                    page.revision = 0;
                     false
                 }
                 LinkEvent::Server(Event::Library(event))
