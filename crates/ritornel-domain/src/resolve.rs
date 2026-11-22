@@ -91,6 +91,7 @@ const ALBUM_MARKERS: &[&str] = &[
     "demos",
     "mono",
     "acoustic",
+    "acoustics",
     "instrumental",
     "instrumentals",
     "karaoke",
@@ -345,6 +346,9 @@ fn markers(text: Option<&str>, words: &'static [&'static str], list: u8) -> Vec<
     for word in split.iter().copied().chain(joined) {
         if list >= 2 && CAPPELLA.contains(&word) {
             add("a cappella".to_owned());
+        } else if list >= 2 && word == "acoustics" && words.contains(&word) {
+            // "Acoustics" is an acoustic record, as "Acoustic" is.
+            add("acoustic".to_owned());
         } else if let Some(marker) = words.iter().find(|marker| **marker == word) {
             add((*marker).to_owned());
         }

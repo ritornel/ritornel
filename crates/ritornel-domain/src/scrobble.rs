@@ -873,7 +873,11 @@ mod tests {
                 ..
             }
         ));
-        for album in ["Low Tide (Live)", "Low Tide: Acoustic"] {
+        for album in [
+            "Low Tide (Live)",
+            "Low Tide: Acoustic",
+            "Low Tide (Acoustics)",
+        ] {
             assert_eq!(
                 judge("The Quiet Harbour", Some(album), "Lanterns"),
                 Verdict::Doubtful {
@@ -883,6 +887,11 @@ mod tests {
                 "{album}"
             );
         }
+        // "Acoustics" is the one marker "Acoustic" is.
+        assert_eq!(
+            album_markers_of("Low Tide (Acoustics)"),
+            album_markers_of("Low Tide: Acoustic")
+        );
         // With no album, one recording binds as before.
         assert!(matches!(
             judge("The Quiet Harbour", None, "Lanterns"),
