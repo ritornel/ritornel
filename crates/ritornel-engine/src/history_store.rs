@@ -1385,13 +1385,12 @@ impl LibraryStore {
         self.read(derived)
     }
 
-    /// Whether any play was judged by a rule other than the one in force,
-    /// which a rebuild puts right.
+    /// Whether any play was derived under an earlier rule or grouper.
     pub fn history_needs_rebuild(&self) -> Result<bool, Error> {
         self.read(|connection| {
             Ok(connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM play_event WHERE play_rule_version <> ?1)",
-                [PlayRule::CURRENT.version],
+                "SELECT EXISTS (SELECT 1 FROM play_event WHERE play_rule_version <> ?1 OR grouper_version <> ?2)",
+                [PlayRule::CURRENT.version, derive::GROUPER_VERSION],
                 |row| row.get(0),
             )?)
         })

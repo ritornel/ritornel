@@ -309,6 +309,25 @@ fn a_full_rebuild_equals_what_ingest_derived_on_every_fixture() {
 }
 
 #[test]
+fn an_old_derived_zone_is_rebuilt_from_the_original_observation() {
+    let at = library();
+    let mut listen = at.listen(1, 0, T0, 60_000);
+    listen.zone = Some("Invented/Harbour".into());
+    at.send(&listen, PlayRule::CURRENT);
+    at.library.write(WriteRequest { method: "test.previous_derivation", command: None, client: None }, |write| {
+        write.connection().execute("UPDATE play_event SET grouper_version = 1, zone_name = 'Invented/Harbour', zone_basis = 'captured'", [])?;
+        Ok(String::new())
+    }).unwrap();
+    assert!(at.library.history_needs_rebuild().unwrap());
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE zone_basis = 'none' AND zone_name IS NULL"),
+        1
+    );
+    assert!(!at.library.history_needs_rebuild().unwrap());
+}
+
+#[test]
 fn after_the_rule_is_bumped_a_rebuild_equals_ingest_under_the_new_rule() {
     // A stricter rule, for the test: three quarters of the track.
     let v2 = PlayRule {

@@ -38,8 +38,9 @@ use jiff::Timestamp;
 use jiff::tz::{TimeZone, TimeZoneDatabase};
 
 /// The grouper's version. Grouper 1 joins `continues` chains and groups
-/// nothing across sources, because nothing else reports a play yet.
-pub const GROUPER_VERSION: i64 = 1;
+/// nothing across sources. Version 2 uses known zones and the full clock
+/// difference when dating a chain, and bounds its accumulated play time.
+pub const GROUPER_VERSION: i64 = 2;
 
 /// How long after the end of a listen one that continues it may start and
 /// still be joined to it.
