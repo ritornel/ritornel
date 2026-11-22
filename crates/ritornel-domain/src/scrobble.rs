@@ -887,10 +887,30 @@ mod tests {
                 "{album}"
             );
         }
-        // "Acoustics" is the one marker "Acoustic" is.
+        // "Acoustics" is the one marker "Acoustic" is: a play from it fits
+        // the acoustic record.
         assert_eq!(
             album_markers_of("Low Tide (Acoustics)"),
             album_markers_of("Low Tide: Acoustic")
+        );
+        let acoustic = Catalog::new(vec![recording(
+            7,
+            "Mira Vale",
+            "Undertow",
+            &[(71, "Undertow"), (72, "Undertow (Acoustic)")],
+        )]);
+        assert_eq!(
+            acoustic.judge(Scrobbled {
+                artist: "Mira Vale",
+                album: Some("Undertow (Acoustics)"),
+                title: "Undertow",
+            }),
+            Verdict::Bind {
+                recording: 7,
+                appearance: Some(72),
+                candidates: 1,
+                rule: Rule::Exact,
+            }
         );
         // With no album, one recording binds as before.
         assert!(matches!(

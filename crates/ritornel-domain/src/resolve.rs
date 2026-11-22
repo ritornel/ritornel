@@ -91,7 +91,6 @@ const ALBUM_MARKERS: &[&str] = &[
     "demos",
     "mono",
     "acoustic",
-    "acoustics",
     "instrumental",
     "instrumentals",
     "karaoke",
@@ -346,9 +345,6 @@ fn markers(text: Option<&str>, words: &'static [&'static str], list: u8) -> Vec<
     for word in split.iter().copied().chain(joined) {
         if list >= 2 && CAPPELLA.contains(&word) {
             add("a cappella".to_owned());
-        } else if list >= 2 && word == "acoustics" && words.contains(&word) {
-            // "Acoustics" is an acoustic record, as "Acoustic" is.
-            add("acoustic".to_owned());
         } else if let Some(marker) = words.iter().find(|marker| **marker == word) {
             add((*marker).to_owned());
         }
@@ -387,9 +383,17 @@ pub(crate) fn markers_of(title: &str, list: u8) -> Vec<String> {
 }
 
 /// The version markers of an album title, such as "live" or "acoustic", by
-/// policy 2's list.
+/// policy 2's list, as the scrobble matcher reads them. It also reads
+/// "Acoustics" as "acoustic"; the file resolver's policies do not, so that
+/// their results stay as they are.
 pub(crate) fn album_markers_of(album: &str) -> Vec<String> {
     let mut found = markers(Some(album), ALBUM_MARKERS, 2);
+    let acoustics = crate::normalize::joined_words(album)
+        .split(' ')
+        .any(|word| word == "acoustics");
+    if acoustics && !found.iter().any(|marker| marker == "acoustic") {
+        found.push("acoustic".to_owned());
+    }
     found.sort();
     found
 }
