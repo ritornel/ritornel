@@ -95,15 +95,6 @@ impl LinkSessions {
         held.insert(token_hash, Peer { server, session });
     }
 
-    /// Whether any satellite is linked.
-    pub(crate) fn any(&self) -> bool {
-        !self
-            .0
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty()
-    }
-
     /// The satellite whose link session `token` is, if it is one.
     pub(crate) fn peer(&self, token: &SessionToken) -> Option<Peer> {
         // A map lookup is not constant time, but the key is a SHA-256 of
@@ -322,6 +313,22 @@ mod tests {
         assert!(versions_differ(3, 2).contains("update this server"));
         assert!(versions_differ(2, 3).contains("update the hub"));
         assert!(versions_differ(2, 3).contains("the hub 2, this server 3"));
+    }
+
+    #[test]
+    fn a_new_listen_record_is_a_new_contract() {
+        // `link.listen` carries the listen record as JSON, which the
+        // contract's digest does not see. A hub and a satellite that agree
+        // on the contract must agree on the record too, so a change to the
+        // record raises CONTRACT_VERSION, and this pair with it.
+        assert_eq!(
+            (
+                ritornel_contract::CONTRACT_VERSION,
+                ritornel_engine::LISTEN_RECORD_VERSION
+            ),
+            (1, 1),
+            "the listen record changed: raise CONTRACT_VERSION too"
+        );
     }
 
     #[test]

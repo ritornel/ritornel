@@ -178,15 +178,19 @@ impl Uplink {
         error
     }
 
-    fn answered(&self, route: SocketAddr) {
+    /// The hub answered: on a connection just opened to `route`, or on one
+    /// already open.
+    fn answered(&self, route: Option<SocketAddr>) {
         let mut reach = lock(&self.reach);
         if reach.answers != Some(true) {
-            info!(hub = %self.link.hub, %route, "the hub answers");
+            info!(hub = %self.link.hub, "the hub answers");
             reach.since_ms = Some(self.clock.now_ms());
             self.changes.send_modify(|count| *count += 1);
         }
         reach.answers = Some(true);
-        reach.route = Some(route.to_string());
+        if let Some(route) = route {
+            reach.route = Some(route.to_string());
+        }
         reach.problem = None;
         reach.failed_at_ms = None;
     }
@@ -250,7 +254,7 @@ impl Uplink {
             };
             match opened {
                 Ok(client) => {
-                    self.answered(route);
+                    self.answered(Some(route));
                     return Ok(client);
                 }
                 Err(why) => tried.push(format!("{route}: {why}")),
@@ -269,8 +273,15 @@ impl Uplink {
     /// What became of a call: the hub's own answer, or the hub lost.
     fn answer(&self, result: Result<Value, ritornel_client::Error>) -> Result<Value, RpcError> {
         match result {
-            Ok(value) => Ok(value),
-            Err(ritornel_client::Error::Call(error)) => Err(error),
+            // An answer, even a refusal, is the hub answering.
+            Ok(value) => {
+                self.answered(None);
+                Ok(value)
+            }
+            Err(ritornel_client::Error::Call(error)) => {
+                self.answered(None);
+                Err(error)
+            }
             Err(other) => {
                 self.lost(&other.to_string());
                 Err(self.unreachable())
