@@ -448,16 +448,16 @@ impl AudioRenderer {
         if self.running.is_none() {
             return Some("the output stopped answering");
         }
+        if self.shared.lost.load(Ordering::SeqCst) {
+            return Some(WENT_AWAY);
+        }
         if self.stalled() {
             self.shared.stalled.store(true, Ordering::SeqCst);
         }
-        if self.shared.stalled.load(Ordering::SeqCst) {
-            Some(STALLED)
-        } else if self.shared.lost.load(Ordering::SeqCst) {
-            Some(WENT_AWAY)
-        } else {
-            None
-        }
+        self.shared
+            .stalled
+            .load(Ordering::SeqCst)
+            .then_some(STALLED)
     }
 
     /// Whether the output, told to play, has asked for no frames for
@@ -475,15 +475,15 @@ impl AudioRenderer {
     }
 
     /// When the output last took frames, on its clock: when the last it
-    /// asked for were done, or now if it never asked or they are not done
-    /// yet. `heard` is when the last frame of a span was done, where that is
-    /// known, which leaves out any silence the output took after it.
+    /// asked for are done, or now if it never asked. `heard` is when the
+    /// last frame of a span is done, where that is known, which leaves out
+    /// any silence the output took after it. Either may be a moment ahead
+    /// of now, as the output stamps a buffer for when it will play, and so
+    /// never before the span's own `Began`.
     fn last_taken(&self, heard: u64) -> u64 {
-        let now = output::now();
-        let asked = self.shared.asked_until.load(Ordering::SeqCst);
-        match (heard, asked) {
-            (0, 0) => now,
-            (0, at) | (at, _) => at.min(now),
+        match (heard, self.shared.asked_until.load(Ordering::SeqCst)) {
+            (0, 0) => output::now(),
+            (0, at) | (at, _) => at,
         }
     }
 
@@ -827,10 +827,15 @@ impl Renderer for AudioRenderer {
 
     fn unload(&mut self) {
         self.collect();
+        // Read before the output is told it plays no more, which a stall
+        // is measured against.
+        let lost = self.lost().is_some();
+        // With nothing loaded, nothing plays, so nothing can stall.
+        self.playing = false;
         let Some(old) = self.decoding.take() else {
             return;
         };
-        if self.lost().is_some() {
+        if lost {
             self.decoding = Some(old);
             self.abandon();
             return;

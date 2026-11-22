@@ -417,6 +417,12 @@ impl Callback {
     /// many frames came from the ring: they are the first of `out`, and the
     /// rest is silence.
     pub(crate) fn render(&mut self, out: &mut [f32]) -> usize {
+        // A stalled output is lost for good: should it ask again before it
+        // is let go, it is handed silence, and nothing more of any span.
+        if self.shared.stalled.load(Ordering::SeqCst) {
+            out.fill(0.0);
+            return 0;
+        }
         let now = (self.clock)();
         self.take_messages(now);
         self.shared.callbacks.fetch_add(1, Ordering::Relaxed);

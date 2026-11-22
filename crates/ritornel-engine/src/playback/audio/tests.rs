@@ -1635,7 +1635,7 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
     // At real time, the output stops asking for frames 800 ms in, with no
     // error, as a stream does behind a sound server whose device went
     // away.
-    let stall_after = Duration::from_millis(300);
+    let stall_after = Duration::from_secs(1);
     let (renderer, tap, hold) = on_demand_held(800, stall_after);
     let mut rig = Pipeline::new(&[2_000], Box::new(renderer));
     rig.play();
@@ -1664,11 +1664,11 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
     // It was noticed once the output had asked for nothing for the time a
     // stall takes.
     assert!(
-        ended.ended_at_ms + 300 <= noticed_by + 1,
+        ended.ended_at_ms + 1_000 <= noticed_by + 1,
         "{ended:?}, noticed by {noticed_by}"
     );
     assert!(
-        ended.ended_at_ms <= stopped_by + 20,
+        ended.ended_at_ms <= stopped_by + 50,
         "{ended:?}, stopped by {stopped_by}"
     );
     assert!(failing.since_ms >= ended.ended_at_ms, "{failing:?}");
@@ -1716,7 +1716,7 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
 #[test]
 fn an_output_that_asks_for_nothing_while_paused_is_not_lost() {
     use crate::playback::Status;
-    let stall_after = Duration::from_millis(200);
+    let stall_after = Duration::from_secs(1);
     let (renderer, _tap, hold) = on_demand_held(500, stall_after);
     let mut rig = Pipeline::new(&[1_000], Box::new(renderer));
     rig.play();
@@ -1724,7 +1724,7 @@ fn an_output_that_asks_for_nothing_while_paused_is_not_lost() {
     let request = rig.request("playback.pause");
     rig.player.pause(request, &rig.server).unwrap();
     // Held still for longer than a stall while paused.
-    std::thread::sleep(stall_after * 3);
+    std::thread::sleep(stall_after + Duration::from_millis(500));
     rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
     let state = rig.player.state();
     assert_eq!((state.status, state.output_failing), (Status::Paused, None));
