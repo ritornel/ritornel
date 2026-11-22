@@ -535,9 +535,8 @@ mod enabled {
         core: &'a Core,
         lastfm: &'a Lastfm,
         account: Id,
-        row: i64,
+        job: &'a Job,
         stop: &'a std::sync::atomic::AtomicBool,
-        cancelled: bool,
         batches: u64,
         summary: SyncSummary,
         saved: Instant,
@@ -547,7 +546,66 @@ mod enabled {
         SourceError::sink(error.to_string())
     }
 
+    #[cfg(test)]
+    #[test]
+    fn a_sync_observes_cancellation_between_progress_saves() {
+        use ritornel_engine::{Command, Fingerprint, NewJob};
+        let (core, scratch) = crate::dispatch::tests::core();
+        let lastfm = Lastfm::new(Default::default(), scratch.path());
+        let id = |n| Id::from_bytes([n; 16]);
+        let command = |n, method| Command {
+            id: id(n),
+            fingerprint: Fingerprint::of(method, b"{}"),
+        };
+        let job = core
+            .with_stores(|stores| {
+                let store = stores.server();
+                store
+                    .start_job(
+                        command(1, "lastfm.sync"),
+                        "lastfm.sync",
+                        NewJob {
+                            kind: "lastfm.sync",
+                            dedupe_key: "someone".into(),
+                            target: id(2),
+                            params_json: "{}".into(),
+                            session: None,
+                        },
+                    )
+                    .unwrap();
+                store.claim_job(id(3)).unwrap().unwrap()
+            })
+            .unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let sink = JobSink {
+            core: &core,
+            lastfm: &lastfm,
+            account: id(2),
+            job: &job,
+            stop: &stop,
+            batches: 0,
+            summary: Default::default(),
+            saved: Instant::now(),
+        };
+        assert!(!sink.stopping());
+        core.with_stores(|stores| {
+            stores
+                .server()
+                .cancel_job(command(4, "jobs.cancel"), "jobs.cancel", job.public_id)
+                .unwrap()
+                .unwrap()
+        })
+        .unwrap();
+        assert!(sink.stopping());
+    }
+
     impl JobSink<'_> {
+        fn cancellation_requested(&self) -> bool {
+            self.job.cancel_requested || self.core.with_stores(|stores| {
+                matches!(stores.server().job(self.job.public_id), Ok(Some(job)) if job.cancel_requested)
+            }).unwrap_or(false)
+        }
+
         fn library<T>(
             &self,
             work: impl FnOnce(&LibraryStore) -> Result<T, ritornel_engine::Error>,
@@ -567,12 +625,11 @@ mod enabled {
                 label: read.label.clone(),
                 ..Progress::default()
             };
-            let row = self.row;
+            let row = self.job.id;
             if let Some(Ok(job)) = self
                 .core
                 .with_stores(|stores| stores.server().save_progress(row, progress))
             {
-                self.cancelled |= job.cancel_requested;
                 self.core.publish_job(&job);
             }
             self.saved = Instant::now();
@@ -623,7 +680,7 @@ mod enabled {
         }
 
         fn stopping(&self) -> bool {
-            self.cancelled || self.stop.load(std::sync::atomic::Ordering::SeqCst)
+            self.stop.load(std::sync::atomic::Ordering::SeqCst) || self.cancellation_requested()
         }
     }
 
@@ -695,9 +752,8 @@ mod enabled {
             core,
             lastfm,
             account: session.account,
-            row,
+            job: &job,
             stop,
-            cancelled: job.cancel_requested,
             batches: 0,
             summary: SyncSummary::default(),
             saved: Instant::now(),
@@ -706,7 +762,7 @@ mod enabled {
         let mut summary = sink.summary;
         match synced {
             Ok(synced) if synced.stopped => {
-                if sink.cancelled {
+                if sink.cancellation_requested() {
                     finish(JobState::Cancelled, None, Some(&summary));
                 }
                 // Stopped with the server: the next run carries on.

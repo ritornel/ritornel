@@ -1007,7 +1007,7 @@ fn run<M: Method>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use ritornel_contract::{METHODS, Request, RequestId, Topic};
     use ritornel_engine::{OsEntropy, SystemClock};
     use serde_json::json;
@@ -1016,7 +1016,7 @@ mod tests {
     use crate::testing::Scratch;
 
     /// A core on a database in memory, and the directory it reports on.
-    fn core() -> (Core, Scratch) {
+    pub(crate) fn core() -> (Core, Scratch) {
         let scratch = Scratch::new();
         let dir = DataDir::prepare(scratch.path().join("data")).unwrap();
         let store =
