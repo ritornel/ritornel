@@ -52,7 +52,7 @@ pub(crate) fn disc_in_title(album: &str) -> Option<(String, i64)> {
         if let Some((mut title, disc)) = trailing_disc(rest) {
             // A bracket left open in the title is a note the marker sits
             // inside.
-            if !notes.is_empty() && !paired(&title) {
+            if !closed(&title) {
                 return None;
             }
             for note in notes.iter().rev() {
@@ -62,26 +62,32 @@ pub(crate) fn disc_in_title(album: &str) -> Option<(String, i64)> {
             return Some((title, disc));
         }
         let at = last_note(rest)?;
-        notes.push(rest.get(at..)?);
+        let note = rest.get(at..)?;
+        // "(of 2)" is the marker's, and goes with it.
+        let counted = normalize(note)
+            .strip_prefix("of ")
+            .is_some_and(|count| !count.is_empty() && count.chars().all(|c| c.is_ascii_digit()));
+        if !counted {
+            notes.push(note);
+        }
         rest = rest.get(..at)?.trim_end();
     }
 }
 
-/// Whether every bracket in `text` is closed by its own kind.
-fn paired(text: &str) -> bool {
+/// Whether no bracket in `text` is left open. A closing one with nothing
+/// of its kind open, as in a smiley, is no bracket.
+fn closed(text: &str) -> bool {
     let mut open: Vec<char> = Vec::new();
     for c in text.chars() {
-        let closes = match c {
-            '(' | '[' => {
-                open.push(c);
-                continue;
+        match c {
+            '(' | '[' => open.push(c),
+            ')' | ']' => {
+                let opens = if c == ')' { '(' } else { '[' };
+                if open.last() == Some(&opens) {
+                    open.pop();
+                }
             }
-            ')' => '(',
-            ']' => '[',
-            _ => continue,
-        };
-        if open.pop() != Some(closes) {
-            return false;
+            _ => {}
         }
     }
     open.is_empty()
@@ -144,31 +150,14 @@ fn trailing_disc(album: &str) -> Option<(String, i64)> {
     Some((title.to_owned(), disc))
 }
 
-/// The album title and disc an item's album title gives, unless the disc
-/// its tags claim, other than 1, is another: then the marker is part of the
-/// title.
-fn title_disc(facts: &crate::extract::Facts) -> Option<(String, i64)> {
-    let (title, disc) = facts.album.as_deref().and_then(disc_in_title)?;
-    facts
-        .disc
-        .is_none_or(|claimed| claimed == 1 || claimed == disc)
-        .then_some((title, disc))
-}
-
 /// The disc a folder's own name gives: "CD1", "Disc 2 [FLAC]", "Night
 /// Drives (Disc 2)".
 fn disc_of_folder(name: &str) -> Option<i64> {
     let mut rest = name.trim_end();
-    loop {
-        if let Some(disc) = marker(rest) {
-            return Some(disc);
-        }
-        match last_note(rest) {
-            Some(at) => rest = rest.get(..at)?.trim_end(),
-            None => break,
-        }
+    while let Some(at) = last_note(rest) {
+        rest = rest.get(..at)?.trim_end();
     }
-    disc_in_title(name).map(|(_, disc)| disc)
+    marker(rest).or_else(|| disc_in_title(name).map(|(_, disc)| disc))
 }
 
 /// The library with the disc numbers the switches imply, or `None` when
@@ -179,9 +168,27 @@ pub(crate) fn apply(library: &Library, policy: &Policy) -> Option<Library> {
     }
     let mut library = library.clone();
     if policy.disc_from_album_title {
+        // A title one file's disc tag contradicts is a title for every file
+        // that carries it, or the discs of one set would part.
+        let contradicted: BTreeSet<String> = library
+            .items
+            .iter()
+            .filter_map(|item| {
+                let album = item.facts.album.as_deref()?;
+                let (_, disc) = disc_in_title(album)?;
+                let claimed = item.facts.disc?;
+                (claimed != 1 && claimed != disc).then(|| album.to_owned())
+            })
+            .collect();
         for item in &mut library.items {
             let facts = &mut item.facts;
-            if let Some((title, disc)) = title_disc(facts) {
+            let Some(album) = facts.album.as_deref() else {
+                continue;
+            };
+            if contradicted.contains(album) {
+                continue;
+            }
+            if let Some((title, disc)) = disc_in_title(album) {
                 facts.album = Some(title);
                 facts.disc = Some(disc);
             }
@@ -353,9 +360,21 @@ mod tests {
             "Night Drives Disc 2 ]",
             "Night Drives Disc 2 (Live]",
             "Night Drives [Sessions Disc 2 (Gold)",
+            "Night Drives [Sessions Disc 2",
         ] {
             assert_eq!(split(title), None, "{title}");
         }
+        // A stray closing bracket leaves nothing open.
+        assert_eq!(
+            split("Smile :) Disc 1 [Remastered]"),
+            some("Smile :) [Remastered]", 1)
+        );
+        // "(of 2)" belongs to the marker.
+        assert_eq!(split("White Field Disc 1 (of 2)"), some("White Field", 1));
+        assert_eq!(
+            split("White Field Disc 2 [of 2] [Gold]"),
+            some("White Field [Gold]", 2)
+        );
         assert_eq!(
             split("Night Drives Disc 1 [Remastered [Gold]]"),
             some("Night Drives [Remastered [Gold]]", 1)
@@ -375,29 +394,8 @@ mod tests {
         assert_eq!(disc_of_folder("CD1 [FLAC]"), Some(1));
         assert_eq!(disc_of_folder("Disc 2 (24-96)"), Some(2));
         assert_eq!(disc_of_folder("[FLAC]"), None);
-    }
-
-    #[test]
-    fn a_title_whose_marker_the_disc_tag_contradicts_is_left_as_it_is() {
-        let facts = |album: &str, disc: Option<i64>| crate::extract::Facts {
-            album: Some(album.to_owned()),
-            disc,
-            ..Default::default()
-        };
-        let read = |album, disc| title_disc(&facts(album, disc));
-        assert_eq!(read("The Gold Disc 2 [Remastered]", Some(3)), None);
-        assert_eq!(
-            read("The Gold Disc 2 [Remastered]", Some(2)),
-            Some(("The Gold [Remastered]".to_owned(), 2))
-        );
-        // A disc tag of 1 is the default many taggers write, and gives way.
-        assert_eq!(
-            read("The Gold Disc 2 [Remastered]", Some(1)),
-            Some(("The Gold [Remastered]".to_owned(), 2))
-        );
-        assert_eq!(
-            read("The Gold Disc 2", None),
-            Some(("The Gold".to_owned(), 2))
-        );
+        // Many notes are read in linear time.
+        let long = format!("CD1{}", " []".repeat(200_000));
+        assert_eq!(disc_of_folder(&long), Some(1));
     }
 }

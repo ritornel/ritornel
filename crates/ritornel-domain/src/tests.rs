@@ -1753,6 +1753,34 @@ fn a_disc_marker_in_the_album_title_can_be_taken_as_the_disc() {
 }
 
 #[test]
+fn an_album_title_one_files_disc_tag_contradicts_is_left_as_it_is_for_all() {
+    let on = Policy {
+        disc_from_album_title: true,
+        ..Policy::v1()
+    };
+    // A set of three discs whose title holds a marker: the tags of the
+    // third say the marker is the title's.
+    let mut world = World::under(on.clone());
+    for disc in 1..=3 {
+        world.add(
+            file(
+                ["A/1.flac", "A/2.flac", "A/3.flac"][disc as usize - 1],
+                disc,
+            )
+            .song(&format!("Song {disc}"), "Ninefold", 200)
+            .on("The Gold Disc 2 [Remastered]", Some(disc), 1),
+        );
+    }
+    let resolution = world.settle();
+    assert_eq!(resolution.releases.len(), 1);
+    assert_eq!(
+        resolution.releases[0].title.as_deref(),
+        Some("The Gold Disc 2 [Remastered]")
+    );
+    world.assert_settled();
+}
+
+#[test]
 fn sibling_folders_that_collide_and_share_no_title_can_be_discs_of_one_release() {
     let on = Policy {
         discs_from_folders: true,
