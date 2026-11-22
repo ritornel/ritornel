@@ -1,5 +1,5 @@
 //! Lists read through views: the engine's half. See "Large lists" in
-//! docs/design/contract.md.
+//! docs/internals/contract.md.
 //!
 //! [`LibraryStore::list_open`] resolves a query once, in one short read
 //! transaction, into the ordered row IDs a view holds, the sections that

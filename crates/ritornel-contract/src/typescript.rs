@@ -1,7 +1,8 @@
 //! The contract as TypeScript: `contract/contract.ts` at the repository
 //! root, which a client written in TypeScript is typed by. A test here fails
 //! when that file and the Rust types disagree, so CI catches a contract that
-//! changed without its TypeScript. See decision 1 in docs/design/contract.md.
+//! changed without its TypeScript. See "Schema definition and code
+//! generation" in docs/internals/contract.md.
 //!
 //! To write the file again after changing a wire type or the method table:
 //! `mise run contract`.
@@ -331,8 +332,8 @@ export const ART_SIZES = [{art_sizes}] as const;
 export const FILTER_VERSION = {FILTER_VERSION};
 
 /**
- * Every method, in the order of the contract's call list: what kind of call
- * it is, and whether it needs a `full` session.
+ * Every method, in the order of the method table: what kind of call it is,
+ * and whether it needs a `full` session.
  */
 export const METHODS = {{
 {methods}}} as const;

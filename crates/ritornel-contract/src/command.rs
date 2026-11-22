@@ -1,5 +1,5 @@
-//! Commands: the calls that change something lasting. See decisions 13 and
-//! 14 and "Commands" in docs/design/contract.md.
+//! Commands: the calls that change something lasting. See "Commands,
+//! playback, and jobs" in docs/internals/contract.md.
 //!
 //! A command carries an `idempotencyKey`, a UUID its client makes, and
 //! returns a [`Receipt`]. Sending the same key again with the same params

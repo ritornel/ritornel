@@ -1,7 +1,7 @@
 //! Jobs and roots in `server.db`: work longer than one call, as a row with
 //! a claim, a heartbeat and a checkpoint, and where each named root is on
 //! this machine. See "Jobs and outbox" in docs/internals/server.md, and
-//! decision 17 in docs/design/contract.md.
+//! "Commands, playback, and jobs" in docs/internals/contract.md.
 
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 use sha2::{Digest, Sha256};

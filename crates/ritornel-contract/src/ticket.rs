@@ -1,6 +1,6 @@
 //! The socket ticket: how a client that cannot put a credential in a header
-//! opens the socket. See "Requests that cannot carry headers" and
-//! "Query-string credentials" in docs/design/contract.md, and "Pairing a
+//! opens the socket. See "Query-string credentials and origin checks" in
+//! docs/internals/contract.md, and "Pairing a
 //! client" in docs/design/linking.md.
 //!
 //! A page cannot set a header on a WebSocket upgrade, so the desktop's page

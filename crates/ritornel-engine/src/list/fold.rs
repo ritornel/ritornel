@@ -1,5 +1,5 @@
 //! Text as a person compares it: for ordering a list by name and for
-//! matching what was typed. See "Large lists" in docs/design/contract.md
+//! matching what was typed. See "Large lists" in docs/internals/contract.md
 //! and "Organise as a person would" in docs/design/ui.md.
 
 use ritornel_domain::normalize::fold_accents;

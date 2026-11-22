@@ -1,7 +1,7 @@
 //! What carries frames between the client and a server: a socket, or a
 //! pair of channels in memory. Both carry a frame as text, so the encoding
-//! is the same and only the transport differs (docs/design/contract.md,
-//! decision 4).
+//! is the same and only the transport differs ("Transport-neutral
+//! dispatcher" in docs/internals/contract.md).
 
 use std::net::SocketAddr;
 

@@ -1,6 +1,6 @@
 //! The calls that read lists through views, `media.token`, covers, and what
 //! the server tells sessions after a library write. See "Large lists",
-//! "Events and subscriptions" and "Media" in docs/design/contract.md.
+//! "Events and subscriptions" and "Media" in docs/internals/contract.md.
 
 use std::sync::{Arc, PoisonError, Weak};
 use std::time::Instant;
@@ -42,7 +42,8 @@ impl Fanout {
     /// those subscribed, and a `list` event for each view of each one that
     /// the change can have made out of date.
     ///
-    /// The rule for `reorder` is the coarse one of "Large lists" step 5:
+    /// The rule for `reorder` is the coarse one of "Large lists" in
+    /// docs/internals/contract.md:
     /// a change of play counts reorders only views that sort or filter on
     /// plays, and any other change reorders every view. No view sorts or
     /// filters on plays, so a change of plays alone reorders none: only the

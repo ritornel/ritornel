@@ -1,7 +1,7 @@
 //! The player's calls and events through `ritornel-client`: a real server
 //! in the test process whose player renders to the null output, which
-//! makes no sound and opens no device. See "Playback and jobs" and
-//! "Events and subscriptions" in docs/design/contract.md.
+//! makes no sound and opens no device. See "Commands, playback, and jobs" and
+//! "Events and subscriptions" in docs/internals/contract.md.
 //!
 //! Nothing here sleeps: a test waits for an answer or an event, and is cut
 //! off with a message if it has not finished in [`WAIT`].

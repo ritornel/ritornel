@@ -1,6 +1,5 @@
-//! The two pages about one thing that M1 has: an artist's and an album's.
-//! See "What a client sees" and the M1 "Browse" row of the minimum call
-//! list in docs/design/contract.md.
+//! Detail pages for an artist and an album. See "Entities and identifiers"
+//! and "Method summary" in docs/internals/contract.md.
 //!
 //! - `artist.get` takes an [`ArtistGetParams`] and returns an
 //!   [`ArtistPage`]: the artist's row and the colour of their picture.

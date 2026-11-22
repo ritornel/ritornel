@@ -1,6 +1,6 @@
 //! The player's calls and what they carry: what is playing, the transport,
-//! and the queue. See "Playback and jobs" and decisions 13, 14 and 16 in
-//! docs/design/contract.md.
+//! and the queue. See "Commands, playback, and jobs" in
+//! docs/internals/contract.md.
 //!
 //! Playback commands are safe to retry by construction: there is no
 //! toggle, a position is absolute, and a skip or a seek names the entry it

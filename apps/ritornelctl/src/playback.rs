@@ -1,6 +1,6 @@
 //! `ritornelctl play`, the transport, `now` and `queue`: the server's player
-//! from the command line. See "Playback and jobs" in
-//! docs/design/contract.md. The player is the server's: it plays on when
+//! from the command line. See "Commands, playback, and jobs" in
+//! docs/internals/contract.md. The player is the server's: it plays on when
 //! this program ends.
 
 use std::io::Write;

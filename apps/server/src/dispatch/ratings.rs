@@ -1,5 +1,5 @@
-//! `ratings.set`: the listener's stars for a recording. See flags 5 and 6
-//! in docs/design/schema.md.
+//! `ratings.set`: the listener's stars for a recording. See "Ratings and
+//! loves" in docs/internals/schema.md.
 
 use ritornel_contract::methods::{Method, RatingsSet};
 use ritornel_contract::{ErrorCode, RatingSet, RatingSetParams, Receipt, ReceiptStatus, RpcError};

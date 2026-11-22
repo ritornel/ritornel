@@ -5,8 +5,9 @@
 //! A run takes a data directory and its lock ([`HeldDir`]), then starts a
 //! [`Server`]: it opens `server.db` through the engine, and `library.db` if
 //! it is a library's hub, listens on loopback, says where it is in
-//! `server.json`, and answers the contract until it is asked to stop. See "Process lifecycle" and "Data directory" in
-//! docs/internals/server.md, and docs/design/contract.md.
+//! `server.json`, and answers the contract until it is asked to stop. See
+//! "Process lifecycle" and "Data directory" in docs/internals/server.md, and
+//! docs/internals/contract.md.
 //!
 //! The dispatcher (`dispatch`) takes a decoded frame and a session and knows
 //! nothing of transports. The socket (`listener`) and the in-memory

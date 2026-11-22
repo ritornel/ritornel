@@ -1,5 +1,5 @@
 //! The listener: the HTTP routes and the socket, on loopback. See "Session
-//! and frames" and "Media" in docs/design/contract.md, decisions 5 and 8 in
+//! and frames" and "Media" in docs/internals/contract.md, decisions 5 and 8 in
 //! docs/design/linking.md, and "Process lifecycle" in
 //! docs/internals/server.md.
 //!
@@ -73,8 +73,9 @@ const MAX_HEAD_BYTES: usize = 16 * 1024;
 
 /// The `Origin` the desktop app's page presents on macOS. Every Tauri app
 /// presents it, so it keeps web pages out and does not say the page is
-/// Ritornel's: the ticket does that (docs/design/contract.md, "Origin
-/// check"). This string is all the server knows of the desktop's shell.
+/// Ritornel's: the ticket does that ("Query-string credentials and origin
+/// checks" in docs/internals/contract.md). This string is all the server
+/// knows of the desktop's shell.
 const DESKTOP_ORIGIN: &str = "tauri://localhost";
 
 /// Where a request carried what let it in.

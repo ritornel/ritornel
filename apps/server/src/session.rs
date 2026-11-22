@@ -1,6 +1,6 @@
 //! One client's session on one transport: what it may do, whether it has
 //! said hello, what it is subscribed to, and what is waiting to be sent to
-//! it. See "Events and subscriptions" in docs/design/contract.md.
+//! it. See "Events and subscriptions" in docs/internals/contract.md.
 //!
 //! Everything a session is sent goes through its queue, in order: the
 //! response to each call, and events. A response is never dropped. Of

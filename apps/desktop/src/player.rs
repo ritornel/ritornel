@@ -6,9 +6,9 @@
 //!
 //! The state comes whole on the `playback` topic and the position on
 //! `progress`, carried on between ticks. Every command carries a key of its
-//! own, so sending it again is safe (docs/design/contract.md, decisions 13
-//! and 16). A rating set here shows at once wherever the song is; if the
-//! server refuses it, it goes back.
+//! own, so sending it again is safe ("Commands, playback, and jobs" in
+//! docs/internals/contract.md). A rating set here shows at once wherever
+//! the song is; if the server refuses it, it goes back.
 
 use std::collections::HashMap;
 use std::sync::Arc;

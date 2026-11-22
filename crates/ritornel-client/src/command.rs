@@ -11,7 +11,7 @@ use crate::Error;
 /// Make one for each thing to be done, and keep it for as long as the
 /// outcome is unknown: sending a command again with its key returns the
 /// first result, and with a new key asks for the work a second time
-/// (docs/design/contract.md, decision 13).
+/// ("Commands, playback, and jobs" in docs/internals/contract.md).
 pub fn idempotency_key() -> Result<Id, Error> {
     let mut random = [0; 10];
     getrandom::fill(&mut random).map_err(|error| Error::NoRandom(error.to_string()))?;

@@ -1,5 +1,5 @@
 //! Media: the token a page reads covers with, and the threads that make
-//! covers. See "Media" in docs/design/contract.md.
+//! covers. See "Media" in docs/internals/contract.md.
 //!
 //! A media token is 32 random bytes, written as 64 hex digits, made for one
 //! session the first time it asks and the same for as long as that session

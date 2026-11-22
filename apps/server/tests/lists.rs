@@ -3,7 +3,8 @@
 //! on an invented library of its own, talked to through `ritornel-client`.
 //!
 //! Each test of a call runs twice, joined to the dispatcher by channels in
-//! memory and over a real socket (docs/design/contract.md, decision 4).
+//! memory and over a real socket ("Transport-neutral dispatcher" in
+//! docs/internals/contract.md).
 //! Covers are plain HTTP, so their tests run over the socket's listener.
 
 #![allow(

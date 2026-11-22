@@ -176,8 +176,8 @@ fn a_library_table_without_the_revision_column_is_caught() {
 /// The search index needs FTS5 with the trigram tokenizer and its
 /// `remove_diacritics` option. The migration would fail without them; this
 /// says that the SQLite built in has them, and that they do what
-/// docs/design/contract.md asks of search: a substring, whatever its case
-/// and its accents.
+/// "Large lists" in docs/internals/contract.md asks of search: a substring,
+/// whatever its case and its accents.
 #[test]
 fn the_search_index_finds_a_substring_whatever_its_case_and_accents() {
     let library = library();

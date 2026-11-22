@@ -4,7 +4,8 @@
 //!
 //! Each test of a call runs twice: joined to the dispatcher by channels in
 //! memory, and over a real socket on loopback. The frames are JSON on both,
-//! and only the transport differs (docs/design/contract.md, decision 4).
+//! and only the transport differs ("Transport-neutral dispatcher" in
+//! docs/internals/contract.md).
 //!
 //! Nothing here sleeps. A test waits for an answer or for an event, and
 //! every test is cut off, with a message, if it has not finished in

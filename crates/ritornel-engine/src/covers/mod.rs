@@ -1,6 +1,6 @@
 //! Covers: a picture's bytes read from where they are, scaled to a served
-//! size, and kept in the cache. See decision 18 and "Media" in
-//! docs/design/contract.md, and "Data directory" in docs/internals/server.md.
+//! size, and kept in the cache. See "Media" in
+//! docs/internals/contract.md, and "Data directory" in docs/internals/server.md.
 //!
 //! `library.db` keeps a picture as the hash of its bytes, and where it came
 //! with: embedded in a file, a folder image beside one, or a file of a

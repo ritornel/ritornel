@@ -1,8 +1,8 @@
 //! Contract tests of the socket ticket: how the desktop's page opens the
 //! socket, and why no other page can. A real server inside the test
 //! process, on a data directory of its own and a port the system picks,
-//! as in `contract.rs`. See "Query-string credentials" and "Origin check"
-//! in docs/design/contract.md.
+//! as in `contract.rs`. See "Query-string credentials and origin checks"
+//! in docs/internals/contract.md.
 //!
 //! A ticket belongs to the socket's upgrade, so everything here is over a
 //! real socket on loopback. The transport in memory has no upgrade and

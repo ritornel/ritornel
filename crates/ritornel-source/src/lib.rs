@@ -1,5 +1,5 @@
 //! The traits a plugin implements, and what it hands the core through them.
-//! See "The traits" and decision 8 in docs/design/plugins.md.
+//! See "Traits and storage boundary" in docs/internals/plugins.md.
 //!
 //! There is one so far, [`HistorySource`]: something that brings plays in
 //! from elsewhere, under its own history endpoint, through the one ingest
@@ -12,8 +12,8 @@
 //! it a [`Sink`], which writes what it is handed in one transaction with
 //! the cursor that says how far the source has read.
 //!
-//! The trait is not stable: plugins.md calls none stable until two
-//! plugins have used it.
+//! The trait is not stable: "Traits and storage boundary" in
+//! docs/internals/plugins.md calls none stable until two plugins have used it.
 
 use std::fmt;
 

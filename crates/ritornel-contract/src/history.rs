@@ -2,9 +2,8 @@
 //! the derived tables. See "Queries M1 must answer" and "Rebuild" in
 //! docs/design/history.md.
 //!
-//! History in M1 is meant to be read through `list.open` with `kind:
-//! "history"` (docs/design/contract.md). Until list views are built, these
-//! two direct calls read it, for `ritornelctl history`.
+//! Direct history queries serve history reads without opening a list view
+//! (see "Large lists" in docs/internals/contract.md).
 //!
 //! What a page says of your history with an artist or an album is one call
 //! each, `history.artist` and `history.album`, answered with a

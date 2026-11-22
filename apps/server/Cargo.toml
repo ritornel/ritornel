@@ -16,7 +16,7 @@ default = ["audio-output", "lastfm", "media-session"]
 audio-output = ["ritornel-engine/audio-output"]
 # Last.fm: the import of a history, loved tracks, and scrobbling, through
 # `ritornel-lastfm`. A server built without it links no Last.fm code, and
-# CI builds it both ways. See docs/design/plugins.md.
+# CI builds it both ways. See docs/internals/plugins.md.
 lastfm = ["dep:ritornel-lastfm", "dep:ritornel-source"]
 # The system's media session: Now Playing and the media keys on macOS,
 # with `main` blocking in the platform run loop, and MPRIS on the session
