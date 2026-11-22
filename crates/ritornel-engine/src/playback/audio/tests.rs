@@ -288,6 +288,40 @@ fn a_seek_ends_the_span_with_its_count_and_the_next_plays_the_rest() {
 }
 
 #[test]
+fn a_seek_to_the_end_of_a_track_or_past_it_reads_nothing_and_ends_it_as_its_audio_ran_out() {
+    // Each fixture is 500 ms long: a seek bar dragged to its end asks for
+    // 500, and a duration the library has wrong can ask for more.
+    for name in ["a.flac", "a.mp3", "a.ogg", "a.wav", "a.aiff", "a.alac.m4a"] {
+        for at in [500, 10_000] {
+            let mut source = Source::open(&fixture(name), at)
+                .unwrap_or_else(|error| panic!("{name} at {at}: {error}"));
+            assert!(!source.next().unwrap(), "{name} at {at}");
+            // Past the end, the whole track was once read for nothing.
+            if at > 500 {
+                assert_eq!(source.packets, 0, "{name} at {at}");
+            }
+        }
+    }
+    // Cut short, the file says it is longer than it is: a seek past the
+    // cut is not to the end it says, and fails as any unreadable file does.
+    let scratch = crate::testing::Scratch::new();
+    let cut = scratch.path().join("cut.flac");
+    let whole = std::fs::read(fixture("a.flac")).unwrap();
+    std::fs::write(&cut, &whole[..whole.len() - 800]).unwrap();
+    assert_eq!(Source::open(&cut, 450).unwrap_err().reason, "unreadable");
+    assert!(!Source::open(&cut, 500).unwrap().next().unwrap());
+    let mut renderer = AudioRenderer::open(Output::Null { speed: 5 }).unwrap();
+    let path = fixture("a.flac");
+    renderer.load(&path, facts(&path), 0, 1).unwrap();
+    renderer.play();
+    heard(&renderer);
+    renderer.seek(1, 500, 2).unwrap();
+    let mut said = Vec::new();
+    until(&mut renderer, &mut said, |said| ended(said, 2).is_some());
+    assert_eq!(ended(&said, 2), Some((0, End::Drained)));
+}
+
+#[test]
 fn a_seek_that_cannot_open_the_file_leaves_the_span_in_hand_playing_and_counted() {
     let scratch = crate::testing::Scratch::new();
     let path = scratch.path().join("a.mp3");
