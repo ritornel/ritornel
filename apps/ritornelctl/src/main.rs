@@ -23,6 +23,7 @@ mod identity;
 mod jobs;
 mod lastfm;
 mod library;
+mod link;
 mod playback;
 mod scan;
 mod server;

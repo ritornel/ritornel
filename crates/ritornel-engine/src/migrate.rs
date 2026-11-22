@@ -39,11 +39,18 @@ impl Migration {
 // dump through that store and finds what it held. AGENTS.md has the rule.
 
 /// The migrations of `server.db`.
-pub(crate) const SERVER: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_server",
-    sql: include_str!("../migrations/server/0001_server.sql"),
-}];
+pub(crate) const SERVER: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_server",
+        sql: include_str!("../migrations/server/0001_server.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_hub_link",
+        sql: include_str!("../migrations/server/0002_hub_link.sql"),
+    },
+];
 
 /// The migrations of `library.db`.
 pub(crate) const LIBRARY: &[Migration] = &[

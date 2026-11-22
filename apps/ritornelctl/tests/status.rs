@@ -310,7 +310,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             ("Server version", env!("CARGO_PKG_VERSION")),
             ("Contract version", "0"),
             ("SQLite version", "3.54.1"),
-            ("Server schema", "1"),
+            ("Server schema", "2"),
         ]
     );
     assert_eq!(facts[7], ("Library", "none"));
@@ -346,7 +346,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
                 "server": env!("CARGO_PKG_VERSION"),
                 "contract": 0,
                 "sqlite": "3.54.1",
-                "serverSchema": 1,
+                "serverSchema": 2,
             },
             "freeDisk": { "dataBytes": free },
             "logPath": logs_dir.to_str().unwrap(),
@@ -445,7 +445,7 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
     assert_eq!(
         shown[6..10],
         [
-            ("Server schema", "1"),
+            ("Server schema", "2"),
             ("Library schema", library_schema_text.as_str()),
             ("Library ID", library_id),
             ("Library revision", "1"),

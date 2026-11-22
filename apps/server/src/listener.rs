@@ -60,6 +60,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
 use crate::dispatch::{Core, MAX_MESSAGE_BYTES};
+use crate::link::Peer;
 use crate::ticket::Tickets;
 use crate::transport::{self, Wire};
 use crate::{Bounds, Error, Listen};
@@ -275,6 +276,7 @@ fn router(core: Arc<Core>, tickets: Arc<Tickets>) -> Router {
         .route(route::DESCRIPTOR, get(descriptor))
         .route(route::HEALTH, get(health))
         .route(route::TICKET, post(ticket))
+        .route(route::LINK, post(join))
         .route(route::WS, get(socket))
         .route(&format!("{}/{{art}}/{{size}}", route::ART), get(art))
         // A path the server does not have is checked like any other, so
@@ -303,30 +305,35 @@ async fn require_credential(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if request.method() == Method::GET && request.uri().path() == route::DESCRIPTOR {
+    // The descriptor is public, and a satellite joining presents the
+    // invite's secret in its body, which is checked there.
+    if (request.method() == Method::GET && request.uri().path() == route::DESCRIPTOR)
+        || (request.method() == Method::POST && request.uri().path() == route::LINK)
+    {
         return next.run(request).await;
     }
     // Each check is a comparison in memory. It reads no file and no
     // database, so a request costs an async worker nothing it could wait on.
     let by_header = bearer(request.headers())
         .and_then(|token| core.authenticate(&token))
-        .map(|kind| (kind, Presented::Header));
+        .map(|(kind, peer)| (kind, peer, Presented::Header));
     let admitted = by_header
         .or_else(|| {
             socket_ticket(&request)
                 .and_then(|ticket| tickets.redeem(ticket))
-                .map(|kind| (kind, Presented::Ticket))
+                .map(|kind| (kind, None, Presented::Ticket))
         })
         .or_else(|| {
             // A media token reads media, and nothing else: a session of no
             // kind is opened with it.
             media_token(&request)
                 .filter(|token| core.media_accepts(token))
-                .map(|_| (SessionKind::Limited, Presented::MediaToken))
+                .map(|_| (SessionKind::Limited, None, Presented::MediaToken))
         });
     match admitted {
-        Some((kind, presented)) => {
+        Some((kind, peer, presented)) => {
             request.extensions_mut().insert(kind);
+            request.extensions_mut().insert(peer);
             request.extensions_mut().insert(presented);
             next.run(request).await
         }
@@ -421,8 +428,18 @@ async fn health() -> Response {
 async fn ticket(
     Extension(tickets): Extension<Arc<Tickets>>,
     Extension(kind): Extension<SessionKind>,
+    Extension(peer): Extension<Option<Peer>>,
     headers: HeaderMap,
 ) -> Response {
+    // A satellite opens its socket with its link session in the header,
+    // and a ticket would lose which satellite it is.
+    if peer.is_some() {
+        return (
+            StatusCode::FORBIDDEN,
+            "a link session opens its socket itself\n",
+        )
+            .into_response();
+    }
     // A program asks for a ticket, and a program names no origin. A page
     // does, and no page is given one: its shell asks for it. A browser
     // would not get this far in any case, since a request with an
@@ -443,6 +460,39 @@ async fn ticket(
             error!(error = %failed, "a ticket could not be made");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+    }
+}
+
+/// The largest body a satellite may send to join.
+const MAX_LINK_BODY: usize = 4 * 1024;
+
+/// A satellite joining: `POST /v1/link`, with the invite's secret in a
+/// [`LinkRequest`](ritornel_contract::LinkRequest). It is answered with the
+/// link session's token, or refused with why.
+async fn join(State(core): State<Arc<Core>>, request: Request) -> Response {
+    let Ok(body) = axum::body::to_bytes(request.into_body(), MAX_LINK_BODY).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "the request is too long\n").into_response();
+    };
+    let Ok(asked) = serde_json::from_slice::<ritornel_contract::LinkRequest>(&body) else {
+        return (StatusCode::BAD_REQUEST, "that is not a request to link\n").into_response();
+    };
+    // It writes both databases.
+    let granted = tokio::task::spawn_blocking(move || core.grant_link(&asked)).await;
+    match granted {
+        Ok(Ok(granted)) => {
+            let mut response = json(&granted);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
+        Ok(Err((status, why))) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            why,
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -514,6 +564,7 @@ fn origin_may_open_a_socket(headers: &HeaderMap, presented: Presented) -> bool {
 async fn socket(
     State(core): State<Arc<Core>>,
     Extension(kind): Extension<SessionKind>,
+    Extension(peer): Extension<Option<Peer>>,
     Extension(presented): Extension<Presented>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
@@ -536,7 +587,7 @@ async fn socket(
         .max_frame_size(MAX_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
             // The session runs as a task the server owns, not as this one.
-            if let Err(mut socket) = core.run(kind, socket) {
+            if let Err(mut socket) = core.run(kind, peer.map(|peer| peer.server), socket) {
                 // The server began to stop, or the last place was taken,
                 // while the socket was being opened.
                 let _ = socket.send(Message::Close(None)).await;

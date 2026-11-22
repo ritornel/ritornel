@@ -37,6 +37,7 @@ mod invent;
 mod jobs;
 mod lastfm;
 mod library;
+mod link;
 mod listener;
 mod lock;
 mod logs;

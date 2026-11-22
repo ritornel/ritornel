@@ -17,12 +17,12 @@ use ritornel_contract::methods::{
     HistoryRebuild, HistoryRecent, HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones,
     IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall,
     LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
-    LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, ListClose,
-    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
-    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
-    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
-    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus, ServersList,
-    SourcesAdd, SourcesList, SourcesTracks, TracksGet,
+    LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkInvite,
+    LinkJoin, LinkStatusCall, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
+    MediaTokenCall, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume,
+    PlaybackSeek, PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove,
+    QueueRemove, QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello,
+    ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -52,6 +52,7 @@ mod churn;
 mod export;
 mod history;
 mod lastfm;
+mod link;
 mod lists;
 #[cfg(feature = "media-session")]
 mod media_keys;
@@ -116,6 +117,17 @@ pub(crate) struct Core {
     local_credential: Verifier,
     /// What the descriptor's proof is signed with.
     signer: ritornel_engine::Signer,
+    /// The invites this hub has made and not seen used.
+    invites: crate::link::Invites,
+    /// The link sessions this hub has issued, checked as the local
+    /// credential is.
+    link_sessions: crate::link::LinkSessions,
+    /// Where other machines reach this server, once it is listening: empty
+    /// when it listens on loopback only.
+    routes: std::sync::OnceLock<Vec<String>>,
+    /// The runtime the server runs on, for the calls that go out to
+    /// another server. `None` in the dispatcher's own tests.
+    runtime: Option<tokio::runtime::Handle>,
     /// What a library created here takes its times and its IDs from.
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
@@ -175,7 +187,7 @@ struct Sessions {
     closed: bool,
 }
 
-fn role(role: Role) -> ServerRole {
+pub(super) fn role(role: Role) -> ServerRole {
     match role {
         Role::Unassigned => ServerRole::Unassigned,
         Role::Hub => ServerRole::Hub,
@@ -215,6 +227,8 @@ impl Core {
             .ok_or(Error::Store(ritornel_engine::Error::Corrupt(
                 "a running server with no identity",
             )))?;
+        let link_sessions =
+            crate::link::LinkSessions::new(stores.server.link_sessions().map_err(Error::Store)?);
         let cache = dir.cache()?;
         let covers = ritornel_engine::covers::Covers::new(&cache).map_err(|error| Error::Io {
             doing: "prepare",
@@ -229,6 +243,10 @@ impl Core {
             job_events: Mutex::default(),
             local_credential,
             signer,
+            invites: crate::link::Invites::default(),
+            link_sessions,
+            routes: std::sync::OnceLock::new(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
             clock,
             entropy,
             bounds,
@@ -275,17 +293,35 @@ impl Core {
         lock(&self.this).role == ServerRole::Hub
     }
 
-    /// What kind of session `token` holds, if it holds one. The only
-    /// credential there is yet is the local one, and it is `full`.
+    /// What kind of session `token` holds, if it holds one, and the
+    /// satellite it is the link of, if it is a link session. The local
+    /// credential and a link session are both `full`.
     ///
     /// Every credential check goes through here: the per-call session check
-    /// and revocation will too. It compares against what the server loaded
-    /// when it started and touches neither a file nor the database, so it
-    /// is safe to call on an async worker.
-    pub(crate) fn authenticate(&self, token: &SessionToken) -> Option<SessionKind> {
-        self.local_credential
-            .accepts(token)
-            .then_some(SessionKind::Full)
+    /// and revocation will too. It compares against what the server holds
+    /// in memory and touches neither a file nor the database, so it is safe
+    /// to call on an async worker.
+    pub(crate) fn authenticate(
+        &self,
+        token: &SessionToken,
+    ) -> Option<(SessionKind, Option<crate::link::Peer>)> {
+        if self.local_credential.accepts(token) {
+            return Some((SessionKind::Full, None));
+        }
+        self.link_sessions
+            .peer(token)
+            .map(|peer| (SessionKind::Full, Some(peer)))
+    }
+
+    /// Says where other machines reach this server: once, when it starts
+    /// listening. Listening on loopback only, nowhere.
+    pub(crate) fn set_routes(&self, routes: Vec<String>) {
+        let _ = self.routes.set(routes);
+    }
+
+    /// The routes an invite offers when it is not told which.
+    fn offered_routes(&self) -> Vec<String> {
+        self.routes.get().cloned().unwrap_or_default()
     }
 
     /// What the server says about itself to anyone who asks. With a
@@ -297,6 +333,7 @@ impl Core {
             capability::EVENTS_LIBRARY,
             capability::LISTS,
             capability::MEDIA_ART,
+            capability::LINK,
         ]
         .map(str::to_owned)
         .to_vec();
@@ -344,12 +381,17 @@ impl Core {
 
     /// Opens a session of this kind. `None` once the server is stopping,
     /// and while it has as many sessions as it takes.
-    fn open(&self, sessions: &mut Sessions, kind: SessionKind) -> Option<Arc<Session>> {
+    fn open(
+        &self,
+        sessions: &mut Sessions,
+        kind: SessionKind,
+        peer: Option<Id>,
+    ) -> Option<Arc<Session>> {
         if sessions.closed || sessions.open.len() >= self.bounds.max_sessions {
             return None;
         }
         sessions.next_id += 1;
-        let session = Arc::new(Session::new(sessions.next_id, kind));
+        let session = Arc::new(Session::linked(sessions.next_id, kind, peer));
         sessions.open.insert(session.id(), Arc::clone(&session));
         self.fanout.add(&session);
         Some(session)
@@ -358,7 +400,7 @@ impl Core {
     /// Opens a session with no transport, for a test to call through.
     #[cfg(test)]
     pub(crate) fn open_session(&self, kind: SessionKind) -> Option<Arc<Session>> {
-        self.open(&mut lock(&self.sessions), kind)
+        self.open(&mut lock(&self.sessions), kind, None)
     }
 
     /// The sessions that are open, oldest first.
@@ -377,12 +419,13 @@ impl Core {
     pub(crate) fn run<W: Wire + 'static>(
         self: &Arc<Self>,
         kind: SessionKind,
+        peer: Option<Id>,
         mut wire: W,
     ) -> Result<(), W> {
         // One lock for the check and for the task, so that a stop sees
         // either none of this or all of it.
         let mut sessions = lock(&self.sessions);
-        let Some(session) = self.open(&mut sessions, kind) else {
+        let Some(session) = self.open(&mut sessions, kind, peer) else {
             return Err(wire);
         };
         // Tasks that have ended are forgotten as new ones come.
@@ -744,6 +787,13 @@ impl Core {
             RecordDismiss::NAME => {
                 run::<RecordDismiss>(params, |params| self.record_dismiss(stores, &params))
             }
+            LinkInvite::NAME => {
+                run::<LinkInvite>(params, |params| self.link_invite(stores, session, &params))
+            }
+            LinkJoin::NAME => {
+                run::<LinkJoin>(params, |params| self.link_join(stores, session, &params))
+            }
+            LinkStatusCall::NAME => run::<LinkStatusCall>(params, |_| self.link_status(stores)),
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {
                 run::<HistorySetZones>(params, |params| self.history_set_zones(stores, &params))
@@ -1097,7 +1147,7 @@ mod tests {
                 "name": "desk",
                 "role": "unassigned",
                 "contractVersion": CONTRACT_VERSION,
-                "capabilities": ["events.servers", "events.library", "lists", "media.art"],
+                "capabilities": ["events.servers", "events.library", "lists", "media.art", "link"],
                 "limits": {
                     "maxMessageBytes": 1_048_576,
                     "maxViews": 16,
@@ -1291,7 +1341,7 @@ mod tests {
                     "server": env!("CARGO_PKG_VERSION"),
                     "contract": CONTRACT_VERSION,
                     "sqlite": "3.54.1",
-                    "serverSchema": 1,
+                    "serverSchema": ritornel_engine::SERVER_SCHEMA_VERSION,
                 },
                 // There is no library, so nothing is said of one.
                 "freeDisk": { "dataBytes": free },
@@ -1703,6 +1753,7 @@ mod tests {
                 "events.library",
                 "lists",
                 "media.art",
+                "link",
                 "playback"
             ]
         );
@@ -2017,16 +2068,16 @@ mod tests {
         let (core, scratch) = core();
         let token = std::fs::read_to_string(scratch.path().join("data/credential")).unwrap();
         let token = SessionToken::new(token.trim());
-        assert_eq!(core.authenticate(&token), Some(SessionKind::Full));
+        assert_eq!(core.authenticate(&token), Some((SessionKind::Full, None)));
         assert_eq!(core.authenticate(&SessionToken::new("anything")), None);
         assert_eq!(core.authenticate(&SessionToken::new("")), None);
 
         // With the database busy, and then gone, the answer is the same.
         let busy = core.stall();
-        assert_eq!(core.authenticate(&token), Some(SessionKind::Full));
+        assert_eq!(core.authenticate(&token), Some((SessionKind::Full, None)));
         drop(busy);
         core.close_store().unwrap();
-        assert_eq!(core.authenticate(&token), Some(SessionKind::Full));
+        assert_eq!(core.authenticate(&token), Some((SessionKind::Full, None)));
         assert_eq!(core.authenticate(&SessionToken::new("anything")), None);
     }
 

@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use ritornel_contract::{EVENT_METHOD, Event, Frame, Notification, SessionKind, Topic};
+use ritornel_contract::{EVENT_METHOD, Event, Frame, Id, Notification, SessionKind, Topic};
 use ritornel_engine::View;
 use tokio::sync::{Notify, watch};
 use tracing::error;
@@ -24,6 +24,8 @@ use crate::views::Views;
 pub(crate) struct Session {
     id: u64,
     kind: SessionKind,
+    /// On a hub, the satellite this session is the link of.
+    peer: Option<Id>,
     state: Mutex<State>,
     /// Wakes the one task that sends this session's frames.
     wake: Notify,
@@ -108,10 +110,17 @@ fn merge(unsent: &mut Event, newer: Event) {
 }
 
 impl Session {
+    #[cfg(test)]
     pub(crate) fn new(id: u64, kind: SessionKind) -> Self {
+        Self::linked(id, kind, None)
+    }
+
+    /// A session that is the link of the satellite `peer`, if there is one.
+    pub(crate) fn linked(id: u64, kind: SessionKind, peer: Option<Id>) -> Self {
         Self {
             id,
             kind,
+            peer,
             state: Mutex::default(),
             wake: Notify::new(),
             shut: watch::Sender::new(false),
@@ -126,6 +135,11 @@ impl Session {
 
     pub(crate) fn kind(&self) -> SessionKind {
         self.kind
+    }
+
+    /// The satellite this session is the link of: `None` for a client's.
+    pub(crate) fn peer(&self) -> Option<Id> {
+        self.peer
     }
 
     fn state(&self) -> MutexGuard<'_, State> {

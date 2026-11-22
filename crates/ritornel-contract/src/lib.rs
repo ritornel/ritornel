@@ -47,6 +47,7 @@ mod id;
 mod identity;
 mod lastfm;
 mod library;
+mod link;
 mod list;
 pub mod local;
 mod media;
@@ -91,6 +92,10 @@ pub use library::{
     JobItem, JobState, JobTarget, JobsList, LibraryStats, PictureFolder, PictureFolders,
     PicturesImported, ScanStartParams, ScanStarted, ScanSummary, Source, SourceAdded, SourceKind,
     SourcesAddParams, SourcesList,
+};
+pub use link::{
+    HubStatus, InviteLink, LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkRequest,
+    LinkStatus, SatelliteStatus,
 };
 pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,
@@ -149,6 +154,9 @@ pub mod capability {
     /// The server serves covers at `GET /v1/art/{artId}/{size}`, with the
     /// media token from `media.token`.
     pub const MEDIA_ART: &str = "media.art";
+    /// The server can be linked to another: `link.invite` on a hub,
+    /// `link.join` on a server with no library, and `link.status`.
+    pub const LINK: &str = "link";
     /// The server has a player: the `playback.*` and `queue.*` calls and
     /// the `playback`, `progress` and `queue` topics. A server with no
     /// audio output has none, and refuses those calls as `unsupported`
@@ -173,6 +181,12 @@ pub mod route {
     /// The [public descriptor](crate::PublicDescriptor). It is the one
     /// route that needs no credential.
     pub const DESCRIPTOR: &str = "/v1/descriptor";
+
+    /// Where a satellite joins a hub: a `POST` of a
+    /// [`LinkRequest`](crate::LinkRequest), answered with a
+    /// [`LinkGranted`](crate::LinkGranted). Like the descriptor it needs no
+    /// credential: the invite's secret is the credential.
+    pub const LINK: &str = "/v1/link";
 
     /// Whether the server is up: a [`Health`]. It needs a credential.
     pub const HEALTH: &str = "/v1/health";

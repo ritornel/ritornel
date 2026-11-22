@@ -468,6 +468,26 @@ methods! {
     /// record ends only when it is put right.
     RecordDismiss: "record.dismiss", Command, needs_full: true,
     DismissParams => Dismissed;
+
+    /// `link.invite`: on a hub listening on the private network, makes a
+    /// one-time link, good for ten minutes, that another server joins with
+    /// to become this hub's satellite. Only a session on the hub's own
+    /// machine may ask for one, never a satellite's.
+    LinkInvite: "link.invite", Session, needs_full: true,
+    LinkInviteParams => LinkInvite;
+
+    /// `link.join`: makes this server, which holds no library and is
+    /// linked to none, the satellite of the hub that made the link. It
+    /// checks that the hub holds the key the link names before it sends
+    /// anything. Sent again once it has joined that hub, it answers as
+    /// `link.status` does.
+    LinkJoin: "link.join", Command, needs_full: true,
+    LinkJoinParams => LinkStatus;
+
+    /// `link.status`: this server's hub, if it is a satellite, or its
+    /// satellites, if it is a hub.
+    LinkStatusCall: "link.status", Query, needs_full: true,
+    NoParams => LinkStatus;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -547,7 +567,10 @@ mod tests {
                 "library.setWatching",
                 "server.backup",
                 "history.export",
-                "record.dismiss"
+                "record.dismiss",
+                "link.invite",
+                "link.join",
+                "link.status"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -590,7 +613,10 @@ mod tests {
                 "library.setWatching",
                 "server.backup",
                 "history.export",
-                "record.dismiss"
+                "record.dismiss",
+                "link.invite",
+                "link.join",
+                "link.status"
             ]
         );
         // Everything but reading the library and controlling playback

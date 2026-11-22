@@ -43,6 +43,7 @@ pub(crate) fn attach(core: &Arc<Core>, kind: SessionKind) -> (Sender<String>, Re
     // are dropped here, and the client finds both closed.
     let _ = core.run(
         kind,
+        None,
         Channels {
             from_client,
             to_client,

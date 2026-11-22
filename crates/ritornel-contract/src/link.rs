@@ -1,0 +1,234 @@
+//! The link between a hub and its satellites: inviting one, joining one,
+//! and what each says of the other. See "The link between the hub and a
+//! satellite" in docs/design/linking.md.
+//!
+//! A hub invites a satellite with a one-time link that names the hub, its
+//! public key and where it may be reached, and carries a secret. The
+//! satellite checks that the server at a route proves it holds that key,
+//! trades the secret for a link session at `POST /v1/link`, and from then
+//! on dials the hub with that session. The hub never dials a satellite.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{Id, ServerRole, hex};
+
+/// The params of `link.invite`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkInviteParams {
+    /// Where the satellite may reach the hub, as `address:port`, in the
+    /// order to try. Left empty, the hub offers the addresses it finds it
+    /// has on the private network and a tailnet.
+    #[serde(default)]
+    pub routes: Vec<String>,
+}
+
+/// The result of `link.invite`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkInvite {
+    /// The link to give the satellite: `link.join` takes it. It holds a
+    /// secret, and works once.
+    pub link: String,
+    /// When it stops working, as Unix milliseconds.
+    pub expires_at_ms: i64,
+}
+
+/// The params of `link.join`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkJoinParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// The link `link.invite` gave on the hub.
+    pub link: String,
+}
+
+/// The result of `link.status`, and of `link.join`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkStatus {
+    /// This server's role.
+    pub role: ServerRole,
+    /// On a satellite, its hub. Left out on any other server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub hub: Option<HubStatus>,
+    /// On a hub, the satellites linked to it, oldest first.
+    #[serde(default)]
+    pub satellites: Vec<SatelliteStatus>,
+}
+
+/// A satellite's hub, as the satellite knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HubStatus {
+    /// The hub's server ID.
+    pub server_id: Id,
+    /// The hub's name. Text from another machine: display only.
+    pub name: String,
+    /// The library the hub holds.
+    pub library_id: Id,
+    /// The hub epoch the satellite last saw.
+    pub epoch: i64,
+    /// Where the hub is reached, in the order they are tried.
+    pub routes: Vec<String>,
+    /// When the satellite joined, as Unix milliseconds.
+    pub linked_at_ms: i64,
+}
+
+/// A satellite, as its hub knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SatelliteStatus {
+    /// The satellite's server ID.
+    pub server_id: Id,
+    /// Its name when it joined. Text from another machine: display only.
+    pub name: String,
+    /// When it joined, as Unix milliseconds.
+    pub linked_at_ms: i64,
+}
+
+/// What a satellite sends to `POST /v1/link` to join: the invite's secret
+/// and who it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRequest {
+    /// The invite's secret, as hex.
+    pub secret: String,
+    /// The satellite's server ID.
+    pub server_id: Id,
+    /// The satellite's name.
+    pub name: String,
+    /// The [contract version](crate::CONTRACT_VERSION) the satellite
+    /// speaks. A hub refuses another.
+    pub contract_version: u32,
+}
+
+/// What the hub answers a satellite that joined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkGranted {
+    /// The link session's token, which the satellite presents from now on.
+    pub token: String,
+    /// The library the hub holds.
+    pub library_id: Id,
+    /// The hub epoch.
+    pub epoch: i64,
+}
+
+/// The scheme of an invite link.
+const SCHEME: &str = "ritornel://link/";
+
+/// An invite, as its link writes it:
+/// `ritornel://link/<hub ID>?key=<public key>&route=<address:port>…#<secret>`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InviteLink {
+    /// The hub's server ID.
+    pub hub: Id,
+    /// The hub's public key.
+    pub key: [u8; 32],
+    /// Where the hub may be reached, in order.
+    pub routes: Vec<String>,
+    /// The secret that is traded for a link session.
+    pub secret: [u8; 32],
+}
+
+impl InviteLink {
+    /// Reads a link. `None` if it is not one.
+    pub fn parse(text: &str) -> Option<Self> {
+        let rest = text.trim().strip_prefix(SCHEME)?;
+        let (rest, secret) = rest.split_once('#')?;
+        let (hub, query) = rest.split_once('?')?;
+        let mut key = None;
+        let mut routes = Vec::new();
+        for pair in query.split('&') {
+            match pair.split_once('=')? {
+                ("key", value) => key = Some(hex::decode_array(value)?),
+                ("route", value) if !value.is_empty() => routes.push(value.to_owned()),
+                _ => return None,
+            }
+        }
+        if routes.is_empty() {
+            return None;
+        }
+        Some(Self {
+            hub: hub.parse().ok()?,
+            key: key?,
+            routes,
+            secret: hex::decode_array(secret)?,
+        })
+    }
+}
+
+/// The link itself, secret and all: it is what a person copies to the
+/// satellite.
+impl fmt::Display for InviteLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{SCHEME}{}?key={}", self.hub, hex::encode(&self.key))?;
+        for route in &self.routes {
+            write!(f, "&route={route}")?;
+        }
+        write!(f, "#{}", hex::encode(&self.secret))
+    }
+}
+
+/// Never the secret.
+impl fmt::Debug for InviteLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InviteLink")
+            .field("hub", &self.hub)
+            .field("routes", &self.routes)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invite() -> InviteLink {
+        InviteLink {
+            hub: Id::from_bytes([0x11; 16]),
+            key: [0x22; 32],
+            routes: vec![
+                "192.168.1.20:4747".to_owned(),
+                "100.101.7.3:4747".to_owned(),
+            ],
+            secret: [0x33; 32],
+        }
+    }
+
+    #[test]
+    fn a_link_reads_back_as_it_was_written() {
+        let text = invite().to_string();
+        assert!(text.starts_with("ritornel://link/11111111-1111-1111-1111-111111111111?key=2222"));
+        assert!(text.contains("&route=192.168.1.20:4747&route=100.101.7.3:4747#3333"));
+        assert_eq!(InviteLink::parse(&format!("  {text}\n")), Some(invite()));
+        assert!(!format!("{:?}", invite()).contains("3333"));
+    }
+
+    #[test]
+    fn anything_else_is_not_a_link() {
+        let text = invite().to_string();
+        for wrong in [
+            String::new(),
+            text.replace("ritornel://link/", "http://"),
+            text.replace('#', "&"),
+            text.replace("key=22", "key=zz"),
+            text.replace("&route=192.168.1.20:4747&route=100.101.7.3:4747", ""),
+            text.replace("route=", "other="),
+            text.replace("#3333", "#33"),
+        ] {
+            assert_eq!(InviteLink::parse(&wrong), None, "{wrong}");
+        }
+    }
+}

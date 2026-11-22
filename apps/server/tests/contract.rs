@@ -198,6 +198,7 @@ impl Running {
                 capability::EVENTS_LIBRARY,
                 capability::LISTS,
                 capability::MEDIA_ART,
+                capability::LINK,
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -375,7 +376,10 @@ async fn the_status_reports_versions_role_and_server_id(via: Via) {
     assert_eq!(status.versions.server, env!("CARGO_PKG_VERSION"));
     assert_eq!(status.versions.contract, CONTRACT_VERSION);
     assert_eq!(status.versions.sqlite, "3.54.1");
-    assert_eq!(status.versions.server_schema, 1);
+    assert_eq!(
+        status.versions.server_schema,
+        ritornel_engine::SERVER_SCHEMA_VERSION
+    );
     // It has no library, and says nothing of one.
     assert_eq!(status.versions.library_schema, None);
     assert_eq!(status.library, None);
