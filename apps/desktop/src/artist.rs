@@ -213,10 +213,11 @@ pub(crate) struct Artist {
     /// The display's scale they were read for: on another display the face
     /// and the portrait are read again, sharp there.
     pictured_scale: f32,
-    /// The last read of the face and of the portrait asked for: an earlier
+    /// The last read of the face, the portrait and the blurs asked for: an earlier
     /// one coming late, for another display or picture, is let go.
     face_read: u64,
     portrait_read: u64,
+    blur_read: u64,
     pub top: f32,
     elastic: crate::elastic::Elastic,
     /// How tall the page was when last drawn, and the column of history
@@ -283,6 +284,7 @@ impl Artist {
             pictured_scale: 0.,
             face_read: 0,
             portrait_read: 0,
+            blur_read: 0,
             top: 0.,
             elastic: crate::elastic::Elastic::default(),
             height: Rc::new(Cell::new(0.)),
@@ -545,6 +547,8 @@ impl Artist {
         }
         self.pictured_for = Some((art, wants_portrait));
         self.pictured_scale = scale;
+        self.blur_read += 1;
+        let blur_read = self.blur_read;
         // A portrait of another picture, or of none, is not kept meanwhile.
         self.forget_portrait(Some(window), cx);
         self.picture_failed = false;
@@ -574,8 +578,8 @@ impl Artist {
         cx.spawn(async move |this, cx| {
             let blurs = blurs.await.ok().flatten();
             this.update(cx, |page, cx| {
-                // Too late: the page shows another picture now.
-                if page.pictured_for.map(|(at, _)| at) != Some(Some(art)) {
+                // Too late: the page has asked for its pictures again since.
+                if page.blur_read != blur_read {
                     return;
                 }
                 match blurs {
