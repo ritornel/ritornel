@@ -7,6 +7,7 @@
 //! than the file in hand, and a job that was stopped is taken up again by
 //! the next run from what it had committed.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -101,7 +102,7 @@ impl Worker {
     pub(crate) fn stop(mut self) {
         self.signal();
         if let Some(thread) = self.thread.take() {
-            // It has panicked only if a job did, which the log has.
+            // A job that panicked was caught, and the log has it.
             let _ = thread.join();
         }
     }
@@ -126,7 +127,7 @@ fn work(core: &Core, boot: Id, scan: ScanSettings, stop: &AtomicBool) {
         while !stop.load(Ordering::SeqCst) {
             let claimed = core.with_stores(|stores| stores.server().claim_job(boot));
             match claimed {
-                Some(Ok(Some(job))) => run(core, job, scan, stop),
+                Some(Ok(Some(job))) => caught(core, job, |job| run(core, job, scan, stop)),
                 Some(Ok(None)) => break,
                 Some(Err(failed)) => {
                     error!(error = %failed, "no job could be claimed");
@@ -139,6 +140,43 @@ fn work(core: &Core, boot: Id, scan: ScanSettings, stop: &AtomicBool) {
         if stop.load(Ordering::SeqCst) {
             return;
         }
+    }
+}
+
+/// Runs `body` on a claimed job, and ends the job as failed if it panics,
+/// as a reader may on a file it cannot make sense of. The worker lives on
+/// to run the jobs after it, and the job is not left running for ever.
+pub(crate) fn caught(
+    core: &Core,
+    job: ritornel_engine::Job,
+    body: impl FnOnce(ritornel_engine::Job),
+) {
+    let (row, job_id) = (job.id, job.public_id);
+    let Err(panicked) = std::panic::catch_unwind(AssertUnwindSafe(|| body(job))) else {
+        return;
+    };
+    let why = panicked
+        .downcast_ref::<&str>()
+        .map(|why| (*why).to_owned())
+        .or_else(|| panicked.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no reason given".to_owned());
+    let failure = format!("the job stopped on an error it did not expect: {why}");
+    error!(job_id = %job_id, error = %failure, "a job panicked");
+    let ended = core.with_stores(|stores| {
+        stores
+            .server()
+            .finish_job(row, JobState::Failed, Some(failure))
+    });
+    match ended {
+        Some(Ok(job)) => {
+            core.publish_job(&job);
+            // Changes that waited for this job to end may go now.
+            core.wake_watch();
+        }
+        Some(Err(failed)) => {
+            error!(job_id = %job_id, error = %failed, "a job's end could not be saved")
+        }
+        None => {}
     }
 }
 

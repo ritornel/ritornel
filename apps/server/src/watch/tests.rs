@@ -494,6 +494,26 @@ fn a_manual_scan_queued_or_running_since_the_changes_is_joined() {
 }
 
 #[test]
+fn a_job_that_panics_ends_as_failed_and_says_why() {
+    let mut rig = Rig::new();
+    let mut start = rig.key();
+    start["sourceId"] = json!(rig.source);
+    rig.call("scan.start", start);
+    let boot = Id::from_bytes([0xb0; 16]);
+    let job = rig
+        .core
+        .with_stores(|stores| stores.server().claim_job(boot).unwrap().unwrap())
+        .unwrap();
+    crate::jobs::caught(&rig.core, job, |_| panic!("a file the reader chokes on"));
+    let ended = rig.jobs().pop().unwrap();
+    assert_eq!(ended.state, JobState::Failed);
+    assert_eq!(
+        ended.error.as_deref(),
+        Some("the job stopped on an error it did not expect: a file the reader chokes on")
+    );
+}
+
+#[test]
 fn a_root_that_goes_offline_is_never_taken_to_be_empty() {
     let mut rig = Rig::new();
     let away = rig.scratch.path().join("unmounted");
