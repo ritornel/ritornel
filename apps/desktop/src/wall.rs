@@ -41,6 +41,10 @@ const FOOT: f32 = 48.;
 const PAGE: usize = 100;
 /// Pages of rows kept: 20,000 rows. The real client keeps 40.
 const KEEP_PAGES: usize = 200;
+/// How often the wall's view is used while nothing else reads it. The
+/// server lets a view go once it has gone ten minutes unused, and tells the
+/// wall of no more changes; a wall with its rows all read uses it no more.
+const KEEP_VIEW: Duration = Duration::from_secs(4 * 60);
 const PAGES_IN_FLIGHT: usize = 4;
 /// Decoded covers kept, in bytes of pixels. GPUI's sprite atlas holds a
 /// second copy of each on the GPU. `RITORNEL_GPUI_COVER_MB` overrides it,
@@ -268,6 +272,8 @@ pub(crate) struct Wall {
     _looks: gpui::Subscription,
     /// The task that takes covers in for this session.
     arrivals: Option<gpui::Task<()>>,
+    /// Uses the view now and then, so that the server keeps it.
+    keeping: Option<gpui::Task<()>>,
     /// Whether the view could not be opened.
     failed: bool,
     view: Option<String>,
@@ -324,6 +330,16 @@ pub(crate) struct Wall {
     replace_again: bool,
     /// After a replacement, the row to keep where it was on screen.
     pending_anchor: Option<(usize, f32)>,
+    /// Bumped with each open or replacement of the view, and whenever the
+    /// wall or the session changes: an answer to any but the latest is let
+    /// go, and the view it opened is closed.
+    opening: u64,
+    /// The newest library revision a list event has named, of any view: one
+    /// newer than a view just opened says it changed while it was opening.
+    heard_revision: u64,
+    /// The server has let the view go: nothing is read through it until
+    /// another takes its place.
+    lost: bool,
     /// Which wall, in which order, and whether the large letters stand beside it.
     pub kind: WallKind,
     pub order: Order,
@@ -356,6 +372,20 @@ impl Wall {
             LinkEvent::Connected(net) => wall.start(Arc::clone(net), cx),
             LinkEvent::Away => wall.end(cx),
             LinkEvent::Server(ritornel_contract::Event::List(event)) => wall.heard(event, cx),
+            // A change made while no view was held names no view, but its
+            // revision says whether a view that opens meanwhile is older.
+            LinkEvent::Server(ritornel_contract::Event::Library(event))
+                if event.changed.is_empty()
+                    || !event.changed.iter().all(|change| {
+                        matches!(
+                            change,
+                            ritornel_contract::LibraryChange::Stats
+                                | ritornel_contract::LibraryChange::Ratings
+                        )
+                    }) =>
+            {
+                wall.heard_revision = wall.heard_revision.max(event.library_revision);
+            }
             LinkEvent::Server(_) => {}
         });
         // The large letters follow Settings › Appearance at once.
@@ -379,6 +409,7 @@ impl Wall {
             _link: followed,
             _looks: looks,
             arrivals: None,
+            keeping: None,
             failed: false,
             view: None,
             total: 0,
@@ -413,6 +444,9 @@ impl Wall {
             last_replace: None,
             replace_again: false,
             pending_anchor: None,
+            opening: 0,
+            heard_revision: 0,
+            lost: false,
             kind: WallKind::Artists,
             order: BY_NAME,
             letters: true,
@@ -462,6 +496,17 @@ impl Wall {
         self.wants = Some(wants);
         self.loader = loader;
         self.net = Some(net);
+        // Revisions are the server's: another may count from elsewhere.
+        self.heard_revision = 0;
+        self.keeping = Some(cx.spawn(async move |wall, cx| {
+            loop {
+                cx.background_executor().timer(KEEP_VIEW).await;
+                if wall.update(cx, |wall, cx| wall.keep_view(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+        self.forget_asks();
         self.view = None;
         self.pages.clear();
         self.pages_in_flight = 0;
@@ -473,6 +518,8 @@ impl Wall {
     /// The session ended: what was read is let go, and the covers already
     /// decoded are kept.
     fn end(&mut self, cx: &mut Context<Self>) {
+        self.forget_asks();
+        self.keeping = None;
         self.net = None;
         self.wants = None;
         self.arrivals = None;
@@ -480,6 +527,16 @@ impl Wall {
         self.pages.clear();
         self.pages_in_flight = 0;
         cx.notify();
+    }
+
+    /// Lets go of every open and replacement under way: their answers are
+    /// for a wall, an order or a session since left.
+    fn forget_asks(&mut self) {
+        self.opening += 1;
+        self.lost = false;
+        self.replacing = None;
+        self.replace_again = false;
+        self.pending_anchor = None;
     }
 
     /// How the wall is laid out: under headings of time for a date, else
@@ -514,6 +571,7 @@ impl Wall {
         if let Some(view) = self.view.take() {
             self.close_view(view);
         }
+        self.forget_asks();
         self.kind = kind;
         self.order = order;
         self.pages.clear();
@@ -1038,6 +1096,7 @@ impl Wall {
     /// answered by a view that replaces this one, at most once a second,
     /// keeping the row at the top where it was on screen.
     fn heard(&mut self, event: &ritornel_contract::ListEvent, cx: &mut Context<Self>) {
+        self.heard_revision = self.heard_revision.max(event.library_revision);
         if self.view.as_deref() != Some(event.view.as_str())
             || event.library_revision <= self.revision
         {
@@ -1115,10 +1174,20 @@ impl Wall {
     /// keep in place; everything changes at once when its rows are in.
     fn replace(&mut self, cx: &mut Context<Self>) {
         self.last_replace = Some(Instant::now());
-        let (Some(net), Some(old), Some(layout)) =
-            (self.net.clone(), self.view.clone(), self.layout.clone())
-        else {
+        let (Some(net), Some(old)) = (self.net.clone(), self.view.clone()) else {
             self.replacing = None;
+            return;
+        };
+        // Not laid out yet, empty or never drawn, there is no row to keep in
+        // place: the view is opened afresh.
+        let Some(layout) = self.layout.clone() else {
+            self.forget_asks();
+            self.selected = None;
+            self.view = None;
+            self.close_view(old);
+            self.pages.clear();
+            self.pages_in_flight = 0;
+            self.open(cx);
             return;
         };
         let wall_top = (self.top - HEADER).max(0.);
@@ -1131,8 +1200,10 @@ impl Wall {
             WallKind::Albums => ListKind::Albums,
         };
         let key = self.order.key;
-        let asked = (self.kind, self.order);
+        self.opening += 1;
+        let asked = self.opening;
         let selected = self.selected.clone();
+        let selected_id = selected.as_ref().map(|selected| selected.id);
         let offset = (index / PAGE * PAGE) as u64;
         let replaced = net.rt().spawn(async move {
             let opened = client
@@ -1152,15 +1223,27 @@ impl Wall {
                     }),
                 })
                 .await?;
-            let sections = client.list_sections(&opened.view).await?;
-            // The rows around the anchor, so that what replaces the old ones is there at once.
-            let near = match opened.anchor_index {
-                Some(at) if at / PAGE as u64 * PAGE as u64 != offset => Some(
-                    client
-                        .list_window(&opened.view, at / PAGE as u64 * PAGE as u64, PAGE as u64)
-                        .await?,
-                ),
-                _ => None,
+            let read = async {
+                let sections = client.list_sections(&opened.view).await?;
+                // The rows around the anchor, so that what replaces the old ones is there at once.
+                let near = match opened.anchor_index {
+                    Some(at) if at / PAGE as u64 * PAGE as u64 != offset => Some(
+                        client
+                            .list_window(&opened.view, at / PAGE as u64 * PAGE as u64, PAGE as u64)
+                            .await?,
+                    ),
+                    _ => None,
+                };
+                Ok::<_, ritornel_client::Error>((sections, near))
+            };
+            // The old view has ended with the open: a new one that cannot be
+            // read is closed too, and the replacement is asked for again.
+            let (sections, near) = match read.await {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = client.list_close(&opened.view).await;
+                    return Err(error);
+                }
             };
             // The selection, found again in the new view.
             let found = match &selected {
@@ -1182,10 +1265,15 @@ impl Wall {
         cx.spawn(async move |wall, cx| {
             let answer = replaced.await;
             let _ = wall.update(cx, |wall, cx| {
+                // Asked for a wall, an order or a session since left.
+                if wall.opening != asked {
+                    if let Ok(Ok((opened, ..))) = &answer {
+                        wall.close_view(opened.view.clone());
+                    }
+                    return;
+                }
                 wall.replacing = None;
-                if (wall.kind, wall.order) == asked
-                    && let Ok(Ok((opened, sections, near, found))) = answer
-                {
+                if let Ok(Ok((opened, sections, near, found))) = answer {
                     wall.total = opened.total as usize;
                     wall.sections = sections
                         .sections
@@ -1194,13 +1282,17 @@ impl Wall {
                         .collect();
                     wall.pages.clear();
                     wall.pages_in_flight = 0;
-                    wall.pages.insert(
-                        opened.offset as usize / PAGE,
-                        Page::Ready {
-                            rows: rows_of(opened.rows),
-                            used: wall.frame,
-                        },
-                    );
+                    // A list grown shorter than the rows asked for answers from
+                    // its end, not from the start of a page: those are read anew.
+                    if opened.offset == offset {
+                        wall.pages.insert(
+                            opened.offset as usize / PAGE,
+                            Page::Ready {
+                                rows: rows_of(opened.rows),
+                                used: wall.frame,
+                            },
+                        );
+                    }
                     if let Some(near) = near {
                         wall.pages.insert(
                             near.offset as usize / PAGE,
@@ -1213,12 +1305,16 @@ impl Wall {
                     if let Some(at) = opened.anchor_index {
                         wall.pending_anchor = Some((at as usize, screen));
                     }
+                    // Found again for the row selected when asked, not one
+                    // chosen since, whose place is in the old view.
                     wall.selected = match (wall.selected.take(), found) {
-                        (Some(selected), Some(index)) => Some(Selected {
-                            index: index as usize,
-                            view: opened.view.clone(),
-                            ..selected
-                        }),
+                        (Some(selected), Some(index)) if Some(selected.id) == selected_id => {
+                            Some(Selected {
+                                index: index as usize,
+                                view: opened.view.clone(),
+                                ..selected
+                            })
+                        }
                         _ => None,
                     };
                     crate::debug(format_args!(
@@ -1227,13 +1323,47 @@ impl Wall {
                     ));
                     wall.revision = opened.library_revision;
                     wall.view = Some(opened.view);
+                    wall.lost = false;
                     wall.layout = None;
+                    // The library changed while it was opening.
+                    if wall.heard_revision > wall.revision {
+                        wall.replace_again = true;
+                    }
+                } else {
+                    // Not opened or not read: asked again, a second on at the soonest.
+                    wall.replace_again = true;
                 }
                 if std::mem::take(&mut wall.replace_again) {
                     wall.schedule_replace(cx);
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Uses the view, reading its first row, so that the server keeps it; one
+    /// the server has let go already is opened again in its place.
+    fn keep_view(&mut self, cx: &mut Context<Self>) {
+        let (Some(view), Some(net)) = (self.view.clone(), self.net.clone()) else {
+            return;
+        };
+        let asked_of = view.clone();
+        let client = Arc::clone(&net.client);
+        let read = net
+            .rt()
+            .spawn(async move { client.list_window(&view, 0, 1).await });
+        cx.spawn(async move |wall, cx| {
+            let answer = read.await;
+            wall.update(cx, |wall, cx| {
+                if wall.view.as_deref() == Some(asked_of.as_str()) && expired(&answer) {
+                    wall.lost = true;
+                    if wall.replacing.is_none() {
+                        wall.schedule_replace(cx);
+                    }
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -1263,7 +1393,8 @@ impl Wall {
             WallKind::Albums => ListKind::Albums,
         };
         let key = self.order.key;
-        let asked = (self.kind, self.order);
+        self.opening += 1;
+        let asked = self.opening;
         let opened = net.rt().spawn(async move {
             let opened = client
                 .list_open(&ListOpenParams {
@@ -1285,8 +1416,9 @@ impl Wall {
         cx.spawn(async move |this, cx| {
             let answer = opened.await;
             this.update(cx, |wall, cx| {
-                // Opened for a wall or an order since left.
-                if (wall.kind, wall.order) != asked {
+                // Opened for a wall, an order or a session since left, or
+                // overtaken by another open.
+                if wall.opening != asked {
                     if let Ok(Ok((opened, _))) = &answer {
                         wall.close_view(opened.view.clone());
                     }
@@ -1309,7 +1441,12 @@ impl Wall {
                         );
                         wall.revision = opened.library_revision;
                         wall.view = Some(opened.view);
+                        wall.lost = false;
                         wall.layout = None;
+                        // The library changed while it was opening.
+                        if wall.heard_revision > wall.revision {
+                            wall.schedule_replace(cx);
+                        }
                         if let Some(artist) = wall.reveal.take() {
                             wall.locate(artist, cx);
                         }
@@ -1337,6 +1474,9 @@ impl Wall {
         let (Some(view), Some(net)) = (self.view.clone(), self.net.clone()) else {
             return;
         };
+        if self.lost {
+            return;
+        }
         self.pages.insert(page, Page::Loading);
         self.pages_in_flight += 1;
         let asked_of = view.clone();
@@ -1366,8 +1506,16 @@ impl Wall {
                         );
                         wall.evict_pages();
                     }
-                    _ => {
+                    // Unused for long, the view was let go by the server: one
+                    // opened in its place keeps the row at the top where it is.
+                    answer => {
                         wall.pages.remove(&page);
+                        if expired(&answer) {
+                            wall.lost = true;
+                            if wall.replacing.is_none() {
+                                wall.schedule_replace(cx);
+                            }
+                        }
                     }
                 }
                 cx.notify();
@@ -2055,6 +2203,15 @@ impl Wall {
         };
         self.fling = Some(fling);
     }
+}
+
+/// Whether a call on a view failed because the server had let the view go.
+fn expired<T>(answer: &Result<Result<T, ritornel_client::Error>, tokio::task::JoinError>) -> bool {
+    matches!(
+        answer,
+        Ok(Err(ritornel_client::Error::Call(error)))
+            if error.data.code == ritornel_contract::ErrorCode::ViewExpired
+    )
 }
 
 /// The letter's ink: faint at rest, full while the wall moves, fading back
