@@ -880,6 +880,29 @@ fn a_scanned_song_is_found_with_either_spelling_of_a_folded_letter() {
 }
 
 #[test]
+fn indexed_search_files_a_song_by_its_display_title() {
+    let lib = library(5);
+    lib.store.write(WriteRequest { method: "test.write", command: None, client: None }, |write| {
+        let db = write.connection();
+        let mut statement = db.prepare("SELECT min(id) FROM track_appearance GROUP BY recording_id ORDER BY recording_id LIMIT 2")?;
+        let ids = statement.query_map([], |row| row.get::<_, i64>(0))?.collect::<Result<Vec<_>, _>>()?;
+        for (key, title) in ids.into_iter().zip(["Å Harbor Frost", "The Harbor Dusk"]) {
+            db.execute("UPDATE track_appearance SET display_title = ?1 WHERE id = ?2", (title, key))?;
+            db.execute("UPDATE search_text SET title = ?1 WHERE rowid = ?2", (fold::fold(title), key))?;
+        }
+        Ok(String::new())
+    }).unwrap();
+    let songs = lib.store.search("harbor", 10).unwrap().songs;
+    assert_eq!(
+        songs
+            .iter()
+            .filter_map(|hit| hit.song.title.as_deref())
+            .collect::<Vec<_>>(),
+        ["Å Harbor Frost", "The Harbor Dusk"]
+    );
+}
+
+#[test]
 fn a_nul_in_typed_text_is_ignored_by_both_song_searches() {
     let mut rig = crate::scan_tests::Rig::new();
     rig.put("Tin Field.wav", "a.wav");
