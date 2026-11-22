@@ -12,7 +12,11 @@ use unicode_normalization::char::is_combining_mark;
 /// 2: a mark is kept wherever NFKC leaves it, so a virama or a tone mark
 /// keeps two names apart; punctuation that parts words (a dash, a slash, a
 /// plus) parts them as a space does; and "&" reads as "and".
-pub const NORMALIZER_VERSION: i64 = 2;
+///
+/// 3: a symbol at either end of a name, such as the plus of "Night Drives
+/// +", is a word of its key, so a record named apart by one is not the
+/// same record.
+pub const NORMALIZER_VERSION: i64 = 3;
 
 /// Whether a mark between two words parts them as a space does: dashes,
 /// slashes and the like. Everything else that is not a letter, a digit or a
@@ -23,11 +27,97 @@ fn parts_words(c: char) -> bool {
             .contains(c)
 }
 
+/// Whether a mark is a symbol, as Unicode's maths, currency and other
+/// symbols are, rather than punctuation: `+`, `=`, `÷`, `$`, `★`.
+fn is_symbol(c: char) -> bool {
+    !c.is_alphanumeric()
+        && matches!(c,
+            '+' | '<' | '=' | '>' | '$'
+            | '\u{a2}'..='\u{a6}' | '\u{a9}' | '\u{ac}' | '\u{ae}' | '\u{b0}' | '\u{b1}'
+            | '\u{d7}' | '\u{f7}'
+            | '\u{20a0}'..='\u{20cf}' | '\u{2100}'..='\u{2bff}' | '\u{1f000}'..='\u{1faff}')
+        // A mark that parts words, as a dash, a slash or a tilde does, is
+        // punctuation however it is written, but for a plus and a times.
+        && !(parts_words(c) && !matches!(c, '+' | '\u{d7}'))
+        // The brackets among them, ornamental and mathematical, are
+        // punctuation.
+        && !matches!(c,
+            '\u{2308}'..='\u{230b}' | '\u{2329}' | '\u{232a}' | '\u{2768}'..='\u{2775}'
+            | '\u{27c5}' | '\u{27c6}' | '\u{27e6}'..='\u{27ef}' | '\u{2983}'..='\u{2998}'
+            | '\u{29d8}'..='\u{29db}' | '\u{29fc}' | '\u{29fd}')
+}
+
+/// Whether a mark only says whether the character before it is drawn as
+/// text or as an emoji: no part of a key from version 3. Other variation
+/// selectors, which can make another ideograph, stay.
+fn is_presentation(c: char) -> bool {
+    matches!(c, '\u{fe0e}' | '\u{fe0f}')
+}
+
+/// The symbols in the marks before a name's first letter or digit, or
+/// after its last.
+fn edge_symbols(marks: impl Iterator<Item = char>) -> String {
+    marks
+        // "&" is the word "and" in a name with letters.
+        .take_while(|c| !c.is_alphanumeric() && *c != '&')
+        .filter(|c| is_symbol(*c))
+        .collect()
+}
+
+/// A name without the bracketed notes at its end: "Night Drives +" of
+/// "Night Drives + (Deluxe) [2024]".
+fn without_trailing_notes(text: &str) -> &str {
+    let mut end = text.trim_end();
+    while end.ends_with([')', ']', '}']) {
+        let mut depth = 0_u32;
+        let mut open = None;
+        for (at, c) in end.char_indices().rev() {
+            match c {
+                ')' | ']' | '}' => depth += 1,
+                '(' | '[' | '{' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        open = Some(at);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match open {
+            // A bracket of symbols alone is no note: "Night Drives (+)".
+            Some(at)
+                if end[at..].chars().any(|c| c.is_alphanumeric() || c == '&')
+                    || !end[at..].chars().any(is_symbol) =>
+            {
+                end = end[..at].trim_end();
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
 /// The key of a name: NFKC, lower case, "&" as "and", punctuation that
 /// parts words made a space, other punctuation and symbols removed, runs of
-/// white space made one space. A name that is nothing but punctuation
-/// keeps it, so that `!!!` and `???` stay two names.
+/// white space made one space. A symbol at either end stays, as a word of
+/// its own, so that "Night Drives +" is not "Night Drives". A name that is
+/// nothing but punctuation keeps it, so that `!!!` and `???` stay two
+/// names.
 pub fn normalize(text: &str) -> String {
+    normalize_with(text, true)
+}
+
+/// The key of a name without the symbols at either end, as version 2 made
+/// it: for telling whether two texts that came back from one place name
+/// the same thing.
+pub fn words_key(text: &str) -> String {
+    normalize_with(text, false)
+}
+
+/// [`normalize`], keeping the symbols at either end or not, as version 2
+/// did not.
+fn normalize_with(text: &str, edges: bool) -> String {
     // Lower case can leave a letter and a mark that compose: composed
     // again, and the dot that a capital dotted I leaves on its small i
     // taken off, as Turkish reads it.
@@ -41,7 +131,16 @@ pub fn normalize(text: &str) -> String {
         .collect();
     // "&" alone is a name of punctuation, not the word "and".
     if !folded.chars().any(char::is_alphanumeric) {
-        return folded.split_whitespace().collect::<Vec<_>>().join(" ");
+        let drawn: String = folded
+            .chars()
+            .filter(|c| !(edges && is_presentation(*c)))
+            .collect();
+        let kept = if drawn.trim().is_empty() {
+            folded.as_str()
+        } else {
+            drawn.as_str()
+        };
+        return kept.split_whitespace().collect::<Vec<_>>().join(" ");
     }
     let mut spaced = String::with_capacity(folded.len());
     for c in folded.chars() {
@@ -55,7 +154,9 @@ pub fn normalize(text: &str) -> String {
     for word in spaced.split_whitespace() {
         let kept: String = word
             .chars()
-            .filter(|c| c.is_alphanumeric() || is_combining_mark(*c))
+            .filter(|c| {
+                (c.is_alphanumeric() || is_combining_mark(*c)) && !(edges && is_presentation(*c))
+            })
             .collect();
         if !kept.chars().any(char::is_alphanumeric) {
             continue;
@@ -66,11 +167,39 @@ pub fn normalize(text: &str) -> String {
         key.push_str(&kept);
     }
     if key.is_empty() {
-        folded.split_whitespace().collect::<Vec<_>>().join(" ")
-    } else {
-        // Taking punctuation out can bring a letter and its mark together.
-        key.nfc().collect()
+        return folded.split_whitespace().collect::<Vec<_>>().join(" ");
     }
+    if edges {
+        let (first, last) = (
+            edge_symbols(folded.chars()),
+            edge_symbols(folded.chars().rev()),
+        );
+        if !first.is_empty() {
+            key.insert(0, ' ');
+            key.insert_str(0, &first);
+        }
+        if !last.is_empty() {
+            key.push(' ');
+            key.extend(last.chars().rev());
+        } else {
+            // A symbol just before the notes at the end keeps its place.
+            let head = without_trailing_notes(&folded);
+            let before = edge_symbols(head.chars().rev());
+            if !before.is_empty()
+                && head.len() < folded.trim_end().len()
+                && head.chars().any(char::is_alphanumeric)
+            {
+                let at =
+                    normalize_with(head, false).split(' ').count() + usize::from(!first.is_empty());
+                let mut words: Vec<&str> = key.split(' ').collect();
+                let before: String = before.chars().rev().collect();
+                words.insert(at.min(words.len()), &before);
+                key = words.join(" ");
+            }
+        }
+    }
+    // Taking punctuation out can bring a letter and its mark together.
+    key.nfc().collect()
 }
 
 /// The key of a name as normaliser `version` made it, for finding what an
@@ -78,6 +207,7 @@ pub fn normalize(text: &str) -> String {
 pub fn normalize_by(version: i64, text: &str) -> Option<String> {
     match version {
         1 => Some(normalize_v1(text)),
+        2 => Some(normalize_with(text, false)),
         NORMALIZER_VERSION => Some(normalize(text)),
         _ => None,
     }
@@ -118,13 +248,27 @@ fn normalize_v1(text: &str) -> String {
 /// keeps its full key.
 pub fn core(text: &str) -> String {
     let mut outside = String::with_capacity(text.len());
+    // A bracket of symbols alone, as "(+)", is kept: it is no note.
+    let mut inside = String::new();
     let mut depth = 0_u32;
     for c in text.chars() {
         match c {
             '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let folded: String = inside.nfkc().collect();
+                    let words = folded.chars().any(|c| c.is_alphanumeric() || c == '&');
+                    if !words && folded.chars().any(is_symbol) {
+                        outside.push(' ');
+                        outside.push_str(&inside);
+                        outside.push(' ');
+                    }
+                    inside.clear();
+                }
+            }
             _ if depth == 0 => outside.push(c),
-            _ => {}
+            _ => inside.push(c),
         }
     }
     let key = normalize(&outside);
@@ -280,6 +424,91 @@ mod tests {
             Some(normalize("Lanterns-42"))
         );
         assert_eq!(normalize_by(0, "Lanterns"), None);
+    }
+
+    #[test]
+    fn a_symbol_at_either_end_of_a_name_stays_in_its_key() {
+        // "Night Drives +" is another record than "Night Drives", however
+        // the symbol is spaced or bracketed.
+        assert_ne!(normalize("Night Drives +"), normalize("Night Drives"));
+        assert_eq!(normalize("Night Drives +"), "night drives +");
+        for spelling in ["Night Drives+", "Night Drives (+)", " Night Drives  + "] {
+            assert_eq!(normalize(spelling), "night drives +", "{spelling}");
+        }
+        // Records named by a symbol keep it beside a note.
+        let keys: Vec<String> = ["+ (Deluxe)", "= (Deluxe)", "\u{f7} (Deluxe)", "Deluxe"]
+            .into_iter()
+            .map(normalize)
+            .collect();
+        for (at, key) in keys.iter().enumerate() {
+            assert!(!keys[at + 1..].contains(key), "{keys:?}");
+        }
+        assert_eq!(normalize("\u{f7} (Deluxe)"), "\u{f7} deluxe");
+        // A symbol between words still parts them, and punctuation at
+        // either end is still no part of a name.
+        assert_eq!(normalize("Mira + Vale"), "mira vale");
+        assert_eq!(normalize("Mira+Vale"), "mira vale");
+        for spelling in [
+            "Night Drives!",
+            "(Night Drives)",
+            "Night Drives...",
+            "*Night Drives",
+            "Night Drives -",
+        ] {
+            assert_eq!(normalize(spelling), "night drives", "{spelling}");
+        }
+        // A symbol in brackets of its own stays in the key without notes
+        // too, and an emoji's presentation is no part of the key.
+        assert_eq!(core("Night Drives (+)"), "night drives +");
+        assert_eq!(core("Night Drives +"), "night drives +");
+        assert_eq!(core("Night Drives (Live)"), "night drives");
+        assert_eq!(normalize("Mira\u{2764}\u{fe0f}"), "mira \u{2764}");
+        assert_eq!(normalize("Mira \u{2764}\u{fe0f}"), "mira \u{2764}");
+        // A symbol before the notes at the end is kept where it is.
+        assert_eq!(
+            normalize("Night Drives + (Deluxe)"),
+            "night drives + deluxe"
+        );
+        assert_ne!(
+            normalize("Night Drives + (Deluxe)"),
+            normalize("Night Drives (Deluxe)")
+        );
+        assert_eq!(core("Night Drives + (Deluxe)"), "night drives +");
+        // A bracket of symbols before a note is the symbol, not a note.
+        assert_eq!(
+            normalize("Night Drives (+) (Deluxe)"),
+            "night drives + deluxe"
+        );
+        // A plus however wide, in brackets too.
+        assert_eq!(core("Night Drives (\u{ff0b})"), "night drives +");
+        // A selector that makes another ideograph keeps two names apart.
+        assert_ne!(
+            normalize("\u{845b}\u{e0100}"),
+            normalize("\u{845b}\u{e0101}")
+        );
+        assert_eq!(normalize("\u{2764}\u{fe0f}"), normalize("\u{2764}"));
+        // A bracket with "&" in it is a note, as one with "and" is.
+        assert_eq!(core("Night Drives (& +)"), core("Night Drives (and +)"));
+        // With a leading symbol too, and several notes.
+        assert_eq!(
+            normalize("\u{2605} Night Drives + (Deluxe) [2024]"),
+            "\u{2605} night drives + deluxe 2024"
+        );
+        // "&" is "and" wherever it is.
+        assert_eq!(normalize("Night Drives + &"), "night drives and");
+        // Marks that part words are not symbols, however they are written.
+        assert_eq!(normalize("\u{ff5e}Night Drives\u{ff5e}"), "night drives");
+        assert_eq!(normalize("\u{301c}Night Drives\u{301c}"), "night drives");
+        assert_eq!(normalize("Night Drives \u{2212}"), "night drives");
+        assert_eq!(normalize("Night Drives |"), "night drives");
+        // Ornamental brackets are brackets, not symbols.
+        assert_eq!(normalize("\u{2768}Night Drives\u{2769}"), "night drives");
+        // Version 2 dropped it, and its keys can be made again.
+        assert_eq!(
+            normalize_by(2, "Night Drives +"),
+            Some("night drives".to_owned())
+        );
+        assert_eq!(normalize_by(2, "Mira - Vale"), Some("mira vale".to_owned()));
     }
 
     #[test]
