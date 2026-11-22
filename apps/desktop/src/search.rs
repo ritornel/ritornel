@@ -162,6 +162,32 @@ struct View {
     /// Whether `hits` answer `text`.
     settled: bool,
     failed: bool,
+    sent: bool,
+    waiting: bool,
+}
+
+impl View {
+    fn dispatch(&mut self) -> bool {
+        !self.settled && !std::mem::replace(&mut self.sent, true)
+    }
+
+    fn fail(&mut self) {
+        self.hits.clear();
+        self.selected = 0;
+        self.settled = true;
+        self.failed = true;
+        self.waiting = false;
+    }
+
+    fn start(&mut self, text: String) {
+        self.text = text;
+        self.open = true;
+        self.selected = 0;
+        self.settled = false;
+        self.failed = false;
+        self.sent = false;
+        self.waiting = false;
+    }
 }
 
 pub(crate) struct SearchBox {
@@ -170,8 +196,6 @@ pub(crate) struct SearchBox {
     view: View,
     /// Bumped by every keystroke: an answer for an older one is dropped.
     asked: u64,
-    /// Return was pressed before the answer for what was typed came.
-    waiting: bool,
     asking: Option<Task<()>>,
     /// When the dropdown came down, for it to rise into place.
     dropped: Option<Instant>,
@@ -212,7 +236,6 @@ impl SearchBox {
                 ..View::default()
             },
             asked: 0,
-            waiting: false,
             asking: None,
             dropped: None,
             pictures: Pictures::default(),
@@ -237,8 +260,8 @@ impl SearchBox {
 
     /// The field's text changed.
     fn typed(&mut self, text: String, cx: &mut Context<Self>) {
-        self.waiting = false;
         self.asked += 1;
+        self.hovered_song = None;
         if text.trim().is_empty() {
             self.asking = None;
             self.view = View {
@@ -252,9 +275,7 @@ impl SearchBox {
         if !self.view.open {
             self.dropped = Some(Instant::now());
         }
-        self.view.text = text.clone();
-        self.view.open = true;
-        self.view.settled = false;
+        self.view.start(text.clone());
         let asked = self.asked;
         self.asking = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SETTLE).await;
@@ -265,9 +286,11 @@ impl SearchBox {
     }
 
     fn ask(&mut self, text: String, asked: u64, cx: &mut Context<Self>) {
+        if asked != self.asked || !self.view.dispatch() {
+            return;
+        }
         let Some(net) = self.link.read(cx).net() else {
-            self.view.settled = true;
-            self.view.failed = true;
+            self.view.fail();
             cx.notify();
             return;
         };
@@ -291,6 +314,7 @@ impl SearchBox {
                     Ok(Ok(results)) => {
                         let hits = hits_of(&results);
                         let selected = top_of(&hits, &results);
+                        let waiting = search.view.waiting;
                         search.view = View {
                             text,
                             open: true,
@@ -298,16 +322,16 @@ impl SearchBox {
                             selected,
                             settled: true,
                             failed: false,
+                            sent: true,
+                            waiting: false,
                         };
                         search.pictures_wanted(cx);
-                        if search.waiting {
-                            search.waiting = false;
+                        if waiting {
                             search.pick(selected, cx);
                         }
                     }
                     _ => {
-                        search.view.settled = true;
-                        search.view.failed = true;
+                        search.view.fail();
                     }
                 }
                 cx.notify();
@@ -370,6 +394,9 @@ impl SearchBox {
 
     /// The arrows: moves the choice, staying within the results.
     fn move_by(&mut self, by: i32, cx: &mut Context<Self>) {
+        if !self.view.settled {
+            return;
+        }
         let Some(last) = self.view.hits.len().checked_sub(1) else {
             return;
         };
@@ -388,7 +415,7 @@ impl SearchBox {
             self.pick(self.view.selected, cx);
             return;
         }
-        self.waiting = true;
+        self.view.waiting = true;
         let (text, asked) = (self.view.text.clone(), self.asked);
         self.ask(text, asked, cx);
     }
@@ -439,8 +466,8 @@ impl SearchBox {
     /// with it, and the field lets go of the keys.
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.asked += 1;
+        self.hovered_song = None;
         self.asking = None;
-        self.waiting = false;
         self.view = View {
             settled: true,
             ..View::default()
@@ -532,7 +559,8 @@ impl SearchBox {
     /// The dropdown: a raised card 440 points wide at the field's right
     /// edge, its rows 50 points with a 36-point picture in each.
     fn dropdown(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.view.open || !(self.view.settled || !self.view.hits.is_empty()) {
+        if !self.view.open || (!self.view.settled && self.view.hits.is_empty()) {
+            self.drop_bounds.set(None);
             return None;
         }
         let size = window.viewport_size();
@@ -619,13 +647,15 @@ impl SearchBox {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (title, sub, art, key, round) = Self::shown(hit);
-        let lit = index == self.view.selected;
+        let asked = self.asked;
+        let settled = self.view.settled;
+        let lit = settled && index == self.view.selected;
         let picture = art.and_then(|art| self.pictures.get(&art));
         let scale = window.scale_factor();
         let soft = (art.is_none())
             .then(|| theme::soft_cached(&format!("{title}{sub}"), (36. * scale).ceil() as u32));
         let song = matches!(hit, Hit::Song(_));
-        let playing = self.hovered_song == Some(index) && song;
+        let playing = settled && self.hovered_song == Some(index) && song;
         let arts = Rc::clone(&self.arts);
         let radius = if round { 18. } else { 6. };
         let mut face = div()
@@ -683,8 +713,10 @@ impl SearchBox {
                         cx.listener(move |search, _, window, cx| {
                             window.prevent_default();
                             cx.stop_propagation();
-                            search.close(cx);
-                            cx.emit(SearchEvent::Play(appearance));
+                            if search.asked == asked {
+                                search.close(cx);
+                                cx.emit(SearchEvent::Play(appearance));
+                            }
                         }),
                     )
                     .child(icon("play", 14., gpui::rgb(0xffffff))),
@@ -699,15 +731,24 @@ impl SearchBox {
             .items_center()
             .gap(px(12.))
             .when(lit, |row| row.bg(theme::fill()))
-            .on_mouse_move(cx.listener(move |search, _, _, cx| {
-                let hovered = song.then_some(index);
-                if search.view.selected != index || search.hovered_song != hovered {
-                    search.view.selected = index;
-                    search.hovered_song = hovered;
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(move |search, _, _, cx| search.pick(index, cx)))
+            .when(settled, |row| {
+                row.on_mouse_move(cx.listener(move |search, _, _, cx| {
+                    if search.asked != asked {
+                        return;
+                    }
+                    let hovered = song.then_some(index);
+                    if search.view.selected != index || search.hovered_song != hovered {
+                        search.view.selected = index;
+                        search.hovered_song = hovered;
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(move |search, _, _, cx| {
+                    if search.asked == asked {
+                        search.pick(index, cx);
+                    }
+                }))
+            })
             .child(face)
             .child(
                 div()
@@ -837,6 +878,36 @@ impl Render for SearchBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn previous_hits_stay_visible_until_the_next_search_fails() {
+        let mut view = View {
+            text: "Harbour".to_owned(),
+            hits: vec![Hit::Artist(ArtistRow {
+                artist_id: Id::from_bytes([1; 16]),
+                name: Some("Harbour".to_owned()),
+                sort_name: None,
+                album_count: 1,
+                track_count: 1,
+                art_id: None,
+                portrait: false,
+            })],
+            settled: true,
+            open: true,
+            ..View::default()
+        };
+        view.start("North".to_owned());
+        assert_eq!(view.hits.len(), 1);
+        assert_eq!(view.selected, 0);
+        assert!(!view.settled);
+        assert!(view.dispatch());
+        view.waiting = true;
+        assert!(!view.dispatch());
+        view.fail();
+        assert!(view.failed && view.settled);
+        assert!(!view.waiting);
+        assert!(view.hits.get(view.selected).is_none());
+    }
 
     fn tiny_image() -> Arc<RenderImage> {
         Arc::new(RenderImage::new(vec![image::Frame::new(

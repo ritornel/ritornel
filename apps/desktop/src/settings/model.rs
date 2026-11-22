@@ -22,10 +22,10 @@ use ritornel_contract::methods::{
     ServerStatus as StatusCall, SourcesAdd, SourcesList,
 };
 use ritornel_contract::{
-    DismissParams, ErrorCode, Event, Id, ImportPicturesParams, Job, JobCancelParams, JobTarget,
-    KeyParams, LastfmStatus, LastfmSyncParams, Method, NoParams, PictureFolders, ReceiptStatus,
-    ScanStartParams, ScrobblingParams, ServerStatus, SetZonesParams, SignInFinishParams, Source,
-    SourcesAddParams, WatchingParams, ZonePeriod,
+    DismissParams, ErrorCode, Event, Id, ImportPicturesParams, Job, JobCancelParams, JobState,
+    JobTarget, KeyParams, LastfmStatus, LastfmSyncParams, Method, NoParams, PictureFolders,
+    ReceiptStatus, ScanStartParams, ScrobblingParams, ServerStatus, SetZonesParams,
+    SignInFinishParams, Source, SourcesAddParams, WatchingParams, ZonePeriod,
 };
 
 use crate::link::{Link, LinkEvent};
@@ -87,6 +87,7 @@ pub(crate) struct Model {
     pub sources: Option<Vec<Source>>,
     /// The newest scan of each source, by its ID.
     pub scans: HashMap<Id, Job>,
+    sources_read: u64,
     pub pictures: Option<PictureFolders>,
     pub lastfm: Option<LastfmStatus>,
     pub zones: Option<Vec<ZonePeriod>>,
@@ -165,11 +166,50 @@ fn scanned(job: &Job) -> Option<Id> {
     }
 }
 
+/// Progress within one run of a scan, including the walk before the total is known.
+fn scan_progress(job: &Job) -> (u8, bool, u64, u64, u64, u64, u64) {
+    let phase = match job.state {
+        JobState::Queued => 0,
+        JobState::Running => 1,
+        JobState::Cancelling => 2,
+        _ => 3,
+    };
+    (
+        phase,
+        job.total.is_some(),
+        job.scan.map_or(0, |scan| scan.files),
+        job.done,
+        job.skipped,
+        job.failed,
+        job.bytes,
+    )
+}
+
+/// A list is newest first. An event cannot order two jobs created in the same millisecond.
+fn keep_scan(scans: &mut HashMap<Id, Job>, source: Id, job: Job, from_list: bool) -> bool {
+    if let Some(kept) = scans.get(&source) {
+        if job.job_id == kept.job_id {
+            if scan_progress(&job) <= scan_progress(kept) {
+                return false;
+            }
+        } else if !from_list && job.created_at <= kept.created_at {
+            return false;
+        }
+    }
+    scans.insert(source, job);
+    true
+}
+
 impl Model {
     /// Starts reading from the app's connection, now and each time it connects again.
     pub(crate) fn new(link: Entity<Link>, quiet: bool, cx: &mut Context<Self>) -> Self {
         let followed = cx.subscribe(&link, |model, _, event: &LinkEvent, cx| match event {
-            LinkEvent::Connected(_) => model.read_all(cx),
+            LinkEvent::Connected(_) => {
+                model.scans.clear();
+                model.busy.clear();
+                model.read_all(cx);
+                cx.notify();
+            }
             LinkEvent::Server(Event::Jobs(event)) => model.heard_job(event.job.clone(), cx),
             LinkEvent::Away | LinkEvent::Server(_) => cx.notify(),
         });
@@ -178,6 +218,7 @@ impl Model {
             link,
             sources: None,
             scans: HashMap::new(),
+            sources_read: 0,
             pictures: None,
             lastfm: None,
             zones: None,
@@ -233,18 +274,25 @@ impl Model {
         F: Future<Output = Result<T, Error>> + 'static,
     {
         let Some(net) = self.net(cx) else { return };
-        let work = work(net);
+        let work = work(Arc::clone(&net));
         cx.spawn(async move |model, cx| {
             let found = work.await;
             let _ = model.update(cx, |model, cx| {
-                then(model, found, cx);
-                cx.notify();
+                if model
+                    .net(cx)
+                    .is_some_and(|current| Arc::ptr_eq(&net, &current))
+                {
+                    then(model, found, cx);
+                    cx.notify();
+                }
             });
         })
         .detach();
     }
 
     pub(crate) fn read_sources(&mut self, cx: &mut Context<Self>) {
+        self.sources_read += 1;
+        let asked = self.sources_read;
         self.reading(
             cx,
             |net| {
@@ -254,18 +302,25 @@ impl Model {
                 );
                 async move { Ok((sources.await?, jobs.await?)) }
             },
-            |model, found, _| match found {
-                Ok((sources, jobs)) => {
-                    model.sources = Some(sources.sources);
-                    // Newest first: the first scan of each source is its last.
-                    for job in jobs.jobs.into_iter().rev() {
-                        if let Some(source) = scanned(&job) {
-                            model.scans.insert(source, job);
+            move |model, found, _| {
+                if asked != model.sources_read {
+                    return;
+                }
+                match found {
+                    Ok((sources, jobs)) => {
+                        model.sources = Some(sources.sources);
+                        let mut seen = HashSet::new();
+                        for job in jobs.jobs {
+                            if let Some(source) = scanned(&job)
+                                && seen.insert(source)
+                            {
+                                keep_scan(&mut model.scans, source, job, true);
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    model.problems.insert(Group::Library, trouble(&error));
+                    Err(error) => {
+                        model.problems.insert(Group::Library, trouble(&error));
+                    }
                 }
             },
         );
@@ -325,15 +380,16 @@ impl Model {
 
     fn heard_job(&mut self, job: Job, cx: &mut Context<Self>) {
         if let Some(source) = scanned(&job) {
-            let was_running = self.scans.get(&source).is_some_and(|was| !is_ended(was));
+            let prior = self.scans.get(&source);
+            let new_job = prior.is_none_or(|kept| kept.job_id != job.job_id);
+            let tied = prior.is_some_and(|kept| new_job && kept.created_at == job.created_at);
             let ended = is_ended(&job);
-            self.scans.insert(source, job);
-            if ended && was_running {
+            let changed = keep_scan(&mut self.scans, source, job, false);
+            if tied || (changed && (new_job || ended)) {
                 self.read_sources(cx);
-            }
-            // A rescan the server started on its own shows in the status.
-            if ended {
-                self.read_status(cx);
+                if ended {
+                    self.read_status(cx);
+                }
             }
         } else if job.kind == SYNC_JOB && is_ended(&job) {
             self.read_lastfm(cx);
@@ -367,11 +423,17 @@ impl Model {
         self.busy.insert(busy);
         self.problems.remove(&group);
         cx.notify();
-        let work = work(net);
+        let work = work(Arc::clone(&net));
         cx.spawn(async move |model, cx| {
             let found = work.await;
             model
                 .update(cx, |model, cx| {
+                    if model
+                        .net(cx)
+                        .is_none_or(|current| !Arc::ptr_eq(&net, &current))
+                    {
+                        return false;
+                    }
                     model.busy.remove(&busy);
                     cx.notify();
                     match found {
@@ -411,10 +473,8 @@ impl Model {
                     };
                     ask::<ScanStart>(&net, params).await
                 },
-                move |model, started, _| match started {
-                    Ok(started) => {
-                        model.scans.insert(source_id, started.job);
-                    }
+                move |model, started, cx| match started {
+                    Ok(started) => model.heard_job(started.job, cx),
                     Err(error) => {
                         model.problems.insert(Group::Library, trouble(&error));
                     }
@@ -512,9 +572,13 @@ impl Model {
                 let started = ask::<ScanStart>(&net, params).await?;
                 Ok((added, started.job))
             },
-            |model, (source, job), _| {
-                model.scans.insert(source.source_id, job);
-                model.sources.get_or_insert_with(Vec::new).push(source);
+            |model, (source, job), cx| {
+                model.heard_job(job, cx);
+                let sources = model.sources.get_or_insert_with(Vec::new);
+                if !sources.iter().any(|row| row.source_id == source.source_id) {
+                    sources.push(source);
+                }
+                model.read_sources(cx);
             },
         )
     }
@@ -867,4 +931,45 @@ impl Model {
 /// A model for a window, on the app's connection.
 pub(crate) fn new(link: Entity<Link>, quiet: bool, cx: &mut gpui::App) -> Entity<Model> {
     cx.new(|cx| Model::new(link, quiet, cx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_start_reply_after_completion_leaves_the_scan_finished() -> Result<(), serde_json::Error> {
+        let id = Id::from_bytes([1; 16]);
+        let queued: Job = serde_json::from_value(serde_json::json!({
+            "jobId": id, "kind": "scan", "state": "queued", "createdAt": 1,
+            "done": 0, "failed": 0, "skipped": 0, "bytes": 0
+        }))?;
+        let mut scans = HashMap::new();
+        let mut done = queued.clone();
+        done.state = JobState::Succeeded;
+        assert!(keep_scan(&mut scans, id, done, false));
+        assert!(!keep_scan(&mut scans, id, queued.clone(), false));
+        assert!(scans.get(&id).is_some_and(is_ended));
+
+        let mut next = queued.clone();
+        next.job_id = Id::from_bytes([2; 16]);
+        assert!(!keep_scan(&mut scans, id, next.clone(), false));
+        assert!(keep_scan(&mut scans, id, next.clone(), true));
+        assert!(!keep_scan(&mut scans, id, queued, false));
+        assert_eq!(scans.get(&id), Some(&next));
+
+        let mut walking = next;
+        walking.state = JobState::Running;
+        let mut reading = walking.clone();
+        reading.total = Some(5);
+        assert!(keep_scan(&mut scans, id, reading.clone(), false));
+        assert!(!keep_scan(&mut scans, id, walking, true));
+        let mut later = reading.clone();
+        later.skipped = 4;
+        later.failed = 1;
+        assert!(keep_scan(&mut scans, id, later.clone(), false));
+        assert!(!keep_scan(&mut scans, id, reading, true));
+        assert_eq!(scans.get(&id), Some(&later));
+        Ok(())
+    }
 }
