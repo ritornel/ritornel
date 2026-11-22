@@ -378,8 +378,10 @@ impl Core {
         awake.follow_the_rule(self.clock.now_ms());
     }
 
-    /// Follows the wake setting `server.db` keeps, as a server starts.
-    pub(crate) fn follow_awake_at_start(&self) {
+    /// Follows the wake setting `server.db` keeps, as a server starts:
+    /// asking the system to keep the machine awake only if `asks`.
+    pub(crate) fn follow_awake_at_start(&self, asks: bool) {
+        lock(&self.awake).asks = asks;
         let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
         if let Some(stores) = stores.as_ref() {
             self.follow_stored_awake(stores);

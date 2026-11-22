@@ -88,6 +88,8 @@ pub(crate) struct KeptAwake {
     pub(crate) setting: Awake,
     pub(crate) activity: Activity,
     held: Option<crate::platform::Awake>,
+    /// Whether this run asks the system at all (`Run::keep_awake`).
+    pub(crate) asks: bool,
     /// When the system last refused to keep the machine awake.
     refused_at_ms: Option<i64>,
 }
@@ -116,7 +118,7 @@ impl KeptAwake {
         let may_ask = self
             .refused_at_ms
             .is_none_or(|at| now_ms.saturating_sub(at) >= ASK_AGAIN_MS);
-        if wanted && self.held.is_none() && may_ask {
+        if wanted && self.held.is_none() && may_ask && self.asks {
             match crate::platform::stay_awake(
                 "Ritornel keeps this hub awake for its linked servers",
             ) {

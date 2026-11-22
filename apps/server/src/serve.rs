@@ -74,6 +74,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         lastfm: lastfm(env),
         watch: crate::WatchRun::on(),
         backup_dir: settings.backup_dir.clone(),
+        keep_awake: true,
         // `RITORNEL_TEST_COMPUTER_NAME`, for the tests alone, stands in
         // for the machine's name, so that a test need not know it.
         name: env("RITORNEL_TEST_COMPUTER_NAME")

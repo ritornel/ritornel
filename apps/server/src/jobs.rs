@@ -71,6 +71,12 @@ pub struct Run {
     /// The computer's name, which a server still called by the default
     /// name takes. `serve` reads it; a server in a test keeps the default.
     pub name: Option<String>,
+    /// Whether this run asks the system to keep the machine awake when its
+    /// wake setting says to. `serve` does. A server in a test does not, so
+    /// that a test neither changes the machine's power settings nor starts
+    /// a helper process, which holds a copy of every open file for an
+    /// instant, another server's lock among them.
+    pub keep_awake: bool,
 }
 
 /// The running worker.
