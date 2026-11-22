@@ -386,6 +386,7 @@ pub(crate) struct Wall {
     /// Coming up from an artist's page, the one you came from, to scroll
     /// to once the Artists wall is open, and to mark for a moment.
     reveal: Option<Id>,
+    locating: Option<gpui::Task<()>>,
     reveal_at: Option<usize>,
     here: Option<(Id, Instant)>,
     /// Back from an artist's page, theirs settles into place.
@@ -439,6 +440,7 @@ impl Wall {
             player,
             elastic: crate::elastic::Elastic::default(),
             reveal: None,
+            locating: None,
             reveal_at: None,
             here: None,
             settling: None,
@@ -572,6 +574,7 @@ impl Wall {
         self.opening += 1;
         self.lost = false;
         self.replacing = None;
+        self.locating = None;
         self.selected = None;
         self.reveal_at = None;
         self.replace_again = false;
@@ -706,7 +709,8 @@ impl Wall {
                 })
                 .await
         });
-        cx.spawn(async move |wall, cx| {
+        self.reveal_at = None;
+        self.locating = Some(cx.spawn(async move |wall, cx| {
             let located = located.await;
             crate::debug(format_args!("wall: located {located:?}"));
             if let Ok(Ok(located)) = located
@@ -721,8 +725,7 @@ impl Wall {
                 })
                 .ok();
             }
-        })
-        .detach();
+        }));
     }
 
     /// The index of letters, open under the letter that opened it: quiet,
