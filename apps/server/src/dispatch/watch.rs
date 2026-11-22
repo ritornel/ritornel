@@ -52,10 +52,11 @@ impl Core {
     }
 
     /// Turns watching on or off for this machine, and keeps it so. It is
-    /// what a setting in the app calls.
-    pub(crate) fn set_watching(&self, on: bool) -> Result<(), crate::Error> {
-        self.with_stores(|stores| stores.server().set_watching(on))
-            .ok_or(crate::Error::Stopped)??;
+    /// what a setting in the app calls, with the databases the call holds
+    /// already: taking them again could wait behind the server stopping,
+    /// which waits for the call.
+    pub(crate) fn set_watching(&self, stores: &Stores, on: bool) -> Result<(), crate::Error> {
+        stores.server().set_watching(on)?;
         info!(
             on,
             "watching the library's folders is turned {}",
@@ -316,7 +317,8 @@ impl Core {
         stores: &Stores,
         params: &WatchingParams,
     ) -> Result<WatchingSet, RpcError> {
-        self.set_watching(params.on).map_err(super::failed)?;
+        self.set_watching(stores, params.on)
+            .map_err(super::failed)?;
         Ok(WatchingSet {
             receipt: Receipt {
                 command_id: params.idempotency_key,
