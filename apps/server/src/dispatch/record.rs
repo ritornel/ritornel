@@ -158,6 +158,13 @@ impl Core {
                         Ok(lost.withdrawn),
                         true,
                     );
+                    add(
+                        &mut problems,
+                        &mut unread,
+                        RecordProblemKind::ScrobblesRefused,
+                        Ok(lost.refused),
+                        true,
+                    );
                 }
                 Err(error) => add(
                     &mut problems,

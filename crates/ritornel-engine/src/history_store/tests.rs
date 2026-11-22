@@ -1763,3 +1763,48 @@ fn scrobbles_that_ended_unknown_or_withdrawn_are_counted_from_when_they_ended_un
         crate::LostScrobbles::default()
     );
 }
+
+#[test]
+fn scrobbles_refused_with_their_request_count_until_the_account_takes_one_again() {
+    use crate::Settled;
+
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = T0 + 10 * MINUTE;
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    at.send(&at.listen(2, 1, start + 5 * MINUTE, 300_000), PlayRule::V1);
+    assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 2);
+    // The key is refused: the request and the play in it.
+    let first = at.library.take_due_deliveries(account, 0, 1).unwrap();
+    at.library
+        .settle_deliveries(vec![(
+            first[0].delivery,
+            Settled::Refused("Invalid API key".to_owned()),
+        )])
+        .unwrap();
+    let refused = at
+        .library
+        .lost_scrobbles(i64::MIN)
+        .unwrap()
+        .refused
+        .unwrap();
+    assert_eq!(
+        (refused.count, refused.detail.as_deref()),
+        (1, Some("Invalid API key"))
+    );
+    // Put right: the next is taken, and the refusal is over.
+    let second = at.library.take_due_deliveries(account, 0, 1).unwrap();
+    at.library
+        .settle_deliveries(vec![(
+            second[0].delivery,
+            Settled::Accepted {
+                artist: second[0].artist.clone(),
+                title: second[0].title.clone(),
+            },
+        )])
+        .unwrap();
+    assert_eq!(at.library.lost_scrobbles(i64::MIN).unwrap().refused, None);
+}

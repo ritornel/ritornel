@@ -32,6 +32,10 @@ pub struct ToScrobble {
     pub timestamp_s: u64,
 }
 
+/// The code Last.fm ignores a play with when the account's daily limit is
+/// reached. It is no answer about the play, which can be sent again later.
+pub const DAILY_LIMIT: u32 = scrobl::model::IgnoredCode::DAILY_LIMIT.get();
+
 /// What Last.fm did with one play.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {

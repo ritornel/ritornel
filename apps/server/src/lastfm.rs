@@ -214,7 +214,9 @@ mod enabled {
         Due, Job, JobState, LibraryStore, Observations, Progress, ServerStore, ServiceKey,
         ServiceSession, Settled,
     };
-    use ritornel_lastfm::{NotShown, Outcome, Playing, Sent, SessionKey, ToScrobble, Unsent};
+    use ritornel_lastfm::{
+        DAILY_LIMIT, NotShown, Outcome, Playing, Sent, SessionKey, ToScrobble, Unsent,
+    };
     use ritornel_source::{
         Batch, Error as SourceError, HistorySource, Love, LovesStored, Progress as Read, Sink,
         Stored,
@@ -309,6 +311,10 @@ mod enabled {
     /// How long a play that could not be sent waits before it is sent
     /// again.
     const RETRY_MS: i64 = 5 * 60 * 1000;
+
+    /// How long plays that met the account's daily limit wait before they
+    /// are sent again. Last.fm does not say when the limit lifts.
+    pub(super) const DAILY_LIMIT_RETRY_MS: i64 = 60 * 60 * 1000;
 
     /// How long a track is heard before Last.fm is told it is playing:
     /// skipping through several tells it of the one stopped at alone.
@@ -837,8 +843,12 @@ mod enabled {
             let plays: Vec<ToScrobble> = due.iter().map(to_send).collect();
             let now = (sending.now)();
             let (settled, stop): (Vec<(i64, Settled)>, bool) = match (sending.send)(&key, &plays) {
-                Ok(outcomes) => (
-                    due.iter()
+                Ok(outcomes) => {
+                    // A play over the daily limit is no answer about it: it
+                    // is sent again later, and nothing more is sent now.
+                    let mut limited = false;
+                    let settled = due
+                        .iter()
                         .zip(outcomes)
                         .map(|(due, outcome)| {
                             (
@@ -847,6 +857,13 @@ mod enabled {
                                     Outcome::Accepted { artist, title } => {
                                         Settled::Accepted { artist, title }
                                     }
+                                    Outcome::Ignored { code, message } if code == DAILY_LIMIT => {
+                                        limited = true;
+                                        Settled::Later {
+                                            detail: message,
+                                            at_ms: now + DAILY_LIMIT_RETRY_MS,
+                                        }
+                                    }
                                     Outcome::Ignored { code, message } => Settled::Ignored {
                                         code: i64::from(code),
                                         message,
@@ -854,9 +871,9 @@ mod enabled {
                                 },
                             )
                         })
-                        .collect(),
-                    false,
-                ),
+                        .collect();
+                    (settled, limited)
+                }
                 Err(unsent) => {
                     let (each, stop): (Box<dyn Fn() -> Settled>, bool) = match unsent {
                         Unsent::Later(detail) => (
@@ -926,10 +943,10 @@ mod enabled {
         use std::cell::{Cell, RefCell};
 
         use ritornel_contract::Id;
-        use ritornel_engine::{Due, ServiceKey, ServiceSession};
+        use ritornel_engine::{Due, ServiceKey, ServiceSession, Settled};
         use ritornel_lastfm::{Outcome, Sent, SessionKey, ToScrobble, Unsent};
 
-        use super::{Began, SETTLE, STALE, Sending, Slot, Taken, send_due};
+        use super::{Began, DAILY_LIMIT_RETRY_MS, SETTLE, STALE, Sending, Slot, Taken, send_due};
 
         #[test]
         fn of_tracks_skipped_through_only_the_last_is_shown_once_it_settles() {
@@ -1024,6 +1041,44 @@ mod enabled {
                 now: &|| 0,
             });
             sent.into_inner()
+        }
+
+        #[test]
+        fn a_play_over_the_daily_limit_is_sent_again_later_and_one_too_old_is_not() {
+            let sent = Cell::new(0);
+            let settled = RefCell::new(Vec::new());
+            send_due(&Sending {
+                session: &|| Some(session("KEY_A", true)),
+                stopping: &|| false,
+                take: &|_, _| (sent.get() < 3).then(|| batch(100)),
+                send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
+                    sent.set(sent.get() + 1);
+                    Ok(plays
+                        .iter()
+                        .enumerate()
+                        .map(|(n, _)| Outcome::Ignored {
+                            code: if n == 0 { 3 } else { 5 },
+                            message: if n == 0 { "too old" } else { "daily limit" }.to_owned(),
+                        })
+                        .collect())
+                },
+                settle: &|batch| {
+                    settled.borrow_mut().extend(batch);
+                    true
+                },
+                refuse: &|| {},
+                now: &|| 1_000,
+            });
+            // The limit is reached: nothing more is sent until later.
+            assert_eq!(sent.get(), 1);
+            let settled = settled.into_inner();
+            assert!(matches!(&settled[0].1, Settled::Ignored { code: 3, .. }));
+            for (_, over) in &settled[1..] {
+                assert!(
+                    matches!(over, Settled::Later { at_ms, .. } if *at_ms == 1_000 + DAILY_LIMIT_RETRY_MS),
+                    "{over:?}"
+                );
+            }
         }
 
         #[test]

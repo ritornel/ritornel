@@ -5,10 +5,10 @@ use std::io::Write;
 
 use ritornel_client::contract::methods::RecordDismiss;
 use ritornel_client::contract::{
-    BackupStatus, DismissParams, RecordProblem, RecordProblemKind, RecordStatus, ServerStatus,
-    WatchStatus, WatchedFolder, WatchedKind,
+    BackupStatus, DismissParams, RecordProblem, RecordStatus, ServerStatus, WatchStatus,
+    WatchedFolder, WatchedKind,
 };
-use ritornel_client::local;
+use ritornel_client::{local, record};
 
 use crate::cli::{Error, StatusArgs};
 use crate::server;
@@ -86,47 +86,20 @@ fn recording(record: &RecordStatus, lines: &mut Vec<(&str, String)>) {
     }
     for (n, problem) in record.problems.iter().enumerate() {
         lines.push((if n == 0 { "Record" } else { "" }, stopped(problem)));
-    }
-    if record.problems.iter().any(|problem| problem.dismissable) {
         lines.push((
             "",
-            "`ritornelctl status --dismiss` sets these scrobbles aside".to_owned(),
+            record::what_to_do(problem.kind, "`ritornelctl status --dismiss`"),
         ));
     }
 }
 
-/// One thing that stops the record: what, how many, since when and why.
+/// One thing that stops the record: what, since when and why.
 fn stopped(problem: &RecordProblem) -> String {
-    let n = problem.count;
-    let many = |one: &str, more: &str| {
-        if n == 1 {
-            format!("1 {one}")
-        } else {
-            format!("{n} {more}")
-        }
-    };
-    let what = match problem.kind {
-        RecordProblemKind::ListenUnsaved => "the listen playing cannot be saved".to_owned(),
-        RecordProblemKind::ListensUndelivered => {
-            format!("{} not reached history", many("listen has", "listens have"))
-        }
-        RecordProblemKind::ScrobblesUnknown => format!(
-            "{} not have reached Last.fm",
-            many("scrobble may", "scrobbles may")
-        ),
-        RecordProblemKind::ScrobblesWithdrawn => format!(
-            "{} not sent to Last.fm",
-            many("scrobble was", "scrobbles were")
-        ),
-        RecordProblemKind::Unreadable => {
-            "whether every listen is recorded cannot be read".to_owned()
-        }
-        RecordProblemKind::ImportFailed if n == 1 => "importing from Last.fm failed".to_owned(),
-        RecordProblemKind::ImportFailed => {
-            format!("importing from Last.fm failed {n} times in a row")
-        }
-    };
-    let mut line = format!("{what}, since {}", crate::lastfm::utc(problem.since));
+    let mut line = format!(
+        "{}, since {}",
+        record::what(problem),
+        crate::lastfm::utc(problem.since)
+    );
     if let Some(detail) = &problem.detail {
         line.push_str(&format!(": {detail}"));
     }
@@ -233,7 +206,9 @@ pub(crate) fn size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ritornel_client::contract::{FreeDisk, Id, LibraryStatus, ServerRole, Versions};
+    use ritornel_client::contract::{
+        FreeDisk, Id, LibraryStatus, RecordProblemKind, ServerRole, Versions,
+    };
 
     use super::*;
 
@@ -393,6 +368,12 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
                         true
                     ),
                     problem(
+                        RecordProblemKind::ScrobblesRefused,
+                        4,
+                        Some("Invalid API key"),
+                        true
+                    ),
+                    problem(
                         RecordProblemKind::ImportFailed,
                         1,
                         Some("Last.fm did not answer"),
@@ -401,12 +382,18 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
                 ],
             }),
             "\
-Record            the listen playing cannot be saved, since 2025-11-21 17:01 UTC: disk I/O error
-                  3 listens have not reached history, since 2025-11-21 17:01 UTC
+Record            The listen playing can’t be saved, since 2025-11-21 17:01 UTC: disk I/O error
+                  Check that the disk Ritornel’s data is on has free space. Ritornel keeps trying, and saves the listen as soon as it can.
+                  3 listens haven’t reached your history, since 2025-11-21 17:01 UTC
+                  Ritornel keeps trying. If this lasts, check that the disk Ritornel’s data is on has free space, and look in the server’s log.
                   1 scrobble may not have reached Last.fm, since 2025-11-21 17:01 UTC
-                  2 scrobbles were not sent to Last.fm, since 2025-11-21 17:01 UTC: its play is excluded
-                  importing from Last.fm failed, since 2025-11-21 17:01 UTC: Last.fm did not answer
-                  `ritornelctl status --dismiss` sets these scrobbles aside
+                  Nothing to do yet: the next import from Last.fm clears those that arrived. Ritornel doesn’t send the rest again; they stay in your history here. `ritornelctl status --dismiss` sets them aside.
+                  2 scrobbles weren’t sent to Last.fm, since 2025-11-21 17:01 UTC: its play is excluded
+                  Nothing to do: their plays stopped counting, or grew too old for Last.fm, before they could be sent. They stay in your history here. `ritornelctl status --dismiss` sets them aside.
+                  Last.fm is refusing scrobbles, since 2025-11-21 17:01 UTC: Invalid API key
+                  Check the API key and secret in lastfm.env in Ritornel’s data folder, or sign out and in again in Settings → Last.fm. Refused scrobbles aren’t sent again; once it’s fixed, `ritornelctl status --dismiss` sets them aside.
+                  Importing from Last.fm failed, since 2025-11-21 17:01 UTC: Last.fm did not answer
+                  Ritornel tries again at the next import. If it keeps failing, check the internet connection and the API key in lastfm.env, or sign out and in again in Settings → Last.fm.
 "
         );
     }
@@ -440,8 +427,10 @@ Record            the listen playing cannot be saved, since 2025-11-21 17:01 UTC
         assert_eq!(
             record,
             "\
-Record            importing from Last.fm failed 3 times in a row, since 2025-11-21 17:01 UTC
-                  whether every listen is recorded cannot be read, since 2025-11-21 17:01 UTC: disk I/O error
+Record            Importing from Last.fm failed 3 times in a row, since 2025-11-21 17:01 UTC
+                  Ritornel tries again at the next import. If it keeps failing, check the internet connection and the API key in lastfm.env, or sign out and in again in Settings → Last.fm.
+                  Ritornel can’t tell whether every listen is being recorded, since 2025-11-21 17:01 UTC: disk I/O error
+                  Check that the disk Ritornel’s data is on is connected and has free space, then restart the server.
 "
         );
     }

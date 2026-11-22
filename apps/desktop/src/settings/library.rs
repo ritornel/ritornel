@@ -7,9 +7,8 @@ use gpui::{
     App, Entity, InteractiveElement, IntoElement, ParentElement, Styled, div,
     prelude::FluentBuilder, px,
 };
-use ritornel_contract::{
-    RecordProblem, RecordProblemKind, RecordStatus, WatchState, WatchedFolder, WatchedKind,
-};
+use ritornel_client::record;
+use ritornel_contract::{RecordStatus, WatchState, WatchedFolder, WatchedKind};
 
 use super::act;
 use super::controls::{
@@ -43,40 +42,6 @@ fn watching(folder: Option<&WatchedFolder>, on: bool, clock: &Clock) -> Option<i
     )
 }
 
-/// What stops the record, in a sentence: what, and how many.
-fn stopped(problem: &RecordProblem) -> String {
-    let n = problem.count;
-    let many = |one: &str, more: &str| {
-        if n == 1 {
-            format!("1 {one}")
-        } else {
-            format!("{} {more}", thousands(n))
-        }
-    };
-    match problem.kind {
-        RecordProblemKind::ListenUnsaved => "The listen playing can’t be saved".to_owned(),
-        RecordProblemKind::ListensUndelivered => {
-            format!("{} not reached history", many("listen has", "listens have"))
-        }
-        RecordProblemKind::ScrobblesUnknown => format!(
-            "{} not have reached Last.fm",
-            many("scrobble may", "scrobbles may")
-        ),
-        RecordProblemKind::ScrobblesWithdrawn => format!(
-            "{} not sent to Last.fm",
-            many("scrobble was", "scrobbles were")
-        ),
-        RecordProblemKind::Unreadable => {
-            "Can’t tell whether every listen is being recorded".to_owned()
-        }
-        RecordProblemKind::ImportFailed if n == 1 => "Importing from Last.fm failed".to_owned(),
-        RecordProblemKind::ImportFailed => format!(
-            "Importing from Last.fm failed {} times in a row",
-            thousands(n)
-        ),
-    }
-}
-
 /// Whether the listening record advances: a quiet line while it does, and
 /// a row for each thing that stops it, with since when, while it does not.
 /// Music can go on playing all the while, which is why this is said.
@@ -101,11 +66,14 @@ fn record(
         .iter()
         .position(|problem| problem.dismissable);
     for (n, problem) in record.problems.iter().enumerate() {
+        // What is wrong, since when and why, and what to do about it, in
+        // the words `ritornelctl status` says too.
         let since = format!("Since {}", when(problem.since, clock));
         let said = match &problem.detail {
             Some(detail) => format!("{since}: {detail}"),
             None => since,
         };
+        let to_do = record::what_to_do(problem.kind, "Dismiss");
         rows.push(
             row()
                 .child(
@@ -113,9 +81,10 @@ fn record(
                         .child(
                             div()
                                 .text_color(super::controls::warn())
-                                .child(stopped(problem)),
+                                .child(record::what(problem)),
                         )
-                        .child(sub_wraps(said)),
+                        .child(sub_wraps(said))
+                        .child(sub_wraps(to_do)),
                 )
                 .when(dismiss_at == Some(n), |row| {
                     row.child(actions().child(push(
@@ -132,11 +101,7 @@ fn record(
         .child(boxed(rows))
         .children(model.problems.get(&Group::Record).cloned().map(problem))
         .when(!record.problems.is_empty(), |group| {
-            group.child(note(if dismiss_at.is_some() {
-                "Music plays on while the record has stopped. Dismiss sets these scrobbles aside; a new one shows here again."
-            } else {
-                "Music plays on while the record has stopped."
-            }))
+            group.child(note("Music plays on while the record has stopped."))
         })
 }
 

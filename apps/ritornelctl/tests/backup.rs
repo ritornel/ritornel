@@ -513,7 +513,7 @@ fn while_a_listen_cannot_be_saved_playback_goes_on_and_the_status_says_so_and_si
     assert_eq!(now["status"], "playing");
     let (_, stdout, _) = ritornelctl(&data_dir, &["status"]);
     assert!(
-        stdout.contains("Record            the listen playing cannot be saved, since "),
+        stdout.contains("Record            The listen playing can’t be saved, since "),
         "{stdout}"
     );
     // Dismissing sets aside only scrobbles: this stays until put right.

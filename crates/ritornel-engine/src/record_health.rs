@@ -194,6 +194,11 @@ pub struct LostScrobbles {
     /// Never sent, because their play stopped being one to send. Those the
     /// account already had from another player are not among them.
     pub withdrawn: Option<Failing>,
+    /// Refused with the request that carried them, which is never sent
+    /// again: a key the service no longer takes, or a request it cannot
+    /// read. Only those since the account last took a scrobble: once one
+    /// is taken, what refused them is put right.
+    pub refused: Option<Failing>,
 }
 
 impl LibraryStore {
@@ -206,6 +211,9 @@ impl LibraryStore {
                 "WITH lost AS (
                    SELECT d.id, d.updated_at_ms, d.detail FROM history_delivery d
                    WHERE d.state = ?1 AND d.rev > ?2 AND coalesce(d.detail, '') <> ?3
+                     AND (d.state <> 'refused' OR d.rev > coalesce(
+                       (SELECT max(taken.rev) FROM history_delivery taken
+                        WHERE taken.endpoint_id = d.endpoint_id AND taken.state = 'accepted'), 0))
                      -- Its echo, imported from the account it was sent to, joined its play.
                      AND NOT EXISTS (
                        SELECT 1 FROM play_event_observation mine
@@ -231,6 +239,7 @@ impl LibraryStore {
             Ok(LostScrobbles {
                 unknown: of("unknown")?,
                 withdrawn: of("withdrawn")?,
+                refused: of("refused")?,
             })
         })
     }

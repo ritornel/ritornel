@@ -3550,7 +3550,7 @@ export type RecordProblem = { kind: RecordProblemKind,
 /**
  * What has stopped the record advancing.
  */
-export type RecordProblemKind = "listen_unsaved" | "listens_undelivered" | "scrobbles_unknown" | "scrobbles_withdrawn" | "import_failed" | "unreadable";
+export type RecordProblemKind = "listen_unsaved" | "listens_undelivered" | "scrobbles_unknown" | "scrobbles_withdrawn" | "scrobbles_refused" | "import_failed" | "unreadable";
 
 /**
  * Whether the listening record is advancing: each listen saved and taken

@@ -271,6 +271,12 @@ pub enum RecordProblemKind {
     /// Scrobbles were never sent, because their plays stopped being ones
     /// to send.
     ScrobblesWithdrawn,
+    /// The service refuses the requests that carry scrobbles, so none is
+    /// taken: a key it no longer accepts, or a request it cannot read.
+    /// Those refused are not sent again. It ends when one is taken again,
+    /// or on `record.dismiss`. A play the service declines alone, in a
+    /// request it took, is not this: no one can do anything about that.
+    ScrobblesRefused,
     /// Importing the service's history failed, and has not worked since.
     ImportFailed,
     /// What would say whether the record advances could not be read, so
@@ -286,6 +292,7 @@ impl RecordProblemKind {
             Self::ListensUndelivered => "listens_undelivered",
             Self::ScrobblesUnknown => "scrobbles_unknown",
             Self::ScrobblesWithdrawn => "scrobbles_withdrawn",
+            Self::ScrobblesRefused => "scrobbles_refused",
             Self::ImportFailed => "import_failed",
             Self::Unreadable => "unreadable",
         }
