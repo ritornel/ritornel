@@ -124,13 +124,42 @@ impl ServerStore {
         })
     }
 
-    /// The last dismissal of the scrobbles that ended unknown or
-    /// withdrawn: none that ended by its revision count against the record.
+    /// Since when the service has refused this server's session, while it
+    /// does: nothing is scrobbled until a new sign-in.
+    pub fn session_refused(&self, service: &str) -> Result<Option<i64>, Error> {
+        let service = service.to_owned();
+        self.read(move |connection| {
+            let refused: Option<(bool, Option<String>, i64)> = connection
+                .query_row(
+                    "SELECT s.sign_in_again, t.value_json, s.signed_in_at_ms
+                     FROM service_session s
+                     LEFT JOIN server_setting t ON t.key = s.service || '.refused_at_ms'
+                     WHERE s.service = ?1",
+                    [&service],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            // A refusal recorded before its time was kept, or one older than
+            // the session (a time kept for an earlier one), is said from the
+            // sign-in: the earliest it can have been.
+            Ok(match refused {
+                Some((true, at, signed_in)) => Some(
+                    at.and_then(|at| at.parse::<i64>().ok())
+                        .filter(|at| *at >= signed_in)
+                        .unwrap_or(signed_in),
+                ),
+                _ => None,
+            })
+        })
+    }
+
+    /// The last dismissal of the scrobbles that ended unknown,
+    /// withdrawn or refused: none that ended by its revision count against the record.
     pub fn record_dismissal(&self) -> Result<Option<Dismissal>, Error> {
         self.read(|connection| Ok(held_dismissal(connection)?.map(|held| held.dismissal())))
     }
 
-    /// Sets aside every scrobble that ended unknown or withdrawn by the
+    /// Sets aside every scrobble that ended unknown, withdrawn or refused by the
     /// library revision of `dismissal`, and answers the dismissal in force.
     /// A command already seen changes nothing, so a client that sends one
     /// again for want of an answer, however late, hides nothing that ended
@@ -194,18 +223,41 @@ pub struct LostScrobbles {
     /// Never sent, because their play stopped being one to send. Those the
     /// account already had from another player are not among them.
     pub withdrawn: Option<Failing>,
+    /// Refused with the request that carried them, which is never sent
+    /// again: a key the service no longer takes, or a request it cannot
+    /// read. Only those since the account last took a scrobble: once one
+    /// is taken, what refused them is put right.
+    pub refused: Option<Failing>,
 }
 
 impl LibraryStore {
-    /// The scrobbles that ended unknown or withdrawn after the library
-    /// revision `after`, and
-    /// whose echo has not come back.
-    pub fn lost_scrobbles(&self, after: i64) -> Result<LostScrobbles, Error> {
+    /// The scrobbles that ended unknown, withdrawn or refused after the
+    /// library revision `after`, and whose echo has not come back. Those
+    /// refused are only of the account `signed_in`, the one there is to put
+    /// right; with none signed in there are none.
+    pub fn lost_scrobbles(
+        &self,
+        after: i64,
+        signed_in: Option<&str>,
+    ) -> Result<LostScrobbles, Error> {
+        let signed_in = signed_in.map(str::to_owned);
         self.read(move |connection| {
             let mut statement = connection.prepare(
                 "WITH lost AS (
                    SELECT d.id, d.updated_at_ms, d.detail FROM history_delivery d
+                   LEFT JOIN (
+                     -- The last each account took, found once and not for each row.
+                     SELECT endpoint_id, max(rev) AS rev FROM history_delivery
+                     WHERE ?1 = 'refused' AND state = 'accepted' GROUP BY endpoint_id) taken
+                     ON taken.endpoint_id = d.endpoint_id
                    WHERE d.state = ?1 AND d.rev > ?2 AND coalesce(d.detail, '') <> ?3
+                     -- A refusal is the signed-in account's, since the last it
+                     -- took; another account's is not its to put right.
+                     AND (d.state <> 'refused' OR (
+                       d.endpoint_id = (SELECT endpoint_id FROM service_account
+                                        WHERE service = 'lastfm'
+                                          AND account_name = ?4 COLLATE NOCASE)
+                       AND d.rev > coalesce(taken.rev, 0)))
                      -- Its echo, imported from the account it was sent to, joined its play.
                      AND NOT EXISTS (
                        SELECT 1 FROM play_event_observation mine
@@ -219,7 +271,12 @@ impl LibraryStore {
             )?;
             let mut of = |state: &str| -> Result<Option<Failing>, Error> {
                 let (n, since, detail): (i64, Option<i64>, Option<String>) = statement.query_row(
-                    (state, after, crate::delivery_store::ALREADY_SCROBBLED),
+                    (
+                        state,
+                        after,
+                        crate::delivery_store::ALREADY_SCROBBLED,
+                        signed_in.as_deref(),
+                    ),
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )?;
                 Ok(since.map(|since_ms| Failing {
@@ -231,6 +288,7 @@ impl LibraryStore {
             Ok(LostScrobbles {
                 unknown: of("unknown")?,
                 withdrawn: of("withdrawn")?,
+                refused: of("refused")?,
             })
         })
     }
@@ -360,6 +418,44 @@ mod tests {
                 .map(|failing| (failing.since_ms, failing.count)),
             Some((4_000, 1))
         );
+    }
+
+    #[test]
+    fn a_refused_session_is_said_from_when_it_was_first_refused_until_a_new_sign_in() {
+        let store = store();
+        assert_eq!(store.session_refused("lastfm").unwrap(), None);
+        let save = || {
+            store
+                .save_service_session(
+                    "lastfm",
+                    crate::Id::from_bytes([7; 16]),
+                    "someone",
+                    &crate::ServiceKey::new("invented"),
+                    false,
+                )
+                .unwrap();
+        };
+        save();
+        assert_eq!(store.session_refused("lastfm").unwrap(), None);
+        // A refusal that came late, for a session signed out of since, is
+        // not this one's.
+        store
+            .refuse_service_session("lastfm", "an older key")
+            .unwrap();
+        assert_eq!(store.session_refused("lastfm").unwrap(), None);
+        store.refuse_service_session("lastfm", "invented").unwrap();
+        assert_eq!(
+            store.session_refused("lastfm").unwrap(),
+            Some(1_794_776_400_000)
+        );
+        // Refused again, it is still since the first time.
+        store.refuse_service_session("lastfm", "invented").unwrap();
+        assert_eq!(
+            store.session_refused("lastfm").unwrap(),
+            Some(1_794_776_400_000)
+        );
+        save();
+        assert_eq!(store.session_refused("lastfm").unwrap(), None);
     }
 
     #[test]

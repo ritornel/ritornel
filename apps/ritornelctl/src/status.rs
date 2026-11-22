@@ -5,10 +5,10 @@ use std::io::Write;
 
 use ritornel_client::contract::methods::RecordDismiss;
 use ritornel_client::contract::{
-    BackupStatus, DismissParams, RecordProblem, RecordProblemKind, RecordStatus, ServerStatus,
-    WatchStatus, WatchedFolder, WatchedKind,
+    BackupStatus, DismissParams, RecordProblem, RecordStatus, ServerStatus, WatchStatus,
+    WatchedFolder, WatchedKind,
 };
-use ritornel_client::local;
+use ritornel_client::{local, record};
 
 use crate::cli::{Error, StatusArgs};
 use crate::server;
@@ -82,51 +82,33 @@ fn render(status: &ServerStatus) -> String {
 fn recording(record: &RecordStatus, lines: &mut Vec<(&str, String)>) {
     if record.problems.is_empty() {
         lines.push(("Record", "advancing".to_owned()));
-        return;
     }
     for (n, problem) in record.problems.iter().enumerate() {
         lines.push((if n == 0 { "Record" } else { "" }, stopped(problem)));
+        lines.push(("", record::then(problem, WORDS)));
     }
-    if record.problems.iter().any(|problem| problem.dismissable) {
-        lines.push((
-            "",
-            "`ritornelctl status --dismiss` sets these scrobbles aside".to_owned(),
-        ));
+    // What happened that no one can act on: told, and quieter.
+    for (n, note) in record.notes.iter().enumerate() {
+        lines.push((if n == 0 { "Note" } else { "" }, stopped(note)));
+        lines.push(("", record::then(note, WORDS)));
     }
 }
 
-/// One thing that stops the record: what, how many, since when and why.
+/// How this program says what the person does.
+const WORDS: record::Words<'static> = record::Words {
+    dismiss: "`ritornelctl status --dismiss`",
+    restart: "restart the server",
+    sign_in: "Sign in again with `ritornelctl lastfm signin`, then turn scrobbling back on with \
+              `ritornelctl lastfm scrobbling on`.",
+};
+
+/// One thing that stops the record, or a note: what, since when and why.
 fn stopped(problem: &RecordProblem) -> String {
-    let n = problem.count;
-    let many = |one: &str, more: &str| {
-        if n == 1 {
-            format!("1 {one}")
-        } else {
-            format!("{n} {more}")
-        }
-    };
-    let what = match problem.kind {
-        RecordProblemKind::ListenUnsaved => "the listen playing cannot be saved".to_owned(),
-        RecordProblemKind::ListensUndelivered => {
-            format!("{} not reached history", many("listen has", "listens have"))
-        }
-        RecordProblemKind::ScrobblesUnknown => format!(
-            "{} not have reached Last.fm",
-            many("scrobble may", "scrobbles may")
-        ),
-        RecordProblemKind::ScrobblesWithdrawn => format!(
-            "{} not sent to Last.fm",
-            many("scrobble was", "scrobbles were")
-        ),
-        RecordProblemKind::Unreadable => {
-            "whether every listen is recorded cannot be read".to_owned()
-        }
-        RecordProblemKind::ImportFailed if n == 1 => "importing from Last.fm failed".to_owned(),
-        RecordProblemKind::ImportFailed => {
-            format!("importing from Last.fm failed {n} times in a row")
-        }
-    };
-    let mut line = format!("{what}, since {}", crate::lastfm::utc(problem.since));
+    let mut line = format!(
+        "{}, since {}",
+        record::what(problem),
+        crate::lastfm::utc(problem.since)
+    );
     if let Some(detail) = &problem.detail {
         line.push_str(&format!(": {detail}"));
     }
@@ -233,7 +215,9 @@ pub(crate) fn size(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ritornel_client::contract::{FreeDisk, Id, LibraryStatus, ServerRole, Versions};
+    use ritornel_client::contract::{
+        FreeDisk, Id, LibraryStatus, RecordProblemKind, ServerRole, Versions,
+    };
 
     use super::*;
 
@@ -364,7 +348,10 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
                 .to_owned()
         };
         assert_eq!(
-            tail(RecordStatus { problems: vec![] }),
+            tail(RecordStatus {
+                problems: vec![],
+                notes: vec![]
+            }),
             "Record            advancing\n"
         );
         let at = 1_763_744_462_000;
@@ -385,13 +372,13 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
                         false
                     ),
                     problem(RecordProblemKind::ListensUndelivered, 3, None, false),
-                    problem(RecordProblemKind::ScrobblesUnknown, 1, None, true),
                     problem(
-                        RecordProblemKind::ScrobblesWithdrawn,
-                        2,
-                        Some("its play is excluded"),
+                        RecordProblemKind::ScrobblesRefused,
+                        4,
+                        Some("Invalid API key"),
                         true
                     ),
+                    problem(RecordProblemKind::SignInNeeded, 1, None, false),
                     problem(
                         RecordProblemKind::ImportFailed,
                         1,
@@ -399,15 +386,40 @@ Backup failed     2025-11-22 17:01 UTC: the backup folder /Volumes/Backups/Ritor
                         false
                     ),
                 ],
+                notes: vec![
+                    problem(RecordProblemKind::ScrobblesUnknown, 1, None, true),
+                    problem(
+                        RecordProblemKind::ScrobblesWithdrawn,
+                        2,
+                        Some("its play is excluded"),
+                        true
+                    ),
+                ],
             }),
             "\
-Record            the listen playing cannot be saved, since 2025-11-21 17:01 UTC: disk I/O error
-                  3 listens have not reached history, since 2025-11-21 17:01 UTC
-                  1 scrobble may not have reached Last.fm, since 2025-11-21 17:01 UTC
-                  2 scrobbles were not sent to Last.fm, since 2025-11-21 17:01 UTC: its play is excluded
-                  importing from Last.fm failed, since 2025-11-21 17:01 UTC: Last.fm did not answer
-                  `ritornelctl status --dismiss` sets these scrobbles aside
+Record            The listen playing can’t be saved, since 2025-11-21 17:01 UTC: disk I/O error
+                  Check that the disk Ritornel’s data is on has free space. Ritornel keeps trying, and saves the listen as soon as it can.
+                  3 listens haven’t reached your history, since 2025-11-21 17:01 UTC
+                  Ritornel keeps trying. If this lasts, check that the disk Ritornel’s data is on has free space, and look in the server’s log.
+                  Last.fm is refusing scrobbles, since 2025-11-21 17:01 UTC: Invalid API key
+                  Check the API key and secret Ritornel uses, in lastfm.env in its data folder, then restart the server. It clears by itself once Last.fm takes a scrobble again. Refused scrobbles aren’t sent again; `ritornelctl status --dismiss` sets every scrobble note and warning aside.
+                  Last.fm needs you to sign in again, since 2025-11-21 17:01 UTC
+                  Last.fm no longer accepts Ritornel’s sign-in, so nothing is scrobbled. Sign in again with `ritornelctl lastfm signin`, then turn scrobbling back on with `ritornelctl lastfm scrobbling on`. Plays from before then stay in your history here.
+                  Importing from Last.fm failed, since 2025-11-21 17:01 UTC: Last.fm did not answer
+                  Ritornel tries again at the next import. If it keeps failing, check the internet connection, and the API key and secret in lastfm.env in Ritornel’s data folder, then restart the server.
+Note              1 scrobble may not have reached Last.fm, since 2025-11-21 17:01 UTC
+                  The play is still in your history here. If the next import from Last.fm finds it there, this note clears; Ritornel doesn’t send it again. `ritornelctl status --dismiss` sets every scrobble note and warning aside.
+                  2 plays weren’t sent to Last.fm, since 2025-11-21 17:01 UTC: its play is excluded
+                  They’re still in your history here. Ritornel chose not to send them, for the reason given for the latest. `ritornelctl status --dismiss` sets every scrobble note and warning aside.
 "
+        );
+        // Notes alone: the record advances, and they are said all the same.
+        assert!(
+            tail(RecordStatus {
+                problems: vec![],
+                notes: vec![problem(RecordProblemKind::ScrobblesUnknown, 1, None, true)],
+            })
+            .starts_with("Record            advancing\nNote              1 scrobble")
         );
     }
 
@@ -431,6 +443,7 @@ Record            the listen playing cannot be saved, since 2025-11-21 17:01 UTC
                     dismissable: false,
                 },
             ],
+            notes: vec![],
         });
         let shown = render(&status);
         let record = shown
@@ -440,8 +453,10 @@ Record            the listen playing cannot be saved, since 2025-11-21 17:01 UTC
         assert_eq!(
             record,
             "\
-Record            importing from Last.fm failed 3 times in a row, since 2025-11-21 17:01 UTC
-                  whether every listen is recorded cannot be read, since 2025-11-21 17:01 UTC: disk I/O error
+Record            Importing from Last.fm failed 3 times in a row, since 2025-11-21 17:01 UTC
+                  Ritornel tries again at the next import. If it keeps failing, check the internet connection, and the API key and secret in lastfm.env in Ritornel’s data folder, then restart the server.
+                  Ritornel can’t tell whether every listen is being recorded, since 2025-11-21 17:01 UTC: disk I/O error
+                  Check that the disk Ritornel’s data is on is connected and has free space, then restart the server.
 "
         );
     }

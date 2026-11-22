@@ -201,17 +201,29 @@ impl Link {
     /// run or an earlier one. A server it found is left running.
     pub(crate) fn stop_started(&self) {
         self.stop_owned();
-        let Some(dir) = self.data_dir() else {
-            return;
-        };
-        let holder = std::fs::read_to_string(dir.join(ritornel_contract::local::SERVER_LOCK))
-            .ok()
-            .and_then(|text| ritornel_contract::local::lock_holder(&text));
-        if let Some(pid) = holder
-            && crate::platform::started_here(pid)
-        {
+        if let Some(pid) = self.started_apart() {
             crate::platform::stop_server(pid, ritornel_client::launch::STOP_WAIT);
         }
+    }
+
+    /// Whether quitting the app stops the server it talks to, so that
+    /// opening it again starts the server afresh: one it started. A server
+    /// it found, such as the background service, runs on.
+    pub(crate) fn quitting_stops_the_server(&self) -> bool {
+        self.launcher
+            .as_ref()
+            .is_some_and(|launcher| launcher.owned_pid().is_some())
+            || self.started_apart().is_some()
+    }
+
+    /// The server holding the data directory's lock, if this app started
+    /// it apart from itself, on this run or an earlier one.
+    fn started_apart(&self) -> Option<u32> {
+        let dir = self.data_dir()?;
+        let holder = std::fs::read_to_string(dir.join(ritornel_contract::local::SERVER_LOCK))
+            .ok()
+            .and_then(|text| ritornel_contract::local::lock_holder(&text))?;
+        crate::platform::started_here(holder).then_some(holder)
     }
 
     fn look(&mut self, cx: &mut Context<Self>) {

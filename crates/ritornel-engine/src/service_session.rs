@@ -141,14 +141,25 @@ impl ServerStore {
         self.service_session(service)
     }
 
-    /// Records that the service refused the session.
-    pub fn refuse_service_session(&self, service: &str) -> Result<(), Error> {
-        let service = service.to_owned();
-        self.transact(move |transaction, _, _| {
-            transaction.execute(
-                "UPDATE service_session SET sign_in_again = 1 WHERE service = ?1",
-                [service],
+    /// Records that the service refused the session whose key is `key`,
+    /// and when it first did, for the record's sign to say. A refusal of a
+    /// session since replaced by a new sign-in changes nothing: the answer
+    /// came late, and the new one is not refused.
+    pub fn refuse_service_session(&self, service: &str, key: &str) -> Result<(), Error> {
+        let (service, key) = (service.to_owned(), key.to_owned());
+        self.transact(move |transaction, now_ms, _| {
+            let refused = transaction.execute(
+                "UPDATE service_session SET sign_in_again = 1
+                 WHERE service = ?1 AND session_key = ?2 AND sign_in_again = 0",
+                [&service, &key],
             )?;
+            if refused > 0 {
+                transaction.execute(
+                    "INSERT INTO server_setting (key, value_json) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json",
+                    (format!("{service}.refused_at_ms"), now_ms.to_string()),
+                )?;
+            }
             Ok(())
         })
     }
@@ -190,7 +201,9 @@ mod tests {
         let off = store.set_scrobbling("lastfm", false).unwrap().unwrap();
         assert_eq!(off.scrobble_from_ms, None);
 
-        store.refuse_service_session("lastfm").unwrap();
+        store
+            .refuse_service_session("lastfm", "SENTINEL_SESSION_KEY")
+            .unwrap();
         assert!(
             store
                 .service_session("lastfm")

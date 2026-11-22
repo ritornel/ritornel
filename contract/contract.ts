@@ -3524,7 +3524,8 @@ export type RecordPlayed = {
 };
 
 /**
- * One thing that has stopped the record advancing, and since when.
+ * A warning, one thing that has stopped the record advancing, or a note,
+ * one thing that happened that no one can act on; and since when.
  */
 export type RecordProblem = { kind: RecordProblemKind,
   /**
@@ -3548,9 +3549,9 @@ export type RecordProblem = { kind: RecordProblemKind,
 };
 
 /**
- * What has stopped the record advancing.
+ * What a warning or a note is about.
  */
-export type RecordProblemKind = "listen_unsaved" | "listens_undelivered" | "scrobbles_unknown" | "scrobbles_withdrawn" | "import_failed" | "unreadable";
+export type RecordProblemKind = "listen_unsaved" | "listens_undelivered" | "scrobbles_unknown" | "scrobbles_withdrawn" | "scrobbles_refused" | "sign_in_needed" | "import_failed" | "unreadable";
 
 /**
  * Whether the listening record is advancing: each listen saved and taken
@@ -3559,9 +3560,15 @@ export type RecordProblemKind = "listen_unsaved" | "listens_undelivered" | "scro
  */
 export type RecordStatus = {
   /**
-   * What is wrong now, oldest first. Empty when the record advances.
+   * The warnings: what is wrong now and can be put right, oldest first.
+   * Empty when the record advances.
    */
   problems: Array<RecordProblem>,
+  /**
+   * The notes: what the person should know and can do nothing about,
+   * oldest first. They do not stop the record.
+   */
+  notes: Array<RecordProblem>,
 };
 
 /**

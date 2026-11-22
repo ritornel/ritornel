@@ -39,6 +39,7 @@ mod http;
 pub mod launch;
 pub mod local;
 mod platform;
+pub mod record;
 #[cfg(test)]
 mod testing;
 mod transport;

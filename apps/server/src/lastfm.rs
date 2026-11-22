@@ -75,6 +75,11 @@ pub(crate) struct Lastfm {
     /// The track to show as playing now, until the scrobbler takes it.
     #[cfg(feature = "lastfm")]
     playing: Slot,
+    /// The account nothing is scrobbled for until then, on the monotonic
+    /// clock, because Last.fm said its daily limit was reached or refused a
+    /// request: the plays held back go first when it lifts.
+    #[cfg(feature = "lastfm")]
+    paused: std::sync::Mutex<Option<(ritornel_contract::Id, std::time::Instant)>>,
 }
 
 /// Where a sign-in has got to.
@@ -150,6 +155,7 @@ impl Lastfm {
                 problem,
                 sign_ins: std::sync::Mutex::default(),
                 playing: Slot::default(),
+                paused: std::sync::Mutex::default(),
             }
         }
         #[cfg(not(feature = "lastfm"))]
@@ -214,7 +220,9 @@ mod enabled {
         Due, Job, JobState, LibraryStore, Observations, Progress, ServerStore, ServiceKey,
         ServiceSession, Settled,
     };
-    use ritornel_lastfm::{NotShown, Outcome, Playing, Sent, SessionKey, ToScrobble, Unsent};
+    use ritornel_lastfm::{
+        DAILY_LIMIT, NotShown, Outcome, Playing, Sent, SessionKey, ToScrobble, Unsent,
+    };
     use ritornel_source::{
         Batch, Error as SourceError, HistorySource, Love, LovesStored, Progress as Read, Sink,
         Stored,
@@ -309,6 +317,20 @@ mod enabled {
     /// How long a play that could not be sent waits before it is sent
     /// again.
     const RETRY_MS: i64 = 5 * 60 * 1000;
+
+    /// How long plays that met the account's daily limit wait before they
+    /// are sent again. Last.fm does not say when the limit lifts.
+    pub(super) const DAILY_LIMIT_RETRY_MS: i64 = 60 * 60 * 1000;
+
+    /// How long the account sends nothing after the daily limit is met.
+    pub(super) const DAILY_LIMIT_WAIT: std::time::Duration =
+        std::time::Duration::from_secs(60 * 60);
+
+    /// How long the account sends nothing after Last.fm refuses a request
+    /// whole: long enough not to throw every queued play at a refusal,
+    /// short enough that a request refused for its own content does not
+    /// hold back the rest for long.
+    pub(super) const REFUSED_WAIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
     /// How long a track is heard before Last.fm is told it is playing:
     /// skipping through several tells it of the one stopped at alone.
@@ -413,9 +435,11 @@ mod enabled {
             Ok(()) => debug!("Last.fm is told what is playing"),
             Err(NotShown::SignInAgain(_)) => {
                 warn!("Last.fm refused the session: nothing is scrobbled until a new sign-in");
-                if let Some(Err(failed)) =
-                    core.with_stores(|stores| stores.server().refuse_service_session(SERVICE))
-                {
+                if let Some(Err(failed)) = core.with_stores(|stores| {
+                    stores
+                        .server()
+                        .refuse_service_session(SERVICE, session.key.expose())
+                }) {
                     error!(error = %failed, "a refused session could not be recorded");
                 }
             }
@@ -780,14 +804,32 @@ mod enabled {
                 }
                 None => false,
             },
-            refuse: &|| {
-                if let Some(Err(failed)) =
-                    core.with_stores(|stores| stores.server().refuse_service_session(SERVICE))
-                {
+            refuse: &|key| {
+                if let Some(Err(failed)) = core.with_stores(|stores| {
+                    stores
+                        .server()
+                        .refuse_service_session(SERVICE, key.expose())
+                }) {
                     error!(error = %failed, "a refused session could not be recorded");
                 }
             },
             now: &|| ritornel_engine::Clock::now_ms(&ritornel_engine::SystemClock),
+            paused: &|account| {
+                lastfm
+                    .paused
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some_and(|(paused, until)| {
+                        paused == account && std::time::Instant::now() < until
+                    })
+            },
+            pause: &|account, wait| {
+                *lastfm
+                    .paused
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some((account, std::time::Instant::now() + wait));
+            },
         });
     }
 
@@ -809,9 +851,14 @@ mod enabled {
         /// Records what became of a batch; `false` when it could not.
         pub(crate) settle: &'a dyn Fn(Vec<(i64, Settled)>) -> bool,
         /// Records that Last.fm refused the session.
-        pub(crate) refuse: &'a dyn Fn(),
+        pub(crate) refuse: &'a dyn Fn(&SessionKey),
         /// The time now.
         pub(crate) now: &'a dyn Fn() -> i64,
+        /// Whether nothing is sent for this account for now, after its
+        /// daily limit was met or a request was refused.
+        pub(crate) paused: &'a dyn Fn(Id) -> bool,
+        /// Sends nothing for this account for this long.
+        pub(crate) pause: &'a dyn Fn(Id, std::time::Duration),
     }
 
     /// Sends what is due, a batch at a time, until nothing is due. Before
@@ -829,6 +876,13 @@ mod enabled {
             let Some(from) = session.scrobble_from_ms.filter(|_| !session.sign_in_again) else {
                 return;
             };
+            // This account met its daily limit or was refused: nothing goes
+            // until the wait is over, and then the plays held back go first,
+            // being the oldest due. Another account signed in since is not
+            // held back.
+            if (sending.paused)(session.account) {
+                return;
+            }
             let key = SessionKey::new(session.key.expose());
             let due = match (sending.take)(session.account, from) {
                 Some(due) if !due.is_empty() => due,
@@ -837,8 +891,12 @@ mod enabled {
             let plays: Vec<ToScrobble> = due.iter().map(to_send).collect();
             let now = (sending.now)();
             let (settled, stop): (Vec<(i64, Settled)>, bool) = match (sending.send)(&key, &plays) {
-                Ok(outcomes) => (
-                    due.iter()
+                Ok(outcomes) => {
+                    // A play over the daily limit is no answer about it: it
+                    // is sent again later, and nothing more is sent now.
+                    let mut limited = false;
+                    let settled = due
+                        .iter()
                         .zip(outcomes)
                         .map(|(due, outcome)| {
                             (
@@ -847,6 +905,13 @@ mod enabled {
                                     Outcome::Accepted { artist, title } => {
                                         Settled::Accepted { artist, title }
                                     }
+                                    Outcome::Ignored { code, message } if code == DAILY_LIMIT => {
+                                        limited = true;
+                                        Settled::Later {
+                                            detail: message,
+                                            at_ms: now + DAILY_LIMIT_RETRY_MS,
+                                        }
+                                    }
                                     Outcome::Ignored { code, message } => Settled::Ignored {
                                         code: i64::from(code),
                                         message,
@@ -854,9 +919,13 @@ mod enabled {
                                 },
                             )
                         })
-                        .collect(),
-                    false,
-                ),
+                        .collect();
+                    if limited {
+                        warn!("Last.fm's daily limit is reached: nothing is scrobbled for an hour");
+                        (sending.pause)(session.account, DAILY_LIMIT_WAIT);
+                    }
+                    (settled, limited)
+                }
                 Err(unsent) => {
                     let (each, stop): (Box<dyn Fn() -> Settled>, bool) = match unsent {
                         Unsent::Later(detail) => (
@@ -870,7 +939,7 @@ mod enabled {
                             warn!(
                                 "Last.fm refused the session: nothing is scrobbled until a new sign-in"
                             );
-                            (sending.refuse)();
+                            (sending.refuse)(&key);
                             (
                                 Box::new(move || Settled::Later {
                                     detail: detail.clone(),
@@ -879,8 +948,12 @@ mod enabled {
                                 true,
                             )
                         }
+                        // Last.fm refuses the request itself: every batch
+                        // would be, so nothing more goes for a while.
                         Unsent::Refused(detail) => {
-                            (Box::new(move || Settled::Refused(detail.clone())), false)
+                            warn!("Last.fm refused the request: nothing is scrobbled for a while");
+                            (sending.pause)(session.account, REFUSED_WAIT);
+                            (Box::new(move || Settled::Refused(detail.clone())), true)
                         }
                         Unsent::Unknown(detail) => {
                             (Box::new(move || Settled::Unknown(detail.clone())), false)
@@ -926,10 +999,13 @@ mod enabled {
         use std::cell::{Cell, RefCell};
 
         use ritornel_contract::Id;
-        use ritornel_engine::{Due, ServiceKey, ServiceSession};
+        use ritornel_engine::{Due, ServiceKey, ServiceSession, Settled};
         use ritornel_lastfm::{Outcome, Sent, SessionKey, ToScrobble, Unsent};
 
-        use super::{Began, SETTLE, STALE, Sending, Slot, Taken, send_due};
+        use super::{
+            Began, DAILY_LIMIT_RETRY_MS, DAILY_LIMIT_WAIT, REFUSED_WAIT, SETTLE, STALE, Sending,
+            Slot, Taken, send_due,
+        };
 
         #[test]
         fn of_tracks_skipped_through_only_the_last_is_shown_once_it_settles() {
@@ -1020,10 +1096,118 @@ mod enabled {
                         .collect())
                 },
                 settle: &|_| true,
-                refuse: &|| {},
+                refuse: &|_| {},
                 now: &|| 0,
+                paused: &|_| false,
+                pause: &|_, _| {},
             });
             sent.into_inner()
+        }
+
+        #[test]
+        fn a_play_over_the_daily_limit_is_sent_again_later_and_one_too_old_is_not() {
+            let sent = Cell::new(0);
+            let settled = RefCell::new(Vec::new());
+            // Which account is paused, and whether its wait is over.
+            let paused = Cell::new(None);
+            let over = Cell::new(false);
+            let sending = Sending {
+                session: &|| Some(session("KEY_A", true)),
+                stopping: &|| false,
+                take: &|_, _| Some(batch(100)),
+                send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
+                    sent.set(sent.get() + 1);
+                    Ok(plays
+                        .iter()
+                        .enumerate()
+                        .map(|(n, _)| Outcome::Ignored {
+                            code: if n == 0 { 3 } else { 5 },
+                            message: if n == 0 { "too old" } else { "daily limit" }.to_owned(),
+                        })
+                        .collect())
+                },
+                settle: &|batch| {
+                    settled.borrow_mut().extend(batch);
+                    true
+                },
+                refuse: &|_| {},
+                now: &|| 1_000,
+                paused: &|account| {
+                    paused.get().is_some_and(|(held, _)| held == account) && !over.get()
+                },
+                pause: &|account, wait| paused.set(Some((account, wait))),
+            };
+            send_due(&sending);
+            // The limit is reached: nothing more is sent, however often it
+            // is woken, until the wait is over.
+            assert_eq!(sent.get(), 1);
+            assert!(matches!(paused.get(), Some((_, wait)) if wait == DAILY_LIMIT_WAIT));
+            let first = std::mem::take(&mut *settled.borrow_mut());
+            assert_eq!(first.len(), 50);
+            assert!(matches!(&first[0].1, Settled::Ignored { code: 3, .. }));
+            for (_, later) in &first[1..] {
+                assert!(
+                    matches!(later, Settled::Later { at_ms, .. } if *at_ms == 1_000 + DAILY_LIMIT_RETRY_MS),
+                    "{later:?}"
+                );
+            }
+            send_due(&sending);
+            assert_eq!(sent.get(), 1);
+            over.set(true);
+            send_due(&sending);
+            assert_eq!(sent.get(), 2);
+        }
+
+        #[test]
+        fn one_accounts_pause_does_not_hold_back_another() {
+            let sent = Cell::new(0);
+            let another = Id::from_bytes([8; 16]);
+            send_due(&Sending {
+                session: &|| Some(session("KEY_B", true)),
+                stopping: &|| sent.get() >= 1,
+                take: &|_, _| Some(batch(100)),
+                send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
+                    sent.set(sent.get() + 1);
+                    Ok(plays
+                        .iter()
+                        .map(|play| Outcome::Accepted {
+                            artist: play.artist.clone(),
+                            title: play.title.clone(),
+                        })
+                        .collect())
+                },
+                settle: &|_| true,
+                refuse: &|_| {},
+                now: &|| 1_000,
+                paused: &|account| account == another,
+                pause: &|_, _| {},
+            });
+            assert_eq!(sent.get(), 1);
+        }
+
+        #[test]
+        fn a_request_refused_whole_stops_the_sending_and_pauses_it() {
+            let sent = Cell::new(0);
+            let paused = Cell::new(None);
+            let refused = RefCell::new(Vec::new());
+            send_due(&Sending {
+                session: &|| Some(session("KEY_A", true)),
+                stopping: &|| false,
+                take: &|_, _| Some(batch(100)),
+                send: &|_: &SessionKey, _: &[ToScrobble]| -> Result<Sent, Unsent> {
+                    sent.set(sent.get() + 1);
+                    Err(Unsent::Refused("Invalid API key".to_owned()))
+                },
+                settle: &|_| true,
+                refuse: &|key| refused.borrow_mut().push(key.expose().to_owned()),
+                now: &|| 1_000,
+                paused: &|_| paused.get().is_some(),
+                pause: &|_, wait| paused.set(Some(wait)),
+            });
+            assert_eq!(sent.get(), 1);
+            assert_eq!(paused.get(), Some(REFUSED_WAIT));
+            // A request refused is not the session refused.
+            assert!(refused.borrow().is_empty());
         }
 
         #[test]

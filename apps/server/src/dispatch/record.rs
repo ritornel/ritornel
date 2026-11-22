@@ -110,26 +110,40 @@ impl Core {
             server.failing_deliveries().map_err(text),
             false,
         );
-        // The imports of the account signed in now: one signed out of is
-        // not this server's to import.
-        let imports = server
+        // The account signed in now: its imports and its refusals are the
+        // ones there is to put right.
+        let signed_in = server
             .service_session(SERVICE)
             .map_err(text)
-            .and_then(|session| {
-                session.map_or(Ok(None), |session| {
-                    server
-                        .failing_jobs(
-                            crate::lastfm::SYNC_JOB,
-                            &session.account_name.to_lowercase(),
-                        )
-                        .map_err(text)
-                })
-            });
+            .map(|session| session.map(|session| session.account_name));
+        let imports = signed_in.clone().and_then(|account| {
+            account.map_or(Ok(None), |account| {
+                server
+                    .failing_jobs(crate::lastfm::SYNC_JOB, &account.to_lowercase())
+                    .map_err(text)
+            })
+        });
         add(
             &mut problems,
             &mut unread,
             RecordProblemKind::ImportFailed,
             imports,
+            false,
+        );
+        add(
+            &mut problems,
+            &mut unread,
+            RecordProblemKind::SignInNeeded,
+            server
+                .session_refused(SERVICE)
+                .map(|since| {
+                    since.map(|since_ms| Failing {
+                        since_ms,
+                        count: 1,
+                        detail: None,
+                    })
+                })
+                .map_err(text),
             false,
         );
         let library = stores
@@ -141,7 +155,12 @@ impl Core {
                 .record_dismissal()
                 .map_err(text)
                 .map(|dismissal| dismissal.map_or(i64::MIN, |held| held.through_revision))
-                .and_then(|after| library.lost_scrobbles(after).map_err(text));
+                .and_then(|after| {
+                    let account = signed_in.clone()?;
+                    library
+                        .lost_scrobbles(after, account.as_deref())
+                        .map_err(text)
+                });
             match lost {
                 Ok(lost) => {
                     add(
@@ -156,6 +175,13 @@ impl Core {
                         &mut unread,
                         RecordProblemKind::ScrobblesWithdrawn,
                         Ok(lost.withdrawn),
+                        true,
+                    );
+                    add(
+                        &mut problems,
+                        &mut unread,
+                        RecordProblemKind::ScrobblesRefused,
+                        Ok(lost.refused),
                         true,
                     );
                 }
@@ -180,10 +206,18 @@ impl Core {
         };
         problems.extend(unreadable(&unread, since));
         problems.sort_by_key(|problem| problem.since);
-        RecordStatus { problems }
+        // What no one can act on is not a warning: it is said as a note,
+        // and does not stop the record.
+        let (notes, problems) = problems.into_iter().partition(|problem| {
+            matches!(
+                problem.kind,
+                RecordProblemKind::ScrobblesUnknown | RecordProblemKind::ScrobblesWithdrawn
+            )
+        });
+        RecordStatus { problems, notes }
     }
 
-    /// `record.dismiss`: the scrobbles that ended unknown or withdrawn by
+    /// `record.dismiss`: the scrobbles that ended unknown, withdrawn or refused by
     /// the library's revision now are set aside. The same command again
     /// changes nothing, so a retry hides nothing that ended since, and the
     /// receipt is made and not stored.
@@ -214,7 +248,7 @@ impl Core {
                 .map_err(super::failed)?;
             info!(
                 revision,
-                "the scrobbles that ended unknown or withdrawn so far are dismissed"
+                "the scrobbles that ended unknown, withdrawn or refused so far are dismissed"
             );
         }
         Ok(Dismissed {

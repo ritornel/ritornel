@@ -230,11 +230,17 @@ pub struct ServerStatus {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct RecordStatus {
-    /// What is wrong now, oldest first. Empty when the record advances.
+    /// The warnings: what is wrong now and can be put right, oldest first.
+    /// Empty when the record advances.
     pub problems: Vec<RecordProblem>,
+    /// The notes: what the person should know and can do nothing about,
+    /// oldest first. They do not stop the record.
+    #[serde(default)]
+    pub notes: Vec<RecordProblem>,
 }
 
-/// One thing that has stopped the record advancing, and since when.
+/// A warning, one thing that has stopped the record advancing, or a note,
+/// one thing that happened that no one can act on; and since when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -254,7 +260,7 @@ pub struct RecordProblem {
     pub dismissable: bool,
 }
 
-/// What has stopped the record advancing.
+/// What a warning or a note is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -264,13 +270,22 @@ pub enum RecordProblemKind {
     /// Listens saved on this server have failed to reach history. They are
     /// tried again.
     ListensUndelivered,
-    /// Scrobbles were sent and never answered, and no import has brought
-    /// them back since: the service may not have them. They are not sent
-    /// again. One an import brings back stops counting here.
+    /// A note: scrobbles were sent and never answered, and no import has
+    /// brought them back since, so the service may not have them. They are
+    /// not sent again. One an import brings back stops counting here.
     ScrobblesUnknown,
-    /// Scrobbles were never sent, because their plays stopped being ones
-    /// to send.
+    /// A note: scrobbles were never sent, because their plays stopped being
+    /// ones to send.
     ScrobblesWithdrawn,
+    /// The service refuses the requests that carry scrobbles, so none is
+    /// taken: a key it no longer accepts, or a request it cannot read.
+    /// Those refused are not sent again. It ends when one is taken again,
+    /// or on `record.dismiss`. A play the service declines alone, in a
+    /// request it took, is not this: no one can do anything about that.
+    ScrobblesRefused,
+    /// The service no longer accepts this server's sign-in, so nothing is
+    /// scrobbled until someone signs in again.
+    SignInNeeded,
     /// Importing the service's history failed, and has not worked since.
     ImportFailed,
     /// What would say whether the record advances could not be read, so
@@ -286,6 +301,8 @@ impl RecordProblemKind {
             Self::ListensUndelivered => "listens_undelivered",
             Self::ScrobblesUnknown => "scrobbles_unknown",
             Self::ScrobblesWithdrawn => "scrobbles_withdrawn",
+            Self::ScrobblesRefused => "scrobbles_refused",
+            Self::SignInNeeded => "sign_in_needed",
             Self::ImportFailed => "import_failed",
             Self::Unreadable => "unreadable",
         }
@@ -662,6 +679,12 @@ pub struct ServerInfo {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_record_from_a_server_that_gives_no_notes_has_none() {
+        let record: super::RecordStatus = serde_json::from_str(r#"{"problems":[]}"#).unwrap();
+        assert!(record.notes.is_empty());
+    }
+
     use serde_json::json;
 
     use super::*;

@@ -536,7 +536,8 @@ impl Model {
         .detach();
     }
 
-    /// Sets aside the scrobbles that ended unknown or withdrawn so far.
+    /// Sets aside the scrobbles that ended unknown, withdrawn or refused so
+    /// far: every scrobble note and warning.
     pub(crate) fn dismiss_record(&mut self, cx: &mut Context<Self>) {
         self.doing(
             Busy::Dismissing,

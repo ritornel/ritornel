@@ -41,7 +41,7 @@ use std::time::Duration;
 use scrobl::{ApiKey, ApiSecret, Client};
 
 pub use credentials::{ApiCredentials, CREDENTIALS_FILE, KEY_VARIABLE, SECRET_VARIABLE};
-pub use scrobble::{MAX_BATCH, NotShown, Outcome, Playing, Sent, ToScrobble, Unsent};
+pub use scrobble::{DAILY_LIMIT, MAX_BATCH, NotShown, Outcome, Playing, Sent, ToScrobble, Unsent};
 /// The session key and the sign-in token, as `scrobl` keeps them: no
 /// `Display`, and a redacted `Debug`.
 pub use scrobl::{AuthToken, SessionKey};

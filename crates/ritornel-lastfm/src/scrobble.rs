@@ -32,6 +32,10 @@ pub struct ToScrobble {
     pub timestamp_s: u64,
 }
 
+/// The code Last.fm ignores a play with when the account's daily limit is
+/// reached. It is no answer about the play, which can be sent again later.
+pub const DAILY_LIMIT: u32 = scrobl::model::IgnoredCode::DAILY_LIMIT.get();
+
 /// What Last.fm did with one play.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -155,9 +159,14 @@ impl Lastfm {
             Ok(report) => report.into_value(),
             Err(error) => {
                 let message = error.to_string();
+                // Authentication failing is Last.fm's word for a sign-in it
+                // no longer accepts, as when the account revoked Ritornel:
+                // a new sign-in is the cure, and nothing is lost meanwhile.
+                let revoked = error.api_code() == Some(ApiErrorCode::AUTHENTICATION_FAILED);
                 return Err(match (error.delivery(), error.retry()) {
                     (Some(Delivery::Unknown), _) => Unsent::Unknown(message),
                     (_, Retry::AfterReauthentication) => Unsent::SignInAgain(message),
+                    _ if revoked => Unsent::SignInAgain(message),
                     (Some(Delivery::NotSent), _) | (_, Retry::Later | Retry::AfterBackoff) => {
                         Unsent::Later(message)
                     }

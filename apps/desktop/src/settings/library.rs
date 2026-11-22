@@ -7,6 +7,7 @@ use gpui::{
     App, Entity, InteractiveElement, IntoElement, ParentElement, Styled, div,
     prelude::FluentBuilder, px,
 };
+use ritornel_client::record;
 use ritornel_contract::{
     RecordProblem, RecordProblemKind, RecordStatus, WatchState, WatchedFolder, WatchedKind,
 };
@@ -43,40 +44,6 @@ fn watching(folder: Option<&WatchedFolder>, on: bool, clock: &Clock) -> Option<i
     )
 }
 
-/// What stops the record, in a sentence: what, and how many.
-fn stopped(problem: &RecordProblem) -> String {
-    let n = problem.count;
-    let many = |one: &str, more: &str| {
-        if n == 1 {
-            format!("1 {one}")
-        } else {
-            format!("{} {more}", thousands(n))
-        }
-    };
-    match problem.kind {
-        RecordProblemKind::ListenUnsaved => "The listen playing can’t be saved".to_owned(),
-        RecordProblemKind::ListensUndelivered => {
-            format!("{} not reached history", many("listen has", "listens have"))
-        }
-        RecordProblemKind::ScrobblesUnknown => format!(
-            "{} not have reached Last.fm",
-            many("scrobble may", "scrobbles may")
-        ),
-        RecordProblemKind::ScrobblesWithdrawn => format!(
-            "{} not sent to Last.fm",
-            many("scrobble was", "scrobbles were")
-        ),
-        RecordProblemKind::Unreadable => {
-            "Can’t tell whether every listen is being recorded".to_owned()
-        }
-        RecordProblemKind::ImportFailed if n == 1 => "Importing from Last.fm failed".to_owned(),
-        RecordProblemKind::ImportFailed => format!(
-            "Importing from Last.fm failed {} times in a row",
-            thousands(n)
-        ),
-    }
-}
-
 /// Whether the listening record advances: a quiet line while it does, and
 /// a row for each thing that stops it, with since when, while it does not.
 /// Music can go on playing all the while, which is why this is said.
@@ -85,7 +52,26 @@ fn record(
     model: &Model,
     entity: &Entity<Model>,
     clock: &Clock,
+    cx: &App,
 ) -> impl IntoElement {
+    // Quitting restarts the server only when the app started it; asked
+    // only when something says to restart it.
+    let restarts = record.problems.iter().any(|problem| {
+        matches!(
+            problem.kind,
+            RecordProblemKind::ScrobblesRefused
+                | RecordProblemKind::ImportFailed
+                | RecordProblemKind::Unreadable
+        )
+    });
+    let words = if restarts && !model.link(cx).quitting_stops_the_server() {
+        record::Words {
+            restart: "restart Ritornel’s server",
+            ..WORDS
+        }
+    } else {
+        WORDS
+    };
     let mut rows = Vec::new();
     if record.problems.is_empty() {
         rows.push(
@@ -95,27 +81,36 @@ fn record(
         );
     }
     let dismissing = model.busy.contains(&Busy::Dismissing);
-    // One button sets every such scrobble aside, so one is shown.
-    let dismiss_at = record
+    // The warnings, then the notes: what no one can act on, said quietly.
+    let all: Vec<(&RecordProblem, bool)> = record
         .problems
         .iter()
-        .position(|problem| problem.dismissable);
-    for (n, problem) in record.problems.iter().enumerate() {
+        .map(|problem| (problem, true))
+        .chain(record.notes.iter().map(|note| (note, false)))
+        .collect();
+    // One button sets every such scrobble aside, so one is shown.
+    let dismiss_at = all.iter().position(|(problem, _)| problem.dismissable);
+    for (n, (problem, warning)) in all.iter().enumerate() {
+        // What is wrong or what happened, since when and why, and what to
+        // do or what Ritornel does, in the words `ritornelctl status` says
+        // too.
         let since = format!("Since {}", when(problem.since, clock));
         let said = match &problem.detail {
             Some(detail) => format!("{since}: {detail}"),
             None => since,
         };
+        let then = record::then(problem, words);
         rows.push(
             row()
                 .child(
                     grow()
                         .child(
                             div()
-                                .text_color(super::controls::warn())
-                                .child(stopped(problem)),
+                                .when(*warning, |what| what.text_color(super::controls::warn()))
+                                .child(record::what(problem)),
                         )
-                        .child(sub_wraps(said)),
+                        .child(sub_wraps(said))
+                        .child(sub_wraps(then)),
                 )
                 .when(dismiss_at == Some(n), |row| {
                     row.child(actions().child(push(
@@ -127,25 +122,29 @@ fn record(
                 }),
         );
     }
+    let said =
+        (!record.problems.is_empty()).then_some("Music plays on while the record has stopped.");
     group(true)
         .child(heading("Listening record"))
         .child(boxed(rows))
         .children(model.problems.get(&Group::Record).cloned().map(problem))
-        .when(!record.problems.is_empty(), |group| {
-            group.child(note(if dismiss_at.is_some() {
-                "Music plays on while the record has stopped. Dismiss sets these scrobbles aside; a new one shows here again."
-            } else {
-                "Music plays on while the record has stopped."
-            }))
-        })
+        .children(said.map(note))
 }
+
+/// How the app says what the person does: its own button, and quitting
+/// it, which stops the server it started.
+const WORDS: record::Words<'static> = record::Words {
+    dismiss: "Dismiss",
+    restart: "quit and reopen Ritornel",
+    sign_in: "Sign in again in Settings → Last.fm, then turn scrobbling back on there.",
+};
 
 pub(super) fn render(
     model: &Model,
     entity: &Entity<Model>,
     clock: &Clock,
     active: bool,
-    _cx: &App,
+    cx: &App,
 ) -> impl IntoElement {
     let sources = model.sources.as_deref().unwrap_or_default();
     let here = sources
@@ -298,7 +297,7 @@ pub(super) fn render(
         .status
         .as_ref()
         .and_then(|status| status.record.as_ref())
-        .map(|found| record(found, model, entity, clock));
+        .map(|found| record(found, model, entity, clock, cx));
     let music = group(record.is_none())
         .child(heading("Music folders"))
         .child(boxed(rows))

@@ -357,7 +357,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
                 "folders": [],
             },
             "backup": {},
-            "record": { "problems": [] },
+            "record": { "problems": [], "notes": [] },
         })
     );
 
