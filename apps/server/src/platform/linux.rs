@@ -39,8 +39,6 @@ fn units_dir(env: Env<'_>) -> Result<PathBuf, Error> {
     Ok(config.join("systemd/user"))
 }
 
-/// Writes the unit that serves `data_dir`, enables it and starts it,
-/// replacing one registered before, and says what was done.
 /// The machine's pretty name if one is set, as `hostnamectl` shows it, or
 /// else its host name.
 pub(crate) fn computer_name() -> Option<String> {
@@ -49,7 +47,7 @@ pub(crate) fn computer_name() -> Option<String> {
         .and_then(|info| {
             info.lines().find_map(|line| {
                 let value = line.strip_prefix("PRETTY_HOSTNAME=")?;
-                Some(value.trim().trim_matches('"').to_owned())
+                Some(value.trim().trim_matches(['"', '\'']).to_owned())
             })
         })
         .filter(|name| !name.is_empty());
@@ -75,6 +73,8 @@ pub(crate) fn stay_awake(why: &str) -> std::io::Result<super::Awake> {
         .map(super::Awake)
 }
 
+/// Writes the unit that serves `data_dir`, enables it and starts it,
+/// replacing one registered before, and says what was done.
 pub(crate) fn install_service(data_dir: Option<&Path>, env: Env<'_>) -> Result<String, Error> {
     let units = units_dir(env)?;
     let path = units.join(UNIT);

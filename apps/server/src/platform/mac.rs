@@ -46,8 +46,6 @@ impl Agent {
     }
 }
 
-/// Registers the agent that serves `data_dir` and starts it, replacing one
-/// registered before, and says what was done.
 /// The name in System Settings › General › Sharing, as the person wrote
 /// it: "Studio Mac", not the network's `studio-mac.local`.
 pub(crate) fn computer_name() -> Option<String> {
@@ -74,6 +72,8 @@ pub(crate) fn stay_awake(_why: &str) -> std::io::Result<super::Awake> {
         .map(super::Awake)
 }
 
+/// Registers the agent that serves `data_dir` and starts it, replacing one
+/// registered before, and says what was done.
 pub(crate) fn install_service(data_dir: Option<&Path>, env: Env<'_>) -> Result<String, Error> {
     let Agent { path, domain, job } = Agent::of(env)?;
     // The log directory must be there before launchd opens the log in it.

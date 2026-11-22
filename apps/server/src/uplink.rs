@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ritornel_client::contract::{
@@ -489,6 +490,9 @@ pub(crate) async fn follow(core: std::sync::Arc<crate::dispatch::Core>) {
             continue;
         };
         let mut changes = uplink.changes();
+        // What changed before this began to look is told as well.
+        core.hub_changed();
+        let pinging = Arc::new(AtomicBool::new(false));
         loop {
             tokio::select! {
                 changed = changes.changed() => {
@@ -497,12 +501,29 @@ pub(crate) async fn follow(core: std::sync::Arc<crate::dispatch::Core>) {
                     }
                     core.hub_changed();
                 }
-                () = tokio::time::sleep(CHECK_EVERY) => {
-                    let asked = Arc::clone(&uplink);
-                    let ping = serde_json::json!({ "playing": core.playing() });
-                    let _ = tokio::task::spawn_blocking(move || asked.call("link.ping", ping)).await;
-                }
+                () = tokio::time::sleep(CHECK_EVERY) => ping(&core, &uplink, &pinging),
             }
         }
+    }
+}
+
+/// Pings the hub, saying whether this server plays, unless a ping is still
+/// out. The ping may wait on the hub as long as a call does, so it runs on
+/// a thread of its own: news of the hub is told while it waits, and a
+/// server that stops does not wait for it.
+fn ping(core: &crate::dispatch::Core, uplink: &Arc<Uplink>, pinging: &Arc<AtomicBool>) {
+    if pinging.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let params = serde_json::json!({ "playing": core.playing() });
+    let (asked, out) = (Arc::clone(uplink), Arc::clone(pinging));
+    let started = std::thread::Builder::new()
+        .name("hub ping".to_owned())
+        .spawn(move || {
+            let _ = asked.call("link.ping", params);
+            out.store(false, Ordering::Release);
+        });
+    if started.is_err() {
+        pinging.store(false, Ordering::Release);
     }
 }
