@@ -80,10 +80,10 @@ pub(crate) fn stars_of(rating: Option<u32>, loved: bool) -> u32 {
     }
 }
 
-/// What a click on star `star` sets: that many stars, or none when the song
-/// has exactly that many of its own.
+/// What a click on star `star` sets: that many stars, or none when it is the
+/// last star lit by the song's own (`stars_of`).
 pub(crate) fn clicked(star: u32, own: Option<u32>) -> Option<u32> {
-    (own != Some(star * 20)).then_some(star * 20)
+    (own.map(|own| stars_of(Some(own), false)) != Some(star)).then_some(star * 20)
 }
 
 /// What the card shows once `moving` has gone to `place`: at the top,
@@ -682,6 +682,19 @@ impl Player {
         self.rated.get(&recording).copied().unwrap_or(said)
     }
 
+    /// A click on star `star` of `recording`, whose stars the server last
+    /// said were `said`: that many, or none when it has exactly that many.
+    pub(crate) fn click_star(
+        &mut self,
+        recording: Id,
+        said: Option<u32>,
+        star: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let to = clicked(star, self.own(recording, said));
+        self.rate(recording, to, cx);
+    }
+
     /// Sets a recording's stars, or takes them away with `None`.
     pub(crate) fn rate(&mut self, recording: Id, rating: Option<u32>, cx: &mut Context<Self>) {
         let Some(key) = self.key(cx) else { return };
@@ -959,5 +972,8 @@ mod tests {
         assert_eq!(clicked(3, None), Some(60));
         assert_eq!(clicked(3, Some(80)), Some(60));
         assert_eq!(clicked(3, Some(60)), None);
+        // Three and a half stars show as four: the fourth is the lit one.
+        assert_eq!(clicked(4, Some(70)), None);
+        assert_eq!(clicked(3, Some(70)), Some(60));
     }
 }

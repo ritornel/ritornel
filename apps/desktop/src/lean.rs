@@ -69,7 +69,7 @@ use crate::icons::icon;
 use crate::link::{Link, LinkEvent};
 use crate::moves::{arrive_curve, ease, ease_in, ease_out, fly_curve, progress, since};
 use crate::net::Net;
-use crate::player::{Player, clicked, stars_of};
+use crate::player::{Player, stars_of};
 use crate::theme;
 use crate::tracked::{tracked, tracked_runs};
 
@@ -1710,6 +1710,7 @@ impl Render for LeanBack {
             };
             let foot_width = width - 2. * edge;
             let recording = track.recording_id;
+            let said = track.rating;
             let stars = crate::marks::stars(
                 "lean".into(),
                 stars_of(own, track.loved),
@@ -1727,8 +1728,7 @@ impl Render for LeanBack {
                 move |lean: &mut Self, star, cx| {
                     let Some(recording) = recording else { return };
                     lean.player.update(cx, |player, cx| {
-                        let own = player.own(recording, None);
-                        player.rate(recording, clicked(star, own), cx);
+                        player.click_star(recording, said, star, cx);
                     });
                 },
             );

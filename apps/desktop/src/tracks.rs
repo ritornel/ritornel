@@ -18,7 +18,7 @@ use gpui::{
 use ritornel_contract::{Id, PlayContext, PlaySource, QueuePlace, SongRow};
 
 use crate::icons::icon;
-use crate::player::{Player, clicked, stars_of};
+use crate::player::{Player, stars_of};
 use crate::theme;
 use crate::words;
 
@@ -153,12 +153,15 @@ impl Tracks {
 
     /// A click on star `star` of the song at `at`.
     pub(crate) fn rate(&mut self, at: usize, star: u32, cx: &mut Context<Self>) {
-        let Some(recording) = self.songs.get(at).map(|song| song.recording_id) else {
+        let Some((recording, said)) = self
+            .songs
+            .get(at)
+            .map(|song| (song.recording_id, song.rating))
+        else {
             return;
         };
         self.player.update(cx, |player, cx| {
-            let said = player.own(recording, None);
-            player.rate(recording, clicked(star, said), cx);
+            player.click_star(recording, said, star, cx)
         });
     }
 

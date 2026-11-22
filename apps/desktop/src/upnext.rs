@@ -32,7 +32,7 @@ use ritornel_contract::{Id, QueueEntry, QueuePlace, Repeat, TrackSummary};
 use crate::carry::{self, Carried};
 use crate::icons::icon;
 use crate::link::Link;
-use crate::player::{Player, clicked, stars_of};
+use crate::player::{Player, stars_of};
 use crate::theme;
 use crate::words::{clock, length, plural};
 
@@ -444,6 +444,7 @@ impl UpNextCard {
         let menu = crate::menu::mark(&menu_key, window, cx);
         let drawn = Rc::clone(&self.drawn);
         let recording = track.recording_id;
+        let said = track.rating;
         let stars = crate::marks::stars(
             format!("entry-{index}").into(),
             stars_of(own, track.loved),
@@ -463,8 +464,7 @@ impl UpNextCard {
             move |card: &mut Self, star, cx| {
                 let Some(recording) = recording else { return };
                 card.player.update(cx, |player, cx| {
-                    let own = player.own(recording, None);
-                    player.rate(recording, clicked(star, own), cx);
+                    player.click_star(recording, said, star, cx);
                 });
             },
         );
