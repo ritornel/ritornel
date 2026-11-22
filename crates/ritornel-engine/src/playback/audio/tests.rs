@@ -1703,7 +1703,7 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
 
     // Play opens an output again and carries on, continuing the listen.
     let request = rig.request("playback.resume");
-    let (server, library) = (&rig.server, Some(&rig.library));
+    let (server, library): (_, Option<&dyn Catalog>) = (&rig.server, Some(&rig.library));
     rig.player.resume(request, server, library).unwrap();
     rig.until(|state| state.status == Status::Stopped);
     assert_eq!(rig.player.state().output_failing, None);
@@ -1734,7 +1734,7 @@ fn an_output_that_asks_for_nothing_while_paused_is_not_lost() {
     // It asks again, and play goes on through the same output to the end.
     hold.let_go();
     let request = rig.request("playback.resume");
-    let (server, library) = (&rig.server, Some(&rig.library));
+    let (server, library): (_, Option<&dyn Catalog>) = (&rig.server, Some(&rig.library));
     rig.player.resume(request, server, library).unwrap();
     rig.until(|state| state.status == Status::Stopped);
     let [listen] = rig.staged().try_into().unwrap();
