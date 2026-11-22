@@ -6,8 +6,8 @@
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
-/// The version of [`normalize`] and [`core`]. A stored key is only
-/// comparable with one made by the same version.
+/// The version of stored name keys made by [`normalize`]. A title core
+/// is computed when comparing candidates and is never stored as a name key.
 ///
 /// 2: a mark is kept wherever NFKC leaves it, so a virama or a tone mark
 /// keeps two names apart; punctuation that parts words (a dash, a slash, a
@@ -247,14 +247,21 @@ fn normalize_v1(text: &str) -> String {
 /// titles that differ only in such a note. A title that is all brackets
 /// keeps its full key.
 pub fn core(text: &str) -> String {
+    core_with_fullwidth(text, true)
+}
+
+/// Earlier file policies recognise only ASCII brackets around notes.
+pub(crate) fn core_with_fullwidth(text: &str, fullwidth: bool) -> String {
     let mut outside = String::with_capacity(text.len());
     // A bracket of symbols alone, as "(+)", is kept: it is no note.
     let mut inside = String::new();
     let mut depth = 0_u32;
+    // Read the original brackets before NFKC turns an enclosed numeral
+    // such as ⑴ into "(1)", which would look like a note.
     for c in text.chars() {
         match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => {
+            '(' | '[' | '{' | '（' | '［' | '｛' if fullwidth || c.is_ascii() => depth += 1,
+            ')' | ']' | '}' | '）' | '］' | '｝' if fullwidth || c.is_ascii() => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     let folded: String = inside.nfkc().collect();
@@ -526,6 +533,10 @@ mod tests {
         assert_eq!(core("Lantern [Live] (Radio Edit)"), "lantern");
         assert_eq!(core("(Untitled)"), "untitled");
         assert_eq!(core("Lantern"), "lantern");
+        assert_eq!(core("Lantern（Remastered）"), "lantern");
+        assert_eq!(core("Lantern［＋］"), core("Lantern [+]"));
+        assert_eq!(core("（Untitled）"), "untitled");
+        assert_eq!(core("Lantern ⑴"), "lantern 1");
     }
 
     #[test]
