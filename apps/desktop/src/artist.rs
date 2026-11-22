@@ -257,8 +257,40 @@ impl Artist {
             look: crate::moves::Look::default(),
             _link: followed,
         };
+        cx.on_release(|page, cx| {
+            page.release_images(cx);
+        })
+        .detach();
         page.read(false, cx);
         page
+    }
+
+    /// Drops every picture this page owns from the sprite atlas when the page
+    /// is released.
+    fn release_images(&mut self, cx: &mut gpui::App) {
+        let mut released = false;
+        let mut drop_one = |image: Arc<RenderImage>| {
+            released = true;
+            crate::covers::drop_unshared(image, None, cx);
+        };
+        for (_, image) in self.covers.drain() {
+            drop_one(image);
+        }
+        if let Some(image) = self.face.take() {
+            drop_one(image);
+        }
+        if let Some((image, _)) = self.portrait.take() {
+            drop_one(image);
+        }
+        if let Some((image, _)) = self.blur.take() {
+            drop_one(image);
+        }
+        if let Some((image, _)) = self.banner_blur.take() {
+            drop_one(image);
+        }
+        if released {
+            crate::platform::give_back();
+        }
     }
 
     /// Reads the page, or after a change of plays alone only their songs

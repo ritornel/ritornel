@@ -12,7 +12,7 @@
 //! its album with the song marked, or plays when it is on no record.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -40,6 +40,67 @@ const SETTLE: Duration = Duration::from_millis(60);
 const ARTISTS: usize = 3;
 const ALBUMS: usize = 4;
 const SONGS: usize = 5;
+/// Most search-result thumbnails kept at once (four full dropdowns).
+const MAX_PICTURES: usize = 48;
+
+/// Bounded LRU thumbnail cache for search results that protects active hits.
+#[derive(Default)]
+struct Pictures {
+    map: HashMap<Id, (Arc<RenderImage>, u64)>,
+    in_flight: HashSet<Id>,
+    tick: u64,
+}
+
+impl Pictures {
+    fn get(&mut self, art: &Id) -> Option<Arc<RenderImage>> {
+        self.tick += 1;
+        let (image, used) = self.map.get_mut(art)?;
+        *used = self.tick;
+        Some(Arc::clone(image))
+    }
+
+    fn want(&mut self, art: Id) -> bool {
+        !self.map.contains_key(&art) && self.in_flight.insert(art)
+    }
+
+    fn finish_failed(&mut self, art: Id) {
+        self.in_flight.remove(&art);
+    }
+
+    fn insert(
+        &mut self,
+        art: Id,
+        image: Arc<RenderImage>,
+        keep: &HashSet<Id>,
+    ) -> Vec<Arc<RenderImage>> {
+        self.in_flight.remove(&art);
+        self.tick += 1;
+        let mut evicted = Vec::new();
+        if let Some((old, _)) = self.map.insert(art, (image, self.tick)) {
+            evicted.push(old);
+        }
+        while self.map.len() > MAX_PICTURES {
+            let oldest = self
+                .map
+                .iter()
+                .filter(|(id, _)| !keep.contains(id))
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(id, _)| *id);
+            let Some(old_id) = oldest else {
+                break;
+            };
+            if let Some((old, _)) = self.map.remove(&old_id) {
+                evicted.push(old);
+            }
+        }
+        evicted
+    }
+
+    fn drain(&mut self) -> Vec<Arc<RenderImage>> {
+        self.in_flight.clear();
+        self.map.drain().map(|(_, (image, _))| image).collect()
+    }
+}
 
 /// One result as it drops down.
 #[derive(Debug, Clone)]
@@ -114,8 +175,7 @@ pub(crate) struct SearchBox {
     asking: Option<Task<()>>,
     /// When the dropdown came down, for it to rise into place.
     dropped: Option<Instant>,
-    pictures: HashMap<Id, Arc<RenderImage>>,
-    wanted: std::collections::HashSet<Id>,
+    pictures: Pictures,
     /// Where each row's picture is, for a record's cover to travel from.
     arts: Rc<std::cell::RefCell<HashMap<Id, Bounds<Pixels>>>>,
     /// Where the dropdown is, so a press in it does not close it.
@@ -138,6 +198,12 @@ impl SearchBox {
             FieldEvent::Entered => search.enter(cx),
             FieldEvent::Escaped => search.close(cx),
         });
+        cx.on_release(|search, cx| {
+            for image in search.pictures.drain() {
+                crate::covers::drop_unshared(image, None, cx);
+            }
+        })
+        .detach();
         Self {
             link,
             field,
@@ -149,8 +215,7 @@ impl SearchBox {
             waiting: false,
             asking: None,
             dropped: None,
-            pictures: HashMap::new(),
-            wanted: std::collections::HashSet::new(),
+            pictures: Pictures::default(),
             arts: Rc::default(),
             drop_bounds: Rc::default(),
             hovered_song: None,
@@ -267,7 +332,7 @@ impl SearchBox {
             })
             .collect();
         for art in arts {
-            if !self.wanted.insert(art) {
+            if !self.pictures.want(art) {
                 continue;
             }
             let px = 72;
@@ -281,13 +346,27 @@ impl SearchBox {
                     .flatten()
             });
             cx.spawn(async move |this, cx| {
-                if let Ok(Some((image, _, _))) = read.await {
-                    this.update(cx, |search, cx| {
-                        search.pictures.insert(art, Arc::new(image));
+                let result = read.await.ok().flatten();
+                this.update(cx, |search, cx| match result {
+                    Some((image, _, _)) => {
+                        let keep: HashSet<Id> = search
+                            .view
+                            .hits
+                            .iter()
+                            .filter_map(|hit| match hit {
+                                Hit::Artist(row) => row.art_id,
+                                Hit::Album(tile) => tile.art_id,
+                                Hit::Song(song) => song.art_id,
+                            })
+                            .collect();
+                        for old in search.pictures.insert(art, Arc::new(image), &keep) {
+                            crate::covers::drop_unshared(old, None, cx);
+                        }
                         cx.notify();
-                    })
-                    .ok();
-                }
+                    }
+                    None => search.pictures.finish_failed(art),
+                })
+                .ok();
             })
             .detach();
         }
@@ -329,7 +408,7 @@ impl SearchBox {
             }
             Hit::Album(tile) => {
                 let id = tile.album.id();
-                let image = tile.art_id.and_then(|art| self.pictures.get(&art).cloned());
+                let image = tile.art_id.and_then(|art| self.pictures.get(&art));
                 let lift = self.arts.borrow().get(&id).copied().map(|at| (at, image));
                 SearchEvent::OpenAlbum {
                     row: Arc::new(TileRow::of_album(tile)),
@@ -371,6 +450,7 @@ impl SearchBox {
             ..View::default()
         };
         self.dropped = None;
+        self.arts.borrow_mut().clear();
         self.close_field = true;
         cx.notify();
     }
@@ -544,7 +624,7 @@ impl SearchBox {
     ) -> AnyElement {
         let (title, sub, art, key, round) = Self::shown(hit);
         let lit = index == self.view.selected;
-        let picture = art.and_then(|art| self.pictures.get(&art).cloned());
+        let picture = art.and_then(|art| self.pictures.get(&art));
         let scale = window.scale_factor();
         let soft = (art.is_none())
             .then(|| theme::soft_cached(&format!("{title}{sub}"), (36. * scale).ceil() as u32));
@@ -755,5 +835,51 @@ impl Render for SearchBox {
                 bar.children(key.map(|key| div().text_size(px(12.)).child(key)))
             })
             .children(self.dropdown(window, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_image() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]))
+    }
+
+    #[test]
+    fn search_pictures_stay_bounded_protect_active_hits_and_retry_failures() {
+        let mut cache = Pictures::default();
+        let active = Id::from_bytes([1; 16]);
+        let evictable = Id::from_bytes([2; 16]);
+        let failed = Id::from_bytes([250; 16]);
+        let keep = HashSet::from([active]);
+
+        // Failed requests clear in_flight so a later search can retry.
+        assert!(cache.want(failed));
+        assert!(!cache.want(failed));
+        cache.finish_failed(failed);
+        assert!(cache.want(failed));
+        cache.finish_failed(failed);
+
+        assert!(cache.want(active));
+        assert!(cache.insert(active, tiny_image(), &keep).is_empty());
+        assert!(cache.want(evictable));
+        assert!(cache.insert(evictable, tiny_image(), &keep).is_empty());
+        for i in 3..=(MAX_PICTURES + 5) {
+            let id = Id::from_bytes([i as u8; 16]);
+            assert!(cache.want(id));
+            let evicted = cache.insert(id, tiny_image(), &keep);
+            if i > MAX_PICTURES {
+                assert_eq!(evicted.len(), 1);
+            }
+        }
+        assert_eq!(cache.map.len(), MAX_PICTURES);
+        // Active hit stays cached even after more than MAX_PICTURES inserts.
+        assert!(cache.get(&active).is_some());
+        assert!(cache.get(&evictable).is_none());
+        // Evicted art can be requested again on a later search.
+        assert!(cache.want(evictable));
     }
 }

@@ -57,6 +57,8 @@ pub(crate) const FLY_OUT_MS: f32 = 160.;
 const RADIUS: f32 = 16.;
 /// How long a song just added shows in the accent (`arrived`).
 const ARRIVED_MS: f32 = 1400.;
+/// Covers kept beyond what the queue currently shows before pruning.
+const MAX_PICTURES: usize = 64;
 
 /// The room the page gives Up next's card, as the shell last set it: the
 /// rail when the card moves the page over, or nothing.
@@ -111,7 +113,10 @@ pub(crate) struct UpNextCard {
     player: Entity<Player>,
     /// Covers read, by their art.
     pictures: HashMap<Id, Arc<RenderImage>>,
-    wanted: HashSet<Id>,
+    /// Covers currently being fetched.
+    in_flight: HashSet<Id>,
+    /// Art IDs currently displayed (now playing + queue entries).
+    current_arts: HashSet<Id>,
     /// The entries of the last read, and its revision: entries that arrive
     /// in a later one show arriving for a moment.
     seen: HashSet<Id>,
@@ -146,7 +151,8 @@ impl UpNextCard {
             link,
             player,
             pictures: HashMap::new(),
-            wanted: HashSet::new(),
+            in_flight: HashSet::new(),
+            current_arts: HashSet::new(),
             seen: HashSet::new(),
             last_revision: None,
             fresh: HashSet::new(),
@@ -160,8 +166,20 @@ impl UpNextCard {
             washed: false,
             _player: followed,
         };
+        cx.on_release(|card, cx| {
+            for (_, image) in card.pictures.drain() {
+                crate::covers::drop_unshared(image, None, cx);
+            }
+        })
+        .detach();
         card.read(cx);
         card
+    }
+
+    /// Drops cached covers that are no longer in `current_arts` once the cache
+    /// grows past `MAX_PICTURES`, returning the evicted images for atlas cleanup.
+    fn prune_pictures(&mut self) -> Vec<Arc<RenderImage>> {
+        prune_unused(&mut self.pictures, &self.current_arts)
     }
 
     /// Takes what the player last read of Up next: entries that came in a
@@ -175,10 +193,26 @@ impl UpNextCard {
             .and_then(|state| state.track.as_ref())
             .and_then(|track| track.art_id);
         let read = player.up_next.clone();
+        if let Some(art) = now {
+            self.current_arts.insert(art);
+        }
         self.want(now.into_iter().collect(), cx);
         let Some(read) = read else {
             return;
         };
+        let arts: Vec<Id> = read
+            .entries
+            .iter()
+            .filter_map(|entry| entry.track.art_id)
+            .collect();
+        let mut keep: HashSet<Id> = arts.iter().copied().collect();
+        if let Some(art) = now {
+            keep.insert(art);
+        }
+        self.current_arts = keep;
+        for old in self.prune_pictures() {
+            crate::covers::drop_unshared(old, None, cx);
+        }
         if self.last_revision == Some(read.revision)
             && read.entries.len() == self.seen.len()
             && read
@@ -195,11 +229,6 @@ impl UpNextCard {
         }
         self.seen = ids;
         self.last_revision = Some(read.revision);
-        let arts: Vec<Id> = read
-            .entries
-            .iter()
-            .filter_map(|entry| entry.track.art_id)
-            .collect();
         self.want(arts, cx);
     }
 
@@ -209,7 +238,7 @@ impl UpNextCard {
             return;
         };
         for art in arts {
-            if !self.wanted.insert(art) {
+            if self.pictures.contains_key(&art) || !self.in_flight.insert(art) {
                 continue;
             }
             let px = 88;
@@ -223,13 +252,19 @@ impl UpNextCard {
                     .flatten()
             });
             cx.spawn(async move |this, cx| {
-                if let Ok(Some((image, _, _))) = read.await {
-                    this.update(cx, |card, cx| {
-                        card.pictures.insert(art, Arc::new(image));
+                let result = read.await.ok().flatten();
+                this.update(cx, |card, cx| {
+                    card.in_flight.remove(&art);
+                    if let Some((image, _, _)) = result {
+                        let image = Arc::new(image);
+                        for old in take_picture(&mut card.pictures, &card.current_arts, art, image)
+                        {
+                            crate::covers::drop_unshared(old, None, cx);
+                        }
                         cx.notify();
-                    })
-                    .ok();
-                }
+                    }
+                })
+                .ok();
             })
             .detach();
         }
@@ -996,6 +1031,48 @@ fn outside(shadow: BoxShadow, width: f32, height: f32, radius: f32) -> Vec<gpui:
     strips
 }
 
+/// Prunes cached covers not in `keep` once `pictures` grows past `MAX_PICTURES`.
+fn prune_unused(
+    pictures: &mut HashMap<Id, Arc<RenderImage>>,
+    keep: &HashSet<Id>,
+) -> Vec<Arc<RenderImage>> {
+    if pictures.len() <= MAX_PICTURES {
+        return Vec::new();
+    }
+    let drop_ids: Vec<Id> = pictures
+        .keys()
+        .copied()
+        .filter(|id| !keep.contains(id))
+        .collect();
+    let mut evicted = Vec::with_capacity(drop_ids.len());
+    for id in drop_ids {
+        if let Some(image) = pictures.remove(&id) {
+            evicted.push(image);
+        }
+    }
+    evicted
+}
+
+/// Inserts a fetched cover if `art` is still in `keep`, otherwise returns it
+/// immediately for atlas cleanup so a late completion never repopulates a
+/// pruned queue entry.
+fn take_picture(
+    pictures: &mut HashMap<Id, Arc<RenderImage>>,
+    keep: &HashSet<Id>,
+    art: Id,
+    image: Arc<RenderImage>,
+) -> Vec<Arc<RenderImage>> {
+    if !keep.contains(&art) {
+        return vec![image];
+    }
+    let mut dropped = Vec::new();
+    if let Some(old) = pictures.insert(art, image) {
+        dropped.push(old);
+    }
+    dropped.extend(prune_unused(pictures, keep));
+    dropped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1034,5 +1111,41 @@ mod tests {
         assert_eq!(place_of(Target::End, &entries), QueuePlace::End);
         // With nothing after the song on, the open space plays it next.
         assert_eq!(place_of(Target::End, &[]), QueuePlace::Next);
+    }
+
+    #[test]
+    fn pruning_drops_stale_covers_handles_late_completions_and_large_queues() {
+        let mut pictures = HashMap::new();
+        let kept = Id::from_bytes([1; 16]);
+        let late = Id::from_bytes([250; 16]);
+        let make = || {
+            Arc::new(RenderImage::new(vec![image::Frame::new(
+                image::RgbaImage::new(1, 1),
+            )]))
+        };
+        for i in 1..=(MAX_PICTURES + 10) {
+            let id = Id::from_bytes([i as u8; 16]);
+            pictures.insert(id, make());
+        }
+        let keep = HashSet::from([kept]);
+        let evicted = prune_unused(&mut pictures, &keep);
+        assert_eq!(evicted.len(), MAX_PICTURES + 9);
+        assert_eq!(pictures.len(), 1);
+        assert!(pictures.contains_key(&kept));
+
+        // A late completion for an art ID no longer in the queue is rejected
+        // and returned for atlas cleanup instead of repopulating `pictures`.
+        let rejected = take_picture(&mut pictures, &keep, late, make());
+        assert_eq!(rejected.len(), 1);
+        assert!(!pictures.contains_key(&late));
+
+        // A live queue larger than MAX_PICTURES keeps all of its current arts.
+        let large_keep: HashSet<Id> = (1..=(MAX_PICTURES + 20))
+            .map(|i| Id::from_bytes([i as u8; 16]))
+            .collect();
+        for &id in &large_keep {
+            assert!(take_picture(&mut pictures, &large_keep, id, make()).is_empty() || id == kept);
+        }
+        assert_eq!(pictures.len(), MAX_PICTURES + 20);
     }
 }
