@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [blacksmith-2vcpu-ubuntu-2604, blacksmith-6vcpu-macos-latest]
+        os: [ubuntu-26.04, macos-latest]
     runs-on: ${{ matrix.os }}
     # The macOS job compiles the desktop app's dependencies as well.
     timeout-minutes: 45
@@ -59,7 +59,7 @@ jobs:
     # the server without its default features, so no audio output, media
     # session or Last.fm. pkg-config is pointed at nothing, so any crate
     # that would link a system library (ALSA among them) fails the build.
-    runs-on: blacksmith-2vcpu-ubuntu-2604
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       MISE_DISABLE_TOOLS: conda:ffmpeg,node,pnpm
@@ -76,7 +76,7 @@ jobs:
     # The desktop app on Linux, with GPUI's Wayland and X11 backends, which
     # link fontconfig, xcb and xkbcommon. scripts/desktop.sh skips without
     # them, and fails instead in CI, so this job cannot pass by skipping.
-    runs-on: blacksmith-8vcpu-ubuntu-2604
+    runs-on: ubuntu-26.04
     # It compiles GPUI twice: for clippy and the tests, and in release.
     timeout-minutes: 45
     env:
