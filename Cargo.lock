@@ -2086,6 +2086,7 @@ dependencies = [
  "ritornel-lastfm",
  "ritornel-source",
  "ritornel-windows",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

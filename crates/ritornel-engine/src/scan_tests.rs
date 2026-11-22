@@ -694,6 +694,147 @@ fn a_different_song_saved_over_an_old_file_name_gets_a_new_source_item() {
 }
 
 #[test]
+fn a_moved_file_keeps_its_item_when_other_audio_takes_its_old_path() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    let before = rig.one(
+        "SELECT si.id, a.id, a.recording_id FROM source_item si JOIN assignment a
+                          ON a.source_item_id = si.id",
+    );
+    let root = rig.root();
+    std::fs::rename(
+        root.join("Tin Weather/02.flac"),
+        root.join("Tin Weather/moved.flac"),
+    )
+    .unwrap();
+    rig.put("Tin Weather/02.flac", "a.retagged.flac");
+
+    let summary = rig.scan();
+    assert_eq!(
+        (summary.moved, summary.new, summary.retired, summary.changed),
+        (1, 1, 0, 0)
+    );
+    // The item followed its file, with the same assignment, and its
+    // revisions say where it has been.
+    assert_eq!(
+        rig.one(
+            "SELECT si.id, a.id, a.recording_id FROM source_item si JOIN assignment a
+                 ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+                 WHERE si.provider_key = 'Tin Weather/moved.flac'"
+        ),
+        before
+    );
+    assert_eq!(
+        rig.rows(
+            "SELECT si.id, sr.revision_no, json_extract(sr.payload_json, '$.path')
+             FROM source_item_revision sr JOIN source_item si ON si.id = sr.source_item_id
+             ORDER BY si.id, sr.revision_no"
+        ),
+        [
+            "1|1|Tin Weather/02.flac",
+            "1|2|Tin Weather/moved.flac",
+            "2|1|Tin Weather/02.flac"
+        ]
+    );
+    // The audio now at the old path is a new item of its own, and nothing
+    // was retired.
+    assert_eq!(
+        rig.rows(
+            "SELECT si.provider_key, si.retired_at_ms IS NOT NULL, r.display_title
+             FROM source_item si JOIN assignment a ON a.source_item_id = si.id
+               AND a.superseded_at_ms IS NULL
+             JOIN recording r ON r.id = a.recording_id ORDER BY si.id"
+        ),
+        [
+            "Tin Weather/moved.flac|0|Paper Kites",
+            "Tin Weather/02.flac|0|Another Name Entirely"
+        ]
+    );
+    // And then nothing: the next scan is quiet.
+    let revision = rig.revision();
+    rig.scan();
+    assert_eq!(rig.revision(), revision);
+}
+
+#[test]
+fn a_file_renamed_into_a_moved_files_old_path_keeps_its_item() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.put("Tin Weather/03.flac", "a.retagged.flac");
+    rig.scan();
+    let items = |rig: &Rig| {
+        rig.rows(
+            "SELECT si.id, si.provider_key, sr.audio_asset_id FROM source_item si
+             JOIN source_item_revision sr ON sr.id = si.current_revision_id ORDER BY si.id",
+        )
+    };
+    assert_eq!(
+        items(&rig),
+        ["1|Tin Weather/02.flac|1", "2|Tin Weather/03.flac|2"]
+    );
+    // 02 moves aside, and 03 moves into its place.
+    let root = rig.root();
+    std::fs::rename(
+        root.join("Tin Weather/02.flac"),
+        root.join("Tin Weather/01.flac"),
+    )
+    .unwrap();
+    std::fs::rename(
+        root.join("Tin Weather/03.flac"),
+        root.join("Tin Weather/02.flac"),
+    )
+    .unwrap();
+
+    let summary = rig.scan();
+    assert_eq!(
+        (summary.moved, summary.new, summary.retired, summary.missing),
+        (2, 0, 0, 0)
+    );
+    assert_eq!(
+        items(&rig),
+        ["1|Tin Weather/01.flac|1", "2|Tin Weather/02.flac|2"]
+    );
+}
+
+#[test]
+fn files_each_renamed_into_the_next_ones_place_keep_their_items() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.put("Tin Weather/03.mp3", "a.mp3");
+    rig.scan();
+    let items = |rig: &Rig| {
+        rig.rows(
+            "SELECT si.id, si.provider_key, sr.audio_asset_id FROM source_item si
+             JOIN source_item_revision sr ON sr.id = si.current_revision_id ORDER BY si.id",
+        )
+    };
+    let before = items(&rig);
+    // Each moves up one, the last first: 03 to 04, 02 to 03, 01 to 02.
+    let root = rig.root().join("Tin Weather");
+    std::fs::rename(root.join("03.mp3"), root.join("04.mp3")).unwrap();
+    std::fs::rename(root.join("02.flac"), root.join("03.mp3")).unwrap();
+    std::fs::rename(root.join("01.flac"), root.join("02.flac")).unwrap();
+
+    let summary = rig.scan();
+    assert_eq!(
+        (summary.moved, summary.new, summary.retired, summary.missing),
+        (3, 0, 0, 0)
+    );
+    let after = items(&rig);
+    let renamed = |row: &String, from: &str, to: &str| row.replace(from, to);
+    assert_eq!(
+        after,
+        [
+            renamed(&before[0], "01.flac", "02.flac"),
+            renamed(&before[1], "02.flac", "03.mp3"),
+            renamed(&before[2], "03.mp3", "04.mp3"),
+        ]
+    );
+}
+
+#[test]
 fn a_file_that_vanishes_is_marked_missing_and_reclaims_its_rows_when_it_returns() {
     let mut rig = Rig::new();
     album(&mut rig);
@@ -1155,6 +1296,66 @@ fn a_disk_that_goes_away_mid_scan_leaves_every_file_as_it_was_and_the_next_scan_
     );
     assert_eq!(rig.one(title), "Another Name Entirely");
     assert_eq!(rig.library.stats().unwrap().files_unreadable, 0);
+}
+
+#[test]
+fn another_disk_mounted_at_the_root_after_the_walk_is_not_judged_against_it() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    let (root, away) = (rig.root(), rig.scratch.path().join("unmounted"));
+    for (nothing_to_read, swapped_before_judging) in [(false, false), (true, false), (false, true)]
+    {
+        if swapped_before_judging {
+            // The walk sees only other audio at 01, which is read from
+            // the disk walked. The swap comes before it is judged.
+            rig.scan();
+            rig.put("Tin Weather/01.flac", "b.flac");
+        } else if nothing_to_read {
+            // The walk sees only a file gone, and the scan goes straight to
+            // judging what is missing.
+            rig.scan();
+            rig.put("Tin Weather/03.mp3", "a.mp3");
+            rig.scan();
+            std::fs::remove_file(root.join("Tin Weather/03.mp3")).unwrap();
+        } else {
+            // The walk sees 01 changed and 02 gone.
+            rig.put("Tin Weather/01.flac", "a.retagged.flac");
+            std::fs::remove_file(root.join("Tin Weather/02.flac")).unwrap();
+        }
+        let (revision, before) = (rig.revision(), rig.dump());
+        let (mut run, row) = walked(&mut rig);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        if swapped_before_judging {
+            // The batch is read, and nothing is missing.
+            for _ in 0..2 {
+                assert!(run.prepare(&stop, &mut |_| {}).unwrap());
+                assert_eq!(run.commit(&rig.library).unwrap(), None);
+            }
+        }
+        // Then the disk is swapped for another whose files all read, with
+        // other audio at 01.
+        std::fs::rename(&root, &away).unwrap();
+        rig.put("Tin Weather/01.flac", "a.retagged.flac");
+        let refused = loop {
+            match run.prepare(&stop, &mut |_| {}) {
+                Ok(_) => assert_eq!(run.commit(&rig.library).unwrap(), None),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(&refused, Error::RootOffline { path } if *path == root),
+            "{refused:?}"
+        );
+        rig.server
+            .finish_job(row, JobState::Failed, Some("offline".to_owned()))
+            .unwrap();
+        // Nothing is replaced, retired, missing or changed.
+        assert_eq!((rig.revision(), rig.dump()), (revision, before));
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::rename(&away, &root).unwrap();
+    }
 }
 
 #[test]
