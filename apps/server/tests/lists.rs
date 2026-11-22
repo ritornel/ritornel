@@ -738,6 +738,18 @@ async fn a_session_holds_at_most_its_limit_of_views(via: Via) {
                 .view,
         );
     }
+    // Neither a bad query nor a bad first window may cost a working view.
+    for (sort, window) in [(Some(SortKey::Year), None), (None, Some((0, 501)))] {
+        let mut bad = open(ListKind::Artists, sort, window);
+        bad.replaces = Some(Replaces {
+            view: views[0].clone(),
+            anchor: None,
+        });
+        assert!(client.list_open(&bad).await.is_err());
+        for view in &views {
+            client.list_window(view, 0, 1).await.unwrap();
+        }
+    }
     // The first is used, so the second is the least recently used.
     client.list_window(&views[0], 0, 1).await.unwrap();
     client

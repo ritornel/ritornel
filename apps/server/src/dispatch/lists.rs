@@ -159,9 +159,6 @@ impl Core {
         params: ListOpenParams,
     ) -> Result<ListOpened, RpcError> {
         Self::library(stores, |library| {
-            if let Some(replaces) = &params.replaces {
-                session.close_view(&replaces.view);
-            }
             let started = Instant::now();
             let resolved = library
                 .list_open(params.kind, &params.query)
@@ -173,16 +170,6 @@ impl Core {
             let opened_ms = started.elapsed().as_secs_f64() * 1000.0;
             let resolved = Arc::new(resolved);
             let view = self.new_view_id()?;
-            session.hold_view(view.clone(), Arc::clone(&resolved));
-            debug!(
-                session = session.id(),
-                kind = ?params.kind,
-                rows = resolved.ids.len(),
-                bytes = resolved.bytes(),
-                session_view_bytes = session.view_bytes(),
-                ms = opened_ms,
-                "opened a view"
-            );
             let anchor_index = match params.replaces.as_ref().and_then(|r| r.anchor.as_deref()) {
                 Some(anchor) => library
                     .list_key(params.kind, anchor)
@@ -195,6 +182,19 @@ impl Core {
                 Some(window) => Self::window(library, &resolved, window)?,
                 None => (0, Vec::new()),
             };
+            if let Some(replaces) = &params.replaces {
+                session.close_view(&replaces.view);
+            }
+            session.hold_view(view.clone(), Arc::clone(&resolved));
+            debug!(
+                session = session.id(),
+                kind = ?params.kind,
+                rows = resolved.ids.len(),
+                bytes = resolved.bytes(),
+                session_view_bytes = session.view_bytes(),
+                ms = opened_ms,
+                "opened a view"
+            );
             Ok(ListOpened {
                 view,
                 total: resolved.ids.len() as u64,
