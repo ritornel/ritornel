@@ -15,7 +15,7 @@ use ritornel_contract::{
     SatelliteStatus, ServerRole, hex, link_request_proof,
 };
 use ritornel_engine::playback::{Catalog, Delivered, FileFacts, deliver_listens_to};
-use ritornel_engine::{Clock, HubLink, Ingested, ListenRecord, SendStamps};
+use ritornel_engine::{Clock, HubLink, Ingested, LISTEN_RECORD_VERSION, ListenRecord, SendStamps};
 use tracing::{info, warn};
 
 use super::{Core, Stores, lock};
@@ -30,6 +30,26 @@ const MAX_TRACKS_ASKED: usize = 1000;
 /// take it. The hub not answering is the usual reason, and it is soon
 /// back, so a satellite tries more often than a hub retries its own disk.
 const HUB_BACKOFF_MS: i64 = 30_000;
+
+/// The largest number a listen from a satellite may hold: about 35,000
+/// years in milliseconds, far beyond any clock or track, and far enough
+/// below the limit of the record's arithmetic that no sum or difference of
+/// two overflows.
+const MAX_PLAUSIBLE: u64 = 1 << 50;
+
+/// Whether every number in a listen record is a plausible one.
+fn plausible(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .map(i64::unsigned_abs)
+            .or_else(|| number.as_u64())
+            .is_some_and(|number| number <= MAX_PLAUSIBLE),
+        serde_json::Value::Array(values) => values.iter().all(plausible),
+        serde_json::Value::Object(fields) => fields.values().all(plausible),
+        _ => true,
+    }
+}
 
 /// Where a call is answered on a satellite.
 pub(super) enum Route {
@@ -493,9 +513,32 @@ impl Core {
                 "link.listen is for a satellite's link session",
             ));
         };
+        // What another machine sends is checked before the record's
+        // arithmetic sees it: no time or count beyond what any clock or
+        // track reaches, and a record of the version this hub reads.
+        let stamps = [params.sent_at_ms, params.sent_mono_ms];
+        if !plausible(&params.record)
+            || stamps
+                .iter()
+                .any(|stamp| stamp.unsigned_abs() > MAX_PLAUSIBLE)
+        {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                "that listen holds a number no clock or track reaches",
+            ));
+        }
         let record: ListenRecord = serde_json::from_value(params.record).map_err(|error| {
             RpcError::new(ErrorCode::Invalid, format!("that is not a listen: {error}"))
         })?;
+        if record.v != LISTEN_RECORD_VERSION {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!(
+                    "that listen is of record version {}, and this hub reads {LISTEN_RECORD_VERSION}",
+                    record.v
+                ),
+            ));
+        }
         if record.played_on_server != peer || record.listen_id != params.idempotency_key {
             return Err(RpcError::new(
                 ErrorCode::Forbidden,

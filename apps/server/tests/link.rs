@@ -976,6 +976,20 @@ async fn a_listen_sent_again_is_taken_once_and_only_from_its_own_player() {
             .await
             .unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
+        // A number no clock reaches is refused before the record sees it,
+        // and the hub takes listens as before.
+        let mut wild = record.clone();
+        wild["startedAtMs"] = serde_json::json!(i64::MAX);
+        let refused = linked
+            .call::<LinkListen>(&send(wild, listen_id))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Invalid), "{refused}");
+        let again = linked
+            .call::<LinkListen>(&send(record.clone(), listen_id))
+            .await
+            .unwrap();
+        assert_eq!(again.taken, ListenTaken::Duplicate);
         // Nor does a client of the hub report listens at all.
         let hub_client = client(&scratch, "hub", &hub).await;
         let refused = hub_client
