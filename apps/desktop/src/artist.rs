@@ -204,8 +204,8 @@ pub(crate) struct Artist {
     /// The size its box has now, in device pixels: what is made next.
     wanted: Option<(u32, u32)>,
     /// Their picture blurred for the wash, and for the banner.
-    pub blur: Option<(Arc<RenderImage>, Instant)>,
-    banner_blur: Option<(Arc<RenderImage>, Instant)>,
+    pub blur: crate::blur::Shown,
+    banner_blur: crate::blur::Shown,
     /// The picture the page's pictures were made from, and whether it is
     /// their portrait: a portrait added or taken away can keep the picture's
     /// ID, when it is the same as a cover's.
@@ -585,8 +585,13 @@ impl Artist {
                 match blurs {
                     Some((banner, wash)) => {
                         let now = Instant::now();
-                        page.banner_blur = Some((Arc::new(banner), now));
-                        page.blur = Some((Arc::new(wash), now));
+                        let gone = [
+                            crate::blur::replace(&mut page.banner_blur, Arc::new(banner), now),
+                            crate::blur::replace(&mut page.blur, Arc::new(wash), now),
+                        ];
+                        for old in gone.into_iter().flatten() {
+                            crate::covers::drop_unshared(old, None, cx);
+                        }
                     }
                     // A picture the server cannot make (one in a format it
                     // does not read) is no picture: the page takes its
@@ -712,29 +717,27 @@ impl Artist {
     /// With no picture, soft colour from their name: the face, and the
     /// blurs for the banner and the wash.
     /// While the window draws, it is handed `window`, to let go of the face
-    /// this replaces.
+    /// and the blurs this replaces.
     fn soft_pictures(
         &mut self,
         banner_radius: usize,
         wash_radius: usize,
-        window: Option<&mut Window>,
+        mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         let soft = theme::soft_pixels(&self.name, crate::blur::SIDE);
         let tone = crate::blur::wash_tone(theme::dark());
         let now = Instant::now();
-        self.banner_blur = Some((
-            Arc::new(crate::blur::pixels(
-                &soft,
-                banner_radius,
-                crate::blur::BANNER.1,
-            )),
-            now,
-        ));
-        self.blur = Some((
-            Arc::new(crate::blur::toned(&soft, wash_radius, tone.0, tone.1)),
-            now,
-        ));
+        let banner = crate::blur::pixels(&soft, banner_radius, crate::blur::BANNER.1);
+        let wash = crate::blur::toned(&soft, wash_radius, tone.0, tone.1);
+        // The blurs they replace are let go, as the face is.
+        let gone = [
+            crate::blur::replace(&mut self.banner_blur, Arc::new(banner), now),
+            crate::blur::replace(&mut self.blur, Arc::new(wash), now),
+        ];
+        for old in gone.into_iter().flatten() {
+            crate::covers::drop_unshared(old, window.as_deref_mut(), cx);
+        }
         self.soft_face(window, cx);
     }
 

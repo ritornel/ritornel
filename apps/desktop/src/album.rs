@@ -85,9 +85,7 @@ pub(crate) struct Album {
     page: Option<AlbumPage>,
     history: Option<HistoryOf>,
     more: Vec<AlbumTile>,
-    more_covers: HashMap<Id, Arc<RenderImage>>,
-    more_asked: HashSet<(Id, u32)>,
-    more_px: u32,
+    more_covers: MoreCovers,
     fetches: crate::covers::FetchBag,
     revision: u64,
     reading: Option<Task<()>>,
@@ -104,8 +102,8 @@ pub(crate) struct Album {
     large_read: u64,
     face_read: u64,
     /// The cover blurred for the wash, and for the banner.
-    pub blur: Option<(Arc<RenderImage>, Instant)>,
-    banner_blur: Option<(Arc<RenderImage>, Instant)>,
+    pub blur: crate::blur::Shown,
+    banner_blur: crate::blur::Shown,
     pub top: f32,
     /// The stretch past either end.
     elastic: crate::elastic::Elastic,
@@ -157,9 +155,7 @@ impl Album {
             page: None,
             history: None,
             more: Vec::new(),
-            more_covers: HashMap::new(),
-            more_asked: HashSet::new(),
-            more_px: 0,
+            more_covers: MoreCovers::default(),
             fetches: crate::covers::FetchBag::default(),
             revision: 0,
             reading: None,
@@ -209,7 +205,7 @@ impl Album {
         if let Some((image, _)) = self.banner_blur.take() {
             drop_one(image);
         }
-        for (_, image) in self.more_covers.drain() {
+        for image in self.more_covers.drain() {
             drop_one(image);
         }
         if released {
@@ -340,10 +336,7 @@ impl Album {
     /// The covers of the row at the foot, for only the columns that fit.
     fn more_pictures(&mut self, columns: usize, scale: f32, cx: &mut Context<Self>) {
         let px = (MORE_CARD * scale).ceil() as u32;
-        if self.more_px != px {
-            self.more_px = px;
-            self.more_asked.clear();
-        }
+        self.more_covers.size(px);
         let arts: Vec<Id> = self
             .more
             .iter()
@@ -351,18 +344,16 @@ impl Album {
             .filter_map(|tile| tile.art_id)
             .collect();
         for art in arts {
-            if !self.more_asked.insert((art, px)) {
+            if !self.more_covers.ask(art) {
                 continue;
             }
             self.fetch_opt(art, px, cx, move |page, image, cx| match image {
                 Some(image) => {
-                    if let Some(old) = page.more_covers.insert(art, image) {
+                    if let Some(old) = page.more_covers.took(art, px, image) {
                         crate::covers::drop_unshared(old, None, cx);
                     }
                 }
-                None => {
-                    page.more_asked.remove(&(art, px));
-                }
+                None => page.more_covers.failed(art, px),
             });
         }
     }
@@ -433,8 +424,13 @@ impl Album {
                 match blurs {
                     Some((banner, wash)) => {
                         let now = Instant::now();
-                        page.banner_blur = Some((Arc::new(banner), now));
-                        page.blur = Some((Arc::new(wash), now));
+                        let gone = [
+                            crate::blur::replace(&mut page.banner_blur, Arc::new(banner), now),
+                            crate::blur::replace(&mut page.blur, Arc::new(wash), now),
+                        ];
+                        for old in gone.into_iter().flatten() {
+                            crate::covers::drop_unshared(old, None, cx);
+                        }
                     }
                     // A cover the server cannot make (one in a format it
                     // does not read) is no cover: the page takes the soft
@@ -524,30 +520,28 @@ impl Album {
     /// For a record with no cover, the soft colours made from its title and
     /// artist: the face, and the blurs for the banner and the wash.
     /// While the window draws, it is handed `window`, to let go of the face
-    /// this replaces.
+    /// and the blurs this replaces.
     fn soft_pictures(
         &mut self,
         banner_radius: usize,
         wash_radius: usize,
-        window: Option<&mut Window>,
+        mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         let name = self.soft_name();
         let soft = theme::soft_pixels(&name, crate::blur::SIDE);
         let tone = crate::blur::wash_tone(theme::dark());
         let now = Instant::now();
-        self.banner_blur = Some((
-            Arc::new(crate::blur::pixels(
-                &soft,
-                banner_radius,
-                crate::blur::BANNER.1,
-            )),
-            now,
-        ));
-        self.blur = Some((
-            Arc::new(crate::blur::toned(&soft, wash_radius, tone.0, tone.1)),
-            now,
-        ));
+        let banner = crate::blur::pixels(&soft, banner_radius, crate::blur::BANNER.1);
+        let wash = crate::blur::toned(&soft, wash_radius, tone.0, tone.1);
+        // The blurs they replace are let go, as the face is.
+        let gone = [
+            crate::blur::replace(&mut self.banner_blur, Arc::new(banner), now),
+            crate::blur::replace(&mut self.blur, Arc::new(wash), now),
+        ];
+        for old in gone.into_iter().flatten() {
+            crate::covers::drop_unshared(old, window.as_deref_mut(), cx);
+        }
         self.soft_face(window, cx);
     }
 
@@ -563,9 +557,7 @@ impl Album {
     pub(crate) fn open_record(&mut self, n: usize, cx: &mut Context<Self>) {
         let Some(tile) = self.more.get(n) else { return };
         let row = Arc::new(TileRow::of_album(tile.clone()));
-        let image = tile
-            .art_id
-            .and_then(|art| self.more_covers.get(&art).cloned());
+        let image = tile.art_id.and_then(|art| self.more_covers.get(art));
         let lift = record::Lift::of(&self.landings, row.id, image);
         cx.emit(AlbumEvent::Open(row, lift));
     }
@@ -809,7 +801,7 @@ impl Album {
             );
             let opened = Arc::new(TileRow::of_album(tile.clone()));
             let picture = match tile.art_id {
-                Some(art) => self.more_covers.get(&art).cloned(),
+                Some(art) => self.more_covers.get(art),
                 None => Some(theme::soft_cached(&name, (MORE_CARD * scale).ceil() as u32)),
             };
             let landings = Rc::clone(&self.landings);
@@ -1224,9 +1216,90 @@ impl Render for Album {
     }
 }
 
+/// The covers of the row at the foot of an album's page, read at one size
+/// at a time: the cards' at the display's scale.
+#[derive(Default)]
+struct MoreCovers {
+    covers: HashMap<Id, Arc<RenderImage>>,
+    asked: HashSet<(Id, u32)>,
+    px: u32,
+}
+
+impl MoreCovers {
+    /// Reads them at `px` from now on; at another size, each is asked for again.
+    fn size(&mut self, px: u32) {
+        if self.px != px {
+            self.px = px;
+            self.asked.clear();
+        }
+    }
+
+    /// Whether `art` is to be read now: it has not been asked for at this size.
+    fn ask(&mut self, art: Id) -> bool {
+        self.asked.insert((art, self.px))
+    }
+
+    /// A cover read at `px` came: kept in place of the one before, which is
+    /// handed back to be let go from the sprite atlas. One read for a size
+    /// the row has left since, coming after the one for its size now, is not
+    /// kept; never drawn, it has nothing in the atlas to let go.
+    fn took(&mut self, art: Id, px: u32, image: Arc<RenderImage>) -> Option<Arc<RenderImage>> {
+        if px != self.px {
+            return None;
+        }
+        self.covers.insert(art, image)
+    }
+
+    /// A cover read at `px` could not be read: it may be asked for again.
+    fn failed(&mut self, art: Id, px: u32) {
+        self.asked.remove(&(art, px));
+    }
+
+    fn get(&self, art: Id) -> Option<Arc<RenderImage>> {
+        self.covers.get(&art).cloned()
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = Arc<RenderImage>> + '_ {
+        self.covers.drain().map(|(_, image)| image)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tiny() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]))
+    }
+
+    #[test]
+    fn a_cover_read_for_a_size_the_row_has_left_is_not_kept() {
+        let mut more = MoreCovers::default();
+        let art = Id::from_bytes([1; 16]);
+        // Asked at one scale, then at another before the first came.
+        more.size(100);
+        assert!(more.ask(art));
+        more.size(200);
+        assert!(more.ask(art));
+        let sharp = tiny();
+        assert!(more.took(art, 200, Arc::clone(&sharp)).is_none());
+        // The read at the size the row has left comes last.
+        assert!(more.took(art, 100, tiny()).is_none());
+        assert!(more.get(art).is_some_and(|kept| Arc::ptr_eq(&kept, &sharp)));
+    }
+
+    #[test]
+    fn a_cover_replaced_at_its_size_is_handed_back_to_be_let_go() {
+        let mut more = MoreCovers::default();
+        let art = Id::from_bytes([2; 16]);
+        more.size(100);
+        let first = tiny();
+        assert!(more.took(art, 100, Arc::clone(&first)).is_none());
+        let gone = more.took(art, 100, tiny());
+        assert!(gone.is_some_and(|gone| Arc::ptr_eq(&gone, &first)));
+    }
 
     #[test]
     fn more_columns_matches_visible_row_width() {

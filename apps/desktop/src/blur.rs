@@ -10,7 +10,23 @@
 //! as is Lean back's in the dark palette, which in the light one is
 //! `blur(64px) saturate(1.25) brightness(1.18)`.
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use gpui::RenderImage;
+
+/// A page's blur, and when it came, for its fade in.
+pub(crate) type Shown = Option<(Arc<RenderImage>, Instant)>;
+
+/// Puts `image` in `slot`, come `at`, and hands back the blur it replaces,
+/// for the page to let go from the sprite atlas.
+pub(crate) fn replace(
+    slot: &mut Shown,
+    image: Arc<RenderImage>,
+    at: Instant,
+) -> Option<Arc<RenderImage>> {
+    slot.replace((image, at)).map(|(old, _)| old)
+}
 
 /// The side the picture is blurred at.
 pub(crate) const SIDE: u32 = 128;
@@ -149,6 +165,23 @@ fn box_blur(source: &[[f32; 3]], w: usize, h: usize, radius: usize, across: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tiny() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]))
+    }
+
+    #[test]
+    fn a_blur_replaced_is_handed_back_to_be_let_go() {
+        let mut slot: Shown = None;
+        let (first, second) = (tiny(), tiny());
+        let now = Instant::now();
+        assert!(replace(&mut slot, Arc::clone(&first), now).is_none());
+        let gone = replace(&mut slot, Arc::clone(&second), now);
+        assert!(gone.is_some_and(|gone| Arc::ptr_eq(&gone, &first)));
+        assert!(slot.is_some_and(|(shown, _)| Arc::ptr_eq(&shown, &second)));
+    }
 
     /// A JPEG of three bands down it, green, red and blue, each a third.
     fn banded(w: u32, h: u32) -> Vec<u8> {
