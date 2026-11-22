@@ -332,9 +332,10 @@ impl ServerStore {
     }
 
     /// When this server keeps its machine from sleeping for its linked
-    /// servers: the default until set. See "Keeping a hub awake" in
+    /// servers, if it has been set. A stored value that cannot be read is
+    /// [`Error::Invalid`]. See "Keeping a hub awake" in
     /// docs/internals/server.md.
-    pub fn awake(&self) -> Result<ritornel_contract::Awake, Error> {
+    pub fn awake(&self) -> Result<Option<ritornel_contract::Awake>, Error> {
         self.reader.call(|connection| {
             let value: Option<String> = connection
                 .query_row(
@@ -343,9 +344,10 @@ impl ServerStore {
                     |row| row.get(0),
                 )
                 .optional()?;
-            Ok(value
-                .and_then(|value| serde_json::from_str(&value).ok())
-                .unwrap_or_default())
+            value
+                .map(|value| serde_json::from_str(&value))
+                .transpose()
+                .map_err(|_| Error::Invalid("the stored wake setting cannot be read"))
         })
     }
 
@@ -655,7 +657,7 @@ mod tests {
     fn the_wake_setting_is_the_default_until_set_and_kept_once_set() {
         let clock = Arc::new(FixedClock::at(T0));
         let store = in_memory(&clock);
-        assert_eq!(store.awake().unwrap(), ritornel_contract::Awake::default());
+        assert_eq!(store.awake().unwrap(), None);
         let command = crate::Command {
             id: Id::from_bytes([7; 16]),
             fingerprint: crate::Fingerprint::of("link.setAwake", b"never"),
@@ -668,7 +670,10 @@ mod tests {
             )
             .unwrap();
         assert!(changed.now);
-        assert_eq!(store.awake().unwrap(), ritornel_contract::Awake::Never);
+        assert_eq!(
+            store.awake().unwrap(),
+            Some(ritornel_contract::Awake::Never)
+        );
         // The same command again changes nothing.
         let again = store
             .change_once(
@@ -678,7 +683,10 @@ mod tests {
             )
             .unwrap();
         assert!(!again.now);
-        assert_eq!(store.awake().unwrap(), ritornel_contract::Awake::Never);
+        assert_eq!(
+            store.awake().unwrap(),
+            Some(ritornel_contract::Awake::Never)
+        );
     }
 
     #[test]

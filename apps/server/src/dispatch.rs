@@ -354,22 +354,35 @@ impl Core {
         self.changed(&mut this);
     }
 
-    /// When this server keeps its machine from sleeping for its linked
-    /// servers, as it is kept in `server.db`: read at start, and set again
-    /// by `link.setAwake`. The machine is held, or let go, at once.
-    pub(crate) fn set_awake(&self, setting: ritornel_contract::Awake) {
-        let now = self.clock.now_ms();
+    /// Follows the wake setting `server.db` keeps: at start, and after
+    /// `link.setAwake`. It is read while the wake state is held, so of two
+    /// settings made at once, the one the database kept last is the one
+    /// followed. The machine is held, or let go, at once.
+    pub(crate) fn follow_stored_awake(&self, stores: &Stores) {
         let mut awake = lock(&self.awake);
-        awake.setting = setting;
-        awake.follow_the_rule(now);
+        awake.setting = match stores.server().awake() {
+            Ok(Some(setting)) if setting.is_valid() => setting,
+            Ok(None) => ritornel_contract::Awake::default(),
+            Ok(Some(setting)) => {
+                warn!(
+                    ?setting,
+                    "the stored wake setting is out of range: the default holds until it is set again"
+                );
+                ritornel_contract::Awake::default()
+            }
+            Err(error) => {
+                warn!(%error, "the stored wake setting cannot be read: the default holds until it is set again");
+                ritornel_contract::Awake::default()
+            }
+        };
+        awake.follow_the_rule(self.clock.now_ms());
     }
 
-    /// The wake setting `server.db` keeps.
-    pub(crate) fn stores_awake(&self) -> Result<ritornel_contract::Awake, crate::Error> {
+    /// Follows the wake setting `server.db` keeps, as a server starts.
+    pub(crate) fn follow_awake_at_start(&self) {
         let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
-        match stores.as_ref() {
-            Some(stores) => stores.server().awake().map_err(crate::Error::Store),
-            None => Ok(ritornel_contract::Awake::default()),
+        if let Some(stores) = stores.as_ref() {
+            self.follow_stored_awake(stores);
         }
     }
 

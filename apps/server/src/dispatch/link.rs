@@ -66,9 +66,6 @@ pub(super) enum Route {
     Refused(&'static str),
 }
 
-/// The longest window `link.setAwake` takes: a week.
-const MAX_AWAKE_MINUTES: u32 = 7 * 24 * 60;
-
 /// Where `method` is answered on a satellite: library calls go to the
 /// hub; playback, output and pairing are local. See "Hub and satellites"
 /// in docs/internals/linking.md.
@@ -515,12 +512,10 @@ impl Core {
         stores: &Stores,
         params: &AwakeParams,
     ) -> Result<AwakeSet, RpcError> {
-        if let Awake::WhileActive { minutes } = params.awake
-            && minutes > MAX_AWAKE_MINUTES
-        {
+        if !params.awake.is_valid() {
             return Err(RpcError::new(
                 ErrorCode::Invalid,
-                format!("minutes are at most {MAX_AWAKE_MINUTES}, a week"),
+                format!("minutes are at most {}, a week", Awake::MAX_MINUTES),
             ));
         }
         let command = Command {
@@ -537,7 +532,7 @@ impl Core {
             .map_err(crate::Error::Store)
             .map_err(super::failed)?;
         if changed.now {
-            self.set_awake(params.awake);
+            self.follow_stored_awake(stores);
         }
         Ok(AwakeSet {
             receipt: Receipt {

@@ -209,7 +209,7 @@ impl Server {
         if let Some(player) = player {
             core.set_player(player);
         }
-        core.set_awake(core.stores_awake()?);
+        core.follow_awake_at_start();
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
         core.set_watch(run.watch);
         core.set_backups(crate::backup::Backups::new(run.backup_dir));

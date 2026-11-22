@@ -140,6 +140,7 @@ fn render_status(status: &LinkStatus) -> String {
             ("Hub", format!("{} ({})", hub.name, hub.server_id)),
             ("Library", hub.library_id.to_string()),
             ("Routes", hub.routes.join(", ")),
+            ("Awake", render_awake(status)),
         ]);
     } else {
         text += &server::facts(&[("Role", status.role.as_str().to_owned())]);
@@ -149,6 +150,8 @@ fn render_status(status: &LinkStatus) -> String {
                 format!("{} ({})", satellite.name, satellite.server_id),
             )]);
         }
+    }
+    if status.hub.is_none() {
         text += &server::facts(&[("Awake", render_awake(status))]);
     }
     text

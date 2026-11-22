@@ -75,10 +75,11 @@ pub struct LinkStatus {
 /// it. The display may sleep in every mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(tag = "mode", rename_all = "camelCase")]
+#[serde(tag = "mode", rename_all = "snake_case")]
 pub enum Awake {
     /// While a linked server plays, or has made a call within the last
-    /// `minutes`.
+    /// `minutes`: at most [`Awake::MAX_MINUTES`], and none for while one
+    /// plays only.
     WhileActive {
         /// How long after a linked server's last call.
         minutes: u32,
@@ -87,6 +88,16 @@ pub enum Awake {
     Always,
     /// Never: the machine sleeps as its own settings say.
     Never,
+}
+
+impl Awake {
+    /// The longest window: a week.
+    pub const MAX_MINUTES: u32 = 7 * 24 * 60;
+
+    /// Whether a server takes this setting.
+    pub fn is_valid(self) -> bool {
+        !matches!(self, Self::WhileActive { minutes } if minutes > Self::MAX_MINUTES)
+    }
 }
 
 impl Default for Awake {

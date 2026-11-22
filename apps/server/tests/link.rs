@@ -1070,6 +1070,21 @@ async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_st
             .await
             .unwrap();
         assert_eq!(status.awake, Awake::Never);
+        // A command sent again changes nothing, and its ID is not taken
+        // for another.
+        let once = never(Awake::Always);
+        hub_client.call::<LinkSetAwake>(&once).await.unwrap();
+        let other = AwakeParams {
+            awake: Awake::Never,
+            ..once
+        };
+        assert!(hub_client.call::<LinkSetAwake>(&other).await.is_err());
+        let again = hub_client.call::<LinkSetAwake>(&once).await.unwrap();
+        assert_eq!(again.link.awake, Awake::Always);
+        hub_client
+            .call::<LinkSetAwake>(&never(Awake::default()))
+            .await
+            .unwrap();
     })
     .await;
 }

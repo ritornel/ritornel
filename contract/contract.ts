@@ -594,7 +594,7 @@ export type AutoTrigger = "change" | "lost" | "returned" | "start" | "timer";
  * preference of the server's own, set with `link.setAwake` and kept with
  * it. The display may sleep in every mode.
  */
-export type Awake = { "mode": "whileActive",
+export type Awake = { "mode": "while_active",
   /**
    * How long after a linked server's last call.
    */

@@ -117,7 +117,9 @@ impl KeptAwake {
             .refused_at_ms
             .is_none_or(|at| now_ms.saturating_sub(at) >= ASK_AGAIN_MS);
         if wanted && self.held.is_none() && may_ask {
-            match crate::platform::stay_awake("a linked server is active") {
+            match crate::platform::stay_awake(
+                "Ritornel keeps this hub awake for its linked servers",
+            ) {
                 Ok(held) => {
                     info!(setting = ?self.setting, "the system is asked to keep this machine from sleeping");
                     self.held = Some(held);
