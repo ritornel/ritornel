@@ -1,9 +1,10 @@
 //! Filing an artist's records as a discography, the way a person who knows
-//! the records would (docs/design/ui.md, "An artist's page"): albums first,
-//! with EPs among them, then singles, live recordings, collections and
-//! rarities, and last the records of others they appear on. Newest first
-//! within each, by the year a record first came out and not a reissue's,
-//! records with no year last. Nothing is left out.
+//! the records would ("Album and artist pages" in
+//! docs/internals/desktop.md): albums first, with EPs among them, then
+//! singles, live recordings, collections and rarities, and last the records
+//! of others they appear on. Newest first within each, by the year a record
+//! first came out and not a reissue's, records with no year last. Nothing is
+//! left out.
 //!
 //! This is the one place the rule is written. The Albums list orders an
 //! artist's records by it (`SortKey::Discography`), with a section for each

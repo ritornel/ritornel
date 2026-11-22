@@ -1,7 +1,7 @@
 //! `server.db`: what describes this machine. In this layer that is the
 //! server's identity and the local credential's session. See "Storage split"
-//! in docs/internals/server.md and decision 1 in
-//! docs/design/linking.md.
+//! in docs/internals/server.md and "Server identity and hub role" in
+//! docs/internals/linking.md.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -91,8 +91,9 @@ pub struct BackupFailed {
 const LOCAL_CREDENTIAL_LABEL: &str = "local owner";
 
 /// A server's own record of its role. The library's hub pointer decides
-/// which server is the hub (docs/design/linking.md, decision 2), and until
-/// there is a library every server is unassigned.
+/// which server is the hub ("Server identity and hub role" in
+/// docs/internals/linking.md), and until there is a library every server
+/// is unassigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// It has no library and is linked to none.

@@ -1,14 +1,14 @@
-//! History: one picture of your listening life (`pages/History.svelte`;
-//! docs/design/ui.md, "Kinds of page": a picture). A stream across all
-//! your years in one quiet hue, as tall as you listened, in layers by the
-//! year you first heard each artist, the oldest at the bottom and the
-//! newest on top (`stream.rs`). The picture runs flush from one edge of the
-//! window to the other, its first month at one and its last at the other,
-//! a picture and not a framed chart; what is written on it and under it
-//! keeps to the page's margins. Under it, at the left a caption, which says
-//! what a layer is and who made it up that month when one is pointed at (a
-//! click holds it), and at the right this day in years gone by
-//! (`thisday.rs`). With less room the two stand one under the other.
+//! History: one picture of your listening life ("History tab and Lean
+//! back" in docs/internals/desktop.md). A stream across all your years in
+//! one quiet hue, as tall as you listened, in layers by the year you first
+//! heard each artist, the oldest at the bottom and the newest on top
+//! (`stream.rs`). The picture runs flush from one edge of the window to the
+//! other, its first month at one and its last at the other, a picture and
+//! not a framed chart; what is written on it and under it keeps to the
+//! page's margins. Under it, at the left a caption, which says what a layer
+//! is and who made it up that month when one is pointed at (a click holds
+//! it), and at the right this day in years gone by (`thisday.rs`). With less
+//! room the two stand one under the other.
 //!
 //! It counts every play, matched to the library or not: History is the
 //! record of all of it. It reads `history.stream` and `history.onThisDay`,

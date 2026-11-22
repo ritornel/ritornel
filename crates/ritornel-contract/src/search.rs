@@ -1,6 +1,7 @@
 //! Search as a person types it: the few artists, records and songs whose
 //! names match what was typed, best first, for the results that drop down
-//! under the search field (docs/design/ui.md, "The frame").
+//! under the search field ("Frame and navigation" in
+//! docs/internals/desktop.md).
 //!
 //! - `library.search` takes a [`SearchParams`] and returns
 //!   [`SearchResults`].

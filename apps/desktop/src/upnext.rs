@@ -1,14 +1,14 @@
-//! Up next (`frame/UpNext.svelte`): a card, not a column, with space all
-//! round it, under the search field and exactly as wide (docs/design/ui.md,
-//! "Up next"). With room it moves the page over; in a narrow window it lies
-//! over the page. The shell places it and flies it in and out.
+//! Up next: a card, not a column, with space all round it, under the search
+//! field and exactly as wide ("Queue, context menus, and Settings" in
+//! docs/internals/desktop.md). With room it moves the page over; in a
+//! narrow window it lies over the page. The shell places and flies it.
 //!
 //! The song on heads it, set apart and fixed in place. Under it, what plays
-//! after, in the order it plays: one list, as the queue in M1 is a plain
-//! one. A double-click plays a song now, a drag puts it elsewhere, its ×
-//! takes it out, and a right-click opens its menu. Songs and records
-//! dropped on the card go where they land: at its top they play next,
-//! between two songs after the one above, below them at the end.
+//! after, in the order it plays: one plain list. A double-click plays a
+//! song now, a drag puts it elsewhere, its × takes it out, and a right-click
+//! opens its menu. Songs and records dropped on the card go where they land:
+//! at its top they play next, between two songs after the one above, below
+//! them at the end.
 //!
 //! The real card is frosted glass (`backdrop-filter: blur(40px)
 //! saturate(1.5)`). There is no painted imitation of glass, only the

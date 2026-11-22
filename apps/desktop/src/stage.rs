@@ -1,9 +1,8 @@
-//! The way back: the pages you came through, as the real app keeps them
-//! (`lib/places.ts`, `lib/history.ts`). Every click that goes deeper opens a
-//! page, and Back returns to the one before exactly as it was left
-//! (docs/design/ui.md, principle 4). Here a page is kept whole, its
-//! entity and all, rather than as a scroll position and a memo: going back
-//! draws it again at once.
+//! The way back: the pages you came through ("Frame and navigation" in
+//! docs/internals/desktop.md). Every click that goes deeper opens a page,
+//! and Back returns to the one before exactly as it was left. Here a page
+//! is kept whole, its entity and all, rather than as a scroll position and
+//! a memo: going back draws it again at once.
 
 /// The tabs of the title bar, in their order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

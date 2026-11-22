@@ -168,7 +168,7 @@ pub(crate) fn settings_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(PathBuf::from)
 }
 
-/// The working set, which is what the bakeoff's Windows report compared.
+/// The working set, in bytes.
 pub(crate) fn footprint() -> Option<u64> {
     memory().map(|(working_set, _)| working_set)
 }
@@ -185,8 +185,7 @@ pub(crate) fn memory_line() -> String {
     }
 }
 
-/// The working set and the private bytes, in bytes: the counters the
-/// bakeoff's Windows report used.
+/// The working set and the private bytes, in bytes.
 fn memory() -> Option<(u64, u64)> {
     let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;

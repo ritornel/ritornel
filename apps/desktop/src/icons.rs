@@ -1,7 +1,6 @@
-//! The real app's icons (`apps/desktop-tauri/src/lib/icons.ts`): one path each on
-//! a 16-point square, filled, or drawn as a 1.5-point line. GPUI draws an
-//! SVG as a mask in the element's text colour, as the real app's
-//! `currentColor` does. Served as `icons/<name>.svg`.
+//! Desktop icons: one path each on a 16-point square, filled, or drawn as a
+//! 1.5-point line. GPUI draws an SVG as a mask in the element's text
+//! colour. Served as `icons/<name>.svg`.
 
 use std::borrow::Cow;
 

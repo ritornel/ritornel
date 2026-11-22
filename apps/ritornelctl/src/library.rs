@@ -1,6 +1,6 @@
 //! `ritornelctl library create`: makes the running server a hub with a
-//! library of its own. See "Identity and the hub role" in
-//! docs/design/linking.md.
+//! library of its own. See "Server identity and hub role" in
+//! docs/internals/linking.md.
 //!
 //! `ritornelctl library stats`: what the library holds and what the scans
 //! made of it. Until there is something to browse with, this is how to see

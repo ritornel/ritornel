@@ -1,6 +1,6 @@
 //! What Lean back says about the song that is playing and its record, one
-//! thing at a time, in the prototype's words (`leanFacts` in
-//! prototypes/history/app.js; docs/design/ui.md, "Lean back").
+//! thing at a time ("History tab and Lean back" in
+//! docs/internals/desktop.md).
 //!
 //! It counts as a page does (history_pages.rs): the plays that count and
 //! are not excluded, of songs the library has bound them to. The song's are

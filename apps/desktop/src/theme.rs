@@ -1,6 +1,6 @@
-//! The real client's palettes (`apps/desktop-tauri/src/app.css`): Graphite, the
-//! prototype's default, dark; and Mist, light. The window follows the
-//! system's appearance, as the real app does; there is no switch.
+//! The desktop palettes ("Frame and navigation" in
+//! docs/internals/desktop.md): Graphite (dark) and Mist (light). The window
+//! follows the system's appearance; there is no switch.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

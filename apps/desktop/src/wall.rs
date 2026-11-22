@@ -77,7 +77,8 @@ pub(crate) enum Subject {
     Artist(Id),
 }
 
-/// Which wall the Library shows. Songs waits (docs/design/ui.md, "The first pass").
+/// Which wall the Library shows ("Library walls and cover loading" in
+/// docs/internals/desktop.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WallKind {
     Artists,

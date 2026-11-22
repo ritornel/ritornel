@@ -1,7 +1,6 @@
 //! The listener's whole history as the History tab draws it: the plays of
-//! each month, in layers by the year each artist was first heard (the
-//! prototype's `histBase` and its "When you found it" slice,
-//! prototypes/history/stream.js).
+//! each month, in layers by the year each artist was first heard ("History
+//! tab and Lean back" in docs/internals/desktop.md).
 //!
 //! It counts every dated play that counts and is not excluded, bound or
 //! not, as History is the record of all of it. A play is its artist's as

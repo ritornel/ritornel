@@ -1,7 +1,7 @@
-//! "On this day", under History's picture (`pages/thisday.ts`): who you
-//! spent this day with in years gone by, in the prototype's words for it
-//! (prototypes/history/insights.js, `onThisDay`). A few lines and no more;
-//! a day that was a device catching up says nothing. Its tests come with it.
+//! "On this day", under History's picture ("History tab and Lean back" in
+//! docs/internals/desktop.md): who you spent this day with in years gone
+//! by. A few lines and no more; a day that was a device catching up says
+//! nothing. Its tests come with it.
 
 use ritornel_contract::{OnThisDay, Phrase, Play};
 

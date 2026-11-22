@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::{Id, ListSupport};
 
 /// A server's own record of its role. The library's hub pointer decides
-/// which server is the hub (docs/design/linking.md, decision 2).
+/// which server is the hub ("Server identity and hub role" in
+/// docs/internals/linking.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -36,7 +37,8 @@ impl ServerRole {
     }
 }
 
-/// What a session may do (docs/design/linking.md, decision 6).
+/// What a session may do ("Local credentials, sessions, and tokens" in
+/// docs/internals/linking.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]

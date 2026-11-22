@@ -1,6 +1,6 @@
 //! Artist pictures: the portrait a picture folder's manifest chose for each
-//! artist, matched to the library's artists and read in place. See "Artist
-//! pictures" in docs/plan.md.
+//! artist, matched to the library's artists and read in place. See "Catalog
+//! projection and displayed metadata" in docs/internals/identity.md.
 //!
 //! The folder is format 1, as its README sets out: a folder for each artist
 //! named by their MusicBrainz ID, `by-name/<safe name>/` for an artist with
