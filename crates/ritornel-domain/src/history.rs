@@ -38,8 +38,9 @@ use jiff::Timestamp;
 use jiff::tz::{TimeZone, TimeZoneDatabase};
 
 /// The grouper's version. Grouper 1 joins `continues` chains and groups
-/// nothing across sources, because nothing else reports a play yet.
-pub const GROUPER_VERSION: i64 = 1;
+/// nothing across sources. Version 2 uses known zones and the full clock
+/// difference when dating a chain, and bounds its accumulated play time.
+pub const GROUPER_VERSION: i64 = 2;
 
 /// How long after the end of a listen one that continues it may start and
 /// still be joined to it.
@@ -608,15 +609,15 @@ pub fn date_listen(listen: &Listen) -> (i64, ClockBasis, i64) {
         && boot == listen.boot
         && sent_mono >= listen.started_mono_ms
     {
-        let age = sent_mono - listen.started_mono_ms;
+        let age = sent_mono.abs_diff(listen.started_mono_ms);
         return (
-            received.received_at_ms.saturating_sub(age),
+            received.received_at_ms.saturating_sub_unsigned(age),
             ClockBasis::HubAge,
             HUB_AGE_PRECISION_MS,
         );
     }
     let skew = received.clock_skew_ms.unwrap_or(0);
-    let shift = if skew.abs() > SKEW_TOLERANCE_MS {
+    let shift = if skew.unsigned_abs() > SKEW_TOLERANCE_MS.unsigned_abs() {
         skew
     } else {
         0
@@ -649,7 +650,8 @@ fn zone_of(
     event_at_ms: i64,
     periods: &[ZonePeriod],
 ) -> (Option<String>, ZoneBasis) {
-    if let Some(captured) = &listen.zone
+    let captured = listen.zone.as_ref().filter(|name| known_zone(name));
+    if let Some(captured) = captured
         && !says_nothing(captured)
     {
         return (Some(captured.clone()), ZoneBasis::Captured);
@@ -657,7 +659,7 @@ fn zone_of(
     if let Some(period) = assumed_zone(listen.listener, event_at_ms, periods) {
         return (Some(period.zone.clone()), ZoneBasis::Assumed);
     }
-    match &listen.zone {
+    match captured {
         Some(captured) => (Some(captured.clone()), ZoneBasis::Captured),
         None => (None, ZoneBasis::None),
     }
@@ -960,7 +962,9 @@ fn derive_listens(inputs: &Inputs<'_>, excluded: &BTreeSet<i64>) -> Vec<Play> {
                 .filter_map(|index| inputs.listens.get(*index))
                 .collect();
             let (&head, &last) = (listens.first()?, listens.last()?);
-            let ms_played = listens.iter().map(|listen| listen.ms_played).sum::<i64>();
+            let ms_played = listens.iter().fold(0_i64, |total, listen| {
+                total.saturating_add(listen.ms_played.max(0))
+            });
             let (counts, outcome) = judge(
                 &inputs.rule,
                 ms_played,
