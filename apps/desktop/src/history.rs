@@ -150,7 +150,13 @@ impl HistoryPage {
                 {
                     page.quiet = Some(cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(SETTLE).await;
-                        this.update(cx, |page, cx| page.load(cx)).ok();
+                        // Put behind another page meanwhile, it waits to be shown.
+                        this.update(cx, |page, cx| {
+                            if page.freshness.heard(true).is_some() {
+                                page.load(cx);
+                            }
+                        })
+                        .ok();
                     }));
                 }
                 _ => {}
