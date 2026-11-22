@@ -244,6 +244,15 @@ pub(crate) fn flight_at(
     }
 }
 
+/// How much of each end's picture shows `along` a flight (0 to 1): the one
+/// it flies to comes in over the first half, and the one it leaves goes
+/// over the second, so the picture never thins (`Flight`).
+pub(crate) fn crossed(along: f32) -> (f32, f32) {
+    let along = along.clamp(0., 1.);
+    let leaving = if along < 0.5 { 1. } else { 2. * (1. - along) };
+    (leaving, (2. * along).min(1.))
+}
+
 /// Whether a target can be seen in the page's area: a cover lands only
 /// where it can be seen.
 pub(crate) fn seen(target: Bounds<Pixels>, top: f32, bottom: f32) -> bool {
@@ -255,6 +264,17 @@ pub(crate) fn seen(target: Bounds<Pixels>, top: f32, bottom: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_picture_crossing_never_thins() {
+        assert_eq!(crossed(0.), (1., 0.));
+        assert_eq!(crossed(0.5), (1., 1.));
+        assert_eq!(crossed(1.), (0., 1.));
+        for step in 0..=20 {
+            let (leaving, coming) = crossed(step as f32 / 20.);
+            assert!(leaving.max(coming) >= 1. - 1e-6, "{step}");
+        }
+    }
 
     #[test]
     fn a_page_waits_unseen_then_hops_into_place() {

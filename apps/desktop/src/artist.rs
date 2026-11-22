@@ -1,6 +1,7 @@
 //! An artist's page (`pages/Artist.svelte`): the banner from edge to edge
 //! made of their picture (`banner.rs`), with their portrait standing clear
-//! at the right when they have one, and under it everything of theirs,
+//! at the right, or with none the cover their picture is, and under it
+//! everything of theirs,
 //! filed as a discography the way a person who knows the records would:
 //! albums first, then singles, live recordings, collections and rarities,
 //! the records they appear on, and last their songs that are on no record.
@@ -193,6 +194,11 @@ pub(crate) struct Artist {
     /// The portrait made for the banner's box (`banner::melted`): the box's
     /// size in device pixels, the picture, and when the first was shown.
     melted: Option<((u32, u32), Arc<RenderImage>, Instant)>,
+    /// Whether the portrait is away while a copy of it travels.
+    pub portrait_away: bool,
+    /// Whether the banner's picture could not be read: then there is none
+    /// to wait for, or to land on.
+    picture_failed: bool,
     /// Whether a portrait is being made now: one at a time.
     melting: bool,
     /// The size its box has now, in device pixels: what is made next.
@@ -261,6 +267,8 @@ impl Artist {
             portrait: None,
             melted: None,
             melting: false,
+            portrait_away: false,
+            picture_failed: false,
             wanted: None,
             blur: None,
             banner_blur: None,
@@ -473,10 +481,20 @@ impl Artist {
                     && current
                     && page.wanted == Some(size)
                 {
-                    let since = page
-                        .melted
-                        .as_ref()
-                        .map_or_else(Instant::now, |made| made.2);
+                    // Made while a copy of it travels, it is shown whole when
+                    // it lands, not faded in again.
+                    let since = page.melted.as_ref().map_or_else(
+                        || {
+                            let now = Instant::now();
+                            if page.portrait_away {
+                                now.checked_sub(std::time::Duration::from_millis(300))
+                                    .unwrap_or(now)
+                            } else {
+                                now
+                            }
+                        },
+                        |made| made.2,
+                    );
                     if let Some((_, old, _)) = page.melted.replace((size, Arc::new(image), since)) {
                         crate::covers::drop_unshared(old, None, cx);
                     }
@@ -510,6 +528,7 @@ impl Artist {
         self.pictured_for = Some((art, wants_portrait));
         // A portrait of another picture, or of none, is not kept meanwhile.
         self.forget_portrait(Some(window), cx);
+        self.picture_failed = false;
         let scale = window.scale_factor();
         let (width, viewport) = viewport_of(window);
         let banner_radius = crate::blur::radius(crate::blur::BANNER.0, width + 120.);
@@ -522,12 +541,14 @@ impl Artist {
         self.fetch(art, (28. * scale).ceil() as u32, cx, |page, image| {
             page.face = Some(image);
         });
-        // A portrait stands at most 380 points wide; a cover never stands there.
-        // It is kept at its own shape, and cropped to its box as it is made.
-        // It is asked for at twice the box's widest, so that a portrait up to
-        // twice as tall as it is wide still covers the box sharply, as far as
-        // the server's largest size allows.
-        if wants_portrait {
+        // Their portrait stands at most 380 points wide at the banner's right
+        // end; with none, the cover their picture is stands in for it, so that
+        // every artist's circle on the wall has somewhere to fly to. It is
+        // kept at its own shape, and cropped to its box as it is made. It is
+        // asked for at twice the box's widest, so that a picture up to twice
+        // as tall as it is wide still covers the box sharply, as far as the
+        // server's largest size allows.
+        {
             let http = Arc::clone(&self.net.art);
             let bucket = self.net.bucket((2. * 380. * scale).ceil() as u32);
             let read = self.net.rt().spawn(async move {
@@ -536,18 +557,20 @@ impl Artist {
             });
             self.fetches.push(read.abort_handle());
             cx.spawn(async move |this, cx| {
-                if let Ok(Some(source)) = read.await {
-                    this.update(cx, |page, cx| {
-                        // Too late: the page shows another picture now.
-                        if page.pictured_for != Some((Some(art), true)) {
-                            return;
-                        }
-                        page.forget_portrait(None, cx);
-                        page.portrait = Some(Arc::new(source));
-                        cx.notify();
-                    })
-                    .ok();
-                }
+                let source = read.await.ok().flatten();
+                this.update(cx, |page, cx| {
+                    // Too late: the page shows another picture now.
+                    if page.pictured_for.map(|(at, _)| at) != Some(Some(art)) {
+                        return;
+                    }
+                    page.forget_portrait(None, cx);
+                    match source {
+                        Some(source) => page.portrait = Some(Arc::new(source)),
+                        None => page.picture_failed = true,
+                    }
+                    cx.notify();
+                })
+                .ok();
             })
             .detach();
         }
@@ -616,10 +639,24 @@ impl Artist {
 
     /// Whether it is ready to be seen: what it shows read, and its picture there.
     pub(crate) fn ready(&self) -> bool {
+        self.page.as_ref().is_some_and(|page| {
+            (page.artist.art_id.is_none() || self.blur.is_some())
+                && (page.artist.art_id.is_none() || self.melted.is_some() || self.picture_failed)
+        }) || self.problem
+    }
+
+    /// Whether the artist has a picture to stand at the banner's right end:
+    /// their portrait, or the cover that stands in for it.
+    pub(crate) fn expects_portrait(&self) -> bool {
         self.page
             .as_ref()
-            .is_some_and(|page| page.artist.art_id.is_none() || self.blur.is_some())
-            || self.problem
+            .is_some_and(|page| page.artist.art_id.is_some())
+            && !self.picture_failed
+    }
+
+    /// The portrait as the banner shows it, once it is made.
+    pub(crate) fn portrait(&self) -> Option<Arc<RenderImage>> {
+        self.melted.as_ref().map(|(_, image, _)| Arc::clone(image))
     }
 
     /// What its colour is borrowed from: the same again changes nothing.
@@ -1178,6 +1215,7 @@ impl Render for Artist {
             portrait: self
                 .melted
                 .as_ref()
+                .filter(|_| !self.portrait_away)
                 .map(|(_, image, since)| (Arc::clone(image), *since)),
             picture: (self.look.picture, self.look.scale),
         };
