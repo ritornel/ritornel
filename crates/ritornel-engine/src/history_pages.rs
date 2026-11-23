@@ -381,7 +381,7 @@ fn span(connection: &Connection, listener: i64, today: Today) -> Result<Option<Y
                    ORDER BY event_at_utc_ms LIMIT 1) began
                 WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
                   AND pe.local_date IS NOT NULL
-                  AND pe.event_at_utc_ms BETWEEN began.at AND began.at + ?2),
+                  AND pe.event_at_utc_ms BETWEEN began.at AND min(began.at + ?2, ?3)),
                (SELECT max(pe.local_date) FROM play_event pe,
                   (SELECT event_at_utc_ms AS at FROM play_event
                    WHERE listener_id = ?1 AND counts = 1 AND excluded = 0
