@@ -37,12 +37,20 @@ pub(crate) fn try_hold_as_a_server(file: &std::fs::File) -> bool {
     file.try_lock().is_ok()
 }
 
-/// A program at `path` that is a script for the shell, `unix`, standing in
-/// for another; `windows` is the same script for Windows.
+/// A program that runs `unix`, a script for the shell, standing in for
+/// another; `windows` is the same script for Windows. It is `fake-server`
+/// beside this file, which runs the script it is given in its environment.
+/// A test that wrote an executable and ran it at once could find it busy
+/// (ETXTBSY) on Linux: a child that another test's thread forked meanwhile
+/// holds it open for writing until that child runs its own program.
 #[cfg(test)]
-pub(crate) fn script(path: &std::path::Path, unix: &str, _windows: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, format!("#!/bin/sh\n{unix}\n")).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path.to_owned()
+pub(crate) fn script(_dir: &std::path::Path, unix: &str, _windows: &str) -> crate::launch::Program {
+    let mut program = crate::launch::Program::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/platform/fake-server"
+    ));
+    program
+        .env
+        .push(("RITORNEL_FAKE_SERVER".into(), unix.into()));
+    program
 }

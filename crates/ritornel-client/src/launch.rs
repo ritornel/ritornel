@@ -381,11 +381,7 @@ mod tests {
         /// A program that is a script, standing in for the server: `unix`,
         /// for the shell, on Unix, and `windows`, a batch file, on Windows.
         fn program(&self, unix: &str, windows: &str) -> Program {
-            Program::new(crate::platform::script(
-                &self.0.join("fake-server"),
-                unix,
-                windows,
-            ))
+            crate::platform::script(&self.0, unix, windows)
         }
     }
 
@@ -438,7 +434,9 @@ mod tests {
         assert!(!scratch.0.join("data").exists());
     }
 
-    #[tokio::test]
+    // Time stands still but while every task waits, so the diagnostic
+    // always comes before the wait for it ends, however busy the machine.
+    #[tokio::test(start_paused = true)]
     async fn a_diagnostic_can_arrive_after_the_readiness_wait() {
         let scratch = Scratch::new("late-diagnostic");
         let launcher = Launcher::new(scratch.0.clone(), None);
@@ -449,6 +447,7 @@ mod tests {
         let (result, ()) = tokio::join!(
             launcher.await_ready(Ready { said_ready, stderr }, Duration::ZERO),
             async {
+                // sleep: the diagnostic comes after the readiness wait ended.
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let _ = diagnosis.send("ritornel-server: library unavailable".to_owned());
             }

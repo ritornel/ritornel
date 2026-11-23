@@ -619,7 +619,9 @@ mod tests {
         assert!(matches!(answer, Err(Error::Protocol(_))), "{answer:?}");
     }
 
-    #[tokio::test]
+    // Time stands still but while every task waits, so the deadline
+    // fails only a call that would never be answered.
+    #[tokio::test(start_paused = true)]
     async fn a_reply_arrives_while_another_request_waits_to_be_written() {
         let (outgoing, mut requests) = mpsc::channel(1);
         let (replies, incoming) = mpsc::channel(1);
@@ -643,7 +645,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // Time stands still but while every task waits, so the deadline
+    // fails only a call that would never be answered.
+    #[tokio::test(start_paused = true)]
     async fn an_error_without_a_request_id_ends_pending_calls() {
         let (client, mut requests, replies) = pair();
         let peer = async {
@@ -714,7 +718,14 @@ mod tests {
             }
         });
         drop(connection);
-        runtime().block_on(async {
+        // Time stands still but while the call waits, so the deadline fails
+        // only a call that would never be released.
+        let other = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        other.block_on(async {
             let reply = tokio::time::timeout(std::time::Duration::from_secs(1), call).await;
             assert!(matches!(reply, Ok(Err(Error::Transport(_)))), "{reply:?}");
         });
