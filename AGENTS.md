@@ -31,6 +31,21 @@ Ritornel is a music player for a collection you own: a server, `ritornel-server`
 - **Test data is invented.** Nothing from a real library or listening history is committed.
 - **Licences.** A dependency carries a licence that `deny.toml` lists, and `mise run licenses` checks it.
 
+## Writing tests that don't depend on timing
+
+CI runs the tests in parallel on small, busy machines, Windows' slowest of all, so a test that counts on how long something takes fails there now and then. A test waits for what it checks, never for time to pass.
+
+- **Wait on an event or a condition, not a fixed sleep.** Look again until it holds, inside the test's `WAIT`: `while partial(&scratch).is_empty() { sleep(20 ms) }`, not `sleep(500 ms)` and hope. `scripts/check-test-sleeps.sh`, part of `mise run check`, asks every sleep in a test for a `// sleep:` comment that says why no event will do.
+- **Use the clock the code takes.** Where code takes a `Clock`, a `now` or tokio's time, give it a fixed or paused one: `#[tokio::test(start_paused = true)]`, `elastic.scroll_at(&mut top, wheel, max, t0 + Duration::from_millis(10))`. Add a narrow seam where it is cheap.
+- **A deadline is a backstop, and says what never happened.** `assert!(Instant::now() < deadline, "the decoder never {what}")`, with a deadline of the test's `WAIT`, a minute. An upper bound on elapsed time is only for a claim about time, and comes from the constant it proves against: `took < Duration::from_secs(8)` against a call's eight-second wait, not `took < 3 s`.
+- **Hold what a test must catch.** Hold the null output where the test looks (`AudioRenderer::held`), or play slowly enough that each step outlasts any look, rather than race a short track at speed.
+- **Assert on what the test caused, not on the latest.** Follow the job a call returned. Where more may come, such as a watcher's second rescan or a delivery still sending, wait until nothing is on its way, or accept a later one: `last.job_id >= Some(rescan.job_id)`.
+- **A scratch folder is always new.** `tempfile::Builder::new().prefix("ritornel-server-pages-").tempdir()`, never a name made from the process ID, which Windows soon gives out again.
+- **Tests listen on loopback unless they test interface selection.** `Listen::on_port(0)` or `--listen 127.0.0.1:0`. Only `a_server_on_the_private_network_is_found_on_loopback` binds every interface, because that is what it tests; on Windows each new test binary that does raises the firewall's prompt.
+- **Keep a port you rely on.** A port is yours only while you hold it: keep the listener (`unanswering.incoming().for_each(drop)`), and retry a bind to a port just let go.
+- **A failed subprocess says why.** `ok(&data_dir, &["library", "create"])`, which fails with the exit code, stdout and stderr, not `assert_eq!(ritornelctl(..).0, Some(0))`. A server's stderr goes to the test (`Stdio::inherit()`), and nextest shows it with the failure.
+- **Tests share nothing.** No environment variable, current directory or static that a test changes: a server gets its environment through `Command::env` or `Run`.
+
 ## Pull requests
 
 An agent opens a pull request when the person it works for asks. The title is `type(scope): what changed`, and the body ends with the model and harness that did the work. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest.

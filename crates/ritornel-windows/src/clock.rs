@@ -25,6 +25,8 @@ mod tests {
     #[test]
     fn the_clock_moves_forward() {
         let before = since_boot_ms();
+        // sleep: a known time for the clock to move over; only a lower bound is
+        // checked.
         std::thread::sleep(std::time::Duration::from_millis(50));
         let after = since_boot_ms();
         assert!(after >= before + 30, "{before} {after}");
@@ -37,6 +39,8 @@ mod tests {
         let mut last = since_boot_ms();
         let mut smallest = u64::MAX;
         for _ in 0..50 {
+            // sleep: steps between readings of the clock; only the smallest is
+            // checked.
             std::thread::sleep(std::time::Duration::from_millis(2));
             let now = since_boot_ms();
             if now > last {

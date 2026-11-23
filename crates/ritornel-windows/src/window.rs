@@ -365,6 +365,8 @@ mod tests {
         });
         // The other test's taskkill may ask this window to close as well.
         while heard.recv_timeout(Duration::from_secs(10)).unwrap() != Closing::SessionEnding {}
+        // sleep: time for the process to stop, were it to; a slow machine can
+        // only make this pass when it should not.
         std::thread::sleep(Duration::from_millis(100));
         assert!(!ending.is_finished());
         window.stopped();

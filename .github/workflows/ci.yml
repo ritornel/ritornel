@@ -56,7 +56,7 @@ jobs:
           fi
 
   checks:
-    name: Formatting, dependencies, docs and licences
+    name: Formatting, dependencies, test sleeps, docs and licences
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
@@ -71,6 +71,7 @@ jobs:
           rust-cache: workspace
       - run: mise run fmt
       - run: mise run deps
+      - run: mise run sleeps
       - run: mise run docs
       - run: mise run licenses
 

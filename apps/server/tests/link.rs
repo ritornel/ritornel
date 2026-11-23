@@ -986,6 +986,7 @@ async fn a_satellites_stop_ends_its_pull_and_leaves_nothing_behind() {
             .await
             .unwrap();
         while partial(&scratch).is_empty() {
+            // sleep: between looks; the test's WAIT bounds them.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
@@ -1150,6 +1151,7 @@ fn staged(scratch: &Scratch) -> usize {
 /// Waits until the satellite's outbox is empty.
 async fn delivered(scratch: &Scratch) {
     while waiting(scratch) > 0 {
+        // sleep: between looks; the test's WAIT bounds them.
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -1692,6 +1694,8 @@ impl Relay {
                     let mut chunk = vec![0; 16 * 1024];
                     while let Ok(read @ 1..) = from_hub.read(&mut chunk).await {
                         while held.load(Ordering::SeqCst) {
+                            // sleep: the relay holds what the hub sends for as
+                            // long as the test says.
                             tokio::time::sleep(Duration::from_millis(20)).await;
                         }
                         if to_satellite.write_all(&chunk[..read]).await.is_err() {
@@ -1789,6 +1793,7 @@ async fn a_satellite_stops_in_time_while_its_hub_does_not_answer_and_its_listens
         // first may have been answered before the hold, but not the second.
         let id = desk.server_id();
         while at_hub(&scratch, id).len() + waiting(&scratch) <= 2 {
+            // sleep: between looks; the test's WAIT bounds them.
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 

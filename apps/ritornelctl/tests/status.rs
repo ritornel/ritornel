@@ -459,6 +459,7 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
             "watching did not come on within {WAIT:?}. Last status:\n{}",
             printed.stdout
         );
+        // sleep: between looks; the deadline bounds them.
         std::thread::sleep(Duration::from_millis(10));
     };
     let shown = facts(&printed);

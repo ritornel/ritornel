@@ -827,6 +827,8 @@ mod tests {
                     decode_with(sem, move || {
                         let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(now, Ordering::SeqCst);
+                        // sleep: each decode takes a moment, so that they
+                        // overlap if the bound lets them.
                         std::thread::sleep(Duration::from_millis(15));
                         active.fetch_sub(1, Ordering::SeqCst);
                         Some(i)
@@ -931,6 +933,7 @@ mod tests {
         rt.block_on(async {
             let mut bag = FetchBag::default();
             let task = tokio::spawn(async {
+                // sleep: a task that would run a minute, for the drop to abort.
                 tokio::time::sleep(Duration::from_secs(60)).await;
             });
             bag.push(task.abort_handle());
