@@ -1310,27 +1310,31 @@ fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
     let again = apply(&rig, 2, archive.clone());
     assert_eq!((again.streams, again.new_streams), (3, 0));
     assert_eq!(rig.one(observations), "3");
-    // A later archive stores only what this one lacked.
+    // A later archive stores only what this one lacked: a new track, and
+    // a third report of Lanternfish that sorts before the two stored.
     let mut later = archive.clone();
     later.push(stream(T0 - HOUR, 200_000, "Salt Road"));
+    let mut third_report = stream(T0 - 2 * HOUR, 180_000, "Lanternfish");
+    third_report.reason_end = Some("endplay".to_owned());
+    later.insert(0, third_report);
     let third = apply(&rig, 3, later);
-    assert_eq!((third.streams, third.new_streams), (4, 1));
-    assert_eq!(rig.one(observations), "4");
-    assert_eq!(in_force(&rig), "4");
+    assert_eq!((third.streams, third.new_streams), (5, 2));
+    assert_eq!(rig.one(observations), "5");
+    assert_eq!(in_force(&rig), "5");
 
     // Undoing the first of the runs leaves in force what the others held.
     let revision = rig.revision();
     let undone = undo(&rig, 1);
     assert!(!undone.in_force);
     assert_eq!(rig.revision(), revision + 1);
-    assert_eq!(in_force(&rig), "4");
+    assert_eq!(in_force(&rig), "5");
     // Undone again, nothing is written.
     assert_eq!(undo(&rig, 1), undone);
     assert_eq!(rig.revision(), revision + 1);
     undo(&rig, 2);
     undo(&rig, 3);
     assert_eq!(in_force(&rig), "0");
-    assert_eq!(rig.one(observations), "4", "nothing is removed");
+    assert_eq!(rig.one(observations), "5", "nothing is removed");
     assert_eq!(rig.library.derived_history().unwrap(), plays);
     assert_eq!(
         rig.library
@@ -1346,14 +1350,14 @@ fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
     // ledgers, and what each held.
     let scratch = crate::testing::Scratch::new();
     let exported = rig.library.export_record(scratch.path(), T0).unwrap();
-    assert_eq!((exported.runs, exported.run_streams), (3, 10));
+    assert_eq!((exported.runs, exported.run_streams), (3, 11));
     let observations = std::fs::read_to_string(scratch.path().join("observations.jsonl")).unwrap();
     let streams: Vec<serde_json::Value> = observations
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .filter(|line| line["import"]["stream"].is_object())
         .collect();
-    assert_eq!(streams.len(), 4);
+    assert_eq!(streams.len(), 5);
     assert_eq!(streams[0]["import"]["stream"]["platform"], "mac");
     let runs = std::fs::read_to_string(scratch.path().join("runs.jsonl")).unwrap();
     let first_run: serde_json::Value = serde_json::from_str(runs.lines().next().unwrap()).unwrap();
@@ -1364,4 +1368,53 @@ fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
     )
     .unwrap();
     assert_eq!(manifest["version"], 3);
+}
+
+#[test]
+fn a_row_a_later_archive_spells_otherwise_keeps_the_record_it_was_stored_with() {
+    let rig = rig();
+    let first = stream(T0 - 3 * HOUR, 200_000, "Paper Kites");
+    apply(&rig, 1, vec![first.clone()]);
+    let stored = rig.one("SELECT payload_json FROM history_observation WHERE kind = 'import'");
+    let mut respelled = first.clone();
+    respelled.album = Some("Tin Weather (Deluxe)".to_owned());
+    let report = rig.library.stream_dry_run(vec![respelled.clone()]).unwrap();
+    assert_eq!(report.respelled, 1);
+    assert_eq!(report.years[0].already_stored, 1);
+    let again = apply(&rig, 2, vec![respelled]);
+    assert_eq!(again.new_streams, 0);
+    assert_eq!(
+        rig.one("SELECT payload_json FROM history_observation WHERE kind = 'import'"),
+        stored
+    );
+    assert_eq!(rig.one("SELECT count(*) FROM history_ingest_conflict"), "0");
+}
+
+#[test]
+fn a_stored_stream_and_a_runs_rows_are_never_changed_or_removed() {
+    let rig = rig();
+    apply(&rig, 1, vec![stream(T0 - 3 * HOUR, 200_000, "Paper Kites")]);
+    for sql in [
+        "UPDATE observation_import_stream SET ms_played = 1",
+        "DELETE FROM observation_import_stream",
+        "UPDATE import_run SET streams = 9",
+        "DELETE FROM import_run",
+        "UPDATE import_run_event SET state = 'undone'",
+        "DELETE FROM import_run_event",
+        "UPDATE import_run_stream SET rev = 0",
+        "DELETE FROM import_run_stream",
+    ] {
+        let refused = rig.library.write(
+            WriteRequest {
+                method: "test.tamper",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(sql, [])?;
+                Ok(String::new())
+            },
+        );
+        assert!(refused.is_err(), "{sql}");
+    }
 }

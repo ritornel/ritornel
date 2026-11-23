@@ -163,31 +163,51 @@ pub(crate) fn apply(
     out: &mut dyn Write,
 ) -> Result<(), Error> {
     let run_id = run_id(args)?;
-    let (job, run) = server::ask_for(&args.server, env, None, async |client| {
+    let (job, run, applied) = server::ask_for(&args.server, env, None, async |client| {
         let job = run_job::<ImportsApply>(client, run_id).await?;
+        // The staged run, with the report applying worked out, while the
+        // hub keeps it; the run as the library holds it in any case.
         let run = client
             .call::<ImportsGet>(&ImportsGetParams { run_id })
-            .await?;
-        Ok((job, run))
+            .await
+            .ok();
+        let applied = match run.as_ref().and_then(|run| run.applied.clone()) {
+            Some(applied) => Some(applied),
+            None => client
+                .call::<ImportsList>(&NoParams {})
+                .await?
+                .runs
+                .into_iter()
+                .find(|run| run.run_id == run_id),
+        };
+        Ok((job, run, applied))
     })?;
     print(
         &args.server,
         out,
-        &json!({ "run": run, "job": job }),
+        &json!({ "run": run, "applied": applied, "job": job }),
         || {
             let mut text = String::new();
-            match (&job.state, &run.applied) {
+            match (&job.state, &applied) {
                 (JobState::Succeeded, Some(applied)) => {
                     let _ = writeln!(
                         text,
-                        "Applied run {}: {} streams, {} of them new to the library. It is in force.",
-                        applied.run_id, applied.streams, applied.new_streams
+                        "Applied run {}: {} streams, {} of them new to the library. It is {}.",
+                        applied.run_id,
+                        applied.streams,
+                        applied.new_streams,
+                        if applied.in_force {
+                            "in force"
+                        } else {
+                            "out of force: it was undone, and importing its archive again \
+                             brings it back"
+                        }
                     );
-                    if let Some(report) = &run.report {
-                        text.push_str(&report_text(report, false).replacen(
-                            "\nDry run\n",
-                            "\nWhat applying did\n",
-                            1,
+                    if let Some(report) = run.as_ref().and_then(|run| run.report.as_ref()) {
+                        text.push_str(&report_text(
+                            report,
+                            "What applying does, as worked out just before it wrote",
+                            false,
                         ));
                     }
                 }
@@ -305,12 +325,12 @@ fn rendered(tally: &Tally, run: &ImportRun, job: &Job, samples: bool) -> String 
         );
         return text;
     };
-    text.push_str(&report_text(report, samples));
+    text.push_str(&report_text(report, "Dry run", samples));
     text
 }
 
-fn report_text(report: &ImportReport, samples: bool) -> String {
-    let mut text = String::from("\nDry run\n");
+fn report_text(report: &ImportReport, heading: &str, samples: bool) -> String {
+    let mut text = format!("\n{heading}\n");
     let mut lines = vec![
         (
             "Listens",

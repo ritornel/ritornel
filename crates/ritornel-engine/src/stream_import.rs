@@ -133,7 +133,7 @@ impl LibraryStore {
                 stored: stored_streams(connection)?,
             })
         })?;
-        let streams = keyed(records);
+        let streams = keyed(records, &read.stored);
         Ok(dry_run(&DryRunInput {
             streams: &streams,
             scrobbles: &read.scrobbles,
@@ -426,7 +426,7 @@ fn apply_in(
     )?;
     let row = connection.last_insert_rowid();
     let mut held = connection.prepare_cached(
-        "INSERT OR IGNORE INTO import_run_stream (run_id, observation_id, rev) VALUES (?1, ?2, ?3)",
+        "INSERT INTO import_run_stream (run_id, observation_id, rev) VALUES (?1, ?2, ?3)",
     )?;
     for observation in observations {
         held.execute((row, observation, write.rev()))?;
@@ -446,7 +446,10 @@ impl LibraryStore {
 
     /// Applies a run of streams: stores those not stored yet and records
     /// the run, in one write. A run applied before writes nothing and
-    /// returns what it is.
+    /// returns what it is. That is looked at before the write is begun, as
+    /// one writer of runs, the hub's job worker, is enough to make sure of;
+    /// a second writer racing it would find the run inside the write, and
+    /// take a revision that changes nothing.
     pub fn apply_streams(
         &self,
         request: WriteRequest,
@@ -458,8 +461,10 @@ impl LibraryStore {
         if let Some(stored) = self.stored_run(run)? {
             return Ok(stored);
         }
-        let streams = keyed(records);
         let written = self.write(request, move |write| {
+            // Keyed against what is stored as this write sees it, so that a
+            // row a run stored before keeps its key.
+            let streams = keyed(records, &stored_streams(write.connection())?);
             let stored = apply_in(write, run, &streams, &reader, session)?;
             Ok(serde_json::to_string(&stored)?)
         })?;

@@ -80,6 +80,15 @@ pub(crate) const APPLY_JOB: &str = "imports.apply";
 /// The kind of the job that undoes an applied run.
 pub(crate) const UNDO_JOB: &str = "imports.undo";
 
+/// A staged run as an apply reads it.
+#[derive(Debug)]
+pub(crate) struct Whole {
+    pub(crate) streams: Vec<SpotifyStream>,
+    pub(crate) begun_at: i64,
+    pub(crate) reader: String,
+    pub(crate) report: Option<ImportReport>,
+}
+
 /// The params of a run's job: the dry run, the apply or the undo.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -210,7 +219,8 @@ impl Staging {
         }
         if streams.iter().any(|stream| stream.plausible().is_err()) {
             return Err(Refused::Invalid(
-                "a stream ends outside 1970 to 2100, or played longer than a day",
+                "a stream names no track, artist or title, ends outside 1970 to 2100, or played \
+                 longer than a day",
             ));
         }
         let _writing = self
@@ -276,9 +286,27 @@ impl Staging {
             .map(|meta| self.shown(run, &meta)))
     }
 
-    /// What read a staged run's archive.
-    pub(crate) fn reader(&self, run: Id) -> Result<Option<String>, Error> {
-        Ok(self.meta(run)?.map(|meta| meta.reader))
+    /// What an apply reads of a staged run, in one look under the lock:
+    /// every stream, when it was begun, what read it, and its report.
+    /// `None` when the run has expired or a piece is missing.
+    pub(crate) fn whole(&self, run: Id, now: i64) -> Result<Option<Whole>, Error> {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(meta) = self.meta(run)? else {
+            return Ok(None);
+        };
+        let Some((streams, begun_at)) = self.streams(run, now)? else {
+            return Ok(None);
+        };
+        let report = read_json(&self.run_dir(run).join("report.json"))?;
+        Ok(Some(Whole {
+            streams,
+            begun_at,
+            reader: meta.reader,
+            report,
+        }))
     }
 
     /// Every stream of a run whose every piece is held, in the order of its
@@ -352,50 +380,29 @@ pub(crate) async fn sweep(core: std::sync::Arc<Core>) {
 /// Carries a claimed dry run to its end: reads the run's streams, works
 /// out what applying them would do, and keeps the report beside the run.
 pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
-    let (row, job_id) = (job.id, job.public_id);
-    info!(job_id = %job_id, "a dry run of an import is claimed");
-    let finish = |state: JobState, failure: Option<String>| match core
-        .with_stores(|stores| stores.server().finish_job(row, state, failure))
-    {
-        Some(Ok(job)) => core.publish_job(&job),
-        Some(Err(failed)) => {
-            error!(job_id = %job_id, error = %failed, "a job's end could not be saved");
-        }
-        None => {}
-    };
+    info!(job_id = %job.public_id, "a dry run of an import is claimed");
+    let failed = |why: String| finish(core, &job, JobState::Failed, Some(why));
     let Ok(params) = serde_json::from_str::<RunJobParams>(&job.params_json) else {
-        return finish(
-            JobState::Failed,
-            Some("the job's params are not a run".to_owned()),
-        );
+        return failed("the job's params are not a run".to_owned());
     };
     let (streams, begun_at) = match core.staging().streams(params.run_id, core.now_ms()) {
         Ok(Some(found)) => found,
         Ok(None) => {
-            return finish(
-                JobState::Failed,
-                Some("the staged run is gone, or a piece of it is missing".to_owned()),
-            );
+            return failed("the staged run is gone, or a piece of it is missing".to_owned());
         }
-        Err(failed) => return finish(JobState::Failed, Some(failed.to_string())),
+        Err(error) => return failed(error.to_string()),
     };
     let report = core.with_library(|_, library| library.stream_dry_run(streams));
     match report {
         Some(Ok(report)) => match core.staging().save_report(params.run_id, begun_at, &report) {
-            Ok(true) => finish(JobState::Succeeded, None),
-            Ok(false) => finish(
-                JobState::Failed,
-                Some(
-                    "the staged run expired, or was staged again, while it was dry run".to_owned(),
-                ),
+            Ok(true) => finish(core, &job, JobState::Succeeded, None),
+            Ok(false) => failed(
+                "the staged run expired, or was staged again, while it was dry run".to_owned(),
             ),
-            Err(failed) => finish(JobState::Failed, Some(failed.to_string())),
+            Err(error) => failed(error.to_string()),
         },
-        Some(Err(failed)) => finish(JobState::Failed, Some(failed.to_string())),
-        None => finish(
-            JobState::Failed,
-            Some("this server holds no library".to_owned()),
-        ),
+        Some(Err(error)) => failed(error.to_string()),
+        None => failed("this server holds no library".to_owned()),
     }
 }
 
@@ -457,14 +464,17 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
         );
     };
     let run = params.run_id;
+    // A run this job applied before the server stopped, its job not yet
+    // ended, is applied: its staged run is gone with the restart, and is
+    // not needed.
+    match core.with_library(|_, library| library.stored_run(run)) {
+        Some(Ok(Some(_))) => return finish(core, &job, JobState::Succeeded, None),
+        Some(Err(failed)) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
+        Some(Ok(None)) | None => {}
+    }
     let staging = core.staging();
-    let found = staging.streams(run, core.now_ms()).and_then(|streams| {
-        Ok(streams
-            .zip(staging.reader(run)?)
-            .zip(staging.run(run, core.now_ms())?))
-    });
-    let ((streams, begun_at), reader, shown) = match found {
-        Ok(Some((((streams, begun_at), reader), shown))) => ((streams, begun_at), reader, shown),
+    let whole = match staging.whole(run, core.now_ms()) {
+        Ok(Some(whole)) => whole,
         Ok(None) => {
             return finish(
                 core,
@@ -475,9 +485,15 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
         }
         Err(failed) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
     };
-    if let Some(why) = stale(shown.report.as_ref()) {
+    if let Some(why) = stale(whole.report.as_ref()) {
         return finish(core, &job, JobState::Failed, Some(why.to_owned()));
     }
+    let Whole {
+        streams,
+        begun_at,
+        reader,
+        ..
+    } = whole;
     let applied = core.with_library(|_, library| {
         let report = library.stream_dry_run(streams.clone())?;
         let stored = library.apply_streams(

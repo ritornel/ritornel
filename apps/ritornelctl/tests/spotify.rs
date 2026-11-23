@@ -311,7 +311,7 @@ fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere
             .is_some()
     );
 
-    // Applied, the run's three streams are stored in one revision.
+    // Applied, the run's four streams are stored in one revision.
     let run = answer["run"]["runId"].as_str().unwrap().to_owned();
     let before = revision(&data_dir).as_u64().unwrap();
     let (code, out, err) = ritornelctl(&data_dir, &["spotify", "apply", &run]);
@@ -320,7 +320,7 @@ fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere
         out.contains("4 streams, 4 of them new to the library. It is in force."),
         "{out}"
     );
-    assert!(out.contains("What applying did"), "{out}");
+    assert!(out.contains("What applying does"), "{out}");
     assert_eq!(revision(&data_dir).as_u64().unwrap(), before + 1);
     // The same archive again stores nothing new.
     let (code, out, _) = ritornelctl(

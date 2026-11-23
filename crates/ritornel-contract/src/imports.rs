@@ -82,10 +82,24 @@ pub const LATEST_STREAM_END: i64 = 4_102_444_800_000;
 pub const LONGEST_STREAM_MS: i64 = 24 * 60 * 60 * 1000;
 
 impl SpotifyStream {
-    /// Whether its times are ones a stream can have: an end from 1970 to
-    /// 2100 and a time played from nothing to a day, so that no sum or
-    /// difference of two overflows. `Err` names the field that is not.
+    /// Whether it is a stream there can be: a track's URI, an artist and a
+    /// title, an end from 1970 to 2100 and a time played from nothing to a
+    /// day, so that no sum or difference of two overflows and no two tracks
+    /// share a key. `Err` names the field that is not.
     pub fn plausible(&self) -> Result<(), &'static str> {
+        let track = self
+            .track_uri
+            .strip_prefix("spotify:track:")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()));
+        if !track {
+            return Err("spotify_track_uri");
+        }
+        if self.title.is_empty() {
+            return Err("master_metadata_track_name");
+        }
+        if self.artist.is_empty() {
+            return Err("master_metadata_album_artist_name");
+        }
         if !(0..LATEST_STREAM_END).contains(&self.ended_at) {
             return Err("ts");
         }
