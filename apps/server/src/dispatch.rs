@@ -160,6 +160,8 @@ pub(crate) struct Core {
     has_player: std::sync::atomic::AtomicBool,
     /// What wakes the thread that delivers finished listens.
     deliveries: crate::playback::Wake,
+    /// What wakes the pulling of a master a satellite's player waits for.
+    pulls: crate::playback::Wake,
     /// Last.fm, once the server has started.
     lastfm: std::sync::OnceLock<crate::lastfm::Lastfm>,
     /// Watching the hub's folders, once the server has started.
@@ -290,6 +292,7 @@ impl Core {
             player: Mutex::new(None),
             has_player: std::sync::atomic::AtomicBool::new(false),
             deliveries: crate::playback::Wake::default(),
+            pulls: crate::playback::Wake::default(),
             lastfm: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
@@ -427,11 +430,11 @@ impl Core {
         lock(&self.awake).follow_the_rule(now);
     }
 
-    /// Whether this server's player is playing.
+    /// Whether this server's player is playing, or about to.
     pub(crate) fn playing(&self) -> bool {
-        lock(&self.player).as_ref().is_some_and(|player| {
-            player.state().status == ritornel_engine::playback::Status::Playing
-        })
+        lock(&self.player)
+            .as_ref()
+            .is_some_and(|player| player.state().status.wants_sound())
     }
 
     /// Says which port other machines reach this server on: once, when it

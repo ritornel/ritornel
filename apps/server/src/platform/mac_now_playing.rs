@@ -68,7 +68,8 @@ impl Controls {
     pub(crate) fn set_state(&mut self, state: &PlayerState) {
         let progress = Some(MediaPosition(millis(state.position_ms)));
         let playback = match state.status {
-            Status::Playing => MediaPlayback::Playing { progress },
+            // About to make sound, so the keys pause it.
+            Status::Playing | Status::Buffering => MediaPlayback::Playing { progress },
             Status::Paused => MediaPlayback::Paused { progress },
             Status::Stopped => MediaPlayback::Stopped,
         };

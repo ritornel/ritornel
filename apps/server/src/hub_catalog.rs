@@ -1,7 +1,8 @@
 //! What a satellite's player reads of the library: the hub's, through the
 //! link. A track's master is pulled whole from the hub into the satellite's
-//! own cache before it plays, and kept there for the next time. See
-//! "Hub and satellites" in docs/internals/linking.md.
+//! own cache before it plays, and kept there for the next time. The pull is
+//! done off the player ([`HubCatalog::fetch`]), which answers meanwhile.
+//! See "Hub and satellites" in docs/internals/linking.md.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -103,18 +104,39 @@ impl HubCatalog {
         }
     }
 
+    /// The copies the hub offers of an appearance, best first: none while
+    /// it does not answer.
+    fn offered(&self, appearance: Id) -> Option<LinkCopies> {
+        self.call::<LinkCopiesCall>(&LinkCopiesParams { appearance })
+            .inspect_err(|error| warn!(%error, "a track's copies could not be read from the hub"))
+            .ok()
+    }
+
+    /// Pulls the first of the hub's copies of an appearance that can be
+    /// pulled into the cache, unless one is kept already. It may take as
+    /// long as the master takes to cross the network, so it is done off
+    /// the player.
+    pub(crate) fn fetch(&self, appearance: Id) -> Result<(), Error> {
+        let Some(LinkCopies { copies }) = self.offered(appearance) else {
+            return Err(Error::Playback(
+                "the hub did not say where this track is".to_owned(),
+            ));
+        };
+        let mut last = Error::Playback("the hub has no copy of this track".to_owned());
+        for copy in &copies {
+            match self.pull(appearance, copy) {
+                Ok(_) => return Ok(()),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+
     /// The master, pulled from the hub if it is not kept here already.
     fn pull(&self, appearance: Id, copy: &HubCopy) -> Result<PathBuf, Error> {
         let kept = self.kept(copy);
         if facts_of(&kept).is_some_and(|facts| facts.size_bytes == copy.size_bytes) {
-            // Played again, so it is the newest to keep.
-            let touched = std::fs::File::options()
-                .append(true)
-                .open(&kept)
-                .and_then(|file| file.set_modified(SystemTime::now()));
-            if let Err(error) = touched {
-                warn!(%error, "a kept master could not be marked as played");
-            }
+            played_again(&kept);
             return Ok(kept);
         }
         let route_to = self.uplink.route().ok_or(Error::Playback(
@@ -167,6 +189,17 @@ impl HubCatalog {
                 )))
             }
         }
+    }
+}
+
+/// Marks a kept master as played now, so that it is the newest to keep.
+fn played_again(kept: &Path) {
+    let touched = std::fs::File::options()
+        .append(true)
+        .open(kept)
+        .and_then(|file| file.set_modified(SystemTime::now()));
+    if let Err(error) = touched {
+        warn!(%error, "a kept master could not be marked as played");
     }
 }
 
@@ -264,41 +297,45 @@ impl Catalog for HubCatalog {
         Ok(shown)
     }
 
-    /// The first of the hub's copies that can be pulled, kept here. The
-    /// hub has chosen their order. While the hub does not answer there is
-    /// none: the track is not played, and what plays now plays on.
+    /// The first of the hub's copies that is kept here, or, where none
+    /// is, the first as one to be fetched. The hub has chosen their order.
+    /// While the hub does not answer there is none: the track is not
+    /// played, and what plays now plays on.
     fn copies(&self, appearance: Id, _server: Id) -> Result<Vec<Copy>, Error> {
-        let offered = match self.call::<LinkCopiesCall>(&LinkCopiesParams { appearance }) {
-            Ok(offered) => offered,
-            Err(error) => {
-                warn!(%error, "a track's copies could not be read from the hub");
-                return Ok(Vec::new());
-            }
+        let Some(LinkCopies { copies }) = self.offered(appearance) else {
+            return Ok(Vec::new());
         };
-        let LinkCopies { copies } = offered;
-        let mut last = None;
-        for copy in copies {
-            match self.pull(appearance, &copy) {
-                Ok(path) => {
-                    let Some(facts) = facts_of(&path) else {
-                        continue;
-                    };
-                    return Ok(vec![Copy::fetched(
-                        copy.source_item_id,
-                        copy.revision,
-                        copy.asset_id,
-                        copy.duration_ms,
-                        path,
-                        facts,
-                    )]);
-                }
-                Err(error) => last = Some(error),
+        for copy in &copies {
+            let kept = self.kept(copy);
+            if !facts_of(&kept).is_some_and(|facts| facts.size_bytes == copy.size_bytes) {
+                continue;
+            }
+            // Marked first, so the facts it plays under are the file's as
+            // it now is.
+            played_again(&kept);
+            if let Some(facts) = facts_of(&kept) {
+                return Ok(vec![Copy::fetched(
+                    copy.source_item_id,
+                    copy.revision,
+                    copy.asset_id,
+                    copy.duration_ms,
+                    kept,
+                    facts,
+                )]);
             }
         }
-        match last {
-            Some(error) => Err(error),
-            None => Ok(Vec::new()),
-        }
+        Ok(copies
+            .first()
+            .map(|copy| {
+                Copy::elsewhere(
+                    copy.source_item_id,
+                    copy.revision,
+                    copy.asset_id,
+                    copy.duration_ms,
+                )
+            })
+            .into_iter()
+            .collect())
     }
 
     fn first_listener(&self) -> Result<Option<Id>, Error> {

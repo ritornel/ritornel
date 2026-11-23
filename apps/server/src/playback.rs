@@ -143,7 +143,10 @@ pub(crate) fn restore(
     Ok(Some(player))
 }
 
-/// The two running threads. Dropping them tells them to stop.
+/// How long the thread that pulls masters waits when nothing wakes it.
+const PULL_IDLE: Duration = Duration::from_secs(1);
+
+/// The running threads. Dropping them tells them to stop.
 #[derive(Debug)]
 pub(crate) struct Workers {
     core: Arc<Core>,
@@ -160,6 +163,13 @@ impl Workers {
     pub(crate) fn start(core: Arc<Core>, run: PlaybackRun, run_id: Id) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let ticker = if core.has_player() {
+            // Told to stop with the others but never waited for: a pull
+            // ends once its master has crossed or stalls, and a stop does
+            // not wait on the network.
+            let (puller, stop_pulling) = (Arc::clone(&core), Arc::clone(&stop));
+            std::thread::Builder::new()
+                .name("ritornel-pull".to_owned())
+                .spawn(move || pull(&puller, &stop_pulling))?;
             let (core, stop) = (Arc::clone(&core), Arc::clone(&stop));
             Some(
                 std::thread::Builder::new()
@@ -208,6 +218,7 @@ impl Workers {
     fn signal(&self) {
         self.stop.store(true, Ordering::SeqCst);
         self.core.deliveries().wake();
+        self.core.pulls().wake();
     }
 }
 
@@ -255,6 +266,27 @@ fn tick(core: &Core, stop: &AtomicBool) {
             Err(failed) => error!(error = %failed, "the player's tick failed"),
         }
         std::thread::sleep(TICK);
+    }
+}
+
+/// Pulls what the player waits for, one master at a time, with the player
+/// let go meanwhile, and hands each back to it.
+fn pull(core: &Core, stop: &AtomicBool) {
+    while !stop.load(Ordering::SeqCst) {
+        match core.wanted_master() {
+            Some((fetch, hub)) => {
+                let outcome = hub
+                    .fetch(fetch.appearance)
+                    .map_err(|error| error.to_string());
+                if let Err(why) = &outcome {
+                    warn!(appearance = %fetch.appearance, %why, "a master could not be pulled from the hub");
+                }
+                if !stop.load(Ordering::SeqCst) {
+                    core.master_fetched(fetch, outcome);
+                }
+            }
+            None => core.pulls().wait(PULL_IDLE),
+        }
     }
 }
 

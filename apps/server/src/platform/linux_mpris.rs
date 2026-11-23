@@ -283,7 +283,8 @@ impl Shown {
 
     fn status_name(&self) -> &'static str {
         match self.status {
-            Status::Playing => "Playing",
+            // About to make sound, so the keys pause it.
+            Status::Playing | Status::Buffering => "Playing",
             Status::Paused => "Paused",
             Status::Stopped => "Stopped",
         }

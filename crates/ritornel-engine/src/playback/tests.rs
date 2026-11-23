@@ -193,6 +193,67 @@ pub(crate) fn catalog(library: &LibraryStore, server: Id, tracks: &[Track]) -> (
         .unzip()
 }
 
+/// The library as a satellite's player reads it: each appearance in `away`
+/// has only a copy elsewhere, to be fetched before it plays, until it is
+/// taken out of `away`.
+struct Away<'a> {
+    library: &'a LibraryStore,
+    away: &'a std::collections::HashSet<Id>,
+}
+
+impl<'a> Away<'a> {
+    fn new(library: &'a LibraryStore, away: &'a std::collections::HashSet<Id>) -> Self {
+        Self { library, away }
+    }
+}
+
+impl Catalog for Away<'_> {
+    fn track(&self, appearance: Id) -> Result<Option<super::TrackDisplay>, crate::Error> {
+        self.library.track(appearance)
+    }
+
+    fn tracks(&self, appearances: &[Id]) -> Result<Vec<Option<super::TrackDisplay>>, crate::Error> {
+        self.library.tracks(appearances)
+    }
+
+    fn copies(&self, appearance: Id, server: Id) -> Result<Vec<super::Copy>, crate::Error> {
+        let copies = self.library.copies(appearance, server)?;
+        if !self.away.contains(&appearance) {
+            return Ok(copies);
+        }
+        Ok(copies
+            .into_iter()
+            .map(|copy| {
+                super::Copy::elsewhere(
+                    copy.source_item(),
+                    copy.revision_no(),
+                    copy.asset(),
+                    copy.duration_ms(),
+                )
+            })
+            .collect())
+    }
+
+    fn first_listener(&self) -> Result<Option<Id>, crate::Error> {
+        self.library.first_listener()
+    }
+
+    fn unknown_appearance(&self, appearances: &[Id]) -> Result<Option<Id>, crate::Error> {
+        self.library.unknown_appearance(appearances)
+    }
+
+    fn said_again(&self, track: &mut super::TrackDisplay) -> Result<(), crate::Error> {
+        self.library.said_again(track)
+    }
+
+    fn release_tracks(
+        &self,
+        release: Id,
+    ) -> Result<Option<Vec<super::TrackDisplay>>, crate::Error> {
+        self.library.release_tracks(release)
+    }
+}
+
 /// Everything a player test needs: the stores, the renderer, the clocks.
 struct Rig {
     /// The playing server's wall clock.
@@ -203,6 +264,9 @@ struct Rig {
     entropy: Arc<CountingEntropy>,
     server: ServerStore,
     library: LibraryStore,
+    /// The tracks whose masters are elsewhere, as a satellite's not yet
+    /// pulled are: see [`Away`].
+    away: std::collections::HashSet<Id>,
     identity: ServerIdentity,
     fake: Fake,
     player: Player,
@@ -283,6 +347,7 @@ impl Rig {
             entropy,
             server,
             library,
+            away: std::collections::HashSet::new(),
             identity,
             fake,
             player,
@@ -310,7 +375,8 @@ impl Rig {
 
     /// Ticks the player and keeps what it said began.
     fn tick(&mut self) {
-        let events = self.player.tick(&self.server, Some(&self.library)).unwrap();
+        let catalog = Away::new(&self.library, &self.away);
+        let events = self.player.tick(&self.server, Some(&catalog)).unwrap();
         self.note(&events);
     }
 
@@ -362,9 +428,10 @@ impl Rig {
             shuffle: None,
             known: false,
         };
+        let catalog = Away::new(&self.library, &self.away);
         let done = self
             .player
-            .play(request, what, &self.server, Some(&self.library))
+            .play(request, what, &self.server, Some(&catalog))
             .unwrap();
         self.note(&done.events);
         // The first frames are heard on the next tick.
@@ -381,7 +448,11 @@ impl Rig {
         let request = self.request("playback.resume");
         let done = self
             .player
-            .resume(request, &self.server, Some(&self.library))
+            .resume(
+                request,
+                &self.server,
+                Some(&Away::new(&self.library, &self.away)),
+            )
             .unwrap();
         self.note(&done.events);
         self.tick();
@@ -412,7 +483,13 @@ impl Rig {
         let entry = self.entry();
         let done = self
             .player
-            .skip(request, entry, direction, &self.server, Some(&self.library))
+            .skip(
+                request,
+                entry,
+                direction,
+                &self.server,
+                Some(&Away::new(&self.library, &self.away)),
+            )
             .unwrap();
         self.note(&done.events);
         self.tick();
@@ -2934,4 +3011,111 @@ fn a_song_the_output_could_not_open_is_where_a_restart_finds_the_player() {
     );
     assert!(rig.restart(0xb1).is_empty());
     assert_eq!(rig.player.state().current.unwrap().index, 1);
+}
+
+impl Rig {
+    /// The master the player waits for is here, or could not be fetched:
+    /// the track is taken out of `away` first when it is here.
+    fn fetched(&mut self, fetch: super::Fetch, outcome: Result<(), String>) {
+        if outcome.is_ok() {
+            self.away.remove(&fetch.appearance);
+        }
+        let catalog = Away::new(&self.library, &self.away);
+        let events = self
+            .player
+            .fetched(fetch, outcome, &self.server, Some(&catalog))
+            .unwrap();
+        self.note(&events);
+    }
+
+    /// The tracks at `at` in the album are elsewhere.
+    fn elsewhere(&mut self, at: &[usize]) {
+        self.away.extend(at.iter().map(|at| self.tracks[*at]));
+    }
+}
+
+#[test]
+fn a_track_whose_master_is_elsewhere_buffers_and_plays_once_it_is_fetched() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[0, 1]);
+    rig.play(0);
+    // It answers at once, waiting for the first master, and nothing is
+    // heard or recorded meanwhile.
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    let first = rig.entry();
+    let wanted = rig.player.wanted().unwrap();
+    assert_eq!((wanted.entry, wanted.appearance), (first, rig.tracks[0]));
+    rig.wait(5_000);
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    assert!(rig.began.is_empty());
+    assert!(rig.staged().is_empty());
+
+    // Here: it plays.
+    rig.fetched(wanted, Ok(()));
+    assert_eq!(rig.player.state().status, Status::Playing);
+    // The next master is not asked for until the first is heard.
+    assert_eq!(rig.player.wanted(), None);
+    rig.pass(1_000);
+    let next = rig.player.wanted().unwrap();
+    assert_eq!(next.appearance, rig.tracks[1]);
+    rig.fetched(next, Ok(()));
+    // Joined to the first, it follows with nothing more asked.
+    rig.pass(240_000);
+    assert_eq!(rig.player.wanted(), None);
+    assert_eq!(rig.player.state().status, Status::Playing);
+    // The first's listen is the user's pick and ended as it finished, and
+    // the second's began from it.
+    let [listen, second] = rig.staged().try_into().unwrap();
+    assert_eq!(listen.started.start_reason.as_str(), "user_pick");
+    assert_eq!(listen.ended.unwrap().end_reason.as_str(), "finished");
+    assert_eq!(listen.heard.ms_played, 240_000);
+    assert_eq!(second.started.start_reason.as_str(), "auto_advance");
+    assert_eq!(
+        rig.began
+            .iter()
+            .map(|(track, _)| *track)
+            .collect::<Vec<_>>(),
+        rig.tracks[..2]
+    );
+}
+
+#[test]
+fn a_master_that_cannot_be_fetched_marks_its_entry_and_the_player_moves_on() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[0]);
+    rig.play(0);
+    let wanted = rig.player.wanted().unwrap();
+    rig.fetched(wanted, Err("the hub went away".to_owned()));
+    // The next is here, and plays.
+    assert_eq!(rig.player.state().status, Status::Playing);
+    assert_ne!(rig.entry(), wanted.entry);
+    let page = rig.player.window(super::Order::Queue, 0, 1);
+    assert_eq!(page.entries[0].0, wanted.entry);
+    assert_eq!(page.entries[0].2.as_deref(), Some("no_copy_reachable"));
+}
+
+#[test]
+fn a_pause_while_buffering_waits_and_a_fetch_no_longer_wanted_changes_nothing() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[0, 1]);
+    rig.play(0);
+    let first = rig.player.wanted().unwrap();
+    rig.pause();
+    assert_eq!(rig.player.state().status, Status::Paused);
+    assert_eq!(rig.player.wanted(), None);
+    // Fetched while paused: it waits to be played.
+    rig.fetched(first, Ok(()));
+    assert_eq!(rig.player.state().status, Status::Paused);
+    rig.resume();
+    assert_eq!(rig.player.state().status, Status::Playing);
+
+    // A skip to a track elsewhere buffers it, and the first's fetch, late,
+    // changes nothing.
+    rig.skip(Direction::Next);
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    let second = rig.player.wanted().unwrap();
+    assert_eq!(second.appearance, rig.tracks[1]);
+    rig.fetched(first, Ok(()));
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    assert_eq!(rig.player.wanted(), Some(second));
 }

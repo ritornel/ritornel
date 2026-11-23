@@ -23,7 +23,7 @@ use ritornel_contract::{
     TrackSummary,
 };
 use ritornel_engine::playback::{
-    self as engine, AddTracks, Catalog, Direction, Done, Order, Place, PlayTracks, Player,
+    self as engine, AddTracks, Catalog, Direction, Done, Fetch, Order, Place, PlayTracks, Player,
     PlayerEvent, PlayerState, Request, Settings, Status, TrackDisplay,
 };
 use ritornel_engine::{Command, LibraryStore, ServerStore};
@@ -195,6 +195,7 @@ impl Core {
                 Status::Stopped => PlaybackStatus::Stopped,
                 Status::Playing => PlaybackStatus::Playing,
                 Status::Paused => PlaybackStatus::Paused,
+                Status::Buffering => PlaybackStatus::Buffering,
             },
             entry_id: current.map(|now| now.entry_id),
             index: current.and_then(|now| u32::try_from(now.index).ok()),
@@ -296,8 +297,12 @@ impl Core {
         )
         .map_err(refused)?;
         let state = player.state();
+        let wants = player.wanted().is_some();
         drop(library);
         self.publish_player(events, Some(state));
+        if wants {
+            self.pulls.wake();
+        }
         Ok(done)
     }
 
@@ -327,8 +332,12 @@ impl Core {
             }
             let events = ticked?;
             let state = (!events.is_empty()).then(|| player.state());
+            let wants = player.wanted().is_some();
             drop(library);
             self.publish_player(events, state);
+            if wants {
+                self.pulls.wake();
+            }
             Ok(())
         });
         ticked.unwrap_or(Ok(()))
@@ -342,6 +351,32 @@ impl Core {
         let bytes = bytes.unwrap_or(DEFAULT_CACHE_BYTES);
         let _ = self.cache_bytes.set(bytes);
         crate::hub_catalog::tidy(&self.audio_cache(), bytes);
+    }
+
+    /// What wakes the pulling of a master the player waits for.
+    pub(crate) fn pulls(&self) -> &crate::playback::Wake {
+        &self.pulls
+    }
+
+    /// The master the player waits for, with the hub to pull it from:
+    /// none on a hub, or while the player waits for nothing. The player is
+    /// let go before the pull, so it answers meanwhile.
+    pub(crate) fn wanted_master(&self) -> Option<(Fetch, HubCatalog)> {
+        let hub = self.hub_catalog()?;
+        let fetch = lock(&self.player).as_ref()?.wanted()?;
+        Some((fetch, hub))
+    }
+
+    /// Hands the player a master pulled for it, or why it could not be.
+    pub(crate) fn master_fetched(&self, fetch: Fetch, outcome: Result<(), String>) {
+        let handed = self.with_stores(|stores| {
+            self.with_player(stores, |player, server, library| {
+                Ok(((), player.fetched(fetch, outcome, server, library)?))
+            })
+        });
+        if let Some(Err(error)) = handed {
+            error!(%error, "a pulled master could not be handed to the player");
+        }
     }
 
     /// On a satellite, the hub's library as its player reads it.

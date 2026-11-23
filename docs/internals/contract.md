@@ -177,5 +177,4 @@ The methods registered in `crates/ritornel-contract/src/methods.rs`, by area (se
 A few wire types already carry variants reserved for upcoming work:
 
 - `ErrorCode::PlanStale` is defined for future plan-then-commit destructive commands.
-- `PlaybackStatus::Buffering` is defined for streamed playback.
 - `ClientKind` already includes `browser`, `phone`, and `agent` alongside `desktop` and `cli`.
