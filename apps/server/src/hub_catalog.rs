@@ -113,10 +113,10 @@ impl HubCatalog {
     }
 
     /// Pulls the first of the hub's copies of an appearance that can be
-    /// pulled into the cache, unless one is kept already. It may take as
-    /// long as the master takes to cross the network, so it is done off
-    /// the player.
-    pub(crate) fn fetch(&self, appearance: Id) -> Result<(), Error> {
+    /// pulled into the cache, unless one is kept already, and returns it as
+    /// the player opens it. It may take as long as the master takes to
+    /// cross the network, so it is done off the player.
+    pub(crate) fn fetch(&self, appearance: Id) -> Result<Copy, Error> {
         let Some(LinkCopies { copies }) = self.offered(appearance) else {
             return Err(Error::Playback(
                 "the hub did not say where this track is".to_owned(),
@@ -125,7 +125,19 @@ impl HubCatalog {
         let mut last = Error::Playback("the hub has no copy of this track".to_owned());
         for copy in &copies {
             match self.pull(appearance, copy) {
-                Ok(_) => return Ok(()),
+                Ok(path) => {
+                    let Some(facts) = facts_of(&path) else {
+                        continue;
+                    };
+                    return Ok(Copy::fetched(
+                        copy.source_item_id,
+                        copy.revision,
+                        copy.asset_id,
+                        copy.duration_ms,
+                        path,
+                        facts,
+                    ));
+                }
                 Err(error) => last = error,
             }
         }

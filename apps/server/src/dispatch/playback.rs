@@ -368,7 +368,7 @@ impl Core {
     }
 
     /// Hands the player a master pulled for it, or why it could not be.
-    pub(crate) fn master_fetched(&self, fetch: Fetch, outcome: Result<(), String>) {
+    pub(crate) fn master_fetched(&self, fetch: Fetch, outcome: Result<engine::Copy, String>) {
         let handed = self.with_stores(|stores| {
             self.with_player(stores, |player, server, library| {
                 Ok(((), player.fetched(fetch, outcome, server, library)?))
