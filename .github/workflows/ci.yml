@@ -102,6 +102,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends pkg-config libasound2-dev
       - run: cargo clippy --locked --package ritornel-server --no-default-features --features audio-output --all-targets -- -D warnings
       - run: cargo test --locked --package ritornel-engine --package ritornel-server --no-default-features --features ritornel-server/audio-output
