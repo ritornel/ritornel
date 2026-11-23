@@ -624,6 +624,9 @@ mod enabled {
         lastfm: &'a Lastfm,
         account: Id,
         job: &'a Job,
+        /// Whether the sync reads everything again, which sets aside what
+        /// an earlier one stored twice.
+        full: bool,
         stop: &'a std::sync::atomic::AtomicBool,
         batches: u64,
         summary: SyncSummary,
@@ -678,11 +681,12 @@ mod enabled {
         }
 
         fn commit(&mut self, batch: Batch) -> Result<Stored, SourceError> {
-            let account = self.account;
+            let (account, full) = (self.account, self.full);
             let outcome = self.library(|library| {
                 library.ingest(Observations::Imports {
                     account,
                     batch: &batch,
+                    full,
                 })
             })?;
             let ritornel_engine::IngestOutcome::Imports(stored) = outcome else {
@@ -692,6 +696,12 @@ mod enabled {
             self.summary.read += batch.records.len() as u64;
             self.summary.new += stored.new;
             self.summary.gone += stored.gone;
+            if stored.set_aside > 0 {
+                info!(
+                    set_aside = stored.set_aside,
+                    "a full sync set aside scrobbles an earlier import stored twice"
+                );
+            }
             if self.lastfm.fail_after_batch() == Some(self.batches) {
                 // The crash test asked for the server to die here, after
                 // the library committed the batch and its cursor.
@@ -801,6 +811,7 @@ mod enabled {
             lastfm,
             account: session.account,
             job: &job,
+            full,
             stop,
             batches: 0,
             summary: SyncSummary::default(),
@@ -1192,6 +1203,7 @@ mod enabled {
                 lastfm: &lastfm,
                 account: id(2),
                 job: &job,
+                full: false,
                 stop: &stop,
                 batches: 0,
                 summary: Default::default(),

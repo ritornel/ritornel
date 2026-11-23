@@ -510,6 +510,64 @@ fn gone(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<u64, Er
         .count() as u64)
 }
 
+/// What an import set aside as a duplicate says, in its correction.
+pub(crate) const DUPLICATE_NOTE: &str =
+    "stored twice by an earlier read: the source holds this record once";
+
+/// The imports a full read finds stored twice in the batch's span: each one
+/// the source no longer holds, while it holds a record of the same track at
+/// the same time, as a read of pages whose order shifted between requests
+/// could leave. Only an import whose play is its own is taken, so that a
+/// play of this library's own that an echo joined is never left out, and an
+/// import set aside once, even if that was revoked since, is not taken
+/// again.
+fn duplicates(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Vec<i64>, Error> {
+    let keys: HashSet<&[u8]> = batch
+        .records
+        .iter()
+        .map(|record| record.source_key.as_slice())
+        .collect();
+    let held: HashSet<(i64, &str, Option<&str>, &str)> = batch
+        .records
+        .iter()
+        .map(|record| {
+            let track = &record.track;
+            (
+                record.played_at_ms,
+                track.artist.as_str(),
+                track.album.as_deref(),
+                track.title.as_str(),
+            )
+        })
+        .collect();
+    let mut statement = connection.prepare_cached(
+        "SELECT o.id, o.source_key, i.played_at_utc_ms, i.artist, i.album, i.title
+         FROM observation_import i
+         JOIN history_observation o ON o.id = i.observation_id
+         WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms >= ?2 AND i.played_at_utc_ms < ?3
+           AND NOT EXISTS (SELECT 1 FROM correction_target t
+                           JOIN observation_correction c ON c.observation_id = t.correction_id
+                           WHERE t.target_observation_id = o.id AND c.verb = 'exclude')
+           AND (SELECT count(*) FROM play_event_observation mine
+                JOIN play_event_observation other ON other.play_event_id = mine.play_event_id
+                WHERE mine.observation_id = o.id) = 1
+         ORDER BY o.id",
+    )?;
+    let mut rows = statement.query((endpoint, batch.span.from_ms, batch.span.to_ms))?;
+    let mut found = Vec::new();
+    while let Some(row) = rows.next()? {
+        let key: Vec<u8> = row.get(1)?;
+        let (at, artist, album, title): (i64, String, Option<String>, String) =
+            (row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?);
+        if !keys.contains(key.as_slice())
+            && held.contains(&(at, artist.as_str(), album.as_deref(), title.as_str()))
+        {
+            found.push(row.get(0)?);
+        }
+    }
+    Ok(found)
+}
+
 /// Stores the batch's new records, binds what they name where the matcher
 /// is sure, derives their plays and moves the cursor, in the write's
 /// transaction. Returns how many were new.
@@ -830,16 +888,20 @@ impl LibraryStore {
     /// Takes in a batch of import records through the one ingest call (see
     /// [`LibraryStore::ingest`]): every record that is new, the plays
     /// derived from them and the batch's cursor, in one transaction. A
-    /// batch with nothing new writes nothing, its cursor included.
+    /// batch with nothing new writes nothing, its cursor included. Of a
+    /// `full` read, the same transaction sets aside what an earlier read
+    /// stored twice in the batch's span ([`duplicates`]), each with an
+    /// `exclude` correction that says [`DUPLICATE_NOTE`].
     pub(crate) fn ingest_import_batch(
         &self,
         account: Id,
         batch: &Batch,
+        full: bool,
         rule: ritornel_domain::history::PlayRule,
     ) -> Result<Stored, Error> {
         // Read first: a batch that is all stored already writes nothing,
         // and takes no library revision.
-        let (new, gone) = {
+        let (new, gone, doubled) = {
             let batch = batch.clone();
             self.read(move |connection| {
                 let rows = rows_of(connection, account)?;
@@ -848,14 +910,24 @@ impl LibraryStore {
                     rows.endpoint,
                     batch.records.iter().map(|record| &record.source_key),
                 )?;
+                let doubled = if full {
+                    duplicates(connection, rows.endpoint, &batch)?.len()
+                } else {
+                    0
+                };
                 Ok((
                     batch.records.len() - held.len(),
                     gone(connection, rows.endpoint, &batch)?,
+                    doubled,
                 ))
             })?
         };
-        if new == 0 {
-            return Ok(Stored { new: 0, gone });
+        if new == 0 && doubled == 0 {
+            return Ok(Stored {
+                new: 0,
+                gone,
+                set_aside: 0,
+            });
         }
         let batch = batch.clone();
         let written = self.write(
@@ -864,11 +936,23 @@ impl LibraryStore {
                 command: None,
                 client: None,
             },
-            move |write| Ok(ingest_imports(write, account, &batch, rule)?.to_string()),
+            move |write| {
+                let new = ingest_imports(write, account, &batch, rule)?;
+                let doubled = if full {
+                    let endpoint = rows_of(write.connection(), account)?.endpoint;
+                    duplicates(write.connection(), endpoint, &batch)?
+                } else {
+                    Vec::new()
+                };
+                crate::history_store::exclude(write, &doubled, DUPLICATE_NOTE, rule)?;
+                Ok(serde_json::to_string(&(new, doubled.len()))?)
+            },
         )?;
+        let (new, set_aside): (u64, u64) = serde_json::from_str(&written.result_json)?;
         Ok(Stored {
-            new: written.result_json.parse().unwrap_or(0),
+            new,
             gone,
+            set_aside,
         })
     }
 

@@ -140,6 +140,9 @@ pub enum Observations<'a> {
         account: Id,
         /// What the source read.
         batch: &'a ritornel_source::Batch,
+        /// Whether it is of a full read, which sets aside what an earlier
+        /// read stored twice ("Last.fm" in docs/internals/history.md).
+        full: bool,
     },
 }
 
@@ -979,6 +982,64 @@ fn window_observations(connection: &Connection, window: Window) -> Result<Vec<i6
     Ok(found)
 }
 
+/// Sets aside each of `targets`, observations of the account's history,
+/// with an `exclude` correction of its own on the manual endpoint, which
+/// says `note`, and derives their plays again by `rule`. Nothing is
+/// removed, and a correction is revoked as any other is.
+pub(crate) fn exclude(
+    write: &Write<'_>,
+    targets: &[i64],
+    note: &str,
+    rule: PlayRule,
+) -> Result<(), Error> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let connection = write.connection();
+    let manual: i64 = connection
+        .query_row(
+            "SELECT id FROM history_endpoint WHERE kind = 'manual'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(Error::Corrupt("a library with no manual endpoint"))?;
+    let payload = serde_json::json!({ "verb": "exclude", "note": note }).to_string();
+    for target in targets {
+        let listener: i64 = connection.query_row(
+            "SELECT listener_id FROM history_observation WHERE id = ?1",
+            [target],
+            |row| row.get(0),
+        )?;
+        connection.execute(
+            "INSERT INTO history_observation
+               (endpoint_id, source_key, kind, listener_id, captured_at_utc_ms,
+                received_at_utc_ms, zone_basis, payload_json, rev)
+             VALUES (?1, ?2, 'correction', ?3, ?4, ?4, 'none', ?5, ?6)",
+            rusqlite::params![
+                manual,
+                write.new_id()?.as_bytes(),
+                listener,
+                write.now_ms(),
+                payload,
+                write.rev(),
+            ],
+        )?;
+        let correction = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO observation_correction (observation_id, verb, note, rev)
+             VALUES (?1, 'exclude', ?2, ?3)",
+            rusqlite::params![correction, note, write.rev()],
+        )?;
+        connection.execute(
+            "INSERT INTO correction_target (correction_id, target_observation_id, rev)
+             VALUES (?1, ?2, ?3)",
+            (correction, target, write.rev()),
+        )?;
+    }
+    rederive(write, &targets.iter().copied().collect(), rule)
+}
+
 /// The non-correction observations affected by a correction, following
 /// `revoke` targets down to the corrections they undo.
 fn correction_affected_observations(
@@ -1423,9 +1484,16 @@ impl LibraryStore {
             Observations::Listen { record, stamps } => Ok(IngestOutcome::Listen(
                 self.ingest_listen_by(record, stamps, PlayRule::CURRENT)?,
             )),
-            Observations::Imports { account, batch } => Ok(IngestOutcome::Imports(
-                self.ingest_import_batch(account, batch, PlayRule::CURRENT)?,
-            )),
+            Observations::Imports {
+                account,
+                batch,
+                full,
+            } => Ok(IngestOutcome::Imports(self.ingest_import_batch(
+                account,
+                batch,
+                full,
+                PlayRule::CURRENT,
+            )?)),
         }
     }
 

@@ -75,11 +75,17 @@ fn batch(records: Vec<ImportRecord>, from_ms: i64, to_ms: i64) -> Batch {
 
 impl Rig {
     fn ingest(&self, batch: &Batch) -> ritornel_source::Stored {
+        self.read(batch, false)
+    }
+
+    /// Takes in a batch as a read that is full or not does.
+    fn read(&self, batch: &Batch, full: bool) -> ritornel_source::Stored {
         match self
             .library
             .ingest(Observations::Imports {
                 account: self.account,
                 batch,
+                full,
             })
             .unwrap()
         {
@@ -163,6 +169,96 @@ fn a_batch_is_stored_with_its_cursor_and_a_second_reading_writes_nothing() {
     let stored = rig.ingest(&fewer);
     assert_eq!((stored.new, stored.gone), (0, 1));
     assert_eq!(rig.revision(), again);
+}
+
+#[test]
+fn a_full_read_sets_aside_a_scrobble_an_earlier_read_stored_twice() {
+    let rig = rig();
+    // An earlier read whose pages shifted between requests: Paper Kites
+    // twice in its second, Lanternfish not at all.
+    let shifted = batch(
+        vec![
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 0),
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 1),
+            record(T0 - HOUR, "Somebody Else", "Not Here", 0),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    );
+    rig.ingest(&shifted);
+    // What the source holds: one Paper Kites, and Lanternfish in the same
+    // second. Not Here is gone from it altogether.
+    let held = batch(
+        vec![
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 0),
+            record(T0 - 3 * HOUR, "moss arcade", "LANTERNFISH", 0),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    );
+    let counted = "SELECT count(*) FROM play_event WHERE excluded = 0";
+    let corrections =
+        "SELECT count(*) FROM observation_correction WHERE verb = 'exclude' AND note IS NOT NULL";
+
+    // A read that is not full stores what is new and sets nothing aside.
+    let stored = rig.ingest(&held);
+    assert_eq!((stored.new, stored.gone, stored.set_aside), (1, 2, 0));
+    assert_eq!(rig.one(counted), "4");
+
+    // A full read sets the second Paper Kites aside, and nothing else: Not
+    // Here is gone, and no record of the same track and time is left.
+    let stored = rig.read(&held, true);
+    assert_eq!((stored.new, stored.gone, stored.set_aside), (0, 2, 1));
+    assert_eq!(rig.one(counted), "3");
+    assert_eq!(rig.one(corrections), "1");
+    assert_eq!(
+        rig.one("SELECT count(*) FROM history_observation WHERE kind = 'import'"),
+        "4",
+        "nothing is removed"
+    );
+    assert_eq!(
+        rig.one(
+            "SELECT o.payload_json FROM correction_target t
+             JOIN history_observation o ON o.id = t.target_observation_id"
+        ),
+        r#"{"name":"Paper Kites","ordinal":1}"#
+    );
+
+    // Again: already set aside, so nothing is written.
+    let revision = rig.revision();
+    assert_eq!(rig.read(&held, true).set_aside, 0);
+    assert_eq!(rig.revision(), revision);
+
+    // Revoked by the owner, it counts again, and a full read leaves it be.
+    let correction = rig.one(
+        "SELECT hex(o.source_key) FROM history_observation o
+         JOIN observation_correction c ON c.observation_id = o.id",
+    );
+    let correction: Id = format!(
+        "{}-{}-{}-{}-{}",
+        &correction[0..8],
+        &correction[8..12],
+        &correction[12..16],
+        &correction[16..20],
+        &correction[20..32]
+    )
+    .to_lowercase()
+    .parse()
+    .unwrap();
+    rig.library
+        .revoke_correction(
+            WriteRequest {
+                method: "history.revoke",
+                command: None,
+                client: None,
+            },
+            correction,
+            None,
+        )
+        .unwrap();
+    assert_eq!(rig.one(counted), "4");
+    assert_eq!(rig.read(&held, true).set_aside, 0);
+    assert_eq!(rig.one(counted), "4");
 }
 
 #[test]

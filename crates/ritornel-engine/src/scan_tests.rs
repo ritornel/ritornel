@@ -1476,6 +1476,7 @@ fn a_scrobble_bound_to_a_scanned_song_leaves_every_later_scan_and_the_identity_r
         .ingest(crate::Observations::Imports {
             account,
             batch: &batch,
+            full: false,
         })
         .unwrap();
     assert_eq!(

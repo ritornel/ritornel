@@ -162,6 +162,7 @@ fn import(library: &LibraryStore, account: Id, plays: usize) -> std::time::Durat
                         },
                         cursor: format!("{{\"readBefore\":{}}}", to / 1000),
                     },
+                    full: false,
                 })
                 .unwrap();
             assert!(matches!(stored, IngestOutcome::Imports(_)));

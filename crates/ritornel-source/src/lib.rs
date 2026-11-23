@@ -91,6 +91,11 @@ pub struct Stored {
     /// Records stored before for the span that the source no longer
     /// holds. They stay: a record is never removed.
     pub gone: u64,
+    /// Of those, the ones a full read found stored twice, as an earlier
+    /// read could: the source holds one record of the same track at the
+    /// same time, and the core holds more. Each is left out of the plays,
+    /// and stays. None on a read that is not full.
+    pub set_aside: u64,
 }
 
 /// A track the listener marked as loved at a source, with when.
