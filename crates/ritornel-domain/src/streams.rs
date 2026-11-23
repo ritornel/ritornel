@@ -141,7 +141,6 @@ pub fn pins<'a>(
     corrections: &[Correction],
     streams: impl IntoIterator<Item = (i64, &'a Stream)>,
 ) -> Pins {
-    let streams: HashMap<i64, &Stream> = streams.into_iter().collect();
     let active = active_corrections(corrections);
     let mut in_order: Vec<&Correction> = corrections
         .iter()
@@ -150,7 +149,11 @@ pub fn pins<'a>(
                 && matches!(correction.verb, Verb::Join | Verb::Split)
         })
         .collect();
+    if in_order.is_empty() {
+        return Pins::default();
+    }
     in_order.sort_by_key(|correction| correction.observation);
+    let streams: HashMap<i64, &Stream> = streams.into_iter().collect();
     type Listen = (i64, i64, String);
     let mut newest: HashMap<(Listen, i64), (i64, bool, &[u8])> = HashMap::new();
     for correction in in_order {
@@ -423,17 +426,25 @@ pub fn match_streams(
         .map(|s| (name_key(&s.artist), name_key(&s.title)))
         .collect();
     // A pin names a stream; it stands for the stream's event. Streams of
-    // one key are one listen, so any of them stands for it.
-    let event_by_key: HashMap<&[u8], usize> = streams
-        .iter()
-        .enumerate()
-        .filter_map(|(at, stream)| Some((stream.key.as_slice(), *event_of.get(&at)?)))
-        .collect();
-    let scrobble_at: HashMap<i64, usize> = scrobbles
-        .iter()
-        .enumerate()
-        .map(|(at, scrobble)| (scrobble.observation, at))
-        .collect();
+    // one key are one listen, so any of them stands for it. With no pins,
+    // nothing is looked up.
+    let (event_by_key, scrobble_at): (HashMap<&[u8], usize>, HashMap<i64, usize>) =
+        if pins.apart.is_empty() && pins.together.is_empty() {
+            (HashMap::new(), HashMap::new())
+        } else {
+            (
+                streams
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(at, stream)| Some((stream.key.as_slice(), *event_of.get(&at)?)))
+                    .collect(),
+                scrobbles
+                    .iter()
+                    .enumerate()
+                    .map(|(at, scrobble)| (scrobble.observation, at))
+                    .collect(),
+            )
+        };
     let pinned = |stream: &Vec<u8>, scrobble: &i64| {
         Some((
             *event_by_key.get(stream.as_slice())?,
