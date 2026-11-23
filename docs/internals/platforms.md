@@ -13,6 +13,7 @@ Ritornel was built on macOS first. Linux and Windows came early, while the code 
 | A hub found by its `.local` name | Bonjour | With Avahi, and nss-mdns on a satellite | Yes | As Linux |
 | A hub kept from idle sleep | `caffeinate -i` | `systemd-inhibit --what=idle` | Not yet | As Linux |
 | Desktop app | Yes | Wayland or X11 | Yes | None |
+| Installed app (`mise run install`) | `/Applications/Ritornel.app` | `~/.local/lib/ritornel`, with a launcher entry and an icon | Not yet | None |
 | App menus | The menu bar | A button in the title bar | A button in the title bar | None |
 | Data directory | `~/Library/Application Support/Ritornel` | `$XDG_DATA_HOME/ritornel` | `%LOCALAPPDATA%\Ritornel` | As Linux |
 
@@ -47,6 +48,7 @@ What differs between systems sits in a `platform` module in each crate that need
 
   Each queue entry gets its own track ID so `SetPosition` can refuse a stale one. The bus name is `org.mpris.MediaPlayer2.ritornel`.
 - **The background service is a systemd user unit, not a system unit,** for the same reason macOS uses a user agent: the user's session owns the session bus and the sound server. It restarts ten seconds after an unclean exit, matching the launchd agent.
+- **The installed app is a folder in `~/.local/lib`, not in the data directory.** `scripts/install.sh` copies the bundle `scripts/desktop.sh app` makes, the app with its server beside it, to `~/.local/lib/ritornel`, staged and swapped in as on macOS. `$XDG_DATA_HOME/ritornel` is the data directory and is never written by an install: on both systems the script replaces only a folder that already holds the app, and stops before writing anything when another folder is in the way. Without the desktop app's libraries, `scripts/desktop.sh app` skips the app and the script installs the programs alone. The launcher entry and the 512-pixel icon go in `$XDG_DATA_HOME/applications` and `$XDG_DATA_HOME/icons/hicolor`, named `dev.ritornel.desktop` after the window's app ID, which is how a launcher, a Wayland compositor (`app_id`), X11 (`WM_CLASS`) and MPRIS (`DesktopEntry`) match the window and the media session to the entry and its icon.
 - **The desktop app starts its server detached,** in its own session and with nothing tied to the app, so the server outlives it. A server the app started carries `RITORNEL_STARTED_BY_APP=1`, so Quit can distinguish it from one the app only found.
 
 ### Windows

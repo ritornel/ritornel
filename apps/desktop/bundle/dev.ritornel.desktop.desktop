@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Ritornel
+GenericName=Music Player
+Comment=Play the music you own
+Exec=EXEC
+Icon=dev.ritornel.desktop
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=dev.ritornel.desktop

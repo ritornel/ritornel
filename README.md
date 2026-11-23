@@ -27,7 +27,7 @@ Planned:
 
 ## Building it
 
-For now you need a Mac with Xcode's command-line tools, and [mise](https://mise.jdx.dev), which installs everything else at the versions this repository pins.
+You need [mise](https://mise.jdx.dev), which installs everything else at the versions this repository pins, and on a Mac Xcode's command-line tools. On Linux the server needs ALSA's development files and the desktop app those of fontconfig, xcb and xkbcommon; [`AGENTS.md`](AGENTS.md) names the packages.
 
 ```sh
 mise trust
@@ -39,7 +39,7 @@ mise run install       # a release build, installed for everyday use
 
 `mise run desktop:run` touches no music or library of yours: it makes a library of invented artists and albums in `apps/desktop/.invented` and serves it silently on a port of its own. It does share the installed app's remembered view settings, such as which wall is open. The invented library has no audio. `scripts/desktop.sh tones` runs the app on a small one that plays.
 
-`mise run install` puts `ritornel-server` and `ritornelctl` in `~/.local/bin` and `Ritornel.app` in `/Applications`. The app starts its own server and keeps its data in `~/Library/Application Support/Ritornel`. To add music, open Settings › Library in the app and add the folder your music is in: the first folder makes the library, in that data folder, and the music folder is only ever read. Or run `ritornelctl library create` and then `ritornelctl scan <folder>`.
+`mise run install` puts `ritornel-server` and `ritornelctl` in `~/.local/bin` and `Ritornel.app` in `/Applications`. The app starts its own server and keeps its data in `~/Library/Application Support/Ritornel`. On Linux the app and its server go in `~/.local/lib/ritornel`, with a launcher entry so that Ritornel appears among the system's apps, and the data is in `~/.local/share/ritornel` by default. Without the desktop app's libraries it installs the programs alone. To add music, open Settings › Library in the app and add the folder your music is in: the first folder makes the library, in that data folder, and the music folder is only ever read. Or run `ritornelctl library create` and then `ritornelctl scan <folder>`.
 
 ## Last.fm
 

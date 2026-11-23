@@ -17,7 +17,7 @@ description = "Build every crate and both programs, and on macOS and Linux the d
 run = ["cargo build --locked --workspace --all-targets", { task = "desktop:app" }]
 
 [tasks.install]
-description = "Build in release and install it: the programs in ~/.local/bin, and on a Mac Ritornel.app, with its own server, in /Applications"
+description = "Build in release and install it: the programs in ~/.local/bin, and the app with its own server, on a Mac Ritornel.app in /Applications and on Linux ~/.local/lib/ritornel with a launcher entry"
 run = [
     "cargo build --locked --release --package ritornel-server --package ritornelctl",
     { task = "desktop:app" },
