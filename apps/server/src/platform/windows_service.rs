@@ -74,7 +74,8 @@ fn task_name(user: &str) -> String {
 
 /// The user the service is for: `DOMAIN\name`, and their task's name.
 fn user(env: Env<'_>) -> Result<(String, String), Error> {
-    match (env("USERDOMAIN"), env("USERNAME")) {
+    let set = |name| env(name).filter(|value| !value.is_empty());
+    match (set("USERDOMAIN"), set("USERNAME")) {
         (Some(domain), Some(name)) => {
             let name = name.to_string_lossy();
             Ok((
@@ -218,7 +219,9 @@ fn unxml(text: &str) -> String {
 
 /// A program from the system's own folder.
 fn system_program(name: &str, env: Env<'_>) -> PathBuf {
-    let root = env("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let root = env("SystemRoot")
+        .filter(|root| !root.is_empty())
+        .unwrap_or_else(|| r"C:\Windows".into());
     Path::new(&root).join("System32").join(name)
 }
 
@@ -233,11 +236,13 @@ fn schtasks(args: &[&OsStr], env: Env<'_>) -> Result<(), Error> {
         return Ok(());
     }
     let verb = args.first().map(|verb| verb.to_string_lossy());
-    Err(Error::Service(format!(
-        "schtasks {} failed: {}",
-        verb.unwrap_or_default(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
+    let verb = verb.unwrap_or_default();
+    let said = String::from_utf8_lossy(&output.stderr);
+    Err(Error::Service(match (said.trim(), output.status.code()) {
+        ("", Some(code)) => format!("schtasks {verb} failed with exit code {code}"),
+        ("", None) => format!("schtasks {verb} failed"),
+        (said, _) => format!("schtasks {verb} failed: {said}"),
+    }))
 }
 
 /// What Task Scheduler says of a task.
@@ -530,8 +535,14 @@ fn supervise(
     log: &mut dyn Write,
 ) -> Result<(), Error> {
     loop {
-        let mut child =
-            start().map_err(|error| Error::Service(format!("cannot start the server: {error}")))?;
+        let mut child = start().map_err(|error| {
+            // Under a console no one sees, the log is the only place to say so.
+            let _ = writeln!(
+                log,
+                "ritornel-server service: cannot start the server: {error}"
+            );
+            Error::Service(format!("cannot start the server: {error}"))
+        })?;
         let pid = child.id();
         let input = child.stdin.take();
         let ended = heard.clone();

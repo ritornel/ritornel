@@ -163,7 +163,8 @@ mod fallback {
     /// There is no background service here.
     fn no_service() -> Error {
         Error::Service(
-            "it is built for macOS, Linux and Windows only so far; elsewhere run              `ritornel-server serve` under the system's service manager"
+            "it is built for macOS, Linux and Windows only so far; elsewhere run \
+             `ritornel-server serve` under the system's service manager"
                 .to_owned(),
         )
     }
