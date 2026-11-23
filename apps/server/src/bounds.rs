@@ -40,9 +40,8 @@ pub const TICKET_LIFE: Duration = Duration::from_secs(10);
 
 /// The longest a satellite waits for its hub to answer a call. The longest
 /// call a client makes through a satellite, such as a history page, takes
-/// a fraction of this on a hub, and the satellite must say the hub is away
-/// before its own clients give up on it: `ritornelctl` gives up on finding
-/// and greeting a server after ten seconds.
+/// a fraction of this on a hub, and a client that asks while the hub is
+/// away hears so in seconds, not after its own wait runs out.
 pub const HUB_CALL_WAIT: Duration = Duration::from_secs(8);
 
 /// The bounds one server runs with. [`Default`] is what a server uses. A

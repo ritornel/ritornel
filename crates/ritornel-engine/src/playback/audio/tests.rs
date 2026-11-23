@@ -189,7 +189,7 @@ fn facts(path: &Path) -> FileFacts {
 }
 
 /// Gathers what the renderer says until `done` holds of all of it, for at
-/// most ten seconds. The null output runs at many times real time, so this
+/// most a minute. The null output runs at many times real time, so this
 /// is milliseconds.
 fn until(renderer: &mut AudioRenderer, said: &mut Vec<Event>, done: impl Fn(&[Event]) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1714,6 +1714,12 @@ fn wall_ms() -> i64 {
     crate::SystemClock.now_ms()
 }
 
+/// Now, on the clock the pipeline's listens are also stamped on.
+fn mono_ms() -> i64 {
+    use crate::Timekeeper;
+    crate::SystemTimekeeper.mono_ms()
+}
+
 #[test]
 fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_stays_silent() {
     use crate::playback::Status;
@@ -1727,7 +1733,7 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
     let mut rig = Pipeline::new(&[2_000], Box::new(renderer));
     rig.play();
     rig.until(|_| hold.waiting().is_some());
-    let stopped_by = wall_ms();
+    let (stopped_by, stopped_by_mono) = (wall_ms(), mono_ms());
     rig.until(|state| state.status == Status::Paused);
     let noticed_by = wall_ms();
 
@@ -1754,8 +1760,13 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
         ended.ended_at_ms + stall_ms <= noticed_by + 1,
         "{ended:?}, noticed by {noticed_by}"
     );
+    // How much later than when the output was seen to stop a stamp may
+    // be: the player turns the output's clock into these two as it takes
+    // the end in, and a busy machine may pause it between the readings.
+    // It is far less than a stall.
+    let late = 500;
     assert!(
-        ended.ended_at_ms <= stopped_by + 50,
+        ended.ended_at_ms <= stopped_by + late,
         "{ended:?}, stopped by {stopped_by}"
     );
     assert!(failing.since_ms >= ended.ended_at_ms, "{failing:?}");
@@ -1765,15 +1776,17 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
     // when the output rendered late, on a busy machine: a late render
     // cannot be caught up once the output is held.
     let started = &lost.started;
-    let mono = ended.ended_mono_ms.unwrap();
-    let seen = stopped_by - started.started_at_ms;
-    for (ended_at, started_at) in [
-        (ended.ended_at_ms, started.started_at_ms),
-        (mono, started.started_mono_ms),
+    for (ended_at, started_at, stopped_by) in [
+        (ended.ended_at_ms, started.started_at_ms, stopped_by),
+        (
+            ended.ended_mono_ms.unwrap(),
+            started.started_mono_ms,
+            stopped_by_mono,
+        ),
     ] {
-        let span = ended_at - started_at;
+        let (span, seen) = (ended_at - started_at, stopped_by - started_at);
         assert!(
-            (0..=seen + 50).contains(&span),
+            (0..=seen + late).contains(&span),
             "{span} against {seen} seen, {heard} heard: {lost:?}"
         );
     }

@@ -1028,10 +1028,11 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
                 break server;
             }
             if let Some(ended) = child.try_wait().unwrap() {
-                let mut said = String::new();
+                let mut said = Vec::new();
                 if let Some(mut stderr) = child.stderr.take() {
-                    std::io::Read::read_to_string(&mut stderr, &mut said).unwrap();
+                    std::io::Read::read_to_end(&mut stderr, &mut said).unwrap();
                 }
+                let said = String::from_utf8_lossy(&said);
                 panic!("the server ended before it was found, with {ended}: {said}");
             }
             // sleep: between looks while it starts; the test's WAIT bounds them.
