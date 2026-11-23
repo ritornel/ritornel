@@ -45,6 +45,7 @@ pub mod hex;
 mod history;
 mod id;
 mod identity;
+mod imports;
 mod lastfm;
 mod library;
 mod link;
@@ -81,6 +82,7 @@ pub use identity::{
     Binding, DryRun, DryRunParams, FileFacts, ItemChange, ItemOutcome, Nearest, Penalties,
     PolicyOverrides, PolicyValues, Review, ReviewCause, ReviewList,
 };
+pub use imports::{SpotifyPlatform, SpotifyStream};
 pub use lastfm::{
     DeliveryCount, DoubtfulTrack, ImportSchedule, KeyParams, LastImport, LastfmReport,
     LastfmReportParams, LastfmStatus, LastfmSyncParams, LastfmSyncStarted, NearlyMatched,
