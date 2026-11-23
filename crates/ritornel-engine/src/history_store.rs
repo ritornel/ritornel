@@ -482,7 +482,7 @@ pub(crate) fn corrections(connection: &Connection) -> Result<Vec<Correction>, Er
 }
 
 /// Every listener's zone periods.
-fn zone_periods(connection: &Connection) -> Result<Vec<ZonePeriod>, Error> {
+pub(crate) fn zone_periods(connection: &Connection) -> Result<Vec<ZonePeriod>, Error> {
     let mut statement = connection.prepare_cached(
         "SELECT listener_id, zone_name, valid_from_ms, valid_to_ms FROM listener_zone_period",
     )?;

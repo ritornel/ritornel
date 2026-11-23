@@ -84,7 +84,11 @@ pub use identity::{
     Binding, DryRun, DryRunParams, FileFacts, ItemChange, ItemOutcome, Nearest, Penalties,
     PolicyOverrides, PolicyValues, Review, ReviewCause, ReviewList,
 };
-pub use imports::SpotifyStream;
+pub use imports::{
+    ImportProblem, ImportReport, ImportRun, ImportYear, ImportsDryRunParams, ImportsDryRunStarted,
+    ImportsGetParams, ImportsStageParams, ImportsStaged, JoinSample, MAX_STREAMS_PER_PIECE,
+    SpotifyStream, StreamTier, TierJoins,
+};
 pub use lastfm::{
     DeliveryCount, DoubtfulTrack, ImportSchedule, KeyParams, LastImport, LastfmReport,
     LastfmReportParams, LastfmStatus, LastfmSyncParams, LastfmSyncStarted, NearlyMatched,
@@ -146,7 +150,7 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 /// one contract. A server refuses a client whose number is not its own,
 /// and a satellite refuses a hub of another ("Session and frames" in
 /// docs/internals/contract.md).
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 3;
 
 /// The capability flags a server may list in its descriptor.
 pub mod capability {

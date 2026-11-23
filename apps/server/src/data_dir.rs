@@ -14,6 +14,8 @@
 //!   cache/         covers/, made on demand, and tmp/, where each is written first
 //!   backups/       made only when a database is migrated with no backup folder
 //!                  named: the copy taken before, as a way back from it
+//!   imports/       runs of streams staged for a dry run, removed at every
+//!                  start (`crate::imports`)
 //! ```
 //!
 //! A backup is never written here: it goes to a folder named outside this
@@ -115,6 +117,11 @@ impl DataDir {
     /// folder is named. It is not made until then.
     pub(crate) fn backups(&self) -> PathBuf {
         self.root.join("backups")
+    }
+
+    /// Where runs of streams are staged.
+    pub(crate) fn imports(&self) -> PathBuf {
+        self.root.join("imports")
     }
 
     pub(crate) fn logs(&self) -> PathBuf {

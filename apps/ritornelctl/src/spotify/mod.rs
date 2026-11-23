@@ -6,10 +6,12 @@
 //! It stores nothing and sends nothing.
 
 mod archive;
+mod import;
 mod rows;
 
 pub(crate) use self::archive::Error as ArchiveError;
 use self::archive::shown;
+pub(crate) use self::import::import;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;

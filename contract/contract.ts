@@ -10,7 +10,7 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 2;
+export const CONTRACT_VERSION = 3;
 
 /** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
@@ -121,6 +121,9 @@ export const METHODS = {
   "lastfm.sync": { kind: "command", needsFull: true },
   "lastfm.setScrobbling": { kind: "command", needsFull: true },
   "lastfm.report": { kind: "query", needsFull: true },
+  "imports.stage": { kind: "command", needsFull: true },
+  "imports.dryRun": { kind: "command", needsFull: true },
+  "imports.get": { kind: "query", needsFull: true },
   "artists.importPictures": { kind: "command", needsFull: true },
   "artists.pictureFolders": { kind: "query", needsFull: true },
   "library.setWatching": { kind: "command", needsFull: true },
@@ -200,6 +203,9 @@ export type MethodMap = {
   "lastfm.sync": { params: LastfmSyncParams; result: LastfmSyncStarted };
   "lastfm.setScrobbling": { params: ScrobblingParams; result: ScrobblingSet };
   "lastfm.report": { params: LastfmReportParams; result: LastfmReport };
+  "imports.stage": { params: ImportsStageParams; result: ImportsStaged };
+  "imports.dryRun": { params: ImportsDryRunParams; result: ImportsDryRunStarted };
+  "imports.get": { params: ImportsGetParams; result: ImportRun };
   "artists.importPictures": { params: ImportPicturesParams; result: PicturesImported };
   "artists.pictureFolders": { params: NoParams; result: PictureFolders };
   "library.setWatching": { params: WatchingParams; result: WatchingSet };
@@ -1582,6 +1588,118 @@ export type ImportPicturesParams = {
 };
 
 /**
+ * What stands in the way of applying a run, and what to do about it.
+ */
+export type ImportProblem = "no_zone" | "tier_not_in_force";
+
+/**
+ * What a dry run found: what the run holds, and what applying it would
+ * do, by year. Nothing was written to find it.
+ */
+export type ImportReport = {
+  /**
+   * When it was worked out.
+   */
+  madeAt: number,
+  /**
+   * The matcher's version.
+   */
+  matcherVersion: number,
+  /**
+   * Streams in the run, repeats included.
+   */
+  streams: number,
+  /**
+   * Listens they report: each repeat counted once.
+   */
+  events: number,
+  /**
+   * Scrobbles offered to the streams: Last.fm's, less those set aside
+   * and those that are this library's own listens come back.
+   */
+  scrobbles: number,
+  /**
+   * Scrobbles set aside, which no stream may take.
+   */
+  scrobblesExcluded: number,
+  /**
+   * Scrobbles that are this library's own listens come back.
+   */
+  scrobblesEchoes: number,
+  /**
+   * What each tier joins.
+   */
+  tiers: Array<TierJoins>,
+  /**
+   * By year.
+   */
+  years: Array<ImportYear>,
+  /**
+   * Streams played offline, and of those, the ones with the time
+   * offline mode was used.
+   */
+  offline: number,
+  /**
+   * See `offline`.
+   */
+  offlineTimestamped: number,
+  /**
+   * Of those, the ones whose offline time reads as seconds near the
+   * stream's end, and as milliseconds near it; the rest are neither.
+   */
+  offlineSeconds: number,
+  /**
+   * See `offline_seconds`.
+   */
+  offlineMilliseconds: number,
+  /**
+   * Scrobbles no stream took, stamped between the stream before and the
+   * worked-out start of a stream of the same names that has no
+   * scrobble: where a pause would put them.
+   */
+  paused: number,
+  /**
+   * What stands in the way of applying.
+   */
+  problems: Array<ImportProblem>,
+  /**
+   * A sample of the joins of each tier not in force, for judging it.
+   */
+  samples: Array<JoinSample>,
+};
+
+/**
+ * A run of streams staged on the hub. It is removed a day after it was
+ * begun, and when the hub starts.
+ */
+export type ImportRun = {
+  /**
+   * The run.
+   */
+  runId: string,
+  /**
+   * How many pieces it has.
+   */
+  pieces: number,
+  /**
+   * How many of them the hub holds.
+   */
+  received: number,
+  /**
+   * The streams in those pieces.
+   */
+  streams: number,
+  /**
+   * When the hub removes it.
+   */
+  expiresAt: number,
+  /**
+   * The last dry run's report, once one has finished.
+   */
+  report?: ImportReport,
+};
+
+/**
  * When the account's history is imported. Only the library's hub imports:
  * when it starts, when a client such as the desktop app opens and the
  * last import ended more than an hour before, and six hours after the
@@ -1612,6 +1730,169 @@ export type ImportSchedule = {
    * the listener has no zones.
    */
   off?: string,
+};
+
+/**
+ * What a dry run found for one year, by each stream's worked-out start in
+ * UTC. The joins and the plays after are by the tiers in force.
+ */
+export type ImportYear = {
+  /**
+   * The year.
+   */
+  year: number,
+  /**
+   * Listens Spotify reported: streams, each repeat counted once.
+   */
+  streams: number,
+  /**
+   * Of those, the ones joined to a scrobble by tier A.
+   */
+  joinedStart: number,
+  /**
+   * By tier B.
+   */
+  joinedDuring: number,
+  /**
+   * By tier C.
+   */
+  joinedRenamed: number,
+  /**
+   * With no scrobble, and counted by the play rule.
+   */
+  aloneCounted: number,
+  /**
+   * With no scrobble, and not counted: skipped or partial.
+   */
+  aloneNotCounted: number,
+  /**
+   * With no scrobble, and no length for its track to judge it by.
+   */
+  aloneUnknown: number,
+  /**
+   * Scrobbles of the year that no stream took, of those offered.
+   */
+  scrobblesAlone: number,
+  /**
+   * Plays of the year now, by their start in UTC.
+   */
+  playsBefore: number,
+  /**
+   * Plays of the year once applied.
+   */
+  playsAfter: number,
+  /**
+   * Of the plays now, the ones that count.
+   */
+  countedBefore: number,
+  /**
+   * Of the plays once applied, the ones that count.
+   */
+  countedAfter: number,
+  /**
+   * Streams that start where no zone the listener was in covers, so
+   * that their local date is unknown.
+   */
+  noZone: number,
+};
+
+/**
+ * The params of `imports.dryRun`.
+ */
+export type ImportsDryRunParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The run.
+   */
+  runId: string,
+};
+
+/**
+ * The result of `imports.dryRun`.
+ */
+export type ImportsDryRunStarted = {
+  /**
+   * The job that works the dry run out. Its report is the run's, from
+   * `imports.get`, once the job has succeeded.
+   */
+  job: Job,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * The params of `imports.get`.
+ */
+export type ImportsGetParams = {
+  /**
+   * The run.
+   */
+  runId: string,
+};
+
+/**
+ * The params of `imports.stage`: one piece of a run of streams read from
+ * an archive, which the hub keeps until the run is dry run.
+ */
+export type ImportsStageParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The run, made by the client for its first piece and named by every
+   * piece after.
+   */
+  runId: string,
+  /**
+   * Which piece this is, from 0.
+   */
+  piece: number,
+  /**
+   * How many pieces the run has.
+   */
+  pieces: number,
+  /**
+   * Its streams, at most [`MAX_STREAMS_PER_PIECE`].
+   */
+  streams: Array<SpotifyStream>,
+};
+
+/**
+ * The result of `imports.stage`.
+ */
+export type ImportsStaged = {
+  /**
+   * The run as the hub now holds it.
+   */
+  run: ImportRun,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
 };
 
 /**
@@ -1805,6 +2086,10 @@ export type JobTarget = { "type": "source",
   /**
    * The account's ID.
    */
+  id: string, } | { "type": "import_run",
+  /**
+   * The run's ID.
+   */
   id: string,
 };
 
@@ -1826,6 +2111,45 @@ export type JobsList = {
    * The newest jobs, newest first.
    */
   jobs: Array<Job>,
+};
+
+/**
+ * One join a dry run shows for judging a tier: both records' names and how
+ * far apart they were.
+ */
+export type JoinSample = {
+  /**
+   * The tier that joined them.
+   */
+  tier: StreamTier,
+  /**
+   * Whether the scrobble is a second report.
+   */
+  second: boolean,
+  /**
+   * The stream's artist and title.
+   */
+  streamArtist: string,
+  /**
+   * See `stream_artist`.
+   */
+  streamTitle: string,
+  /**
+   * The scrobble's artist and title.
+   */
+  scrobbleArtist: string,
+  /**
+   * See `scrobble_artist`.
+   */
+  scrobbleTitle: string,
+  /**
+   * The scrobble's stamp less the stream's worked-out start.
+   */
+  fromStartMs: number,
+  /**
+   * How long the stream played.
+   */
+  msPlayed: number,
 };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
@@ -4971,6 +5295,82 @@ export type SourcesTracksParams = {
 };
 
 /**
+ * What kind of device played a stream. Spotify's own text names the device
+ * and its system, so only this word is kept. A word it does not know is
+ * refused with an error that does not repeat it, so that text sent in its
+ * place is never echoed back or logged.
+ */
+export type SpotifyPlatform = "mac" | "windows" | "linux" | "android" | "ios" | "web" | "cast" | "other";
+
+/**
+ * One row of Spotify's extended streaming history, as Ritornel keeps it.
+ *
+ * It is the whole of what is taken from a row. The row's IP address, user
+ * agent, account name and country, its platform as text, and any field
+ * this type does not name are never read into it, and the type refuses a
+ * field it does not name, so nothing else can ride along with it.
+ */
+export type SpotifyStream = {
+  /**
+   * When the stream ended, in Unix milliseconds, to the second.
+   */
+  endedAt: number,
+  /**
+   * How long it played.
+   */
+  msPlayed: number,
+  /**
+   * The track, as `spotify:track:` and its ID.
+   */
+  trackUri: string,
+  /**
+   * The track's title.
+   */
+  title: string,
+  /**
+   * The artist, as Spotify named it.
+   */
+  artist: string,
+  /**
+   * The album, as Spotify named it.
+   */
+  album?: string,
+  /**
+   * Why it began, as Spotify says it, such as `clickrow`.
+   */
+  reasonStart?: string,
+  /**
+   * Why it ended, as Spotify says it, such as `trackdone`.
+   */
+  reasonEnd?: string,
+  /**
+   * Whether shuffle was on.
+   */
+  shuffle?: boolean,
+  /**
+   * Spotify's own mark that the track was skipped.
+   */
+  skipped?: boolean,
+  /**
+   * Whether it played offline.
+   */
+  offline?: boolean,
+  /**
+   * When offline mode was used, as the row gives it. Its unit is not
+   * documented, so it is kept as given.
+   */
+  offlineTimestamp?: number,
+  /**
+   * Whether it was played in a private session.
+   */
+  incognito?: boolean,
+  /**
+   * What kind of device played it, as one word.
+   */
+  platform: SpotifyPlatform,
+};
+
+/**
  * One layer of the picture of a listener's history: the artists first
  * heard in one year, and how much they were played in each month after.
  */
@@ -4989,6 +5389,11 @@ export type StreamLayer = {
    */
   most: Array<Array<number>>,
 };
+
+/**
+ * A rule that joins a scrobble to a stream.
+ */
+export type StreamTier = "start" | "during" | "renamed";
 
 /**
  * The result of `events.subscribe` and `events.unsubscribe`.
@@ -5033,6 +5438,28 @@ export type SyncSummary = {
    * the end: newly bound, moved to another recording, or released.
    */
   matchedAfter: number,
+};
+
+/**
+ * What a tier joins.
+ */
+export type TierJoins = {
+  /**
+   * The tier.
+   */
+  tier: StreamTier,
+  /**
+   * Whether it is in force: whether applying would join what it finds.
+   */
+  inForce: boolean,
+  /**
+   * Scrobbles it joins as a stream's own.
+   */
+  joined: number,
+  /**
+   * Scrobbles it joins as a second report of a stream that has one.
+   */
+  second: number,
 };
 
 /**

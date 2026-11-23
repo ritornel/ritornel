@@ -56,6 +56,8 @@ pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
         target: job.target.map(|id| {
             if job.kind == crate::lastfm::SYNC_JOB {
                 JobTarget::Account { id }
+            } else if job.kind == crate::imports::DRY_RUN_JOB {
+                JobTarget::ImportRun { id }
             } else {
                 JobTarget::Source { id }
             }

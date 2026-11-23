@@ -15,16 +15,16 @@ use ritornel_contract::methods::{
     self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, EventsSubscribe,
     EventsUnsubscribe, HistoryAlbum, HistoryArtist, HistoryExport, HistoryOnThisDay,
     HistoryRebuild, HistoryRecent, HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones,
-    IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall,
-    LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
-    LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkCopiesCall,
-    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall, ListClose,
-    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
-    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
-    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
-    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerSetSettings,
-    ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks,
-    TracksGet,
+    IdentityDryRun, IdentityReview, ImportsDryRun, ImportsGet, ImportsStage, JobsCancel, JobsGet,
+    JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart,
+    LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching,
+    LibraryStats, LinkCopiesCall, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall,
+    LinkTracksCall, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
+    MediaTokenCall, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume,
+    PlaybackSeek, PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove,
+    QueueRemove, QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello,
+    ServerSetSettings, ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList,
+    SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -53,6 +53,7 @@ mod calls;
 mod churn;
 mod export;
 mod history;
+mod imports;
 mod lastfm;
 mod link;
 mod lists;
@@ -176,6 +177,8 @@ pub(crate) struct Core {
     audio_pace: std::sync::OnceLock<std::time::Duration>,
     /// Last.fm, once the server has started.
     lastfm: std::sync::OnceLock<crate::lastfm::Lastfm>,
+    /// The runs of streams staged for a dry run.
+    staging: crate::imports::Staging,
     /// Watching the hub's folders, once the server has started.
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// Where backups go, once the server has started.
@@ -270,6 +273,7 @@ impl Core {
             ))),
             _ => None,
         };
+        let staging = crate::imports::Staging::start(dir.imports())?;
         let cache = dir.cache()?;
         let covers = ritornel_engine::covers::Covers::new(&cache).map_err(|error| Error::Io {
             doing: "prepare",
@@ -313,6 +317,7 @@ impl Core {
             sounding: std::sync::atomic::AtomicBool::new(false),
             audio_pace: std::sync::OnceLock::new(),
             lastfm: std::sync::OnceLock::new(),
+            staging,
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
             cache_bytes: std::sync::OnceLock::new(),
@@ -1070,6 +1075,11 @@ impl Core {
             LastfmSetScrobbling::NAME => run::<LastfmSetScrobbling>(params, |params| {
                 self.lastfm_set_scrobbling(stores, &params)
             }),
+            ImportsStage::NAME => run::<ImportsStage>(params, |params| self.imports_stage(&params)),
+            ImportsDryRun::NAME => {
+                run::<ImportsDryRun>(params, |params| self.imports_dry_run(stores, &params))
+            }
+            ImportsGet::NAME => run::<ImportsGet>(params, |params| self.imports_get(&params)),
             LastfmReportCall::NAME => {
                 run::<LastfmReportCall>(params, |params| self.lastfm_report(stores, &params))
             }

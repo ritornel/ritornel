@@ -67,13 +67,14 @@ A sleeping hub is one its satellites cannot reach, but a satellite or a player s
   logs/          daily JSON-line log files
   cache/         covers/ (extracted on demand) and tmp/ (atomic writes before rename)
   backups/       pre-migration rollback copy, created only when no backup folder is configured
+  imports/       runs of streams staged for a dry run, owner-only, removed at every start
 ```
 
 The data directory must sit on a local filesystem because SQLite WAL shared memory and OS file locks are unreliable on network shares. Master music folders may live on local disks or network mounts; a missing or empty root is treated as offline rather than empty so scans skip it without dropping locations.
 
 `DataDir::prepare` creates private directories (`0700` on Unix, owner-only ACL on Windows) and tightens permissions on `server.db` and `library.db` at startup (protecting restored databases that may arrive world-readable).
 
-Cache files are written in `cache/tmp/`, synced, and renamed into `cache/covers/` before being indexed. Cover art bytes remain in the audio/folder files and are extracted into `cache/covers/` on demand; nothing in `cache/`, `logs/`, `backups/`, `server.json`, `preparing.json`, or `server.lock` needs to be backed up.
+Cache files are written in `cache/tmp/`, synced, and renamed into `cache/covers/` before being indexed. Cover art bytes remain in the audio/folder files and are extracted into `cache/covers/` on demand; nothing in `cache/`, `logs/`, `backups/`, `imports/`, `server.json`, `preparing.json`, or `server.lock` needs to be backed up.
 
 ### Backups and pre-migration snapshots
 

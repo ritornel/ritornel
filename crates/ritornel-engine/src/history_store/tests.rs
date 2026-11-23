@@ -1125,6 +1125,17 @@ fn a_counted_listen_is_recorded_before_it_is_sent_once_and_its_echo_joins_its_pl
     let incremental = at.library.derived_history().unwrap();
     at.rebuild(PlayRule::V1, false);
     assert_eq!(at.library.derived_history().unwrap(), incremental);
+
+    // A Spotify stream at the same moment is never joined to the echo of a
+    // listen of this library's own: the two are two players. The other
+    // scrobble is offered, and joins its stream.
+    let streams = vec![
+        crate::import_store::tests::stream(start, 144_000, "Paper Kites"),
+        crate::import_store::tests::stream(start + 1000, 144_000, "Lanternfish"),
+    ];
+    let report = at.library.stream_dry_run(streams).unwrap();
+    assert_eq!((report.scrobbles, report.scrobbles_echoes), (1, 1));
+    assert_eq!(report.tiers[0].joined, 1);
 }
 
 #[test]

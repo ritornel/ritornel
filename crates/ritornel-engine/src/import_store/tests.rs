@@ -1145,3 +1145,83 @@ fn releasing_a_scrobble_binding_records_an_unbind_decision() {
     assert!(absent["doubt"].is_null());
     assert_eq!(absent["candidates"], 0);
 }
+
+/// An invented stream of `title` on the invented album, which started at
+/// `start_ms` and played `played_ms`.
+pub(crate) fn stream(
+    start_ms: i64,
+    played_ms: i64,
+    title: &str,
+) -> ritornel_contract::SpotifyStream {
+    ritornel_contract::SpotifyStream {
+        ended_at: start_ms + played_ms,
+        ms_played: played_ms,
+        track_uri: format!("spotify:track:{}", title.replace(' ', "")),
+        title: title.to_owned(),
+        artist: "Moss Arcade".to_owned(),
+        album: Some("Tin Weather".to_owned()),
+        reason_start: Some("trackdone".to_owned()),
+        reason_end: Some("trackdone".to_owned()),
+        shuffle: Some(false),
+        skipped: Some(false),
+        offline: Some(false),
+        offline_timestamp: None,
+        incognito: Some(false),
+        platform: ritornel_contract::SpotifyPlatform::Mac,
+    }
+}
+
+#[test]
+fn a_dry_run_offers_no_stream_a_scrobble_set_aside_and_writes_nothing() {
+    let rig = rig();
+    // An earlier read whose pages shifted stored Paper Kites twice in its
+    // second, and Lanternfish not at all; a full read sets the second
+    // Paper Kites aside.
+    let shifted = batch(
+        vec![
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 0),
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 1),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    );
+    rig.ingest(&shifted);
+    let held = batch(
+        vec![
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 0),
+            record(T0 - 3 * HOUR, "Moss Arcade", "Lanternfish", 0),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    );
+    assert_eq!(rig.read(&held, true).set_aside, 1);
+    let revision = rig.revision();
+
+    // Two streams of it start within seconds of both scrobbles: offered,
+    // the one set aside would join the second.
+    let streams = vec![
+        stream(T0 - 3 * HOUR + 2000, 200_000, "Paper Kites"),
+        stream(T0 - 3 * HOUR - 5000, 210_000, "Paper Kites"),
+    ];
+    let report = rig.library.stream_dry_run(streams).unwrap();
+    assert_eq!(rig.revision(), revision, "a dry run writes nothing");
+    assert_eq!(
+        (
+            report.scrobbles,
+            report.scrobbles_excluded,
+            report.scrobbles_echoes
+        ),
+        (2, 1, 0)
+    );
+    assert_eq!(report.events, 2);
+    let start = &report.tiers[0];
+    assert_eq!((start.joined, start.in_force), (1, true));
+    let year = report.years.iter().find(|year| year.streams > 0).unwrap();
+    // Lanternfish has no stream and stays a scrobble alone.
+    assert_eq!((year.joined_start, year.scrobbles_alone), (1, 1));
+    // The other stream is alone: its track ran to its end, so its length
+    // is known, and all of it was played.
+    assert_eq!(year.alone_counted, 1);
+    assert_eq!(year.plays_after, year.plays_before + 1);
+    assert_eq!(year.counted_after, year.counted_before + 1);
+}

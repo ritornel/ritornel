@@ -1490,4 +1490,4 @@ fn track_detail(connection: &Connection, appearance: Id) -> Result<Option<TrackD
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

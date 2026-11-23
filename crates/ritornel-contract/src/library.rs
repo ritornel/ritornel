@@ -230,6 +230,11 @@ pub enum JobTarget {
         /// The account's ID.
         id: Id,
     },
+    /// A run of streams staged for import.
+    ImportRun {
+        /// The run's ID.
+        id: Id,
+    },
 }
 
 /// One job: a durable resource, readable after clients disconnect and
