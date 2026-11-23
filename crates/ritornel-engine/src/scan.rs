@@ -86,6 +86,7 @@ struct StepResult {
 enum Phase {
     Walk,
     Read,
+    Moves,
     Missing,
     Replaced,
     Resolve,
@@ -322,7 +323,10 @@ impl ScanRun {
         // longer that folder, as when its disk went away or another was
         // mounted at its path, ends the scan: nothing more is recorded, and
         // nothing is taken for gone or replaced.
-        let judged = matches!(self.phase, Phase::Read | Phase::Missing | Phase::Replaced);
+        let judged = matches!(
+            self.phase,
+            Phase::Read | Phase::Moves | Phase::Missing | Phase::Replaced
+        );
         let walked_id = self.walked.as_ref().and_then(|walked| walked.root_id);
         if judged && folder_id(&self.root) != walked_id {
             return Err(Error::RootOffline {
@@ -371,6 +375,16 @@ impl ScanRun {
         match self.phase {
             Phase::Walk => self.sort_walk(library)?,
             Phase::Read => self.record(library)?,
+            Phase::Moves => {
+                self.phase = Phase::Missing;
+                let ops = self.settle_moves();
+                if !ops.is_empty() {
+                    let request = self.next_step();
+                    let receipt = self.step_result(self.summary)?;
+                    library.record(request, self.source.row, ops, receipt)?;
+                    self.committed()?;
+                }
+            }
             Phase::Missing => {
                 // What the walk did not find and no file moved from. The
                 // root was reachable, or the walk would have failed.
@@ -488,7 +502,7 @@ impl ScanRun {
         self.summary.files = walked.files.len() as u64;
         self.summary.unchanged = unchanged;
         self.phase = if self.queue.is_empty() {
-            Phase::Missing
+            Phase::Moves
         } else {
             Phase::Read
         };
@@ -575,7 +589,7 @@ impl ScanRun {
         }
         self.cursor = (self.cursor + self.settings.batch_files.max(1)).min(self.queue.len());
         if self.cursor >= self.queue.len() {
-            self.phase = Phase::Missing;
+            self.phase = Phase::Moves;
         }
         self.summary.bytes_read = counted.bytes_read;
         if !ops.is_empty() {
@@ -620,6 +634,54 @@ impl ScanRun {
                 next = Some(self.replaced.swap_remove(at).1);
             }
         }
+    }
+
+    /// Settles the files at known paths that hold other audio, once every
+    /// file has been read. Where that audio is exactly one gone item's, the
+    /// item moved here: files that swapped paths, or moved round a ring,
+    /// each take another's place, and an item another's file moved onto,
+    /// whose own file is nowhere, is retired, as when a different song takes
+    /// a path. A file at a path whose item moved away is a new item, as in
+    /// [`place`](Self::place). The rest are judged as replaced audio.
+    fn settle_moves(&mut self) -> Vec<RecordOp> {
+        let mut moves = Vec::new();
+        let mut moved = HashSet::new();
+        let mut taken = Vec::new();
+        let mut left = Vec::new();
+        for (here, payload) in std::mem::take(&mut self.replaced) {
+            let item = payload
+                .audio
+                .as_ref()
+                .and_then(|audio| self.gone_by_audio.get_mut(&audio.hash))
+                .filter(|items| items.len() == 1)
+                .and_then(Vec::pop);
+            match item {
+                Some(item) => {
+                    self.gone.retain(|gone| *gone != item);
+                    moved.insert(item);
+                    taken.push(here);
+                    moves.push(RecordOp::Move { item, payload });
+                }
+                None => left.push((here, payload)),
+            }
+        }
+        let mut ops: Vec<RecordOp> = taken
+            .into_iter()
+            .filter(|here| !moved.contains(here))
+            .map(RecordOp::Displace)
+            .collect();
+        self.summary.retired += ops.len() as u64;
+        self.summary.moved += moves.len() as u64;
+        ops.extend(moves);
+        for (here, payload) in left {
+            if moved.contains(&here) {
+                self.summary.new += 1;
+                ops.push(RecordOp::New(payload));
+            } else {
+                self.replaced.push((here, payload));
+            }
+        }
+        ops
     }
 
     /// Settles the files whose audio changed at a path the library knew.
