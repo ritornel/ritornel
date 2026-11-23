@@ -16,8 +16,9 @@
 //!   systemd user unit (`systemd.rs`) on Linux, both built for the tests on
 //!   every Unix, with what they share in `service.rs`, and on Windows a
 //!   task at sign-in and the supervisor it runs (`windows_service.rs`);
-//! - the media session: Now Playing on a Mac (`mac_now_playing.rs`) and
-//!   MPRIS on Linux (`linux_mpris.rs`);
+//! - the media session: Now Playing on a Mac (`mac_now_playing.rs`), MPRIS
+//!   on Linux (`linux_mpris.rs`), and the system's media transport controls
+//!   on Windows (`windows_media.rs`);
 //! - the computer's own name, which a server takes by default, and keeping
 //!   the machine from sleeping while satellites are linked to it
 //!   ([`Awake`]).
@@ -53,6 +54,8 @@ use linux as system;
 
 #[cfg(windows)]
 mod windows;
+#[cfg(all(windows, feature = "media-session"))]
+mod windows_media;
 #[cfg(windows)]
 mod windows_service;
 #[cfg(windows)]
@@ -213,9 +216,7 @@ mod fallback {
         ))
     }
 
-    /// There is no media session: no Now Playing and no media keys. On
-    /// Windows the system's media transport controls, tied to the hidden
-    /// window `serve` opens there, are still to come.
+    /// There is no media session: no Now Playing and no media keys.
     #[cfg(feature = "media-session")]
     pub(crate) const HAS_MEDIA_SESSION: bool = false;
     #[cfg(feature = "media-session")]

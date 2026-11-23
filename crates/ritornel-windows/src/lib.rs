@@ -18,6 +18,8 @@
 //! - `window`: a hidden window, for a process that has none: it hears a
 //!   polite stop (`taskkill /PID`) and the end of the session, and is what
 //!   the system's media controls are tied to.
+//! - `media`, with the `media` feature: the system's media transport
+//!   controls, tied to such a window.
 
 #![cfg(windows)]
 // Tests may unwrap and index, as in the rest of the workspace.
@@ -34,6 +36,8 @@
 pub mod clock;
 pub mod file;
 pub mod lock;
+#[cfg(feature = "media")]
+pub mod media;
 pub mod name;
 pub mod private;
 pub mod window;

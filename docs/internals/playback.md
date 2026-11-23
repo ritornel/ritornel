@@ -65,7 +65,7 @@ System media controls and Now Playing metadata are owned by `ritornel-server` be
 
 - **macOS:** Uses `souvlaki` (`=0.9.3`) for Now Playing and remote commands, with `main` running Core Foundation's run loop (`objc2-core-foundation` in `platform::wait`).
 - **Linux:** Exposes MPRIS (`org.mpris.MediaPlayer2.ritornel` at `/org/mpris/MediaPlayer2`) over the session bus using `zbus` (`=6.3.0`) on the server's Tokio runtime (`platform/linux_mpris.rs`), including entry-targeted `NextFrom` and `SeekIn` commands and `SEEKED_AFTER = 1 s` drift detection. Quietly disables itself if no session bus responds within `CONNECT_WITHIN` (3 s), and leaves a bus that does not take a change of state within `UPDATE_WITHIN` (1 s), logging a warning, so that neither the media session's thread nor the server's stop waits on a bus that has stopped reading.
-- **Windows:** Not yet implemented (media controls are a no-op placeholder).
+- **Windows:** The System Media Transport Controls (`ritornel_windows::media`), tied to the hidden window `serve` opens (`platform/windows_media.rs`). Windows delivers their requests on a thread of its own. See "Windows" in docs/internals/platforms.md.
 
 ## Decisions
 

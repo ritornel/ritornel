@@ -1,8 +1,9 @@
 //! Windows: files closed to others by an access list that names the user
 //! alone, a lock on one byte past the end of `server.lock`, in place of
-//! signals, the console's events and a hidden window, and a background
-//! service that is a task at sign-in (`windows_service.rs`). No media
-//! session yet. What the standard library cannot ask is in
+//! signals, the console's events and a hidden window, to which the system's
+//! media transport controls are tied (`windows_media.rs`), and a background
+//! service that is a task at sign-in (`windows_service.rs`). What the
+//! standard library cannot ask is in
 //! `ritornel-windows`.
 
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -17,12 +18,20 @@ use crate::Error;
 use crate::error::io_error;
 use crate::serve::Stop;
 
-#[cfg(feature = "media-session")]
-pub(crate) use super::fallback::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
 pub(crate) use super::fallback::{stay_awake, wait};
+#[cfg(feature = "media-session")]
+pub(crate) use super::windows_media::Controls as MediaControls;
 pub(crate) use super::windows_service::{
     install_service, run_service, service_status, uninstall_service,
 };
+
+/// The media controls are tied to the hidden window, and Windows delivers
+/// their buttons on a thread of its own: they need neither the main thread
+/// nor the runtime, and go with the process.
+#[cfg(feature = "media-session")]
+pub(crate) const HAS_MEDIA_SESSION: bool = true;
+#[cfg(feature = "media-session")]
+pub(crate) const MEDIA_SESSION_ON_RUNTIME: bool = false;
 
 /// The host name Windows answers to by multicast DNS, which it does for its
 /// own name since Windows 10.
@@ -183,12 +192,15 @@ pub(crate) fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::
     on!(ctrl_logoff(), "session ending");
     on!(ctrl_shutdown(), "session ending");
     let stop = stop.clone();
-    Window::open("Ritornel server", move |why| {
+    let window = Window::open("Ritornel server", move |why| {
         let _ = stop.send(Stop::Signal(match why {
             Closing::Asked => "asked to close",
             Closing::SessionEnding => "session ending",
         }));
-    })
+    })?;
+    #[cfg(feature = "media-session")]
+    super::windows_media::tie_to(window.handle());
+    Ok(window)
 }
 
 /// Whether only the owner can open a file or directory: an access list that

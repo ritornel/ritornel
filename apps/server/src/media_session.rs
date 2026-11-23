@@ -10,7 +10,7 @@
 //!   which is all macOS needs to deliver the keys (`platform::wait`).
 //! - Linux: MPRIS on the session bus, served from the server's own async
 //!   runtime. A server with no session bus has none, quietly.
-//! - Windows: none yet. The system's media transport controls are to be
+//! - Windows: the system's media transport controls (`ritornel-windows`),
 //!   tied to the hidden window `serve` opens there.
 
 use std::path::Path;
@@ -186,7 +186,7 @@ fn show(
 }
 
 /// A file URL for a path, escaped: the data directory has a space in it.
-fn file_url(path: &Path) -> String {
+pub(crate) fn file_url(path: &Path) -> String {
     let mut url = "file://".to_owned();
     for byte in path.to_string_lossy().bytes() {
         if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
