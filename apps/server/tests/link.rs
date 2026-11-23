@@ -902,6 +902,92 @@ async fn a_satellite_answers_and_stops_while_a_slow_pull_is_under_way() {
     .await;
 }
 
+/// What a satellite's cache of masters holds: a pull under way writes a
+/// `.part` file there, and renames it once the master has crossed.
+fn cached(scratch: &Scratch) -> Vec<PathBuf> {
+    let cache = scratch.data_dir("desk").join("cache").join("audio");
+    std::fs::read_dir(cache).map_or_else(
+        |_| Vec::new(),
+        |entries| entries.flatten().map(|entry| entry.path()).collect(),
+    )
+}
+
+/// What a pull under way is writing in a satellite's cache.
+fn partial(scratch: &Scratch) -> Vec<PathBuf> {
+    cached(scratch)
+        .into_iter()
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "part")
+        })
+        .collect()
+}
+
+/// A satellite's stop ends a pull under way and waits for it to remove
+/// what it wrote: once the stop has returned, nothing of that server
+/// writes to its data directory, which the same process may open again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellites_stop_ends_its_pull_and_leaves_nothing_behind() {
+    bounded(async {
+        let scratch = Scratch::new();
+        // A hub that waits ten seconds before each part of a master.
+        let hub = Server::start_run(
+            HeldDir::take(scratch.data_dir("hub")).unwrap(),
+            Listen::on_port(0),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+            Bounds::default(),
+            Run {
+                audio_pace: Some(Duration::from_secs(10)),
+                ..Run::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut hub_client = client(&scratch, "hub", &hub).await;
+        hub_client.create_library(key()).await.unwrap();
+        scan(&scratch, &mut hub_client).await;
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        let desk_client = client(&scratch, "desk", &desk).await;
+        join(&desk_client, &invite(&hub, &hub_client).await)
+            .await
+            .unwrap();
+        let ids = song_ids(&desk_client.list_open(&songs()).await.unwrap().rows);
+        desk_client
+            .call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::Tracks { ids },
+                start: None,
+                context: None,
+                shuffle: None,
+            })
+            .await
+            .unwrap();
+        while partial(&scratch).is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The stop does not wait for the master to cross, and leaves no
+        // part of it. Nothing at all is cached: a master that had crossed
+        // before the stop would mean the pull was not under way.
+        drop(desk_client);
+        let stopping = std::time::Instant::now();
+        desk.stop().await.unwrap();
+        let took = stopping.elapsed();
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        assert_eq!(cached(&scratch), Vec::<PathBuf>::new());
+
+        // The directory is opened again in this process, and its stop, too,
+        // leaves no part of a master, whether it began a pull or not.
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        desk.stop().await.unwrap();
+        assert_eq!(partial(&scratch), Vec::<PathBuf>::new());
+        drop(hub_client);
+        hub.stop().await.unwrap();
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_satellite_plays_the_hubs_music_from_copies_it_pulls() {
     bounded(async {

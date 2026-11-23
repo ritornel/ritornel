@@ -515,10 +515,12 @@ impl Uplink {
         }
     }
 
-    /// Runs `work` on the server's runtime and waits for it: for what goes
-    /// to the hub other than calls, such as a master pulled.
-    pub(crate) fn block_on<T>(&self, work: impl std::future::Future<Output = T>) -> T {
-        self.runtime.block_on(work)
+    /// Runs `work` on the server's runtime and waits for it, for what goes
+    /// to the hub other than calls, such as a master pulled: never past a
+    /// stop's deadline. `None` if that ran out first, and `work` was
+    /// dropped.
+    pub(crate) fn block_on<T>(&self, work: impl std::future::Future<Output = T>) -> Option<T> {
+        self.wait_on(None, work)
     }
 
     /// Lets go of a session's connection: the session has closed.

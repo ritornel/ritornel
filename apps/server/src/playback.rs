@@ -156,31 +156,33 @@ pub(crate) struct Workers {
     /// This run of the server, the boot ID of last resort.
     run_id: Id,
     stop: Arc<AtomicBool>,
+    /// Ends a pull under way, which `stop` cannot reach while the pull
+    /// waits on the network.
+    cancel_pull: tokio::sync::watch::Sender<bool>,
     ticker: Option<JoinHandle<()>>,
+    puller: Option<JoinHandle<()>>,
     deliverer: Option<JoinHandle<()>>,
 }
 
 impl Workers {
-    /// Starts the control loop, if there is a player, and the effect
-    /// worker.
+    /// Starts the control loop and the puller, if there is a player, and
+    /// the effect worker.
     pub(crate) fn start(core: Arc<Core>, run: PlaybackRun, run_id: Id) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
-        let ticker = if core.has_player() {
-            // Told to stop with the others but never waited for: a pull
-            // ends once its master has crossed or stalls, and a stop does
-            // not wait on the network.
-            let (puller, stop_pulling) = (Arc::clone(&core), Arc::clone(&stop));
-            std::thread::Builder::new()
+        let cancel_pull = tokio::sync::watch::Sender::new(false);
+        let (ticker, puller) = if core.has_player() {
+            let (pulling, stop_pulling) = (Arc::clone(&core), Arc::clone(&stop));
+            let cancel = cancel_pull.subscribe();
+            let puller = std::thread::Builder::new()
                 .name("ritornel-pull".to_owned())
-                .spawn(move || pull(&puller, &stop_pulling))?;
+                .spawn(move || pull(&pulling, &stop_pulling, &cancel))?;
             let (core, stop) = (Arc::clone(&core), Arc::clone(&stop));
-            Some(
-                std::thread::Builder::new()
-                    .name("ritornel-player".to_owned())
-                    .spawn(move || tick(&core, &stop))?,
-            )
+            let ticker = std::thread::Builder::new()
+                .name("ritornel-player".to_owned())
+                .spawn(move || tick(&core, &stop))?;
+            (Some(ticker), Some(puller))
         } else {
-            None
+            (None, None)
         };
         let deliverer = {
             let (core, stop) = (Arc::clone(&core), Arc::clone(&stop));
@@ -194,18 +196,26 @@ impl Workers {
             core,
             run_id,
             stop,
+            cancel_pull,
             ticker,
+            puller,
             deliverer: Some(deliverer),
         })
     }
 
-    /// Stops the threads and waits for the first two, then shuts the player down
-    /// cleanly and delivers what that closed.
+    /// Stops the threads and waits for them, then shuts the player down
+    /// cleanly and delivers what that closed. A pull under way is ended,
+    /// and its partial file removed, before this returns, so nothing of
+    /// the server writes to its data directory afterwards.
     pub(crate) fn stop(mut self) {
         self.signal();
-        for thread in [self.ticker.take(), self.deliverer.take()]
-            .into_iter()
-            .flatten()
+        for thread in [
+            self.ticker.take(),
+            self.puller.take(),
+            self.deliverer.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             // It has panicked only if a step did, which the log has.
             let _ = thread.join();
@@ -220,6 +230,7 @@ impl Workers {
 
     fn signal(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.cancel_pull.send_replace(true);
         self.core.deliveries().wake();
         self.core.pulls().wake();
     }
@@ -273,13 +284,14 @@ fn tick(core: &Core, stop: &AtomicBool) {
 }
 
 /// Pulls what the player waits for, one master at a time, with the player
-/// let go meanwhile, and hands each back to it.
-fn pull(core: &Core, stop: &AtomicBool) {
+/// let go meanwhile, and hands each back to it. `cancel` ends a pull under
+/// way.
+fn pull(core: &Core, stop: &AtomicBool, cancel: &tokio::sync::watch::Receiver<bool>) {
     while !stop.load(Ordering::SeqCst) {
         match core.wanted_master() {
             Some((fetch, hub)) => {
                 let outcome = hub
-                    .fetch(fetch.appearance)
+                    .fetch(fetch.appearance, cancel)
                     .map_err(|error| error.to_string());
                 if let Err(why) = &outcome {
                     warn!(appearance = %fetch.appearance, %why, "a master could not be pulled from the hub");
