@@ -8,81 +8,107 @@ on:
 permissions:
   contents: read
 
+# A newer push to a PR cancels its older run. Each run on main has a group of
+# its own, so none is cancelled or held back, and main's caches always save.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
+# The jobs together run what `mise run check` runs, each part where it can
+# fail: what is the same on every system once, and what differs by system on
+# each. The setup they share is .github/actions/setup.
 jobs:
-  check:
-    # The hub is Linux and the desktop is macOS, so both run everything they
-    # build. On Linux that includes the server's audio output, which links
-    # ALSA, so the job installs ALSA's development files; the hub job below
-    # proves the hub needs none. The desktop app is built here on macOS, and
-    # on Linux in its own job, desktop-linux.
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-26.04, macos-latest]
-    runs-on: ${{ matrix.os }}
-    # The macOS job compiles the desktop app's dependencies as well.
-    timeout-minutes: 45
-    env:
-      # A tool no step uses is not installed: ffmpeg alone is some ninety
-      # conda packages, and the fixtures it made are committed. It comes
-      # off this list with the first step that needs it.
-      MISE_DISABLE_TOOLS: conda:ffmpeg
+  checks:
+    name: Formatting, dependencies, docs and licences
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Installs what mise.toml pins, and the Rust that rust-toolchain.toml
-      # names.
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
-      # PRs restore from main so their builds do not fill the cache quota.
-      # On macOS, the desktop check also builds into its own target directory.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # rustdoc runs the build scripts, and cpal's asks for ALSA.
+      - uses: ./.github/actions/setup
         with:
-          key: ${{ matrix.os }}
-          workspaces: |
-            .
-            ${{ runner.os == 'macOS' && 'apps/desktop' || '' }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # cpal's ALSA backend, for the server's audio output on Linux.
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends libasound2-dev
-      # The steps are the tasks behind `mise run check`, one each so a
-      # failure names itself.
+          packages: libasound2-dev
+          disable-tools: conda:ffmpeg
       - run: mise run fmt
       - run: mise run deps
       - run: mise run docs
       - run: mise run licenses
+
+  workspace:
+    # Clippy and the tests of the main workspace, on each system its code
+    # differs for. On Linux the server's audio output links ALSA, so that
+    # job installs ALSA's development files; the hub job proves the hub
+    # needs none.
+    name: Workspace on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, os: ubuntu-26.04, packages: libasound2-dev }
+          - { name: macOS, os: macos-latest }
+          - { name: Windows, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          packages: ${{ matrix.packages }}
       - run: mise run lint
       - run: mise run test
-      - if: runner.os == 'macOS'
-        run: mise run desktop:check
+
+  desktop:
+    # The desktop app, a workspace of its own, checked, linted, tested and
+    # built in release on each system. On Linux GPUI's Wayland and X11
+    # backends link fontconfig, xcb and xkbcommon; scripts/desktop.sh skips
+    # without them, and fails instead in CI, so the job cannot pass by
+    # skipping. On Windows the task runs scripts/desktop.ps1.
+    name: Desktop app on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-26.04
+            packages: pkg-config libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+          - { name: macOS, os: macos-latest }
+          - { name: Windows, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    # It compiles GPUI twice: for clippy and the tests, and in release.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          packages: ${{ matrix.packages }}
+          workspaces: apps/desktop
+      - run: mise run desktop:check
 
   hub:
     # The headless hub, as it is built for a Linux machine with no desktop:
     # the server without its default features, so no audio output, media
     # session or Last.fm. pkg-config is pointed at nothing, so any crate
     # that would link a system library (ALSA among them) fails the build.
+    # `mise run lint` lints it.
+    name: Hub on Linux, linking no system library
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
-      MISE_DISABLE_TOOLS: conda:ffmpeg,node,pnpm
       PKG_CONFIG_LIBDIR: /nonexistent
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --locked --package ritornel-server --no-default-features --all-targets -- -D warnings
+      - uses: ./.github/actions/setup
       - run: cargo test --locked --package ritornel-server --no-default-features
 
   player-arm64:
@@ -90,45 +116,33 @@ jobs:
     # server with its audio output alone, which links ALSA, and no media
     # session or Last.fm. GitHub's arm64 runner builds it natively, which is
     # simpler than cross-linking ALSA, and runs the engine's and the
-    # server's tests on arm64. It runs beside the other jobs, so the check
-    # takes no longer. The last step prints the release build's size and
-    # the server's memory at idle.
+    # server's tests on arm64. The last step prints the release build's
+    # size and the server's memory at idle.
+    name: Player on arm64 Linux
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
-    env:
-      MISE_DISABLE_TOOLS: conda:ffmpeg,node,pnpm,aqua:EmbarkStudios/cargo-deny
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/setup
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends pkg-config libasound2-dev
+          packages: pkg-config libasound2-dev
       - run: cargo clippy --locked --package ritornel-server --no-default-features --features audio-output --all-targets -- -D warnings
       - run: cargo test --locked --package ritornel-engine --package ritornel-server --no-default-features --features ritornel-server/audio-output
       - run: cargo build --locked --release --package ritornel-server --no-default-features --features audio-output
       - run: cargo build --locked --release --package ritornelctl
       - run: scripts/player-footprint.sh target/release
 
-  desktop-linux:
-    # The desktop app on Linux, with GPUI's Wayland and X11 backends, which
-    # link fontconfig, xcb and xkbcommon. scripts/desktop.sh skips without
-    # them, and fails instead in CI, so this job cannot pass by skipping.
-    runs-on: ubuntu-26.04
-    # It compiles GPUI twice: for clippy and the tests, and in release.
-    timeout-minutes: 45
-    env:
-      MISE_DISABLE_TOOLS: conda:ffmpeg,node,pnpm
+  passed:
+    # The one check for branch protection to require: it passes only when
+    # every job above passed, so it stays the same as jobs are added. A job
+    # added above goes in this list too.
+    name: CI passed
+    if: always()
+    needs: [checks, workspace, desktop, hub, player-arm64]
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: apps/desktop
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends pkg-config libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
-      - run: mise run desktop:check
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
