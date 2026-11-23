@@ -471,6 +471,13 @@ impl Artist {
     /// Reads a cover at `px` pixels, once, and keeps it. One that could not
     /// be read is asked for again after a while.
     fn want(&mut self, art: Id, px: u32, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
+        let image = self.cover_at(art, px, cx);
+        let exact = self.covers.contains_key(&(art, px));
+        crate::waits::drawn("artist", art, px, exact);
+        image
+    }
+
+    fn cover_at(&mut self, art: Id, px: u32, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
         if let Some(image) = self.covers.get(&(art, px)) {
             return Some(Arc::clone(image));
         }
@@ -1195,6 +1202,7 @@ fn gutter(width: f32) -> f32 {
 
 impl Render for Artist {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::waits::frame("artist");
         self.pictures(window, cx);
         self.menued = crate::menu::marked(window, cx);
         let (width, viewport) = viewport_of(window);

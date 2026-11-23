@@ -8,10 +8,19 @@ Flings both the Albums and Artists walls with momentum, opens and leaves
 artist and album pages, and samples macOS `footprint` (plus optional
 `vmmap --summary` checkpoints) for both processes separately.
 
+With `--waits`, it also times how long each tile waits for its picture,
+from the frame it is first shown to the first that draws its cover or
+portrait (`apps/desktop/src/waits.rs`), and reports the median and the
+slowest while flinging each wall, opening an artist's page, and going Back
+to an artist's page and to the wall. `--slow` keeps the app and its
+server on the efficiency cores (`taskpolicy -c background`), a rough
+stand-in for a slower Mac: it slows the CPU, not the GPU.
+
 Usage:
     scripts/desktop-memory.py --out-dir /tmp/ritornel-mem --label run1
     scripts/desktop-memory.py --out-dir /tmp/ritornel-mem --label run2 --seed 19
     RITORNEL_OFFSCREEN=1 scripts/desktop-memory.py --out-dir /tmp/ritornel-mem --label hidden
+    RITORNEL_OFFSCREEN=1 scripts/desktop-memory.py --out-dir /tmp/ritornel-mem --label waits --waits --slow
 """
 
 from __future__ import annotations
@@ -122,54 +131,89 @@ def capture_vmmap(pid: int) -> str:
         return f"vmmap error: {exc}"
 
 
+# What each `waits` label times, and on which surface.
+WAITS = {
+    "albums-fling": "wall",
+    "artists-fling": "wall",
+    "artist-open": "artist",
+    "artist-back": "artist",
+    "wall-back": "wall",
+}
+
+
 def build_script(
     albums_secs: int,
     artists_secs: int,
     rest_secs: int,
     pages: bool,
     final_rest_secs: int,
+    waits: bool = False,
 ) -> str:
+    # `waits <label>` reports the tiles shown since the last report;
+    # `waits -` only starts the count again.
+    def timed(label: str) -> list[str]:
+        return [f"waits {label}"] if waits else []
+
     steps = [
         "wall albums artist",
+        *timed("-"),
         "mem phase-start",
         f"wait {int((1.5 + albums_secs) * 1000)}",
         "mem phase-albums-end",
+        *timed("albums-fling"),
     ]
     if artists_secs > 0:
-        steps.extend(["wall artists", f"wait {int(artists_secs * 1000)}", "mem phase-artists-end"])
+        steps.extend(
+            [
+                "wall artists",
+                f"wait {int(artists_secs * 1000)}",
+                "mem phase-artists-end",
+                *timed("artists-fling"),
+            ]
+        )
     if rest_secs > 0:
         steps.extend([f"wait {int(rest_secs * 1000)}", "mem phase-post-fling-rest"])
     if pages:
-        steps.extend(["wall artists", "wait 1000"])
+        steps.extend(["wall artists", "wait 1000", *timed("-")])
         for idx in (0, 2, 4, 6, 8, 10):
             steps.extend(
                 [
                     f"open {idx}",
                     "wait 1000",
+                    *timed("artist-open"),
                     "record 0",
                     "wait 900",
+                    *timed("-"),
                     "back",
                     "wait 600",
+                    *timed("artist-back"),
                     "back",
                     "wait 600",
+                    *timed("wall-back"),
                 ]
             )
-        steps.extend(["wall albums artist", "wait 1200"])
+        steps.extend(["wall albums artist", "wait 1200", *timed("-")])
         for idx in (0, 2, 4, 6, 8, 10):
             steps.extend(
                 [
                     f"open {idx}",
                     "wait 1000",
+                    *timed("-"),
                     "up",
                     "wait 900",
+                    *timed("artist-open"),
                     "record 0",
                     "wait 900",
+                    *timed("-"),
                     "back",
                     "wait 500",
+                    *timed("artist-back"),
                     "back",
                     "wait 500",
+                    *timed("-"),
                     "back",
                     "wait 500",
+                    *timed("wall-back"),
                 ]
             )
         # 6-deep back-stack navigation chain, then back out to the wall.
@@ -322,6 +366,44 @@ def resolve_offscreen_display(env: Mapping[str, str] | None = None) -> dict[str,
     }
 
 
+def summarize_waits(stderr: str) -> dict:
+    """Pool the `waits` lines the app printed, by label, on the surface each label times."""
+    pooled: dict[str, dict] = {}
+    for line in stderr.splitlines():
+        if not line.startswith("waits {"):
+            continue
+        report = json.loads(line[len("waits ") :])
+        label = report["label"]
+        if WAITS.get(label) != report["surface"]:
+            continue
+        entry = pooled.setdefault(label, {"waited": [], "unpainted": 0, "waiting": []})
+        entry["waited"].extend(report["waitedMs"])
+        entry["unpainted"] += report["unpainted"]
+        entry["waiting"].extend(report["stillWaitingMs"])
+
+    def at(values: list[float], share: float) -> float:
+        # The nearest rank, rounded half up as the app rounds it.
+        return values[int((len(values) - 1) * share + 0.5)] if values else 0.0
+
+    summary = {}
+    for label in WAITS:
+        if label not in pooled:
+            continue
+        entry = pooled[label]
+        waited = sorted(entry["waited"])
+        summary[label] = {
+            "shown": len(waited),
+            "atOnce": sum(1 for ms in waited if ms == 0),
+            "medianMs": at(waited, 0.5),
+            "p90Ms": at(waited, 0.9),
+            "slowestMs": at(waited, 1.0),
+            "unpainted": entry["unpainted"],
+            "stillWaiting": len(entry["waiting"]),
+            "longestStillWaitingMs": max(entry["waiting"], default=0.0),
+        }
+    return summary
+
+
 def print_summary(result: dict) -> None:
     samples = result["samples"]
     if not samples:
@@ -366,6 +448,16 @@ def print_summary(result: dict) -> None:
             f">20ms {measure.get('framesOver20ms', 0)}, "
             f">34ms {measure.get('framesOver34ms', 0)}"
         )
+    waits = result.get("waits") or {}
+    if waits:
+        print("  Picture waits (ms):")
+        for label, w in waits.items():
+            print(
+                f"    {label:<14} median {w['medianMs']:5.0f}, p90 {w['p90Ms']:5.0f}, "
+                f"slowest {w['slowestMs']:5.0f}; {w['shown']} shown, {w['atOnce']} at once, "
+                f"{w['unpainted']} gone before painted, {w['stillWaiting']} still waiting "
+                f"(longest {w['longestStillWaitingMs']:.0f} so far)"
+            )
 
 
 def main() -> int:
@@ -387,6 +479,12 @@ def main() -> int:
     ap.add_argument("--size", default="1400x900", help="Window size WxH")
     ap.add_argument("--vmmap-at", default="", help="Comma-separated seconds for vmmap checkpoints")
     ap.add_argument("--skip-build", action="store_true", help="Reuse existing release binaries")
+    ap.add_argument(
+        "--waits", action="store_true", help="Time how long tiles wait for their pictures"
+    )
+    ap.add_argument(
+        "--slow", action="store_true", help="Keep the app and server on the efficiency cores (taskpolicy)"
+    )
     args = ap.parse_args()
 
     try:
@@ -424,8 +522,10 @@ def main() -> int:
         server_env = os.environ.copy()
         server_env["RITORNEL_TEST_NO_MEDIA_SESSION"] = "1"
         server_log = open(server_log_path, "wb")
+        slow = ["taskpolicy", "-c", "background"] if args.slow else []
         server = subprocess.Popen(
             [
+                *slow,
                 str(server_bin),
                 "serve",
                 "--owned",
@@ -464,12 +564,15 @@ def main() -> int:
             args.rest_secs,
             not args.no_pages,
             args.final_rest_secs,
+            args.waits,
         )
 
         gpui_env = os.environ.copy()
         gpui_env["HOME"] = isolated_home
         gpui_env.update(display_env)
         gpui_env["RITORNEL_GPUI_DEBUG"] = "1"
+        if args.waits:
+            gpui_env["RITORNEL_GPUI_WAITS"] = "1"
 
         gpui_cmd = [
             str(gpui_bin),
@@ -486,6 +589,7 @@ def main() -> int:
         ]
         if measure_secs > 0:
             gpui_cmd.extend(["--measure", str(measure_secs), "--out", str(measure_json_path)])
+        gpui_cmd = [*slow, *gpui_cmd]
 
         expected_secs = (
             1.5
@@ -586,6 +690,10 @@ def main() -> int:
             "final_rest_secs": args.final_rest_secs,
             "exit_code": rc,
             "measure": measure_data,
+            "waits": summarize_waits(gpui_stderr_path.read_text(errors="replace"))
+            if args.waits
+            else None,
+            "slow": args.slow,
             "samples": samples,
         }
         out_json.write_text(json.dumps(result, indent=2), encoding="utf-8")

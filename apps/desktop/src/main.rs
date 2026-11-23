@@ -49,6 +49,7 @@ mod thisday;
 mod tracked;
 mod tracks;
 mod upnext;
+mod waits;
 mod wall;
 mod words;
 

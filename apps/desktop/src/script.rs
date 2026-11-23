@@ -35,6 +35,9 @@
 //!   there, the pointer moved there in steps while it is held, and let go
 //!   where it is, as a drag by hand; in points from the window's top left
 //! - `mem <label>`: print the memory footprint
+//! - `waits <label>`: print how long tiles waited for their pictures since
+//!   the last, with `RITORNEL_GPUI_WAITS=1` (`waits.rs`); `waits -` starts
+//!   the count again
 //! - `close`: close the window, as its close button does; the app runs on
 //! - `quit`
 
@@ -585,6 +588,7 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
                     let _ = window.update(cx, |_, window, _| window.remove_window());
                 }
                 "mem" => eprintln!("mem {}: {}", rest.trim(), crate::platform::memory_line()),
+                "waits" => crate::waits::report(rest.trim()),
                 "quit" => {
                     cx.update(|cx| cx.quit());
                 }

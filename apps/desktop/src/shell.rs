@@ -1663,6 +1663,13 @@ impl Render for Shell {
         if covered {
             pages.clear();
         }
+        // The page the measure of picture waits times, once it can be seen.
+        let timed = match shown {
+            Shown::Wall => Some("wall"),
+            Shown::Artist(_) => Some("artist"),
+            _ => None,
+        };
+        crate::waits::on_screen(timed.filter(|_| opacity > 0. && !covered));
         let content = div()
             .relative()
             .size_full()

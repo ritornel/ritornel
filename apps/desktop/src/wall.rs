@@ -1869,6 +1869,7 @@ impl Wall {
     fn render_wall(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let started = Instant::now();
         self.frame += 1;
+        crate::waits::frame("wall");
         let (window_width, viewport) = viewport_of(window);
         // With Up next moving the page over, the wall is laid out in the
         // room left of the card.
@@ -2133,6 +2134,9 @@ impl Wall {
                                     (ready.image.clone(), opacity)
                                 })
                             });
+                            if visible && let Some(art) = row.art {
+                                crate::waits::drawn("wall", art, px_size, cover.is_some());
+                            }
                             if let Some((_, opacity)) = &cover {
                                 if *opacity < 1. {
                                     fading = true;
