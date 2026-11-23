@@ -111,5 +111,10 @@ tokio-tungstenite = "0.29.0"
 # mode, a migration behind.
 rusqlite = { version = "=0.42.0", default-features = false, features = ["bundled"] }
 
+# The MPRIS tests' bus: the player and a bus that stops reading, as two
+# ends of one socket.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "=6.3.0", default-features = false, features = ["tokio", "service", "p2p"] }
+
 [lints]
 workspace = true

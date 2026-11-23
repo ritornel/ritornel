@@ -42,10 +42,17 @@ const SEEKED_AFTER: Duration = Duration::from_secs(1);
 /// A bus that takes the connection and never answers is no bus.
 const CONNECT_WITHIN: Duration = Duration::from_secs(3);
 
+/// How long the session bus has to take one change to what the player
+/// shows. A bus that has stopped reading is left, so that neither the
+/// media session's thread nor the server's stop, which waits for it, waits
+/// on the bus for ever.
+const UPDATE_WITHIN: Duration = Duration::from_secs(1);
+
 /// The connection that serves the player. Dropping it takes the player off
 /// the bus.
 pub(crate) struct Controls {
-    connection: Connection,
+    /// None once the bus has stopped taking what the player shows.
+    connection: Option<Connection>,
     runtime: Handle,
     /// The cover of the track the player is on, as a file URL.
     art_url: Option<String>,
@@ -98,7 +105,7 @@ impl Controls {
             Some(connection)
         })?;
         Some(Self {
-            connection: opened,
+            connection: Some(opened),
             runtime,
             art_url: None,
         })
@@ -115,9 +122,17 @@ impl Controls {
         self.update(Shown::of(state, self.art_url.clone()));
     }
 
-    fn update(&self, next: Shown) {
-        let updated = self.runtime.block_on(async {
-            let player = self.player().await?;
+    /// Shows `next`, or leaves the bus if it does not take it within
+    /// [`UPDATE_WITHIN`].
+    fn update(&mut self, next: Shown) {
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let shown = async {
+            let player = connection
+                .object_server()
+                .interface::<_, Player>(PATH)
+                .await?;
             let emitter = player.signal_emitter();
             let mut serving = player.get_mut().await;
             let before = serving.shown.clone();
@@ -147,17 +162,22 @@ impl Controls {
                 Player::seeked(emitter, position).await?;
             }
             zbus::Result::Ok(())
-        });
-        if let Err(error) = updated {
-            warn!(%error, "MPRIS could not be told the player's state");
+        };
+        // The timer is made inside the runtime, which this thread is not.
+        match self
+            .runtime
+            .block_on(async { tokio::time::timeout(UPDATE_WITHIN, shown).await })
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "MPRIS could not be told the player's state"),
+            Err(_) => {
+                warn!(
+                    within = ?UPDATE_WITHIN,
+                    "the session bus stopped taking the player's state, so the player leaves it"
+                );
+                self.connection = None;
+            }
         }
-    }
-
-    async fn player(&self) -> zbus::Result<zbus::object_server::InterfaceRef<Player>> {
-        self.connection
-            .object_server()
-            .interface::<_, Player>(PATH)
-            .await
     }
 }
 
@@ -773,6 +793,69 @@ mod tests {
         assert!(waited < Duration::from_secs(5), "{waited:?}");
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bus that lets the player in and then stops reading is left at
+    /// the first change it does not take within [`UPDATE_WITHIN`], and the
+    /// changes after it wait on nothing.
+    #[test]
+    fn a_bus_that_stops_reading_is_left() {
+        use std::sync::mpsc;
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        // The bus lets the player in on a runtime of its own, which is
+        // never run again, so nothing reads what the player sends. Leaked,
+        // as is the player's runtime, so that a change that hangs does not
+        // hold the test up.
+        let (let_in, bus) = mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let bus = zbus::connection::Builder::unix_stream(theirs)
+                .server(zbus::Guid::generate())
+                .p2p()
+                .build();
+            let connection = runtime.block_on(bus).unwrap();
+            let_in
+                .send(Box::leak(Box::new((runtime, connection))))
+                .unwrap();
+        });
+        let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ));
+        let keys: Keys = std::sync::Arc::new(|_| {});
+        let player = zbus::connection::Builder::unix_stream(ours).p2p();
+        let connection = runtime.block_on(connect(player, keys)).unwrap();
+        bus.recv().unwrap();
+        let mut controls = Controls {
+            connection: Some(connection),
+            runtime: runtime.handle().clone(),
+            art_url: None,
+        };
+        // Each change of volume is a signal, until the socket is full.
+        let (done, left) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut shown = state(Status::Playing, 0);
+            for step in 0..100_000_u32 {
+                shown.volume = f64::from(step % 100) / 100.0;
+                controls.set_state(&shown);
+                if controls.connection.is_none() {
+                    break;
+                }
+            }
+            let started = Instant::now();
+            controls.set_state(&state(Status::Paused, 0));
+            done.send((controls.connection.is_none(), started.elapsed()))
+                .unwrap();
+        });
+        let (gone, after) = left.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(gone, "a bus that stopped reading was not left");
+        assert!(after < Duration::from_millis(100), "{after:?}");
     }
 
     #[test]

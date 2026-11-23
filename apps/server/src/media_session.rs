@@ -100,8 +100,8 @@ impl MediaSession {
 
     /// Stops the thread and waits for it, which takes the player off the
     /// session bus. The server does this while its runtime still runs,
-    /// where the session is served from it (`Server::stop`). The wait is at
-    /// most one attempt to connect, which is bounded.
+    /// where the session is served from it (`Server::stop`). Each wait on
+    /// the bus is bounded: an attempt to connect, and each update.
     pub(crate) fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
         let _ = self.send.send(Message::Stop);
