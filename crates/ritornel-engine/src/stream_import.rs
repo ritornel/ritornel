@@ -53,6 +53,7 @@ fn scrobbles(connection: &Connection) -> Result<(Vec<Scrobble>, u64, u64), Error
         }
         // Keyed as derivation keys it, so that a tie goes the same way.
         offered.push(Scrobble {
+            observation,
             key: row.get(1)?,
             at_ms,
             artist,

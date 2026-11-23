@@ -422,6 +422,7 @@ mod tests {
 
     fn scrobble(at_s: i64, title: &str) -> Scrobble {
         Scrobble {
+            observation: at_s,
             key: format!("{at_s}:{title}").into_bytes(),
             at_ms: EVENING + at_s * 1000,
             artist: "Calla Brandt".to_owned(),

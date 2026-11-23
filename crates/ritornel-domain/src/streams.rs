@@ -13,7 +13,7 @@ use ritornel_contract::SpotifyStream;
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
-use crate::history::Outcome;
+use crate::history::{Correction, Outcome, Verb, active_corrections};
 
 /// How far a scrobble's stamp may be from a stream's worked-out start, or
 /// past its end, for the two to be one listen.
@@ -105,6 +105,8 @@ pub struct Stream {
 /// the echo of a listen of this library's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scrobble {
+    /// Its observation, which a correction names it by.
+    pub observation: i64,
     /// What it is told apart by, and ordered by where all else is equal.
     pub key: Vec<u8>,
     /// When the scrobbler stamped it, in UTC.
@@ -115,15 +117,82 @@ pub struct Scrobble {
     pub title: String,
 }
 
-/// Stream and scrobble pairs, by the index of each in what the matcher was
-/// given, that a correction has said are one listen or are not.
+/// Stream and scrobble pairs that a correction has said are one listen or
+/// are not: a stream by its key and a scrobble by its observation, so that
+/// the same pins hold in any list of streams and scrobbles. A pin whose
+/// stream or scrobble is not in what the matcher is given pins nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pins {
     /// Never joined.
-    pub apart: HashSet<(usize, usize)>,
+    pub apart: HashSet<(Vec<u8>, i64)>,
     /// Joined before any tier runs, each scrobble to the event of its
-    /// stream.
-    pub together: Vec<(usize, usize)>,
+    /// stream, in order: of two that join one scrobble, the first takes it.
+    pub together: Vec<(Vec<u8>, i64)>,
+}
+
+/// The pins that the `join` and `split` corrections standing now make,
+/// among these stored streams, each given with its observation. A target
+/// that is none of the streams is read as a scrobble.
+///
+/// Of two corrections that pin one listen and one scrobble, by any row of
+/// the listen, the newer says it; and of two that join one scrobble, the
+/// newer is read first and takes it.
+pub fn pins<'a>(
+    corrections: &[Correction],
+    streams: impl IntoIterator<Item = (i64, &'a Stream)>,
+) -> Pins {
+    let streams: HashMap<i64, &Stream> = streams.into_iter().collect();
+    let active = active_corrections(corrections);
+    let mut in_order: Vec<&Correction> = corrections
+        .iter()
+        .filter(|correction| {
+            active.contains(&correction.observation)
+                && matches!(correction.verb, Verb::Join | Verb::Split)
+        })
+        .collect();
+    in_order.sort_by_key(|correction| correction.observation);
+    type Listen = (i64, i64, String);
+    let mut newest: HashMap<(Listen, i64), (i64, bool, &[u8])> = HashMap::new();
+    for correction in in_order {
+        for target in &correction.targets {
+            let Some(stream) = streams.get(target) else {
+                continue;
+            };
+            let r = &stream.record;
+            let listen = (r.ended_at, r.ms_played, r.track_uri.clone());
+            for scrobble in correction
+                .targets
+                .iter()
+                .filter(|target| !streams.contains_key(target))
+            {
+                newest.insert(
+                    (listen.clone(), *scrobble),
+                    (
+                        correction.observation,
+                        correction.verb == Verb::Join,
+                        stream.key.as_slice(),
+                    ),
+                );
+            }
+        }
+    }
+    let mut pins = Pins::default();
+    let mut together: Vec<(i64, &[u8], i64)> = Vec::new();
+    for ((_, scrobble), (by, join, stream)) in newest {
+        if join {
+            together.push((by, stream, scrobble));
+        } else {
+            pins.apart.insert((stream.to_vec(), scrobble));
+        }
+    }
+    // Newest first, and in one correction by the stream's key and the
+    // scrobble's observation.
+    together.sort_unstable_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))));
+    pins.together = together
+        .into_iter()
+        .map(|(_, stream, scrobble)| (stream.to_vec(), scrobble))
+        .collect();
+    pins
 }
 
 /// One listen as Spotify reported it: a stream, and every other row of the
@@ -353,11 +422,28 @@ pub fn match_streams(
         .iter()
         .map(|s| (name_key(&s.artist), name_key(&s.title)))
         .collect();
-    // A pin names a stream; it stands for the stream's event.
+    // A pin names a stream; it stands for the stream's event. Streams of
+    // one key are one listen, so any of them stands for it.
+    let event_by_key: HashMap<&[u8], usize> = streams
+        .iter()
+        .enumerate()
+        .filter_map(|(at, stream)| Some((stream.key.as_slice(), *event_of.get(&at)?)))
+        .collect();
+    let scrobble_at: HashMap<i64, usize> = scrobbles
+        .iter()
+        .enumerate()
+        .map(|(at, scrobble)| (scrobble.observation, at))
+        .collect();
+    let pinned = |stream: &Vec<u8>, scrobble: &i64| {
+        Some((
+            *event_by_key.get(stream.as_slice())?,
+            *scrobble_at.get(scrobble)?,
+        ))
+    };
     let apart: HashSet<(usize, usize)> = pins
         .apart
         .iter()
-        .filter_map(|(stream, scrobble)| Some((*event_of.get(stream)?, *scrobble)))
+        .filter_map(|(stream, scrobble)| pinned(stream, scrobble))
         .collect();
 
     let mut scrobble_free = vec![true; scrobbles.len()];
@@ -365,14 +451,14 @@ pub fn match_streams(
     let mut joins = Vec::new();
 
     for (stream, scrobble) in &pins.together {
-        let Some(&event) = event_of.get(stream) else {
+        let Some((event, scrobble)) = pinned(stream, scrobble) else {
             continue;
         };
-        if !scrobble_free.get(*scrobble).copied().unwrap_or(false) {
+        if !scrobble_free.get(scrobble).copied().unwrap_or(false) {
             continue;
         }
         let second = !event_free.get(event).copied().unwrap_or(false);
-        if let Some(flag) = scrobble_free.get_mut(*scrobble) {
+        if let Some(flag) = scrobble_free.get_mut(scrobble) {
             *flag = false;
         }
         if let Some(flag) = event_free.get_mut(event) {
@@ -380,7 +466,7 @@ pub fn match_streams(
         }
         joins.push(Join {
             event,
-            scrobble: *scrobble,
+            scrobble,
             tier: None,
             second,
         });
@@ -750,6 +836,7 @@ mod tests {
 
     fn scrobble(title: &str, at_s: i64) -> Scrobble {
         Scrobble {
+            observation: at_s,
             key: format!("{at_s:012}:{title}").into_bytes(),
             at_ms: 1_552_680_000_000 + at_s * 1000,
             artist: "Calla Brandt".to_owned(),
@@ -1030,8 +1117,9 @@ mod tests {
     fn a_pin_apart_is_never_joined_and_a_pin_together_is_joined_first() {
         let streams = [stream("Low Tide", 221, 221)];
         let scrobbles = [scrobble("Low Tide", 0)];
+        let key = streams[0].key.clone();
         let apart = Pins {
-            apart: HashSet::from([(0, 0)]),
+            apart: HashSet::from([(key.clone(), 0)]),
             together: Vec::new(),
         };
         assert!(
@@ -1041,12 +1129,67 @@ mod tests {
         );
         let together = Pins {
             apart: HashSet::new(),
-            together: vec![(0, 0)],
+            together: vec![(key, 5000)],
         };
         let far = [scrobble("Paper Lanterns", 5000)];
         let matched = match_streams(&streams, &far, Tiers::ALL, &together);
         assert_eq!(matched.joins.len(), 1);
         assert_eq!(matched.joins[0].tier, None);
+    }
+
+    #[test]
+    fn a_correction_pins_its_stream_by_key_in_any_list_and_the_newer_says_it() {
+        let low = stream("Low Tide", 221, 221);
+        let lanterns = stream("Paper Lanterns", 900, 210);
+        let (near, far) = (scrobble("Low Tide", 0), scrobble("Paper Lanterns", 5000));
+        let correction = |observation, verb, targets: Vec<i64>| Correction {
+            observation,
+            verb,
+            targets,
+            window: None,
+            recording: None,
+        };
+        // The streams' observations are 101 and 102; the scrobbles' are
+        // their times, 0 and 5000.
+        let mut corrections = vec![
+            correction(200, Verb::Split, vec![101, 0]),
+            correction(201, Verb::Join, vec![102, 5000]),
+        ];
+        let pinned = pins(&corrections, [(101, &low), (102, &lanterns)]);
+        for streams in [
+            vec![low.clone(), lanterns.clone()],
+            vec![
+                lanterns.clone(),
+                stream("Quiet Room", 400, 200),
+                low.clone(),
+            ],
+        ] {
+            let scrobbles = [far.clone(), near.clone()];
+            let matched = match_streams(&streams, &scrobbles, Tiers::ALL, &pinned);
+            assert_eq!(
+                joins(&streams, &matched),
+                [("Paper Lanterns".to_owned(), 0, None, false)]
+            );
+        }
+        // A newer split of the same pair undoes the join, and the older
+        // split still keeps its own pair apart, which joins without it.
+        corrections.push(correction(202, Verb::Split, vec![102, 5000]));
+        let pinned = pins(&corrections, [(101, &low), (102, &lanterns)]);
+        assert!(
+            match_streams(&[lanterns], &[far], Tiers::ALL, &pinned)
+                .joins
+                .is_empty()
+        );
+        let (low, near) = ([low], [near]);
+        assert!(
+            match_streams(&low, &near, Tiers::ALL, &Pins::default())
+                .joins
+                .len()
+                == 1
+                && match_streams(&low, &near, Tiers::ALL, &pinned)
+                    .joins
+                    .is_empty()
+        );
     }
 
     /// A join by the keys of its stream and scrobble, its tier, and whether
