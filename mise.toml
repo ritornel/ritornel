@@ -46,10 +46,12 @@ run = "scripts/check-deps.sh"
 
 [tasks.docs]
 description = "Check docs/internals citations, doc rules and rustdoc intra-doc links"
-run = [
-    "scripts/check-docs.sh",
-    "cargo doc --locked --workspace --no-deps --all-features --document-private-items",
-]
+run = ["scripts/check-docs.sh", { task = "rustdoc" }]
+
+# Each system documents its own platform code, so CI runs this on each.
+[tasks.rustdoc]
+description = "Check rustdoc intra-doc links"
+run = "cargo doc --locked --workspace --no-deps --all-features --document-private-items"
 env = { RUSTDOCFLAGS = "-D rustdoc::broken_intra_doc_links" }
 
 [tasks.licenses]

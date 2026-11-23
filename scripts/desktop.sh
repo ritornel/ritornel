@@ -68,7 +68,9 @@ case $system in
         fi
         ;;
     *)
-        echo "On Windows, scripts/desktop.ps1 checks the GPUI desktop app: skipped."
+        needs="This script runs on macOS and Linux; on Windows, scripts/desktop.ps1 does what it does"
+        [[ -z ${CI:-} ]] || { echo "$needs, and CI must not skip it." >&2; exit 1; }
+        echo "$needs: skipped."
         exit 0
         ;;
 esac

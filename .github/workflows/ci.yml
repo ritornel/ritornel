@@ -40,8 +40,8 @@ jobs:
       - run: mise run licenses
 
   workspace:
-    # Clippy and the tests of the main workspace, on each system its code
-    # differs for. On Linux the server's audio output links ALSA, so that
+    # Clippy, rustdoc's links and the tests of the main workspace, on each
+    # system its code differs for. On Linux the server's audio output links ALSA, so that
     # job installs ALSA's development files; the hub job proves the hub
     # needs none.
     name: Workspace on ${{ matrix.name }}
@@ -62,6 +62,9 @@ jobs:
         with:
           packages: ${{ matrix.packages }}
       - run: mise run lint
+      # The checks job runs it on Linux, with the rest of `mise run docs`.
+      - if: runner.os != 'Linux'
+        run: mise run rustdoc
       - run: mise run test
 
   desktop:

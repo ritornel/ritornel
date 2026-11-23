@@ -1,7 +1,7 @@
 #requires -Version 7.0
-# Builds and runs the desktop app (apps/desktop), in GPUI, on Windows, as
-# scripts/desktop.sh does on a Mac. The server is built here too, from the
-# main workspace.
+# Checks, builds and runs the desktop app (apps/desktop), in GPUI, on
+# Windows, as scripts/desktop.sh does on macOS and Linux. `run`, `tones` and
+# `app` build the server too, from the main workspace.
 #
 #   pwsh -File .\scripts\desktop.ps1 check          check formatting, run clippy with
 #                                        warnings denied, run the tests and
