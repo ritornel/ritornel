@@ -16,7 +16,7 @@ use crate::streams::{
     name_key, repeat_order,
 };
 
-/// How many joins of each tier not in force a report shows for judging it.
+/// How many joins of tiers B and C a report shows, for judging them.
 pub const SAMPLES_PER_TIER: usize = 25;
 
 /// How near the end of its stream an offline time must be to read as one
@@ -28,6 +28,9 @@ const OFFLINE_NEAR_MS: i64 = 24 * 60 * 60 * 1000;
 pub struct DryRunInput<'a> {
     /// The run's streams, with their keys.
     pub streams: &'a [Stream],
+    /// The streams in force now, with their keys, which applying keeps in
+    /// force beside the run's.
+    pub in_force: &'a [Stream],
     /// The scrobbles that may be offered to a stream.
     pub scrobbles: &'a [Scrobble],
     /// Scrobbles set aside, which are offered to none.
@@ -215,28 +218,84 @@ fn spread<T: Clone>(items: &[T], count: usize) -> Vec<T> {
         .collect()
 }
 
-/// Works out what applying a run would do.
-pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
-    let in_force = match_streams(input.streams, input.scrobbles, Tiers::CURRENT, input.pins);
-    let every = match_streams(input.streams, input.scrobbles, Tiers::ALL, input.pins);
-    let lengths = lengths(input.streams, &in_force.events);
+/// What streams add to each year's plays and counted plays: an event alone
+/// is a play of its own, counted or not by the stream rule, and a second
+/// report's scrobble, a play of its own without them, joins the play of the
+/// stream it repeats. An event joined to a scrobble takes its play's place.
+fn added(streams: &[Stream], scrobbles: &[Scrobble], pins: &Pins) -> BTreeMap<i32, (i64, i64)> {
+    let matched = match_streams(streams, scrobbles, Tiers::ALL, pins);
+    let lengths = lengths(streams, &matched.events);
+    let joined: HashSet<usize> = matched
+        .joins
+        .iter()
+        .filter(|join| !join.second)
+        .map(|join| join.event)
+        .collect();
+    let mut added: BTreeMap<i32, (i64, i64)> = BTreeMap::new();
+    for (index, event) in matched.events.iter().enumerate() {
+        if joined.contains(&index) {
+            continue;
+        }
+        let Some(record) = first_record(streams, event) else {
+            continue;
+        };
+        let (counts, _) = judge_alone(
+            record.ms_played,
+            lengths.get(&record.track_uri).copied(),
+            record.reason_end.as_deref(),
+        );
+        let year = added.entry(year(event.start_ms)).or_default();
+        year.0 += 1;
+        year.1 += i64::from(counts);
+    }
+    for join in matched.joins.iter().filter(|join| join.second) {
+        if let Some(scrobble) = scrobbles.get(join.scrobble) {
+            let year = added.entry(year(scrobble.at_ms)).or_default();
+            year.0 -= 1;
+            year.1 -= 1;
+        }
+    }
+    added
+}
 
+/// Works out what applying a run would do. What it says of listens, joins
+/// and streams alone is of every stream in force once it is applied, the
+/// run's and those in force now, as applying derives every play from them.
+pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
+    let run = input.streams;
+    let held: HashSet<&[u8]> = input.in_force.iter().map(|s| s.key.as_slice()).collect();
+    // A stream stored already keeps its record as it was stored.
+    let union: Vec<Stream> = input
+        .in_force
+        .iter()
+        .cloned()
+        .chain(
+            run.iter()
+                .filter(|stream| !held.contains(stream.key.as_slice()))
+                .map(|stream| Stream {
+                    key: stream.key.clone(),
+                    record: input
+                        .stored
+                        .get(&stream.key)
+                        .unwrap_or(&stream.record)
+                        .clone(),
+                }),
+        )
+        .collect();
+    let input = &DryRunInput {
+        streams: &union,
+        ..*input
+    };
+    let matched = match_streams(input.streams, input.scrobbles, Tiers::ALL, input.pins);
+    let lengths = lengths(input.streams, &matched.events);
+
+    let counts = crate::streams::counts(&matched);
     let tiers = Tier::ALL
         .iter()
         .map(|tier| {
-            let on = match tier {
-                Tier::Start => true,
-                Tier::During => Tiers::CURRENT.during,
-                Tier::Renamed => Tiers::CURRENT.renamed,
-            };
-            let source = if on { &in_force } else { &every };
-            let (joined, second) = crate::streams::counts(source)
-                .get(tier)
-                .copied()
-                .unwrap_or_default();
+            let (joined, second) = counts.get(tier).copied().unwrap_or_default();
             TierJoins {
                 tier: contract_tier(*tier),
-                in_force: on,
                 joined,
                 second,
             }
@@ -249,14 +308,14 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         row.plays_before = *plays;
         row.counted_before = *counted;
     }
-    let joined_tier: HashMap<usize, Option<Tier>> = in_force
+    let joined_tier: HashMap<usize, Option<Tier>> = matched
         .joins
         .iter()
         .filter(|join| !join.second)
         .map(|join| (join.event, join.tier))
         .collect();
     let mut alone: Vec<usize> = Vec::new();
-    for (index, event) in in_force.events.iter().enumerate() {
+    for (index, event) in matched.events.iter().enumerate() {
         let row = row(&mut years, year(event.start_ms));
         row.streams += 1;
         let first = event.streams.first().and_then(|at| input.streams.get(*at));
@@ -291,50 +350,44 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
             }
         }
     }
-    let taken: HashSet<usize> = in_force.joins.iter().map(|join| join.scrobble).collect();
+    let taken: HashSet<usize> = matched.joins.iter().map(|join| join.scrobble).collect();
     for (at, scrobble) in input.scrobbles.iter().enumerate() {
         if !taken.contains(&at) {
             row(&mut years, year(scrobble.at_ms)).scrobbles_alone += 1;
         }
     }
-    // A second report's scrobble is a play of its own now, and joins the
-    // play of the stream it repeats.
-    let mut merged: BTreeMap<i32, u64> = BTreeMap::new();
-    for join in in_force.joins.iter().filter(|join| join.second) {
-        if let Some(scrobble) = input.scrobbles.get(join.scrobble) {
-            *merged.entry(year(scrobble.at_ms)).or_default() += 1;
-        }
-    }
+    // The plays now hold what the streams in force add; once applied they
+    // hold what every stream in force adds instead.
+    let after = added(input.streams, input.scrobbles, input.pins);
+    let now = added(input.in_force, input.scrobbles, input.pins);
     for row in years.values_mut() {
-        let alone = row.alone_counted + row.alone_not_counted + row.alone_unknown;
-        let merged = merged.get(&row.year).copied().unwrap_or(0);
-        row.plays_after = (row.plays_before + alone).saturating_sub(merged);
-        row.counted_after = (row.counted_before + row.alone_counted).saturating_sub(merged);
+        let (after, now) = (
+            after.get(&row.year).copied().unwrap_or_default(),
+            now.get(&row.year).copied().unwrap_or_default(),
+        );
+        let moved = |before: u64, after: i64, now: i64| {
+            u64::try_from(i128::from(before) + i128::from(after) - i128::from(now)).unwrap_or(0)
+        };
+        row.plays_after = moved(row.plays_before, after.0, now.0);
+        row.counted_after = moved(row.counted_before, after.1, now.1);
     }
 
     let (offline, offline_timestamped, offline_seconds, offline_milliseconds) =
-        offline_facts(input.streams, &in_force);
-    let paused = paused(input, &in_force, &alone, &taken);
+        offline_facts(input.streams, &matched);
+    let paused = paused(input, &matched, &alone, &taken);
 
     let mut problems = Vec::new();
     if years.values().any(|row| row.no_zone > 0) {
         problems.push(ImportProblem::NoZone);
-    }
-    if tiers
-        .iter()
-        .any(|tier| !tier.in_force && tier.joined + tier.second > 0)
-    {
-        problems.push(ImportProblem::TierNotInForce);
     }
 
     ImportReport {
         made_at: input.made_at,
         grouper_version: crate::history::GROUPER_VERSION,
         play_rule_version: crate::history::PlayRule::CURRENT.version,
-        streams: input.streams.len() as u64,
-        events: in_force.events.len() as u64,
-        respelled: input
-            .streams
+        streams: run.len() as u64,
+        events: crate::streams::events(run).len() as u64,
+        respelled: run
             .iter()
             .filter(|stream| {
                 input
@@ -354,7 +407,7 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         offline_milliseconds,
         paused,
         problems,
-        samples: samples(input, &every),
+        samples: samples(input, &matched),
     }
 }
 
@@ -440,31 +493,25 @@ fn paused(
     counted.len() as u64
 }
 
-/// A sample of what each tier not in force would join.
-fn samples(input: &DryRunInput<'_>, every: &Matched) -> Vec<JoinSample> {
+/// A sample of what tiers B and C join, which ask less of the time or the
+/// names than A does.
+fn samples(input: &DryRunInput<'_>, matched: &Matched) -> Vec<JoinSample> {
     let mut samples = Vec::new();
     for tier in [Tier::During, Tier::Renamed] {
-        let on = match tier {
-            Tier::During => Tiers::CURRENT.during,
-            _ => Tiers::CURRENT.renamed,
-        };
-        if on {
-            continue;
-        }
-        let mut joins: Vec<_> = every
+        let mut joins: Vec<_> = matched
             .joins
             .iter()
             .filter(|join| join.tier == Some(tier))
             .collect();
         joins.sort_by_key(|join| {
-            every
+            matched
                 .events
                 .get(join.event)
                 .map_or(0, |event| event.start_ms)
         });
         for join in spread(&joins, SAMPLES_PER_TIER) {
             let (Some(event), Some(scrobble)) = (
-                every.events.get(join.event),
+                matched.events.get(join.event),
                 input.scrobbles.get(join.scrobble),
             ) else {
                 continue;
@@ -630,6 +677,7 @@ mod tests {
     ) -> DryRunInput<'a> {
         DryRunInput {
             streams,
+            in_force: &[],
             scrobbles,
             excluded: 0,
             echoes: 0,
@@ -704,6 +752,38 @@ mod tests {
     }
 
     #[test]
+    fn an_archive_in_force_already_adds_no_play_and_a_later_one_only_its_new_streams() {
+        let older = fresh(vec![
+            record(221, 221, "Low Tide", "trackdone"),
+            record(1000, 221, "Low Tide", "trackdone"),
+        ]);
+        let scrobbles = vec![scrobble(1, "Low Tide")];
+        // The plays now: the scrobble's, joined to the first stream, and
+        // the second stream alone, which counts.
+        let plays = BTreeMap::from([(2019, (2, 2))]);
+        let pins = Pins::default();
+        let again = DryRunInput {
+            in_force: &older,
+            ..input(&older, &scrobbles, &plays, &pins)
+        };
+        let year = dry_run(&again).years[0];
+        assert_eq!((year.streams, year.already_stored), (2, 0));
+        assert_eq!((year.plays_after, year.counted_after), (2, 2));
+        // A later archive holds those and one stream more, a skip.
+        let mut later = older.clone();
+        later.extend(fresh(vec![record(2000, 12, "Paper Lanterns", "fwdbtn")]));
+        let next = DryRunInput {
+            in_force: &older,
+            ..input(&later, &scrobbles, &plays, &pins)
+        };
+        let report = dry_run(&next);
+        assert_eq!((report.streams, report.events), (3, 3));
+        let year = &report.years[0];
+        assert_eq!(year.streams, 3);
+        assert_eq!((year.plays_after, year.counted_after), (3, 2));
+    }
+
+    #[test]
     fn a_dry_run_counts_by_year_and_says_what_stands_in_the_way() {
         let streams = fresh(vec![
             // Joined by tier A.
@@ -712,17 +792,20 @@ mod tests {
             record(1000, 221, "Low Tide", "trackdone"),
             // Alone, twelve seconds: a skip.
             record(1100, 12, "Paper Lanterns", "fwdbtn"),
-            // Alone, no length to judge it by.
+            // Joined by tier B.
             record(1300, 100, "Night Ferry", "endplay"),
+            // Alone, no length to judge it by.
+            record(1500, 100, "Harbour Lights", "endplay"),
         ]);
         let scrobbles = vec![
             scrobble(1, "Low Tide"),
-            // Stamped as the stream played: tier B, not in force.
+            // Stamped as the stream played.
             scrobble(1250, "Night Ferry"),
         ];
         let plays = BTreeMap::from([(2019, (10, 8))]);
         let report = dry_run(&DryRunInput {
             streams: &streams,
+            in_force: &[],
             scrobbles: &scrobbles,
             excluded: 3,
             echoes: 2,
@@ -733,32 +816,30 @@ mod tests {
             stored: &HashMap::new(),
             made_at: 7,
         });
-        assert_eq!((report.streams, report.events, report.scrobbles), (4, 4, 2));
+        assert_eq!((report.streams, report.events, report.scrobbles), (5, 5, 2));
         assert_eq!((report.scrobbles_excluded, report.scrobbles_echoes), (3, 2));
         let year = &report.years[0];
         assert_eq!(year.year, 2019);
         assert_eq!(
             (
                 year.joined_start,
+                year.joined_during,
                 year.alone_counted,
                 year.alone_not_counted,
                 year.alone_unknown
             ),
-            (1, 1, 1, 1)
+            (1, 1, 1, 1, 1)
         );
-        assert_eq!(year.scrobbles_alone, 1);
+        assert_eq!(year.scrobbles_alone, 0);
         assert_eq!((year.plays_after, year.counted_after), (13, 9));
-        assert_eq!(year.no_zone, 4);
-        assert_eq!(
-            report.problems,
-            [ImportProblem::NoZone, ImportProblem::TierNotInForce]
-        );
+        assert_eq!(year.no_zone, 5);
+        assert_eq!(report.problems, [ImportProblem::NoZone]);
         let during = report
             .tiers
             .iter()
             .find(|tier| tier.tier == StreamTier::During)
             .unwrap();
-        assert_eq!((during.joined, during.in_force), (1, false));
+        assert_eq!(during.joined, 1);
         assert_eq!(report.samples.len(), 1);
         assert_eq!(report.samples[0].stream_title, "Night Ferry");
 
@@ -771,6 +852,7 @@ mod tests {
         }];
         let report = dry_run(&DryRunInput {
             streams: &streams,
+            in_force: &[],
             scrobbles: &scrobbles,
             excluded: 0,
             echoes: 0,
@@ -782,6 +864,6 @@ mod tests {
             made_at: 7,
         });
         assert_eq!(report.years[0].no_zone, 0);
-        assert_eq!(report.problems, [ImportProblem::TierNotInForce]);
+        assert!(report.problems.is_empty());
     }
 }

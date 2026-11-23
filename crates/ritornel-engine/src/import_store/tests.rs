@@ -279,6 +279,42 @@ fn a_full_read_sets_aside_a_scrobble_an_earlier_read_stored_twice() {
 }
 
 #[test]
+fn a_full_read_sets_aside_a_second_copy_that_a_stream_joined() {
+    let rig = rig();
+    apply(&rig, 1, vec![stream(T0 - 3 * HOUR, 200_000, "Paper Kites")]);
+    // A read whose pages shifted stored Paper Kites twice, and the stream
+    // took both: one as its own and one as a second report.
+    rig.ingest(&batch(
+        vec![
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 0),
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 1),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    ));
+    let joined =
+        "SELECT count(*) FROM play_event_observation WHERE joined_by IN ('start', 'during')";
+    assert_eq!(rig.one(joined), "2");
+    // The source lists one, and Lanternfish in the same second, so a full
+    // read sets the other aside, and the stream's play keeps the one listed.
+    let held = batch(
+        vec![
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 0),
+            record(T0 - 3 * HOUR, "Moss Arcade", "Lanternfish", 0),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    );
+    assert_eq!(rig.read(&held, true).set_aside, 1);
+    assert_eq!(rig.one(joined), "1");
+    assert_eq!(
+        rig.one("SELECT count(*) FROM play_event WHERE excluded = 0 AND counts = 1"),
+        "2"
+    );
+    assert_eq!(rebuild_changes(&rig), "0");
+}
+
+#[test]
 fn a_full_read_keeps_a_repeat_deleted_at_the_source_and_lifts_one_listed_again() {
     let rig = rig();
     let counted = "SELECT count(*) FROM play_event WHERE excluded = 0";
@@ -1217,7 +1253,10 @@ fn a_dry_run_offers_no_stream_a_scrobble_set_aside_and_writes_nothing() {
     );
     assert_eq!(report.events, 2);
     let start = &report.tiers[0];
-    assert_eq!((start.joined, start.in_force), (1, true));
+    assert_eq!(
+        (start.tier, start.joined),
+        (ritornel_contract::StreamTier::Start, 1)
+    );
     let year = report.years.iter().find(|year| year.streams > 0).unwrap();
     // Lanternfish has no stream and stays a scrobble alone.
     assert_eq!((year.joined_start, year.scrobbles_alone), (1, 1));
@@ -1726,27 +1765,34 @@ fn scrobbles_that_arrive_after_their_streams_join_them_as_a_rebuild_would() {
             stream(T0 - 2 * HOUR, 180_000, "Lanternfish"),
             skipped,
             stream(T0 - HOUR + 60_000, 250_000, "Salt Road (Live)"),
+            stream(T0 - 5 * HOUR, 200_000, "Harbour Lights"),
+            stream(T0 - 6 * HOUR, 200_000, "Night Ferry (Remastered)"),
         ],
     );
-    // Alone, the short skip does not count and the four minutes do.
+    // Alone, the short skip does not count, and the rest count by their
+    // tracks' lengths.
     assert_eq!(
         rig.one(
             "SELECT group_concat(pe.outcome || ':' || pe.counts, ',' ORDER BY pe.event_at_utc_ms)
              FROM play_event pe"
         ),
-        "listened:1,listened:1,skipped:0,listened:1"
+        "listened:1,listened:1,listened:1,listened:1,skipped:0,listened:1"
     );
     assert_eq!(rebuild_changes(&rig), "0");
 
-    // The scrobbles come later, with a sync: two join their streams, and
-    // one, of a track Spotify did not play, stands alone.
+    // The scrobbles come later, with a sync: two join their streams at
+    // their start, one stamped near its stream's end joins it, one whose
+    // title Spotify spelled otherwise joins its stream, and one, of a
+    // track Spotify did not play, stands alone.
     rig.ingest(&batch(
         vec![
+            record(T0 - 6 * HOUR + 3000, "Moss Arcade", "Night Ferry", 0),
+            record(T0 - 5 * HOUR + 190_000, "Moss Arcade", "Harbour Lights", 0),
             record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 0),
             record(T0 - 2 * HOUR + 3000, "Moss Arcade", "Lanternfish", 0),
             record(T0 - 30 * 60_000, "Somebody Else", "Not Here", 0),
         ],
-        T0 - 4 * HOUR,
+        T0 - 7 * HOUR,
         T0,
     ));
     let joined = |how: &str| {
@@ -1755,10 +1801,25 @@ fn scrobbles_that_arrive_after_their_streams_join_them_as_a_rebuild_would() {
         ))
     };
     assert_eq!(
-        (joined("start"), joined("repeat")),
-        ("2".into(), "1".into())
+        (
+            joined("start"),
+            joined("repeat"),
+            joined("during"),
+            joined("renamed")
+        ),
+        ("2".into(), "1".into(), "1".into(), "1".into())
     );
-    assert_eq!(rig.one("SELECT count(*) FROM play_event"), "5");
+    assert_eq!(rig.one("SELECT count(*) FROM play_event"), "7");
+    // Where the names disagree, the stream's track speaks for the play.
+    assert_eq!(
+        rig.one(
+            "SELECT si.provider_key FROM play_event pe
+             JOIN source_item si ON si.id = pe.source_item_id
+             JOIN play_event_observation peo ON peo.play_event_id = pe.id
+             WHERE peo.joined_by = 'renamed'"
+        ),
+        "spotify:track:NightFerry(Remastered)"
+    );
     // A joined play is dated by its stream, from its end, and counts by the
     // scrobble's verdict.
     assert_eq!(
@@ -1769,14 +1830,121 @@ fn scrobbles_that_arrive_after_their_streams_join_them_as_a_rebuild_would() {
         ),
         "end:source_verdict:200000"
     );
-    // The report tells the two joined to streams from an echo, and counts
+    // The report tells the four joined to streams from an echo, and counts
     // as the account's plays only the one that stands alone.
     let report = rig.library.import_report(rig.account, 10).unwrap();
     assert_eq!(
         (report.plays, report.echoes, report.joined_to_streams),
-        (1, 0, 2)
+        (1, 0, 4)
     );
     // What the sync derived is what a rebuild derives.
+    assert_eq!(rebuild_changes(&rig), "0");
+}
+
+#[test]
+fn a_correction_by_time_finds_a_joined_scrobble_by_its_own_stamp() {
+    let rig = rig();
+    // The stream began eight seconds before its scrobble was stamped.
+    apply(
+        &rig,
+        1,
+        vec![stream(T0 - HOUR - 8000, 200_000, "Lanternfish")],
+    );
+    rig.ingest(&batch(
+        vec![record(T0 - HOUR, "Moss Arcade", "Lanternfish", 0)],
+        T0 - 2 * HOUR,
+        T0,
+    ));
+    let endpoint = rig
+        .library
+        .service_account(rig.account)
+        .unwrap()
+        .unwrap()
+        .endpoint;
+    let (recording, row): (Id, String) = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT r.public_id, r.id FROM recording r
+                 JOIN track_appearance ta ON ta.recording_id = r.id
+                 WHERE ta.display_title = 'Paper Kites'",
+                [],
+                |row| {
+                    Ok((
+                        Id::from_bytes(row.get(0)?),
+                        row.get::<_, i64>(1)?.to_string(),
+                    ))
+                },
+            )?)
+        })
+        .unwrap();
+    // The account's plays from the scrobble's stamp on, which the stream's
+    // start is before, are of another song.
+    rig.library
+        .set_observation_recording(
+            WriteRequest {
+                method: "history.setRecording",
+                command: None,
+                client: None,
+            },
+            crate::CorrectionTargets::Window {
+                endpoint,
+                from_ms: Some(T0 - HOUR),
+                to_ms: Some(T0 - HOUR + 1000),
+                source_item: None,
+            },
+            Some(recording),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(rig.one("SELECT count(*) FROM play_event"), "1");
+    assert_eq!(rig.one("SELECT recording_id FROM play_event"), row);
+    assert_eq!(rebuild_changes(&rig), "0");
+}
+
+#[test]
+fn a_dry_run_of_an_archive_in_force_promises_the_plays_there_are() {
+    let rig = rig();
+    let archive = vec![
+        stream(T0 - 2 * HOUR, 250_000, "Paper Kites"),
+        stream(T0 - HOUR, 250_000, "Lanternfish"),
+    ];
+    apply(&rig, 1, archive.clone());
+    let report = rig.library.stream_dry_run(archive).unwrap();
+    let total = |of: fn(&ritornel_contract::ImportYear) -> u64| {
+        report.years.iter().map(of).sum::<u64>().to_string()
+    };
+    let plays = rig.one("SELECT count(*) FROM play_event WHERE excluded = 0");
+    assert_eq!(total(|year| year.plays_before), plays);
+    assert_eq!(total(|year| year.plays_after), plays);
+}
+
+#[test]
+fn a_later_archive_can_give_a_track_its_length_and_undoing_it_takes_it_away() {
+    let rig = rig();
+    // Left after 100 seconds, with no stream of its track that ran to its
+    // end: there is no length to judge it by.
+    let mut left = stream(T0 - 5 * HOUR, 100_000, "Night Ferry");
+    left.reason_end = Some("endplay".to_owned());
+    apply(&rig, 1, vec![left.clone()]);
+    let judged = "SELECT outcome || ':' || counts FROM play_event ORDER BY event_at_utc_ms LIMIT 1";
+    assert_eq!(rig.one(judged), "unknown:0");
+    // A later archive holds it and the track played to its end, three
+    // minutes long: half of that was heard.
+    apply(
+        &rig,
+        2,
+        vec![
+            left,
+            stream(T0 - 3 * HOUR, 180_000, "Night Ferry"),
+            stream(T0 - 2 * HOUR, 180_000, "Night Ferry"),
+        ],
+    );
+    assert_eq!(rig.one(judged), "listened:1");
+    assert_eq!(rebuild_changes(&rig), "0");
+    undo(&rig, 2);
+    assert_eq!(rig.one(judged), "unknown:0");
     assert_eq!(rebuild_changes(&rig), "0");
 }
 

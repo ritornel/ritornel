@@ -641,39 +641,26 @@ fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<
         .collect()
 }
 
-/// The observations a play can depend on: a listen's, those joined to it by
-/// `continues` links, either way, as far as they go, and the echoes of
-/// their deliveries; an import's, the listen it is the echo of and that
-/// listen's.
-fn neighbourhood(connection: &Connection, observation: i64) -> Result<BTreeSet<i64>, Error> {
-    let mut found = BTreeSet::from([observation]);
-    let mut todo = vec![observation];
-    let mut kind = connection.prepare_cached(
-        "SELECT o.kind, o.endpoint_id, i.played_at_utc_ms, i.artist, i.title
-         FROM history_observation o
-         LEFT JOIN observation_import i ON i.observation_id = o.id WHERE o.id = ?1",
-    )?;
-    let mut back = connection.prepare_cached(
-        "SELECT p.id FROM history_observation o
-         JOIN observation_listen l ON l.observation_id = o.id
-         JOIN history_observation p ON p.endpoint_id = o.endpoint_id
-                                   AND p.source_key = l.continues_source_key
-         WHERE o.id = ?1",
-    )?;
-    let mut forward = connection.prepare_cached(
-        "SELECT n.observation_id FROM history_observation o
-         JOIN history_observation m ON m.endpoint_id = o.endpoint_id
-         JOIN observation_listen n ON n.observation_id = m.id
-         WHERE o.id = ?1 AND n.continues_source_key = o.source_key",
-    )?;
-    while let Some(at) = todo.pop() {
-        let (what, endpoint, played_at, artist, title): (
-            String,
-            i64,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-        ) = kind.query_row([at], |row| {
+/// The observations a play of this one can depend on, one step away: a
+/// listen's, those joined to it by a `continues` link either way and the
+/// echoes of its deliveries; an import's, the listen it is the echo of and
+/// the streams and scrobbles the stream matcher could join it with; and any
+/// observation a correction joins to it. [`rederive`] follows them as far
+/// as they go.
+fn neighbours(connection: &Connection, at: i64) -> Result<Vec<i64>, Error> {
+    let (what, endpoint, played_at, artist, title): (
+        String,
+        i64,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+    ) = connection
+        .prepare_cached(
+            "SELECT o.kind, o.endpoint_id, i.played_at_utc_ms, i.artist, i.title
+             FROM history_observation o
+             LEFT JOIN observation_import i ON i.observation_id = o.id WHERE o.id = ?1",
+        )?
+        .query_row([at], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -682,29 +669,44 @@ fn neighbourhood(connection: &Connection, observation: i64) -> Result<BTreeSet<i
                 row.get(4)?,
             ))
         })?;
-        let mut near = Vec::new();
-        if what == "import" {
-            if let (Some(played_at), Some(artist), Some(title)) = (played_at, artist, title) {
-                near.extend(echo_of(connection, endpoint, played_at, &artist, &title)?);
-            }
-            // The streams and scrobbles the matcher could join it with.
-            near.extend(crate::history_streams::neighbours(connection, at)?);
-        } else {
-            for statement in [&mut back, &mut forward] {
-                let joined: Vec<i64> = statement
-                    .query_map([at], |row| row.get(0))?
-                    .collect::<Result<_, _>>()?;
-                near.extend(joined);
-            }
-            near.extend(echoes_of(connection, at)?);
+    let mut near = Vec::new();
+    if what == "import" {
+        if let (Some(played_at), Some(artist), Some(title)) = (played_at, artist, title) {
+            near.extend(echo_of(connection, endpoint, played_at, &artist, &title)?);
         }
-        for next in near {
-            if found.insert(next) {
-                todo.push(next);
-            }
+        near.extend(crate::history_streams::neighbours(connection, at)?);
+    } else {
+        for sql in [
+            "SELECT p.id FROM history_observation o
+             JOIN observation_listen l ON l.observation_id = o.id
+             JOIN history_observation p ON p.endpoint_id = o.endpoint_id
+                                       AND p.source_key = l.continues_source_key
+             WHERE o.id = ?1",
+            "SELECT n.observation_id FROM history_observation o
+             JOIN history_observation m ON m.endpoint_id = o.endpoint_id
+             JOIN observation_listen n ON n.observation_id = m.id
+             WHERE o.id = ?1 AND n.continues_source_key = o.source_key",
+        ] {
+            let joined: Vec<i64> = connection
+                .prepare_cached(sql)?
+                .query_map([at], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            near.extend(joined);
         }
+        near.extend(echoes_of(connection, at)?);
     }
-    Ok(found)
+    let pinned: Vec<i64> = connection
+        .prepare_cached(
+            "SELECT other.target_observation_id FROM correction_target mine
+             JOIN observation_correction c ON c.observation_id = mine.correction_id
+                                          AND c.verb = 'join'
+             JOIN correction_target other ON other.correction_id = mine.correction_id
+             WHERE mine.target_observation_id = ?1",
+        )?
+        .query_map([at], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    near.extend(pinned);
+    Ok(near)
 }
 
 /// Drops the plays these observations support, and every link to them.
@@ -869,7 +871,7 @@ pub(crate) fn rederive(
         if !around.insert(observation) {
             continue;
         }
-        for near in neighbourhood(connection, observation)? {
+        for near in neighbours(connection, observation)? {
             if !around.contains(&near) {
                 todo.push(near);
             }
@@ -891,10 +893,7 @@ pub(crate) fn rederive(
         .chain(imports.iter().map(|import| import.source_item))
         .chain(streams.iter().map(|stream| stream.source_item))
         .collect();
-    let tracks: BTreeSet<String> = streams
-        .iter()
-        .map(|stream| stream.record.track_uri.clone())
-        .collect();
+    let tracks: BTreeSet<i64> = streams.iter().map(|stream| stream.source_item).collect();
     let plays = derive::derive(&Inputs {
         listens: &listens,
         imports: &imports,
@@ -902,7 +901,7 @@ pub(crate) fn rederive(
         corrections: &corrections(connection)?,
         zone_periods: &zone_periods(connection)?,
         rule,
-        lengths: &crate::history_streams::lengths(connection, Some(&tracks))?,
+        lengths: &crate::history_streams::lengths(connection, &tracks)?,
         streams: &streams,
     });
     insert_plays(write, &plays)
@@ -920,7 +919,7 @@ pub(crate) fn derive_all(connection: &Connection, rule: PlayRule) -> Result<Vec<
         corrections: &corrections(connection)?,
         zone_periods: &zone_periods(connection)?,
         rule,
-        lengths: &crate::history_streams::lengths(connection, None)?,
+        lengths: &crate::history_streams::lengths_of(&streams),
         streams: &streams,
     }))
 }

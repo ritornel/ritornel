@@ -25,6 +25,7 @@ struct Read {
     listener: i64,
     zone_periods: Vec<ritornel_domain::history::ZonePeriod>,
     stored: HashMap<Vec<u8>, SpotifyStream>,
+    in_force: Vec<Stream>,
 }
 
 /// The streams stored already, by key, as they were stored.
@@ -168,6 +169,13 @@ fn read(connection: &Connection) -> Result<Read, Error> {
         listener,
         zone_periods: zone_periods(connection)?,
         stored: stored_streams(connection)?,
+        in_force: crate::history_streams::streams(connection, None)?
+            .into_iter()
+            .map(|stream| Stream {
+                key: stream.key,
+                record: stream.record,
+            })
+            .collect(),
     })
 }
 
@@ -175,6 +183,7 @@ fn read(connection: &Connection) -> Result<Read, Error> {
 fn report(read: &Read, streams: &[Stream], made_at: i64) -> ImportReport {
     dry_run(&DryRunInput {
         streams,
+        in_force: &read.in_force,
         scrobbles: &read.scrobbles,
         excluded: read.excluded,
         echoes: read.echoes,
@@ -318,8 +327,7 @@ fn stored_run(connection: &Connection, run: Id) -> Result<Option<StoredRun>, Err
 
 /// Stores a run's streams that are not stored yet, and records the run, the
 /// streams it held and that it is in force, in one write. A run applied
-/// before is not applied again. Derivation passes streams over, so no play
-/// changes.
+/// before is not applied again. It derives no play: its caller does.
 fn apply_in(
     write: &Write<'_>,
     run: Id,

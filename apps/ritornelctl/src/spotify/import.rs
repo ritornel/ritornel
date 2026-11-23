@@ -352,16 +352,7 @@ fn report_text(report: &ImportReport, heading: &str, samples: bool) -> String {
         .map(|tier| {
             (
                 tier_name(tier.tier),
-                format!(
-                    "{} joined, {} second reports{}",
-                    tier.joined,
-                    tier.second,
-                    if tier.in_force {
-                        ""
-                    } else {
-                        ", not yet in force"
-                    }
-                ),
+                format!("{} joined, {} second reports", tier.joined, tier.second),
             )
         })
         .collect();
@@ -417,15 +408,11 @@ fn report_text(report: &ImportReport, heading: &str, samples: bool) -> String {
                     "  Some streams fall where no zone covers, so they would have no local date: \
                      say where you were then, with `ritornelctl history zone add`.\n"
                 }
-                ImportProblem::TierNotInForce => {
-                    "  A tier not yet in force finds joins: until it is, what it would join stands \
-                     as plays of its own.\n"
-                }
             });
         }
     }
     if samples && !report.samples.is_empty() {
-        text.push_str("\nSamples of the tiers not yet in force: stream | scrobble\n");
+        text.push_str("\nSamples of tiers B and C: stream | scrobble\n");
         for sample in &report.samples {
             let _ = writeln!(
                 text,

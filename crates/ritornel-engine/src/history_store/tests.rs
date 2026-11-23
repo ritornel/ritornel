@@ -211,7 +211,7 @@ impl Library {
         found.unwrap()
     }
 
-    fn count(&self, sql: &'static str) -> i64 {
+    fn count(&self, sql: &str) -> i64 {
         self.library
             .read(|connection| Ok(connection.query_row(sql, [], |row| row.get(0))?))
             .unwrap()
@@ -350,10 +350,10 @@ fn after_the_rule_is_bumped_a_rebuild_equals_ingest_under_the_new_rule() {
     // The 60% listen counted under the rule in force and does not under
     // the stricter one.
     assert_eq!(
-        bumped.count(String::leak(format!(
+        bumped.count(&format!(
             "SELECT count(*) FROM play_event WHERE play_rule_version = {}",
             v2.version
-        ))),
+        )),
         before.len() as i64
     );
     assert!(bumped.library.history_needs_rebuild().unwrap());

@@ -315,8 +315,8 @@ when given alone:
   --no-wait             lastfm sync: start it and return at once
   --limit <n>           lastfm report: how many doubtful tracks. The
                         default is 50
-  --samples             spotify import: show a sample of what each rule not
-                        yet in force would join, for judging it
+  --samples             spotify import: show a sample of what tiers B and C
+                        join, for judging them
   --data-dir <dir>      The data directory of the server to talk to
   --json                Print the answer as JSON, in the shape the server
                         sends it in
@@ -483,7 +483,7 @@ pub(crate) struct SpotifyRunArgs {
 pub(crate) struct SpotifyImportArgs {
     /// The zip file Spotify sent, or the folder it was unpacked to.
     pub(crate) archive: PathBuf,
-    /// Show a sample of what each rule not yet in force would join.
+    /// Show a sample of what tiers B and C join.
     #[arg(long)]
     pub(crate) samples: bool,
     #[command(flatten)]

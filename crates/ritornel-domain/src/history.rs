@@ -1284,7 +1284,7 @@ fn derive_streams(
         })
         .collect();
     let pins = pins(inputs.corrections, inputs.streams, &offered);
-    let matched = match_streams(&streams, &scrobbles, Tiers::CURRENT, &pins);
+    let matched = match_streams(&streams, &scrobbles, Tiers::ALL, &pins);
     let mut joins: HashMap<usize, Vec<(usize, Option<Tier>, bool)>> = HashMap::new();
     let mut taken = BTreeSet::new();
     for join in &matched.joins {
@@ -1343,16 +1343,28 @@ fn derive_streams(
             (counts, outcome, CountBasis::PlayRule)
         };
         let start = record.ended_at.saturating_sub(record.ms_played);
+        // Each record answers a correction's window by its own time, as
+        // the store finds what a correction touches.
         let chosen = members
             .iter()
-            .map(|stream| (stream.observation, stream.endpoint, stream.source_item))
-            .chain(
-                scrobbled
-                    .iter()
-                    .map(|import| (import.observation, import.endpoint, import.source_item)),
-            )
-            .filter_map(|(observation, endpoint, item)| {
-                overrides.for_observation(observation, endpoint, item, start)
+            .map(|stream| {
+                (
+                    stream.observation,
+                    stream.endpoint,
+                    stream.source_item,
+                    start,
+                )
+            })
+            .chain(scrobbled.iter().map(|import| {
+                (
+                    import.observation,
+                    import.endpoint,
+                    import.source_item,
+                    import.played_at_ms,
+                )
+            }))
+            .filter_map(|(observation, endpoint, item, at_ms)| {
+                overrides.for_observation(observation, endpoint, item, at_ms)
             })
             .max_by_key(|(corr_id, _)| *corr_id);
         let binding = match chosen {

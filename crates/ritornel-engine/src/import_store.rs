@@ -648,9 +648,10 @@ struct Recheck {
 /// source lists. A later read may have
 /// stored the one missed since, which changes nothing here. A scrobble
 /// deleted at the source, or one added to it later, changes how many the
-/// second holds, and is never taken for one. Only an import whose play is its own is set
-/// aside, so that a play of this library's own that an echo joined is never
-/// left out, and one set aside before, even if that was revoked since, is
+/// second holds, and is never taken for one. An import whose play holds a
+/// listen is never set aside, so that a play of this library's own that an
+/// echo joined is never left out; one a stream joined may be, as a scrobble
+/// set aside is offered to no stream. One set aside before, even if that was revoked since, is
 /// not set aside again. An import set aside so whose key the source lists
 /// again has its correction revoked, if it stands.
 fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Recheck, Error> {
@@ -692,9 +693,11 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
                 NOT EXISTS (SELECT 1 FROM correction_target t
                             JOIN observation_correction c ON c.observation_id = t.correction_id
                             WHERE t.target_observation_id = o.id AND c.verb = 'exclude')
-                AND (SELECT count(*) FROM play_event_observation mine
-                     JOIN play_event_observation other ON other.play_event_id = mine.play_event_id
-                     WHERE mine.observation_id = o.id) = 1,
+                AND NOT EXISTS (SELECT 1 FROM play_event_observation mine
+                                JOIN play_event_observation other
+                                  ON other.play_event_id = mine.play_event_id
+                                JOIN observation_listen l ON l.observation_id = other.observation_id
+                                WHERE mine.observation_id = o.id),
                 (SELECT max(c.observation_id) FROM correction_target t
                  JOIN observation_correction c ON c.observation_id = t.correction_id
                  JOIN history_observation co ON co.id = c.observation_id

@@ -67,7 +67,7 @@ impl Tier {
     }
 }
 
-/// Which tiers past A are in force. A always is.
+/// Which tiers past A the matcher runs. A always does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Tiers {
     /// Tier B.
@@ -77,14 +77,8 @@ pub struct Tiers {
 }
 
 impl Tiers {
-    /// The tiers in force: A alone, until B and C have each been judged on
-    /// a sample of what they join.
-    pub const CURRENT: Self = Self {
-        during: false,
-        renamed: false,
-    };
-
-    /// Every tier, for a dry run that says what each would join.
+    /// Every tier: the matcher as derivation and the dry run run it. Fewer
+    /// are for weighing one tier against another.
     pub const ALL: Self = Self {
         during: true,
         renamed: true,
@@ -743,15 +737,20 @@ pub fn match_streams(
 
 /// A track's length, as its streams say it: the median time played among
 /// its events that ran to their end and played over thirty seconds, the
-/// lower of two middles. By track URI.
+/// lower of two middles. An event ran to its end when any of its rows says
+/// so, since its repeats share its time played. By track URI.
 pub fn lengths(streams: &[Stream], events: &[Event]) -> HashMap<String, i64> {
     let mut played: HashMap<&str, Vec<i64>> = HashMap::new();
     for event in events {
-        let Some(stream) = event.streams.first().and_then(|at| streams.get(*at)) else {
+        let mut rows = event.streams.iter().filter_map(|at| streams.get(*at));
+        let Some(stream) = rows.next() else {
             continue;
         };
         let r = &stream.record;
-        if r.reason_end.as_deref() == Some(TRACK_DONE) && r.ms_played > THIRTY_SECONDS_MS {
+        let ran_to_end = std::iter::once(stream)
+            .chain(rows)
+            .any(|row| row.record.reason_end.as_deref() == Some(TRACK_DONE));
+        if ran_to_end && r.ms_played > THIRTY_SECONDS_MS {
             played
                 .entry(r.track_uri.as_str())
                 .or_default()
@@ -919,7 +918,7 @@ mod tests {
         );
         // Eleven seconds is too far, and another title is not it.
         let scrobbles = [scrobble("Low Tide", -11), scrobble("Paper Lanterns", 0)];
-        let matched = match_streams(&streams, &scrobbles, Tiers::CURRENT, &Pins::default());
+        let matched = match_streams(&streams, &scrobbles, Tiers::default(), &Pins::default());
         assert!(matched.joins.is_empty());
     }
 
@@ -927,7 +926,7 @@ mod tests {
     fn back_to_back_plays_of_one_track_each_take_their_own_scrobble() {
         let streams = [stream("Low Tide", 200, 200), stream("Low Tide", 400, 200)];
         let scrobbles = [scrobble("Low Tide", 201), scrobble("Low Tide", 1)];
-        let matched = match_streams(&streams, &scrobbles, Tiers::CURRENT, &Pins::default());
+        let matched = match_streams(&streams, &scrobbles, Tiers::ALL, &Pins::default());
         let mut pairs: Vec<(i64, usize)> = matched
             .joins
             .iter()
@@ -961,19 +960,30 @@ mod tests {
     }
 
     #[test]
+    fn a_repeat_that_ran_to_its_end_gives_its_track_a_length_whichever_row_speaks() {
+        let mut first = stream("Low Tide", 120, 120);
+        first.record.reason_end = Some("endplay".to_owned());
+        let mut again = stream("Low Tide", 120, 120);
+        again.key = b"sp1:again".to_vec();
+        let streams = [first, again];
+        let events = events(&streams);
+        // The row that says it was ended speaks for the event.
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].streams, [0, 1]);
+        assert_eq!(
+            lengths(&streams, &events).get(&streams[0].record.track_uri),
+            Some(&120_000)
+        );
+    }
+
+    #[test]
     fn a_pause_moves_the_worked_out_start_past_what_tier_a_takes() {
         // Played 3:41 of a track with a pause of a minute: the worked-out
-        // start is a minute after the scrobble's stamp, which no tier takes
-        // and the dry run counts as where a pause would put it. A scrobble
-        // stamped while the stream played is tier B's.
+        // start is a minute after the scrobble's stamp, which no tier takes,
+        // B included, and the dry run counts as where a pause would put it.
+        // A scrobble stamped while the stream played is tier B's.
         let streams = [stream("Low Tide", 281, 221)];
         let scrobbles = [scrobble("Low Tide", 0)];
-        assert!(
-            match_streams(&streams, &scrobbles, Tiers::CURRENT, &Pins::default())
-                .joins
-                .is_empty()
-        );
-        // Stamped before the worked-out start: B does not take it either.
         assert!(all(&streams, &scrobbles).is_empty());
         let scrobbles = [scrobble("Low Tide", 150)];
         assert_eq!(
@@ -1025,9 +1035,9 @@ mod tests {
             all(&streams, &scrobbles),
             [("Low Tide - Live".to_owned(), 0, Some(Tier::Renamed), false)]
         );
-        // Not in force, it joins nothing.
+        // Tier A alone joins nothing.
         assert!(
-            match_streams(&streams, &scrobbles, Tiers::CURRENT, &Pins::default())
+            match_streams(&streams, &scrobbles, Tiers::default(), &Pins::default())
                 .joins
                 .is_empty()
         );

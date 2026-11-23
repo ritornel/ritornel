@@ -1636,7 +1636,7 @@ export type ImportPicturesParams = {
 /**
  * What stands in the way of applying a run, and what to do about it.
  */
-export type ImportProblem = "no_zone" | "tier_not_in_force";
+export type ImportProblem = "no_zone";
 
 /**
  * What a dry run found: what the run holds, and what applying it would
@@ -1720,7 +1720,7 @@ export type ImportReport = {
    */
   problems: Array<ImportProblem>,
   /**
-   * A sample of the joins of each tier not in force, for judging it.
+   * A sample of the joins of tiers B and C, for judging them.
    */
   samples: Array<JoinSample>,
 };
@@ -1816,11 +1816,12 @@ export type ImportYear = {
    */
   year: number,
   /**
-   * Listens Spotify reported: streams, each repeat counted once.
+   * Listens in force once the run is applied, the run's and those in
+   * force now: streams, each repeat counted once.
    */
   streams: number,
   /**
-   * Of those, the ones an earlier run stored already.
+   * Of those, the ones stored already.
    */
   alreadyStored: number,
   /**
@@ -5553,10 +5554,6 @@ export type TierJoins = {
    * The tier.
    */
   tier: StreamTier,
-  /**
-   * Whether it is in force: whether applying would join what it finds.
-   */
-  inForce: boolean,
   /**
    * Scrobbles it joins as a stream's own.
    */
