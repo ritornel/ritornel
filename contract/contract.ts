@@ -2234,7 +2234,9 @@ export type LibraryStatus = {
   libraryId: string,
   /**
    * The library revision: it counts the writes to the library, and a
-   * client that holds what it read at this revision may keep it.
+   * client that holds what it read at this revision may keep it. On a
+   * satellite it is 0: the library is its hub's, and a status answers
+   * without waiting on the hub.
    */
   revision: number,
 };

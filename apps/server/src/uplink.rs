@@ -10,9 +10,10 @@
 //! and job events come back to it alone. The server keeps one more
 //! connection for its own work: what its player reads, and its listens.
 //!
-//! A connection is made by walking the routes in order: on each, the
-//! satellite checks that the server there proves it holds the hub's pinned
-//! key before it presents its link session.
+//! A connection is made at the best address the routes give now, this
+//! network before a tailnet (`link::candidates`): at each, the satellite
+//! checks that the server there proves it holds the hub's pinned key
+//! before it presents its link session.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -235,29 +236,17 @@ impl Uplink {
                 return Err(problem.clone());
             }
         }
-        let mut tried = Vec::new();
         // Each route is resolved again at each dial, so a hub found by its
-        // name is found wherever its address has moved.
-        for route in self.link.routes.iter().take(link::MAX_ROUTES) {
-            // Each address has its own time, so one that does not answer
-            // leaves the next its chance.
-            let opened = async {
-                let mut why = Vec::new();
-                for address in link::resolve(route).await? {
-                    match link::within(link::CONNECT_WAIT, self.open(address)).await {
-                        Ok(client) => return Ok((address, client)),
-                        Err(problem) => why.push(format!("{address}: {problem}")),
-                    }
-                }
-                Err(why.join(", "))
-            };
-            match opened.await {
-                Ok((address, client)) => {
-                    self.answered(Some(address));
-                    return Ok(client);
-                }
-                Err(why) => tried.push(format!("{route}: {why}")),
+        // name is found wherever its address has moved, and the best way
+        // to it is chosen again: this network before a tailnet, and the
+        // next tried soon when one does not answer (`link::first_answer`).
+        let (candidates, mut tried) = link::candidates(&self.link.routes).await;
+        match link::first_answer(candidates, |address| self.open(address)).await {
+            Ok((address, client)) => {
+                self.answered(Some(address));
+                return Ok(client);
             }
+            Err(failed) => tried.extend(failed),
         }
         let why = if tried.is_empty() {
             "the link has no route to the hub".to_owned()

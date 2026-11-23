@@ -242,13 +242,7 @@ pub(crate) async fn resolve(route: &str) -> Result<Vec<SocketAddr>, String> {
             .map_err(|error| format!("it could not be resolved: {error}"))
     })
     .await?;
-    let mut usable = Vec::new();
-    for address in &found {
-        if address.is_ipv4() && is_private_route(address.ip()) && !usable.contains(address) {
-            usable.push(*address);
-        }
-    }
-    usable.truncate(MAX_ADDRESSES);
+    let usable = usable(route, &found);
     if usable.is_empty() {
         return Err(if found.is_empty() {
             "it resolves to no address".to_owned()
@@ -257,6 +251,174 @@ pub(crate) async fn resolve(route: &str) -> Result<Vec<SocketAddr>, String> {
         });
     }
     Ok(usable)
+}
+
+/// What a satellite may dial of what `route` resolved to: its IPv4
+/// addresses on a private network or a tailnet, best first ([`Way`]), and
+/// at most [`MAX_ADDRESSES`] of them.
+fn usable(route: &str, found: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut usable: Vec<SocketAddr> = Vec::new();
+    for address in found {
+        if address.is_ipv4() && is_private_route(address.ip()) && !usable.contains(address) {
+            usable.push(*address);
+        }
+    }
+    // Stable, so the resolver's order holds among equals.
+    usable.sort_by_key(|address| Way::of(route, *address));
+    usable.truncate(MAX_ADDRESSES);
+    usable
+}
+
+/// How long a satellite waits on one address before it also tries the
+/// next. An address on a home network answers in milliseconds.
+const STAGGER: Duration = Duration::from_millis(500);
+
+/// Tries `attempt` at each of `candidates`, best first, each given
+/// [`CONNECT_WAIT`], and returns the first that succeeds. The next is
+/// started when the one before fails or has not answered within
+/// [`STAGGER`], so the best way that answers soon is taken, and one that
+/// never answers does not hold up the rest. What failed is said.
+pub(crate) async fn first_answer<T, F>(
+    candidates: Vec<(String, SocketAddr)>,
+    attempt: impl Fn(SocketAddr) -> F,
+) -> Result<(SocketAddr, T), Vec<String>>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    use futures_util::StreamExt;
+    let start = |(route, address): (String, SocketAddr)| {
+        let tried = within(CONNECT_WAIT, attempt(address));
+        async move { (route, address, tried.await) }
+    };
+    let mut waiting = candidates.into_iter();
+    let mut running = futures_util::stream::FuturesUnordered::new();
+    let mut failed = Vec::new();
+    loop {
+        if running.is_empty() {
+            match waiting.next() {
+                Some(next) => running.push(start(next)),
+                None => return Err(failed),
+            }
+        }
+        tokio::select! {
+            Some((route, address, tried)) = running.next() => match tried {
+                Ok(answer) => return Ok((address, answer)),
+                Err(why) => {
+                    failed.push(format!("{route} ({address}): {why}"));
+                    if let Some(next) = waiting.next() {
+                        running.push(start(next));
+                    }
+                }
+            },
+            () = tokio::time::sleep(STAGGER), if waiting.len() > 0 => {
+                if let Some(next) = waiting.next() {
+                    running.push(start(next));
+                }
+            }
+        }
+    }
+}
+
+/// Where a route's address leads, in the order a satellite tries them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Way {
+    /// An address on this network, written as an address.
+    Here,
+    /// A name, such as `studio-mac.local`, that resolves to an address on
+    /// this network.
+    NamedHere,
+    /// An address on a tailnet: through a tunnel, which is slower for the
+    /// masters a satellite pulls.
+    Tailnet,
+}
+
+impl Way {
+    fn of(route: &str, address: SocketAddr) -> Self {
+        match address.ip() {
+            IpAddr::V4(v4) if crate::config::is_tailnet(v4) => Self::Tailnet,
+            _ if route.parse::<SocketAddr>().is_ok() => Self::Here,
+            _ => Self::NamedHere,
+        }
+    }
+}
+
+/// The addresses a satellite tries to reach its hub, best first, with the
+/// route each came from, and why any route gave none. Every route is
+/// resolved again, all at once, and what it gives is ordered by where it
+/// leads ([`Way`]): an address on this network, then a name that resolves
+/// to one, then a tailnet, so a satellite at home pulls masters over its
+/// own network and uses a tunnel only when that fails. Among equals, the
+/// order the invite named them holds.
+pub(crate) async fn candidates(routes: &[String]) -> (Vec<(String, SocketAddr)>, Vec<String>) {
+    let routes: Vec<&String> = routes.iter().take(MAX_ROUTES).collect();
+    let resolved =
+        futures_util::future::join_all(routes.iter().map(|route| resolve_recently(route))).await;
+    let mut problems = Vec::new();
+    let mut found = Vec::new();
+    for (route, addresses) in routes.into_iter().zip(resolved) {
+        match addresses {
+            Ok(addresses) => found.push((route.clone(), addresses)),
+            Err(why) => problems.push(format!("{route}: {why}")),
+        }
+    }
+    (order(found), problems)
+}
+
+/// What routes resolved to, one address a line, best first: by where each
+/// leads ([`Way`]), then in the order the routes were named, and an
+/// address that two routes give only once, where it ranks best.
+fn order(resolved: Vec<(String, Vec<SocketAddr>)>) -> Vec<(String, SocketAddr)> {
+    let mut found: Vec<(Way, String, SocketAddr)> = resolved
+        .into_iter()
+        .flat_map(|(route, addresses)| {
+            addresses
+                .into_iter()
+                .map(move |address| (Way::of(&route, address), route.clone(), address))
+        })
+        .collect();
+    // Stable, so the routes' order holds among equals.
+    found.sort_by_key(|(way, ..)| *way);
+    let mut seen = Vec::new();
+    found
+        .into_iter()
+        .filter(|(_, _, address)| {
+            let new = !seen.contains(address);
+            seen.push(*address);
+            new
+        })
+        .map(|(_, route, address)| (route, address))
+        .collect()
+}
+
+/// How long what a route resolved to, or that it resolved to nothing, is
+/// used again. A satellite opens a connection for each client session,
+/// and a name that does not resolve, such as a `.local` name away from
+/// home, would make each of them wait out [`RESOLVE_WAIT`] again.
+const RESOLVED_FOR: Duration = Duration::from_secs(30);
+
+type Resolved = Result<Vec<SocketAddr>, String>;
+
+/// What each route resolved to lately, and when.
+static RECENTLY: std::sync::LazyLock<Mutex<HashMap<String, (Instant, Resolved)>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// [`resolve`], or what it gave for `route` within [`RESOLVED_FOR`].
+async fn resolve_recently(route: &str) -> Resolved {
+    let recent = RECENTLY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(route)
+        .filter(|(at, _)| at.elapsed() < RESOLVED_FOR)
+        .map(|(_, resolved)| resolved.clone());
+    if let Some(resolved) = recent {
+        return resolved;
+    }
+    let resolved = resolve(route).await;
+    RECENTLY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(route.to_owned(), (Instant::now(), resolved.clone()));
+    resolved
 }
 
 /// Asks the server at `route` for its descriptor with a fresh nonce, and
@@ -481,6 +643,139 @@ mod tests {
         for ip in ["100.63.255.255", "100.128.0.1", "192.168.1.20"] {
             assert!(!crate::config::is_tailnet(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[test]
+    fn addresses_are_ordered_by_where_they_lead_and_each_tried_once() {
+        let routes = |list: &[(&str, &[&str])]| -> Vec<(String, Vec<SocketAddr>)> {
+            list.iter()
+                .map(|(route, addresses)| {
+                    (
+                        (*route).to_owned(),
+                        addresses.iter().map(|a| a.parse().unwrap()).collect(),
+                    )
+                })
+                .collect()
+        };
+        let ordered = order(routes(&[
+            // A tailnet's name, first as a satellite may have kept it.
+            ("studio.example-overlay.net:4747", &["100.64.0.9:4747"]),
+            // A name for this network that also gives a tailnet address.
+            (
+                "studio-mac.local:4747",
+                &["100.64.0.9:4747", "192.168.1.20:4747"],
+            ),
+            ("192.168.1.20:4747", &["192.168.1.20:4747"]),
+            ("10.0.0.2:4747", &["10.0.0.2:4747"]),
+        ]));
+        let ordered: Vec<(&str, String)> = ordered
+            .iter()
+            .map(|(route, address)| (route.as_str(), address.to_string()))
+            .collect();
+        assert_eq!(
+            ordered,
+            [
+                ("192.168.1.20:4747", "192.168.1.20:4747".to_owned()),
+                ("10.0.0.2:4747", "10.0.0.2:4747".to_owned()),
+                (
+                    "studio.example-overlay.net:4747",
+                    "100.64.0.9:4747".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_names_addresses_are_ranked_before_the_cap() {
+        let found: Vec<SocketAddr> = [
+            "100.64.0.1:4747",
+            "100.64.0.2:4747",
+            "8.8.8.8:4747",
+            "100.64.0.3:4747",
+            "100.64.0.4:4747",
+            "192.168.1.20:4747",
+            "100.64.0.1:4747",
+        ]
+        .iter()
+        .map(|address| address.parse().unwrap())
+        .collect();
+        let kept = usable("studio.example-overlay.net:4747", &found);
+        assert_eq!(kept.len(), MAX_ADDRESSES);
+        assert_eq!(kept[0], "192.168.1.20:4747".parse().unwrap());
+        assert_eq!(kept[1], "100.64.0.1:4747".parse().unwrap());
+    }
+
+    fn at(address: &str) -> (String, SocketAddr) {
+        (address.to_owned(), address.parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_best_address_that_answers_soon_is_taken_and_a_silent_one_holds_up_nothing() {
+        let (lan, tunnel) = ("192.168.1.20:4747", "100.64.0.1:4747");
+        // The better answers a moment later than the next would: it is
+        // still taken, since the next is not asked until it has had time.
+        let answered = first_answer(vec![at(lan), at(tunnel)], |address| async move {
+            if address.ip().to_string() == "192.168.1.20" {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok::<_, String>(address)
+        })
+        .await
+        .unwrap();
+        assert_eq!(answered.0, lan.parse().unwrap());
+
+        // One that never answers: the next is asked after the stagger, not
+        // after the whole connect wait.
+        let started = Instant::now();
+        let answered = first_answer(vec![at(lan), at(tunnel)], |address| async move {
+            if address.ip().to_string() == "192.168.1.20" {
+                std::future::pending::<()>().await;
+            }
+            Ok::<_, String>(address)
+        })
+        .await
+        .unwrap();
+        assert_eq!(answered.0, tunnel.parse().unwrap());
+        assert!(started.elapsed() < CONNECT_WAIT, "{:?}", started.elapsed());
+
+        // None answers: each says why.
+        let failed = first_answer(vec![at(lan), at(tunnel)], |_| async {
+            Err::<(), _>("refused".to_owned())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(failed.len(), 2, "{failed:?}");
+    }
+
+    #[tokio::test]
+    async fn this_network_is_tried_before_a_name_for_it_and_a_tailnet_last() {
+        let routes = [
+            "100.64.7.3:4747",
+            "localhost:4747",
+            "nowhere.invalid:4747",
+            "192.168.1.20:4747",
+            "10.0.0.2:4747",
+        ]
+        .map(str::to_owned);
+        let (found, problems) = candidates(&routes).await;
+        let order: Vec<_> = found
+            .iter()
+            .map(|(route, address)| (route.as_str(), address.ip().to_string()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("192.168.1.20:4747", "192.168.1.20".to_owned()),
+                ("10.0.0.2:4747", "10.0.0.2".to_owned()),
+                ("localhost:4747", "127.0.0.1".to_owned()),
+                ("100.64.7.3:4747", "100.64.7.3".to_owned()),
+            ]
+        );
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("nowhere.invalid:4747"),
+            "{problems:?}"
+        );
     }
 
     #[tokio::test]

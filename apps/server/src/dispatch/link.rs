@@ -336,26 +336,17 @@ impl Core {
             )
         })?;
         let name = self.name();
-        let (route, address, descriptor) = runtime
+        let (address, descriptor) = runtime
             .block_on(async {
-                let mut tried = Vec::new();
-                for route in &invite.routes {
-                    let addresses = match link::resolve(route).await {
-                        Ok(addresses) => addresses,
-                        Err(why) => {
-                            tried.push(format!("{route}: {why}"));
-                            continue;
-                        }
-                    };
-                    for address in addresses {
-                        let reached = link::reach(address, invite.hub, &invite.key, &*self.entropy);
-                        match link::within(link::CONNECT_WAIT, reached).await {
-                            Ok(descriptor) => return Ok((route.clone(), address, descriptor)),
-                            Err(why) => tried.push(format!("{route} ({address}): {why}")),
-                        }
-                    }
-                }
-                Err(format!("no route reached the hub. {}", tried.join("; ")))
+                let (candidates, mut tried) = link::candidates(&invite.routes).await;
+                let reached = link::first_answer(candidates, |address| {
+                    link::reach(address, invite.hub, &invite.key, &*self.entropy)
+                })
+                .await;
+                reached.map_err(|failed| {
+                    tried.extend(failed);
+                    format!("no route reached the hub. {}", tried.join("; "))
+                })
             })
             .map_err(|why| {
                 RpcError::new(ErrorCode::Unavailable, why).with_detail("reason", "hub_unreachable")
@@ -373,16 +364,9 @@ impl Core {
             .map_err(|why| {
                 RpcError::new(ErrorCode::Conflict, why).with_detail("reason", "refused")
             })?;
-        // The route that worked goes first, as the invite named it: a name
-        // is resolved again at each dial.
-        let mut routes = vec![route.clone()];
-        routes.extend(
-            invite
-                .routes
-                .iter()
-                .filter(|other| **other != route)
-                .cloned(),
-        );
+        // Kept as the invite named them: which is best is decided again at
+        // each dial (`link::candidates`).
+        let routes = invite.routes.clone();
         let identity = stores
             .server
             .link_to_hub(&HubLink {
@@ -396,7 +380,7 @@ impl Core {
                 linked_at_ms: self.clock.now_ms(),
             })
             .map_err(internal)?;
-        info!(hub = %invite.hub, library_id = %granted.library_id, %route, "linked to a hub");
+        info!(hub = %invite.hub, library_id = %granted.library_id, %address, "linked to a hub");
         if let Some(link) = stores.server.hub_link().map_err(internal)? {
             *self.uplink.write().unwrap_or_else(PoisonError::into_inner) =
                 Some(std::sync::Arc::new(crate::uplink::Uplink::new(
