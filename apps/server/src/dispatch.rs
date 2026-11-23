@@ -386,21 +386,19 @@ impl Core {
     /// followed. The machine is held, or let go, at once.
     pub(crate) fn follow_stored_awake(&self, stores: &Stores) {
         let mut awake = lock(&self.awake);
-        let stored = stores.server().awake();
-        awake.set_by_call = matches!(stored, Ok(Some(setting)) if setting.is_valid());
-        awake.setting = match stored {
-            Ok(Some(setting)) if setting.is_valid() => setting,
-            Ok(None) => ritornel_contract::Awake::default(),
+        (awake.setting, awake.set_by_call) = match stores.server().awake() {
+            Ok(Some(setting)) if setting.is_valid() => (setting, true),
+            Ok(None) => (ritornel_contract::Awake::default(), false),
             Ok(Some(setting)) => {
                 warn!(
                     ?setting,
                     "the stored wake setting is out of range: the default holds until it is set again"
                 );
-                ritornel_contract::Awake::default()
+                (ritornel_contract::Awake::default(), false)
             }
             Err(error) => {
                 warn!(%error, "the stored wake setting cannot be read: the default holds until it is set again");
-                ritornel_contract::Awake::default()
+                (ritornel_contract::Awake::default(), false)
             }
         };
         awake.follow_the_rule(self.clock.now_ms());

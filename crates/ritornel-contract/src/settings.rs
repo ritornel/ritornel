@@ -11,7 +11,8 @@ use crate::{Awake, Id};
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SetBy {
-    /// Nothing did: it is the default.
+    /// Neither a start-up setting nor a call: the default, or for the
+    /// name, the name the server already had.
     Default,
     /// `config.toml` in the data directory.
     File,
@@ -34,6 +35,40 @@ pub struct Setting<T> {
     pub set_by: SetBy,
 }
 
+/// Which network a server listens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ListenNetwork {
+    /// This machine alone, on `127.0.0.1`.
+    Loopback,
+    /// The private network, for satellites to reach it: every interface,
+    /// taking connections only from private addresses.
+    Private,
+}
+
+impl ListenNetwork {
+    /// The network as it is written on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Private => "private",
+        }
+    }
+}
+
+/// Where a server is set to listen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ListenOn {
+    /// The network.
+    pub network: ListenNetwork,
+    /// The port it is set to take. 0 asks the system for one. The port it
+    /// took is in `server.json`, and differs where the system picked it.
+    pub port: u16,
+}
+
 /// The least severe level the server logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -49,6 +84,19 @@ pub enum LogLevel {
     Debug,
     /// Everything.
     Trace,
+}
+
+impl LogLevel {
+    /// The level as it is written on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
 }
 
 /// The result of `server.settings`: the settings of the server called,
@@ -70,10 +118,9 @@ pub struct ServerSettings {
     /// The most a satellite's cache of masters pulled from its hub holds,
     /// in bytes. 2 GiB by default.
     pub cache_bytes: Setting<u64>,
-    /// Where it listens: `127.0.0.1:<port>`, or `private:<port>` for the
-    /// private network. By default `127.0.0.1:4747`, or a port the system
-    /// picks when that one is taken.
-    pub listen: Setting<String>,
+    /// Where it is set to listen. By default on loopback, port 4747, and
+    /// on a port the system picks when that one is taken.
+    pub listen: Setting<ListenOn>,
     /// The least severe level it logs.
     pub log_level: Setting<LogLevel>,
     /// The folder backups are written to, outside the data directory.

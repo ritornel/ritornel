@@ -2664,6 +2664,26 @@ export type ListWindowParams = {
 };
 
 /**
+ * Which network a server listens on.
+ */
+export type ListenNetwork = "loopback" | "private";
+
+/**
+ * Where a server is set to listen.
+ */
+export type ListenOn = {
+  /**
+   * The network.
+   */
+  network: ListenNetwork,
+  /**
+   * The port it is set to take. 0 asks the system for one. The port it
+   * took is in `server.json`, and differs where the system picked it.
+   */
+  port: number,
+};
+
+/**
  * What became of a listen a satellite sent.
  */
 export type ListenTaken = "stored" | "duplicate" | "conflict";
@@ -4401,11 +4421,10 @@ export type ServerSettings = {
    */
   cacheBytes: Setting<number>,
   /**
-   * Where it listens: `127.0.0.1:<port>`, or `private:<port>` for the
-   * private network. By default `127.0.0.1:4747`, or a port the system
-   * picks when that one is taken.
+   * Where it is set to listen. By default on loopback, port 4747, and
+   * on a port the system picks when that one is taken.
    */
-  listen: Setting<string>,
+  listen: Setting<ListenOn>,
   /**
    * The least severe level it logs.
    */

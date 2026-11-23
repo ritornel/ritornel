@@ -659,7 +659,7 @@ fn settings_say_what_gave_each_and_the_wake_setting_is_changed_from_a_terminal()
     );
     assert_eq!(
         shown["listen"],
-        json!({ "value": "127.0.0.1:0", "setBy": "flag" })
+        json!({ "value": { "network": "loopback", "port": 0 }, "setBy": "flag" })
     );
     assert_eq!(
         shown["logLevel"],

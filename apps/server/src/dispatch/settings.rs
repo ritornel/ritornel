@@ -83,7 +83,7 @@ impl Core {
                 set_by: set_by(origins.cache_size),
             },
             listen: Setting {
-                value: start_up.listen.to_string(),
+                value: start_up.listen.into(),
                 set_by: set_by(origins.listen),
             },
             log_level: Setting {

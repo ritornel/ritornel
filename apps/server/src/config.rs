@@ -143,15 +143,17 @@ impl Listen {
     }
 }
 
-impl fmt::Display for Listen {
-    /// The setting as it is written: `127.0.0.1` and a port, or `private`
-    /// and a port. The default is written with the port it tries first.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let port = self.port.unwrap_or(DEFAULT_PORT);
-        if self.private {
-            write!(f, "private:{port}")
-        } else {
-            write!(f, "127.0.0.1:{port}")
+impl From<Listen> for ritornel_contract::ListenOn {
+    /// The setting as `server.settings` reports it. The default is
+    /// reported with the port it tries first.
+    fn from(listen: Listen) -> Self {
+        Self {
+            network: if listen.private {
+                ritornel_contract::ListenNetwork::Private
+            } else {
+                ritornel_contract::ListenNetwork::Loopback
+            },
+            port: listen.port.unwrap_or(DEFAULT_PORT),
         }
     }
 }
@@ -416,7 +418,10 @@ fn bytes(text: &str) -> Option<u64> {
         _ => return None,
     };
     let number: u64 = number.parse().ok().filter(|number| *number > 0)?;
-    number.checked_mul(1 << shift)
+    // Every number of the contract fits in 53 bits, and the size is one.
+    number
+        .checked_mul(1 << shift)
+        .filter(|bytes| *bytes < 1 << 53)
 }
 
 /// The server's name, without the spaces around it: some text, no longer
@@ -962,6 +967,30 @@ mod tests {
                 .log_level,
             Level::DEBUG
         );
+    }
+
+    #[test]
+    fn the_listen_setting_is_reported_with_the_port_it_takes_first() {
+        use ritornel_contract::{ListenNetwork, ListenOn};
+        let on = |network, port| ListenOn { network, port };
+        assert_eq!(
+            ListenOn::from(Listen::DEFAULT),
+            on(ListenNetwork::Loopback, DEFAULT_PORT)
+        );
+        assert_eq!(
+            ListenOn::from(Listen::on_port(0)),
+            on(ListenNetwork::Loopback, 0)
+        );
+        assert_eq!(
+            ListenOn::from(Listen::private_on_port(4800)),
+            on(ListenNetwork::Private, 4800)
+        );
+    }
+
+    #[test]
+    fn a_cache_size_fits_in_53_bits() {
+        assert_eq!(bytes("8388607 GiB"), Some(8_388_607 << 30));
+        assert_eq!(bytes("8388608 GiB"), None);
     }
 
     #[test]

@@ -1319,7 +1319,15 @@ async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_st
             awake: Some(Awake::Never),
             ..once
         };
-        assert!(hub_client.call::<ServerSetSettings>(&other).await.is_err());
+        let refused = hub_client
+            .call::<ServerSetSettings>(&other)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            code(&refused),
+            Some(ErrorCode::IdempotencyMismatch),
+            "{refused}"
+        );
         let again = hub_client.call::<ServerSetSettings>(&once).await.unwrap();
         assert_eq!(again.settings.awake.value, Awake::Always);
         // Setting the default is a choice, and is kept as one.

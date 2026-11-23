@@ -130,7 +130,8 @@ pub use server::{
     WatchingSet, descriptor_proof,
 };
 pub use settings::{
-    LogLevel, ServerSettings, ServerSettingsSet, SetBy, SetServerSettingsParams, Setting,
+    ListenNetwork, ListenOn, LogLevel, ServerSettings, ServerSettingsSet, SetBy,
+    SetServerSettingsParams, Setting,
 };
 pub use ticket::{SocketTicket, TICKET_PARAM};
 

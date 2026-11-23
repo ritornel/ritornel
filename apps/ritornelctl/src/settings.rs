@@ -6,7 +6,8 @@ use std::io::Write;
 
 use ritornel_client::contract::methods::{ServerSetSettings, ServerSettingsCall};
 use ritornel_client::contract::{
-    Awake, LogLevel, NoParams, ServerSettings, ServerSettingsSet, SetBy, SetServerSettingsParams,
+    Awake, ListenNetwork, ListenOn, NoParams, ServerSettings, ServerSettingsSet, SetBy,
+    SetServerSettingsParams,
 };
 use ritornel_client::local;
 
@@ -92,13 +93,11 @@ fn size(bytes: u64) -> String {
     }
 }
 
-fn level(level: LogLevel) -> &'static str {
-    match level {
-        LogLevel::Error => "error",
-        LogLevel::Warn => "warn",
-        LogLevel::Info => "info",
-        LogLevel::Debug => "debug",
-        LogLevel::Trace => "trace",
+/// Where the server is set to listen, as `--listen` takes it.
+fn listen(listen: ListenOn) -> String {
+    match listen.network {
+        ListenNetwork::Loopback => format!("127.0.0.1:{}", listen.port),
+        ListenNetwork::Private => format!("private:{}", listen.port),
     }
 }
 
@@ -132,13 +131,13 @@ fn render(settings: &ServerSettings) -> String {
             ),
         ),
         (
-            "Listens on",
-            given(settings.listen.value.clone(), settings.listen.set_by),
+            "Listen",
+            given(listen(settings.listen.value), settings.listen.set_by),
         ),
         (
             "Log level",
             given(
-                level(settings.log_level.value).to_owned(),
+                settings.log_level.value.as_str().to_owned(),
                 settings.log_level.set_by,
             ),
         ),
@@ -158,7 +157,7 @@ fn render(settings: &ServerSettings) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ritornel_client::contract::Setting;
+    use ritornel_client::contract::{LogLevel, Setting};
 
     use super::*;
 
@@ -207,7 +206,10 @@ mod tests {
                 set_by: SetBy::File,
             },
             listen: Setting {
-                value: "private:4747".to_owned(),
+                value: ListenOn {
+                    network: ListenNetwork::Private,
+                    port: 4747,
+                },
                 set_by: SetBy::Flag,
             },
             log_level: Setting {
@@ -225,7 +227,7 @@ mod tests {
 Name              Kitchen Speakers (environment)
 Awake             never (set by a call)
 Cache             512 MiB (config.toml)
-Listens on        private:4747 (command line)
+Listen            private:4747 (command line)
 Log level         info (default)
 Backups           none (default)
 "

@@ -100,8 +100,8 @@ fn internal(error: impl std::fmt::Display) -> RpcError {
 /// Whether `method` is kept from a satellite's link session: what names
 /// the hub's own folders, which a satellite cannot see, and what is for the
 /// hub's own machine alone, such as its backups, its settings and its
-/// links. A satellite
-/// is trusted with the library's calls and its own listens, and no more.
+/// links. A satellite is trusted with the library's calls and its own
+/// listens, and no more.
 pub(super) fn kept_from_a_link(method: &str) -> bool {
     matches!(
         method,
