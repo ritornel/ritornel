@@ -16,6 +16,6 @@ mod windows;
 #[cfg(windows)]
 use windows as system;
 
-pub(crate) use system::start_without_console;
+pub(crate) use system::{ask_to_stop, start_without_console};
 #[cfg(test)]
 pub(crate) use system::{script, try_hold_as_a_server};

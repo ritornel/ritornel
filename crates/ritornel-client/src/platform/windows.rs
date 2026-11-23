@@ -14,6 +14,27 @@ pub(crate) fn start_without_console(command: &mut Command) {
     std::os::windows::process::CommandExt::creation_flags(command, CREATE_NO_WINDOW);
 }
 
+/// Asks the process `pid` to stop, as the system asks a program to end:
+/// `taskkill` without `/F` closes its windows, and the server's hidden one
+/// stops it cleanly. Only a process the user may end can be asked.
+pub(crate) fn ask_to_stop(pid: u32) -> std::io::Result<()> {
+    let mut command = Command::new("taskkill");
+    start_without_console(&mut command);
+    let asked = command
+        .args(["/PID", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if asked.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "taskkill could not ask process {pid} to end"
+        )))
+    }
+}
+
 /// Tries to hold a lock file as a running server does: the one byte past
 /// its end that a server holds, which leaves the pid in it readable
 /// (`local::WINDOWS_LOCK_BYTE`).

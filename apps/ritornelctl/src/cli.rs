@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! ritornelctl status [--dismiss] [--data-dir <dir>] [--json]
+//! ritornelctl server stop [--data-dir <dir>] [--json]
 //! ritornelctl backup [--data-dir <dir>] [--json]
 //! ritornelctl export <folder> [--data-dir <dir>] [--json]
 //! ritornelctl library create [--data-dir <dir>] [--json]
@@ -58,6 +59,7 @@ running on a data directory, and never starts one.
 
 Usage:
   ritornelctl status [--dismiss] [--data-dir <dir>] [--json]
+  ritornelctl server stop [--data-dir <dir>] [--json]
   ritornelctl backup [--data-dir <dir>] [--json]
   ritornelctl export <folder> [--data-dir <dir>] [--json]
   ritornelctl library create [--data-dir <dir>] [--json]
@@ -101,6 +103,10 @@ Commands:
                    in history, each scrobble answered, each import done.
                    Scrobbles that ended unanswered or were not sent are
                    said until --dismiss sets them aside
+  server stop      Stop the server on the data directory, cleanly, as the
+                   system does at shutdown: the player pauses and keeps its
+                   place. Only the user's own server, on this machine. The
+                   desktop app starts it again when it opens
   backup           Copy the server's databases, with the listening history,
                    into a new folder in the server's backup folder, while
                    it goes on playing. The backup folder is named when the
@@ -147,7 +153,8 @@ Commands:
                    plays on when this program ends
   pause, resume    Pause, and play on. After the server restarts, resume
                    carries on where the last run stopped
-  stop             Stop. Resume plays the track from its beginning
+  stop             Stop playing. Resume plays the track from its beginning.
+                   The server runs on; `server stop` stops it
   next, previous   Skip forward, or back. Previous starts the track again
                    when it is more than three seconds in
   seek <position>  Move the playing track to a position: seconds, or m:ss
@@ -393,6 +400,13 @@ enum Command {
     Lastfm(LastfmCommand),
     #[command(subcommand)]
     Link(LinkCommand),
+    #[command(subcommand)]
+    Server(ServerCommand),
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum ServerCommand {
+    Stop(ServerArgs),
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
@@ -800,6 +814,7 @@ fn try_run(
     };
     match command {
         Command::Status(args) => status::status(&args, env, out),
+        Command::Server(ServerCommand::Stop(args)) => crate::server::stop(&args, env, out),
         Command::Backup(args) => backup::backup(&args, env, out),
         Command::Export(args) => export::export(&args, env, out),
         Command::Library(LibraryCommand::Create(args)) => library::create(&args, env, out),

@@ -6,6 +6,25 @@ use std::process::Command;
 /// Starts `command` with no console window: on Unix there is none to make.
 pub(crate) fn start_without_console(_command: &mut Command) {}
 
+/// Asks the process `pid` to stop, as the system does at shutdown: a
+/// SIGTERM, which a server answers by stopping cleanly. Only a process of
+/// the same user can be asked.
+pub(crate) fn ask_to_stop(pid: u32) -> std::io::Result<()> {
+    let asked = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if asked.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "kill could not signal process {pid}"
+        )))
+    }
+}
+
 /// Tries to hold a lock file as a running server does: the whole file.
 #[cfg(test)]
 pub(crate) fn try_hold_as_a_server(file: &std::fs::File) -> bool {

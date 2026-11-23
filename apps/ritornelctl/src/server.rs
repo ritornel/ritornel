@@ -17,6 +17,30 @@ use crate::cli::{Error, ServerArgs};
 pub(crate) const ANSWER_WAIT: Duration = Duration::from_secs(10);
 
 /// Finds the server the arguments name, says hello, and makes one call.
+/// `ritornelctl server stop`: asks the server on the data directory to
+/// stop, and waits for it to have stopped.
+pub(crate) fn stop(
+    args: &ServerArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let data_dir = local::data_dir(args.data_dir.as_deref(), env)?;
+    let stopped = local::stop(&data_dir, ritornel_client::launch::STOP_WAIT)?;
+    print(
+        args,
+        out,
+        &stopped,
+        |stopped| serde_json::to_string_pretty(&serde_json::json!({ "stopped": stopped })),
+        |stopped| {
+            if *stopped {
+                "The server has stopped.\n".to_owned()
+            } else {
+                "The server was asked to stop, and is still stopping.\n".to_owned()
+            }
+        },
+    )
+}
+
 pub(crate) fn ask<T>(
     args: &ServerArgs,
     env: local::Env<'_>,

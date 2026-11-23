@@ -265,6 +265,40 @@ pub async fn find(data_dir: &Path) -> Result<LocalServer, Error> {
     })
 }
 
+/// Asks the server running on `data_dir` to stop, as the system does at
+/// shutdown, and waits up to `wait` for it to have stopped: for the lock
+/// to be let go. A server stops cleanly when asked: it pauses the player,
+/// keeps where it was and lets its databases go. It is the user's own
+/// server that is asked: only one who can read the directory's
+/// credential, and so the process's owner, gets this far, and only on
+/// this machine. Any contract version is asked alike, so an old server
+/// can be stopped before it is replaced. Says whether it stopped within
+/// `wait`; one that has not is still stopping, and is not killed.
+pub fn stop(data_dir: &Path, wait: Duration) -> Result<bool, Error> {
+    let named = alive(data_dir)?;
+    let path = data_dir.join(local::CREDENTIAL);
+    read(&path)?.ok_or_else(|| Error::File {
+        doing: "read",
+        path,
+        source: ErrorKind::NotFound.into(),
+    })?;
+    crate::platform::ask_to_stop(named.pid).map_err(|source| Error::File {
+        doing: "stop the server holding",
+        path: data_dir.join(local::SERVER_LOCK),
+        source,
+    })?;
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if probe(data_dir)? == Lock::Free {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
