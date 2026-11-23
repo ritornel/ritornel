@@ -329,8 +329,9 @@ fn ritornelctl_play_plays_a_folder_start_to_finish_and_every_listen_reaches_hist
     let folder = music.to_str().unwrap();
     // Ten times real time: each track lasts four seconds, through several
     // of the looks `play --follow` takes every half second, so a slow
-    // machine misses neither. The server's zone is one far from midnight, so that "today" cannot turn
-    // between the plays and the question of what was played on it.
+    // machine misses neither. The server's zone is one far from midnight,
+    // so that "today" cannot turn between the plays and the question of
+    // what was played on it.
     let zone = a_zone_at_noon();
     let server = Server::start(
         &data_dir,
