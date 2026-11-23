@@ -88,6 +88,20 @@ pub(crate) fn open(
     Ok((identity, Some(library)))
 }
 
+/// Gives this server's row in the library's registry of servers the name
+/// `server.db` gives it, after a rename at start or while it runs. The two
+/// files cannot commit together, so a registry left behind, as by a crash
+/// between them, is put right at the next start. Nothing is written when
+/// the names already agree.
+pub(crate) fn keep_registry_name(library: &LibraryStore, identity: &ServerIdentity) {
+    let behind = library
+        .server_name(identity.server_id)
+        .is_ok_and(|known| known.is_some_and(|known| known != identity.name));
+    if behind && let Err(error) = library.register_server(identity.server_id, &identity.name) {
+        warn!(%error, "the library's registry keeps this server's old name");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -210,6 +224,50 @@ mod tests {
         };
         assert_eq!(refused.kind(), ErrorCode::Conflict);
         server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_hub_renamed_at_start_keeps_the_librarys_registry_in_step() {
+        let scratch = Scratch::new();
+        let data_dir = scratch.path().join("data");
+        let server = start(&data_dir).await.unwrap();
+        let this = server.server_id();
+        client(&server)
+            .await
+            .create_library(key(0xc0))
+            .await
+            .unwrap();
+        let first = server.name();
+        server.stop().await.unwrap();
+        let registry = || -> String {
+            rusqlite::Connection::open(data_dir.join("library.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT name FROM server WHERE public_id = ?1",
+                    [this.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(registry(), first);
+
+        // Named by its settings now: the registry follows.
+        let server = Server::start_run(
+            HeldDir::take(data_dir.clone()).unwrap(),
+            Listen::on_port(0),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+            crate::Bounds::default(),
+            crate::Run {
+                name: Some("Porch Speakers".to_owned()),
+                ..crate::Run::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.name(), "Porch Speakers");
+        server.stop().await.unwrap();
+        assert_eq!(registry(), "Porch Speakers");
     }
 
     #[tokio::test]

@@ -682,23 +682,31 @@ impl Core {
         library
     }
 
-    /// Renames the server, and sends its new status to every session that
-    /// subscribed to the `servers` topic.
+    /// Renames the server, keeps its row in the library's registry of
+    /// servers in step on a hub, and sends its new status to every session
+    /// that subscribed to the `servers` topic.
     ///
     /// No call of the contract reaches this yet; it is used by tests to
     /// change a server's status and exercise the `servers` topic.
     pub(crate) fn rename(&self, name: &str) -> Result<(), Error> {
-        // The database before the name, as a call takes them: the other
+        // The databases before the name, as a call takes them: the other
         // order could wait on a call while that call waits on this.
         let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
         let stores = stores.as_ref().ok_or(Error::Stopped)?;
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         // Held from the write to the last publish, so two renames reach
-        // every session in the order they were stored.
+        // every session, and the registry, in the order they were stored.
         let mut this = lock(&self.this);
         let Some(identity) = stores.server.rename(name)? else {
             // A core is made from an identity, so there is always one.
             return Ok(());
         };
+        if let Some(library) = library.as_ref() {
+            crate::library::keep_registry_name(library, &identity);
+        }
         this.name = identity.name;
         self.changed(&mut this);
         Ok(())
@@ -1737,6 +1745,30 @@ mod tests {
         // The library is a file only the OS user can read.
         let library_db = scratch.path().join("data/library.db");
         assert!(crate::platform::path_is_private(&library_db));
+    }
+
+    #[test]
+    fn a_hub_renamed_while_it_runs_keeps_the_librarys_registry_in_step() {
+        let (core, scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
+        let registry = || -> (String, i64) {
+            rusqlite::Connection::open(scratch.path().join("data/library.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT name, (SELECT rev FROM library_meta) FROM server WHERE public_id = ?1",
+                    [core.server_id().as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(registry(), ("desk".to_owned(), 1));
+
+        core.rename("attic").unwrap();
+        assert_eq!(registry(), ("attic".to_owned(), 2));
+        // The same name again writes nothing.
+        core.rename("attic").unwrap();
+        assert_eq!(registry(), ("attic".to_owned(), 2));
     }
 
     #[test]

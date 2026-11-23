@@ -181,13 +181,8 @@ impl Server {
         let (identity, library) = library::open(dir, &store, identity, &clock, &entropy)?;
         // A hub renamed at start, as after its computer's name, keeps the
         // library's registry of servers in step.
-        if let Some(library) = &library
-            && library
-                .server_name(identity.server_id)
-                .is_ok_and(|known| known.is_some_and(|known| known != identity.name))
-            && let Err(error) = library.register_server(identity.server_id, &identity.name)
-        {
-            warn!(%error, "the library's registry keeps this server's old name");
+        if let Some(library) = &library {
+            library::keep_registry_name(library, &identity);
         }
 
         // This run holds the directory's lock, so whatever run claimed a
