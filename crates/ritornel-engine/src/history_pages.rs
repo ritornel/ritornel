@@ -365,10 +365,10 @@ fn history_of(
 /// local date: from the local year of their first dated play to this year,
 /// or to the next, where a play already heard in a zone ahead of the
 /// server's has reached it. A play dated after now, by a clock that was
-/// wrong, does not stretch it. The first dated play in time is not always
-/// the first by local date: one heard just after midnight on New
-/// Year's Day in a zone far ahead can come before one heard late on New
-/// Year's Eve in a zone far behind. So each end is the earliest or latest
+/// wrong, neither begins nor stretches it. The first dated play in time is
+/// not always the first by local date: one heard just after midnight on
+/// New Year's Day in a zone far ahead can come before one heard late on
+/// New Year's Eve in a zone far behind. So each end is the earliest or latest
 /// local date among the plays near it in time.
 fn span(connection: &Connection, listener: i64, today: Today) -> Result<Option<YearSpan>, Error> {
     let (first, last): (Option<i64>, Option<i64>) = connection
@@ -377,7 +377,7 @@ fn span(connection: &Connection, listener: i64, today: Today) -> Result<Option<Y
                (SELECT min(pe.local_date) FROM play_event pe,
                   (SELECT event_at_utc_ms AS at FROM play_event
                    WHERE listener_id = ?1 AND counts = 1 AND excluded = 0
-                     AND local_date IS NOT NULL AND event_at_utc_ms IS NOT NULL
+                     AND local_date IS NOT NULL AND event_at_utc_ms <= ?3
                    ORDER BY event_at_utc_ms LIMIT 1) began
                 WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
                   AND pe.local_date IS NOT NULL

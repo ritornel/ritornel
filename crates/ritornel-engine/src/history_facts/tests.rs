@@ -238,6 +238,13 @@ fn a_time_of_day_is_said_only_where_it_stands_out() {
             .collect(),
     ));
     assert_eq!(of(&facts(&gathered, TODAY), FactKind::TimeOfDay), None);
+    // Dated after now, by a clock that was wrong: no time of day.
+    gathered.record = Some(record(
+        (0..40)
+            .map(|at| heard(-300 - at, 20270101, 1, 20, 0))
+            .collect(),
+    ));
+    assert_eq!(of(&facts(&gathered, TODAY), FactKind::TimeOfDay), None);
 }
 
 #[test]

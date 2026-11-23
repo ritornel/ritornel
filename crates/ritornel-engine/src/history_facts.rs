@@ -119,9 +119,13 @@ fn long(date: i64) -> String {
 /// The part of the day most of a record's plays fall in, when it holds
 /// 45% of them and there are enough to say: the part, its plays, and all
 /// the plays with an hour.
-fn leaning(plays: &[Heard]) -> Option<(usize, u64, u64)> {
+fn leaning(plays: &[Heard], now_ms: i64) -> Option<(usize, u64, u64)> {
     let mut parts = [0_u64; 4];
-    for heard in plays {
+    // A play after now, by a clock that was wrong, has no time of day.
+    for heard in plays
+        .iter()
+        .filter(|heard| heard.at_ms.is_none_or(|at| at <= now_ms))
+    {
         if let Some(part) = heard
             .hour
             .and_then(|hour| usize::try_from(hour / 6).ok())
@@ -274,7 +278,7 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
     // A part of the day that holds most of its plays, and half as many
     // again as the listener's plays at that time hold of theirs.
     let all: u64 = gathered.parts.iter().sum();
-    if let Some((part, most, timed)) = leaning(&record.plays)
+    if let Some((part, most, timed)) = leaning(&record.plays, today.now_ms)
         && all > 0
         && 2 * most * all >= 3 * gathered.parts.get(part).copied().unwrap_or(0) * timed
         && let Some(name) = PARTS.get(part)
@@ -528,7 +532,7 @@ fn read_track(
     let mut parts = [0_u64; 4];
     if record
         .as_ref()
-        .is_some_and(|record| leaning(&record.plays).is_some())
+        .is_some_and(|record| leaning(&record.plays, today.now_ms).is_some())
     {
         let mut statement = connection.prepare_cached(PARTS_OF_DAY)?;
         let mut rows = statement.query([listener])?;
