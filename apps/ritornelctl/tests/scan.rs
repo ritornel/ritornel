@@ -128,7 +128,14 @@ fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) 
         let _ = child.wait();
         panic!("ritornelctl {args:?} did not end within {WAIT:?}");
     };
-    (child.wait().unwrap().code(), stdout, stderr)
+    let ended = child.wait().unwrap();
+    // No test has ritornelctl ended by a signal: one that was, was ended from
+    // outside the test, and the failure says so rather than as a code.
+    assert!(
+        ended.code().is_some(),
+        "ritornelctl {args:?} was ended from outside: {ended}\n--- stdout\n{stdout}--- stderr\n{stderr}"
+    );
+    (ended.code(), stdout, stderr)
 }
 
 /// `ritornelctl` with `--json`, which must succeed, as the JSON it printed.
@@ -139,8 +146,7 @@ fn json(data_dir: &Path, args: &[&str]) -> Value {
 }
 
 /// Runs `ritornelctl` and returns what it printed. Unless it succeeded,
-/// the test fails with its exit code, `None` when a signal ended it, and
-/// everything it printed.
+/// the test fails with its exit code and everything it printed.
 fn ok(data_dir: &Path, args: &[&str]) -> String {
     let (code, stdout, stderr) = ritornelctl(data_dir, args);
     assert_eq!(

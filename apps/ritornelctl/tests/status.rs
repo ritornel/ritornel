@@ -123,9 +123,16 @@ fn run(mut command: Command) -> Ended {
         let _ = child.wait();
         panic!("{command:?} did not end within {WAIT:?}");
     };
+    // Both pipes are at their end, so the process has ended. No test has
+    // ritornelctl ended by a signal: one that was, was ended from outside
+    // the test, and the failure says so rather than as a code.
+    let ended = child.wait().unwrap();
+    assert!(
+        ended.code().is_some(),
+        "{command:?} was ended from outside: {ended}\n--- stdout\n{stdout}--- stderr\n{stderr}"
+    );
     Ended {
-        // Both pipes are at their end, so the process has ended.
-        code: child.wait().unwrap().code(),
+        code: ended.code(),
         stdout,
         stderr,
     }
