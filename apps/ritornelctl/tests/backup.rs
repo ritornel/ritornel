@@ -277,8 +277,7 @@ fn with_no_backup_folder_there_is_no_backup_and_nothing_is_written_beside_the_da
 
     let status = json(&data_dir, &["status"]);
     assert_eq!(status["backup"], serde_json::json!({}), "{status}");
-    let (code, stdout, _) = ritornelctl(&data_dir, &["status"]);
-    assert_eq!(code, Some(0));
+    let stdout = ok(&data_dir, &["status"]);
     assert!(
         stdout.contains("Backup            none: no backup folder is named"),
         "{stdout}"
@@ -504,7 +503,7 @@ fn while_a_listen_cannot_be_saved_playback_goes_on_and_the_status_says_so_and_si
     ok(&data_dir, &["scan", folder]);
     let status = json(&data_dir, &["status"]);
     assert_eq!(status["record"]["problems"], serde_json::json!([]));
-    let (_, stdout, _) = ritornelctl(&data_dir, &["status"]);
+    let stdout = ok(&data_dir, &["status"]);
     assert!(stdout.contains("Record            advancing"), "{stdout}");
 
     ok(&data_dir, &["play", folder]);
@@ -521,7 +520,7 @@ fn while_a_listen_cannot_be_saved_playback_goes_on_and_the_status_says_so_and_si
         now["positionMs"].as_u64().unwrap() > before
     });
     assert_eq!(now["status"], "playing");
-    let (_, stdout, _) = ritornelctl(&data_dir, &["status"]);
+    let stdout = ok(&data_dir, &["status"]);
     assert!(
         stdout.contains("Record            The listen playing can’t be saved, since "),
         "{stdout}"

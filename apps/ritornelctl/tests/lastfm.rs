@@ -377,8 +377,7 @@ fn logs(data_dir: &Path) -> String {
 /// album and that artist, so the two say the same.
 fn page_agrees_with_the_plays(data_dir: &Path, what: &str, name: &str, plays: &Value) {
     let page = json(data_dir, &["history", what, name]);
-    let (code, text, stderr) = ritornelctl(data_dir, &["history", what, name]);
-    assert_eq!(code, Some(0), "{stderr}");
+    let text = ok(data_dir, &["history", what, name]);
     let said: String = page["sentence"]
         .as_array()
         .unwrap()
@@ -490,7 +489,7 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
         stdout.ends_with("Signed in to Last.fm as someone.\n"),
         "{stdout}"
     );
-    let (_, status, _) = ritornelctl(&data_dir, &["lastfm", "status"]);
+    let status = ok(&data_dir, &["lastfm", "status"]);
     assert!(status.contains("Account           someone\n"), "{status}");
 
     // A sync waits for the zones.
@@ -510,7 +509,7 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
             "2009-08-01",
         ],
     ] {
-        assert_eq!(ritornelctl(&data_dir, zone).0, Some(0), "{zone:?}");
+        ok(&data_dir, zone);
     }
     let zones = json(&data_dir, &["history", "zones"]);
     assert_eq!(zones["periods"][1]["from"], "2009-06-01");
@@ -561,7 +560,7 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
         "Second Wind"
     );
     assert_eq!(report["absentPlays"], 10);
-    let (_, text, _) = ritornelctl(&data_dir, &["lastfm", "report"]);
+    let text = ok(&data_dir, &["lastfm", "report"]);
     assert!(
         text.contains("Plays matched     21 of 41 (51.2%)"),
         "{text}"
@@ -569,8 +568,7 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
 
     // The loved track shows as loved.
     let track = play["track"]["appearanceId"].as_str().unwrap();
-    let (code, shown, _) = ritornelctl(&data_dir, &["show", track]);
-    assert_eq!(code, Some(0));
+    let shown = ok(&data_dir, &["show", track]);
     assert!(
         shown.contains("Loved             by lastfm:someone"),
         "{shown}"
@@ -641,7 +639,7 @@ fn the_hub_imports_on_its_own_when_it_starts_and_a_failure_waits_for_the_next_tr
         "someone"
     );
     assert!(stderr.contains(TOKEN), "{stderr}");
-    let (_, text, _) = ritornelctl(&data_dir, &["lastfm", "status"]);
+    let text = ok(&data_dir, &["lastfm", "status"]);
     assert!(
         text.contains("Next import       only by hand: no zones"),
         "{text}"
@@ -673,7 +671,7 @@ fn the_hub_imports_on_its_own_when_it_starts_and_a_failure_waits_for_the_next_tr
     assert!(import["last"]["failure"].is_string(), "{status}");
     assert_eq!(import["next"], ended + 6 * 3_600_000, "{status}");
     assert_eq!(import["onOpenAfter"], ended + 3_600_000, "{status}");
-    let (_, text, _) = ritornelctl(&data_dir, &["lastfm", "status"]);
+    let text = ok(&data_dir, &["lastfm", "status"]);
     assert!(text.contains(", failed: Last.fm: "), "{text}");
     assert!(text.contains(", or when the app opens after "), "{text}");
     let jobs = json(&data_dir, &["jobs"]);
@@ -693,7 +691,7 @@ fn the_hub_imports_on_its_own_when_it_starts_and_a_failure_waits_for_the_next_tr
     let status = json(&data_dir, &["lastfm", "status"]);
     assert_eq!(status["imported"], 41);
     assert_eq!(status["import"]["last"]["state"], "succeeded", "{status}");
-    let (_, text, _) = ritornelctl(&data_dir, &["lastfm", "status"]);
+    let text = ok(&data_dir, &["lastfm", "status"]);
     assert!(text.contains(" UTC, succeeded\n"), "{text}");
     server.stop();
 

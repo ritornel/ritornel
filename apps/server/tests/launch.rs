@@ -144,7 +144,7 @@ async fn two_launches_at_once_end_on_one_server_and_one_owns_it() {
 async fn a_server_started_by_hand_is_used_and_never_stopped() {
     let scratch = Scratch::new();
     let data_dir = scratch.data_dir();
-    let mut by_hand = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
+    let by_hand = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
         .arg("serve")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -156,8 +156,11 @@ async fn a_server_started_by_hand_is_used_and_never_stopped() {
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
+    // Killed if the test fails before it is stopped, so that it outlives
+    // nothing.
+    let mut by_hand = Killed(by_hand);
     let mut ready = String::new();
-    BufReader::new(by_hand.stdout.take().unwrap())
+    BufReader::new(by_hand.0.stdout.take().unwrap())
         .read_line(&mut ready)
         .unwrap();
     assert!(ready.starts_with("ready "), "{ready:?}");
@@ -178,14 +181,27 @@ async fn a_server_started_by_hand_is_used_and_never_stopped() {
     if cfg!(windows) {
         let _ = Command::new("taskkill")
             .arg("/PID")
-            .arg(by_hand.id().to_string())
+            .arg(by_hand.0.id().to_string())
             .output();
     } else {
-        let _ = Command::new("kill").arg(by_hand.id().to_string()).status();
+        let _ = Command::new("kill")
+            .arg(by_hand.0.id().to_string())
+            .status();
     }
-    let ended = by_hand.wait().unwrap();
+    let ended = by_hand.0.wait().unwrap();
     assert!(ended.success(), "the server ended with {ended}");
     launched.unwrap();
+}
+
+/// A child process that is killed when it is dropped, as when a test fails
+/// before it has stopped it.
+struct Killed(std::process::Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// One track of forty seconds of tone, as 16-bit WAV at 8 kHz.

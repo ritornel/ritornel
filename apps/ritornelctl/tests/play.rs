@@ -291,10 +291,11 @@ impl Drop for Server {
 /// waits for it to.
 fn run_until_it_dies(data_dir: &Path, variables: &[(&str, &str)]) -> Option<i32> {
     let (mut child, stdout) = spawn(data_dir, variables);
-    assert!(
-        rest(&stdout).is_some(),
-        "the server did not die within {WAIT:?}"
-    );
+    if rest(&stdout).is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the server did not die within {WAIT:?}");
+    }
     child.wait().unwrap().code()
 }
 

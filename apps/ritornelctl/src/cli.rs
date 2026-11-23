@@ -1320,7 +1320,12 @@ mod tests {
 
     #[test]
     fn with_no_server_it_says_so_and_exits_with_the_code_kept_for_that() {
-        let dir = std::env::temp_dir().join(format!("ritornelctl-unit-{}", std::process::id()));
+        // A folder that is not there, inside one that is this test's own.
+        let scratch = tempfile::Builder::new()
+            .prefix("ritornelctl-unit-")
+            .tempdir()
+            .unwrap();
+        let dir = scratch.path().join("absent");
         for line in [&["status"][..], &["library", "create"]] {
             let mut line = line.to_vec();
             line.extend(["--data-dir", dir.to_str().unwrap()]);

@@ -258,7 +258,7 @@ fn scan_adds_the_folder_scans_it_and_the_stats_say_what_came_out() {
     assert_eq!(code, Some(1));
     assert!(stderr.contains("this server holds no library"), "{stderr}");
     ok(&data_dir, &["library", "create"]);
-    assert_eq!(ritornelctl(&data_dir, &["jobs"]).1, "No jobs.\n");
+    assert_eq!(ok(&data_dir, &["jobs"]), "No jobs.\n");
 
     let (code, stdout, stderr) = ritornelctl(&data_dir, &["scan", folder]);
     assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
@@ -276,8 +276,7 @@ fn scan_adds_the_folder_scans_it_and_the_stats_say_what_came_out() {
         assert!(stdout.contains(line), "{line}: {stdout}");
     }
 
-    let (code, stdout, _) = ritornelctl(&data_dir, &["library", "stats"]);
-    assert_eq!(code, Some(0));
+    let stdout = ok(&data_dir, &["library", "stats"]);
     for line in [
         "Library revision  4\n",
         "Files             4\n",
@@ -400,8 +399,7 @@ fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was(
     let (data_dir, music) = (scratch.data_dir(), scratch.music());
     let server = Server::start(&data_dir, &[]);
     ok(&data_dir, &["library", "create"]);
-    let (code, _, stderr) = ritornelctl(&data_dir, &["scan", music.to_str().unwrap()]);
-    assert_eq!(code, Some(0), "{stderr}");
+    ok(&data_dir, &["scan", music.to_str().unwrap()]);
     let before = library_bytes(&data_dir);
 
     let run = json(
@@ -417,8 +415,7 @@ fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was(
     );
     assert_eq!(run["wouldChange"], 0);
     assert_eq!(run["changes"], Value::Array(Vec::new()));
-    let (code, stdout, _) = ritornelctl(&data_dir, &["identity", "re-resolve", "--dry-run"]);
-    assert_eq!(code, Some(0));
+    let stdout = ok(&data_dir, &["identity", "re-resolve", "--dry-run"]);
     for line in [
         "Policy            policy 3\n",
         "Would change      0 (0 to another recording)\n",
@@ -444,7 +441,7 @@ fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was(
     let review = json(&data_dir, &["identity", "review"]);
     assert_eq!(review["reviews"], Value::Array(Vec::new()));
     assert_eq!(
-        ritornelctl(&data_dir, &["identity", "review"]).1,
+        ok(&data_dir, &["identity", "review"]),
         "0 marked for review.\n"
     );
 
