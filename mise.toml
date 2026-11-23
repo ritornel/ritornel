@@ -31,6 +31,7 @@ description = "Run everything CI runs"
 run = [
     { task = "fmt" },
     { task = "deps" },
+    { task = "sleeps" },
     { task = "docs" },
     { task = "licenses" },
     { task = "lint" },
@@ -45,6 +46,10 @@ run = "cargo fmt --all --check"
 [tasks.deps]
 description = "Check that dependencies point one way"
 run = "scripts/check-deps.sh"
+
+[tasks.sleeps]
+description = "Check that every sleep in a test says why no event will do"
+run = "scripts/check-test-sleeps.sh"
 
 [tasks.docs]
 description = "Check docs/internals citations, doc rules and rustdoc intra-doc links"

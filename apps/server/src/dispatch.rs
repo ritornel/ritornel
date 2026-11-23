@@ -2501,6 +2501,7 @@ mod tests {
                 queued.elapsed() < Duration::from_secs(60),
                 "the close never waited"
             );
+            // sleep: between looks; the deadline bounds them.
             std::thread::sleep(Duration::from_millis(1));
         }
         go.send(()).unwrap();
@@ -2535,6 +2536,7 @@ mod tests {
                 }
                 drop(stores);
                 assert!(started.elapsed() < Duration::from_secs(60), "{what}");
+                // sleep: between looks; the deadline bounds them.
                 std::thread::sleep(Duration::from_millis(1));
             }
         };

@@ -292,6 +292,8 @@ mod tests {
                                 buf.drain(..end + 4);
                                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                                 peak.fetch_max(now, Ordering::SeqCst);
+                                // sleep: a slow reply, so that requests overlap
+                                // if the bound lets them.
                                 tokio::time::sleep(Duration::from_millis(25)).await;
                                 let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
                                 let sent = socket.write_all(reply).await.is_ok();

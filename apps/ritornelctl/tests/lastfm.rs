@@ -237,6 +237,7 @@ fn until(data_dir: &Path, args: &[&str], done: impl Fn(&Value) -> bool) -> Value
             Instant::now() < deadline,
             "{args:?} never got there: {answer}"
         );
+        // sleep: between looks; the deadline bounds them.
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -591,6 +592,7 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
     let deadline = Instant::now() + WAIT;
     while fake.scrobbled().len() < 2 {
         assert!(Instant::now() < deadline, "{:?}", fake.scrobbled());
+        // sleep: between looks; the deadline bounds them.
         std::thread::sleep(Duration::from_millis(100));
     }
     let sent = fake.scrobbled();
@@ -736,6 +738,7 @@ fn shown(fake: &FakeLastfm, count: usize) -> Vec<std::collections::HashMap<Strin
             return sent;
         }
         assert!(Instant::now() < deadline, "{sent:?}");
+        // sleep: between looks; the deadline bounds them.
         std::thread::sleep(Duration::from_millis(50));
     }
 }

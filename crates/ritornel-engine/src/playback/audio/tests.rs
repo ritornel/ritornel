@@ -202,6 +202,7 @@ fn until(renderer: &mut AudioRenderer, said: &mut Vec<Event>, done: impl Fn(&[Ev
             Instant::now() < deadline,
             "the output did not get there: {said:?}"
         );
+        // sleep: between looks; the deadline bounds them.
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -229,6 +230,7 @@ fn until_handoff(renderer: &AudioRenderer, what: &str, done: impl Fn(&super::Slo
             return;
         }
         assert!(Instant::now() < deadline, "the decoder never {what}");
+        // sleep: between looks; the deadline bounds them.
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -251,6 +253,7 @@ fn heard(renderer: &AudioRenderer) -> u64 {
             return progress.frames;
         }
         assert!(Instant::now() < deadline, "nothing was heard");
+        // sleep: between looks; the deadline bounds them.
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -1310,6 +1313,7 @@ fn no_mix_of_short_tracks_nexts_pauses_and_seeks_leaves_a_span_without_an_end_or
                     since.elapsed() < Duration::from_secs(10),
                     "seed {seed}: span {current} of {queue:?}, left alone, has no end: {said:?}"
                 );
+                // sleep: between looks; the liveness bound above ends them.
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
@@ -1504,6 +1508,7 @@ impl Pipeline {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !done(&self.player.state()) {
             assert!(Instant::now() < deadline, "{:?}", self.player.state());
+            // sleep: the tick's own pace; the deadline bounds the ticks.
             std::thread::sleep(Duration::from_millis(ms));
             self.player.tick(&self.server, Some(&self.library)).unwrap();
         }
@@ -1863,6 +1868,7 @@ fn a_next_the_output_has_run_into_cannot_be_let_go_before_the_player_has_heard_o
     let deadline = Instant::now() + Duration::from_secs(60);
     while renderer.progress().span != 2 {
         assert!(Instant::now() < deadline);
+        // sleep: between looks; the deadline bounds them.
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(!renderer.cancel_next());

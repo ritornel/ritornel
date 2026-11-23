@@ -724,6 +724,8 @@ mod tests {
     fn stop_after(heard: &Sender<Heard>, after: Duration) {
         let heard = heard.clone();
         std::thread::spawn(move || {
+            // sleep: the stop comes this long after, as one from the system
+            // would.
             std::thread::sleep(after);
             let _ = heard.send(Heard::Stop);
         });
