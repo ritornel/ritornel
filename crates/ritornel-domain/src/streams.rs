@@ -180,28 +180,31 @@ impl Matched {
     }
 }
 
-/// The key two names are compared by: Unicode NFKC, lower case, and no
-/// white space or punctuation. Accents, symbols, credits and version words
-/// stay, so a live take is never the studio one.
+/// The key two names are compared by: Unicode NFKC, case folded, and no
+/// white space or punctuation, brackets of every kind among it. Accents,
+/// symbols, credits and version words stay, so a live take is never the
+/// studio one.
 pub fn name_key(text: &str) -> String {
-    let folded: String = text
-        .nfkc()
-        .flat_map(char::to_lowercase)
-        .filter(|c| c.is_alphanumeric() || is_combining_mark(*c) || is_kept_symbol(*c))
-        .collect();
+    let mut folded = String::with_capacity(text.len());
+    for c in text.nfkc().flat_map(char::to_lowercase) {
+        match c {
+            // Case folding beyond lower case: a final sigma is a sigma, and
+            // a sharp s is two.
+            'ς' => folded.push('σ'),
+            'ß' => folded.push_str("ss"),
+            c if c.is_alphanumeric() || is_combining_mark(c) || is_kept_symbol(c) => {
+                folded.push(c);
+            }
+            _ => {}
+        }
+    }
     folded.nfc().collect()
 }
 
 /// Whether a mark that is neither a letter nor a digit is a symbol that
 /// tells two names apart, as `+` or `★` does, and not punctuation.
 fn is_kept_symbol(c: char) -> bool {
-    !c.is_whitespace()
-        && !c.is_ascii_punctuation()
-        && !c.is_control()
-        && matches!(c,
-            '\u{a2}'..='\u{a9}' | '\u{ac}' | '\u{ae}'..='\u{b1}' | '\u{b4}' | '\u{d7}' | '\u{f7}'
-            | '\u{2100}'..='\u{2bff}' | '\u{1f000}'..='\u{1faff}')
-        || matches!(c, '+' | '<' | '=' | '>' | '$' | '^' | '`' | '|' | '~')
+    crate::normalize::is_symbol(c) || matches!(c, '^' | '`' | '|' | '~')
 }
 
 /// What a stream's names are compared by.
@@ -209,21 +212,22 @@ fn names(record: &SpotifyStream) -> (String, String) {
     (name_key(&record.artist), name_key(&record.title))
 }
 
-/// The order of streams that repeat one another: their other kept fields,
-/// names left out, and then their keys.
-fn repeat_order(stream: &Stream) -> impl Ord + '_ {
-    let r = &stream.record;
+/// The order of records that repeat one another: their other kept fields,
+/// and their names only where all of those are the same, so that which
+/// speaks for a listen never depends on the order the rows came in.
+pub fn repeat_order(r: &SpotifyStream) -> impl Ord + '_ {
     (
-        r.reason_start.as_deref(),
-        r.reason_end.as_deref(),
-        r.shuffle,
-        r.skipped,
-        r.offline,
-        r.offline_timestamp,
-        r.incognito,
-        r.platform,
-        r.album.as_deref(),
-        stream.key.as_slice(),
+        (
+            r.reason_start.as_deref(),
+            r.reason_end.as_deref(),
+            r.shuffle,
+            r.skipped,
+            r.offline,
+            r.offline_timestamp,
+            r.incognito,
+            r.platform,
+        ),
+        (r.title.as_str(), r.artist.as_str(), r.album.as_deref()),
     )
 }
 
@@ -242,7 +246,11 @@ pub fn events(streams: &[Stream]) -> Vec<Event> {
     let mut events: Vec<(&[u8], Event)> = by
         .into_iter()
         .filter_map(|((end_ms, ms_played, _), mut members)| {
-            members.sort_by(|(_, a), (_, b)| repeat_order(a).cmp(&repeat_order(b)));
+            members.sort_by(|(_, a), (_, b)| {
+                repeat_order(&a.record)
+                    .cmp(&repeat_order(&b.record))
+                    .then_with(|| a.key.cmp(&b.key))
+            });
             let first = members.first()?.1.key.as_slice();
             Some((
                 first,
@@ -265,6 +273,11 @@ struct Edge<'a> {
     event_key: &'a [u8],
     scrobble: usize,
     event: usize,
+}
+
+/// How far apart two instants are, without overflow.
+fn distance(a: i64, b: i64) -> i64 {
+    i64::try_from((i128::from(a) - i128::from(b)).unsigned_abs()).unwrap_or(i64::MAX)
 }
 
 /// Takes pairs one to one, the closest first and the lower keys on a tie,
@@ -407,13 +420,17 @@ pub fn match_streams(
         let Some(names) = scrobble_names.get(scrobble) else {
             continue;
         };
-        for event in near(names, s.at_ms - WITHIN_MS, s.at_ms + WITHIN_MS) {
+        for event in near(
+            names,
+            s.at_ms.saturating_sub(WITHIN_MS),
+            s.at_ms.saturating_add(WITHIN_MS),
+        ) {
             if !allowed(event, scrobble) {
                 continue;
             }
             let start = events.get(event).map_or(0, |e| e.start_ms);
             edges.push(Edge {
-                distance: (s.at_ms - start).abs(),
+                distance: distance(s.at_ms, start),
                 scrobble_key: &s.key,
                 event_key: event_key(event),
                 scrobble,
@@ -444,7 +461,8 @@ pub fn match_streams(
                 let Some(names) = scrobble_names.get(scrobble) else {
                     continue;
                 };
-                for event in near(names, s.at_ms - longest - WITHIN_MS, s.at_ms) {
+                let from = s.at_ms.saturating_sub(longest).saturating_sub(WITHIN_MS);
+                for event in near(names, from, s.at_ms) {
                     let Some(e) = events.get(event) else {
                         continue;
                     };
@@ -452,12 +470,12 @@ pub fn match_streams(
                     if has_own != second
                         || !allowed(event, scrobble)
                         || s.at_ms < e.start_ms
-                        || s.at_ms > e.end_ms + WITHIN_MS
+                        || s.at_ms > e.end_ms.saturating_add(WITHIN_MS)
                     {
                         continue;
                     }
                     edges.push(Edge {
-                        distance: (s.at_ms - e.end_ms).abs(),
+                        distance: distance(s.at_ms, e.end_ms),
                         scrobble_key: &s.key,
                         event_key: event_key(event),
                         scrobble,
@@ -490,12 +508,13 @@ pub fn match_streams(
     // stamps are as close as in A, each is the other's only candidate, and
     // neither has a record of its own names within the hour.
     if tiers.renamed {
-        let mut by_artist: HashMap<&str, Vec<usize>> = HashMap::new();
-        let mut by_title: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (event, (artist, title)) in event_names.iter().enumerate() {
-            by_artist.entry(artist).or_default().push(event);
-            by_title.entry(title).or_default().push(event);
-        }
+        // Every event by its start, for finding those near a stamp.
+        let mut by_start: Vec<(i64, usize)> = events
+            .iter()
+            .enumerate()
+            .map(|(event, e)| (e.start_ms, event))
+            .collect();
+        by_start.sort_unstable();
         let mut scrobbles_by_names: HashMap<&(String, String), Vec<i64>> = HashMap::new();
         for (scrobble, names) in scrobble_names.iter().enumerate() {
             if let Some(s) = scrobbles.get(scrobble) {
@@ -506,14 +525,20 @@ pub fn match_streams(
             stamps.sort_unstable();
         }
         let scrobble_partner = |names: &(String, String), at: i64| {
-            !near(names, at - PARTNER_WITHIN_MS, at + PARTNER_WITHIN_MS).is_empty()
+            !near(
+                names,
+                at.saturating_sub(PARTNER_WITHIN_MS),
+                at.saturating_add(PARTNER_WITHIN_MS),
+            )
+            .is_empty()
         };
         let event_partner = |names: &(String, String), start: i64| {
             scrobbles_by_names.get(names).is_some_and(|stamps| {
-                let first = stamps.partition_point(|at| *at < start - PARTNER_WITHIN_MS);
+                let first =
+                    stamps.partition_point(|at| *at < start.saturating_sub(PARTNER_WITHIN_MS));
                 stamps
                     .get(first)
-                    .is_some_and(|at| *at <= start + PARTNER_WITHIN_MS)
+                    .is_some_and(|at| *at <= start.saturating_add(PARTNER_WITHIN_MS))
             })
         };
         let mut candidates: Vec<(usize, usize, i64)> = Vec::new();
@@ -524,25 +549,25 @@ pub fn match_streams(
             let Some(names) = scrobble_names.get(scrobble) else {
                 continue;
             };
-            let mut found: Vec<usize> = by_artist
-                .get(names.0.as_str())
-                .into_iter()
-                .chain(by_title.get(names.1.as_str()))
-                .flatten()
-                .copied()
-                .filter(|event| {
-                    events.get(*event).is_some_and(|e| {
-                        (s.at_ms - e.start_ms).abs() <= WITHIN_MS
-                            && e.end_ms - e.start_ms >= THIRTY_SECONDS_MS
-                    }) && event_names.get(*event) != Some(names)
-                })
-                .collect();
-            found.sort_unstable();
-            found.dedup();
-            for event in found {
-                if event_free.get(event).copied().unwrap_or(false) && allowed(event, scrobble) {
-                    let start = events.get(event).map_or(0, |e| e.start_ms);
-                    candidates.push((scrobble, event, (s.at_ms - start).abs()));
+            let first =
+                by_start.partition_point(|(start, _)| *start < s.at_ms.saturating_sub(WITHIN_MS));
+            let last =
+                by_start.partition_point(|(start, _)| *start <= s.at_ms.saturating_add(WITHIN_MS));
+            for (start, event) in by_start.get(first..last).unwrap_or_default() {
+                let (Some(e), Some(own)) = (events.get(*event), event_names.get(*event)) else {
+                    continue;
+                };
+                // One of the two agrees, and a name that folds to nothing,
+                // as one of punctuation alone does, agrees with none.
+                let artist = !names.0.is_empty() && own.0 == names.0;
+                let title = !names.1.is_empty() && own.1 == names.1;
+                let renamed = artist != title && own != names;
+                if renamed
+                    && e.end_ms.saturating_sub(e.start_ms) >= THIRTY_SECONDS_MS
+                    && event_free.get(*event).copied().unwrap_or(false)
+                    && allowed(*event, scrobble)
+                {
+                    candidates.push((scrobble, *event, distance(s.at_ms, *start)));
                 }
             }
         }
@@ -744,6 +769,10 @@ mod tests {
         assert_ne!(name_key("Café"), name_key("Cafe"));
         assert_ne!(name_key("Low Tide - Live"), name_key("Low Tide"));
         assert_ne!(name_key("Night Drives +"), name_key("Night Drives"));
+        // Brackets of every kind are punctuation, and case is folded.
+        assert_eq!(name_key("Low Tide ❨Live❩"), name_key("Low Tide (Live)"));
+        assert_eq!(name_key("ΟΔΟΣ"), name_key("οδος"));
+        assert_eq!(name_key("Straße"), name_key("STRASSE"));
     }
 
     #[test]
@@ -802,8 +831,9 @@ mod tests {
     #[test]
     fn a_pause_moves_the_worked_out_start_past_what_tier_a_takes() {
         // Played 3:41 of a track with a pause of a minute: the worked-out
-        // start is a minute after the scrobble's stamp. Tier B takes it, as
-        // a scrobble stamped while the stream played.
+        // start is a minute after the scrobble's stamp, which no tier takes
+        // and the dry run counts as where a pause would put it. A scrobble
+        // stamped while the stream played is tier B's.
         let streams = [stream("Low Tide", 281, 221)];
         let scrobbles = [scrobble("Low Tide", 0)];
         assert!(
@@ -886,6 +916,74 @@ mod tests {
             assert_eq!(title, titles[scrobble]);
             assert_eq!((tier, second), (Some(Tier::During), false));
         }
+        // With B left out, each scrobble sits on the next track's start
+        // with the same artist, and C still moves none of them: each has a
+        // stream of its own names within the hour.
+        let c_alone = Tiers {
+            during: false,
+            renamed: true,
+        };
+        let matched = match_streams(&streams, &scrobbles, c_alone, &Pins::default());
+        assert!(matched.joins.is_empty(), "{:?}", matched.joins);
+    }
+
+    #[test]
+    fn tier_c_takes_only_a_lone_candidate_within_ten_seconds_with_no_partner() {
+        let c_alone = Tiers {
+            during: false,
+            renamed: true,
+        };
+        let joined = |streams: &[Stream], scrobbles: &[Scrobble]| {
+            match_streams(streams, scrobbles, c_alone, &Pins::default())
+                .joins
+                .len()
+        };
+        let live = || stream("Low Tide - Live", 221, 221);
+        // At ten seconds it is taken; at eleven it is not.
+        assert_eq!(joined(&[live()], &[scrobble("Low Tide", 10)]), 1);
+        assert_eq!(joined(&[live()], &[scrobble("Low Tide", 11)]), 0);
+        // Thirty seconds played is enough; less is not.
+        assert_eq!(
+            joined(
+                &[stream("Low Tide - Live", 30, 30)],
+                &[scrobble("Low Tide", 0)]
+            ),
+            1
+        );
+        assert_eq!(
+            joined(
+                &[stream("Low Tide - Live", 29, 29)],
+                &[scrobble("Low Tide", 0)]
+            ),
+            0
+        );
+        // A renamed artist with the same title is a candidate too.
+        let mut credited = scrobble("Low Tide", 0);
+        credited.artist = "Calla Brandt feat. Odile Castellan".to_owned();
+        assert_eq!(
+            joined(&[live()], &[credited.clone()]),
+            0,
+            "two names differ"
+        );
+        assert_eq!(joined(&[stream("Low Tide", 221, 221)], &[credited]), 1);
+        // Two candidates for one scrobble: neither is taken.
+        let mut other = stream("Low Tide - Demo", 222, 222);
+        other.key = b"sp1:other".to_vec();
+        assert_eq!(joined(&[live(), other], &[scrobble("Low Tide", 0)]), 0);
+        // The stream has a scrobble of its own names within the hour.
+        assert_eq!(
+            joined(
+                &[live()],
+                &[scrobble("Low Tide", 0), scrobble("Low Tide - Live", 3000)]
+            ),
+            0
+        );
+        // Names that fold to nothing agree with nothing.
+        let mut blank = stream("...", 221, 221);
+        blank.record.artist = "Odile Castellan".to_owned();
+        let mut marks = scrobble("???", 0);
+        marks.artist = "Søren Dunmore Ensemble".to_owned();
+        assert_eq!(joined(&[blank], &[marks]), 0);
     }
 
     #[test]

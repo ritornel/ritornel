@@ -13,7 +13,7 @@ use ritornel_contract::{
 use crate::history::{Outcome, ZonePeriod, assumed_zone};
 use crate::streams::{
     Event, Matched, Pins, STREAM_MATCHER_VERSION, Scrobble, Stream, Tier, Tiers, judge_alone,
-    lengths, match_streams, name_key,
+    lengths, match_streams, name_key, repeat_order,
 };
 
 /// How many joins of each tier not in force a report shows for judging it.
@@ -85,25 +85,21 @@ fn first_record<'a>(streams: &'a [Stream], event: &Event) -> Option<&'a SpotifyS
 /// with an earlier one the same keys too.
 pub fn keyed(records: Vec<SpotifyStream>) -> Vec<Stream> {
     let mut order: Vec<usize> = (0..records.len()).collect();
-    let fields = |at: &usize| {
-        records.get(*at).map(|r| {
-            (
-                r.ended_at,
-                r.ms_played,
-                r.track_uri.clone(),
-                r.reason_start.clone(),
-                r.reason_end.clone(),
-                r.shuffle,
-                r.skipped,
-                r.offline,
-                r.offline_timestamp,
-                r.incognito,
-                r.platform,
-                r.album.clone(),
-            )
-        })
-    };
-    order.sort_by_cached_key(fields);
+    order.sort_by(|a, b| match (records.get(*a), records.get(*b)) {
+        (Some(a), Some(b)) => (
+            a.ended_at,
+            a.ms_played,
+            a.track_uri.as_str(),
+            repeat_order(a),
+        )
+            .cmp(&(
+                b.ended_at,
+                b.ms_played,
+                b.track_uri.as_str(),
+                repeat_order(b),
+            )),
+        _ => std::cmp::Ordering::Equal,
+    });
     let mut places: HashMap<(i64, i64, &str), u32> = HashMap::new();
     let mut keys: Vec<Vec<u8>> = vec![Vec::new(); records.len()];
     for at in order {
@@ -113,7 +109,10 @@ pub fn keyed(records: Vec<SpotifyStream>) -> Vec<Stream> {
         let place = places
             .entry((r.ended_at, r.ms_played, r.track_uri.as_str()))
             .or_default();
-        let id = r.track_uri.trim_start_matches("spotify:track:");
+        let id = r
+            .track_uri
+            .strip_prefix("spotify:track:")
+            .unwrap_or(&r.track_uri);
         if let Some(key) = keys.get_mut(at) {
             *key = format!("sp1:{}:{}:{id}:{place}", r.ended_at, r.ms_played).into_bytes();
         }
@@ -213,10 +212,19 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
             row(&mut years, year(scrobble.at_ms)).scrobbles_alone += 1;
         }
     }
+    // A second report's scrobble is a play of its own now, and joins the
+    // play of the stream it repeats.
+    let mut merged: BTreeMap<i32, u64> = BTreeMap::new();
+    for join in in_force.joins.iter().filter(|join| join.second) {
+        if let Some(scrobble) = input.scrobbles.get(join.scrobble) {
+            *merged.entry(year(scrobble.at_ms)).or_default() += 1;
+        }
+    }
     for row in years.values_mut() {
         let alone = row.alone_counted + row.alone_not_counted + row.alone_unknown;
-        row.plays_after = row.plays_before + alone;
-        row.counted_after = row.counted_before + row.alone_counted;
+        let merged = merged.get(&row.year).copied().unwrap_or(0);
+        row.plays_after = (row.plays_before + alone).saturating_sub(merged);
+        row.counted_after = (row.counted_before + row.alone_counted).saturating_sub(merged);
     }
 
     let (offline, offline_timestamped, offline_seconds, offline_milliseconds) =
@@ -270,9 +278,10 @@ fn offline_facts(streams: &[Stream], matched: &Matched) -> (u64, u64, u64, u64) 
             continue;
         };
         stamped += 1;
-        if (at.saturating_mul(1000) - r.ended_at).abs() <= OFFLINE_NEAR_MS {
+        let near = |at: i128| (at - i128::from(r.ended_at)).abs() <= i128::from(OFFLINE_NEAR_MS);
+        if near(i128::from(at) * 1000) {
             seconds += 1;
-        } else if (at - r.ended_at).abs() <= OFFLINE_NEAR_MS {
+        } else if near(i128::from(at)) {
             millis += 1;
         }
     }
@@ -294,18 +303,19 @@ fn paused(
         .map(|event| (event.start_ms, event.end_ms))
         .collect();
     by_start.sort_unstable();
-    let mut free: HashMap<(String, String), Vec<i64>> = HashMap::new();
+    let mut free: HashMap<(String, String), Vec<(i64, usize)>> = HashMap::new();
     for (at, scrobble) in input.scrobbles.iter().enumerate() {
         if !taken.contains(&at) {
             free.entry((name_key(&scrobble.artist), name_key(&scrobble.title)))
                 .or_default()
-                .push(scrobble.at_ms);
+                .push((scrobble.at_ms, at));
         }
     }
     for stamps in free.values_mut() {
         stamps.sort_unstable();
     }
-    let mut count = 0;
+    // Each scrobble once, however many streams it sits before.
+    let mut counted: HashSet<usize> = HashSet::new();
     for index in alone {
         let Some(event) = matched.events.get(*index) else {
             continue;
@@ -313,19 +323,25 @@ fn paused(
         let Some(record) = first_record(input.streams, event) else {
             continue;
         };
+        // Only between this stream and one that played before it.
         let before = by_start.partition_point(|(start, _)| *start < event.start_ms);
-        let previous_end = before
-            .checked_sub(1)
-            .and_then(|at| by_start.get(at))
-            .map_or(i64::MIN, |(_, end)| *end);
+        let Some((_, previous_end)) = before.checked_sub(1).and_then(|at| by_start.get(at)) else {
+            continue;
+        };
         let names = (name_key(&record.artist), name_key(&record.title));
         if let Some(stamps) = free.get(&names) {
-            let from = stamps.partition_point(|at| *at <= previous_end);
-            let to = stamps.partition_point(|at| *at < event.start_ms);
-            count += to.saturating_sub(from) as u64;
+            let from = stamps.partition_point(|(at, _)| at <= previous_end);
+            let to = stamps.partition_point(|(at, _)| *at < event.start_ms);
+            counted.extend(
+                stamps
+                    .get(from..to)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|(_, at)| *at),
+            );
         }
     }
-    count
+    counted.len() as u64
 }
 
 /// A sample of what each tier not in force would join.
@@ -444,6 +460,89 @@ mod tests {
         assert_eq!(
             place_of_other.as_deref(),
             Some("sp1:1552683821000:221000:LowTide:0")
+        );
+    }
+
+    #[test]
+    fn which_repeat_speaks_never_depends_on_the_order_rows_came_in() {
+        // Two rows of one listen that differ only in their title: the same
+        // record speaks for it, and has the same key, in either order.
+        let low = record(221, 221, "Low Tide", "trackdone");
+        let mut renamed = low.clone();
+        renamed.title = "Low Tide - Remastered".to_owned();
+        let speaks = |records: Vec<SpotifyStream>| {
+            let streams = keyed(records);
+            let events = crate::streams::events(&streams);
+            let first = &streams[events[0].streams[0]];
+            (first.record.title.clone(), first.key.clone())
+        };
+        assert_eq!(
+            speaks(vec![low.clone(), renamed.clone()]),
+            speaks(vec![renamed, low])
+        );
+    }
+
+    fn input<'a>(
+        streams: &'a [Stream],
+        scrobbles: &'a [Scrobble],
+        plays: &'a BTreeMap<i32, (u64, u64)>,
+        pins: &'a Pins,
+    ) -> DryRunInput<'a> {
+        DryRunInput {
+            streams,
+            scrobbles,
+            excluded: 0,
+            echoes: 0,
+            plays_by_year: plays,
+            listener: 1,
+            zone_periods: &[],
+            pins,
+            made_at: 7,
+        }
+    }
+
+    #[test]
+    fn a_pause_is_counted_after_a_stream_before_and_each_scrobble_once() {
+        let streams = keyed(vec![
+            record(100, 100, "Paper Lanterns", "trackdone"),
+            // Two streams alone of one track, with the same worked-out
+            // start, a minute after the stream before ended.
+            record(400, 240, "Low Tide", "trackdone"),
+            record(400, 240, "Low Tide", "endplay"),
+        ]);
+        let scrobbles = vec![
+            // Long before any stream: not where a pause would put it.
+            scrobble(-90_000, "Low Tide"),
+            // Between the stream before and the worked-out start.
+            scrobble(130, "Low Tide"),
+        ];
+        let (plays, pins) = (BTreeMap::new(), Pins::default());
+        let report = dry_run(&input(&streams, &scrobbles, &plays, &pins));
+        assert_eq!(report.paused, 1);
+    }
+
+    #[test]
+    fn an_offline_time_of_any_size_reads_as_neither_unit_without_overflow() {
+        let mut far = record(221, 221, "Low Tide", "trackdone");
+        far.offline = Some(true);
+        far.offline_timestamp = Some(i64::MIN);
+        let mut seconds = record(500, 221, "Night Ferry", "trackdone");
+        seconds.offline = Some(true);
+        seconds.offline_timestamp = Some((EVENING + 500_000) / 1000);
+        let mut millis = record(900, 221, "Paper Lanterns", "trackdone");
+        millis.offline = Some(true);
+        millis.offline_timestamp = Some(EVENING + 899_000);
+        let streams = keyed(vec![far, seconds, millis]);
+        let (plays, pins) = (BTreeMap::new(), Pins::default());
+        let report = dry_run(&input(&streams, &[], &plays, &pins));
+        assert_eq!(
+            (
+                report.offline,
+                report.offline_timestamped,
+                report.offline_seconds,
+                report.offline_milliseconds
+            ),
+            (3, 3, 1, 1)
         );
     }
 

@@ -22,6 +22,24 @@ fn no_run() -> RpcError {
     )
 }
 
+/// Refuses a call on a server that holds no library. A satellite sends
+/// these calls on to its hub, so this is a server with neither.
+fn no_library(stores: &Stores) -> Result<(), RpcError> {
+    let held = stores
+        .library
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some();
+    if held {
+        Ok(())
+    } else {
+        Err(RpcError::new(
+            ErrorCode::Invalid,
+            "this server holds no library: import on the library's hub",
+        ))
+    }
+}
+
 fn internal(error: impl std::fmt::Display) -> RpcError {
     RpcError::new(ErrorCode::Internal, error.to_string())
 }
@@ -34,8 +52,10 @@ impl Core {
 
     pub(super) fn imports_stage(
         &self,
+        stores: &Stores,
         params: &ImportsStageParams,
     ) -> Result<ImportsStaged, RpcError> {
+        no_library(stores)?;
         let now = self.clock.now_ms();
         let run = self
             .staging
@@ -83,17 +103,7 @@ impl Core {
             .with_detail("received", run.received.to_string())
             .with_detail("pieces", run.pieces.to_string()));
         }
-        if stores
-            .library
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none()
-        {
-            return Err(RpcError::new(
-                ErrorCode::Invalid,
-                "this server holds no library: dry run on its hub",
-            ));
-        }
+        no_library(stores)?;
         let command = Command {
             id: params.idempotency_key,
             fingerprint: fingerprint::<ImportsDryRun>(params)?,

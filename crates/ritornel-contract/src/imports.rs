@@ -74,6 +74,28 @@ pub struct SpotifyStream {
     pub via: Option<PlayedVia>,
 }
 
+/// The latest end a stream may have: the start of 2100, in Unix
+/// milliseconds.
+pub const LATEST_STREAM_END: i64 = 4_102_444_800_000;
+
+/// The longest a stream may have played: a day.
+pub const LONGEST_STREAM_MS: i64 = 24 * 60 * 60 * 1000;
+
+impl SpotifyStream {
+    /// Whether its times are ones a stream can have: an end from 1970 to
+    /// 2100 and a time played from nothing to a day, so that no sum or
+    /// difference of two overflows. `Err` names the field that is not.
+    pub fn plausible(&self) -> Result<(), &'static str> {
+        if !(0..LATEST_STREAM_END).contains(&self.ended_at) {
+            return Err("ts");
+        }
+        if !(0..=LONGEST_STREAM_MS).contains(&self.ms_played) {
+            return Err("ms_played");
+        }
+        Ok(())
+    }
+}
+
 /// The most streams one piece of a staged run holds. A stream is about
 /// four hundred bytes on the wire, so a piece stays well under a message's
 /// limit of 1 MiB.

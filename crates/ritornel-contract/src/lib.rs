@@ -86,8 +86,8 @@ pub use identity::{
 };
 pub use imports::{
     ImportProblem, ImportReport, ImportRun, ImportYear, ImportsDryRunParams, ImportsDryRunStarted,
-    ImportsGetParams, ImportsStageParams, ImportsStaged, JoinSample, MAX_STREAMS_PER_PIECE,
-    SpotifyStream, StreamTier, TierJoins,
+    ImportsGetParams, ImportsStageParams, ImportsStaged, JoinSample, LATEST_STREAM_END,
+    LONGEST_STREAM_MS, MAX_STREAMS_PER_PIECE, SpotifyStream, StreamTier, TierJoins,
 };
 pub use lastfm::{
     DeliveryCount, DoubtfulTrack, ImportSchedule, KeyParams, LastImport, LastfmReport,

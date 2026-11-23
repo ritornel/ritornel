@@ -1133,8 +1133,39 @@ fn a_counted_listen_is_recorded_before_it_is_sent_once_and_its_echo_joins_its_pl
         crate::import_store::tests::stream(start, 144_000, "Paper Kites"),
         crate::import_store::tests::stream(start + 1000, 144_000, "Lanternfish"),
     ];
-    let report = at.library.stream_dry_run(streams).unwrap();
+    let report = at.library.stream_dry_run(streams.clone()).unwrap();
     assert_eq!((report.scrobbles, report.scrobbles_echoes), (1, 1));
+    assert_eq!(report.tiers[0].joined, 1);
+
+    // A second copy of the echo, as a read that shifted could store, stands
+    // as a play of its own, and is still never offered to a stream.
+    let again = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: b"again".to_vec(),
+            played_at_ms: start,
+            track: ritornel_source::TrackText {
+                artist: "moss arcade".to_owned(),
+                album: Some("Tin Weather".to_owned()),
+                title: "Paper Kites".to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: start,
+            to_ms: start + 1000,
+        },
+        cursor: "{}".to_owned(),
+    };
+    at.library
+        .ingest(Observations::Imports {
+            account,
+            batch: &again,
+            full: false,
+        })
+        .unwrap();
+    let report = at.library.stream_dry_run(streams).unwrap();
+    assert_eq!((report.scrobbles, report.scrobbles_echoes), (1, 2));
     assert_eq!(report.tiers[0].joined, 1);
 }
 

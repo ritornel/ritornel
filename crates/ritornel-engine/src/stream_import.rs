@@ -8,7 +8,7 @@ use ritornel_domain::stream_report::{DryRunInput, dry_run, keyed};
 use ritornel_domain::streams::{Pins, Scrobble};
 use rusqlite::Connection;
 
-use crate::history_store::zone_periods;
+use crate::history_store::{echo_of, zone_periods};
 use crate::{Error, LibraryStore};
 
 /// What a dry run reads from the library, as of one commit.
@@ -23,12 +23,14 @@ struct Read {
 
 /// Every scrobble of every account, sorted into those a stream may take,
 /// those set aside and those that are this library's own listens come back.
-/// An import is set aside when its play is excluded, and is an echo when it
-/// is not its play's primary record: it joined a listen's play.
+/// An import is an echo when it matches a delivery of a listen, as
+/// derivation finds it, so that a second copy of an echo, which stands as a
+/// play of its own, is an echo too; and it is set aside when its play is
+/// excluded.
 fn scrobbles(connection: &Connection) -> Result<(Vec<Scrobble>, u64, u64), Error> {
     let mut statement = connection.prepare(
-        "SELECT a.id, o.source_key, i.played_at_utc_ms, i.artist, i.title,
-                pe.excluded, peo.role
+        "SELECT a.id, o.source_key, i.played_at_utc_ms, i.artist, i.title, pe.excluded,
+                o.endpoint_id
            FROM observation_import i
            JOIN history_observation o ON o.id = i.observation_id
            JOIN service_account a ON a.endpoint_id = o.endpoint_id
@@ -40,8 +42,8 @@ fn scrobbles(connection: &Connection) -> Result<(Vec<Scrobble>, u64, u64), Error
     while let Some(row) = rows.next()? {
         let account: i64 = row.get(0)?;
         let source_key: Vec<u8> = row.get(1)?;
-        let role: Option<String> = row.get(6)?;
-        if role.as_deref() == Some("corroborating") {
+        let (at_ms, artist, title): (i64, String, String) = (row.get(2)?, row.get(3)?, row.get(4)?);
+        if echo_of(connection, row.get(6)?, at_ms, &artist, &title)?.is_some() {
             echoes += 1;
             continue;
         }
@@ -53,9 +55,9 @@ fn scrobbles(connection: &Connection) -> Result<(Vec<Scrobble>, u64, u64), Error
         key.extend(source_key);
         offered.push(Scrobble {
             key,
-            at_ms: row.get(2)?,
-            artist: row.get(3)?,
-            title: row.get(4)?,
+            at_ms,
+            artist,
+            title,
         });
     }
     Ok((offered, excluded, echoes))
@@ -73,7 +75,7 @@ fn plays_by_year(connection: &Connection) -> Result<BTreeMap<i32, (u64, u64)>, E
     )?;
     let rows = statement.query_map([], |row| {
         Ok((
-            row.get::<_, i32>(0)?,
+            row.get::<_, Option<i32>>(0)?.unwrap_or(0),
             (row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?),
         ))
     })?;

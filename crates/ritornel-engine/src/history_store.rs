@@ -505,7 +505,7 @@ const MAY_HAVE_ARRIVED: &str = "('sending', 'accepted', 'unknown')";
 /// listen to the import's own endpoint, which may have arrived, sent with
 /// the import's time to the second and naming the same track, as sent or as
 /// the service took it. Of several, the earliest listen.
-fn echo_of(
+pub(crate) fn echo_of(
     connection: &Connection,
     endpoint: i64,
     played_at_ms: i64,

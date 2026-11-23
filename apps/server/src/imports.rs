@@ -23,7 +23,7 @@ use std::sync::atomic::AtomicBool;
 use ritornel_contract::{Id, ImportReport, ImportRun, MAX_STREAMS_PER_PIECE, SpotifyStream};
 use ritornel_engine::JobState;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::Error;
 use crate::dispatch::Core;
@@ -103,11 +103,16 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
     temporary.push(".new");
     let temporary = PathBuf::from(temporary);
     let _ = std::fs::remove_file(&temporary);
-    let mut file = create_private_file(&temporary).map_err(io_error("create", &temporary))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(io_error("write", &temporary))?;
-    std::fs::rename(&temporary, path).map_err(io_error("rename", path))
+    // The file is closed before it is renamed, which Windows needs, and
+    // removed if anything fails.
+    let written = create_private_file(&temporary)
+        .and_then(|mut file| file.write_all(&bytes).and_then(|()| file.sync_all()))
+        .map_err(io_error("write", &temporary))
+        .and_then(|()| std::fs::rename(&temporary, path).map_err(io_error("rename", path)));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 impl Staging {
@@ -135,8 +140,18 @@ impl Staging {
         read_json(&self.run_dir(run).join("run.json"))
     }
 
-    /// Removes the runs begun more than a day before `now`.
-    fn sweep(&self, now: i64) {
+    /// Removes the runs begun more than a day before `now`, holding the
+    /// lock: a run is never removed while a piece of it is stored or a
+    /// report saved.
+    pub(crate) fn sweep(&self, now: i64) {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sweep_held(now);
+    }
+
+    fn sweep_held(&self, now: i64) {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
@@ -146,8 +161,10 @@ impl Staging {
                 .ok()
                 .flatten()
                 .map(|meta| meta.begun_at);
-            if begun.is_none_or(|begun| now - begun > KEEP_MS) {
-                let _ = std::fs::remove_dir_all(&path);
+            if begun.is_none_or(|begun| now.saturating_sub(begun) > KEEP_MS)
+                && let Err(failed) = std::fs::remove_dir_all(&path)
+            {
+                warn!(error = %failed, "a staged run that has expired could not be removed");
             }
         }
     }
@@ -170,11 +187,16 @@ impl Staging {
         if streams.len() > MAX_STREAMS_PER_PIECE {
             return Err(Refused::Invalid("a piece holds too many streams"));
         }
+        if streams.iter().any(|stream| stream.plausible().is_err()) {
+            return Err(Refused::Invalid(
+                "a stream ends outside 1970 to 2100, or played longer than a day",
+            ));
+        }
         let _writing = self
             .writing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.sweep(now);
+        self.sweep_held(now);
         let dir = self.run_dir(run);
         let mut meta = match self.meta(run).map_err(Refused::Disk)? {
             Some(meta) if meta.pieces != pieces => {
@@ -197,13 +219,15 @@ impl Staging {
         match read_json::<Vec<SpotifyStream>>(&file).map_err(Refused::Disk)? {
             Some(held) if held != streams => return Err(Refused::Conflict),
             Some(_) => {}
-            None => {
-                write_json(&file, &streams).map_err(Refused::Disk)?;
-                meta.received.insert(piece, streams.len() as u64);
-                write_json(&dir.join("run.json"), &meta).map_err(Refused::Disk)?;
-                // A new piece makes the last report out of date.
-                let _ = std::fs::remove_file(dir.join("report.json"));
-            }
+            None => write_json(&file, &streams).map_err(Refused::Disk)?,
+        }
+        // Said in run.json, if it is not: a piece written whole once before,
+        // whose run.json was not, is said now.
+        if meta.received.get(&piece) != Some(&(streams.len() as u64)) {
+            meta.received.insert(piece, streams.len() as u64);
+            write_json(&dir.join("run.json"), &meta).map_err(Refused::Disk)?;
+            // A new piece makes the last report out of date.
+            let _ = std::fs::remove_file(dir.join("report.json"));
         }
         Ok(self.shown(run, &meta))
     }
@@ -221,18 +245,27 @@ impl Staging {
         }
     }
 
-    /// A staged run, with its last report.
+    /// A staged run that has not expired, with its last report.
     pub(crate) fn run(&self, run: Id, now: i64) -> Result<Option<ImportRun>, Error> {
         Ok(self
             .meta(run)?
-            .filter(|meta| now - meta.begun_at <= KEEP_MS)
+            .filter(|meta| now.saturating_sub(meta.begun_at) <= KEEP_MS)
             .map(|meta| self.shown(run, &meta)))
     }
 
     /// Every stream of a run whose every piece is held, in the order of its
-    /// pieces. `None` when the run is gone or a piece is missing.
-    pub(crate) fn streams(&self, run: Id) -> Result<Option<Vec<SpotifyStream>>, Error> {
-        let Some(meta) = self.meta(run)? else {
+    /// pieces, with when the run was begun, which tells it from a run
+    /// staged again under its ID. `None` when the run is gone or a piece is
+    /// missing.
+    pub(crate) fn streams(
+        &self,
+        run: Id,
+        now: i64,
+    ) -> Result<Option<(Vec<SpotifyStream>, i64)>, Error> {
+        let Some(meta) = self
+            .meta(run)?
+            .filter(|meta| now.saturating_sub(meta.begun_at) <= KEEP_MS)
+        else {
             return Ok(None);
         };
         if meta.received.len() != meta.pieces as usize {
@@ -246,20 +279,45 @@ impl Staging {
                 None => return Ok(None),
             }
         }
-        Ok(Some(streams))
+        Ok(Some((streams, meta.begun_at)))
     }
 
-    /// Keeps a dry run's report beside its run.
-    pub(crate) fn save_report(&self, run: Id, report: &ImportReport) -> Result<(), Error> {
+    /// Keeps a dry run's report beside its run, if the run is still the one
+    /// begun at `begun_at` and holds every piece the report read. Returns
+    /// whether it was kept.
+    pub(crate) fn save_report(
+        &self,
+        run: Id,
+        begun_at: i64,
+        report: &ImportReport,
+    ) -> Result<bool, Error> {
         let _writing = self
             .writing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = self.run_dir(run);
-        if !dir.exists() {
-            return Ok(());
+        match self.meta(run)? {
+            Some(meta)
+                if meta.begun_at == begun_at && meta.received.len() == meta.pieces as usize =>
+            {
+                write_json(&self.run_dir(run).join("report.json"), report)?;
+                Ok(true)
+            }
+            _ => Ok(false),
         }
-        write_json(&dir.join("report.json"), report)
+    }
+}
+
+/// How often the staged runs are looked at for any that have expired.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Removes the staged runs that have expired, once an hour, for as long as
+/// the server runs: a run is not kept past its day because nothing else was
+/// staged after it.
+pub(crate) async fn sweep(core: std::sync::Arc<Core>) {
+    loop {
+        tokio::time::sleep(SWEEP_EVERY).await;
+        let core = std::sync::Arc::clone(&core);
+        let _ = tokio::task::spawn_blocking(move || core.staging().sweep(core.now_ms())).await;
     }
 }
 
@@ -283,8 +341,8 @@ pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &Atomic
             Some("the job's params are not a run".to_owned()),
         );
     };
-    let streams = match core.staging().streams(params.run_id) {
-        Ok(Some(streams)) => streams,
+    let (streams, begun_at) = match core.staging().streams(params.run_id, core.now_ms()) {
+        Ok(Some(found)) => found,
         Ok(None) => {
             return finish(
                 JobState::Failed,
@@ -295,8 +353,14 @@ pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &Atomic
     };
     let report = core.with_library(|_, library| library.stream_dry_run(streams));
     match report {
-        Some(Ok(report)) => match core.staging().save_report(params.run_id, &report) {
-            Ok(()) => finish(JobState::Succeeded, None),
+        Some(Ok(report)) => match core.staging().save_report(params.run_id, begun_at, &report) {
+            Ok(true) => finish(JobState::Succeeded, None),
+            Ok(false) => finish(
+                JobState::Failed,
+                Some(
+                    "the staged run expired, or was staged again, while it was dry run".to_owned(),
+                ),
+            ),
             Err(failed) => finish(JobState::Failed, Some(failed.to_string())),
         },
         Some(Err(failed)) => finish(JobState::Failed, Some(failed.to_string())),
@@ -347,14 +411,14 @@ mod tests {
         let second = vec![stream("Paper Lanterns")];
         let shown = staging.stage(run(), 1, 2, &second, NOW).unwrap();
         assert_eq!((shown.pieces, shown.received, shown.streams), (2, 1, 1));
-        assert_eq!(staging.streams(run()).unwrap(), None);
+        assert_eq!(staging.streams(run(), NOW).unwrap(), None);
         let first = vec![stream("Low Tide"), stream("Night Ferry")];
         let shown = staging.stage(run(), 0, 2, &first, NOW).unwrap();
         assert_eq!(
             (shown.received, shown.streams, shown.expires_at),
             (2, 3, NOW + KEEP_MS)
         );
-        let whole = staging.streams(run()).unwrap().unwrap();
+        let (whole, _) = staging.streams(run(), NOW).unwrap().unwrap();
         let titles: Vec<&str> = whole.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(titles, ["Low Tide", "Night Ferry", "Paper Lanterns"]);
         // Only the OS user can read what was kept.
@@ -386,6 +450,81 @@ mod tests {
             staging.stage(Id::from_bytes([1; 16]), 0, 1, &many, NOW),
             Err(Refused::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn a_piece_whose_run_was_not_said_is_said_when_it_is_sent_again() {
+        let scratch = Scratch::new();
+        let staging = Staging::start(scratch.path().join("imports")).unwrap();
+        staging
+            .stage(run(), 0, 2, &[stream("Low Tide")], NOW)
+            .unwrap();
+        // Piece 1 reached the disk and run.json did not, as when the disk
+        // filled between the two.
+        let dir = scratch.path().join("imports").join(run().to_string());
+        write_json(&dir.join("piece-1.json"), &vec![stream("Night Ferry")]).unwrap();
+        assert_eq!(staging.run(run(), NOW).unwrap().unwrap().received, 1);
+        let again = staging
+            .stage(run(), 1, 2, &[stream("Night Ferry")], NOW)
+            .unwrap();
+        assert_eq!((again.received, again.streams), (2, 2));
+        assert!(staging.streams(run(), NOW).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_stream_whose_times_no_stream_can_have_is_refused() {
+        let scratch = Scratch::new();
+        let staging = Staging::start(scratch.path().join("imports")).unwrap();
+        let mut long = stream("Low Tide");
+        long.ms_played = i64::MAX;
+        let mut late = stream("Low Tide");
+        late.ended_at = i64::MAX;
+        for wrong in [long, late] {
+            assert!(matches!(
+                staging.stage(run(), 0, 1, &[wrong], NOW),
+                Err(Refused::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_report_is_kept_only_for_the_run_it_was_made_of() {
+        let scratch = Scratch::new();
+        let staging = Staging::start(scratch.path().join("imports")).unwrap();
+        staging
+            .stage(run(), 0, 1, &[stream("Low Tide")], NOW)
+            .unwrap();
+        let (_, begun_at) = staging.streams(run(), NOW).unwrap().unwrap();
+        assert!(staging.streams(run(), NOW + KEEP_MS + 1).unwrap().is_none());
+        // Swept, and staged again under the same ID a day later: a report
+        // of the first is not the second's.
+        staging.sweep(NOW + KEEP_MS + 1);
+        staging
+            .stage(run(), 0, 1, &[stream("Low Tide")], NOW + KEEP_MS + 2)
+            .unwrap();
+        let report = ImportReport {
+            made_at: NOW,
+            matcher_version: 1,
+            streams: 1,
+            events: 1,
+            scrobbles: 0,
+            scrobbles_excluded: 0,
+            scrobbles_echoes: 0,
+            tiers: Vec::new(),
+            years: Vec::new(),
+            offline: 0,
+            offline_timestamped: 0,
+            offline_seconds: 0,
+            offline_milliseconds: 0,
+            paused: 0,
+            problems: Vec::new(),
+            samples: Vec::new(),
+        };
+        assert!(!staging.save_report(run(), begun_at, &report).unwrap());
+        let later = NOW + KEEP_MS + 2;
+        assert!(staging.run(run(), later).unwrap().unwrap().report.is_none());
+        let (_, begun_again) = staging.streams(run(), later).unwrap().unwrap();
+        assert!(staging.save_report(run(), begun_again, &report).unwrap());
     }
 
     #[test]

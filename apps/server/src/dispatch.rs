@@ -1075,7 +1075,9 @@ impl Core {
             LastfmSetScrobbling::NAME => run::<LastfmSetScrobbling>(params, |params| {
                 self.lastfm_set_scrobbling(stores, &params)
             }),
-            ImportsStage::NAME => run::<ImportsStage>(params, |params| self.imports_stage(&params)),
+            ImportsStage::NAME => {
+                run::<ImportsStage>(params, |params| self.imports_stage(stores, &params))
+            }
             ImportsDryRun::NAME => {
                 run::<ImportsDryRun>(params, |params| self.imports_dry_run(stores, &params))
             }

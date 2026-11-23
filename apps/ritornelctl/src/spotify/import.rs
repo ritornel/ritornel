@@ -10,12 +10,12 @@ use std::time::Duration;
 use ritornel_client::contract::methods::{ImportsDryRun, ImportsGet, ImportsStage};
 use ritornel_client::contract::{
     ImportProblem, ImportReport, ImportRun, ImportsDryRunParams, ImportsGetParams,
-    ImportsStageParams, JobState, MAX_STREAMS_PER_PIECE, SpotifyStream, StreamTier,
+    ImportsStageParams, Job, JobState, MAX_STREAMS_PER_PIECE, SpotifyStream, StreamTier,
 };
 use ritornel_client::local;
 use serde_json::json;
 
-use super::{Tally, read, render, to_json};
+use super::{Tally, read, render_tally, to_json};
 use crate::cli::{Error, SpotifyImportArgs};
 use crate::server;
 
@@ -100,7 +100,7 @@ pub(crate) fn import(
         text.push('\n');
         text
     } else {
-        rendered(&tally, &run, args.samples)
+        rendered(&tally, &run, &job, args.samples)
     };
     out.write_all(text.as_bytes())
         .and_then(|()| out.flush())
@@ -125,8 +125,8 @@ fn minutes(ms: i64) -> String {
 }
 
 /// What was read, the run, and its dry run, as a person reads them.
-fn rendered(tally: &Tally, run: &ImportRun, samples: bool) -> String {
-    let mut text = render(tally).replace("Nothing was stored or sent.\n", "");
+fn rendered(tally: &Tally, run: &ImportRun, job: &Job, samples: bool) -> String {
+    let mut text = render_tally(tally);
     let _ = writeln!(
         text,
         "\nSent {} streams to the hub as run {}, kept there for a day. Nothing was written to \
@@ -134,7 +134,11 @@ fn rendered(tally: &Tally, run: &ImportRun, samples: bool) -> String {
         run.streams, run.run_id
     );
     let Some(report) = &run.report else {
-        text.push_str("The dry run made no report.\n");
+        let _ = writeln!(
+            text,
+            "The dry run made no report: {}.",
+            job.error.as_deref().unwrap_or("it did not finish")
+        );
         return text;
     };
     text.push_str(&report_text(report, samples));
