@@ -1133,8 +1133,8 @@ impl Player {
                 self.sync(server, &mut events);
                 self.changed(&mut events);
             }
-            // Nothing plays yet: the master is still fetched, and play
-            // opens it from where the entry waits.
+            // Nothing plays yet. A fetch under way goes on, and play opens
+            // the entry from where it waits.
             Status::Buffering => {
                 self.status = Status::Paused;
                 self.held_reason = self
@@ -1594,6 +1594,8 @@ impl Player {
             let entry = self.queue.get(index)?.clone();
             Some((entry, self.follows_by(index)))
         }) else {
+            // Nothing follows: a fetch for what did is let go.
+            self.fetching_next = None;
             return Ok(());
         };
         // Its master is being fetched: it is asked for once. One fetched
@@ -1715,20 +1717,30 @@ impl Player {
         let mut events = Vec::new();
         self.sync(server, &mut events);
         if self.status == Status::Buffering && self.fetching == Some(fetch) {
+            let library = library.ok_or(no_library())?;
             self.fetching = None;
             self.pulled = Some((fetch, outcome));
-            let library = library.ok_or(no_library())?;
-            self.start(server, library, &mut events)?;
+            let started = self.start(server, library, &mut events);
             self.pulled = None;
+            if let Err(error) = started {
+                // Paused where it waits, not buffering for nothing.
+                self.status = Status::Paused;
+                self.changed(&mut events);
+                return Err(error);
+            }
             // Where it is now, should it go down before a frame is heard:
             // another entry, if this one could not be fetched.
             server.save_place(self.entry_row(), self.position_ms, self.resume_listen)?;
             self.changed(&mut events);
         } else if self.fetching_next == Some(fetch) {
             self.fetching_next = None;
-            // Only while it is still the next and nothing is joined yet.
+            // Only while a track plays that it is still the next of, and
+            // nothing is joined to it yet.
             let follows = self.following().and_then(|index| self.queue.get(index));
-            if self.prepared.is_none() && follows.is_some_and(|next| next.entry_id == fetch.entry) {
+            if self.loaded.is_some()
+                && self.prepared.is_none()
+                && follows.is_some_and(|next| next.entry_id == fetch.entry)
+            {
                 match outcome {
                     Ok(copy) => {
                         self.pulled = Some((fetch, Ok(copy)));

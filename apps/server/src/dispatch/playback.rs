@@ -368,9 +368,20 @@ impl Core {
     }
 
     /// Hands the player a master pulled for it, or why it could not be.
+    /// The cache is trimmed here, with the player held, so that nothing it
+    /// is opening can be let go meanwhile.
     pub(crate) fn master_fetched(&self, fetch: Fetch, outcome: Result<engine::Copy, String>) {
         let handed = self.with_stores(|stores| {
             self.with_player(stores, |player, server, library| {
+                if let Ok(copy) = &outcome {
+                    let limit = self
+                        .cache_bytes
+                        .get()
+                        .copied()
+                        .unwrap_or(DEFAULT_CACHE_BYTES);
+                    let kept = copy.path(&std::collections::HashMap::new());
+                    crate::hub_catalog::trim(&self.audio_cache(), limit, kept.as_deref());
+                }
                 Ok(((), player.fetched(fetch, outcome, server, library)?))
             })
         });
@@ -381,14 +392,8 @@ impl Core {
 
     /// On a satellite, the hub's library as its player reads it.
     pub(crate) fn hub_catalog(&self) -> Option<HubCatalog> {
-        self.uplink().map(|uplink| {
-            let bytes = self
-                .cache_bytes
-                .get()
-                .copied()
-                .unwrap_or(DEFAULT_CACHE_BYTES);
-            HubCatalog::new(uplink, self.audio_cache(), bytes)
-        })
+        self.uplink()
+            .map(|uplink| HubCatalog::new(uplink, self.audio_cache()))
     }
 
     /// Where a satellite keeps the masters it pulls.

@@ -46,7 +46,11 @@ impl Core {
             let idempotency_key = ritornel_engine::new_id(self.clock.now_ms(), &*self.entropy)
                 .map_err(super::playback::refused)?;
             let command = PlaybackCommandParams { idempotency_key };
-            let playing = state.status == PlaybackStatus::Playing;
+            // Buffering is about to play, so the toggle pauses it.
+            let playing = matches!(
+                state.status,
+                PlaybackStatus::Playing | PlaybackStatus::Buffering
+            );
             match (key, state.entry_id) {
                 (Key::Toggle, _) if playing => self.playback_pause(stores, &command),
                 (Key::Toggle | Key::Play, _) => self.playback_resume(stores, &command),

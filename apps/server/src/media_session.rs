@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak, mpsc};
 use std::thread::JoinHandle;
 
 use ritornel_engine::Id;
-use ritornel_engine::playback::{PlayerState, Status};
+use ritornel_engine::playback::PlayerState;
 use tokio::runtime::Handle;
 use tracing::debug;
 
@@ -147,7 +147,7 @@ fn run(
             }
             Message::State(state) => {
                 if controls.is_none() {
-                    if state.status != Status::Playing {
+                    if !state.status.wants_sound() {
                         continue;
                     }
                     let keys = keys.clone();

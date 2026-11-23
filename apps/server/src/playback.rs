@@ -1,6 +1,7 @@
-//! The player's two threads: the control loop, which ticks the player a
-//! few times a second, and the effect worker, which delivers finished
-//! listens from the outbox to history. See "Audio pipeline" and "Recording a
+//! The player's threads: the control loop, which ticks the player a few
+//! times a second; the effect worker, which delivers finished listens from
+//! the outbox to history; and on a satellite, the puller, which pulls the
+//! masters the player waits for. See "Audio pipeline" and "Recording a
 //! listen" in docs/internals/playback.md, and "Jobs and outbox" in
 //! docs/internals/server.md.
 //!
@@ -144,7 +145,9 @@ pub(crate) fn restore(
 }
 
 /// How long the thread that pulls masters waits when nothing wakes it.
-const PULL_IDLE: Duration = Duration::from_secs(1);
+/// Every call and tick that leaves the player waiting wakes it, so this is
+/// only a fallback.
+const PULL_IDLE: Duration = Duration::from_secs(30);
 
 /// The running threads. Dropping them tells them to stop.
 #[derive(Debug)]
@@ -196,7 +199,7 @@ impl Workers {
         })
     }
 
-    /// Stops both threads and waits for them, then shuts the player down
+    /// Stops the threads and waits for the first two, then shuts the player down
     /// cleanly and delivers what that closed.
     pub(crate) fn stop(mut self) {
         self.signal();

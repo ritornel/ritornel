@@ -33,8 +33,6 @@ pub(crate) struct HubCatalog {
     uplink: Arc<Uplink>,
     /// Where pulled masters are kept.
     cache: PathBuf,
-    /// The most it holds, in bytes.
-    cache_bytes: u64,
 }
 
 /// A call the hub refused or could not be asked, as the player reports it.
@@ -66,12 +64,8 @@ fn facts_of(path: &Path) -> Option<FileFacts> {
 }
 
 impl HubCatalog {
-    pub(crate) fn new(uplink: Arc<Uplink>, cache: PathBuf, cache_bytes: u64) -> Self {
-        Self {
-            uplink,
-            cache,
-            cache_bytes,
-        }
+    pub(crate) fn new(uplink: Arc<Uplink>, cache: PathBuf) -> Self {
+        Self { uplink, cache }
     }
 
     fn call<M: Method>(&self, params: &M::Params) -> Result<M::Result, Error> {
@@ -147,8 +141,9 @@ impl HubCatalog {
     /// The master, pulled from the hub if it is not kept here already.
     fn pull(&self, appearance: Id, copy: &HubCopy) -> Result<PathBuf, Error> {
         let kept = self.kept(copy);
+        // Kept already. Its time is left alone: the player may have it open,
+        // and a file whose time changes is one it no longer plays.
         if facts_of(&kept).is_some_and(|facts| facts.size_bytes == copy.size_bytes) {
-            played_again(&kept);
             return Ok(kept);
         }
         let route_to = self.uplink.route().ok_or(Error::Playback(
@@ -184,7 +179,6 @@ impl HubCatalog {
                     ms = started.elapsed().as_millis(),
                     "a master was pulled from the hub"
                 );
-                trim(&self.cache, self.cache_bytes, Some(&kept));
                 Ok(kept)
             }
             Ok(bytes) => {
@@ -204,8 +198,20 @@ impl HubCatalog {
     }
 }
 
-/// Marks a kept master as played now, so that it is the newest to keep.
+/// How often a kept master is marked as played, at most.
+const MARK_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Marks a kept master as played now, so that it is the newest to keep:
+/// at most once a day. The player checks a file's time each time it reads
+/// it again, so one it opened lately, and may have open still, is never
+/// marked while it plays.
 fn played_again(kept: &Path) {
+    let lately = std::fs::metadata(kept)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|at| at.elapsed().is_ok_and(|ago| ago < MARK_EVERY));
+    if lately {
+        return;
+    }
     let touched = std::fs::File::options()
         .append(true)
         .open(kept)
@@ -219,7 +225,7 @@ fn played_again(kept: &Path) {
 /// `limit` bytes. It never lets go of `keep`, the one just pulled, nor of
 /// the newest other, which is playing or about to, nor of one being
 /// pulled.
-fn trim(cache: &Path, limit: u64, keep: Option<&Path>) {
+pub(crate) fn trim(cache: &Path, limit: u64, keep: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(cache) else {
         return;
     };
