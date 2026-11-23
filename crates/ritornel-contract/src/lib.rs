@@ -38,6 +38,7 @@
 )]
 
 mod command;
+mod device;
 mod error;
 mod event;
 mod frame;
@@ -65,6 +66,7 @@ mod ticket;
 mod typescript;
 
 pub use command::{LibraryCreateParams, LibraryCreated, Receipt, ReceiptStatus};
+pub use device::{DeviceKind, Platform, PlayedVia};
 pub use error::{ErrorCode, ErrorData, RpcError};
 pub use event::{
     EVENT_METHOD, Event, JobsEvent, LibraryChange, LibraryEvent, ListEvent, ServersEvent,
@@ -82,7 +84,7 @@ pub use identity::{
     Binding, DryRun, DryRunParams, FileFacts, ItemChange, ItemOutcome, Nearest, Penalties,
     PolicyOverrides, PolicyValues, Review, ReviewCause, ReviewList,
 };
-pub use imports::{SpotifyPlatform, SpotifyStream};
+pub use imports::SpotifyStream;
 pub use lastfm::{
     DeliveryCount, DoubtfulTrack, ImportSchedule, KeyParams, LastImport, LastfmReport,
     LastfmReportParams, LastfmStatus, LastfmSyncParams, LastfmSyncStarted, NearlyMatched,

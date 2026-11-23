@@ -11,11 +11,11 @@ mod rows;
 pub(crate) use self::archive::Error as ArchiveError;
 use self::archive::shown;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::Path;
 
-use ritornel_client::contract::{SpotifyPlatform, SpotifyStream};
+use ritornel_client::contract::{DeviceKind, Platform, PlayedVia, SpotifyStream};
 use serde_json::json;
 
 use self::rows::{NotMusic, Row};
@@ -35,6 +35,9 @@ pub(crate) struct Archive {
     pub(crate) streams: Vec<SpotifyStream>,
     pub(crate) tally: Tally,
 }
+
+/// The word a tally gives a stream whose row did not say.
+const UNKNOWN: &str = "unknown";
 
 /// The counts of what an archive held. None holds a value from a row.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -64,8 +67,13 @@ pub(crate) struct Tally {
     pub(crate) thirty_distinct: u64,
     /// The first and the last stream's end.
     pub(crate) span: Option<(i64, i64)>,
-    /// The streams by platform, in the order of [`SpotifyPlatform::ALL`].
-    pub(crate) platforms: [u64; SpotifyPlatform::ALL.len()],
+    /// The streams by their platform's word, `unknown` when the row did
+    /// not say.
+    pub(crate) platforms: BTreeMap<&'static str, u64>,
+    /// The streams by their kind of device's word, `unknown` likewise.
+    pub(crate) devices: BTreeMap<&'static str, u64>,
+    /// The streams by how they were played, `unknown` likewise.
+    pub(crate) vias: BTreeMap<&'static str, u64>,
     /// The names of fields the reader does not know.
     pub(crate) unknown: BTreeSet<String>,
 }
@@ -116,12 +124,18 @@ impl Archive {
             tally.music += 1;
             let thirty = stream.ms_played >= THIRTY_SECONDS_MS;
             tally.thirty += u64::from(thirty);
-            let platform = SpotifyPlatform::ALL
-                .iter()
-                .position(|word| *word == stream.platform);
-            if let Some(count) = platform.and_then(|at| tally.platforms.get_mut(at)) {
-                *count += 1;
-            }
+            *tally
+                .platforms
+                .entry(stream.platform.map_or(UNKNOWN, Platform::as_str))
+                .or_default() += 1;
+            *tally
+                .vias
+                .entry(stream.via.map_or(UNKNOWN, PlayedVia::as_str))
+                .or_default() += 1;
+            *tally
+                .devices
+                .entry(stream.device_kind.map_or(UNKNOWN, DeviceKind::as_str))
+                .or_default() += 1;
             tally.span = Some(match tally.span {
                 None => (stream.ended_at, stream.ended_at),
                 Some((from, to)) => (from.min(stream.ended_at), to.max(stream.ended_at)),
@@ -172,16 +186,12 @@ fn to_json(tally: &Tally) -> serde_json::Value {
         .zip(tally.not_music)
         .map(|(kind, count)| (kind.as_str().to_owned(), json!(count)))
         .collect();
-    let platforms: serde_json::Map<String, serde_json::Value> = SpotifyPlatform::ALL
-        .iter()
-        .zip(tally.platforms)
-        .map(|(word, count)| (word.as_str().to_owned(), json!(count)))
-        .collect();
     let wrong: Vec<serde_json::Value> = tally
         .wrong_named
         .iter()
-        .map(|(file, row, field)| json!({ "file": file, "row": row, "field": field }))
+        .map(|(file, row, field)| json!({ "file": shown(file), "row": row, "field": field }))
         .collect();
+    let unknown: Vec<String> = tally.unknown.iter().map(|name| shown(name)).collect();
     json!({
         "files": tally.files,
         "videoFiles": tally.video_files,
@@ -196,8 +206,10 @@ fn to_json(tally: &Tally) -> serde_json::Value {
         "thirtySecondsDistinct": tally.thirty_distinct,
         "first": tally.span.map(|(from, _)| day(from)),
         "last": tally.span.map(|(_, to)| day(to)),
-        "platforms": platforms,
-        "unknownFields": tally.unknown,
+        "platforms": tally.platforms,
+        "deviceKinds": tally.devices,
+        "playedVia": tally.vias,
+        "unknownFields": unknown,
     })
 }
 
@@ -254,14 +266,18 @@ fn render(tally: &Tally) -> String {
             ),
         ));
     }
-    let platforms: Vec<String> = SpotifyPlatform::ALL
-        .iter()
-        .zip(tally.platforms)
-        .filter(|(_, count)| *count > 0)
-        .map(|(word, count)| format!("{} {count}", word.as_str()))
-        .collect();
-    if !platforms.is_empty() {
-        lines.push(("By platform", platforms.join(", ")));
+    for (label, counts) in [
+        ("By platform", &tally.platforms),
+        ("By device", &tally.devices),
+        ("Played via", &tally.vias),
+    ] {
+        if !counts.is_empty() {
+            let words: Vec<String> = counts
+                .iter()
+                .map(|(word, count)| format!("{word} {count}"))
+                .collect();
+            lines.push((label, words.join(", ")));
+        }
     }
     if !tally.unknown.is_empty() {
         let names: Vec<String> = tally.unknown.iter().map(|name| shown(name)).collect();
@@ -441,7 +457,9 @@ mod tests {
             thirty: 5,
             thirty_distinct: 3,
             span: Some((1_552_684_449_000, 1_577_952_240_000)),
-            platforms: [1, 0, 0, 0, 4, 0, 1, 0],
+            platforms: BTreeMap::from([("ios", 4), ("mac", 1), ("unknown", 1)]),
+            devices: BTreeMap::from([("computer", 1), ("tv", 1), ("unknown", 4)]),
+            vias: BTreeMap::from([("app", 5), ("cast", 1)]),
             unknown: BTreeSet::from(["MARKED_FIELD".to_owned()]),
         }
     }
@@ -499,6 +517,8 @@ mod tests {
             "offlineTimestamp",
             "incognito",
             "platform",
+            "deviceKind",
+            "via",
         ];
         for stream in &read.streams {
             let value = serde_json::to_value(stream).unwrap();
@@ -623,7 +643,9 @@ mod tests {
             "Streams of music  6\n",
             "From              2019-03-15 to 2020-01-02\n",
             "Not music         2: 1 episode, 1 audiobook\n",
-            "By platform       mac 1, ios 4, cast 1\n",
+            "By platform       ios 4, mac 1, unknown 1\n",
+            "By device         computer 1, tv 1, unknown 4\n",
+            "Played via        app 5, cast 1\n",
             "Not read          1 file of video history: music videos and video shows\n",
             "Nothing was stored or sent.\n",
         ] {
@@ -635,5 +657,7 @@ mod tests {
         assert_eq!(json["thirtySecondsDistinct"], 3);
         assert_eq!(json["notMusic"]["episode"], 1);
         assert_eq!(json["platforms"]["ios"], 4);
+        assert_eq!(json["deviceKinds"]["tv"], 1);
+        assert_eq!(json["playedVia"]["cast"], 1);
     }
 }

@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::{DeviceKind, Platform, PlayedVia};
+
 /// One row of Spotify's extended streaming history, as Ritornel keeps it.
 ///
 /// It is the whole of what is taken from a row. The row's IP address, user
@@ -57,82 +59,19 @@ pub struct SpotifyStream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub incognito: Option<bool>,
-    /// What kind of device played it, as one word.
-    pub platform: SpotifyPlatform,
-}
-
-/// What kind of device played a stream. Spotify's own text names the device
-/// and its system, so only this word is kept. A word it does not know is
-/// refused with an error that does not repeat it, so that text sent in its
-/// place is never echoed back or logged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "snake_case")]
-pub enum SpotifyPlatform {
-    /// A Mac.
-    Mac,
-    /// A Windows computer.
-    Windows,
-    /// A Linux computer.
-    Linux,
-    /// An Android phone or tablet.
-    Android,
-    /// An iPhone or iPad.
-    Ios,
-    /// Spotify's web player.
-    Web,
-    /// A speaker, television or other device Spotify casts to.
-    Cast,
-    /// Anything else, or nothing said.
-    Other,
-}
-
-impl<'de> Deserialize<'de> for SpotifyPlatform {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Word;
-        impl serde::de::Visitor<'_> for Word {
-            type Value = SpotifyPlatform;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a platform word")
-            }
-            fn visit_str<E: serde::de::Error>(self, word: &str) -> Result<SpotifyPlatform, E> {
-                SpotifyPlatform::ALL
-                    .into_iter()
-                    .find(|platform| platform.as_str() == word)
-                    .ok_or_else(|| E::custom("a platform is one of its words"))
-            }
-        }
-        deserializer.deserialize_str(Word)
-    }
-}
-
-impl SpotifyPlatform {
-    /// Every word, in order.
-    pub const ALL: [Self; 8] = [
-        Self::Mac,
-        Self::Windows,
-        Self::Linux,
-        Self::Android,
-        Self::Ios,
-        Self::Web,
-        Self::Cast,
-        Self::Other,
-    ];
-
-    /// The word, as it is on the wire.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Mac => "mac",
-            Self::Windows => "windows",
-            Self::Linux => "linux",
-            Self::Android => "android",
-            Self::Ios => "ios",
-            Self::Web => "web",
-            Self::Cast => "cast",
-            Self::Other => "other",
-        }
-    }
+    /// The operating system of the device that played it, when the row
+    /// says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub platform: Option<Platform>,
+    /// The hardware the sound came out of, when the row says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub device_kind: Option<DeviceKind>,
+    /// How that device played it, when the row says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub via: Option<PlayedVia>,
 }
 
 #[cfg(test)]
@@ -156,6 +95,8 @@ mod tests {
             "offline": false,
             "incognito": false,
             "platform": "ios",
+            "deviceKind": "phone",
+            "via": "app",
         })
     }
 
@@ -163,7 +104,14 @@ mod tests {
     fn a_stream_reads_and_writes_the_same() {
         let wire = stream();
         let read: SpotifyStream = serde_json::from_value(wire.clone()).unwrap();
-        assert_eq!(read.platform, SpotifyPlatform::Ios);
+        assert_eq!(
+            (read.platform, read.device_kind, read.via),
+            (
+                Some(Platform::Ios),
+                Some(DeviceKind::Phone),
+                Some(PlayedVia::App)
+            )
+        );
         assert_eq!(serde_json::to_value(read).unwrap(), wire);
     }
 
@@ -177,19 +125,14 @@ mod tests {
                 "{field}"
             );
         }
-        let mut wire = stream();
-        wire["platform"] = json!("iOS 17.1 (MARKED_DEVICE)");
-        let error = serde_json::from_value::<SpotifyStream>(wire)
-            .unwrap_err()
-            .to_string();
-        assert!(!error.contains("MARKED"), "{error}");
-        for platform in SpotifyPlatform::ALL {
-            let word = serde_json::to_value(platform).unwrap();
-            assert_eq!(word, json!(platform.as_str()));
-            assert_eq!(
-                serde_json::from_value::<SpotifyPlatform>(word).unwrap(),
-                platform
-            );
+        // A word it does not know is read as `other`, and never repeated.
+        for field in ["platform", "deviceKind", "via"] {
+            let mut wire = stream();
+            wire[field] = json!("iOS 17.1 (MARKED_DEVICE)");
+            let read: SpotifyStream = serde_json::from_value(wire).unwrap();
+            let written = serde_json::to_string(&read).unwrap();
+            assert!(!written.contains("MARKED"), "{written}");
+            assert!(written.contains("\"other\""), "{written}");
         }
     }
 }

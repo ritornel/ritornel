@@ -175,7 +175,18 @@ fn check(names: &[&str]) -> Result<u64, Error> {
 fn walk(folder: &Path, depth: usize, found: &mut Vec<PathBuf>) -> Result<(), Error> {
     for entry in std::fs::read_dir(folder).map_err(Error::Open)? {
         let entry = entry.map_err(Error::Open)?;
-        let kind = entry.file_type().map_err(Error::Open)?;
+        // A link is followed, to a file or a folder. One that leads nowhere
+        // fails the read when it is named as a history file, and is passed
+        // over otherwise, as anything else in the folder is.
+        let kind = match std::fs::metadata(entry.path()) {
+            Ok(metadata) => metadata.file_type(),
+            Err(error) => {
+                if kind(&entry.file_name().to_string_lossy()) == Kind::Other {
+                    continue;
+                }
+                return Err(Error::Open(error));
+            }
+        };
         if kind.is_dir() && depth > 0 {
             walk(&entry.path(), depth - 1, found)?;
         } else if kind.is_file() {

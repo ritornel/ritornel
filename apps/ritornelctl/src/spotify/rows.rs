@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
-use ritornel_client::contract::{SpotifyPlatform, SpotifyStream};
+use ritornel_client::contract::{DeviceKind, Platform, PlayedVia, SpotifyStream};
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -265,7 +265,9 @@ impl Raw {
         let ms_played = whole(self, "ms_played")?
             .filter(|ms| *ms >= 0)
             .ok_or("ms_played")?;
-        let platform = text(self, "platform")?;
+        let (platform, device_kind, via) = text(self, "platform")?
+            .as_deref()
+            .map_or((None, None, None), device_words);
         Ok(Row::Music(SpotifyStream {
             ended_at,
             ms_played,
@@ -280,9 +282,9 @@ impl Raw {
             offline: flag(self, "offline")?,
             offline_timestamp: whole(self, "offline_timestamp")?,
             incognito: flag(self, "incognito_mode")?,
-            platform: platform
-                .as_deref()
-                .map_or(SpotifyPlatform::Other, platform_word),
+            platform,
+            device_kind,
+            via,
         }))
     }
 }
@@ -327,32 +329,131 @@ fn instant(ts: &str) -> Option<i64> {
         .map(jiff::Timestamp::as_millisecond)
 }
 
-/// How a platform's text begins, and the word for it. Spotify's text puts
-/// the system first and the device after it, so only the beginning is
-/// read: a device's own name never decides the word. A Spotify Connect
-/// device, such as a speaker or a television, is a `Partner`.
-const PLATFORMS: [(&str, SpotifyPlatform); 12] = [
-    ("partner", SpotifyPlatform::Cast),
-    ("cast", SpotifyPlatform::Cast),
-    ("webplayer", SpotifyPlatform::Web),
-    ("web_player", SpotifyPlatform::Web),
-    ("web player", SpotifyPlatform::Web),
-    ("android", SpotifyPlatform::Android),
-    ("ios", SpotifyPlatform::Ios),
-    ("os x", SpotifyPlatform::Mac),
-    ("osx", SpotifyPlatform::Mac),
-    ("macos", SpotifyPlatform::Mac),
-    ("windows", SpotifyPlatform::Windows),
-    ("linux", SpotifyPlatform::Linux),
-];
+/// What a platform's text says of the device that played the stream: its
+/// operating system, the hardware the sound came out of, and how it played
+/// it. Each is left out where the text does not say. Only these words are
+/// kept, and the text is read only for them.
+pub(crate) type Words = (Option<Platform>, Option<DeviceKind>, Option<PlayedVia>);
 
-/// The kind of device a platform's text names. Only the word is kept.
-pub(crate) fn platform_word(text: &str) -> SpotifyPlatform {
-    let text = text.trim_start().to_ascii_lowercase();
-    PLATFORMS
+/// The words for a platform's text. Spotify's text names the system first
+/// and the device after it, or, for a Spotify Connect device, `Partner`
+/// and its maker and model. A device's own name never decides a word: the
+/// system, a model of the maker's or a kind the maker names does.
+pub(crate) fn device_words(text: &str) -> Words {
+    use DeviceKind::{Car, Computer, Phone, Tablet, Watch};
+    use Platform::{Android, Ios, Linux, Mac, Windows};
+    let text = text.trim().to_ascii_lowercase();
+    let app = Some(PlayedVia::App);
+    if text.is_empty() || text == "not_applicable" || text == "unknown" {
+        return (None, None, None);
+    }
+    if text.starts_with("partner") {
+        return partner(&text);
+    }
+    if text.starts_with("cast") {
+        return (None, None, Some(PlayedVia::Cast));
+    }
+    if let Some(host) = ["webplayer", "web_player", "web player"]
         .iter()
-        .find(|(prefix, _)| text.starts_with(prefix))
-        .map_or(SpotifyPlatform::Other, |(_, word)| *word)
+        .find_map(|prefix| text.strip_prefix(prefix))
+    {
+        // An older web player names the system it ran on, a computer's.
+        let host = host.trim_start();
+        let platform =
+            if host.starts_with("osx") || host.starts_with("os x") || host.starts_with("mac") {
+                Some(Mac)
+            } else if host.starts_with("windows") {
+                Some(Windows)
+            } else if host.starts_with("linux") {
+                Some(Linux)
+            } else {
+                None
+            };
+        return (platform, platform.map(|_| Computer), Some(PlayedVia::Web));
+    }
+    if text.starts_with("android") {
+        let kind = (text.contains("android auto") || text.contains("android_auto")).then_some(Car);
+        return (Some(Android), kind, app);
+    }
+    if text.starts_with("ios") {
+        // iOS names the model after its version.
+        let kind = if text.contains("iphone") {
+            Some(Phone)
+        } else if text.contains("ipad") {
+            Some(Tablet)
+        } else if text.contains("watch") {
+            Some(Watch)
+        } else {
+            None
+        };
+        return (Some(Ios), kind, app);
+    }
+    for (prefix, platform) in [
+        ("os x", Mac),
+        ("osx", Mac),
+        ("macos", Mac),
+        ("windows", Windows),
+        ("linux", Linux),
+    ] {
+        if text.starts_with(prefix) {
+            return (Some(platform), Some(Computer), app);
+        }
+    }
+    (Some(Platform::Other), None, None)
+}
+
+/// The words for a Spotify Connect device: `Partner`, its integration, and
+/// its maker, model and more after it. A television, a set-top box or a
+/// console plays Spotify in an app of its own; Google's speakers, displays
+/// and dongles are cast to; a receiver or a network speaker with no app is a
+/// Connect receiver.
+fn partner(text: &str) -> Words {
+    use DeviceKind::{Car, Console, Group, Speaker, Tv};
+    use PlayedVia::{App, Cast, Connect};
+    let mut words = text.split_whitespace();
+    let _partner = words.next();
+    let integration = words.next().unwrap_or_default();
+    let rest: String = words.collect::<Vec<_>>().join(" ");
+    let mut fields = rest.split(';');
+    let maker = fields.next().unwrap_or_default();
+    let model = fields.next().unwrap_or_default();
+    let named = |token: &str| maker.contains(token) || model.contains(token);
+    let google = integration.contains("google") || named("google") || named("chromecast");
+    let other = Some(Platform::Other);
+    if named("avr") || named("receiver") {
+        return (None, Some(Speaker), Some(Connect));
+    }
+    if named("xbox") || named("playstation") {
+        return (other, Some(Console), Some(App));
+    }
+    if model == "car" || named("car thing") || named("carplay") || named("android auto") {
+        return (None, Some(Car), None);
+    }
+    if named("group") {
+        return (None, Some(Group), Some(if google { Cast } else { Connect }));
+    }
+    if named("cast_audio") || named("chromecast audio") {
+        return (None, Some(Speaker), Some(Cast));
+    }
+    if named("cast_tv") || named("chromecast") {
+        return (None, Some(Tv), Some(Cast));
+    }
+    if google && (named("home") || named("nest") || named("display")) {
+        return (None, Some(Speaker), Some(Cast));
+    }
+    if named("echo") || named("sonos") || named("speaker") {
+        return (None, Some(Speaker), Some(Connect));
+    }
+    if integration.contains("roku")
+        || named("roku")
+        || named("tv")
+        || named("tizen")
+        || named("webos")
+        || named("player")
+    {
+        return (other, Some(Tv), Some(App));
+    }
+    (None, None, None)
 }
 
 #[cfg(test)]
@@ -421,7 +522,9 @@ mod tests {
                 offline: Some(false),
                 offline_timestamp: Some(1_552_684_000),
                 incognito: Some(false),
-                platform: SpotifyPlatform::Ios,
+                platform: Some(Platform::Ios),
+                device_kind: None,
+                via: Some(PlayedVia::App),
             }
         );
         let kept = serde_json::to_string(&stream).unwrap();
@@ -531,36 +634,98 @@ mod tests {
     }
 
     #[test]
-    fn a_platform_is_kept_as_one_word() {
-        for (text, word) in [
-            ("OS X 10.9.5 [x86 4]", SpotifyPlatform::Mac),
-            ("osx", SpotifyPlatform::Mac),
-            ("Windows 10 (10.0.19045; x64)", SpotifyPlatform::Windows),
-            ("windows", SpotifyPlatform::Windows),
-            ("Linux [x86-0]", SpotifyPlatform::Linux),
+    fn a_platform_is_kept_as_words_for_its_system_its_device_and_how_it_played() {
+        use DeviceKind::{Car, Computer, Console, Group, Phone, Speaker, Tablet, Tv, Watch};
+        use Platform::{Android, Ios, Linux, Mac, Other, Windows};
+        use PlayedVia::{App, Cast, Connect, Web};
+        for (text, words) in [
+            (
+                "OS X 10.9.5 [x86 4]",
+                (Some(Mac), Some(Computer), Some(App)),
+            ),
+            ("osx", (Some(Mac), Some(Computer), Some(App))),
+            (
+                "Windows 10 (10.0.19045; x64)",
+                (Some(Windows), Some(Computer), Some(App)),
+            ),
+            ("Linux [x86-0]", (Some(Linux), Some(Computer), Some(App))),
+            // A phone or a tablet is not guessed.
             (
                 "Android OS 9 API 28 (Invented, Model)",
-                SpotifyPlatform::Android,
+                (Some(Android), None, Some(App)),
             ),
-            ("android", SpotifyPlatform::Android),
-            ("iOS 17.1 (iPhone15,2)", SpotifyPlatform::Ios),
-            ("ios", SpotifyPlatform::Ios),
-            ("web_player osx 10.15.7;chrome 120.0", SpotifyPlatform::Web),
-            ("WebPlayer (websocket RFC6455)", SpotifyPlatform::Web),
-            ("Partner google cast_tv;Invented;;", SpotifyPlatform::Cast),
-            ("Partner invented_speaker;Model;;", SpotifyPlatform::Cast),
-            ("cast_to_device", SpotifyPlatform::Cast),
-            // A device's name never decides it.
+            ("android", (Some(Android), None, Some(App))),
+            ("ios", (Some(Ios), None, Some(App))),
+            ("iOS 17.1 (iPhone15,2)", (Some(Ios), Some(Phone), Some(App))),
+            ("iOS 12.1 (iPad7,5)", (Some(Ios), Some(Tablet), Some(App))),
+            ("iOS 10.0 (Watch3,4)", (Some(Ios), Some(Watch), Some(App))),
+            (
+                "web_player osx 10.15.7;chrome 120.0",
+                (Some(Mac), Some(Computer), Some(Web)),
+            ),
+            (
+                "web_player windows 10;firefox 120.0",
+                (Some(Windows), Some(Computer), Some(Web)),
+            ),
+            ("WebPlayer (websocket RFC6455)", (None, None, Some(Web))),
+            ("web_player", (None, None, Some(Web))),
+            ("cast", (None, None, Some(Cast))),
+            ("cast_to_device", (None, None, Some(Cast))),
+            (
+                "Partner google cast_audio;Chromecast Audio;;",
+                (None, Some(Speaker), Some(Cast)),
+            ),
+            (
+                "Partner google cast_tv;Chromecast;;",
+                (None, Some(Tv), Some(Cast)),
+            ),
+            (
+                "Partner google cast_group;Google Cast Group;;",
+                (None, Some(Group), Some(Cast)),
+            ),
+            (
+                "Partner google cast;Google Home Mini;;",
+                (None, Some(Speaker), Some(Cast)),
+            ),
+            (
+                "Partner google cast;Google Nest Hub;;",
+                (None, Some(Speaker), Some(Cast)),
+            ),
+            (
+                "Partner invented avr;Model;;",
+                (None, Some(Speaker), Some(Connect)),
+            ),
+            (
+                "Partner amazon_salmon Amazon;Echo Dot;;",
+                (None, Some(Speaker), Some(Connect)),
+            ),
+            (
+                "Partner invented Microsoft;Xbox One;;",
+                (Some(Other), Some(Console), Some(App)),
+            ),
+            (
+                "Partner roku_tv Invented;TV;;",
+                (Some(Other), Some(Tv), Some(App)),
+            ),
+            (
+                "Partner invented Apple;Apple TV;;",
+                (Some(Other), Some(Tv), Some(App)),
+            ),
+            ("Partner invented Invented;Car;;", (None, Some(Car), None)),
+            ("Partner invented Invented;Model;;", (None, None, None)),
+            // A device's own name never decides them.
             (
                 "Android OS 9 (Invented Broadcast)",
-                SpotifyPlatform::Android,
+                (Some(Android), None, Some(App)),
             ),
-            ("iOS 17.1 (Webster's Phone)", SpotifyPlatform::Ios),
-            ("webOS TV", SpotifyPlatform::Other),
-            ("", SpotifyPlatform::Other),
-            ("something new", SpotifyPlatform::Other),
+            ("iOS 17.1 (Webster's Phone)", (Some(Ios), None, Some(App))),
+            ("webOS TV", (Some(Other), None, None)),
+            ("something new", (Some(Other), None, None)),
+            ("not_applicable", (None, None, None)),
+            ("unknown", (None, None, None)),
+            ("", (None, None, None)),
         ] {
-            assert_eq!(platform_word(text), word, "{text}");
+            assert_eq!(device_words(text), words, "{text}");
         }
     }
 }
