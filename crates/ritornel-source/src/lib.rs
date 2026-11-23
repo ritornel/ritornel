@@ -154,7 +154,8 @@ pub trait Sink {
     fn cursor(&mut self) -> Result<Option<String>, Error>;
     /// Stores a batch and its cursor, in one transaction. A record stored
     /// before writes nothing, and a batch with nothing new moves no cursor
-    /// and writes nothing, but what the core sets aside on a full read.
+    /// and writes nothing, but what the core sets aside, or lifts, on a full
+    /// read.
     fn commit(&mut self, batch: Batch) -> Result<Stored, Error>;
     /// Makes the stored loved tracks the list as it stands now.
     fn loves(&mut self, loves: Vec<Love>) -> Result<LovesStored, Error>;

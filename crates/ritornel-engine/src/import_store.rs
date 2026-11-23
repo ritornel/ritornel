@@ -512,7 +512,7 @@ fn gone(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<u64, Er
 
 /// What an import set aside as a duplicate says, in its correction.
 pub(crate) const DUPLICATE_NOTE: &str = "set aside by a full sync: the source lists as many \
-     scrobbles in this second as its first read stored, with one fewer of this one, as a read \
+     scrobbles in this second as its first read stored, with fewer of this one, as a read \
      whose pages shifted leaves";
 
 /// What such a correction is marked with in its payload, as its `reason`:
@@ -647,7 +647,7 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
         }
         // How many of each track the first read stored, and how many of
         // those still count.
-        let mut stored: HashMap<&Track, (usize, usize)> = HashMap::new();
+        let mut stored: BTreeMap<&Track, (usize, usize)> = BTreeMap::new();
         for import in &first {
             let (all, counting) = stored.entry(&import.track).or_default();
             *all += 1;
