@@ -962,21 +962,45 @@ fn a_track_the_decoder_has_taken_is_let_go_until_the_output_reaches_it_and_never
 
 #[test]
 fn a_seek_plays_the_track_it_names_even_once_the_output_has_run_on_into_the_next() {
-    let (mut renderer, _) = AudioRenderer::tapped(AS_IS, 50).unwrap();
+    let first_frames = 7001;
+    // Hold the output after it has played at least 10 ms of the next track.
+    let (mut renderer, _, hold) = AudioRenderer::held(AS_IS, 50, first_frames + 160).unwrap();
     renderer
         .load(&fixture("g1.flac"), facts(&fixture("g1.flac")), 0, 1)
         .unwrap();
     let next = fixture("g2.flac");
-    renderer.queue_next(&next, facts(&next), 2).unwrap();
+    assert!(
+        renderer
+            .queue_next(&next, facts(&next), 2)
+            .unwrap()
+            .is_some()
+    );
     renderer.play();
     let mut said = Vec::new();
-    until(&mut renderer, &mut said, |said| ended(said, 1).is_some());
-    // The player decided on the first, which the output has just left.
+    until(&mut renderer, &mut said, |said| {
+        hold.waiting().is_some()
+            && said
+                .iter()
+                .any(|event| matches!(event, Event::Began { span: 2, .. }))
+    });
+    assert_eq!(
+        ended(&said, 1),
+        Some((first_frames, End::Joined { next: 2 }))
+    );
+
+    // Queue the pause before letting the output take messages again, so
+    // the second track cannot finish while the seek is being prepared.
+    renderer.pause();
+    hold.let_go();
     renderer.seek(1, 400, 3).unwrap();
+    renderer.play();
     until(&mut renderer, &mut said, |said| ended(said, 3).is_some());
-    assert!(matches!(ended(&said, 2), Some((_, End::Replaced))));
+    assert!(
+        matches!(ended(&said, 2), Some((_, End::Replaced))),
+        "{said:?}"
+    );
     // From 400 ms of the first track to its end: 37 ms at 16 kHz.
-    assert_eq!(ended(&said, 3), Some((7001 - 6400, End::Drained)));
+    assert_eq!(ended(&said, 3), Some((first_frames - 6400, End::Drained)));
 }
 
 #[test]

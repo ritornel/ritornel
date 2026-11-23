@@ -47,6 +47,15 @@ impl DirLock {
     /// good, and it is refused at once. A client that is looking holds the
     /// lock shared for an instant, and that is waited out.
     pub(crate) fn acquire(dir: &Path, path: &Path) -> Result<Self, Error> {
+        Self::acquire_waiting_for_look(dir, path, || std::thread::sleep(LOOK_PAUSE))
+    }
+
+    /// Calls `wait_for_look` before retrying a lock that clients can share.
+    fn acquire_waiting_for_look(
+        dir: &Path,
+        path: &Path,
+        mut wait_for_look: impl FnMut(),
+    ) -> Result<Self, Error> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         platform::create_owner_only(&mut options);
@@ -73,7 +82,7 @@ impl DirLock {
                     endpoint: None,
                 });
             }
-            std::thread::sleep(LOOK_PAUSE);
+            wait_for_look();
         }
         // The pid a dead server left is replaced before anything else is
         // done, so that the lock and the file disagree for as short a time
@@ -147,34 +156,23 @@ mod tests {
     fn clients_looking_at_the_lock_are_waited_out_and_do_not_refuse_a_server() {
         let scratch = Scratch::new();
         let path = scratch.path().join("server.lock");
-        // A client holds the lock shared while it looks. Here one keeps
-        // looking, on and off, for as long as servers start.
-        let looking = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let looker = std::thread::spawn({
-            let (path, looking) = (path.clone(), looking.clone());
-            move || {
-                while looking.load(std::sync::atomic::Ordering::SeqCst) {
-                    if let Ok(file) = File::open(&path)
-                        && file.try_lock_shared().is_ok()
-                    {
-                        std::thread::yield_now();
-                        file.unlock().unwrap();
-                    }
-                }
-            }
-        });
-        for _ in 0..200 {
-            let held = DirLock::acquire(scratch.path(), &path).unwrap();
-            // And while a server has it, a second is refused at once.
-            let refused = DirLock::acquire(scratch.path(), &path);
-            assert!(
-                matches!(refused, Err(Error::InUse { pid: Some(_), .. })),
-                "{refused:?}"
-            );
-            drop(held);
-        }
-        looking.store(false, std::sync::atomic::Ordering::SeqCst);
-        looker.join().unwrap();
+        let client = File::create_new(&path).unwrap();
+        client.try_lock_shared().unwrap();
+        let mut client = Some(client);
+        // Let the client finish its look only when the server has seen
+        // the shared lock and is about to retry.
+        let _held = DirLock::acquire_waiting_for_look(scratch.path(), &path, || {
+            let client = client.take().expect("the client has already let go");
+            client.unlock().unwrap();
+        })
+        .unwrap();
+        assert!(client.is_none(), "the server did not wait for the client");
+
+        let refused = DirLock::acquire(scratch.path(), &path);
+        assert!(
+            matches!(refused, Err(Error::InUse { pid: Some(_), .. })),
+            "{refused:?}"
+        );
     }
 
     #[test]

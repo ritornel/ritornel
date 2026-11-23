@@ -8,9 +8,8 @@
 //! ritornelctl` alone does not build the server, and would use whatever
 //! server an earlier build left there.
 //!
-//! Nothing here sleeps. Each wait is for a process to print a line or to
-//! end, and is bounded by [`WAIT`]: a process that hangs is killed and
-//! fails its test with a message that says what it was waited for.
+//! Each wait is for a process to print a line, report a state, or end.
+//! [`WAIT`] bounds the waits, and a process that hangs is killed.
 
 #![allow(
     clippy::unwrap_used,
@@ -24,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -434,11 +433,24 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
     };
     assert_eq!(library_id.len(), 36, "{library_id}");
 
-    // The status shows what now exists.
-    let printed = status(&data_dir, &[]);
+    // Creating the library wakes the watcher. Wait for it to report that
+    // it is on before checking how status prints the new hub.
+    let deadline = Instant::now() + WAIT;
+    let printed = loop {
+        let printed = status(&data_dir, &[]);
+        let shown = facts(&printed);
+        assert_eq!(shown.len(), 15, "{}", printed.stdout);
+        if shown[12] == ("Watching", "on") {
+            break printed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "watching did not come on within {WAIT:?}. Last status:\n{}",
+            printed.stdout
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     let shown = facts(&printed);
-    assert_eq!(shown.len(), 15, "{}", printed.stdout);
-    assert_eq!(shown[12], ("Watching", "on"));
     let json: Value = serde_json::from_str(&status(&data_dir, &["--json"]).stdout).unwrap();
     let library_schema = json["versions"]["librarySchema"].as_i64().unwrap();
     assert!(library_schema >= 2);
