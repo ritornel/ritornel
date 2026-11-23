@@ -708,9 +708,9 @@ impl ServerStore {
     /// and when its own last checkpoint was and with what it had heard,
     /// and queues each for delivery. The one cut off in the entry the
     /// player is on becomes the listen a resume continues, from no later
-    /// than where that listen ended. Returns the
-    /// listens closed. This server holds the data directory's lock, so the
-    /// run that left them is gone.
+    /// than where that listen ended. Returns the listens closed. This
+    /// server holds the data directory's lock, so the run that left them is
+    /// gone.
     pub fn close_crashed_listens(&self) -> Result<Vec<Id>, Error> {
         self.transact(|transaction, now_ms, _| {
             let current: Option<[u8; 16]> = transaction
@@ -1181,6 +1181,7 @@ mod tests {
         let closed = store.staged_listen(started.listen_id).unwrap().unwrap();
         assert_eq!(closed.heard.ms_played, 5_000);
         assert_eq!(closed.ended.unwrap().end_position_ms, 5_000);
-        assert_eq!(store.playback_session().unwrap().resume_listen, None);
+        let session = store.playback_session().unwrap();
+        assert_eq!((session.resume_listen, session.position_ms), (None, 42_000));
     }
 }
