@@ -1,7 +1,7 @@
 //! What a server and the clients on its machine agree on outside the
 //! socket: where the data directory is, the lock that says a server is
-//! alive on it, the shape of `server.json`, and the name of the credential
-//! file. See "Process lifecycle" in docs/internals/server.md.
+//! alive on it, the shape of `server.json` and of `preparing.json`, and the
+//! name of the credential file. See "Process lifecycle" in docs/internals/server.md.
 //!
 //! It is here because the server writes these and a local client reads
 //! them, and this is the one crate both may depend on. Nothing here touches
@@ -52,6 +52,17 @@ pub fn lock_holder(text: &str) -> Option<u32> {
 
 /// The file in the data directory that says where the running server is.
 pub const SERVER_JSON: &str = "server.json";
+
+/// The file in the data directory that says what a server is doing before
+/// it listens, while that takes more than a moment: copying the databases,
+/// migrating them, or deriving history again. It holds a [`PreparingJson`],
+/// and is there only for the steps that run, and gone once `server.json` is
+/// written.
+///
+/// As with `server.json`, a client believes it only while [`SERVER_LOCK`]
+/// is held and names the same pid: a server that was killed while
+/// preparing leaves it behind.
+pub const PREPARING_JSON: &str = "preparing.json";
 
 /// The file in the data directory that holds the local owner's session
 /// token, on one line. Only the OS user can read it, and a program that can
@@ -117,6 +128,27 @@ pub struct ServerJson {
     pub server_id: Id,
     /// The [contract version](crate::CONTRACT_VERSION) the server speaks.
     pub contract_version: u32,
+}
+
+/// What `preparing.json` holds: the server's process, and what it is doing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparingJson {
+    /// The server's process.
+    pub pid: u32,
+    /// What it is doing now.
+    pub step: Preparing,
+}
+
+/// What a server is doing before it listens, in the order it does them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Preparing {
+    /// Copying the databases, before a migration.
+    Backup,
+    /// Migrating a database to this program's schema.
+    Migration,
+    /// Deriving history again under this program's play rule.
+    History,
 }
 
 #[cfg(test)]
@@ -227,5 +259,19 @@ pub(crate) mod tests {
             "contractVersion": 0,
         });
         assert!(serde_json::from_value::<ServerJson>(named).is_err());
+    }
+
+    #[test]
+    fn preparing_json_names_the_process_and_the_step() {
+        let contents = PreparingJson {
+            pid: 4312,
+            step: Preparing::Migration,
+        };
+        let wire = json!({ "pid": 4312, "step": "migration" });
+        assert_eq!(serde_json::to_value(&contents).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_value::<PreparingJson>(wire).unwrap(),
+            contents
+        );
     }
 }

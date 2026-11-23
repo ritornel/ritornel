@@ -2379,6 +2379,12 @@ impl Wall {
     fn blank(&self, cx: &mut Context<Self>) -> Option<Blank> {
         let Some(net) = &self.net else {
             let link = self.link.read(cx);
+            // A server getting the library ready says so, in place of a
+            // page that could pass for an empty library.
+            if let Some(step) = link.preparing {
+                let (title, text) = crate::link::preparing_words(step);
+                return Some(Blank::new(title, text));
+            }
             // Looking for the first time: the page has only its name.
             let State::Away {
                 why,

@@ -8,7 +8,7 @@ A local client resolves the data directory in order—`--data-dir`, `RITORNEL_DA
 
 1. Read `server.json` and request the server's public descriptor. If the server ID in `server.json` matches the descriptor, connect and stop here.
 2. Otherwise spawn `ritornel-server serve --data-dir <dir>` (when the client is allowed to launch a server).
-3. On startup, the server takes the exclusive OS lock on `server.lock`, loads configuration, initializes daily JSON-line logs under a fresh `boot_id`, opens and migrates `server.db` (and `library.db` on a hub), requeues jobs left by any earlier boot ID, binds its listener, atomically writes `server.json` (temp file then rename), and prints one ready line to standard output.
+3. On startup, the server takes the exclusive OS lock on `server.lock`, loads configuration, initializes daily JSON-line logs under a fresh `boot_id`, opens and migrates `server.db` (and `library.db` on a hub), requeues jobs left by any earlier boot ID, binds its listener, atomically writes `server.json` (temp file then rename), and prints one ready line to standard output. While a step before listening takes more than a moment (the copy before a migration, the migration, or deriving history again under a new play rule), it says which in `preparing.json` (`local::PreparingJson`: its PID and the step), written the same way and removed once `server.json` is written (`preparing::Steps`). A client believes it, as it does `server.json`, only while the lock is held by the PID it names (`ritornel_client::local::preparing`); the desktop shows it in place of "Not connected".
 
 By default the server tries `127.0.0.1:4747` and falls back to an OS-assigned loopback port if taken. An explicit `--listen` address (or `RITORNEL_LISTEN` / `listen` in `config.toml`) binds that exact loopback port or fails startup (`127.0.0.1:0` asks the OS for an ephemeral port). `private:<port>` binds every IPv4 interface on that port and closes, before reading a byte, any connection whose peer is not loopback, private (RFC 1918 or IPv6 unique-local), link-local, or in the tailnet range `100.64.0.0/10` (`Listen::admits`); it logs a warning that traffic is plain HTTP. No other address can be named, so a public address is never bound. `server.json` records literal `127.0.0.1` in either mode, never `localhost`.
 
@@ -59,6 +59,7 @@ A sleeping hub is one its satellites cannot reach, but a satellite or a player s
 <data-dir>/
   server.lock    exclusive lock held while running; contains the server PID
   server.json    endpoint, PID, server ID, contract version; rewritten at each start
+  preparing.json PID and step, while a slow step runs before the server listens
   credential     local session token, readable only by the OS user
   config.toml    optional settings needed before a database opens
   server.db      server-local SQLite database (every server)
@@ -72,7 +73,7 @@ The data directory must sit on a local filesystem because SQLite WAL shared memo
 
 `DataDir::prepare` creates private directories (`0700` on Unix, owner-only ACL on Windows) and tightens permissions on `server.db` and `library.db` at startup (protecting restored databases that may arrive world-readable).
 
-Cache files are written in `cache/tmp/`, synced, and renamed into `cache/covers/` before being indexed. Cover art bytes remain in the audio/folder files and are extracted into `cache/covers/` on demand; nothing in `cache/`, `logs/`, `backups/`, `server.json`, or `server.lock` needs to be backed up.
+Cache files are written in `cache/tmp/`, synced, and renamed into `cache/covers/` before being indexed. Cover art bytes remain in the audio/folder files and are extracted into `cache/covers/` on demand; nothing in `cache/`, `logs/`, `backups/`, `server.json`, `preparing.json`, or `server.lock` needs to be backed up.
 
 ### Backups and pre-migration snapshots
 

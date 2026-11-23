@@ -90,6 +90,10 @@ impl DataDir {
         self.root.join(local::SERVER_JSON)
     }
 
+    pub(crate) fn preparing_json(&self) -> PathBuf {
+        self.root.join(local::PREPARING_JSON)
+    }
+
     pub(crate) fn credential(&self) -> PathBuf {
         self.root.join(local::CREDENTIAL)
     }
@@ -187,8 +191,10 @@ impl HeldDir {
             },
             other => other,
         })?;
-        // Whatever `server.json` says now, a server that is gone wrote it.
+        // Whatever `server.json` and `preparing.json` say now, a server
+        // that is gone wrote them.
         server_json::remove(&dir.server_json())?;
+        server_json::remove(&dir.preparing_json())?;
         Ok(Self { dir, _lock: lock })
     }
 

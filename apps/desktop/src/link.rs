@@ -10,7 +10,9 @@
 //! stops when the app ends. While there is no server it keeps looking, a
 //! little less often each time up to every two seconds, and explains why;
 //! "Look again" looks at once. A session that ends is "lost", and looked
-//! for again.
+//! for again. Until there is a session it also watches for what a server
+//! that holds the directory says it is preparing (`preparing.json`), such
+//! as updating the library after an upgrade, so that the window can say so.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -24,6 +26,7 @@ use ritornel_client::launch::{Launcher, Program};
 use ritornel_client::local::LocalServer;
 use ritornel_client::{Error, NotRunning, local};
 use ritornel_contract::Event;
+use ritornel_contract::local::Preparing;
 
 use crate::net::{Net, rt};
 
@@ -89,6 +92,23 @@ impl Why {
     }
 }
 
+/// What the Library and History pages say while the server prepares the
+/// library before it listens.
+pub(crate) fn preparing_words(step: Preparing) -> (&'static str, &'static str) {
+    let text = match step {
+        Preparing::Backup => {
+            "Ritornel is getting your library ready for this version. First it keeps a copy of it as it is now. Your music and history will be here when it is done."
+        }
+        Preparing::Migration => {
+            "Ritornel is getting your library ready for this version, and has kept a copy of it as it was. Your music and history will be here when it is done."
+        }
+        Preparing::History => {
+            "Ritornel is bringing your listening history up to date for this version. Your music and history will be here when it is done."
+        }
+    };
+    ("Updating your library…", text)
+}
+
 #[derive(Clone)]
 pub(crate) enum State {
     /// Looking, for the first time.
@@ -128,6 +148,11 @@ pub(crate) struct Link {
     /// Counts the reads of what the server says of itself, so that only
     /// the latest is kept.
     restating: u64,
+    /// What the server holding the directory says it is preparing, while
+    /// there is no session.
+    pub(crate) preparing: Option<Preparing>,
+    /// Reads that again until there is a session.
+    watching: Option<Task<()>>,
 }
 
 impl EventEmitter<LinkEvent> for Link {}
@@ -171,6 +196,8 @@ impl Link {
             looking: false,
             attempt: None,
             restating: 0,
+            preparing: None,
+            watching: None,
         };
         link.look(cx);
         link
@@ -241,7 +268,54 @@ impl Link {
         crate::platform::started_here(holder).then_some(holder)
     }
 
+    /// What the title bar says while there is no session.
+    pub(crate) fn unconnected(&self) -> &'static str {
+        match (self.preparing, &self.state) {
+            (Some(_), _) => "Updating your library…",
+            (
+                None,
+                State::Looking
+                | State::Away {
+                    why: Why::Starting, ..
+                },
+            ) => "Connecting…",
+            _ => "Not connected",
+        }
+    }
+
+    /// Reads what the server holding the directory says it is preparing,
+    /// four times a second, until a session begins: a server the launcher
+    /// waits for says nothing else until it listens.
+    fn watch_preparing(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.data_dir() else { return };
+        if self.watching.is_some() {
+            return;
+        }
+        self.watching = Some(cx.spawn(async move |link, cx| {
+            loop {
+                let dir = dir.clone();
+                let step = cx
+                    .background_executor()
+                    .spawn(async move { local::preparing(&dir) })
+                    .await;
+                let changed = link.update(cx, |link, cx| {
+                    if link.preparing != step {
+                        link.preparing = step;
+                        cx.notify();
+                    }
+                });
+                if changed.is_err() {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+            }
+        }));
+    }
+
     fn look(&mut self, cx: &mut Context<Self>) {
+        self.watch_preparing(cx);
         let Some(launcher) = self.launcher.clone() else {
             self.state = State::Away {
                 why: Why::Failed,
@@ -378,6 +452,8 @@ impl Link {
     ) {
         self.looking = false;
         self.state = State::Connected(Arc::clone(&net));
+        self.watching = None;
+        self.preparing = None;
         self.say_when_quiet_ends(&net, cx);
         cx.emit(LinkEvent::Connected(net));
         cx.notify();

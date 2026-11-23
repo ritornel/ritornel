@@ -31,6 +31,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use ritornel_contract::local::Preparing;
 use ritornel_contract::{BackupReason, Id};
 use ritornel_engine::backup::{Database, Pending, copy_database, hold_sending, pending_migrations};
 use serde_json::json;
@@ -208,12 +209,14 @@ type IsPending = dyn Fn(&Path, Database) -> Result<Option<Pending>, ritornel_eng
 /// written and what failed, for `server.db` to record once it is open.
 ///
 /// Nothing is migrated without a copy: if neither place can be written,
-/// the server does not start.
+/// the server does not start. `say` is told when the copy begins, and when
+/// it is done and the migrations are next.
 pub(crate) fn before_migrations(
     dir: &DataDir,
     place: Option<&Path>,
     at_ms: i64,
     pending: &IsPending,
+    say: &dyn Fn(Preparing),
 ) -> Result<BeforeMigrations, crate::Error> {
     let server = pending(&dir.server_db(), Database::Server).map_err(crate::Error::Store)?;
     let library = pending(&dir.library_db(), Database::Library).map_err(crate::Error::Library)?;
@@ -230,12 +233,14 @@ pub(crate) fn before_migrations(
         ?library,
         "a database will be migrated, so it is copied first"
     );
+    say(Preparing::Backup);
     let reason = BackupReason::BeforeMigration;
     let mut failed = None;
     if let Some(place) = place {
         match outside(dir, place).and_then(|()| write(dir, place, at_ms, reason, about)) {
             Ok(taken) => {
                 info!(path = %taken.path.display(), "backed up before migrating");
+                say(Preparing::Migration);
                 return Ok(BeforeMigrations {
                     taken: Some(taken),
                     failed: None,
@@ -255,6 +260,7 @@ pub(crate) fn before_migrations(
         source: std::io::Error::other(error.to_string()),
     })?;
     info!(path = %kept.path.display(), "kept a copy in the data directory before migrating");
+    say(Preparing::Migration);
     Ok(BeforeMigrations {
         taken: None,
         failed,
@@ -276,8 +282,9 @@ pub(crate) fn before_migrating(
     dir: &DataDir,
     place: Option<&Path>,
     at_ms: i64,
+    say: &dyn Fn(Preparing),
 ) -> Result<BeforeMigrations, crate::Error> {
-    before_migrations(dir, place, at_ms, &pending_migrations)
+    before_migrations(dir, place, at_ms, &pending_migrations, say)
 }
 
 /// What [`before_migrations`] did, for `server.db` to record.
@@ -823,7 +830,14 @@ mod tests {
         let pending: &IsPending =
             &|_, database| Ok((database == Database::Server).then_some(Pending { from: 1, to: 2 }));
         assert!(
-            before_migrations(&dir, Some(&scratch.path().join("unplugged")), AT, pending).is_err()
+            before_migrations(
+                &dir,
+                Some(&scratch.path().join("unplugged")),
+                AT,
+                pending,
+                &|_| {}
+            )
+            .is_err()
         );
     }
 
@@ -851,12 +865,12 @@ mod tests {
         let dir = data(&scratch);
         let place = scratch.path().join("elsewhere");
         std::fs::create_dir(&place).unwrap();
-        let done = before_migrations(&dir, Some(&place), AT, none).unwrap();
+        let done = before_migrations(&dir, Some(&place), AT, none, &|_| {}).unwrap();
         assert!(done.taken.is_none() && done.failed.is_none());
         assert_eq!(std::fs::read_dir(&place).unwrap().count(), 0);
 
         // A place named: the backup goes there, and nothing beside the data.
-        let done = before_migrations(&dir, Some(&place), AT, pending).unwrap();
+        let done = before_migrations(&dir, Some(&place), AT, pending, &|_| {}).unwrap();
         assert_eq!(
             done.taken.unwrap().path,
             place.join("ritornel-backup-2025-11-21-170102-before-migration")
@@ -865,7 +879,7 @@ mod tests {
 
         // None named: the way back is kept in the data directory, and it
         // is not a backup.
-        let done = before_migrations(&dir, None, AT, pending).unwrap();
+        let done = before_migrations(&dir, None, AT, pending, &|_| {}).unwrap();
         assert!(done.taken.is_none() && done.failed.is_none());
         assert!(
             dir.backups()
@@ -876,7 +890,7 @@ mod tests {
         // A place that cannot be written: the way back is kept all the
         // same, and the failure is said.
         let unplugged = scratch.path().join("unplugged");
-        let done = before_migrations(&dir, Some(&unplugged), AT, pending).unwrap();
+        let done = before_migrations(&dir, Some(&unplugged), AT, pending, &|_| {}).unwrap();
         assert!(done.taken.is_none());
         assert!(done.failed.unwrap().contains("is not there"));
         assert!(

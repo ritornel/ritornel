@@ -1668,7 +1668,8 @@ impl Render for Shell {
             .size_full()
             .children(pages)
             .into_any_element();
-        let server = self.link.read(cx).net().map(|net| {
+        let link = self.link.read(cx);
+        let server = link.net().ok_or_else(|| link.unconnected()).map(|net| {
             let away = crate::away::said(&net);
             let card = self.connection_hovered.then(|| match (&away, &net.hub) {
                 (Some(away), _) => Some(away.card(&crate::away::clock())),

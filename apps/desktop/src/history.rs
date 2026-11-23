@@ -120,6 +120,8 @@ pub(crate) struct HistoryPage {
     elastic: crate::elastic::Elastic,
     /// How tall the page was when last drawn.
     height: Rc<Cell<f32>>,
+    /// The link, for what the server is preparing before there is a session.
+    link: Entity<Link>,
     _link: Subscription,
 }
 
@@ -182,6 +184,7 @@ impl HistoryPage {
             top: 0.,
             elastic: crate::elastic::Elastic::default(),
             height: Rc::new(Cell::new(0.)),
+            link: link.clone(),
             _link: followed,
         };
         page.load(cx);
@@ -786,6 +789,14 @@ impl Render for HistoryPage {
                     .text_color(theme::faint())
                     .child("Your history could not be read."),
             );
+        } else if let Some(step) = self
+            .read
+            .is_none()
+            .then(|| self.link.read(cx).preparing)
+            .flatten()
+        {
+            let (title, text) = crate::link::preparing_words(step);
+            body = body.child(crate::blank::Blank::new(title, text).render(viewport));
         } else if empty {
             body = body.child(
                 crate::blank::Blank::new(
