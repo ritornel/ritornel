@@ -61,7 +61,11 @@ impl Sink for Memory {
             self.cursor = Some(batch.cursor);
             self.writes += 1;
         }
-        Ok(Stored { new, gone })
+        Ok(Stored {
+            new,
+            gone,
+            set_aside: 0,
+        })
     }
 
     fn loves(&mut self, loves: Vec<Love>) -> Result<LovesStored, Error> {

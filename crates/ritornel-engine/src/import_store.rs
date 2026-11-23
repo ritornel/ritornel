@@ -510,6 +510,166 @@ fn gone(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<u64, Er
         .count() as u64)
 }
 
+/// What an import set aside as a duplicate says, in its correction.
+pub(crate) const DUPLICATE_NOTE: &str = "set aside by a full sync: the source lists as many \
+     scrobbles in this second as its first read stored, with fewer of this one, as a read \
+     whose pages shifted leaves";
+
+/// What such a correction is marked with in its payload, as its `reason`:
+/// how a later full sync knows it for its own, whatever its note says.
+const SHIFTED_READ: &str = "shifted_read";
+
+/// What a revocation of such a correction says, when the source lists the
+/// import again.
+const LISTED_AGAIN_NOTE: &str = "the source lists this scrobble again";
+
+/// What a full read finds of what an earlier read stored wrong in the
+/// batch's span.
+#[derive(Debug, Default)]
+struct Recheck {
+    /// The imports to set aside.
+    set_aside: Vec<i64>,
+    /// The corrections that set aside an import the source lists again,
+    /// to revoke.
+    revoke: Vec<i64>,
+}
+
+/// Finds, in the batch's span, what an earlier read stored wrong. A read
+/// whose pages shifted between requests showed one scrobble of a second
+/// twice and another not at all. That is the one shape taken: a second
+/// whose first read, the write that first stored imports of it, stored as
+/// many as the source lists now, but more of one track and fewer of
+/// another. Of the track it stored more of, the imports the source does not
+/// list are set aside, never so many that fewer of it count than the
+/// source lists. A later read may have
+/// stored the one missed since, which changes nothing here. A scrobble
+/// deleted at the source, or one added to it later, changes how many the
+/// second holds, and is never taken for one. Only an import whose play is its own is set
+/// aside, so that a play of this library's own that an echo joined is never
+/// left out, and one set aside before, even if that was revoked since, is
+/// not set aside again. An import set aside so whose key the source lists
+/// again has its correction revoked, if it stands.
+fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Recheck, Error> {
+    type Track = (String, Option<String>, String);
+    let keys: HashSet<&[u8]> = batch
+        .records
+        .iter()
+        .map(|record| record.source_key.as_slice())
+        .collect();
+    // Each second's scrobbles, as the source lists them and as the
+    // library holds them, by track.
+    let mut listed: HashMap<i64, HashMap<Track, usize>> = HashMap::new();
+    for record in &batch.records {
+        let track = &record.track;
+        *listed
+            .entry(record.played_at_ms)
+            .or_default()
+            .entry((
+                track.artist.clone(),
+                track.album.clone(),
+                track.title.clone(),
+            ))
+            .or_default() += 1;
+    }
+    struct Held {
+        observation: i64,
+        rev: i64,
+        listed: bool,
+        track: Track,
+        excluded: bool,
+        takeable: bool,
+        set_aside_by: Option<i64>,
+    }
+    let mut statement = connection.prepare_cached(
+        "SELECT o.id, o.rev, o.source_key, i.played_at_utc_ms, i.artist, i.album, i.title,
+                EXISTS (SELECT 1 FROM play_event_observation peo
+                        JOIN play_event pe ON pe.id = peo.play_event_id
+                        WHERE peo.observation_id = o.id AND pe.excluded = 1),
+                NOT EXISTS (SELECT 1 FROM correction_target t
+                            JOIN observation_correction c ON c.observation_id = t.correction_id
+                            WHERE t.target_observation_id = o.id AND c.verb = 'exclude')
+                AND (SELECT count(*) FROM play_event_observation mine
+                     JOIN play_event_observation other ON other.play_event_id = mine.play_event_id
+                     WHERE mine.observation_id = o.id) = 1,
+                (SELECT max(c.observation_id) FROM correction_target t
+                 JOIN observation_correction c ON c.observation_id = t.correction_id
+                 JOIN history_observation co ON co.id = c.observation_id
+                 WHERE t.target_observation_id = o.id AND c.verb = 'exclude'
+                   AND json_extract(co.payload_json, '$.reason') = ?4)
+         FROM observation_import i
+         JOIN history_observation o ON o.id = i.observation_id
+         WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms >= ?2 AND i.played_at_utc_ms < ?3
+         ORDER BY o.id",
+    )?;
+    let mut rows = statement.query(rusqlite::params![
+        endpoint,
+        batch.span.from_ms,
+        batch.span.to_ms,
+        SHIFTED_READ
+    ])?;
+    let mut held: BTreeMap<i64, Vec<Held>> = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let key: Vec<u8> = row.get(2)?;
+        held.entry(row.get(3)?).or_default().push(Held {
+            observation: row.get(0)?,
+            rev: row.get(1)?,
+            listed: keys.contains(key.as_slice()),
+            track: (row.get(4)?, row.get(5)?, row.get(6)?),
+            excluded: row.get(7)?,
+            takeable: row.get(8)?,
+            set_aside_by: row.get(9)?,
+        });
+    }
+    // Which corrections stand, as derivation has it: a revocation that is
+    // itself revoked lets its target stand again.
+    let active = ritornel_domain::history::active_corrections(&crate::history_store::corrections(
+        connection,
+    )?);
+    let mut found = Recheck::default();
+    for (second, imports) in &held {
+        found.revoke.extend(
+            imports
+                .iter()
+                .filter(|import| import.listed)
+                .filter_map(|import| import.set_aside_by)
+                .filter(|correction| active.contains(correction)),
+        );
+        let Some(listed) = listed.get(second) else {
+            continue;
+        };
+        let first = imports.iter().map(|import| import.rev).min();
+        let first: Vec<&Held> = imports
+            .iter()
+            .filter(|import| Some(import.rev) == first)
+            .collect();
+        if first.len() != listed.values().sum::<usize>() {
+            continue;
+        }
+        // How many of each track the first read stored, and how many of
+        // those still count.
+        let mut stored: BTreeMap<&Track, (usize, usize)> = BTreeMap::new();
+        for import in &first {
+            let (all, counting) = stored.entry(&import.track).or_default();
+            *all += 1;
+            *counting += usize::from(!import.excluded);
+        }
+        for (track, (stored, counting)) in stored {
+            let lists = listed.get(track).copied().unwrap_or(0);
+            if lists == 0 || stored <= lists || counting <= lists {
+                continue;
+            }
+            found.set_aside.extend(
+                first
+                    .iter()
+                    .filter(|import| &import.track == track && !import.listed && import.takeable)
+                    .map(|import| import.observation)
+                    .take(counting - lists),
+            );
+        }
+    }
+    Ok(found)
+}
+
 /// Stores the batch's new records, binds what they name where the matcher
 /// is sure, derives their plays and moves the cursor, in the write's
 /// transaction. Returns how many were new.
@@ -830,16 +990,22 @@ impl LibraryStore {
     /// Takes in a batch of import records through the one ingest call (see
     /// [`LibraryStore::ingest`]): every record that is new, the plays
     /// derived from them and the batch's cursor, in one transaction. A
-    /// batch with nothing new writes nothing, its cursor included.
+    /// batch with nothing new moves no cursor, and writes nothing unless a
+    /// full read finds something to set aside or lift. Of a
+    /// `full` read, the same transaction sets aside what an earlier read
+    /// stored twice in the batch's span, each with an `exclude` correction
+    /// that says [`DUPLICATE_NOTE`], and revokes such a correction whose
+    /// import the source lists again ([`recheck`]).
     pub(crate) fn ingest_import_batch(
         &self,
         account: Id,
         batch: &Batch,
+        full: bool,
         rule: ritornel_domain::history::PlayRule,
     ) -> Result<Stored, Error> {
-        // Read first: a batch that is all stored already writes nothing,
-        // and takes no library revision.
-        let (new, gone) = {
+        // Read first: a batch that is all stored already, with nothing to
+        // set aside or lift, writes nothing and takes no library revision.
+        let (new, gone, rechecked) = {
             let batch = batch.clone();
             self.read(move |connection| {
                 let rows = rows_of(connection, account)?;
@@ -848,14 +1014,25 @@ impl LibraryStore {
                     rows.endpoint,
                     batch.records.iter().map(|record| &record.source_key),
                 )?;
+                let rechecked = if full {
+                    let found = recheck(connection, rows.endpoint, &batch)?;
+                    found.set_aside.len() + found.revoke.len()
+                } else {
+                    0
+                };
                 Ok((
                     batch.records.len() - held.len(),
                     gone(connection, rows.endpoint, &batch)?,
+                    rechecked,
                 ))
             })?
         };
-        if new == 0 {
-            return Ok(Stored { new: 0, gone });
+        if new == 0 && rechecked == 0 {
+            return Ok(Stored {
+                new: 0,
+                gone,
+                set_aside: 0,
+            });
         }
         let batch = batch.clone();
         let written = self.write(
@@ -864,11 +1041,34 @@ impl LibraryStore {
                 command: None,
                 client: None,
             },
-            move |write| Ok(ingest_imports(write, account, &batch, rule)?.to_string()),
+            move |write| {
+                // Before the new records go in: what the library held is
+                // what is compared.
+                let found = if full {
+                    let endpoint = rows_of(write.connection(), account)?.endpoint;
+                    recheck(write.connection(), endpoint, &batch)?
+                } else {
+                    Recheck::default()
+                };
+                let new = ingest_imports(write, account, &batch, rule)?;
+                crate::history_store::exclude(
+                    write,
+                    &found.set_aside,
+                    DUPLICATE_NOTE,
+                    Some(SHIFTED_READ),
+                    rule,
+                )?;
+                for correction in &found.revoke {
+                    crate::history_store::revoke(write, *correction, LISTED_AGAIN_NOTE, rule)?;
+                }
+                Ok(serde_json::to_string(&(new, found.set_aside.len()))?)
+            },
         )?;
+        let (new, set_aside): (u64, u64) = serde_json::from_str(&written.result_json)?;
         Ok(Stored {
-            new: written.result_json.parse().unwrap_or(0),
+            new,
             gone,
+            set_aside,
         })
     }
 
@@ -1104,7 +1304,7 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
         "SELECT count(*), count(pe.recording_id) FROM play_event pe
          JOIN play_event_observation peo ON peo.play_event_id = pe.id AND peo.role = 'primary'
          JOIN history_observation o ON o.id = peo.observation_id
-         WHERE o.endpoint_id = ?1",
+         WHERE o.endpoint_id = ?1 AND pe.excluded = 0",
         [rows.endpoint],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1117,8 +1317,11 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
     )?;
     let mut plays_of: HashMap<i64, i64> = HashMap::new();
     let mut statement = connection.prepare(
-        "SELECT source_item_id, count(*) FROM history_observation
-         WHERE endpoint_id = ?1 AND kind = 'import' GROUP BY source_item_id",
+        "SELECT o.source_item_id, count(*) FROM history_observation o
+         JOIN play_event_observation peo ON peo.observation_id = o.id
+         JOIN play_event pe ON pe.id = peo.play_event_id
+         WHERE o.endpoint_id = ?1 AND o.kind = 'import' AND pe.excluded = 0
+         GROUP BY o.source_item_id",
     )?;
     for row in statement.query_map([rows.endpoint], |row| Ok((row.get(0)?, row.get(1)?)))? {
         let (item, plays) = row?;

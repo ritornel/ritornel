@@ -405,6 +405,7 @@ pub fn invent_plays(
                 span,
                 cursor,
             },
+            full: false,
         })?;
         if let IngestOutcome::Imports(batch) = outcome {
             stored += usize::try_from(batch.new).unwrap_or(0);

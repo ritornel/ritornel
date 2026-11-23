@@ -1032,6 +1032,7 @@ fn scrobble_of(at: &Library, account: Id, at_s: i64, artist: &str, title: &str) 
         .ingest(Observations::Imports {
             account,
             batch: &batch,
+            full: false,
         })
         .unwrap();
 }
@@ -2939,6 +2940,75 @@ fn a_play_joined_by_a_late_middle_listen_is_not_sent_again_from_its_first() {
 }
 
 #[test]
+fn a_full_read_never_sets_aside_an_echo_that_joined_a_listens_play() {
+    use crate::Settled;
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    at.library.plan_deliveries(account, start - MINUTE).unwrap();
+    let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
+    at.library
+        .settle_deliveries(vec![(
+            due[0].delivery,
+            Settled::Accepted {
+                artist: "Moss Arcade".to_owned(),
+                title: "Paper Kites".to_owned(),
+            },
+        )])
+        .unwrap();
+    // The echo joins the listen's play. A full read that holds the same
+    // scrobble under another key finds the echo gone, with a record of the
+    // same track and time held: it is still not set aside, as the play it
+    // is in is the listen's.
+    scrobble_of(&at, account, start / 1000, "Moss Arcade", "Paper Kites");
+    let held = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: b"again".to_vec(),
+            played_at_ms: start,
+            track: ritornel_source::TrackText {
+                artist: "Moss Arcade".to_owned(),
+                album: Some("Tin Weather".to_owned()),
+                title: "Paper Kites".to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: start,
+            to_ms: start + 1000,
+        },
+        cursor: "{}".to_owned(),
+    };
+    let outcome = at
+        .library
+        .ingest(Observations::Imports {
+            account,
+            batch: &held,
+            full: true,
+        })
+        .unwrap();
+    let IngestOutcome::Imports(stored) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!((stored.new, stored.gone, stored.set_aside), (1, 1, 0));
+    let excluded: i64 = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT count(*) FROM play_event WHERE excluded = 1",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(excluded, 0);
+}
+
+#[test]
 fn an_outside_reader_joins_an_echo_under_corrected_names_to_its_play_from_the_export_alone() {
     use crate::Settled;
     use serde_json::Value;
@@ -2995,6 +3065,7 @@ fn an_outside_reader_joins_an_echo_under_corrected_names_to_its_play_from_the_ex
         .ingest(Observations::Imports {
             account,
             batch: &repeat,
+            full: false,
         })
         .unwrap();
 
