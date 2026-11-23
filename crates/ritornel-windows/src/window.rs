@@ -6,7 +6,8 @@
 //! top-level window of the process, and the end of a session sends
 //! `WM_ENDSESSION`, after which the process is ended. A hidden window turns
 //! both into a clean stop. It is also what the system's media controls are
-//! tied to, as they are to a window.
+//! tied to, as they are to a window. Another process in the session can
+//! find one by its title, and ask it to close.
 //!
 //! The window lives on a thread of its own, which runs its messages.
 
@@ -20,9 +21,9 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, TranslateMessage, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
+    GetWindowThreadProcessId, MSG, PostMessageW, PostQuitMessage, RegisterClassW, TranslateMessage,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW,
 };
 
 /// Why the window was asked to close.
@@ -146,6 +147,42 @@ impl Drop for Window {
             let _ = thread.join();
         }
     }
+}
+
+/// The hidden window named `title` in this session, of any process, if one
+/// is open.
+fn find(title: &str) -> Option<HWND> {
+    let class: Vec<u16> = CLASS.encode_utf16().chain([0]).collect();
+    let title: Vec<u16> = title.encode_utf16().chain([0]).collect();
+    // SAFETY: both names end in a NUL.
+    let handle = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+    (!handle.is_null()).then_some(handle)
+}
+
+/// The process whose hidden window is named `title`, in this session, if
+/// one is open.
+pub fn owner(title: &str) -> Option<u32> {
+    let handle = find(title)?;
+    let mut pid = 0;
+    // SAFETY: `pid` is written by the call; a window that has gone since
+    // gives 0.
+    unsafe { GetWindowThreadProcessId(handle, &mut pid) };
+    (pid != 0).then_some(pid)
+}
+
+/// Asks the hidden window named `title`, in this session, to close, as
+/// `taskkill /PID` asks every window of a process. `Ok(false)` when none is
+/// open, and an error when one is but the request could not be posted.
+pub fn ask_to_close(title: &str) -> io::Result<bool> {
+    let Some(handle) = find(title) else {
+        return Ok(false);
+    };
+    // SAFETY: posting to a window that has gone fails and does nothing
+    // else.
+    if unsafe { PostMessageW(handle, WM_CLOSE, 0, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
 }
 
 /// Registers the class, once for the process, and creates a window of it on
@@ -286,6 +323,27 @@ mod tests {
         );
         // The process is still here, and the window closes when dropped.
         drop(window);
+    }
+
+    #[test]
+    fn a_window_is_found_by_its_title_and_asked_to_close() {
+        let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+        let title = format!("Ritornel test {}", std::process::id());
+        assert_eq!(owner(&title), None);
+        assert!(!ask_to_close(&title).unwrap());
+        let (asked, heard) = mpsc::channel();
+        let window = Window::open(&title, move |why| {
+            let _ = asked.send(why);
+        })
+        .unwrap();
+        assert_eq!(owner(&title), Some(std::process::id()));
+        assert!(ask_to_close(&title).unwrap());
+        assert_eq!(
+            heard.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Closing::Asked
+        );
+        drop(window);
+        assert_eq!(owner(&title), None);
     }
 
     #[test]

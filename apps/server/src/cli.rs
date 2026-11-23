@@ -38,10 +38,10 @@ Commands:
                      with --owned by the end of standard input
   service install    Run serve on the data directory in the background,
                      now and at each login, as a launchd user agent on
-                     macOS or a systemd user unit on Linux. The desktop
-                     app then uses it and starts no
-                     server of its own, and quitting the app leaves it
-                     playing. It replaces one installed before
+                     macOS, a systemd user unit on Linux, or a task at
+                     sign-in on Windows. The desktop app then uses it and
+                     starts no server of its own, and quitting the app
+                     leaves it playing. It replaces one installed before
   service uninstall  Stop the background service and remove it
   service status     Say whether it is installed and running
 

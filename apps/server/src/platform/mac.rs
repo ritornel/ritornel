@@ -13,6 +13,7 @@ use super::launchd::{LABEL, install, plist, running_pid, served_dir, uninstall};
 use super::service::{installed, prepare};
 use crate::{Env, Error};
 
+pub(crate) use super::fallback::run_service;
 #[cfg(not(feature = "media-session"))]
 pub(crate) use super::fallback::wait;
 #[cfg(feature = "media-session")]

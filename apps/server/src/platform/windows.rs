@@ -1,7 +1,8 @@
 //! Windows: files closed to others by an access list that names the user
-//! alone, a lock on one byte past the end of `server.lock`, and in place of
-//! signals, the console's events and a hidden window. No background service
-//! and no media session yet. What the standard library cannot ask is in
+//! alone, a lock on one byte past the end of `server.lock`, in place of
+//! signals, the console's events and a hidden window, and a background
+//! service that is a task at sign-in (`windows_service.rs`). No media
+//! session yet. What the standard library cannot ask is in
 //! `ritornel-windows`.
 
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -18,8 +19,9 @@ use crate::serve::Stop;
 
 #[cfg(feature = "media-session")]
 pub(crate) use super::fallback::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
-pub(crate) use super::fallback::{
-    install_service, service_status, stay_awake, uninstall_service, wait,
+pub(crate) use super::fallback::{stay_awake, wait};
+pub(crate) use super::windows_service::{
+    install_service, run_service, service_status, uninstall_service,
 };
 
 /// The host name Windows answers to by multicast DNS, which it does for its

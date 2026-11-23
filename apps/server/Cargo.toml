@@ -69,14 +69,15 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 # This machine's addresses on a tailnet, which an invite offers. The
 # standard library cannot list a machine's addresses.
 if-addrs = "0.15.0"
+# Stages a background service's definition: on Unix a replacement for the
+# unit or agent, beside it, and on Windows the task schtasks reads.
+tempfile = "3.27.0"
 
 # Free disk space, for `server.status`, and the user ID that names the
 # login session the background service runs in. The standard library cannot
 # ask for either without unsafe code.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.6", features = ["fs", "process"] }
-# Stages replacement service definitions on the same filesystem.
-tempfile = "3.27.0"
 
 # The same on Windows, and what Windows has in place of the rest of Unix: a
 # lock on one byte, owner-only access lists, a folder's identity, and the

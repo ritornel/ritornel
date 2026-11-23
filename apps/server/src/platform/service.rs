@@ -1,5 +1,7 @@
 //! What registering the background service takes on every system that has
-//! one: launchd's agent on a Mac, a systemd user unit on Linux.
+//! one: launchd's agent on a Mac, a systemd user unit on Linux, and a task
+//! at sign-in on Windows. Replacing a definition file is Unix's alone:
+//! Task Scheduler replaces a task whole.
 
 use std::path::{Path, PathBuf};
 
@@ -34,6 +36,7 @@ fn check_path(path: &Path) -> Result<(), Error> {
 
 /// Put the new definition in place before asking the manager to stop or
 /// reload anything. Keep the original file beside it until registration succeeds.
+#[cfg(unix)]
 pub(super) struct Replacement<'a> {
     path: &'a Path,
     staged: tempfile::TempDir,
@@ -41,6 +44,7 @@ pub(super) struct Replacement<'a> {
     _lock: std::fs::File,
 }
 
+#[cfg(unix)]
 impl<'a> Replacement<'a> {
     pub(super) fn install(path: &'a Path, contents: &str) -> Result<Self, Error> {
         use crate::error::io_error;
