@@ -12,9 +12,17 @@ use ritornel_client::{Client, local};
 
 use crate::cli::{Error, ServerArgs};
 
-/// How long a whole command may take. A server on this machine answers in
-/// milliseconds.
-pub(crate) const ANSWER_WAIT: Duration = Duration::from_secs(10);
+/// How long finding the server and saying hello may take. A server on this
+/// machine answers them in milliseconds.
+const FIND_WAIT: Duration = Duration::from_secs(10);
+
+/// How long a whole command may take. Most calls are answered in
+/// milliseconds, but one that writes, such as creating the library or
+/// rebuilding history, does real work, and a slow machine such as a
+/// Raspberry Pi, or a busy one, can take many seconds over it. The bound is
+/// there so that a server that never answers cannot hold the command for
+/// ever, not to give up on one that is working.
+pub(crate) const ANSWER_WAIT: Duration = Duration::from_secs(120);
 
 /// `ritornelctl server stop`: asks the server on the data directory to
 /// stop, and waits for it to have stopped. One still stopping when the
@@ -70,7 +78,7 @@ pub(crate) fn ask_for<T>(
     let answer = runtime.block_on(async {
         let asked = async {
             // Finding the server and saying hello never take long.
-            let client = tokio::time::timeout(ANSWER_WAIT, async {
+            let client = tokio::time::timeout(FIND_WAIT, async {
                 let client = local::find(&data_dir).await?.connect().await?;
                 client
                     .hello(&HelloParams {
