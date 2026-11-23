@@ -107,6 +107,8 @@ export const METHODS = {
   "history.onThisDay": { kind: "query", needsFull: false },
   "history.artist": { kind: "query", needsFull: false },
   "history.album": { kind: "query", needsFull: false },
+  "history.artists": { kind: "query", needsFull: false },
+  "history.albums": { kind: "query", needsFull: false },
   "history.track": { kind: "query", needsFull: false },
   "history.stream": { kind: "query", needsFull: false },
   "history.rebuild": { kind: "command", needsFull: true },
@@ -190,8 +192,10 @@ export type MethodMap = {
   "sources.tracks": { params: SourcesTracksParams; result: SourceTracks };
   "history.recent": { params: HistoryRecentParams; result: RecentPlays };
   "history.onThisDay": { params: OnThisDayParams; result: OnThisDay };
-  "history.artist": { params: ArtistGetParams; result: HistoryOf };
-  "history.album": { params: AlbumGetParams; result: HistoryOf };
+  "history.artist": { params: HistoryArtistParams; result: HistoryOf };
+  "history.album": { params: HistoryAlbumParams; result: HistoryOf };
+  "history.artists": { params: HeardListParams; result: HeardArtists };
+  "history.albums": { params: HeardListParams; result: HeardAlbums };
   "history.track": { params: TrackHistoryParams; result: TrackHistory };
   "history.stream": { params: NoParams; result: HistoryStream };
   "history.rebuild": { params: HistoryRebuildParams; result: HistoryRebuilt };
@@ -1285,6 +1289,126 @@ export type Health = {
 export type HealthStatus = "ok";
 
 /**
+ * One album heard, with files or not.
+ */
+export type HeardAlbum = {
+  /**
+   * Its artist's key and its own, which `history.album` takes.
+   */
+  artistKey: string, key: string,
+  /**
+   * Its artist's name and its own.
+   */
+  artistName: string, name: string,
+  /**
+   * The library's record, when it is one.
+   */
+  albumId?: string,
+  /**
+   * The plays.
+   */
+  plays: number,
+  /**
+   * The local date of the first, as `YYYY-MM-DD`, when one has a date.
+   */
+  firstPlayed?: string,
+  /**
+   * The local date of the last, as `YYYY-MM-DD`, when one has a date.
+   */
+  lastPlayed?: string,
+};
+
+/**
+ * The result of `history.albums`: every album heard, as asked.
+ */
+export type HeardAlbums = {
+  /**
+   * This page of them.
+   */
+  albums: Array<HeardAlbum>,
+  /**
+   * How many there are in all.
+   */
+  total: number,
+  /**
+   * The library revision this was read at.
+   */
+  libraryRevision: number,
+};
+
+/**
+ * One artist heard, with files or not.
+ */
+export type HeardArtist = {
+  /**
+   * Their name's key, which `history.artist` takes.
+   */
+  key: string,
+  /**
+   * Their name: the library's, or as their plays spell it most.
+   */
+  name: string,
+  /**
+   * The library's artist, when they are one.
+   */
+  artistId?: string,
+  /**
+   * The plays.
+   */
+  plays: number,
+  /**
+   * The local date of the first, as `YYYY-MM-DD`, when one has a date.
+   */
+  firstPlayed?: string,
+  /**
+   * The local date of the last, as `YYYY-MM-DD`, when one has a date.
+   */
+  lastPlayed?: string,
+};
+
+/**
+ * The result of `history.artists`: every artist heard, as asked.
+ */
+export type HeardArtists = {
+  /**
+   * This page of them.
+   */
+  artists: Array<HeardArtist>,
+  /**
+   * How many there are in all.
+   */
+  total: number,
+  /**
+   * The library revision this was read at.
+   */
+  libraryRevision: number,
+};
+
+/**
+ * The params of `history.artists` and `history.albums`.
+ */
+export type HeardListParams = {
+  /**
+   * The order. Played most first when left out.
+   */
+  order: HeardOrder,
+  /**
+   * How many to give, at most [`MAX_HEARD`]. [`DEFAULT_HEARD`] when left
+   * out.
+   */
+  limit?: number,
+  /**
+   * How many to pass over first.
+   */
+  offset: number,
+};
+
+/**
+ * How `history.artists` and `history.albums` order what they list.
+ */
+export type HeardOrder = "plays" | "first" | "last";
+
+/**
  * The params of `server.hello`: who is calling.
  */
 export type HelloParams = {
@@ -1307,6 +1431,45 @@ export type HelloParams = {
    * built with. A server refuses one that is not its own.
    */
   contractVersion: number,
+};
+
+/**
+ * The params of `history.album`: the library's album, by its record or
+ * one release, or an album heard, by its artist's key and its own, as
+ * `history.albums` gives them. Keys that name exactly one of the library's
+ * records answer with that record.
+ */
+export type HistoryAlbumParams = {
+  /**
+   * The library's album.
+   */
+  ref?: AlbumRef,
+  /**
+   * An album heard: its artist's key.
+   */
+  artistKey?: string,
+  /**
+   * An album heard: its own key, under its artist.
+   */
+  key?: string,
+};
+
+/**
+ * The params of `history.artist`: the library's artist, by its ID, or
+ * an artist heard, by their name's key as `history.artists` gives it. A
+ * key that is the name of exactly one of the library's artists with a
+ * record answers with that artist, so a key kept from before their record
+ * was bought still arrives.
+ */
+export type HistoryArtistParams = {
+  /**
+   * The library's artist.
+   */
+  artistId?: string,
+  /**
+   * An artist heard, by their name's key.
+   */
+  key?: string,
 };
 
 /**

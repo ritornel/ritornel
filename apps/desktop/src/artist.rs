@@ -33,9 +33,9 @@ use gpui::{
 use ritornel_client::Client;
 use ritornel_contract::methods::{ArtistGet, HistoryArtist};
 use ritornel_contract::{
-    AlbumTile, ArtistGetParams, ArtistPage, ContextKind, Event, FILTER_VERSION, Filter, HistoryOf,
-    Id, LibraryChange, ListKind, ListOpenParams, PlayContext, Predicate, Query, RecordPlayed, Row,
-    Section, Shelf, SongRow, Sort, SortKey,
+    AlbumTile, ArtistGetParams, ArtistPage, ContextKind, Event, FILTER_VERSION, Filter,
+    HistoryArtistParams, HistoryOf, Id, LibraryChange, ListKind, ListOpenParams, PlayContext,
+    Predicate, Query, RecordPlayed, Row, Section, Shelf, SongRow, Sort, SortKey,
 };
 
 use crate::banner::{self, Actions, Banner};
@@ -458,7 +458,11 @@ impl Artist {
                     ..Query::default()
                 },
             );
-            let history = client.call::<HistoryArtist>(&params);
+            let of = HistoryArtistParams {
+                artist_id: Some(artist_id),
+                key: None,
+            };
+            let history = client.call::<HistoryArtist>(&of);
             if plays_only {
                 let (loose, history) = tokio::join!(loose, history);
                 let loose = loose?;

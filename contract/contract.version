@@ -2,4 +2,4 @@
 # `mise run contract`, which refuses when the wire has changed and the
 # version has not: raise CONTRACT_VERSION in crates/ritornel-contract.
 version 3
-digest 9a0fcf5dbd0bc947
+digest 84eaa59bd715dff7

@@ -11,10 +11,15 @@
 //! picture ("Album and artist pages" in docs/internals/desktop.md). What
 //! Lean back says about the song that is playing is `history.track`,
 //! answered with a [`TrackHistory`].
+//!
+//! Every artist and every album heard, with files or not, are listed by
+//! `history.artists` and `history.albums`. One that has no files is named by
+//! its key, which the two page calls also take ("History by artist and
+//! album" in docs/internals/history.md).
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AlbumTile, Id, Receipt};
+use crate::{AlbumRef, AlbumTile, Id, Receipt};
 
 /// What became of a play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -376,6 +381,167 @@ pub struct HistoryOf {
     /// The one sentence a page says of it, in its banner. Empty when there
     /// is nothing true to say, which is when there are no plays.
     pub sentence: Vec<Phrase>,
+    /// The library revision this was read at.
+    pub library_revision: u64,
+}
+
+/// The params of `history.artist`: the library's artist, by its ID, or
+/// an artist heard, by their name's key as `history.artists` gives it. A
+/// key that is the name of exactly one of the library's artists with a
+/// record answers with that artist, so a key kept from before their record
+/// was bought still arrives.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryArtistParams {
+    /// The library's artist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub artist_id: Option<Id>,
+    /// An artist heard, by their name's key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub key: Option<String>,
+}
+
+/// The params of `history.album`: the library's album, by its record or
+/// one release, or an album heard, by its artist's key and its own, as
+/// `history.albums` gives them. Keys that name exactly one of the library's
+/// records answer with that record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryAlbumParams {
+    /// The library's album.
+    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub album: Option<AlbumRef>,
+    /// An album heard: its artist's key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub artist_key: Option<String>,
+    /// An album heard: its own key, under its artist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub key: Option<String>,
+}
+
+/// How `history.artists` and `history.albums` order what they list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum HeardOrder {
+    /// Played most first.
+    #[default]
+    Plays,
+    /// First heard longest ago first.
+    First,
+    /// Last heard most recently first.
+    Last,
+}
+
+/// The params of `history.artists` and `history.albums`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HeardListParams {
+    /// The order. Played most first when left out.
+    #[serde(default)]
+    pub order: HeardOrder,
+    /// How many to give, at most [`MAX_HEARD`]. [`DEFAULT_HEARD`] when left
+    /// out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub limit: Option<u32>,
+    /// How many to pass over first.
+    #[serde(default)]
+    pub offset: u32,
+}
+
+/// How many artists or albums a History list gives when not told.
+pub const DEFAULT_HEARD: u32 = 100;
+
+/// The most a History list gives in one call.
+pub const MAX_HEARD: u32 = 1000;
+
+/// When an artist or an album was first and last heard, and how often:
+/// the plays that count and are not excluded.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct Heard {
+    /// The plays.
+    pub plays: u64,
+    /// The local date of the first, as `YYYY-MM-DD`, when one has a date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub first_played: Option<String>,
+    /// The local date of the last, as `YYYY-MM-DD`, when one has a date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub last_played: Option<String>,
+}
+
+/// One artist heard, with files or not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HeardArtist {
+    /// Their name's key, which `history.artist` takes.
+    pub key: String,
+    /// Their name: the library's, or as their plays spell it most.
+    pub name: String,
+    /// The library's artist, when they are one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub artist_id: Option<Id>,
+    /// How often and when.
+    #[serde(flatten)]
+    pub heard: Heard,
+}
+
+/// The result of `history.artists`: every artist heard, as asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HeardArtists {
+    /// This page of them.
+    pub artists: Vec<HeardArtist>,
+    /// How many there are in all.
+    pub total: u64,
+    /// The library revision this was read at.
+    pub library_revision: u64,
+}
+
+/// One album heard, with files or not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HeardAlbum {
+    /// Its artist's key and its own, which `history.album` takes.
+    pub artist_key: String,
+    pub key: String,
+    /// Its artist's name and its own.
+    pub artist_name: String,
+    pub name: String,
+    /// The library's record, when it is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub album_id: Option<Id>,
+    /// How often and when.
+    #[serde(flatten)]
+    pub heard: Heard,
+}
+
+/// The result of `history.albums`: every album heard, as asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct HeardAlbums {
+    /// This page of them.
+    pub albums: Vec<HeardAlbum>,
+    /// How many there are in all.
+    pub total: u64,
     /// The library revision this was read at.
     pub library_revision: u64,
 }

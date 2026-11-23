@@ -710,7 +710,8 @@ fn neighbours(connection: &Connection, at: i64) -> Result<Vec<i64>, Error> {
 }
 
 /// Drops the plays these observations support, and every link to them.
-fn drop_plays_of(connection: &Connection, observations: &BTreeSet<i64>) -> Result<(), Error> {
+fn drop_plays_of(write: &Write<'_>, observations: &BTreeSet<i64>) -> Result<(), Error> {
+    let connection = write.connection();
     let mut plays = BTreeSet::new();
     let mut find = connection.prepare_cached(
         "SELECT play_event_id FROM play_event_observation WHERE observation_id = ?1",
@@ -721,6 +722,9 @@ fn drop_plays_of(connection: &Connection, observations: &BTreeSet<i64>) -> Resul
             .collect::<Result<_, _>>()?;
         plays.extend(found);
     }
+    let mut heard = crate::history_heard::Linker::new(connection, write.rev());
+    heard.unlink(&plays)?;
+    heard.finish()?;
     for play in plays {
         connection
             .prepare_cached("DELETE FROM play_event_observation WHERE play_event_id = ?1")?
@@ -746,6 +750,7 @@ fn keys(connection: &Connection, observation: i64) -> Result<([u8; 16], Vec<u8>)
 /// Writes derived plays.
 fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
     let connection = write.connection();
+    let mut heard = crate::history_heard::Linker::new(connection, write.rev());
     for play in plays {
         let Some(&(head, _)) = play.observations.first() else {
             continue;
@@ -798,6 +803,14 @@ fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
                 play.count_basis.as_str(),
             ])?;
         let event = connection.last_insert_rowid();
+        heard.link(&crate::history_heard::ToLink {
+            event,
+            recording: play.recording,
+            appearance: play.appearance,
+            primary: head,
+            counted: play.counts && !play.excluded,
+            local_date: local.map(|local| local.date),
+        })?;
         let joined: HashMap<i64, derive::Joined> = play.joined.iter().copied().collect();
         for (observation, role) in &play.observations {
             connection
@@ -815,7 +828,7 @@ fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
                 ))?;
         }
     }
-    Ok(())
+    heard.finish()
 }
 
 /// Derives again what a change to a delivery can move: whether an import
@@ -883,7 +896,7 @@ pub(crate) fn rederive(
             }
         }
     }
-    drop_plays_of(connection, &around)?;
+    drop_plays_of(write, &around)?;
     let listens = listens(connection, Some(&around))?;
     let imports = imports(connection, Some(&around))?;
     let streams = crate::history_streams::streams(connection, Some(&around))?;
@@ -934,6 +947,7 @@ pub(crate) fn derive_every_play(write: &Write<'_>) -> Result<(), Error> {
 /// Drops every play and derives each again by `rule`, in the write.
 fn derive_every_play_by(write: &Write<'_>, rule: PlayRule) -> Result<(), Error> {
     let connection = write.connection();
+    crate::history_heard::clear(connection)?;
     connection.execute("DELETE FROM play_event_observation", [])?;
     connection.execute("DELETE FROM play_event", [])?;
     insert_plays(write, &derive_all(connection, rule)?)
@@ -1305,8 +1319,17 @@ fn stale_bindings(connection: &Connection) -> Result<BTreeSet<i64>, Error> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// Derives again the plays whose binding has moved. The resolver calls it
-/// in the transaction that moves bindings.
+/// What a change to the catalog moves, in its write: plays follow their
+/// source items' new bindings, and every play is linked again to the
+/// artists and the record it was heard as.
+pub(crate) fn catalog_changed(write: &Write<'_>) -> Result<(), Error> {
+    rebind(write)?;
+    crate::history_heard::relink(write.connection(), write.rev())
+}
+
+/// Derives again the plays whose binding has moved, in the transaction that
+/// moves bindings: the resolver's, through [`catalog_changed`], and the
+/// matcher's.
 pub(crate) fn rebind(write: &Write<'_>) -> Result<(), Error> {
     let stale = stale_bindings(write.connection())?;
     if stale.is_empty() {

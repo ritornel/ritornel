@@ -322,6 +322,18 @@ fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere
     );
     assert!(out.contains("What applying did"), "{out}");
     assert_eq!(revision(&data_dir).as_u64().unwrap(), before + 1);
+    // The artist and the album heard, with no files: two of the three
+    // listens count, and the skip does not.
+    let (code, out, _) = ritornelctl(&data_dir, &["history", "artists", "--json"]);
+    assert_eq!(code, Some(0), "{out}");
+    let artists: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(artists["total"], 1, "{out}");
+    assert_eq!(artists["artists"][0]["name"], "Calla Brandt");
+    assert_eq!(artists["artists"][0]["key"], "calla brandt");
+    assert_eq!(artists["artists"][0]["plays"], 2);
+    let (code, out, _) = ritornelctl(&data_dir, &["history", "albums"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(out, "Glasshouse \u{2014} Calla Brandt  2\n", "{out}");
     // The same archive again stores nothing new.
     let (code, out, _) = ritornelctl(
         &data_dir,

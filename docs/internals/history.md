@@ -1,6 +1,6 @@
 # History
 
-Ritornel separates raw listening evidence from derived plays so play-counting rules, time-zone assignments, and identity fixes can always be recomputed without losing or mutating what happened. Pure derivation and play-rule logic live in `crates/ritornel-domain/src/history.rs`, and the stream matcher and its dry run in `crates/ritornel-domain/src/{streams,stream_report}.rs`; SQLite ingest, derivation, queries, scrobble delivery, timekeeping, and export live in `crates/ritornel-engine/src/{history_store,history_streams,history_pages,history_stream,history_facts,import_store,stream_import,delivery_store,export,timekeeping}.rs`; server Last.fm workers, staged imports and RPC handlers live in `apps/server/src/{lastfm,imports,dispatch/history,dispatch/lastfm,dispatch/imports,dispatch/export}.rs`; CLI commands live in `apps/ritornelctl/src/{history,lastfm,export}.rs` and `apps/ritornelctl/src/spotify/`.
+Ritornel separates raw listening evidence from derived plays so play-counting rules, time-zone assignments, and identity fixes can always be recomputed without losing or mutating what happened. Pure derivation and play-rule logic live in `crates/ritornel-domain/src/history.rs`, and the stream matcher and its dry run in `crates/ritornel-domain/src/{streams,stream_report}.rs`; SQLite ingest, derivation, queries, scrobble delivery, timekeeping, and export live in `crates/ritornel-engine/src/{history_store,history_streams,history_heard,history_pages,history_stream,history_facts,import_store,stream_import,delivery_store,export,timekeeping}.rs`; server Last.fm workers, staged imports and RPC handlers live in `apps/server/src/{lastfm,imports,dispatch/history,dispatch/lastfm,dispatch/imports,dispatch/export}.rs`; CLI commands live in `apps/ritornelctl/src/{history,lastfm,export}.rs` and `apps/ritornelctl/src/spotify/`.
 
 See [`docs/internals/schema.md`](schema.md) for the immutable history tables, [`docs/internals/playback.md`](playback.md) for listen staging and outbox delivery, [`docs/internals/identity.md`](identity.md) for scrobble matching, and [`docs/internals/plugins.md`](plugins.md) for the `ritornel-lastfm` plugin boundary.
 
@@ -50,17 +50,34 @@ Local calendar fields (`local_date` as `YYYYMMDD`, `month_day` as `MMDD`, `local
 
 ## Queries
 
-All history views query `play_event` directly using its partial indexes (`play_event_recent`, `play_event_counted`, `play_event_on_this_day`) and the `play_effective` view—there is no separate rollup table to keep in sync:
+History views query `play_event` directly using its partial indexes (`play_event_recent`, `play_event_counted`, `play_event_on_this_day`) and the `play_effective` view, and the lists of what was heard read each play's links to it ("History by artist and album"); there is no rollup table to keep in sync:
 
 | Query / Module | Behavior |
 |---|---|
 | `history.recent` (`history_store.rs`) | Cursor-paged recent plays (`PlayCursor`), newest first, including unbound plays and per-listen chain details. |
 | `history.onThisDay` (`history_store.rs`) | Counted, non-excluded plays matching a `MMDD` `month_day` across all years. |
-| `history.artist`, `history.album` (`history_pages.rs`) | Banner summary (`Phrase`), yearly play counts (`YearPlays`), and top 6 artist records (`RECORDS = 6`). Counts only bound, counted, non-excluded plays; uses a 26-hour boundary window (`ZONES_APART_MS`) around the first and last instants so first/last local dates remain accurate across time zones. A play whose UTC instant is after now (stamped by a wrong clock) is counted as one with no instant: it is in no year and is never the first or last play, so the sentence never puts a future month in the past tense, and `firstPlayed` and `lastPlayed` are left out when no play is at or before now. |
+| `history.artists`, `history.albums` (`history_heard.rs`) | Every artist or album heard, with files or not: its key, its name, the library's ID when it is the library's, its counted plays, and its first and last local dates, by plays, first heard or last heard, paged (`HeardListParams`, 100 by default and at most 1,000). Read from the index on the links alone. |
+| `history.artist`, `history.album` (`history_pages.rs`) | Taken by the library's ID, or by a name's key (`HistoryArtistParams`, `HistoryAlbumParams`): a key that is the name of exactly one of the library's artists with a record, or of one of their records, answers with it, and otherwise with the plays heard under the name, with no records. Banner summary (`Phrase`), yearly play counts (`YearPlays`), and top 6 artist records (`RECORDS = 6`). Counts only bound, counted, non-excluded plays; uses a 26-hour boundary window (`ZONES_APART_MS`) around the first and last instants so first/last local dates remain accurate across time zones. A play whose UTC instant is after now (stamped by a wrong clock) is counted as one with no instant: it is in no year and is never the first or last play, so the sentence never puts a future month in the past tense, and `firstPlayed` and `lastPlayed` are left out when no play is at or before now. |
 | `history.track` (`history_facts.rs`) | Track and release history facts for the playing track (play counts, time-of-day patterns, and album history). As on pages, a play whose UTC instant is after now is counted as one with no instant: never the song's last time, the record's first, or its last before today. |
 | `history.stream` (`history_stream.rs`) | Monthly play totals across the entire history (bound and unbound), layered by the year each artist was first heard, naming the top 3 artists per layer-month and excluding catch-up sync days with more than `SYNC_DAY` (300) plays. |
 
-`ritornelctl history` prints recent plays directly, and exposes `artist`, `album`, `on-this-day`, `rebuild`, `zones`, and `zone {add, clear}`.
+`ritornelctl history` prints recent plays directly, and exposes `artist`, `album`, `artists`, `albums`, `on-this-day`, `rebuild`, `zones`, and `zone {add, clear}`.
+
+## History by artist and album
+
+Every play is linked to the artists and the album it was heard as, whether or not there are files for them (`history_heard.rs`). The links are derived: written with the plays by `insert_plays`, dropped with them, and written again whenever the catalog changes.
+
+| A play's | Is the library's, when | Otherwise |
+|---|---|---|
+| Artists | It is bound to a song: each artist of the song's credit, as canonical. Or its names' artist key is the name of exactly one artist the Artists list files (`library_artists`) | The name, by its key |
+| Album | It is bound to an appearance: its release's record. Or its artist is the library's, and exactly one of that artist's records has a version whose title has the album's key (`record_named`) | The album's name under the play's first artist, by its key. None when the play named no album |
+
+- **Keys:** `artist_key` is the normaliser's key with accents folded and a leading "The" and a featured credit left out; `album_key` is the normaliser's key with accents folded (`normalize.rs`). They are narrower than the scrobble matcher's loose key, which also drops spaces and every "and": safe beside a title, and not on a name alone.
+- **Rows:** `heard_artist` and `heard_album` hold a library artist or record by ID, or a name by its key and its spelling played most. A play links to each of its artists in `play_event_artist` and to its album, if any, in `play_event_album`, each link copying whether the play counts and its local date, so a list is read from the index on the links (`play_event_artist_heard`, `play_event_album_heard`) without touching `play_event`. A row no link holds is deleted.
+- **Namesakes:** two of the library's artists with one key take no play by name; it stays under the name until a binding moves it.
+- **When the catalog changes:** a resolve, a display rebuild and a metadata edit or its withdrawal call `catalog_changed`, which derives again the plays whose binding moved and links every play again (`relink`) in the same write. So a record bought later takes its bound plays, and a play of a bonus track the edition lacks finds the record by its names, and the album's row in the list stays one.
+- **Merges:** the library's rows hold the artist as canonical when linked; the list reads each artist's canonical row, and adds together the rows that a merge made one.
+- **Pages by key:** `heard_artist_history` and `heard_album_history` answer a key with the library's artist or record when the rules above find exactly one, so a key kept from before the record was bought still arrives, and otherwise with the name's plays.
 
 ## Last.fm
 
@@ -158,7 +175,7 @@ Derivation reads the streams in force (`history_streams.rs`) beside the scrobble
 
 - **Immutable observations plus pure versioned derivation.** Keeping raw listens, imports, and corrections immutable while versioning `PlayRule` and `GROUPER_VERSION` means rule changes or bug fixes are safe full rebuilds.
 - **Monotonic boot-age dating and bundled IANA TZDB.** Dating listens by monotonic age within a boot neutralizes skewed local wall clocks, and bundling the time-zone database makes local dates reproducible across machines.
-- **No rollup tables.** Indexed scans over `play_event` are fast enough for large histories and eliminate cache-invalidation drift between raw plays and displayed counts.
+- **No rollup tables.** Indexed scans over `play_event` are fast enough for large histories and eliminate cache-invalidation drift between raw plays and displayed counts. The heard links are not a rollup: one row a play, written and dropped with it, so they cannot drift from the plays; they exist so that no list folds every play's names as it is read.
 - **Commit `sending` before HTTP scrobble send.** Persisting `history_delivery` before calling Last.fm guarantees exact echo matching on subsequent imports and prevents duplicate resends after network timeouts.
 - **Self-contained plain-text export.** Exporting observations, ratings, deliveries, and derived plays as JSON Lines, JSON, and CSV ensures the entire listening record remains readable and re-derivable without Ritornel.
 - **Two reports are one listen by their times and names alone.** The stream matcher never asks the library, so buying a record cannot change which old reports are one listen. All three tiers are in force: B and C were judged on a sample of what each joins on real records first, and where C's names disagree the stream's track speaks for the play.

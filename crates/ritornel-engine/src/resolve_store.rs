@@ -1507,8 +1507,9 @@ impl LibraryStore {
     ) -> Result<(Written, Resolved), Error> {
         let written = self.write(request, move |write| {
             let resolved = plan.apply(write)?;
-            // Plays follow their source items' new bindings.
-            crate::history_store::rebind(write)?;
+            // Plays follow their source items' new bindings, and what each
+            // was heard as follows the catalog.
+            crate::history_store::catalog_changed(write)?;
             Ok(serde_json::to_string(&resolved)?)
         })?;
         let resolved = serde_json::from_str(&written.result_json)?;
@@ -1644,7 +1645,7 @@ impl LibraryStore {
             let resolution = ritornel_domain::resolve(&library, &policy);
             let plan = Plan::new(resolution, &library, &shown, policy.version);
             let resolved = plan.apply(write)?;
-            crate::history_store::rebind(write)?;
+            crate::history_store::catalog_changed(write)?;
             Ok(serde_json::to_string(&resolved)?)
         })?;
         let resolved = serde_json::from_str(&written.result_json)?;
@@ -1760,7 +1761,7 @@ impl LibraryStore {
             let plan = Plan::new(resolution, &library, &shown, policy.version);
             if !plan.is_empty() {
                 plan.apply(write)?;
-                crate::history_store::rebind(write)?;
+                crate::history_store::catalog_changed(write)?;
             }
             Ok(serde_json::to_string(&rev)?)
         })
@@ -1844,7 +1845,7 @@ impl LibraryStore {
             let plan = Plan::new(resolution, &library, &shown, policy.version);
             if !plan.is_empty() {
                 plan.apply(write)?;
-                crate::history_store::rebind(write)?;
+                crate::history_store::catalog_changed(write)?;
             }
             Ok(serde_json::to_string(&rev)?)
         })?;
