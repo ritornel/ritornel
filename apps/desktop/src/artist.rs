@@ -47,8 +47,8 @@ use crate::theme;
 use crate::tracks::Tracks;
 use crate::wall::{TileRow, viewport_of};
 use crate::words::artist::{
-    CARD, FIRST_CARD, HISTORY_ACROSS, HISTORY_GAP, SHELF_GAP, artist_facts, history_beside,
-    history_column, shelf_heading, song_columns,
+    CARD, FIRST_CARD, HISTORY_ACROSS, HISTORY_GAP, SHELF_GAP, artist_facts, has_history,
+    history_beside, history_column, shelf_heading, song_columns,
 };
 use crate::words::{pictured, plural, said};
 
@@ -1224,9 +1224,6 @@ impl Render for Artist {
             .flex()
             .flex_col();
         let history = self.history.clone();
-        let shows_history = history.as_ref().is_some_and(|history| {
-            pictured(Some(history)).is_some() || !history.records.is_empty()
-        });
         if self.problem {
             body = body.child(
                 div()
@@ -1241,7 +1238,7 @@ impl Render for Artist {
                 .iter()
                 .map(|(_, records)| records.len())
                 .collect();
-            let beside = history_beside(content, &counts, shows_history);
+            let beside = history_beside(content, &counts, has_history(history.as_ref()));
             let across = !beside && content >= HISTORY_ACROSS;
             let column = history_column(content);
             let area = if beside {
@@ -1274,7 +1271,7 @@ impl Render for Artist {
             };
             let history_part = history
                 .as_ref()
-                .and_then(|history| self.history(history, across && !beside, window, cx));
+                .and_then(|history| self.history(history, across, window, cx));
             if beside {
                 // The column stays under the banner's strip as the records
                 // scroll, until what it stands beside has gone by.
