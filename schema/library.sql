@@ -11,7 +11,7 @@
 --   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
---   0008_spotify_streams  62a4e054e6c6833952387546d0ba257b8cff5e1e63d427a237a519a5d5e306aa
+--   0008_spotify_streams  c39aaf0d9d117dcc4ae189a8b4c807fd89c3a8851aa0706ad1974efd0ee40077
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -1052,7 +1052,7 @@ CREATE TABLE heard_artist (
   artist_id          INTEGER UNIQUE REFERENCES artist(id),   -- the library's artist a bound play's credit names, as canonical when linked; NULL for a name
   name_key           TEXT,                                   -- a name's key (accents folded, no leading 'The' or featured credit); NULL for the library's
   name               TEXT,                                   -- a name's spelling played most; NULL for the library's
-  library_artist_id  INTEGER REFERENCES artist(id),          -- for a name, the library's artist it is, when exactly one with a record has its key
+  library_artist_id  INTEGER REFERENCES artist(id),          -- for a name, the library's artist it is, when exactly one it can be has its key
   rev                INTEGER NOT NULL,
   CHECK ((artist_id IS NULL) = (name_key IS NOT NULL)),
   CHECK ((name_key IS NULL) = (name IS NULL)),
@@ -1108,3 +1108,5 @@ CREATE TABLE play_event_album (
 CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted);
 
 CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date);
+
+CREATE INDEX track_appearance_display_artist_credit ON track_appearance (display_artist_credit_id);

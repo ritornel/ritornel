@@ -204,7 +204,10 @@ fn a_page_counts_the_bound_plays_of_its_artist_and_its_album_as_counting_by_hand
             Ok(connection.query_row(
                 "SELECT count(*), min(pe.local_date), max(pe.local_date) FROM play_event pe
                  JOIN recording r ON r.id = pe.recording_id
-                 JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
+                 LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
+                 JOIN artist_credit_name acn
+                   ON acn.artist_credit_id = coalesce(ta.display_artist_credit_id,
+                                                      r.display_artist_credit_id)
                  WHERE acn.artist_id = (SELECT id FROM artist WHERE public_id = ?1)
                    AND pe.counts = 1 AND pe.excluded = 0",
                 [artist.as_bytes()],
@@ -477,13 +480,18 @@ fn blob(id: Id) -> String {
     format!("x'{hex}'")
 }
 
-/// The counted plays of the artist whose public ID is `artist`, as SQL.
+/// The counted plays of the artist whose public ID is `artist`, as SQL:
+/// of songs credited to them as heard, by the appearance or else the
+/// recording.
 fn plays_of(artist: Id) -> String {
     let artist = blob(artist);
     format!(
         "SELECT pe.id FROM play_event pe
          JOIN recording r ON r.id = pe.recording_id
-         JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
+         LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
+         JOIN artist_credit_name acn
+           ON acn.artist_credit_id = coalesce(ta.display_artist_credit_id,
+                                              r.display_artist_credit_id)
          WHERE acn.artist_id = (SELECT id FROM artist WHERE public_id = {artist})
            AND pe.counts = 1 AND pe.excluded = 0"
     )
@@ -609,7 +617,8 @@ fn played_most_skips_a_record_the_albums_list_no_longer_has() {
     let (invented, listener, artist) = played(4_000);
     let store = &invented.store;
     let artist_blob = blob(artist);
-    // Credit the artist with a played song from each of eight records.
+    // Credit the artist with a played song from each of eight records, and
+    // every appearance as its song is credited.
     tamper(
         store,
         &format!(
@@ -621,7 +630,9 @@ fn played_most_skips_a_record_the_albums_list_no_longer_has() {
                JOIN track_appearance ta ON ta.id = pe.appearance_id
                JOIN release rel ON rel.id = ta.release_id
                WHERE pe.counts = 1
-               GROUP BY rel.release_group_id LIMIT 8)"
+               GROUP BY rel.release_group_id LIMIT 8);
+             UPDATE track_appearance SET display_artist_credit_id = (
+               SELECT r.display_artist_credit_id FROM recording r WHERE r.id = recording_id)"
         ),
     );
     let before = store

@@ -15,7 +15,7 @@ use ritornel_domain::normalize::{album_key, artist_key, artist_spelling};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::list::REACHED_RELEASE_R;
-use crate::{Error, Id, LibraryStore};
+use crate::{Error, Id, LibraryStore, Today};
 
 /// What a play's links are worked out from.
 #[derive(Debug, Clone, Copy)]
@@ -34,17 +34,27 @@ pub(crate) struct ToLink {
     pub local_date: Option<i64>,
 }
 
-/// The library's artists that have a record, as canonical, by their name's
-/// key: those the Artists list files.
+/// The library's artists a name can be, as canonical, by their name's key:
+/// those the Artists list files, those a bound play's song credits, and
+/// those credited on a record a play was heard from. So every artist the
+/// lists give as the library's is found again by their key, files or not.
 pub(crate) fn library_artists(connection: &Connection) -> Result<HashMap<String, Vec<i64>>, Error> {
     let mut statement = connection.prepare_cached(&format!(
         "SELECT a.id, a.display_name FROM artist a
          WHERE a.redirect_to_id IS NULL AND a.display_name IS NOT NULL
-           AND a.id IN (
-             SELECT ca.canonical_id FROM release r
-             JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
-             JOIN artist ca ON ca.id = acn.artist_id
-             WHERE r.redirect_to_id IS NULL AND {REACHED_RELEASE_R})"
+           AND (a.id IN (
+                  SELECT ca.canonical_id FROM release r
+                  JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
+                  JOIN artist ca ON ca.id = acn.artist_id
+                  WHERE r.redirect_to_id IS NULL AND {REACHED_RELEASE_R})
+                OR a.id IN (
+                  SELECT x.canonical_id FROM heard_artist h JOIN artist x ON x.id = h.artist_id)
+                OR a.id IN (
+                  SELECT ca.canonical_id FROM heard_album h
+                  JOIN release r ON r.release_group_id = h.release_group_id
+                  JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
+                  JOIN artist ca ON ca.id = acn.artist_id
+                  WHERE r.redirect_to_id IS NULL))"
     ))?;
     let mut by_key: HashMap<String, Vec<i64>> = HashMap::new();
     let mut rows = statement.query([])?;
@@ -66,8 +76,8 @@ pub(crate) fn only(found: Option<&Vec<i64>>) -> Option<i64> {
     }
 }
 
-/// An artist's records with files, as each version's title's key and the
-/// record.
+/// An artist's records with files or that a play was heard from, as each
+/// version's title's key and the record.
 pub(crate) fn records_of(
     connection: &Connection,
     artist: i64,
@@ -77,7 +87,9 @@ pub(crate) fn records_of(
          JOIN artist_credit_name acn ON acn.artist_credit_id = r.display_artist_credit_id
          JOIN artist ca ON ca.id = acn.artist_id
          WHERE ca.canonical_id = ?1 AND r.redirect_to_id IS NULL
-           AND r.display_title IS NOT NULL AND {REACHED_RELEASE_R}"
+           AND r.display_title IS NOT NULL
+           AND ({REACHED_RELEASE_R} OR r.release_group_id IN (
+                  SELECT release_group_id FROM heard_album WHERE release_group_id IS NOT NULL))"
     ))?;
     let records = statement
         .query_map([artist], |row| {
@@ -250,6 +262,9 @@ pub(crate) struct Linker<'c> {
     album_rows: HashMap<(i64, String), i64>,
     artists_touched: BTreeSet<i64>,
     albums_touched: BTreeSet<i64>,
+    /// Whether a row of the library's artist or record was made or went,
+    /// which can change what any name is.
+    library_moved: bool,
 }
 
 impl<'c> Linker<'c> {
@@ -267,6 +282,7 @@ impl<'c> Linker<'c> {
             album_rows: HashMap::new(),
             artists_touched: BTreeSet::new(),
             albums_touched: BTreeSet::new(),
+            library_moved: false,
         }
     }
 
@@ -342,23 +358,23 @@ impl<'c> Linker<'c> {
     }
 
     /// The row of a row-making `select` and `insert` by one value, found
-    /// or made.
+    /// or made, and whether it was made.
     fn row<P: rusqlite::Params + Clone>(
         &self,
         select: &str,
         insert: &str,
         params: P,
-    ) -> Result<i64, Error> {
+    ) -> Result<(i64, bool), Error> {
         let found: Option<i64> = self
             .connection
             .prepare_cached(select)?
             .query_row(params.clone(), |row| row.get(0))
             .optional()?;
         match found {
-            Some(id) => Ok(id),
+            Some(id) => Ok((id, false)),
             None => {
                 self.connection.prepare_cached(insert)?.execute(params)?;
-                Ok(self.connection.last_insert_rowid())
+                Ok((self.connection.last_insert_rowid(), true))
             }
         }
     }
@@ -367,11 +383,12 @@ impl<'c> Linker<'c> {
         let id = match self.artist_rows.get(&artist) {
             Some(id) => *id,
             None => {
-                let id = self.row(
+                let (id, made) = self.row(
                     "SELECT id FROM heard_artist WHERE artist_id = ?1 AND ?2 = ?2",
                     "INSERT INTO heard_artist (artist_id, rev) VALUES (?1, ?2)",
                     (artist, self.rev),
                 )?;
+                self.library_moved |= made;
                 self.artist_rows.insert(artist, id);
                 id
             }
@@ -384,7 +401,7 @@ impl<'c> Linker<'c> {
         let id = match self.name_rows.get(key) {
             Some(id) => *id,
             None => {
-                let id = self.row(
+                let (id, _) = self.row(
                     "SELECT id FROM heard_artist WHERE name_key = ?1 AND ?2 = ?2 AND ?3 = ?3",
                     "INSERT INTO heard_artist (name_key, name, rev) VALUES (?1, ?2, ?3)",
                     (key, spelling, self.rev),
@@ -401,11 +418,12 @@ impl<'c> Linker<'c> {
         let id = match self.record_rows.get(&group) {
             Some(id) => *id,
             None => {
-                let id = self.row(
+                let (id, made) = self.row(
                     "SELECT id FROM heard_album WHERE release_group_id = ?1 AND ?2 = ?2",
                     "INSERT INTO heard_album (release_group_id, rev) VALUES (?1, ?2)",
                     (group, self.rev),
                 )?;
+                self.library_moved |= made;
                 self.record_rows.insert(group, id);
                 id
             }
@@ -418,7 +436,7 @@ impl<'c> Linker<'c> {
         let id = match self.album_rows.get(&(artist, key.to_owned())) {
             Some(id) => *id,
             None => {
-                let id = self.row(
+                let (id, _) = self.row(
                     "SELECT id FROM heard_album
                      WHERE heard_artist_id = ?1 AND name_key = ?2 AND ?3 = ?3 AND ?4 = ?4",
                     "INSERT INTO heard_album (heard_artist_id, name_key, name, rev)
@@ -547,13 +565,13 @@ impl<'c> Linker<'c> {
     /// Tidies the rows it touched: a row nothing links to any more goes; a
     /// name is spelled as its counted plays spell it most, or its others
     /// when none counts; and a name made is found to be the library's or
-    /// not.
+    /// not, as is every name when a row of the library's came or went.
     pub(crate) fn finish(mut self) -> Result<(), Error> {
         let mut parents = Vec::new();
         for album in &self.albums_touched {
             // An album's name that goes leaves its artist's name to be
             // tidied too, which may have held only it.
-            let parent: Option<Option<i64>> = self
+            let gone: Option<Option<i64>> = self
                 .connection
                 .prepare_cached(
                     "DELETE FROM heard_album WHERE id = ?1
@@ -562,9 +580,11 @@ impl<'c> Linker<'c> {
                 )?
                 .query_row([album], |row| row.get(0))
                 .optional()?;
-            if let Some(parent) = parent {
+            if let Some(parent) = gone {
+                // A record's row has no artist's name above it.
+                self.library_moved |= parent.is_none();
                 parents.extend(parent);
-            } else {
+            } else if self.is_name("heard_album", *album)? {
                 self.connection
                     .prepare_cached(
                         "UPDATE heard_album SET name = spelled.spelling, rev = ?2
@@ -580,15 +600,19 @@ impl<'c> Linker<'c> {
         }
         self.artists_touched.extend(parents);
         for artist in &self.artists_touched {
-            let deleted = self
+            let gone: Option<bool> = self
                 .connection
                 .prepare_cached(
                     "DELETE FROM heard_artist WHERE id = ?1
                        AND NOT EXISTS (SELECT 1 FROM play_event_artist WHERE heard_artist_id = ?1)
-                       AND NOT EXISTS (SELECT 1 FROM heard_album WHERE heard_artist_id = ?1)",
+                       AND NOT EXISTS (SELECT 1 FROM heard_album WHERE heard_artist_id = ?1)
+                     RETURNING artist_id IS NOT NULL",
                 )?
-                .execute([artist])?;
-            if deleted == 0 {
+                .query_row([artist], |row| row.get(0))
+                .optional()?;
+            if let Some(library) = gone {
+                self.library_moved |= library;
+            } else if self.is_name("heard_artist", *artist)? {
                 self.connection
                     .prepare_cached(
                         "UPDATE heard_artist SET name = spelled.spelling, rev = ?2
@@ -603,7 +627,21 @@ impl<'c> Linker<'c> {
             }
         }
         let these = (&self.artists_touched, &self.albums_touched);
-        find_names(self.connection, self.rev, &mut self.catalog, Some(these))
+        let only_these = (!self.library_moved).then_some(these);
+        find_names(self.connection, self.rev, &mut self.catalog, only_these)
+    }
+
+    /// Whether a row of `table` is a name's, which is spelled, rather than
+    /// the library's, which is not.
+    fn is_name(&self, table: &str, id: i64) -> Result<bool, Error> {
+        Ok(self
+            .connection
+            .prepare_cached(&format!(
+                "SELECT name_key IS NOT NULL FROM {table} WHERE id = ?1"
+            ))?
+            .query_row([id], |row| row.get(0))
+            .optional()?
+            .unwrap_or(false))
     }
 }
 
@@ -682,8 +720,9 @@ pub(crate) fn catalog_changed(connection: &Connection, rev: i64) -> Result<(), E
     for play in &moved {
         linker.link(play)?;
     }
-    linker.finish()?;
-    find_names_again(connection, rev)
+    // The catalog changed, so every name is found again.
+    linker.library_moved = true;
+    linker.finish()
 }
 
 /// Finds every name again by what the catalog holds now: after a file is
@@ -696,20 +735,32 @@ pub(crate) fn find_names_again(connection: &Connection, rev: i64) -> Result<(), 
 /// How often a row was heard, and its first and last local dates.
 type Tally = (u64, Option<i64>, Option<i64>);
 
+/// The latest local date a play heard by now can have: today's in the zone
+/// furthest ahead, fourteen hours past UTC.
+fn latest_date(today: Today) -> i64 {
+    crate::local_time(today.now_ms.saturating_add(14 * 3_600_000), "UTC")
+        .map_or(today.date, |local| local.date)
+}
+
 /// How often and when each row was heard by the listener: their plays
-/// that count, and their first and last local dates. Read from the index on
-/// the links alone.
+/// that count, and their first and last local dates. A date no play heard
+/// by now can have, stamped by a wrong clock, is never first or last, as
+/// on a page. Read from the index on the links alone.
 fn tallies(
     connection: &Connection,
     listener: i64,
     table: &str,
     column: &str,
+    today: Today,
 ) -> Result<HashMap<i64, Tally>, Error> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {column}, count(*), min(local_date), max(local_date) FROM {table}
+        "SELECT {column}, count(*),
+                min(CASE WHEN local_date <= ?2 THEN local_date END),
+                max(CASE WHEN local_date <= ?2 THEN local_date END)
+         FROM {table}
          WHERE listener_id = ?1 AND counted = 1 GROUP BY {column}"
     ))?;
-    let rows = statement.query_map([listener], |row| {
+    let rows = statement.query_map((listener, latest_date(today)), |row| {
         Ok((
             row.get::<_, i64>(0)?,
             (
@@ -793,8 +844,15 @@ fn artists(
     connection: &Connection,
     listener: i64,
     params: &HeardListParams,
+    today: Today,
 ) -> Result<HeardArtists, Error> {
-    let tallies = tallies(connection, listener, "play_event_artist", "heard_artist_id")?;
+    let tallies = tallies(
+        connection,
+        listener,
+        "play_event_artist",
+        "heard_artist_id",
+        today,
+    )?;
     let mut statement = connection.prepare(
         "SELECT h.id, ca.id, ca.public_id, ca.display_name, h.name_key, h.name
          FROM heard_artist h
@@ -867,8 +925,15 @@ fn albums(
     connection: &Connection,
     listener: i64,
     params: &HeardListParams,
+    today: Today,
 ) -> Result<HeardAlbums, Error> {
-    let tallies = tallies(connection, listener, "play_event_album", "heard_album_id")?;
+    let tallies = tallies(
+        connection,
+        listener,
+        "play_event_album",
+        "heard_album_id",
+        today,
+    )?;
     let mut statement = connection.prepare(
         "SELECT h.id, coalesce(h.release_group_id, h.library_group_id), h.name_key, h.name,
                 ha.name_key, ha.name, ca.display_name
@@ -968,27 +1033,31 @@ fn albums(
 }
 
 impl LibraryStore {
-    /// `history.artists`: every artist `listener` heard, with files or not.
+    /// `history.artists`: every artist `listener` heard, with files or not,
+    /// read `today`.
     pub fn heard_artists(
         &self,
         listener: Id,
         params: HeardListParams,
+        today: Today,
     ) -> Result<HeardArtists, Error> {
         self.read_snapshot(move |connection| {
             let listener = crate::history_pages::listener_key(connection, listener)?;
-            artists(connection, listener, &params)
+            artists(connection, listener, &params, today)
         })
     }
 
-    /// `history.albums`: every album `listener` heard, with files or not.
+    /// `history.albums`: every album `listener` heard, with files or not,
+    /// read `today`.
     pub fn heard_albums(
         &self,
         listener: Id,
         params: HeardListParams,
+        today: Today,
     ) -> Result<HeardAlbums, Error> {
         self.read_snapshot(move |connection| {
             let listener = crate::history_pages::listener_key(connection, listener)?;
-            albums(connection, listener, &params)
+            albums(connection, listener, &params, today)
         })
     }
 }

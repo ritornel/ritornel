@@ -256,14 +256,14 @@ impl Rig {
 
     fn artists(&self) -> Vec<HeardArtist> {
         self.library
-            .heard_artists(self.listener, HeardListParams::default())
+            .heard_artists(self.listener, HeardListParams::default(), self.today())
             .unwrap()
             .artists
     }
 
     fn albums(&self) -> Vec<HeardAlbum> {
         self.library
-            .heard_albums(self.listener, HeardListParams::default())
+            .heard_albums(self.listener, HeardListParams::default(), self.today())
             .unwrap()
             .albums
     }
@@ -298,6 +298,60 @@ impl Rig {
     fn rebuild(&self) {
         self.library
             .rebuild_history(request("history.rebuild"), false, |_| String::new())
+            .unwrap();
+    }
+
+    /// Credits every song's appearance to Calla Brandt and Odile Castellan,
+    /// a new artist of the library with no record of her own, as a change
+    /// to the catalog does.
+    fn credit_odile(&self) {
+        self.library
+            .write(request("test.credit"), |write| {
+                let (c, rev) = (write.connection(), write.rev());
+                let artist: i64 =
+                    c.query_row("SELECT coalesce(max(id), 0) + 1 FROM artist", [], |row| {
+                        row.get(0)
+                    })?;
+                c.execute(
+                    "INSERT INTO artist (id, public_id, canonical_id, display_name, rev)
+                     VALUES (?1, ?2, ?1, 'Odile Castellan', ?3)",
+                    (artist, write.new_id()?.as_bytes().to_vec(), rev),
+                )?;
+                c.execute(
+                    "INSERT INTO artist_credit (display_text, rev)
+                     VALUES ('Calla Brandt & Odile Castellan', ?1)",
+                    [rev],
+                )?;
+                let credit = c.last_insert_rowid();
+                c.execute(
+                    "INSERT INTO artist_credit_name (artist_credit_id, position, artist_id,
+                                                     credited_name, rev)
+                     SELECT ?1, 0, id, display_name, ?2 FROM artist
+                     WHERE display_name = 'Calla Brandt'
+                     UNION ALL SELECT ?1, 1, ?3, 'Odile Castellan', ?2",
+                    (credit, rev, artist),
+                )?;
+                c.execute(
+                    "UPDATE track_appearance SET display_artist_credit_id = ?1",
+                    [credit],
+                )?;
+                crate::history_store::catalog_changed(write)?;
+                Ok(String::new())
+            })
+            .unwrap();
+    }
+
+    /// Retires every file, as a scan that no longer finds them does.
+    fn retire_files(&self) {
+        self.library
+            .write(request("test.retire"), |write| {
+                write.connection().execute(
+                    "UPDATE source_item SET retired_at_ms = 1 WHERE item_kind = 'file'",
+                    [],
+                )?;
+                crate::history_heard::find_names_again(write.connection(), write.rev())?;
+                Ok(String::new())
+            })
             .unwrap();
     }
 
@@ -480,39 +534,7 @@ fn a_bound_play_follows_the_credit_of_the_appearance_it_was_heard_from() {
     assert_eq!(plays_of(&rig.artists(), "Odile Castellan"), []);
     // The edition's credit names a second artist, which the catalog's
     // change carries to the play without moving its binding.
-    rig.library
-        .write(request("test.credit"), |write| {
-            let (c, rev) = (write.connection(), write.rev());
-            let artist: i64 =
-                c.query_row("SELECT coalesce(max(id), 0) + 1 FROM artist", [], |row| {
-                    row.get(0)
-                })?;
-            c.execute(
-                "INSERT INTO artist (id, public_id, canonical_id, display_name, rev)
-                 VALUES (?1, ?2, ?1, 'Odile Castellan', ?3)",
-                (artist, write.new_id()?.as_bytes().to_vec(), rev),
-            )?;
-            c.execute(
-                "INSERT INTO artist_credit (display_text, rev)
-                 VALUES ('Calla Brandt & Odile Castellan', ?1)",
-                [rev],
-            )?;
-            let credit = c.last_insert_rowid();
-            c.execute(
-                "INSERT INTO artist_credit_name (artist_credit_id, position, artist_id,
-                                                 credited_name, rev)
-                 SELECT ?1, 0, id, display_name, ?2 FROM artist WHERE display_name = 'Calla Brandt'
-                 UNION ALL SELECT ?1, 1, ?3, 'Odile Castellan', ?2",
-                (credit, rev, artist),
-            )?;
-            c.execute(
-                "UPDATE track_appearance SET display_artist_credit_id = ?1",
-                [credit],
-            )?;
-            crate::history_store::catalog_changed(write)?;
-            Ok(String::new())
-        })
-        .unwrap();
+    rig.credit_odile();
     let artists = rig.artists();
     assert_eq!(
         plays_of(&artists, "Calla Brandt"),
@@ -523,13 +545,13 @@ fn a_bound_play_follows_the_credit_of_the_appearance_it_was_heard_from() {
         [("odile castellan", 1, true)]
     );
     // Her key, as the list gives it, finds her page, though she has no
-    // record of her own.
-    assert!(
-        rig.library
-            .heard_artist_history(rig.listener, "odile castellan".to_owned(), rig.today())
-            .unwrap()
-            .is_some()
-    );
+    // record of her own, and it counts her play as the list does.
+    let page = rig
+        .library
+        .heard_artist_history(rig.listener, "odile castellan".to_owned(), rig.today())
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.plays, 1);
     let incremental = rig.links();
     rig.rebuild();
     assert_eq!(rig.links(), incremental);
@@ -627,6 +649,7 @@ fn a_list_is_ordered_as_asked_and_paged() {
                     limit: Some(2),
                     offset: Some(offset),
                 },
+                rig.today(),
             )
             .unwrap()
             .artists
@@ -649,9 +672,114 @@ fn a_list_is_ordered_as_asked_and_paged() {
     );
     assert_eq!(
         rig.library
-            .heard_artists(rig.listener, HeardListParams::default())
+            .heard_artists(rig.listener, HeardListParams::default(), rig.today())
             .unwrap()
             .total,
         3
     );
+}
+
+#[test]
+fn a_name_of_an_artist_a_song_credits_is_theirs_whichever_came_first() {
+    for credited_first in [false, true] {
+        let rig = rig();
+        rig.record(&["Calla Brandt"], "Glasshouse", &["Low Tide"]);
+        rig.credit_odile();
+        let named = || {
+            vec![
+                scrobble(3, "Odile Castellan", "Harbour", "Night Ferry"),
+                scrobble(2, "Odile Castellan", "Harbour", "Paper Lanterns"),
+            ]
+        };
+        let bound = || vec![scrobble(1, "Calla Brandt", "Glasshouse", "Low Tide")];
+        if credited_first {
+            rig.ingest(bound());
+            rig.ingest(named());
+        } else {
+            // Her name is heard before any play names her as the library's.
+            rig.ingest(named());
+            rig.ingest(bound());
+        }
+        assert_eq!(
+            plays_of(&rig.artists(), "Odile Castellan"),
+            [("odile castellan", 3, true)],
+            "credited first: {credited_first}"
+        );
+        // Her key finds her, the library's artist, and her album heard by
+        // its name is found under it.
+        let page = rig
+            .library
+            .heard_artist_history(rig.listener, "odile castellan".to_owned(), rig.today())
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.plays, 1, "the library's page counts the bound play");
+        let album = rig
+            .library
+            .heard_album_history(
+                rig.listener,
+                "odile castellan".to_owned(),
+                "harbour".to_owned(),
+                rig.today(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(album.plays, 2);
+        let incremental = rig.links();
+        rig.rebuild();
+        assert_eq!(rig.links(), incremental);
+    }
+}
+
+#[test]
+fn a_record_whose_files_are_retired_stays_one_entry_found_by_its_keys() {
+    let rig = rig();
+    rig.record(
+        &["Calla Brandt"],
+        "Glasshouse",
+        &["Low Tide", "Paper Lanterns"],
+    );
+    rig.ingest(vec![
+        scrobble(3, "Calla Brandt", "Glasshouse", "Low Tide"),
+        // A bonus track the edition lacks, heard by its names.
+        scrobble(2, "Calla Brandt", "Glasshouse", "Hidden Room"),
+    ]);
+    rig.retire_files();
+    let albums = rig.albums();
+    assert_eq!(albums.len(), 1, "{albums:?}");
+    assert_eq!(
+        (albums[0].heard.plays, albums[0].album_id.is_some()),
+        (2, true)
+    );
+    assert_eq!(
+        plays_of(&rig.artists(), "Calla Brandt"),
+        [("calla brandt", 2, true)]
+    );
+    let page = rig
+        .library
+        .heard_album_history(
+            rig.listener,
+            albums[0].artist_key.clone(),
+            albums[0].key.clone(),
+            rig.today(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.plays, 1, "the library's page counts the bound play");
+}
+
+#[test]
+fn a_play_stamped_after_today_is_never_first_or_last_heard() {
+    let rig = rig();
+    rig.ingest(vec![
+        scrobble(2, "Odile Castellan", "Harbour", "Night Ferry"),
+        // Stamped a year on, by a wrong clock.
+        scrobble(-365, "Odile Castellan", "Harbour", "Paper Lanterns"),
+    ]);
+    let artists = rig.artists();
+    let odile = &artists[0];
+    assert_eq!(odile.heard.plays, 2);
+    assert_eq!(odile.heard.first_played.as_deref(), Some("2026-11-13"));
+    assert_eq!(odile.heard.last_played.as_deref(), Some("2026-11-13"));
+    let albums = rig.albums();
+    assert_eq!(albums[0].heard.last_played.as_deref(), Some("2026-11-13"));
 }

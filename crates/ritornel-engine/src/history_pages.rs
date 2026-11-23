@@ -20,7 +20,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::history_heard::{library_artists, only, record_named, records_of};
 use crate::{Error, Id, LibraryStore};
-use ritornel_domain::normalize::artist_key;
 
 const DAY_MS: i64 = 86_400_000;
 /// "The last year": the 365 days before now.
@@ -435,20 +434,33 @@ fn played_most(connection: &Connection, facts: &Facts) -> Result<Vec<RecordPlaye
     Ok(records)
 }
 
-/// An artist's plays: of every recording whose credit names them, or the
-/// artist they were merged into. `?2` is the artist's canonical key.
+/// An artist's plays: of every song whose credit names them, or the artist
+/// they were merged into, as the appearance it was heard from credits it,
+/// or else as its recording does, as History's lists link it. `?2` is the
+/// artist's canonical key. The recordings either credit narrows the read
+/// to the index on counted plays.
 const ARTIST_PLAYS: &str = "
+WITH credits AS (
+  SELECT acn.artist_credit_id FROM artist a
+  JOIN artist_credit_name acn ON acn.artist_id = a.id
+  WHERE a.canonical_id = ?2)
 SELECT pe.event_at_utc_ms, pe.local_date, rel.release_group_id
 FROM play_event pe
+JOIN recording song ON song.id = pe.recording_id
 LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
 LEFT JOIN release heard ON heard.id = ta.release_id
 LEFT JOIN release rel ON rel.id = heard.canonical_id
 WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
   AND pe.recording_id IN (
-    SELECT r.id FROM artist a
-    JOIN artist_credit_name acn ON acn.artist_id = a.id
-    JOIN recording r ON r.display_artist_credit_id = acn.artist_credit_id
-    WHERE a.canonical_id = ?2 AND r.redirect_to_id IS NULL)";
+    SELECT r.id FROM credits
+    JOIN recording r ON r.display_artist_credit_id = credits.artist_credit_id
+    WHERE r.redirect_to_id IS NULL
+    UNION
+    SELECT y.recording_id FROM credits
+    JOIN track_appearance y ON y.display_artist_credit_id = credits.artist_credit_id)
+  AND song.redirect_to_id IS NULL
+  AND coalesce(ta.display_artist_credit_id, song.display_artist_credit_id)
+      IN (SELECT artist_credit_id FROM credits)";
 
 /// An album's plays: of a song heard from one of its versions. `?2` is its
 /// release group's key. The recordings narrow the read to the index on
@@ -543,8 +555,9 @@ impl LibraryStore {
 impl LibraryStore {
     /// What a page says of `listener`'s history with an artist heard, by
     /// their name's key, read `today`: the library's artist, when exactly
-    /// one with a record has that name, and otherwise the name's plays.
-    /// `None` if no play was heard under it.
+    /// one a name can be has it (`library_artists`), as a name of theirs
+    /// heard is found to be, and otherwise the name's plays. `None` if no
+    /// play was heard under it.
     pub fn heard_artist_history(
         &self,
         listener: Id,
@@ -563,33 +576,10 @@ impl LibraryStore {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if let Some(row) = row {
-                return Ok(
-                    history_of(connection, listener, row, NAME_PLAYS, today, false)
-                        .map(Some)?
-                        .filter(|of| of.plays > 0),
-                );
-            }
-            // The library's artist a song's credit names who has no record
-            // of their own, as History lists them.
-            let mut credited = connection.prepare(
-                "SELECT DISTINCT ca.id, ca.display_name FROM heard_artist h
-                 JOIN artist a ON a.id = h.artist_id
-                 JOIN artist ca ON ca.id = a.canonical_id
-                 WHERE ca.display_name IS NOT NULL",
-            )?;
-            let named: Vec<i64> = credited
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .filter_map(|row| match row {
-                    Ok((artist, name)) => (artist_key(&name) == key).then_some(Ok(artist)),
-                    Err(error) => Some(Err(error)),
-                })
-                .collect::<Result<_, _>>()?;
-            only(Some(&named))
-                .map(|artist| history_of(connection, listener, artist, ARTIST_PLAYS, today, true))
-                .transpose()
+            Ok(row
+                .map(|row| history_of(connection, listener, row, NAME_PLAYS, today, false))
+                .transpose()?
+                .filter(|of| of.plays > 0))
         })
     }
 

@@ -338,10 +338,10 @@ fn imported_size() {
     // What History's lists read: every artist and every album heard.
     let heard = ritornel_contract::HeardListParams::default();
     let artists = slowest(5, || {
-        assert!(store.heard_artists(listener, heard).unwrap().total > 0);
+        assert!(store.heard_artists(listener, heard, today).unwrap().total > 0);
     });
     let albums = slowest(5, || {
-        assert!(store.heard_albums(listener, heard).unwrap().total > 0);
+        assert!(store.heard_albums(listener, heard, today).unwrap().total > 0);
     });
     // What a change to the catalog adds to its write, where nothing of it
     // moves a play.

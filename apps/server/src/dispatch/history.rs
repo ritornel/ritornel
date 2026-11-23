@@ -276,9 +276,10 @@ impl Core {
         stores: &Stores,
         params: &HeardListParams,
     ) -> Result<HeardArtists, RpcError> {
+        let today = self.today();
         Self::library(stores, |library| {
             library
-                .heard_artists(Self::listener(library)?, *params)
+                .heard_artists(Self::listener(library)?, *params, today)
                 .map_err(refused)
         })
     }
@@ -288,9 +289,10 @@ impl Core {
         stores: &Stores,
         params: &HeardListParams,
     ) -> Result<HeardAlbums, RpcError> {
+        let today = self.today();
         Self::library(stores, |library| {
             library
-                .heard_albums(Self::listener(library)?, *params)
+                .heard_albums(Self::listener(library)?, *params, today)
                 .map_err(refused)
         })
     }

@@ -148,9 +148,11 @@ ALTER TABLE play_event_observation ADD COLUMN joined_by TEXT
 -- and rewritten with the plays and by nothing else. A play bound to a song
 -- has its credit's artists and the record it was heard from. Any other
 -- has its names, by their keys: an artist's name, and an album's under it.
--- A name is the library's artist when exactly one artist with a record has
--- that key, and an album's name is that artist's record when exactly one
--- of theirs has its title; which, the catalog decides, and it is found
+-- A name is the library's artist when exactly one artist it can be has
+-- that key: one with a record, one a bound play's song credits, or one
+-- credited on a record a play was heard from. An album's name is that
+-- artist's record when exactly one of theirs, with files or heard from,
+-- has its title; which, the catalog decides, and it is found
 -- again whenever the catalog changes, without touching a play. The History
 -- lists read these, so that no query folds every play's names as it runs.
 -- =============================================================================
@@ -160,7 +162,7 @@ CREATE TABLE heard_artist (
   artist_id          INTEGER UNIQUE REFERENCES artist(id),   -- the library's artist a bound play's credit names, as canonical when linked; NULL for a name
   name_key           TEXT,                                   -- a name's key (accents folded, no leading 'The' or featured credit); NULL for the library's
   name               TEXT,                                   -- a name's spelling played most; NULL for the library's
-  library_artist_id  INTEGER REFERENCES artist(id),          -- for a name, the library's artist it is, when exactly one with a record has its key
+  library_artist_id  INTEGER REFERENCES artist(id),          -- for a name, the library's artist it is, when exactly one it can be has its key
   rev                INTEGER NOT NULL,
   CHECK ((artist_id IS NULL) = (name_key IS NOT NULL)),
   CHECK ((name_key IS NULL) = (name IS NULL)),
@@ -218,3 +220,8 @@ CREATE TABLE play_event_album (
 
 CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted);
 CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date);
+
+-- An artist's page counts a song as the appearance it was heard from
+-- credits it, as the lists link it: the appearances whose credit names
+-- them are found by it.
+CREATE INDEX track_appearance_display_artist_credit ON track_appearance (display_artist_credit_id);
