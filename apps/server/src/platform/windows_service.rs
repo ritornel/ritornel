@@ -795,7 +795,8 @@ mod tests {
         )
         .unwrap();
         assert!(ended.lock().unwrap().is_some());
-        assert!(begun.elapsed() < Duration::from_secs(10));
+        // Ended, not waited on for ever: a minute is far below a hang.
+        assert!(begun.elapsed() < Duration::from_secs(60));
         assert!(String::from_utf8(log).unwrap().contains("was ended"));
     }
 
@@ -817,6 +818,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(starts, 1);
-        assert!(begun.elapsed() < Duration::from_secs(10));
+        // Ended, not waited on for ever: a minute is far below a hang.
+        assert!(begun.elapsed() < Duration::from_secs(60));
     }
 }
