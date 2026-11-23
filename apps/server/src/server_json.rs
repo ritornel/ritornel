@@ -35,18 +35,7 @@ impl ServerJson {
             server_id,
             contract_version: CONTRACT_VERSION,
         };
-        let mut text = serde_json::to_string_pretty(&contents)
-            .map_err(|error| io_error("write", path)(error.into()))?;
-        text.push('\n');
-
-        let temporary = path.with_extension("json.tmp");
-        std::fs::File::create(&temporary)
-            .and_then(|mut file| {
-                file.write_all(text.as_bytes())?;
-                file.sync_all()
-            })
-            .map_err(io_error("write", &temporary))?;
-        std::fs::rename(&temporary, path).map_err(io_error("write", path))?;
+        write_whole(path, &contents)?;
         Ok(Self {
             path: path.to_owned(),
         })
@@ -66,9 +55,31 @@ impl Drop for ServerJson {
     }
 }
 
-/// Removes a `server.json`, if there is one. A server that holds the lock
-/// calls it before anything else: whatever the file says then was written by
-/// a server that is gone.
+/// Writes `contents` as JSON under a temporary name and renames it into
+/// place, so a reader sees all of it or none.
+pub(crate) fn write_whole(path: &Path, contents: &impl serde::Serialize) -> Result<(), Error> {
+    let mut text = serde_json::to_string_pretty(contents)
+        .map_err(|error| io_error("write", path)(error.into()))?;
+    text.push('\n');
+
+    let temporary = path.with_extension("json.tmp");
+    let written = std::fs::File::create(&temporary)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })
+        .map_err(io_error("write", &temporary))
+        .and_then(|()| std::fs::rename(&temporary, path).map_err(io_error("write", path)));
+    if written.is_err() {
+        // Half a file is left for nobody.
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
+/// Removes `server.json`, or `preparing.json`, if it is there. A server
+/// that holds the lock calls it for both before anything else: whatever
+/// they say then was written by a server that is gone.
 pub(crate) fn remove(path: &Path) -> Result<(), Error> {
     match std::fs::remove_file(path) {
         Err(error) if error.kind() != ErrorKind::NotFound => Err(io_error("remove", path)(error)),

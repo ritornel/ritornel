@@ -120,6 +120,8 @@ pub(crate) struct HistoryPage {
     elastic: crate::elastic::Elastic,
     /// How tall the page was when last drawn.
     height: Rc<Cell<f32>>,
+    /// The link, for what the server is preparing before there is a session.
+    link: Entity<Link>,
     _link: Subscription,
 }
 
@@ -182,6 +184,7 @@ impl HistoryPage {
             top: 0.,
             elastic: crate::elastic::Elastic::default(),
             height: Rc::new(Cell::new(0.)),
+            link: link.clone(),
             _link: followed,
         };
         page.load(cx);
@@ -234,9 +237,10 @@ impl HistoryPage {
         }));
     }
 
-    /// Whether it is ready to be seen: read, or known not to be readable.
+    /// Whether it is ready to be seen: read, known not to be readable, or
+    /// with no session to read it through.
     pub(crate) fn ready(&self) -> bool {
-        self.read.is_some() || self.failed || self.unheld
+        self.read.is_some() || self.failed || self.unheld || self.net.is_none()
     }
 
     /// Scrolls the page by `dy` at once, as a script's jump does.
@@ -776,7 +780,12 @@ impl Render for HistoryPage {
                 .read
                 .as_ref()
                 .is_some_and(|read| read.stream.months == 0);
-        if self.failed {
+        if self.read.is_none()
+            && let Some(step) = self.link.read(cx).preparing
+        {
+            let (title, text) = crate::link::preparing_words(step);
+            body = body.child(crate::blank::Blank::new(title, text).render(viewport));
+        } else if self.failed {
             body = body.child(
                 div()
                     .px(px(gutter))

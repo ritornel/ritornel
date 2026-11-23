@@ -29,7 +29,7 @@ use std::time::Duration;
 
 /// How a program reads an environment variable.
 pub use ritornel_contract::local::Env;
-use ritornel_contract::local::{self, ServerJson};
+use ritornel_contract::local::{self, Preparing, PreparingJson, ServerJson};
 use ritornel_contract::{CONTRACT_VERSION, PublicDescriptor, SocketTicket};
 use tokio::net::TcpStream;
 
@@ -110,6 +110,20 @@ pub fn probe(data_dir: &Path) -> Result<Lock, Error> {
         }
         Err(TryLockError::Error(error)) => Err(file_error("lock", &path)(error)),
     }
+}
+
+/// What the server that is alive on `data_dir` says it is doing before it
+/// listens, if it says: `preparing.json`, believed only while its writer
+/// holds the lock. `None` with no server, with one that has nothing to
+/// prepare or is done, and with a file that cannot be read. It contacts
+/// nothing.
+pub fn preparing(data_dir: &Path) -> Option<Preparing> {
+    let Ok(Lock::Held { pid: Some(holder) }) = probe(data_dir) else {
+        return None;
+    };
+    let text = read(&data_dir.join(local::PREPARING_JSON)).ok()??;
+    let said: PreparingJson = serde_json::from_str(&text).ok()?;
+    (said.pid == holder).then_some(said.step)
 }
 
 fn read(path: &Path) -> Result<Option<String>, Error> {
@@ -439,6 +453,25 @@ mod tests {
         // A server that has the lock and has not written its pid yet.
         let _held = hold(&scratch.0, "");
         assert_eq!(probe(&scratch.0).unwrap(), Lock::Held { pid: None });
+    }
+
+    #[test]
+    fn what_a_server_is_preparing_is_believed_only_from_the_one_alive() {
+        let scratch = Scratch::new("preparing");
+        let path = scratch.0.join(local::PREPARING_JSON);
+        std::fs::write(&path, r#"{"pid":4312,"step":"migration"}"#).unwrap();
+        // Left by a server that was killed while it prepared.
+        assert_eq!(preparing(&scratch.0), None);
+
+        let held = hold(&scratch.0, "4312\n");
+        assert_eq!(preparing(&scratch.0), Some(Preparing::Migration));
+        std::fs::write(&path, r#"{"pid":4313,"step":"migration"}"#).unwrap();
+        assert_eq!(preparing(&scratch.0), None, "another server's");
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(preparing(&scratch.0), None);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(preparing(&scratch.0), None, "done preparing");
+        drop(held);
     }
 
     #[tokio::test]

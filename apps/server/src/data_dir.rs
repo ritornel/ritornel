@@ -5,6 +5,7 @@
 //! <data-dir>/
 //!   server.lock    held while running; holds the pid of the server that has it
 //!   server.json    how a local client finds the running server
+//!   preparing.json what the server is doing before it listens, while that is slow
 //!   credential     the local owner's session token; only the OS user can read it
 //!   config.toml    optional: the settings needed before a database opens
 //!   server.db      what describes this server
@@ -18,8 +19,8 @@
 //! A backup is never written here: it goes to a folder named outside this
 //! directory (`crate::backup`).
 //!
-//! Where the directory is, and the names of `server.lock`, `server.json` and
-//! `credential`, are the contract's (`ritornel_contract::local`): a local client reads
+//! Where the directory is, and the names of `server.lock`, `server.json`,
+//! `preparing.json` and `credential`, are the contract's (`ritornel_contract::local`): a local client reads
 //! what the server writes here.
 
 use std::fs::OpenOptions;
@@ -88,6 +89,10 @@ impl DataDir {
 
     pub(crate) fn server_json(&self) -> PathBuf {
         self.root.join(local::SERVER_JSON)
+    }
+
+    pub(crate) fn preparing_json(&self) -> PathBuf {
+        self.root.join(local::PREPARING_JSON)
     }
 
     pub(crate) fn credential(&self) -> PathBuf {
@@ -160,7 +165,8 @@ fn close_if_there(database: &Path) -> Result<(), Error> {
 }
 
 /// A data directory this process holds: it exists, this process has its
-/// lock, and whatever `server.json` said before is gone. From taking it to
+/// lock, and whatever `server.json` and `preparing.json` said before is
+/// gone. From taking it to
 /// dropping it, this is the only server on the directory.
 #[derive(Debug)]
 pub struct HeldDir {
@@ -187,8 +193,10 @@ impl HeldDir {
             },
             other => other,
         })?;
-        // Whatever `server.json` says now, a server that is gone wrote it.
+        // Whatever `server.json` and `preparing.json` say now, a server
+        // that is gone wrote them.
         server_json::remove(&dir.server_json())?;
+        server_json::remove(&dir.preparing_json())?;
         Ok(Self { dir, _lock: lock })
     }
 
@@ -350,7 +358,9 @@ mod tests {
         let root = scratch.path().join("data");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("server.json"), "left behind").unwrap();
+        std::fs::write(root.join("preparing.json"), "left behind").unwrap();
         let held = HeldDir::take(root).unwrap();
         assert!(!held.dir().server_json().exists());
+        assert!(!held.dir().preparing_json().exists());
     }
 }

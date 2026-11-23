@@ -49,6 +49,7 @@ mod media_session;
 mod memory;
 mod platform;
 mod playback;
+mod preparing;
 mod serve;
 mod server;
 mod server_json;

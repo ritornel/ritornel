@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ritornel_contract::local::Preparing;
 use ritornel_contract::{Id, SessionKind};
 use ritornel_engine::{Clock, Entropy, SQLITE_VERSION, ServerStore};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -16,6 +17,7 @@ use crate::dispatch::{Core, Stores};
 use crate::jobs::Worker;
 use crate::listener::{self, Listening};
 use crate::playback;
+use crate::preparing::Steps;
 use crate::server_json::ServerJson;
 use crate::ticket::Tickets;
 use crate::{Bounds, Error, Listen, Run, library, memory};
@@ -125,9 +127,15 @@ impl Server {
     ) -> Result<Self, Error> {
         let dir = held.dir();
         let tickets = Tickets::new(Arc::clone(&entropy), bounds.ticket_life);
+        // What takes more than a moment before the server listens is said
+        // in `preparing.json`, until `server.json` replaces it.
+        let steps = Steps::new(&dir.preparing_json());
         // Nothing is migrated without a copy of it.
         let started_ms = clock.now_ms();
-        let before = crate::backup::before_migrating(dir, run.backup_dir.as_deref(), started_ms)?;
+        let before =
+            crate::backup::before_migrating(dir, run.backup_dir.as_deref(), started_ms, &|step| {
+                steps.say(step)
+            })?;
         let store = ServerStore::open(&dir.server_db(), clock.clone(), entropy.clone())?;
         crate::dispatch::record_backup(
             &store,
@@ -203,7 +211,7 @@ impl Server {
         }
 
         if let Some(library) = &library {
-            history_rule(library)?;
+            history_rule(library, &steps)?;
             // A scrobble a dead run was sending may have arrived: it is
             // never sent again.
             let abandoned = library.abandon_sending()?;
@@ -278,6 +286,7 @@ impl Server {
             listening.local_endpoint(),
             identity.server_id,
         )?;
+        drop(steps);
         Ok(Self {
             transports: Transports(Arc::clone(&core)),
             worker,
@@ -445,10 +454,11 @@ impl Server {
 /// Derives history again if any play was judged by a rule other than the
 /// one this program has: the rule changes by rebuilding ("Incremental
 /// updates and rebuilds" in docs/internals/history.md).
-fn history_rule(library: &ritornel_engine::LibraryStore) -> Result<(), Error> {
+fn history_rule(library: &ritornel_engine::LibraryStore, steps: &Steps) -> Result<(), Error> {
     if !library.history_needs_rebuild().map_err(Error::Library)? {
         return Ok(());
     }
+    steps.say(Preparing::History);
     let request = ritornel_engine::WriteRequest {
         method: "history.rebuild",
         command: None,

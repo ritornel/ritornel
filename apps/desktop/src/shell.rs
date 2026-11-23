@@ -1675,7 +1675,9 @@ impl Render for Shell {
             .size_full()
             .children(pages)
             .into_any_element();
-        let server = self.link.read(cx).net().map(|net| {
+        let link = self.link.read(cx);
+        let unconnected = link.unconnected();
+        let server = link.net().map(|net| {
             let away = crate::away::said(&net);
             let card = self.connection_hovered.then(|| match (&away, &net.hub) {
                 (Some(away), _) => Some(away.card(&crate::away::clock())),
@@ -1984,6 +1986,7 @@ impl Render for Shell {
                         self.pages.can_go_back(),
                         self.pages.current().tab(),
                         server,
+                        unconnected,
                         self.search.clone().into_any_element(),
                         cx.listener(|shell, _, window, cx| shell.back(window, cx)),
                         on_tab,
