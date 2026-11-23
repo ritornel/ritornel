@@ -38,7 +38,12 @@ impl Default for Remembered {
     }
 }
 
+/// Where it is kept; in tests, nowhere, so that a test never reads what
+/// this computer remembers.
 fn path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
     Some(
         crate::platform::settings_dir()?
             .join("dev.ritornel.desktop-gpui")

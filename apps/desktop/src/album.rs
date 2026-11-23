@@ -169,14 +169,27 @@ impl Album {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // When the library changes, what the page shows is read again, and
-        // through a new session when the server is found again.
+        // When the library changes, what the page shows is read again: through
+        // a new session when the server is found again, and when a
+        // satellite's hub is back.
         let followed = cx.subscribe(link, |page: &mut Self, _, event: &LinkEvent, cx| {
             let plays_only = match event {
                 LinkEvent::Connected(net) => {
                     page.reading = None;
                     page.revision = 0;
                     page.net = Arc::clone(net);
+                    page.reset_picture_reads();
+                    page.more_covers.again();
+                    false
+                }
+                // The same session, its hub back: what could not be read
+                // while it was away is read again.
+                LinkEvent::Restated(net) => {
+                    let back = crate::away::back(&page.net, net);
+                    page.net = Arc::clone(net);
+                    if !back {
+                        return;
+                    }
                     page.reset_picture_reads();
                     page.more_covers.again();
                     false

@@ -10,6 +10,12 @@
 //! and job events come back to it alone. The server keeps one more
 //! connection for its own work: what its player reads, and its listens.
 //!
+//! A session's connection that the hub closes, as it does when it stops,
+//! is let go at once. While the session follows the hub's library or job
+//! events, a new one is opened and subscribed when the hub begins to answer
+//! again, or at the next check while it answers, so that the session hears
+//! the hub's events again without having to call.
+//!
 //! A connection is made at the best address the routes give now, this
 //! network before a tailnet (`link::candidates`): at each, the satellite
 //! checks that the server there proves it holds the hub's pinned key
@@ -71,7 +77,10 @@ pub(crate) struct Uplink {
     call_wait: std::time::Duration,
     reach: Mutex<Reach>,
     /// Each client session's connection, by the session's ID.
-    sessions: Mutex<HashMap<u64, Arc<Client>>>,
+    sessions: Arc<Mutex<HashMap<u64, Arc<Client>>>>,
+    /// The sessions whose connection the hub closed while they followed
+    /// its events: subscribed again on a new one once the hub answers.
+    cut: Arc<Cut>,
     /// Counts the times the hub began or stopped answering, for whoever
     /// tells this server's clients.
     changes: tokio::sync::watch::Sender<u64>,
@@ -103,7 +112,8 @@ impl Uplink {
             entropy,
             call_wait,
             reach: Mutex::default(),
-            sessions: Mutex::default(),
+            sessions: Arc::default(),
+            cut: Arc::default(),
             changes: tokio::sync::watch::Sender::new(0),
             own: Mutex::default(),
             stop_by: tokio::sync::watch::Sender::new(None),
@@ -379,7 +389,16 @@ impl Uplink {
                 matches!(&sent, Err(error) if !matches!(error, ritornel_client::Error::Call(_)));
             result = Some(sent);
             if lost {
-                lock(&self.sessions).remove(&session.id());
+                // Only the connection that was lost: another call may
+                // have opened a new one meanwhile. Its relay marks the
+                // session to be subscribed again.
+                let mut sessions = lock(&self.sessions);
+                if sessions
+                    .get(&session.id())
+                    .is_some_and(|held| Arc::ptr_eq(held, &client))
+                {
+                    sessions.remove(&session.id());
+                }
             }
             if !(lost && again) {
                 break;
@@ -419,9 +438,12 @@ impl Uplink {
     /// Asks the hub for these topics on the session's connection, opening
     /// it if it is not open: a client that subscribes is waiting for the
     /// hub's events, and need not call first. The hub not answering is
-    /// not an error here: the next call says so.
+    /// not an error here: the next call says so, and the session is
+    /// subscribed once the hub answers.
     pub(crate) fn subscribe(&self, session: &Arc<Session>) {
-        let _ = self.session_client(session, true);
+        if self.session_client(session, true).is_err() {
+            self.cut.mark(session);
+        }
     }
 
     /// The session's connection, opened if it is not. A new one, or one
@@ -432,11 +454,6 @@ impl Uplink {
         subscribe: bool,
     ) -> Result<Arc<Client>, RpcError> {
         let held = lock(&self.sessions).get(&session.id()).cloned();
-        let topics: Vec<Topic> = session
-            .topics()
-            .into_iter()
-            .filter(|topic| HUB_TOPICS.contains(topic) && *topic != Topic::List)
-            .collect();
         let (client, subscribe) = match held {
             Some(client) => (client, subscribe),
             None => {
@@ -458,14 +475,41 @@ impl Uplink {
                     }
                     sessions.insert(session.id(), Arc::clone(&client));
                 }
-                self.runtime.spawn(relay(events, Arc::downgrade(session)));
+                self.runtime.spawn(relay(
+                    events,
+                    Arc::downgrade(session),
+                    Arc::downgrade(&client),
+                    Arc::clone(&self.sessions),
+                    Arc::clone(&self.cut),
+                ));
                 (client, true)
             }
         };
+        // The topics as they are once connected: one unsubscribed from
+        // meanwhile is not asked for.
+        let topics = followed(&session.topics());
         if subscribe && !topics.is_empty() {
             let params = serde_json::json!({ "topics": topics });
-            if let (Err(error), _) = self.ask(&client, "events.subscribe", params) {
-                warn!(%error, "the hub's events could not be subscribed to");
+            match self.ask(&client, "events.subscribe", params) {
+                (Ok(_), _) => {}
+                // The hub refused: asking again would be refused again.
+                (Err(ritornel_client::Error::Call(error)), _) => {
+                    warn!(error = %error.message, "the hub refused to send its events");
+                }
+                // The connection failed: it is let go, if it is still this
+                // one, and the session is subscribed on another later.
+                (Err(error), _) => {
+                    warn!(%error, "the hub's events could not be subscribed to");
+                    let mut sessions = lock(&self.sessions);
+                    if sessions
+                        .get(&session.id())
+                        .is_some_and(|held| Arc::ptr_eq(held, &client))
+                    {
+                        sessions.remove(&session.id());
+                    }
+                    drop(sessions);
+                    self.cut.mark(session);
+                }
             }
         }
         Ok(client)
@@ -522,15 +566,94 @@ impl Uplink {
         self.wait_on(None, work)
     }
 
+    /// Tells the hub that the session no longer follows these topics, on
+    /// its connection, if it has one: the hub stops sending what would
+    /// only be dropped here.
+    pub(crate) fn unsubscribe(&self, session: &Arc<Session>, topics: &[Topic]) {
+        let topics = followed(topics);
+        if topics.is_empty() {
+            return;
+        }
+        if followed(&session.topics()).is_empty() {
+            lock(&self.cut.sessions).remove(&session.id());
+        }
+        let Some(client) = lock(&self.sessions).get(&session.id()).cloned() else {
+            return;
+        };
+        let params = serde_json::json!({ "topics": topics });
+        if let (Err(error), _) = self.ask(&client, "events.unsubscribe", params) {
+            warn!(%error, "the hub's events could not be unsubscribed from");
+        }
+    }
+
+    /// Subscribes each session that follows the hub's events but is not
+    /// subscribed at the hub: its connection closed, or none could be
+    /// opened or subscribed. A connection is opened where there is none.
+    /// One the hub does not answer for yet waits for the next try. It
+    /// waits, so it runs where waiting is allowed.
+    pub(crate) fn restore(&self) {
+        let cut: Vec<Weak<Session>> = lock(&self.cut.sessions)
+            .drain()
+            .map(|(_, held)| held)
+            .collect();
+        for session in cut.iter().filter_map(Weak::upgrade) {
+            // Closed, or no longer following the hub, since it was marked.
+            if session.is_closed() || followed(&session.topics()).is_empty() {
+                continue;
+            }
+            if self.session_client(&session, true).is_err() {
+                self.cut.mark(&session);
+            }
+        }
+    }
+
     /// Lets go of a session's connection: the session has closed.
     pub(crate) fn forget(&self, session: u64) {
         lock(&self.sessions).remove(&session);
+        lock(&self.cut.sessions).remove(&session);
     }
 }
 
+/// The sessions that follow the hub's events but are not subscribed at the
+/// hub. They are subscribed when the hub begins to answer again, or at the
+/// next check while it answers, never at once: a hub that closes each new
+/// connection is not dialled in a loop.
+#[derive(Debug, Default)]
+struct Cut {
+    sessions: Mutex<HashMap<u64, Weak<Session>>>,
+}
+
+impl Cut {
+    /// Marks `session` to be subscribed when the hub next answers, if it
+    /// is open and follows the hub's events.
+    fn mark(&self, session: &Arc<Session>) {
+        if !session.is_closed() && !followed(&session.topics()).is_empty() {
+            lock(&self.sessions).insert(session.id(), Arc::downgrade(session));
+        }
+    }
+}
+
+/// Of `topics`, those the hub is asked for: its library and job events. A
+/// view's list events come on the connection that holds it, unasked.
+fn followed(topics: &[Topic]) -> Vec<Topic> {
+    topics
+        .iter()
+        .copied()
+        .filter(|topic| HUB_TOPICS.contains(topic) && *topic != Topic::List)
+        .collect()
+}
+
 /// Hands the hub's events on one connection to the session it is for,
-/// until the connection closes or the session goes.
-async fn relay(mut events: tokio::sync::mpsc::UnboundedReceiver<Event>, session: Weak<Session>) {
+/// until the connection closes or the session goes. A connection that
+/// closes is let go, and a session that follows the hub's events is
+/// marked to be subscribed again on a new one.
+async fn relay(
+    mut events: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    session: Weak<Session>,
+    client: Weak<Client>,
+    sessions: Arc<Mutex<HashMap<u64, Arc<Client>>>>,
+    cut: Arc<Cut>,
+) {
     while let Some(event) = events.recv().await {
         let Some(session) = session.upgrade() else {
             return;
@@ -539,6 +662,25 @@ async fn relay(mut events: tokio::sync::mpsc::UnboundedReceiver<Event>, session:
             session.publish(event);
         }
     }
+    let Some(session) = session.upgrade() else {
+        return;
+    };
+    {
+        // Let go if it is still held. Another in its place was opened, and
+        // subscribed, by a call meanwhile; none means a call let this one
+        // go and could not open another.
+        let mut sessions = lock(&sessions);
+        if let Some(held) = sessions.get(&session.id()) {
+            if !client
+                .upgrade()
+                .is_some_and(|ours| Arc::ptr_eq(held, &ours))
+            {
+                return;
+            }
+            sessions.remove(&session.id());
+        }
+    }
+    cut.mark(&session);
 }
 
 /// How often a satellite asks its hub whether it answers, while nothing
@@ -568,12 +710,30 @@ pub(crate) async fn follow(core: std::sync::Arc<crate::dispatch::Core>) {
                     if changed.is_err() {
                         break;
                     }
+                    // Subscribed again before the clients are told, so
+                    // that a client told the hub is back hears its events.
+                    restore(&uplink).await;
                     core.hub_changed();
                 }
-                () = tokio::time::sleep(CHECK_EVERY) => ping(&core, &uplink, &pinging),
+                () = tokio::time::sleep(CHECK_EVERY) => {
+                    restore(&uplink).await;
+                    ping(&core, &uplink, &pinging);
+                }
             }
         }
     }
+}
+
+/// Subscribes again, on a thread where waiting is allowed, the sessions
+/// whose connection the hub closed, if there are any and the hub answers
+/// as last found: a hub that does not is tried by the ping alone.
+async fn restore(uplink: &Arc<Uplink>) {
+    let answers = lock(&uplink.reach).answers == Some(true);
+    if !answers || lock(&uplink.cut.sessions).is_empty() || uplink.stopped() {
+        return;
+    }
+    let uplink = Arc::clone(uplink);
+    let _ = tokio::task::spawn_blocking(move || uplink.restore()).await;
 }
 
 /// Pings the hub, saying whether this server plays, unless a ping is still

@@ -143,6 +143,39 @@ impl Net {
         }
     }
 
+    /// A session over `client`, for tests: a satellite whose hub answers
+    /// or not, with no covers to read.
+    #[cfg(test)]
+    pub(crate) fn satellite(client: Arc<Client>, answers: bool) -> Self {
+        let id = ritornel_contract::Id::from_bytes([1; 16]);
+        Self {
+            client,
+            art: Arc::new(ArtHttp {
+                endpoint: SocketAddr::from(([127, 0, 0, 1], 9)),
+                token: String::new(),
+                idle: Mutex::new(Vec::new()),
+                in_flight: Semaphore::new(MAX_ART_IN_FLIGHT),
+            }),
+            art_sizes: vec![300],
+            name: "Study Mac".to_owned(),
+            role: ritornel_contract::ServerRole::Satellite,
+            versions: None,
+            holds: true,
+            hub: Some(ritornel_contract::HubStatus {
+                server_id: id,
+                name: "Studio Mac".to_owned(),
+                library_id: id,
+                epoch: 1,
+                routes: Vec::new(),
+                linked_at_ms: 0,
+                answers: Some(answers),
+                since_ms: Some(0),
+                route: None,
+                problem: None,
+            }),
+        }
+    }
+
     pub(crate) fn rt(&self) -> &'static Handle {
         rt()
     }
