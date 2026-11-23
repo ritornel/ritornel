@@ -18,7 +18,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ritornel_client::contract::{
@@ -47,13 +46,11 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ritornel-server-lists-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
+        let path = tempfile::Builder::new()
+            .prefix("ritornel-server-lists-")
+            .tempdir()
+            .unwrap()
+            .keep();
         Self(path)
     }
 
@@ -110,9 +107,11 @@ fn invent(data_dir: &Path, root: &Path, albums: usize) {
         .env_remove("RITORNEL_DATA_DIR")
         .output()
         .unwrap();
+    // A process a signal ended has no code, and may have said nothing.
     assert!(
         output.status.success(),
-        "{}",
+        "ritornel-server invent: {}\n--- stderr\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
 }

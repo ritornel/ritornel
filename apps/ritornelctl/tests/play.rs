@@ -19,7 +19,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -50,13 +49,11 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ritornelctl-play-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
+        let path = tempfile::Builder::new()
+            .prefix("ritornelctl-play-")
+            .tempdir()
+            .unwrap()
+            .keep();
         Self(path)
     }
 
@@ -161,15 +158,32 @@ fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) 
         let _ = child.wait();
         panic!("ritornelctl {args:?} did not end within {WAIT:?}");
     };
-    (child.wait().unwrap().code(), stdout, stderr)
+    let ended = child.wait().unwrap();
+    // No test has ritornelctl ended by a signal: one that was, was ended from
+    // outside the test, and the failure says so rather than as a code.
+    assert!(
+        ended.code().is_some(),
+        "ritornelctl {args:?} was ended from outside: {ended}\n--- stdout\n{stdout}--- stderr\n{stderr}"
+    );
+    (ended.code(), stdout, stderr)
 }
 
 fn json(data_dir: &Path, args: &[&str]) -> Value {
     let mut args = args.to_vec();
     args.push("--json");
-    let (code, stdout, stderr) = ritornelctl(data_dir, &args);
-    assert_eq!(code, Some(0), "{args:?}: {stderr}");
-    serde_json::from_str(&stdout).unwrap()
+    serde_json::from_str(&ok(data_dir, &args)).unwrap()
+}
+
+/// Runs `ritornelctl` and returns what it printed. Unless it succeeded,
+/// the test fails with its exit code and everything it printed.
+fn ok(data_dir: &Path, args: &[&str]) -> String {
+    let (code, stdout, stderr) = ritornelctl(data_dir, args);
+    assert_eq!(
+        code,
+        Some(0),
+        "ritornelctl {args:?}\n--- stdout\n{stdout}--- stderr\n{stderr}"
+    );
+    stdout
 }
 
 /// Asks the server, again and again, until `done` says so, for at most
@@ -216,7 +230,9 @@ fn spawn(data_dir: &Path, variables: &[(&str, &str)]) -> (Child, Receiver<String
         .envs(variables.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // The server logs to a file and says on stderr only what went wrong,
+        // which then shows with the failing test.
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let stdout = lines(child.stdout.take().unwrap());
@@ -265,7 +281,7 @@ impl Server {
                 .status()
                 .unwrap()
         };
-        assert!(sent.success());
+        assert!(sent.success(), "asking it to stop: {sent}");
         assert_eq!(self.ended(), Some(0));
     }
 }
@@ -281,10 +297,11 @@ impl Drop for Server {
 /// waits for it to.
 fn run_until_it_dies(data_dir: &Path, variables: &[(&str, &str)]) -> Option<i32> {
     let (mut child, stdout) = spawn(data_dir, variables);
-    assert!(
-        rest(&stdout).is_some(),
-        "the server did not die within {WAIT:?}"
-    );
+    if rest(&stdout).is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the server did not die within {WAIT:?}");
+    }
     child.wait().unwrap().code()
 }
 
@@ -318,8 +335,8 @@ fn ritornelctl_play_plays_a_folder_start_to_finish_and_every_listen_reaches_hist
         &data_dir,
         &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "50"), ("TZ", &zone)],
     );
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
+    ok(&data_dir, &["scan", folder]);
 
     let (code, stdout, stderr) = ritornelctl(&data_dir, &["play", folder, "--follow"]);
     assert_eq!((code, stderr.as_str()), (Some(0), ""));
@@ -369,9 +386,9 @@ fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_on
         &data_dir,
         &[("RITORNEL_TEST_FAIL_AT_POSITION_MS", dies_at.as_str())],
     );
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["play", folder]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
+    ok(&data_dir, &["scan", folder]);
+    ok(&data_dir, &["play", folder]);
     assert_eq!(dying.ended(), ABORTED);
 
     // The next run closes the listen as a crash, and dies itself just
@@ -471,9 +488,9 @@ fn a_server_killed_just_after_a_join_keeps_both_listens_and_the_boundary_between
     let music = scratch.album([3, TRACK_SECONDS]);
     let folder = music.to_str().unwrap();
     let dying = Server::start(&data_dir, &[("RITORNEL_TEST_FAIL_AT_POSITION_MS", "4000")]);
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["play", folder]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
+    ok(&data_dir, &["scan", folder]);
+    ok(&data_dir, &["play", folder]);
     assert_eq!(dying.ended(), ABORTED);
 
     let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);

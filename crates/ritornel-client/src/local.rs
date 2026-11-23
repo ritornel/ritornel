@@ -341,11 +341,11 @@ mod tests {
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "ritornel-client-unit-{}-{name}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&path).unwrap();
+            let path = tempfile::Builder::new()
+                .prefix(&format!("ritornel-client-unit-{name}-"))
+                .tempdir()
+                .unwrap()
+                .keep();
             Self(path)
         }
     }

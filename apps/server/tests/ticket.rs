@@ -28,7 +28,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -62,13 +61,11 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ritornel-server-ticket-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
+        let path = tempfile::Builder::new()
+            .prefix("ritornel-server-ticket-")
+            .tempdir()
+            .unwrap()
+            .keep();
         Self(path)
     }
 
@@ -734,7 +731,9 @@ impl Process {
             });
         }
         let process = Self(child);
-        let ready = printed.recv_timeout(WAIT).expect("no ready line");
+        let ready = printed
+            .recv_timeout(WAIT)
+            .unwrap_or_else(|error| panic!("no ready line within {WAIT:?}: {error}"));
         assert!(ready.starts_with("ready pid="), "{ready}");
         (process, printed)
     }
@@ -755,8 +754,9 @@ impl Process {
                 .status()
                 .unwrap()
         };
-        assert!(asked.success());
-        assert!(self.0.wait().unwrap().success());
+        assert!(asked.success(), "asking it to stop: {asked}");
+        let ended = self.0.wait().unwrap();
+        assert!(ended.success(), "the server ended with {ended}");
     }
 }
 

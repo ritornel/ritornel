@@ -2019,6 +2019,7 @@ dependencies = [
  "ritornel-windows",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
 ]
@@ -2065,6 +2066,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "symphonia",
+ "tempfile",
  "unicode-normalization",
 ]
 
@@ -2076,6 +2078,7 @@ dependencies = [
  "scrobl",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
 ]
 
@@ -2119,6 +2122,7 @@ version = "0.1.0"
 name = "ritornel-windows"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "windows",
  "windows-sys 0.61.2",
 ]
@@ -2131,6 +2135,7 @@ dependencies = [
  "ritornel-client",
  "ritornel-lastfm",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

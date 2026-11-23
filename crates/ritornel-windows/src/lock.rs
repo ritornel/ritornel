@@ -127,12 +127,13 @@ mod tests {
     const FAR: u64 = u64::MAX - 1;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "ritornel-windows-lock-{}-{name}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        path
+        tempfile::Builder::new()
+            .prefix(&format!("ritornel-windows-lock-{name}-"))
+            .tempfile()
+            .unwrap()
+            .into_temp_path()
+            .keep()
+            .unwrap()
     }
 
     #[test]

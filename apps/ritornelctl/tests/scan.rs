@@ -17,7 +17,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -41,13 +40,11 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ritornelctl-scan-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
+        let path = tempfile::Builder::new()
+            .prefix("ritornelctl-scan-")
+            .tempdir()
+            .unwrap()
+            .keep();
         Self(path)
     }
 
@@ -131,16 +128,33 @@ fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) 
         let _ = child.wait();
         panic!("ritornelctl {args:?} did not end within {WAIT:?}");
     };
-    (child.wait().unwrap().code(), stdout, stderr)
+    let ended = child.wait().unwrap();
+    // No test has ritornelctl ended by a signal: one that was, was ended from
+    // outside the test, and the failure says so rather than as a code.
+    assert!(
+        ended.code().is_some(),
+        "ritornelctl {args:?} was ended from outside: {ended}\n--- stdout\n{stdout}--- stderr\n{stderr}"
+    );
+    (ended.code(), stdout, stderr)
 }
 
 /// `ritornelctl` with `--json`, which must succeed, as the JSON it printed.
 fn json(data_dir: &Path, args: &[&str]) -> Value {
     let mut args = args.to_vec();
     args.push("--json");
-    let (code, stdout, stderr) = ritornelctl(data_dir, &args);
-    assert_eq!(code, Some(0), "{args:?}: {stderr}");
-    serde_json::from_str(&stdout).unwrap()
+    serde_json::from_str(&ok(data_dir, &args)).unwrap()
+}
+
+/// Runs `ritornelctl` and returns what it printed. Unless it succeeded,
+/// the test fails with its exit code and everything it printed.
+fn ok(data_dir: &Path, args: &[&str]) -> String {
+    let (code, stdout, stderr) = ritornelctl(data_dir, args);
+    assert_eq!(
+        code,
+        Some(0),
+        "ritornelctl {args:?}\n--- stdout\n{stdout}--- stderr\n{stderr}"
+    );
+    stdout
 }
 
 /// A `ritornel-server` that is running. It is killed if a test ends
@@ -173,7 +187,9 @@ impl Server {
             .envs(variables.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // The server logs to a file and says on stderr only what went wrong,
+            // which then shows with the failing test.
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
         let stdout = lines(child.stdout.take().unwrap());
@@ -217,7 +233,7 @@ impl Server {
                 .status()
                 .unwrap()
         };
-        assert!(sent.success());
+        assert!(sent.success(), "asking it to stop: {sent}");
         assert_eq!(self.ended(), Some(0));
     }
 }
@@ -247,8 +263,8 @@ fn scan_adds_the_folder_scans_it_and_the_stats_say_what_came_out() {
     let (code, _, stderr) = ritornelctl(&data_dir, &["scan", folder]);
     assert_eq!(code, Some(1));
     assert!(stderr.contains("this server holds no library"), "{stderr}");
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["jobs"]).1, "No jobs.\n");
+    ok(&data_dir, &["library", "create"]);
+    assert_eq!(ok(&data_dir, &["jobs"]), "No jobs.\n");
 
     let (code, stdout, stderr) = ritornelctl(&data_dir, &["scan", folder]);
     assert_eq!((code, stderr.as_str()), (Some(0), ""), "{stdout}");
@@ -266,8 +282,7 @@ fn scan_adds_the_folder_scans_it_and_the_stats_say_what_came_out() {
         assert!(stdout.contains(line), "{line}: {stdout}");
     }
 
-    let (code, stdout, _) = ritornelctl(&data_dir, &["library", "stats"]);
-    assert_eq!(code, Some(0));
+    let stdout = ok(&data_dir, &["library", "stats"]);
     for line in [
         "Library revision  4\n",
         "Files             4\n",
@@ -332,7 +347,7 @@ fn a_scan_cut_off_when_the_server_dies_is_taken_up_by_the_next_run_and_finishes(
             ("RITORNEL_TEST_FAIL_AFTER_SCAN_STEP", "2"),
         ],
     );
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
     let started = json(&data_dir, &["scan", folder, "--no-wait"]);
     let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
     // It was killed by a signal, not stopped: no exit code, and it left
@@ -389,9 +404,8 @@ fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was(
     let scratch = Scratch::new();
     let (data_dir, music) = (scratch.data_dir(), scratch.music());
     let server = Server::start(&data_dir, &[]);
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
-    let (code, _, stderr) = ritornelctl(&data_dir, &["scan", music.to_str().unwrap()]);
-    assert_eq!(code, Some(0), "{stderr}");
+    ok(&data_dir, &["library", "create"]);
+    ok(&data_dir, &["scan", music.to_str().unwrap()]);
     let before = library_bytes(&data_dir);
 
     let run = json(
@@ -407,8 +421,7 @@ fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was(
     );
     assert_eq!(run["wouldChange"], 0);
     assert_eq!(run["changes"], Value::Array(Vec::new()));
-    let (code, stdout, _) = ritornelctl(&data_dir, &["identity", "re-resolve", "--dry-run"]);
-    assert_eq!(code, Some(0));
+    let stdout = ok(&data_dir, &["identity", "re-resolve", "--dry-run"]);
     for line in [
         "Policy            policy 3\n",
         "Would change      0 (0 to another recording)\n",
@@ -434,7 +447,7 @@ fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was(
     let review = json(&data_dir, &["identity", "review"]);
     assert_eq!(review["reviews"], Value::Array(Vec::new()));
     assert_eq!(
-        ritornelctl(&data_dir, &["identity", "review"]).1,
+        ok(&data_dir, &["identity", "review"]),
         "0 marked for review.\n"
     );
 
