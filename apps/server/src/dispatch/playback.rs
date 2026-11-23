@@ -235,10 +235,6 @@ impl Core {
     /// wakes the delivery of a listen that closed, and hands Last.fm what
     /// began to play.
     pub(crate) fn publish_player(&self, events: Vec<PlayerEvent>, state: Option<PlayerState>) {
-        if let Some(state) = &state {
-            self.sounding
-                .store(state.status.wants_sound(), Ordering::Relaxed);
-        }
         for event in events {
             match event {
                 PlayerEvent::State => {
@@ -294,12 +290,15 @@ impl Core {
         let hub = self.hub_catalog();
         let mut player = lock(&self.player);
         let player = player.as_mut().ok_or_else(no_player)?;
-        let (done, events) = work(
+        let worked = work(
             player,
             &stores.server,
             catalog(library.as_ref(), hub.as_ref()),
-        )
-        .map_err(refused)?;
+        );
+        // Kept with the player held, whatever the call came to: a call that
+        // failed may still have changed it.
+        self.note_sounding(player);
+        let (done, events) = worked.map_err(refused)?;
         let state = player.state();
         let wants = player.wanted().is_some();
         drop(library);
@@ -328,6 +327,7 @@ impl Core {
                 return Ok(());
             };
             let ticked = player.tick(&stores.server, catalog(library.as_ref(), hub.as_ref()));
+            self.note_sounding(player);
             // The record's sign follows the player's saves, and nothing
             // else a tick can fail at.
             match player.save_failing() {
@@ -355,6 +355,14 @@ impl Core {
         let bytes = bytes.unwrap_or(DEFAULT_CACHE_BYTES);
         let _ = self.cache_bytes.set(bytes);
         crate::hub_catalog::tidy(&self.audio_cache(), bytes);
+    }
+
+    /// Keeps whether the player plays, or is about to, for
+    /// [`playing`](Core::playing): with the player held, so that two calls
+    /// cannot leave it as the earlier one found it.
+    fn note_sounding(&self, player: &Player) {
+        self.sounding
+            .store(player.status().wants_sound(), Ordering::Relaxed);
     }
 
     /// For the tests alone: how long the audio route waits before each
@@ -405,7 +413,8 @@ impl Core {
         if let Some(Err(error)) = handed {
             error!(%error, "a pulled master could not be handed to the player");
             // What it came to is said all the same.
-            let state = lock(&self.player).as_ref().map(Player::state);
+            let player = lock(&self.player);
+            let state = player.as_ref().map(Player::state);
             self.publish_player(vec![PlayerEvent::State], state);
         }
     }

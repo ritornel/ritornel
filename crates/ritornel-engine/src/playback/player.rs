@@ -540,6 +540,11 @@ impl Player {
     }
 
     /// The state, whole.
+    /// Whether it plays, is paused, is stopped or waits for a master.
+    pub fn status(&self) -> Status {
+        self.status
+    }
+
     pub fn state(&self) -> PlayerState {
         let current = self.current.and_then(|index| {
             let entry = self.queue.get(index)?;

@@ -834,7 +834,7 @@ async fn a_satellite_answers_and_stops_while_a_slow_pull_is_under_way() {
     bounded(async {
         let scratch = Scratch::new();
         // A hub that sends each master slowly, so that the satellite's pull
-        // is held open for seconds.
+        // is held open for longer than any of what follows may take.
         let hub = Server::start_run(
             HeldDir::take(scratch.data_dir("hub")).unwrap(),
             Listen::on_port(0),
@@ -842,7 +842,7 @@ async fn a_satellite_answers_and_stops_while_a_slow_pull_is_under_way() {
             Arc::new(OsEntropy),
             Bounds::default(),
             Run {
-                audio_pace: Some(Duration::from_secs(3)),
+                audio_pace: Some(Duration::from_secs(10)),
                 ..Run::default()
             },
         )

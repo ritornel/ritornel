@@ -162,8 +162,8 @@ pub(crate) struct Core {
     deliveries: crate::playback::Wake,
     /// What wakes the pulling of a master a satellite's player waits for.
     pulls: crate::playback::Wake,
-    /// Whether the player is playing, or about to, as its state was last
-    /// sent: see [`playing`](Self::playing).
+    /// Whether the player is playing, or about to, as the last call or
+    /// tick left it: see [`playing`](Self::playing).
     sounding: std::sync::atomic::AtomicBool,
     /// For the tests alone: how long the audio route waits before each
     /// chunk of a master it sends, so that a pull can be held open.
@@ -438,8 +438,8 @@ impl Core {
         lock(&self.awake).follow_the_rule(now);
     }
 
-    /// Whether this server's player is playing, or about to, as its state
-    /// was last sent. It is read without waiting on the player, which a
+    /// Whether this server's player is playing, or about to, as the last
+    /// call or tick left it. It is read without waiting on the player, which a
     /// call may hold while it waits on the hub: the hub's ping reads it on
     /// the async runtime, which must never wait on a lock held by what
     /// waits on the runtime.
