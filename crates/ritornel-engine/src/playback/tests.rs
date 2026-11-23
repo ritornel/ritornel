@@ -3317,3 +3317,77 @@ fn a_track_paused_while_it_buffers_and_skipped_back_to_starts_as_the_users_pick(
     assert_eq!(second.started.appearance, rig.tracks[1]);
     assert_eq!(second.started.start_reason.as_str(), "user_pick");
 }
+
+impl Rig {
+    fn jump(&mut self, entry: Id) {
+        let request = self.request("playback.jump");
+        let catalog = Away::new(&self.library, &self.away);
+        let done = self
+            .player
+            .jump(request, entry, &self.server, Some(&catalog))
+            .unwrap();
+        self.note(&done.events);
+    }
+}
+
+#[test]
+fn a_copy_fetched_during_a_pause_plays_when_the_hub_has_gone() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[0]);
+    rig.play(0);
+    let wanted = rig.player.wanted().unwrap();
+    rig.pause();
+    // Handed back while paused, with the library still saying it is
+    // elsewhere, as it does while the hub does not answer.
+    rig.hand_back(wanted, Ok(()));
+    assert_eq!(rig.player.state().status, Status::Paused);
+    rig.resume();
+    assert_eq!(rig.player.state().status, Status::Playing);
+    rig.pass(1_000);
+    assert_eq!(
+        rig.began.first().map(|(track, _)| *track),
+        Some(rig.tracks[0])
+    );
+}
+
+#[test]
+fn a_next_fetch_asked_for_before_a_stop_cannot_fail_the_same_entry_played_after() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[1]);
+    rig.play(0);
+    rig.pass(1_000);
+    let next = rig.player.wanted().unwrap();
+    rig.stop();
+    // The same entry, played after the stop, waits for a fetch of its own.
+    rig.jump(next.entry);
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    let fresh = rig.player.wanted().unwrap();
+    assert_eq!(fresh.entry, next.entry);
+    assert_ne!(fresh, next);
+    rig.fetched(next, Err("the hub went away".to_owned()));
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    assert_eq!(rig.player.wanted(), Some(fresh));
+    let page = rig.player.window(super::Order::Queue, 1, 1);
+    assert_eq!(page.entries[0].2, None);
+}
+
+#[test]
+fn a_track_paused_while_it_buffers_and_jumped_to_starts_as_the_users_pick() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[2]);
+    rig.play(1);
+    // The last, reached by the queue moving on, waits, and is paused.
+    rig.pass(300_000);
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    rig.pause();
+    // Picked by the listener, it starts as their pick.
+    rig.jump(rig.entry_at(2));
+    rig.resume();
+    let wanted = rig.player.wanted().unwrap();
+    rig.fetched(wanted, Ok(()));
+    rig.pass(1_000);
+    let staged = rig.staged();
+    let last = staged.last().unwrap();
+    assert_eq!(last.started.appearance, rig.tracks[2]);
+    assert_eq!(last.started.start_reason.as_str(), "user_pick");
+}

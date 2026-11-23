@@ -350,9 +350,10 @@ pub struct Player {
     /// The master the entry after it waits for, fetched once the current
     /// one is heard.
     fetching_next: Option<Fetch>,
-    /// Copies fetched and not yet opened, by appearance, newest last: each
-    /// is opened as it is, whether or not the hub still answers, whichever
-    /// attempt asked for it. A few are kept at most.
+    /// The last few copies fetched, by appearance, newest last, whichever
+    /// attempt asked for them: one is opened as it is when the hub offers
+    /// none that is here, so a track fetched plays whether or not the hub
+    /// still answers.
     fetched: Vec<(Id, Copy)>,
     /// Why the current entry's fetch failed, while the player moves on
     /// from it.
@@ -803,6 +804,10 @@ impl Player {
         }
         self.prepared = None;
         self.ran_out = None;
+        // What was asked for on its behalf no longer is; a copy fetched all
+        // the same is kept.
+        self.fetching = None;
+        self.fetching_next = None;
         match self
             .recorder
             .last_closed()
@@ -911,24 +916,30 @@ impl Player {
         library: &dyn Catalog,
         roots: &HashMap<String, PathBuf>,
     ) -> Result<Opened, Error> {
-        // A copy fetched for it comes first, and opens whether or not the
-        // hub still answers.
-        let mut copies = self.fetched_copy(entry.appearance);
-        if copies.is_empty()
-            && let Some((_, why)) = self
-                .unfetched
-                .take_if(|(failed, _)| *failed == entry.entry_id)
+        let (mut copies, unreadable) = match library.copies(entry.appearance, self.setup.server_id)
         {
-            return Ok(Opened::Failed(RenderError::new("no_copy_reachable", why)));
-        }
-        match library.copies(entry.appearance, self.setup.server_id) {
-            Ok(more) => copies.extend(more),
-            Err(_) if !copies.is_empty() => {}
-            Err(error) => {
-                return Ok(Opened::Failed(RenderError::new(
-                    "unreadable",
-                    error.to_string(),
-                )));
+            Ok(copies) => (copies, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        // Where the hub offers none that is here, a copy fetched for it
+        // before is tried first, so it plays whether or not the hub still
+        // answers.
+        if !copies.iter().any(|copy| copy.path(roots).is_some()) {
+            let kept = self.fetched_copy(entry.appearance);
+            let failed = self
+                .unfetched
+                .take_if(|(failed, _)| *failed == entry.entry_id);
+            match (kept.is_empty(), failed, unreadable) {
+                (true, Some((_, why)), _) => {
+                    return Ok(Opened::Failed(RenderError::new("no_copy_reachable", why)));
+                }
+                (true, None, Some(error)) => {
+                    return Ok(Opened::Failed(RenderError::new(
+                        "unreadable",
+                        error.to_string(),
+                    )));
+                }
+                _ => drop(copies.splice(0..0, kept)),
             }
         }
         self.renderer.set_replay_gain(gain_for(entry));
@@ -951,7 +962,6 @@ impl Player {
                         ..listen
                     };
                     self.register(span, &listen, from_ms, None);
-                    self.opened_copy(entry.appearance);
                     return Ok(Opened::Loaded(Box::new(Loaded {
                         span,
                         format,
@@ -964,7 +974,10 @@ impl Player {
                 }
                 // No other copy opens on an output that does not.
                 Err(error) if error.is_output() => return Ok(Opened::Failed(error)),
-                Err(error) => failure = error,
+                Err(error) => {
+                    self.forget_fetched(&copy);
+                    failure = error;
+                }
             }
         }
         Ok(if elsewhere {
@@ -1168,7 +1181,7 @@ impl Player {
                 let library = library.ok_or(no_library())?;
                 // Paused before it was fetched, it starts for the reason it
                 // was to, or the one a skip or a queue edit gave it since.
-                if !self.paused_buffering {
+                if !(self.paused_buffering && self.status == Status::Paused) {
                     self.start_reason = if self.resume_listen.is_some() {
                         StartReason::Resume
                     } else {
@@ -1604,8 +1617,10 @@ impl Player {
             None => {}
         }
         let roots = roots(server)?;
-        let mut copies = self.fetched_copy(entry.appearance);
-        copies.extend(library.copies(entry.appearance, self.setup.server_id)?);
+        let mut copies = library.copies(entry.appearance, self.setup.server_id)?;
+        if !copies.iter().any(|copy| copy.path(&roots).is_some()) {
+            drop(copies.splice(0..0, self.fetched_copy(entry.appearance)));
+        }
         if copies.iter().any(Copy::is_elsewhere)
             && copies.iter().all(|copy| copy.path(&roots).is_none())
         {
@@ -1615,22 +1630,21 @@ impl Player {
         }
         let display = library.track(entry.appearance)?;
         self.renderer.set_replay_gain(gain_for(&entry));
-        let mut opened = None;
-        for copy in copies {
+        let (mut opened, mut declined) = (None, false);
+        for copy in &copies {
             let Some(path) = copy.path(&roots) else {
                 continue;
             };
-            let listen = self.facts(&entry, &copy, reason)?;
+            let listen = self.facts(&entry, copy, reason)?;
             let span = self.next_span();
             match self.renderer.queue_next(&path, copy.facts, span) {
                 Ok(Some(format)) => {
-                    let duration_ms = duration_of(&copy, &format);
+                    let duration_ms = duration_of(copy, &format);
                     let listen = Started {
                         track_duration_ms: duration_ms,
                         ..listen
                     };
                     self.register(span, &listen, 0, None);
-                    self.opened_copy(entry.appearance);
                     opened = Some(Loaded {
                         span,
                         format,
@@ -1643,10 +1657,19 @@ impl Player {
                     break;
                 }
                 // It cannot be joined: it loads when its turn comes.
-                Ok(None) => break,
+                Ok(None) => {
+                    declined = true;
+                    break;
+                }
                 // Its turn tries every copy again and marks the entry.
-                Err(_) => {}
+                Err(_) => self.forget_fetched(copy),
             }
+        }
+        // What was here is gone, as a copy fetched and since let go of is,
+        // and the hub has it: it is fetched, to be joined.
+        if opened.is_none() && !declined && copies.iter().any(Copy::is_elsewhere) {
+            self.fetching_next = Some(self.ask(&entry));
+            return Ok(());
         }
         self.prepared = Some(Prepared {
             entry_id: entry.entry_id,
@@ -1696,7 +1719,7 @@ impl Player {
 
     /// A fetch that [`wanted`](Self::wanted) asked for is done, with the
     /// copy fetched, or failed for the reason given. A copy fetched is kept
-    /// until its entry opens, and the entry waiting for it plays: from
+    /// for its track, and the entry waiting for it plays: from
     /// where it waits if it is the current one, or joined to it if it is
     /// the next. A failure counts only for the attempt that asked: the
     /// current entry is then marked and the player moves on, and a next one
@@ -1720,12 +1743,19 @@ impl Player {
         let joins = self.loaded.is_some()
             && self.prepared.is_none()
             && next.is_some_and(|next| next.appearance == fetch.appearance);
+        // A copy fetched answers whatever asked for its track; a failure only
+        // the attempt that asked.
         let asked_next = self.fetching_next == Some(fetch);
-        if self
-            .fetching_next
-            .is_some_and(|asked| asked.appearance == fetch.appearance)
+        if asked_next
+            || (outcome.is_ok()
+                && self
+                    .fetching_next
+                    .is_some_and(|asked| asked.appearance == fetch.appearance))
         {
             self.fetching_next = None;
+        }
+        if waiting && library.is_none() {
+            return Err(no_library());
         }
         match outcome {
             Ok(copy) => self.keep_fetched(fetch.appearance, copy),
@@ -1772,7 +1802,8 @@ impl Player {
             .collect()
     }
 
-    /// Keeps a copy fetched until its entry opens, with a few others.
+    /// Keeps a copy fetched, with the few fetched last, for its track to
+    /// open while the hub does not answer.
     fn keep_fetched(&mut self, appearance: Id, copy: Copy) {
         const KEPT: usize = 4;
         self.fetched.retain(|(kept, _)| *kept != appearance);
@@ -1782,9 +1813,10 @@ impl Player {
         self.fetched.push((appearance, copy));
     }
 
-    /// The copy fetched for an appearance has opened.
-    fn opened_copy(&mut self, appearance: Id) {
-        self.fetched.retain(|(kept, _)| *kept != appearance);
+    /// A copy fetched that did not open, its file let go of since, is
+    /// forgotten.
+    fn forget_fetched(&mut self, copy: &Copy) {
+        self.fetched.retain(|(_, kept)| kept != copy);
     }
 
     /// A fetch of the master `entry` plays, as an attempt of its own.
