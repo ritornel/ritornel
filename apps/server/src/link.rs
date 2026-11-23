@@ -710,13 +710,16 @@ mod tests {
         (address.to_owned(), address.parse().unwrap())
     }
 
-    #[tokio::test]
+    // Time stands still but while every task waits, so what is measured
+    // is the dialer's own waiting, exactly, however busy the machine.
+    #[tokio::test(start_paused = true)]
     async fn the_best_address_that_answers_soon_is_taken_and_a_silent_one_holds_up_nothing() {
         let (lan, tunnel) = ("192.168.1.20:4747", "100.64.0.1:4747");
         // The better answers a moment later than the next would: it is
         // still taken, since the next is not asked until it has had time.
         let answered = first_answer(vec![at(lan), at(tunnel)], |address| async move {
             if address.ip().to_string() == "192.168.1.20" {
+                // sleep: the better address answers late, within the stagger.
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Ok::<_, String>(address)
@@ -727,7 +730,7 @@ mod tests {
 
         // One that never answers: the next is asked after the stagger, not
         // after the whole connect wait.
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let answered = first_answer(vec![at(lan), at(tunnel)], |address| async move {
             if address.ip().to_string() == "192.168.1.20" {
                 std::future::pending::<()>().await;
@@ -737,7 +740,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(answered.1, tunnel.parse().unwrap());
-        assert!(started.elapsed() < CONNECT_WAIT, "{:?}", started.elapsed());
+        assert_eq!(started.elapsed(), STAGGER);
 
         // None answers: each says why.
         let failed = first_answer(vec![at(lan), at(tunnel)], |_| async {

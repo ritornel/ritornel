@@ -1488,10 +1488,17 @@ async fn no_more_sessions_open_than_the_server_takes() {
 async fn a_taken_default_port_falls_back_to_one_the_system_picks() {
     bounded(async {
         // Hold the default port, unless something on this machine already
-        // does. Either way it is taken when the server starts.
+        // does, or Windows keeps it in a range it has reserved. Either way
+        // it cannot be had when the server starts.
         let held = std::net::TcpListener::bind("127.0.0.1:4747");
         if let Err(taken) = &held {
-            assert_eq!(taken.kind(), std::io::ErrorKind::AddrInUse, "{taken}");
+            assert!(
+                matches!(
+                    taken.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ),
+                "{taken}"
+            );
         }
 
         let scratch = Scratch::new();
@@ -1784,23 +1791,26 @@ fn clients_looking_for_a_server_do_not_keep_one_from_starting() {
     let scratch = Scratch::new();
     let data_dir = scratch.data_dir();
     let looking = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let looks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let lookers: Vec<_> = (0..3)
         .map(|_| {
-            let (data_dir, looking) = (data_dir.clone(), Arc::clone(&looking));
+            let (data_dir, looking, looks) =
+                (data_dir.clone(), Arc::clone(&looking), Arc::clone(&looks));
             std::thread::spawn(move || {
-                let mut looks = 0_u64;
                 while looking.load(Ordering::SeqCst) {
                     local::probe(&data_dir).unwrap();
-                    looks += 1;
+                    looks.fetch_add(1, Ordering::SeqCst);
                 }
-                looks
             })
         })
         .collect();
 
-    // A server takes the directory and lets it go, over and over.
+    // A server takes the directory and lets it go, over and over: at least
+    // 300 times, and until the lookers have looked as often, so that they
+    // were really in the way however the machine shares its time.
     let started = Instant::now();
-    for start in 0..300 {
+    let mut start = 0;
+    while start < 300 || looks.load(Ordering::SeqCst) < 300 {
         let held = HeldDir::take(data_dir.clone());
         assert!(held.is_ok(), "start {start}: {held:?}");
         // While it has it, every look says so.
@@ -1810,15 +1820,17 @@ fn clients_looking_for_a_server_do_not_keep_one_from_starting() {
                 pid: Some(std::process::id())
             }
         );
+        start += 1;
+        assert!(
+            started.elapsed() < WAIT,
+            "{start} starts and {} looks in {WAIT:?}",
+            looks.load(Ordering::SeqCst)
+        );
     }
     looking.store(false, Ordering::SeqCst);
-    let looks: u64 = lookers
-        .into_iter()
-        .map(|looker| looker.join().unwrap())
-        .sum();
-    // The lookers were really in the way, and the starts were not slow.
-    assert!(looks > 300, "{looks} looks");
-    assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+    for looker in lookers {
+        looker.join().unwrap();
+    }
 }
 
 #[tokio::test]

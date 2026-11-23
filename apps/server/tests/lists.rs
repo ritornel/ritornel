@@ -988,21 +988,17 @@ async fn a_cover_needs_the_media_token_and_the_token_opens_nothing_else() {
                 .status,
             401
         );
-        // It ends with its session.
+        // It ends with its session, once the server has seen the socket
+        // close.
         drop(client);
-        let mut ended = false;
-        for _ in 0..100 {
-            if get(endpoint, &art(&first, 64, Some(&token)), &[])
-                .await
-                .status
-                == 401
-            {
-                ended = true;
-                break;
-            }
+        while get(endpoint, &art(&first, 64, Some(&token)), &[])
+            .await
+            .status
+            != 401
+        {
+            // sleep: between looks; the test's WAIT bounds them.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(ended);
     })
     .await;
 }
@@ -1027,15 +1023,13 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let mut found = None;
-        for _ in 0..500 {
+        let found = loop {
             if let Ok(server) = ritornel_client::local::find(&scratch.data_dir()).await {
-                found = Some(server);
-                break;
+                break server;
             }
+            // sleep: between looks while it starts; the test's WAIT bounds them.
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let found = found.unwrap();
+        };
         let token = std::fs::read_to_string(scratch.data_dir().join("credential")).unwrap();
         let client = Client::connect(found.endpoint, &Credential::new(token.trim()))
             .await
@@ -1089,8 +1083,14 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
                 .status()
                 .unwrap()
         };
-        assert!(killed.success());
+        assert!(killed.success(), "asking it to stop: {killed}");
         let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "the server ended with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
         let mut written = String::from_utf8_lossy(&output.stdout).into_owned();
         written.push_str(&String::from_utf8_lossy(&output.stderr));
         for file in std::fs::read_dir(scratch.data_dir().join("logs")).unwrap() {

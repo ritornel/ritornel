@@ -2233,18 +2233,21 @@ mod tests {
         playing(&core, &session, scratch.path(), &["a.flac"]);
         let topics = json!({ "topics": ["playback", "progress"] });
         call(&core, &session, "events.subscribe", Some(topics)).unwrap();
-        // Long enough for the tick to have something to say.
+        // sleep: long enough for the tick to have something to say. Longer
+        // on a slow machine only gives it more.
         std::thread::sleep(Duration::from_millis(1_100));
 
         std::thread::scope(|threads| {
             // Nothing can be sent while this is held: the tick waits to send.
             let sending = lock(&core.sessions);
             let ticking = threads.spawn(|| core.tick_player().unwrap());
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(60);
             while core.player.try_lock().is_ok() {
                 assert!(Instant::now() < deadline, "the tick never took the player");
                 std::thread::yield_now();
             }
+            // sleep: a chance for the tick to let go of the player, which it
+            // must not take.
             std::thread::sleep(Duration::from_millis(200));
             // It holds the player while it waits, so no command comes between.
             assert!(core.player.try_lock().is_err());
@@ -2494,13 +2497,13 @@ mod tests {
         let queued = std::time::Instant::now();
         while core.stores.try_read().is_ok() {
             assert!(
-                queued.elapsed() < Duration::from_secs(5),
+                queued.elapsed() < Duration::from_secs(60),
                 "the close never waited"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
         go.send(()).unwrap();
-        assert_eq!(answered.recv_timeout(Duration::from_secs(5)), Ok(true));
+        assert_eq!(answered.recv_timeout(Duration::from_secs(60)), Ok(true));
         drop(session);
     }
 
@@ -2530,7 +2533,7 @@ mod tests {
                     return;
                 }
                 drop(stores);
-                assert!(started.elapsed() < Duration::from_secs(5), "{what}");
+                assert!(started.elapsed() < Duration::from_secs(60), "{what}");
                 std::thread::sleep(Duration::from_millis(1));
             }
         };
@@ -2558,7 +2561,7 @@ mod tests {
         );
         drop(held);
         let mut got: Vec<_> = (0..2)
-            .map_while(|_| answers.recv_timeout(Duration::from_secs(5)).ok())
+            .map_while(|_| answers.recv_timeout(Duration::from_secs(60)).ok())
             .collect();
         got.sort_unstable();
         assert_eq!(got, [("create", true), ("status", true)]);

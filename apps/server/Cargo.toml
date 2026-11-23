@@ -99,6 +99,8 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 zbus = { version = "=6.3.0", default-features = false, features = ["tokio", "service"], optional = true }
 
 [dev-dependencies]
+# Tests of waits run on paused time, which moves only while every task waits.
+tokio = { version = "1.54.1", features = ["test-util"] }
 # The fake Last.fm the Last.fm tests run against.
 ritornel-lastfm = { workspace = true, features = ["fake"] }
 # The contract tests talk to a server through the client, as every program
