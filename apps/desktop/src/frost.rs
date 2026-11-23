@@ -1,6 +1,5 @@
-//! The frost behind Up next's card, faked. The real card blurs what is
-//! behind it (`backdrop-filter: blur(40px) saturate(1.5)`, `UpNext.svelte`);
-//! GPUI has no backdrop blur, so the card paints under its fill a picture
+//! Simulated backdrop frost behind Up next's card: GPUI has no backdrop
+//! blur, so the card paints under its fill a blurred, saturated picture
 //! of what lies behind it, made on the CPU from what the window drew there:
 //! the window's colour, the wash and its veil, a page's banner, covers and
 //! History's picture. Each is noted here as it is laid out (`piece`), in the
@@ -25,7 +24,7 @@ use gpui::{
     point, px, size,
 };
 
-/// The card's blur, and its saturation (`UpNext.svelte`).
+/// The card's blur and saturation.
 pub(crate) const CARD: (f32, f32) = (40., 1.5);
 
 /// A ground drawn from one colour at the top to another at the bottom.

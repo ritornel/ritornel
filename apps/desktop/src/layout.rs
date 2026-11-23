@@ -1,10 +1,9 @@
-//! Where everything on a wall goes: the real client's `walls/layout.ts`,
-//! with its numbers and its tests. Tiles of 150 points, at least 18 apart
+//! Where everything on a wall goes: tiles of 150 points, at least 18 apart
 //! across and 22 down; under letters, a lane of 96 points for the large
 //! letter and 40 between one letter's tiles and the next's; with the large
 //! letters off, a small heading over each letter's tiles; under a date, a
 //! heading of 52 points over each stretch's tiles. The room left over goes
-//! between the columns (`lib/spread.ts`).
+//! between the columns.
 
 /// How a wall is laid out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

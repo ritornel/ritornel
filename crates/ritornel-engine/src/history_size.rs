@@ -1,9 +1,8 @@
-//! History at the size of a long Last.fm import: about 241,000 plays
-//! against a library of about 14,000 tracks, all invented. It
-//! measures what a wall and a page ask of history with no rollup table,
-//! the counts of every song and one artist's plays by year ("Queries" in
-//! docs/internals/history.md), and checks a small history gives the same
-//! answers as counting by hand.
+//! History at the size of a long Last.fm import: 250,000 plays against an
+//! invented library of 1,200 albums. It measures what a wall and a page ask
+//! of history with no rollup table, the counts of every song and one
+//! artist's plays by year ("Queries" in docs/internals/history.md), and
+//! checks a small history gives the same answers as counting by hand.
 //!
 //! The measurement is slow to set up, so it is ignored by default. Run it
 //! with
@@ -265,9 +264,9 @@ fn the_counts_and_an_artists_years_agree_with_counting_by_hand() {
 }
 
 #[test]
-#[ignore = "slow: about 241,000 plays; run it by name with --ignored"]
+#[ignore = "slow: 250,000 plays; run it by name with --ignored"]
 fn imported_size() {
-    const PLAYS: usize = 241_000;
+    const PLAYS: usize = 250_000;
     let began = Instant::now();
     let invented = library(1_200);
     let store = &invented.store;

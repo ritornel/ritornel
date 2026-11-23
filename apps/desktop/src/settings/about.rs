@@ -1,5 +1,5 @@
-//! About (`settings/About.svelte`): this app, the server it is connected
-//! to, and the contract the two speak.
+//! About: this app, the server it is connected to, and the contract the two
+//! speak.
 
 use gpui::{App, InteractiveElement, IntoElement, ParentElement, Styled, div};
 use ritornel_contract::{CONTRACT_VERSION, ServerRole};

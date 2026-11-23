@@ -286,9 +286,8 @@ impl Server {
     /// Renames the server and sends its new status to every session
     /// subscribed to the `servers` topic.
     ///
-    /// No call of the contract does this yet. It is here because it is the
-    /// one real change to a server's status in this milestone, and so what
-    /// the `servers` topic is tested with.
+    /// No call of the contract does this yet; it is exposed so tests can
+    /// change a server's status and exercise the `servers` topic.
     pub fn rename(&self, name: &str) -> Result<(), Error> {
         self.core.rename(name)
     }

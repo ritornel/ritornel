@@ -3,9 +3,9 @@
 //! returns the candidates in order, and the player opens the first that
 //! works.
 //!
-//! M1 has one kind of candidate, a master on this server, so the order is
-//! among masters alone: lossless first, then the higher sample rate and bit
-//! depth, then the higher bitrate, then the lowest asset.
+//! Candidates are currently masters, so the order is among masters alone:
+//! lossless first, then the higher sample rate and bit depth, then the
+//! higher bitrate, then the lowest asset.
 
 /// One copy the player could open.
 #[derive(Debug, Clone, PartialEq, Eq)]

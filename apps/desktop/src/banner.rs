@@ -1,10 +1,10 @@
-//! The banner an artist's page and an album's open on (`parts/Banner.svelte`):
-//! one banner, the same to the point on both, from edge to edge under the
-//! title bar, made of the page's picture blurred, with the way back, the
-//! name set large, the facts, Play, Shuffle and one sentence. As the page
-//! scrolls it slides under the title bar until a strip of 52 points is
-//! left, with the way back, the face, the name and Play; the large words
-//! fade out and the strip in as it goes, at the real banner's points.
+//! The banner an artist's page and an album's open on: one banner, the same
+//! to the point on both, from edge to edge under the title bar, made of the
+//! page's picture blurred, with the way back, the name set large, the facts,
+//! Play, Shuffle and one sentence. As the page scrolls it slides under the
+//! title bar until a strip of 52 points is left, with the way back, the
+//! face, the name and Play; the large words fade out and the strip fades in
+//! as it goes.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -323,14 +323,13 @@ impl Banner {
                 }
             };
 
-        // The large words, each row where the real banner has it.
+        // The large banner heading and its line height.
         let long = self.title.chars().count() > 22;
         let (size, line) = if long { (40., 42.) } else { (50., 52.) };
-        // The real `h1`'s room for its words: its `max-width` less the 28
-        // points of padding at each side that keep its letters' tails and
-        // shadow uncut (the page's boxes are `border-box`). Beside a hung
-        // cover that is all of `.big`, which ends 32 points short of the
-        // cover; otherwise 62% of it.
+        // Room for the heading: maximum width less 28 points of padding on
+        // each side so descenders and shadows stay uncut. Beside a hung
+        // cover that takes the full text column (ending 32 points short of
+        // the cover); otherwise 62% of it.
         let title_room = if self.hung.is_some() {
             words_right - gutter
         } else {

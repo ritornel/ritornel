@@ -1,15 +1,13 @@
-//! What the pages say and how they take their room, with the real client's
-//! numbers: `pages/words.ts` (counts, lengths, the line of facts under a
-//! page's name), `pages/years.ts` (the picture of your years and the
-//! banner's sentence) and `pages/layout.ts` (how an artist's page and an
-//! album's take the room they have). Their tests come with them.
+//! What the pages say and how they take their room: counts, lengths, the
+//! line of facts under a page's name, the picture of your years, the
+//! banner's sentence, and how an artist's page and an album's lay out their
+//! columns. Their tests come with them.
 
 use ritornel_contract::{
     AlbumPage, ArtColor, HistoryOf, Phrase, RecordType, Shelf, YearPlays, YearSpan,
 };
 
-/// What a page says of your history with what it shows, before there is
-/// any: the prototype's words for a library with no history yet.
+/// Fallback banner line shown for a library with no listening history yet.
 pub(crate) const NO_HISTORY: &str = "Nothing to remember yet. It starts with your first play.";
 
 /// A count with its thousands set apart: "1,200".
@@ -152,9 +150,9 @@ pub(crate) fn pictured(history: Option<&HistoryOf>) -> Option<(&HistoryOf, YearS
     (!history.years.is_empty()).then_some((history, span))
 }
 
-/// The banner's sentence: the server's. Before the history is read,
-/// nothing; before there is any history at all, the prototype's words for
-/// that, said quietly; with history but none of this, nothing.
+/// The banner's sentence from the server. Before history is read, nothing;
+/// before there is any history at all, `NO_HISTORY` said quietly; with
+/// history but none of this item, nothing.
 pub(crate) fn said(history: Option<&HistoryOf>) -> (Vec<Phrase>, bool) {
     let Some(history) = history else {
         return (Vec::new(), false);
@@ -306,7 +304,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counts_and_times_as_the_prototype_words_them() {
+    fn counts_and_times_read_as_a_person_says_them() {
         assert_eq!(plural(1, "album"), "1 album");
         assert_eq!(plural(12, "album"), "12 albums");
         assert_eq!(plural(1200, "song"), "1,200 songs");

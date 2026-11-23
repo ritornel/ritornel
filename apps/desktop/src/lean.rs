@@ -39,12 +39,10 @@
 //! on the way out, as a cover does between pages, while the view fades in or
 //! out under it. It follows the player as it goes.
 //!
-//! The real view is laid out by CSS from the window's size. Here the same
-//! sums are done by hand (`Sizes`), and each part is put where they put it.
-//! The words are set as WebKit sets them: a fact's head drawn in by its
-//! letter-spacing (`tracked.rs`) and broken as `text-wrap: balance` breaks
-//! it, so that the widest of the facts, as set, is the width the group is
-//! centred on.
+//! Layout sizes are computed from the window dimensions (`Sizes`), and each
+//! part is positioned explicitly. The words are set with letter-spacing
+//! tracking (`tracked.rs`) and balanced line breaks, so that the widest fact
+//! is the width the group is centred on.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -72,12 +70,11 @@ use crate::player::{Player, stars_of};
 use crate::theme;
 use crate::tracked::{tracked, tracked_runs};
 
-/// How long each fact stays before the next, as in the prototype.
+/// How long each fact stays before the next.
 pub(crate) const FACT_MS: u64 = 14_000;
-/// A head longer than this is set a size smaller, as the prototype does.
+/// A head longer than this is set a size smaller.
 const LONG_HEAD: usize = 60;
-/// The view comes up slowly, as the prototype's does; it goes in the time
-/// the cover takes to return (`MOTION.fly`).
+/// The view comes up slowly and goes in the time the cover takes to return.
 const OPEN_MS: f32 = 500.;
 const CLOSE_MS: f32 = crate::moves::FLY_MS;
 /// A fact gives way before the next comes up.
@@ -178,10 +175,10 @@ fn clamp(min: f32, value: f32, max: f32) -> f32 {
     min.max(value.min(max))
 }
 
-/// The view's sizes for a window, as its CSS works them out: up to about
-/// 1,680 points across they are the prototype's; past that the cover, the
-/// type and its measure grow with the window; a short window gets smaller
-/// type and a smaller cover, not an overlap.
+/// The view's sizes for a window: up to about 1,680 points across they use
+/// the base dimensions; past that the cover, the type and its measure grow
+/// with the window; a short window gets smaller type and a smaller cover,
+/// not an overlap.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Sizes {
     /// The least margin at each side (`--side`).
@@ -913,8 +910,8 @@ impl LeanBack {
         }
     }
 
-    /// The cover blurred, or for a record with none its soft colour,
-    /// blurred as the real ground's filter blurs it.
+    /// The cover blurred, or for a record with none its soft colour blurred
+    /// for the background.
     fn read_ground(
         &self,
         art: Option<Id>,
@@ -1989,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn sizes_are_the_prototypes_up_to_about_1680_across_and_grow_past_it() {
+    fn sizes_use_base_dimensions_up_to_about_1680_across_and_grow_past_it() {
         let sizes = Sizes::of(1400., 900.);
         assert_eq!(
             (sizes.side, sizes.h, sizes.cover, sizes.gap),

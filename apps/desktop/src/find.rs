@@ -1,6 +1,6 @@
 //! Where a typed name is in a name found, for the lozenge to show the part
-//! typed in the ink and the rest quieter: the real client's `walls/find.ts`,
-//! folding as the server folds (case, accents and punctuation do not count).
+//! typed in the ink and the rest quieter, folding as the server folds (case,
+//! accents and punctuation do not count).
 
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
@@ -135,7 +135,7 @@ pub(crate) fn cut(name: &str, typed: &str) -> Option<Cut> {
 mod tests {
     use super::*;
 
-    /// The real client's tests (`walls/find.test.ts`), as `before[typed]after`.
+    /// Formats a match as `before[typed]after`.
     fn read(name: &str, typed: &str) -> Option<String> {
         cut(name, typed).map(|cut| format!("{}[{}]{}", cut.before, cut.typed, cut.after))
     }

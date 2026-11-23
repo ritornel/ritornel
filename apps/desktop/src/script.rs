@@ -17,8 +17,7 @@
 //! - `album play`, `album shuffle`, `album row <n>` (a double-click on it),
 //!   `album next <n>` (its +) or `album rate <n> <stars>`: on the album page open
 //! - `point <across> <down>`: hold the pointer over History's picture there,
-//!   as shares of the window; `hold <n>`: a click on its nth layer, the
-//!   newest first, as the real app's measure mode clicks one
+//!   as shares of the window; `hold <n>`: click its nth layer (newest first)
 //! - `size <w>x<h>`: resize the window
 //! - `menu <index>`: open that tile's context menu; `dismiss` puts it away;
 //!   `do <index> <item>`: what an item of it does, as `do 3 Play Next`

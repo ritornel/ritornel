@@ -1,6 +1,6 @@
-//! Appearance (`settings/Appearance.svelte`): how the app looks on this
-//! computer. It is kept here and not on the server, and the main window
-//! follows a change at once (`remember::Looks`).
+//! Appearance: how the app looks on this computer. It is kept here and not
+//! on the server, and the main window follows a change at once
+//! (`remember::Looks`).
 
 use gpui::{App, InteractiveElement, IntoElement, ParentElement, Styled, div};
 

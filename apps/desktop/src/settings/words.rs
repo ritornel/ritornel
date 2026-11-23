@@ -1,10 +1,8 @@
-//! What Settings says, worked out from what the server reports
-//! (`settings/words.ts`): times as a person reads them, and one line for a
-//! scan, an import and a zone. Pure, so that the tests can hold the
-//! wording.
+//! What Settings says, worked out from what the server reports: times as a
+//! person reads them, and one line for a scan, an import and a zone. Pure,
+//! so that the tests can hold the wording.
 //!
-//! The real page writes times through `Intl` in the Mac's own locale and
-//! zone. Here the zone is the system's, through `jiff`, and the locale is
+//! Times are formatted in the system's zone via `jiff`, and the locale is
 //! reduced to the two things these lines show of it: whether the clock has
 //! twelve hours or twenty-four, and whether the month comes before the
 //! day (`Style`).

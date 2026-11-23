@@ -72,9 +72,9 @@ The server reads the file when it starts, so start it again: quit and reopen the
 
 ## Architecture docs and history
 
-Subsystem guides live under `docs/internals/` and are indexed in [`ARCHITECTURE.md`](ARCHITECTURE.md). Comments inside shipped migration SQL files remain frozen because migrations are checksummed and never edited, so a few migration comments still name earlier `docs/design/` paths.
+Subsystem guides live under `docs/internals/` and are indexed in [`ARCHITECTURE.md`](ARCHITECTURE.md). Comments inside shipped migration SQL files (and the generated `schema/` dumps) remain frozen because migrations are checksummed and never edited, so a few early migrations still name older `docs/design/` paths.
 
-The history begins with a few large commits made before the repository was public. An earlier desktop client was built with Tauri and Svelte before the GPUI app replaced it; some comments in `apps/desktop/` and the `tauri://localhost` socket origin in `apps/server/` still reflect that earlier client and early prototypes.
+The history begins with a few large commits made before the repository was public. The server still allows the legacy `tauri://localhost` WebSocket origin for webview clients.
 
 ## Contributing
 

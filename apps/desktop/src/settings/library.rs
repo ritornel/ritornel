@@ -1,7 +1,7 @@
-//! The library (`settings/Library.svelte`): whether the listening record
-//! advances, the music folders it reads and their scans, the folder of
-//! artist pictures, and whether the server watches them for changes. Removing a folder waits on the server: it has
-//! no call that forgets one yet.
+//! The library section: whether the listening record advances, the music
+//! folders it reads and their scans, the folder of artist pictures, and
+//! whether the server watches them for changes. Removing a folder waits on
+//! the server: it has no call that forgets one yet.
 
 use gpui::{
     App, Entity, InteractiveElement, IntoElement, ParentElement, Styled, div,

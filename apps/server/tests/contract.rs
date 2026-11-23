@@ -806,7 +806,7 @@ async fn a_subscriber_is_sent_a_servers_event_and_after_unsubscribing_none(via: 
         [Topic::Servers]
     );
 
-    // The one thing that changes a server's status in this milestone.
+    // Trigger a server status change to verify the `servers` topic event.
     running.server.rename("attic").unwrap();
     let Some(Event::Servers(event)) = subscriber.next_event().await else {
         panic!("the connection closed");

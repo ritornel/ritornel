@@ -84,9 +84,9 @@ tempfile = "3.27.0"
 [target.'cfg(windows)'.dependencies]
 ritornel-windows.workspace = true
 
-# The media session on macOS, as the Now Playing spike used it: souvlaki for
-# Now Playing and the remote commands, and Core Foundation's run loop for
-# the main thread, which objc2 wraps with no unsafe code of ours.
+# The media session on macOS: souvlaki for Now Playing and the remote
+# commands, and Core Foundation's run loop for the main thread, which objc2
+# wraps with no unsafe code of ours.
 [target.'cfg(target_os = "macos")'.dependencies]
 souvlaki = { version = "=0.9.3", default-features = false, optional = true }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFRunLoop"], optional = true }

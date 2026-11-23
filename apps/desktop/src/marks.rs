@@ -1,6 +1,5 @@
-//! Small marks the real client draws wherever a song is: its five stars
-//! (`frame/Stars.svelte`) and the three bars of the song playing
-//! (`frame/Eq.svelte`).
+//! Small marks drawn wherever a song appears: its five stars and the three
+//! bars of the song playing.
 
 use gpui::{
     Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString,
@@ -9,13 +8,13 @@ use gpui::{
 
 use crate::theme;
 
-/// Five stars, as the prototype draws them: in the accent when set, and
-/// while the pointer is on them, filled up to the one it is on. `hovered`
-/// is the star the pointer is on, which the view holding them keeps, since
-/// a star's colour depends on its neighbour's hover. A click sets that
-/// many; whether it takes them away is the caller's to decide. The pointer
-/// coming onto a star and leaving it are told apart, since leaving one star
-/// for the next may be heard after coming onto it.
+/// Five stars: in the accent when set, and while the pointer is on them,
+/// filled up to the one it is on. `hovered` is the star the pointer is on,
+/// which the view holding them keeps since a star's colour depends on its
+/// neighbour's hover. A click sets that many; whether it takes them away is
+/// the caller's to decide. The pointer coming onto a star and leaving it are
+/// told apart, since leaving one star for the next may be heard after coming
+/// onto it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stars<V: 'static>(
     key: SharedString,

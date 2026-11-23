@@ -57,15 +57,14 @@ const ICONS: &[(&str, &str, bool)] = &[
         "M2 2h5v1.6H4.7l3 3-1.1 1.1-3-3V7H2zm12 12H9v-1.6h2.3l-3-3 1.1-1.1 3 3V9H14z",
         false,
     ),
-    // The sort menu's chevron, from the real Library page's CSS.
+    // The sort menu's chevron.
     ("chevron", "M4 6.2 8 10.2l4-4", true),
     ("chevronRight", "M6.2 4l4 4-4 4", true),
     ("menu", "M2.5 4h11M2.5 8h11M2.5 12h11", true),
 ];
 
-/// Whole pictures, not one path on the 16-point square: the Settings
-/// window's (`settings/Settings.svelte`, `Library.svelte`), on squares of
-/// their own, and the parts of its spinner (`settings.css`, `.spin`).
+/// Whole SVG icons outside the 16-point icon set: the Settings toolbar icons
+/// and spinner segments.
 const PICTURES: &[(&str, &str)] = &[
     (
         "settings/library",

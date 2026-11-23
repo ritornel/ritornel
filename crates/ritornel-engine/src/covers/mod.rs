@@ -16,9 +16,8 @@
 //!
 //! A cover's colour ([`Covers::color`]) is worked out from the same decoded
 //! picture, when a cover is first made, and kept beside the covers as
-//! `{artId}.color`: the hue the picture has most of, the way the
-//! prototype's `scripts/colors.py` finds it. A page asks for it with the
-//! artist or the album it draws, before any cover of it may have been
+//! `{artId}.color`: the dominant hue of the picture. A page asks for it with
+//! the artist or the album it draws, before any cover of it may have been
 //! made, and then it is worked out there and kept the same way.
 
 use std::fmt;
@@ -302,14 +301,13 @@ fn micros(since: std::time::Instant) -> u64 {
 }
 
 /// The side of the square a picture is shrunk to before its colour is
-/// taken: the prototype's.
+/// sampled.
 const COLOR_SIDE: u32 = 24;
 
-/// The colour a picture is mostly made of, as the prototype's
-/// `scripts/colors.py` finds it: shrunk to 24 pixels square, each pixel
-/// counts by how coloured it is (grey, near black and near white count for
-/// nothing), and the hue is the middle of the twelfth of the colour wheel
-/// that has the most, with the colour's strength there. `None` for a
+/// The colour a picture is mostly made of: shrunk to 24 pixels square, each
+/// pixel counts by how coloured it is (grey, near black and near white count
+/// for nothing), and the hue is the middle of the twelfth of the colour
+/// wheel that has the most, with the colour's strength there. `None` for a
 /// picture that is close to grey all over.
 pub(crate) fn color_of(decoded: &image::DynamicImage) -> Option<ArtColor> {
     let small = decoded.thumbnail_exact(COLOR_SIDE, COLOR_SIDE).to_rgb8();

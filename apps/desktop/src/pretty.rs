@@ -28,9 +28,9 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 // THE POSSIBILITY OF SUCH DAMAGE.
 
-//! CSS's `text-wrap: pretty`, which the real page sets on its sentences,
-//! as WebKit does it (`InlineContentConstrainer::prettifyRange`): the
-//! breaks of a paragraph chosen together, Knuth and Plass's way, for the
+//! Balanced paragraph line breaking (`text-wrap: pretty`), ported from
+//! WebKit (`InlineContentConstrainer::prettifyRange`): the breaks of a
+//! paragraph chosen together, Knuth and Plass's way, for the
 //! least raggedness against an ideal line a little shorter than the room,
 //! rather than each line filled in turn. GPUI fills each line in turn, so
 //! the breaks are found here and set as new lines.
@@ -141,8 +141,8 @@ mod tests {
     #[test]
     fn breaks_the_caption_under_history_as_webkit_does() {
         // The words of History's caption at 18 points, as GPUI measures
-        // them. Across the 621 points WebKit gives it beside a scroll bar,
-        // the real page breaks after "the" and before "Point".
+        // them. Across 621 points beside a scroll bar, this breaks after
+        // "the" and before "Point".
         let widths = [
             39.39, 38.28, 12.91, 25.96, 49.69, 29.10, 31.09, 46.01, 13.99, 29.96, 38.25, 25.96,
             49.48, 15.50, 25.96, 62.82, 49.24, 29.96, 41.98, 43.84, 39.06, 29.10, 46.36, 35.97,

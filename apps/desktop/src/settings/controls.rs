@@ -1,11 +1,10 @@
-//! The Settings window's furniture (`settings/settings.css`): grouped rows
-//! in boxes, as a SwiftUI form has them, and the controls in them.
+//! The Settings window's furniture: grouped rows in boxes, as a SwiftUI form
+//! has them, and the controls in them.
 //!
-//! The real page lets WebKit draw its controls as AppKit does: a push
-//! button, a switch, a pop-up, a date field and a progress bar. GPUI has
-//! none of the system's, so they are drawn here to the measure of the real
-//! window's, read from pictures of it on macOS 26: their sizes, corners and
-//! colours, light and dark, with the window in front and behind.
+//! GPUI has no native OS controls (push buttons, switches, pop-ups, date
+//! fields, progress bars), so they are drawn here to match AppKit's metrics
+//! (sizes, corners, and colours, light and dark, with the window active and
+//! inactive).
 
 use std::time::Duration;
 
@@ -90,7 +89,7 @@ pub(crate) fn heading(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-/// Rows in a box, with a line between each two: `.box` and `.row + .row`.
+/// Rows in a box, with a hairline between each two.
 pub(crate) fn boxed(rows: Vec<Div>) -> Div {
     let rows = rows.into_iter().enumerate().map(|(at, row)| {
         if at == 0 {
@@ -110,7 +109,7 @@ pub(crate) fn boxed(rows: Vec<Div>) -> Div {
         .children(rows)
 }
 
-/// A row of a box: `.row`, at least 40 points tall.
+/// A row of a box, at least 40 points tall.
 pub(crate) fn row() -> Div {
     div()
         .flex()
@@ -121,12 +120,12 @@ pub(crate) fn row() -> Div {
         .py(px(7.))
 }
 
-/// What takes the row's room: `.grow`.
+/// What takes the row's remaining width.
 pub(crate) fn grow() -> Div {
     div().flex_1().min_w_0()
 }
 
-/// A second line, small and quiet, cut short with an ellipsis: `.sub`.
+/// A second line, small and quiet, cut short with an ellipsis.
 pub(crate) fn sub(text: impl Into<SharedString>) -> Div {
     div()
         .mt(px(1.))
@@ -147,7 +146,7 @@ pub(crate) fn sub_wraps(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-/// A label and its value at the right: `.label` and `.value`.
+/// A label and its value at the right.
 pub(crate) fn label_value(label: impl Into<SharedString>, value: impl Into<SharedString>) -> Div {
     row().child(div().flex_1().child(label.into())).child(
         div()
@@ -162,7 +161,7 @@ pub(crate) fn actions() -> Div {
     div().flex().flex_none().gap(px(8.))
 }
 
-/// A note under a box: `.note`.
+/// A note under a box.
 pub(crate) fn note(text: impl Into<SharedString>) -> Div {
     div()
         .mt(px(6.))
@@ -173,7 +172,7 @@ pub(crate) fn note(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
-/// What went wrong, under a box: `.problem`.
+/// What went wrong, under a box.
 pub(crate) fn problem(text: impl Into<SharedString>) -> Div {
     div()
         .mt(px(6.))
@@ -373,7 +372,7 @@ pub(crate) fn progress(id: impl Into<ElementId>, of: Option<(u64, u64)>) -> impl
         )
 }
 
-/// A small spinner, for a wait with no end to show (`.spin`): a ring of
+/// A small spinner, for a wait with no end to show: a ring of
 /// `--fill2` with a quarter of `--dim` going round, once in 0.9 seconds, or
 /// in three when motion is reduced.
 pub(crate) fn spinner(id: impl Into<SharedString>) -> impl IntoElement {
@@ -491,7 +490,7 @@ pub(crate) fn date_field(date: &str) -> impl IntoElement {
         .child(shown)
 }
 
-/// The list's own + and −, as a Mac list has them at its foot (`.edit`).
+/// The list's own + and −, as a Mac list has them at its foot.
 pub(crate) fn edit(
     id: impl Into<ElementId>,
     glyph: &'static str,

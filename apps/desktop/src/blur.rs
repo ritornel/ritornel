@@ -1,9 +1,8 @@
-//! A picture blurred out of all detail, as the real client's CSS blurs one
-//! (`filter: blur(σ) saturate(s)`): GPUI has no blur for an image, so it is
-//! made on the CPU from the picture at 128 pixels, and drawn stretched.
-//! Three box passes are close to a Gaussian; their radius is worked out from
-//! the CSS σ and how large the picture is drawn, so that the blur on screen
-//! is the real one's.
+//! A picture blurred out of all detail (`blur(σ) saturate(s)`): GPUI has no
+//! blur for an image, so it is made on the CPU from the picture at 128
+//! pixels, and drawn stretched.
+//! Three box passes approximate a Gaussian; their radius is scaled from σ
+//! and the drawn size so the on-screen blur matches the target radius.
 //!
 //! The banner's is `blur(44px) saturate(1.3)` over the banner's width and
 //! 120 points; the wash's `blur(64px) saturate(1.5)` over the window and 180,
@@ -31,9 +30,9 @@ pub(crate) fn replace(
 /// The side the picture is blurred at.
 pub(crate) const SIDE: u32 = 128;
 
-/// The banner's blur and saturation (`parts/Banner.svelte`).
+/// The banner's blur and saturation.
 pub(crate) const BANNER: (f32, f32) = (44., 1.3);
-/// The wash's (`frame/Wash.svelte`).
+/// The background wash's blur and saturation.
 pub(crate) const WASH: (f32, f32) = (64., 1.5);
 
 /// The box radius, in pixels of the picture at `SIDE`, whose three passes
@@ -47,8 +46,7 @@ pub(crate) fn radius(sigma: f32, drawn: f32) -> usize {
 }
 
 /// The wash's and Lean back's saturation and brightness in each palette:
-/// in the light one their filter is `blur(64px) saturate(1.25)
-/// brightness(1.18)` (`frame/Wash.svelte`, `frame/LeanBack.svelte`).
+/// in the light palette, saturation is 1.25 and brightness is 1.18.
 pub(crate) fn wash_tone(dark: bool) -> (f32, f32) {
     if dark { (WASH.1, 1.) } else { (1.25, 1.18) }
 }

@@ -6,7 +6,7 @@
 //! not, as History is the record of all of it. A play is its artist's as
 //! the library credits the song, or, unbound, as its source named them; an
 //! artist is known by their name whatever its case. A day of more than 300
-//! plays is a device catching up and is left out, as the prototype does.
+//! plays is treated as a device catching up and left out.
 //!
 //! It reads every counted play once, so it is the heaviest read of
 //! history: about a fifth of a second at 250,000 plays (`history_size.rs`).

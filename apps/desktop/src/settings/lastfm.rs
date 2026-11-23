@@ -1,7 +1,7 @@
-//! Last.fm (`settings/LastFm.svelte`): the account the server is signed in
-//! to, scrobbling, the import of the history, and where you listened,
-//! which dates what is imported. The server holds the key, the secret and
-//! the session: none of them is ever shown here.
+//! Last.fm: the account the server is signed in to, scrobbling, the import
+//! of the history, and where you listened, which dates what is imported. The
+//! server holds the key, the secret, and the session; none of them is ever
+//! shown here.
 
 use gpui::{
     Div, Entity, FocusHandle, FontWeight, InteractiveElement, IntoElement, ParentElement, Styled,
@@ -19,8 +19,7 @@ use crate::theme;
 use crate::words::thousands;
 
 /// Text that wraps at its spaces, with the words in `mono` set in the
-/// monospaced face at 11 points, as the real page sets `lastfm.env`
-/// inside a sentence.
+/// monospaced face at 11 points (such as `lastfm.env` inside a sentence).
 fn sentence(text: &str, mono: &str) -> Div {
     div()
         .flex()
@@ -85,8 +84,8 @@ pub(super) fn render(
                                 .bg(theme::fill())
                                 .font_family(MONO)
                                 .text_size(px(11.))
-                                // `.mono` sets `font`, which sets the
-                                // line back to the face's own height.
+                                // Use the monospaced face's own tighter line
+                                // height rather than the body's 1.4 ratio.
                                 .line_height(px(13.))
                                 .child("SCROBL_API_KEY=…")
                                 .child("SCROBL_API_SECRET=…"),

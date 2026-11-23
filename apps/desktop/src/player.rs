@@ -1,8 +1,6 @@
-//! The server's player as the window shows it, the real client's
-//! `lib/player.svelte.ts`, `lib/ratings.svelte.ts` and `lib/toast.svelte.ts`
-//! in one: what is playing and where, what is up next, the calls that
-//! change them, the stars set here, and the notice that says what went
-//! wrong.
+//! The server's player as the window shows it: what is playing and where,
+//! what is up next, the calls that change them, optimistic star ratings,
+//! and transient error notices.
 //!
 //! The state comes whole on the `playback` topic and the position on
 //! `progress`, carried on between ticks. Every command carries a key of its
@@ -33,7 +31,7 @@ use ritornel_contract::{
 use crate::link::{Link, LinkEvent};
 use crate::net::Net;
 
-/// How long a notice stays: the real toast's 2.6 seconds.
+/// How long a transient notice stays visible, in milliseconds.
 pub(crate) const TOAST_MS: u64 = 2600;
 
 /// How many entries of Up next the card shows.
