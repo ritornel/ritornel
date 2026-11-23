@@ -1,6 +1,6 @@
 # History
 
-Ritornel separates raw listening evidence from derived plays so play-counting rules, time-zone assignments, and identity fixes can always be recomputed without losing or mutating what happened. Pure derivation and play-rule logic live in `crates/ritornel-domain/src/history.rs`; SQLite ingest, derivation, queries, scrobble delivery, timekeeping, and export live in `crates/ritornel-engine/src/{history_store,history_pages,history_stream,history_facts,import_store,delivery_store,export,timekeeping}.rs`; server Last.fm workers and RPC handlers live in `apps/server/src/{lastfm,dispatch/history,dispatch/lastfm,dispatch/export}.rs`; CLI commands live in `apps/ritornelctl/src/{history,lastfm,export}.rs`.
+Ritornel separates raw listening evidence from derived plays so play-counting rules, time-zone assignments, and identity fixes can always be recomputed without losing or mutating what happened. Pure derivation and play-rule logic live in `crates/ritornel-domain/src/history.rs`; SQLite ingest, derivation, queries, scrobble delivery, timekeeping, and export live in `crates/ritornel-engine/src/{history_store,history_pages,history_stream,history_facts,import_store,delivery_store,export,timekeeping}.rs`; server Last.fm workers and RPC handlers live in `apps/server/src/{lastfm,dispatch/history,dispatch/lastfm,dispatch/export}.rs`; CLI commands live in `apps/ritornelctl/src/{history,lastfm,export}.rs` and `apps/ritornelctl/src/spotify/`.
 
 See [`docs/internals/schema.md`](schema.md) for the immutable history tables, [`docs/internals/playback.md`](playback.md) for listen staging and outbox delivery, [`docs/internals/identity.md`](identity.md) for scrobble matching, and [`docs/internals/plugins.md`](plugins.md) for the `ritornel-lastfm` plugin boundary.
 
@@ -69,6 +69,17 @@ Last.fm integration is compiled behind the server's default-on `lastfm` feature 
 - **Batching and backoff:** Sent in batches up to `MAX_BATCH` (50). On Last.fm's daily limit (`DAILY_LIMIT`), affected deliveries defer by 1 hour (`DAILY_LIMIT_RETRY_MS`) and the account pauses for 1 hour (`DAILY_LIMIT_WAIT`). Refused or unanswered batches pause the account for 5 minutes (`REFUSED_WAIT`, `UNANSWERED_WAIT`) so held-back plays retry in order once the pause lifts. A rejected session key sets `service_session.sign_in_again = 1` and halts scrobbling until re-authenticated.
 - **Record health:** Unanswered (`unknown`), `withdrawn`, and `refused` deliveries, `sign_in_again`, and failed imports surface in `server.status` (`docs/internals/server.md`, "Record health").
 
+## Spotify streams
+
+Spotify's extended streaming history is a second source of import records beside Last.fm. `ritornelctl spotify read <archive>` (`apps/ritornelctl/src/spotify/`) reads it on the machine it sits on, from the zip file Spotify sent or the folder it was unpacked to, without unpacking or copying it, and stores and sends nothing.
+
+- **Files:** `archive.rs` reads files named `Streaming_History_Audio_*.json` (or `endsong_*.json` in older archives), in name order. `Streaming_History_Video_*.json` holds music videos and video shows and is counted but not read. An archive with only `StreamingHistory*.json` is the account data's history, a year at minute precision with no track IDs, and is refused with the name of the export to ask for.
+- **Kept fields:** `rows.rs` builds each row into a `SpotifyStream` (`ritornel-contract`): `ts` as `endedAt`, `ms_played`, the track URI, title, artist and album, `reason_start`, `reason_end`, `shuffle`, `skipped`, `offline`, `offline_timestamp` (kept as given, since its unit is undocumented), `incognito_mode`, and the platform reduced to one `SpotifyPlatform` word (`mac`, `windows`, `linux`, `android`, `ios`, `web`, `cast` for Google Cast, Spotify Connect speakers and televisions, or `other`). `SpotifyStream` refuses any field it does not name.
+- **Dropped fields:** `ip_addr`, `ip_addr_decrypted`, `user_agent_decrypted`, `username`, `conn_country` and the platform's text are skipped as each row is parsed, so their values are never held. Any field the reader does not know is skipped the same way and remembered by name only.
+- **Rows that are not music:** a row with an episode or audiobook, a URI that is not `spotify:track:`, or no artist or title is counted by kind (`NotMusic`) and not kept.
+- **Repeats:** rows with the same end time, time played and track URI are one stream reported more than once. The reader keeps every row and counts the repeats, and those that differ from the first in another kept field.
+- **Errors:** a row with a kept field of the wrong type is counted and named by file, row number and field name. A file that is not a JSON list of rows fails the read with its name and the row it broke at. Neither passes on the parser's message, which can quote the input.
+
 ## Export
 
 `history.export` (`crates/ritornel-engine/src/export.rs`, `apps/server/src/dispatch/export.rs`, `ritornelctl export`) writes a portable, self-contained directory (`ritornel-record-<timestamp>`, staged under a dotted name and atomically renamed, with owner-only file permissions) from a single read-only SQLite transaction (`EXPORT_FORMAT = "ritornel-record"`, `EXPORT_VERSION = 2`):
@@ -88,6 +99,7 @@ Last.fm integration is compiled behind the server's default-on `lastfm` feature 
 - **No rollup tables.** Indexed scans over `play_event` are fast enough for large histories and eliminate cache-invalidation drift between raw plays and displayed counts.
 - **Commit `sending` before HTTP scrobble send.** Persisting `history_delivery` before calling Last.fm guarantees exact echo matching on subsequent imports and prevents duplicate resends after network timeouts.
 - **Self-contained plain-text export.** Exporting observations, ratings, deliveries, and derived plays as JSON Lines, JSON, and CSV ensures the entire listening record remains readable and re-derivable without Ritornel.
+- **Spotify's fields are taken by name.** The reader names the fields it keeps, not the ones it drops, so a field Spotify adds later is dropped without a decision. Values of dropped fields never leave the parser, and the reader prints counts and field names, never a value.
 
 ## Later
 

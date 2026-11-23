@@ -33,9 +33,11 @@
 //! ritornelctl link status
 //! ritornelctl settings
 //! ritornelctl settings awake <while-active [<minutes>] | always | never>
+//! ritornelctl spotify read <archive>
 //! ```
 //!
-//! Every command takes `--data-dir <dir>` and `--json`.
+//! Every command takes `--json`, and every command that talks to a server
+//! `--data-dir <dir>`.
 //!
 //! clap parses it. The help is [`USAGE`] and the messages are the fixed
 //! ones in [`usage`], so nothing a person typed is ever printed back.
@@ -52,7 +54,7 @@ use ritornel_client::contract::local::Env;
 
 use crate::{
     artists, backup, export, history, identity, jobs, lastfm, library, link, playback, scan,
-    settings, status,
+    settings, spotify, status,
 };
 
 const USAGE: &str = "\
@@ -97,6 +99,7 @@ Usage:
   ritornelctl settings [--data-dir <dir>] [--json]
   ritornelctl settings awake <while-active [<minutes>] | always | never>
                              [--data-dir <dir>] [--json]
+  ritornelctl spotify read <archive> [--json]
 
 Commands:
   status           Show the running server's ID, name and role, the versions
@@ -226,6 +229,17 @@ Commands:
                    within the minutes given, 30 unless said, which is the
                    default; always; or never. The display may sleep. The
                    server keeps it
+  spotify read <archive>
+                   Read Spotify's extended streaming history, the zip file
+                   Spotify sent or the folder it was unpacked to, where it
+                   is, and say what it holds: its streams of music, the
+                   rows that are not music, repeats and platforms. It keeps
+                   when each stream ended, how long it played, the track
+                   and its names, why it began and ended, shuffle, skips,
+                   offline and private sessions, and the kind of device as
+                   one word. It never keeps the IP address, user agent,
+                   account name, country or the device. It needs no server,
+                   and stores and sends nothing
 
 Options:
   --name <name>         scan, artists pictures: the name the folder is
@@ -329,6 +343,8 @@ pub(crate) enum Error {
     Output(std::io::Error),
     /// The folder to scan could not be found.
     Folder(std::io::Error),
+    /// Spotify's history could not be read.
+    Archive(spotify::ArchiveError),
     /// What `play` was given is no folder there is.
     PlayFolder(std::io::Error),
     /// The job that was waited for did not succeed. The text is its state.
@@ -359,6 +375,7 @@ impl fmt::Display for Error {
             Self::Runtime(error) => write!(f, "cannot start: {error}"),
             Self::Output(error) => write!(f, "cannot write to standard output: {error}"),
             Self::Folder(error) => write!(f, "cannot scan that folder: {error}"),
+            Self::Archive(error) => write!(f, "{error}"),
             Self::PlayFolder(error) => write!(f, "cannot play that folder: {error}"),
             Self::Job(state) => write!(f, "the job {state}"),
             Self::Nothing(what) => f.write_str(what),
@@ -414,6 +431,22 @@ enum Command {
     #[command(subcommand)]
     Server(ServerCommand),
     Settings(SettingsArgs),
+    #[command(subcommand)]
+    Spotify(SpotifyCommand),
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum SpotifyCommand {
+    Read(SpotifyReadArgs),
+}
+
+/// What `spotify read` takes. It talks to no server.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct SpotifyReadArgs {
+    /// The zip file Spotify sent, or the folder it was unpacked to.
+    pub(crate) archive: PathBuf,
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
@@ -868,6 +901,7 @@ fn try_run(
         Command::Lastfm(command) => lastfm::lastfm(&command, env, out, err),
         Command::Link(command) => link::link(&command, env, out),
         Command::Settings(args) => settings::settings(&args, env, out),
+        Command::Spotify(SpotifyCommand::Read(args)) => spotify::read_command(&args, out),
     }
 }
 
