@@ -144,6 +144,27 @@ impl ServerStore {
     }
 
     /// The link sessions that have not been revoked, oldest first.
+    /// Names the link session of the satellite `peer` `label`, and says
+    /// whether that was a new name. The same name again is only read.
+    pub fn relabel_link_session(&self, peer: Id, label: &str) -> Result<bool, Error> {
+        let label = label.to_owned();
+        let named = self
+            .link_sessions()?
+            .into_iter()
+            .any(|session| session.peer == peer && session.label == label);
+        if named {
+            return Ok(false);
+        }
+        self.transact(move |transaction, _, _| {
+            let changed = transaction.execute(
+                "UPDATE session SET label = ?1
+                 WHERE peer_server_pid = ?2 AND revoked_at_ms IS NULL AND label != ?1",
+                (&label, peer.as_bytes()),
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     pub fn link_sessions(&self) -> Result<Vec<LinkSession>, Error> {
         self.read(|connection| {
             let mut statement = connection.prepare(

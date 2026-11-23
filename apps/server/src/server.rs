@@ -24,6 +24,15 @@ use crate::{Bounds, Error, Listen, Run, library, memory};
 /// do that with.
 pub(crate) const DEFAULT_NAME: &str = "Ritornel server";
 
+/// Whether a server called `current` takes its computer's name, `computer`:
+/// when it still has the first-start name, or when it has the computer's
+/// name in another case, as a server on Windows took it from
+/// `COMPUTERNAME`, which Windows upper-cases (`STUDIO-PC` for `Studio-PC`).
+/// Any other name was chosen, and is kept.
+fn takes_computer_name(current: &str, computer: &str) -> bool {
+    current == DEFAULT_NAME || (current != computer && current.eq_ignore_ascii_case(computer))
+}
+
 /// Ends a server's transports when it is dropped. After a stop there are
 /// none, and this does nothing.
 #[derive(Debug)]
@@ -140,9 +149,10 @@ impl Server {
         }
         // A name given in the settings wins over the stored one at every
         // start, so a machine nobody sits at is called what its settings
-        // say. Without one, a server still called by the default name is
-        // named after its computer, so that a hub's satellites and a
-        // satellite's hub say which machine each is, and a name someone
+        // say. Without one, a server is named after its computer while it
+        // still has the default name or the name an older build took from
+        // the computer (`takes_computer_name`), so that a hub's satellites
+        // and a satellite's hub say which machine each is; a name someone
         // chose is kept.
         if let Some(name) = run.name.as_deref() {
             if name != identity.name
@@ -151,9 +161,9 @@ impl Server {
                 info!(name, "renamed by the name setting");
                 identity = renamed;
             }
-        } else if identity.name == DEFAULT_NAME
-            && let Some(name) = run.computer_name.as_deref()
+        } else if let Some(name) = run.computer_name.as_deref()
             && name != identity.name
+            && takes_computer_name(&identity.name, name)
             && let Some(renamed) = store.rename(name)?
         {
             info!(name = %renamed.name, "this server is named after its computer");
@@ -540,6 +550,16 @@ mod tests {
             "contractVersion": ritornel_contract::CONTRACT_VERSION,
         });
         request(id, "server.hello", &params)
+    }
+
+    #[test]
+    fn a_server_takes_its_computers_name_over_the_default_or_a_wrongly_cased_copy() {
+        assert!(takes_computer_name(DEFAULT_NAME, "Studio-PC"));
+        // Taken before from COMPUTERNAME, which Windows upper-cases.
+        assert!(takes_computer_name("STUDIO-PC", "Studio-PC"));
+        assert!(!takes_computer_name("Studio-PC", "Studio-PC"));
+        // A name someone chose is kept.
+        assert!(!takes_computer_name("Living room", "Studio-PC"));
     }
 
     #[test]

@@ -1145,6 +1145,14 @@ async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_st
             })
             .await
             .unwrap();
+        // A satellite that says hello under a new name, as one renamed
+        // after its computer does, is listed by it.
+        let status = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(status.satellites[0].name, "desk");
+
         // Whether the hub is kept awake is the system's to grant, so only
         // the answer is looked for here; the rule has tests of its own.
         linked

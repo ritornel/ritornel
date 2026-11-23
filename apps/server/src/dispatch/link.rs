@@ -164,6 +164,32 @@ fn untrusted_name(name: &str) -> String {
 }
 
 impl Core {
+    /// A satellite said hello as `name`. If it has been renamed since it
+    /// joined, as a server named after its computer may be, the hub's
+    /// records of it take the new name: its link session, which the hub
+    /// lists, and the library's registry of servers.
+    pub(super) fn satellite_named(&self, stores: &Stores, peer: Id, name: &str) {
+        let name = untrusted_name(name);
+        match stores.server.relabel_link_session(peer, &name) {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                warn!(%error, satellite = %peer, "a satellite's new name could not be kept");
+                return;
+            }
+        }
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(library) = library.as_ref()
+            && let Err(error) = library.register_server(peer, &name)
+        {
+            warn!(%error, satellite = %peer, "a satellite's new name could not be kept in the library");
+        }
+        info!(satellite = %peer, %name, "a satellite has a new name");
+    }
+
     /// `link.invite`: a one-time link for a satellite to join with.
     pub(super) fn link_invite(
         &self,

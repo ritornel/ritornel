@@ -796,7 +796,9 @@ impl Core {
             }
         }
         match row.name {
-            ServerHello::NAME => run::<ServerHello>(params, |hello| self.hello(session, &hello)),
+            ServerHello::NAME => {
+                run::<ServerHello>(params, |hello| self.hello(stores, session, &hello))
+            }
             ServerStatus::NAME => run::<ServerStatus>(params, |_| self.status(stores)),
             ServersList::NAME => run::<ServersList>(params, |_| {
                 Ok(ritornel_contract::ServersList {
@@ -1011,7 +1013,12 @@ impl Core {
         }
     }
 
-    fn hello(&self, session: &Session, hello: &HelloParams) -> Result<Descriptor, RpcError> {
+    fn hello(
+        &self,
+        stores: &Stores,
+        session: &Session,
+        hello: &HelloParams,
+    ) -> Result<Descriptor, RpcError> {
         if hello.contract_version != CONTRACT_VERSION {
             return Err(RpcError::new(
                 ErrorCode::Unsupported,
@@ -1029,6 +1036,11 @@ impl Core {
             }
         }
         session.greet();
+        if let Some(peer) = session.peer()
+            && hello.kind == ritornel_contract::ClientKind::Server
+        {
+            self.satellite_named(stores, peer, &hello.name);
+        }
         info!(
             session = session.id(),
             client = %hello.name,

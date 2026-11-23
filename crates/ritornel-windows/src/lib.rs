@@ -13,6 +13,7 @@
 //! - `file`: which file a path is (its volume and file index), the path a
 //!   handle really has, and the room left on a disk.
 //! - `clock`: milliseconds since the machine started, through sleep.
+//! - `name`: the machine's host name, in the case it was set.
 //! - `window`: a hidden window, for a process that has none: it hears a
 //!   polite stop (`taskkill /PID`) and the end of the session, and is what
 //!   the system's media controls are tied to.
@@ -32,6 +33,7 @@
 pub mod clock;
 pub mod file;
 pub mod lock;
+pub mod name;
 pub mod private;
 pub mod window;
 
