@@ -19,10 +19,10 @@ audio-output = ["ritornel-engine/audio-output"]
 # CI builds it both ways. See docs/internals/plugins.md.
 lastfm = ["dep:ritornel-lastfm", "dep:ritornel-source"]
 # The system's media session: Now Playing and the media keys on macOS,
-# with `main` blocking in the platform run loop, and MPRIS on the session
-# bus on Linux. The hub is built without it. See "OS integration" in
+# with `main` blocking in the platform run loop, MPRIS on the session bus
+# on Linux, and the system's media transport controls on Windows. The hub is built without it. See "OS integration" in
 # docs/internals/playback.md.
-media-session = ["dep:souvlaki", "dep:objc2-core-foundation", "dep:zbus"]
+media-session = ["dep:souvlaki", "dep:objc2-core-foundation", "dep:zbus", "ritornel-windows/media"]
 
 [dependencies]
 # A satellite talks to its hub as any client does: the descriptor, the

@@ -2119,6 +2119,7 @@ version = "0.1.0"
 name = "ritornel-windows"
 version = "0.1.0"
 dependencies = [
+ "windows",
  "windows-sys 0.61.2",
 ]
 

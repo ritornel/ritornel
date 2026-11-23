@@ -10,7 +10,7 @@
 //!   which is all macOS needs to deliver the keys (`platform::wait`).
 //! - Linux: MPRIS on the session bus, served from the server's own async
 //!   runtime. A server with no session bus has none, quietly.
-//! - Windows: none yet. The system's media transport controls are to be
+//! - Windows: the system's media transport controls (`ritornel-windows`),
 //!   tied to the hidden window `serve` opens there.
 
 use std::path::Path;
@@ -40,7 +40,7 @@ pub(crate) enum Key {
     NextFrom(Id),
     Previous,
     /// To this position, in milliseconds, in whichever entry the player is
-    /// on. Only macOS's seeks name no entry.
+    /// on. MPRIS's seeks name the entry; macOS's and Windows' do not.
     Seek(u64),
     /// To this position, in milliseconds, in this entry only: nothing if
     /// the player has moved on from it. Only MPRIS names the entry.
@@ -178,15 +178,16 @@ fn show(
         *shown = showing;
         let cover = now
             .and_then(|now| now.track.as_ref())
-            .and_then(|track| core.upgrade()?.now_playing_cover(track.appearance))
-            .map(|path| file_url(&path));
+            .and_then(|track| core.upgrade()?.now_playing_cover(track.appearance));
         controls.set_track(state, cover.as_deref());
     }
     controls.set_state(state);
 }
 
 /// A file URL for a path, escaped: the data directory has a space in it.
-fn file_url(path: &Path) -> String {
+/// Now Playing and MPRIS take a cover by its URL.
+#[allow(dead_code, reason = "Windows' controls take a cover by its path")]
+pub(crate) fn file_url(path: &Path) -> String {
     let mut url = "file://".to_owned();
     for byte in path.to_string_lossy().bytes() {
         if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {

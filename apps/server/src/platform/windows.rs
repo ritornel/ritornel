@@ -1,8 +1,9 @@
 //! Windows: files closed to others by an access list that names the user
 //! alone, a lock on one byte past the end of `server.lock`, in place of
-//! signals, the console's events and a hidden window, and a background
-//! service that is a task at sign-in (`windows_service.rs`). No media
-//! session yet. What the standard library cannot ask is in
+//! signals, the console's events and a hidden window, to which the system's
+//! media transport controls are tied (`windows_media.rs`), and a background
+//! service that is a task at sign-in (`windows_service.rs`). What the
+//! standard library cannot ask is in
 //! `ritornel-windows`.
 
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -17,12 +18,21 @@ use crate::Error;
 use crate::error::io_error;
 use crate::serve::Stop;
 
-#[cfg(feature = "media-session")]
-pub(crate) use super::fallback::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
 pub(crate) use super::fallback::{stay_awake, wait};
+#[cfg(feature = "media-session")]
+pub(crate) use super::windows_media::Controls as MediaControls;
 pub(crate) use super::windows_service::{
     install_service, run_service, service_status, uninstall_service,
 };
+
+/// The media controls are tied to the hidden window, and Windows delivers
+/// their buttons on a thread of its own: they need neither the main thread
+/// nor the runtime. They are let go as the server stops, while the window
+/// is still open.
+#[cfg(feature = "media-session")]
+pub(crate) const HAS_MEDIA_SESSION: bool = true;
+#[cfg(feature = "media-session")]
+pub(crate) const STOP_MEDIA_SESSION_WITH_SERVER: bool = true;
 
 /// The host name Windows answers to by multicast DNS, which it does for its
 /// own name since Windows 10.
@@ -148,11 +158,27 @@ pub(crate) fn lock_shareable(file: &File) -> std::io::Result<bool> {
 }
 
 /// What watches for a stop: the hidden window, which the run keeps until
-/// it has stopped, and then tells so ([`Window::stopped`]), as a session
-/// that is ending waits for that before it ends the process.
-///
-/// [`Window::stopped`]: ritornel_windows::window::Window::stopped
-pub(crate) type Signals = ritornel_windows::window::Window;
+/// it has stopped, and then tells so ([`Signals::stopped`]), as a session
+/// that is ending waits for that before it ends the process. The media
+/// controls are tied to it while it is open.
+#[derive(Debug)]
+pub(crate) struct Signals(ritornel_windows::window::Window);
+
+impl Signals {
+    /// Says that the server has stopped, so that a session that is ending
+    /// may end the process.
+    pub(crate) fn stopped(&self) {
+        self.0.stopped();
+    }
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        // Nothing more is tied to the window, which closes after this.
+        #[cfg(feature = "media-session")]
+        super::windows_media::tie_to(0);
+    }
+}
 
 /// Sends a stop on what Windows has in place of signals: Ctrl+C, Ctrl+Break
 /// and the console closing, when the server runs in one, and for a server
@@ -183,12 +209,15 @@ pub(crate) fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::
     on!(ctrl_logoff(), "session ending");
     on!(ctrl_shutdown(), "session ending");
     let stop = stop.clone();
-    Window::open("Ritornel server", move |why| {
+    let window = Window::open("Ritornel server", move |why| {
         let _ = stop.send(Stop::Signal(match why {
             Closing::Asked => "asked to close",
             Closing::SessionEnding => "session ending",
         }));
-    })
+    })?;
+    #[cfg(feature = "media-session")]
+    super::windows_media::tie_to(window.handle());
+    Ok(Signals(window))
 }
 
 /// Whether only the owner can open a file or directory: an access list that

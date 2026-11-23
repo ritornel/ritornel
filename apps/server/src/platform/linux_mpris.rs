@@ -113,8 +113,8 @@ impl Controls {
 
     /// Takes the cover of the track the player is now on. The state that
     /// comes with it shows the track.
-    pub(crate) fn set_track(&mut self, _: &PlayerState, cover: Option<&str>) {
-        self.art_url = cover.map(str::to_owned);
+    pub(crate) fn set_track(&mut self, _: &PlayerState, cover: Option<&std::path::Path>) {
+        self.art_url = cover.map(crate::media_session::file_url);
     }
 
     /// Shows the track, the status, the position and the volume.

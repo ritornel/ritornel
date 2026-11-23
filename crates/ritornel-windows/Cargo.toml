@@ -1,6 +1,6 @@
 [package]
 name = "ritornel-windows"
-description = "What Ritornel asks of Windows that the standard library cannot: a lock on one byte, owner-only access, a file's identity, a rename written through to the disk, a clock that counts through sleep, the machine's name as it was set, and a hidden window."
+description = "What Ritornel asks of Windows that the standard library cannot: a lock on one byte, owner-only access, a file's identity, a rename written through to the disk, a clock that counts through sleep, the machine's name as it was set, a hidden window, and the system's media transport controls."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -24,6 +24,18 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_WindowsProgramming",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# The system's media transport controls, which are WinRT: only the server
+# with a media session asks for them.
+windows = { version = "0.62.2", optional = true, features = [
+    "Foundation",
+    "Media",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+] }
+
+[features]
+media = ["dep:windows"]
 
 # The workspace's lints, but for unsafe code, which is allowed here and held
 # to a written reason for each block.
