@@ -370,6 +370,8 @@ fn a_play_dated_after_now_is_counted_and_never_said_as_past() {
     play(&mut ahead, -300, 20270911);
     assert_eq!(ahead.plays, 3);
     assert_eq!(ahead.last, Some((NOW - 500 * DAY, Some(20250703))));
+    // Nor is it in a year.
+    assert_eq!(ahead.years, [(2024, 1), (2025, 1)].into());
     assert_eq!(
         said(&sentence(&ahead, since, TODAY)),
         "With you since *February 2024*. Last played in *July 2025*."
@@ -437,8 +439,12 @@ fn a_records_plays_count_its_undated_ones_and_only_dated_ones_have_a_year() {
     }
     facts.add(Some(NOW - 900 * DAY), Some(20240530), Some(7), TODAY);
     facts.add(None, None, Some(8), TODAY);
+    // Dated after now: counted, and in no year, so never its peak.
+    for _ in 0..2 {
+        facts.add(Some(NOW + 300 * DAY), Some(20270911), Some(7), TODAY);
+    }
     let seven = &facts.records[&7];
-    assert_eq!(seven.plays, 4);
+    assert_eq!(seven.plays, 6);
     assert_eq!(seven.years, [(2024, 1)].into());
     let eight = &facts.records[&8];
     assert_eq!((eight.plays, eight.years.len()), (1, 0));
@@ -494,7 +500,8 @@ fn the_span_holds_every_local_year_played_across_the_date_line() {
     // 2020, and the next, by local date, in 2019. And 00:30 on New Year's
     // Day 2027 in Kiritimati is still 2026 where the server is, and comes
     // before 01:00 on New Year's Eve in Honolulu. A play stamped a year
-    // ahead, by a clock that was wrong, is not heard yet.
+    // ahead, by a clock that was wrong, is not heard yet: it is in no year
+    // and does not stretch the span.
     tamper(
         store,
         &format!(
@@ -522,7 +529,7 @@ fn the_span_holds_every_local_year_played_across_the_date_line() {
         .unwrap()
         .unwrap();
     let years: Vec<i32> = history.years.iter().map(|year| year.year).collect();
-    assert_eq!((years.first(), years.last()), (Some(&2019), Some(&2028)));
+    assert_eq!((years.first(), years.last()), (Some(&2019), Some(&2027)));
     let span = history.span.unwrap();
     assert_eq!((span.from, span.to), (2019, 2027));
 }

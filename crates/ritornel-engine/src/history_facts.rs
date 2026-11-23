@@ -206,22 +206,22 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
         return out;
     };
     let plays = u64::try_from(record.plays.len()).unwrap_or(u64::MAX);
+    // A play's instant, unless it is after now, by a clock that was wrong:
+    // such a play is taken as one with no instant, so it is never said as
+    // past.
+    let instant = |heard: &Heard| heard.at_ms.filter(|&at| at <= today.now_ms);
     // The plays with a day, each with its instant and its date.
     let dated: Vec<(i64, i64, &Heard)> = record
         .plays
         .iter()
-        .filter_map(|heard| Some((heard.at_ms?, heard.date?, heard)))
+        .filter_map(|heard| Some((instant(heard)?, heard.date?, heard)))
         .collect();
 
     // A play with no local date before it may be from a day earlier still,
-    // so nothing is said. A play dated after now is not when it was first
-    // heard.
-    if let Some(&(first_at, first, _)) = dated
-        .iter()
-        .filter(|(at, ..)| *at <= today.now_ms)
-        .min_by_key(|(at, ..)| *at)
+    // so nothing is said.
+    if let Some(&(first_at, first, _)) = dated.iter().min_by_key(|(at, ..)| *at)
         && !record.plays.iter().any(|heard| {
-            heard.date.is_none() && heard.at_ms.is_some_and(|earlier| earlier < first_at)
+            heard.date.is_none() && instant(heard).is_some_and(|earlier| earlier < first_at)
         })
         && let Some(ago) = ago(first, today.date)
     {
@@ -368,7 +368,7 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
         .plays
         .iter()
         .filter(|heard| heard.date.is_none_or(|date| date < today.date))
-        .filter_map(|heard| Some((heard.at_ms?, heard.date)))
+        .filter_map(|heard| Some((instant(heard)?, heard.date)))
         .max()
         && last.0 < today.now_ms - YEAR_MS
     {

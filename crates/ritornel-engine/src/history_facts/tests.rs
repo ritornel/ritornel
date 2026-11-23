@@ -374,6 +374,13 @@ fn a_record_unplayed_for_a_year_before_today_says_since_when() {
         ..Gathered::default()
     };
     assert_eq!(of(&facts(&undated(30), TODAY), FactKind::NotSince), None);
+    // Dated next month by a clock that was wrong: not played since.
+    assert_eq!(
+        of(&facts(&undated(-30), TODAY), FactKind::NotSince)
+            .unwrap()
+            .0,
+        "Before today, you had not played it *since May 2024*."
+    );
     // At the same instant as one with a local date, that one is taken.
     let at = |date| Heard {
         // 23:30 UTC on 31 January 2024.
