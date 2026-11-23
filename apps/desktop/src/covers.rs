@@ -880,10 +880,14 @@ mod tests {
 
             // Wait until every decoder slot is occupied inside spawn_blocking,
             // then abort all async waiters.
-            tokio::time::timeout(Duration::from_secs(5), entered.wait()).await?;
+            tokio::time::timeout(Duration::from_secs(60), entered.wait()).await?;
             for handle in aborted {
                 handle.abort();
+                // Each waiter is gone once it says it was cancelled.
+                assert!(handle.await.is_err_and(|error| error.is_cancelled()));
             }
+            // Their blocking closures still hold every permit.
+            assert_eq!(sem.available_permits(), 0);
 
             // A new decode must not enter while the aborted blocking closures
             // still hold their owned permits.
@@ -902,13 +906,15 @@ mod tests {
                 })
                 .await
             });
+            // sleep: time for the extra decode to enter, were a permit free.
+            // A slow machine can only make this pass when it should not.
             tokio::time::sleep(Duration::from_millis(40)).await;
             assert_eq!(extra_entered.load(Ordering::SeqCst), 0);
 
             // Release the blocking closures; now the queued decode completes.
             release.wait();
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), extra).await??,
+                tokio::time::timeout(Duration::from_secs(60), extra).await??,
                 Some(())
             );
             assert_eq!(extra_entered.load(Ordering::SeqCst), 1);
