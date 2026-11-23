@@ -134,6 +134,9 @@ pub(crate) struct Core {
     runtime: Option<tokio::runtime::Handle>,
     /// On a satellite, its link to its hub.
     uplink: RwLock<Option<Arc<crate::uplink::Uplink>>>,
+    /// Once the server is stopping: when every wait on its hub ends, on
+    /// the link it has and on one a join still under way makes.
+    hub_stop_by: std::sync::OnceLock<tokio::time::Instant>,
     /// On a hub, its linked servers' activity, and what keeps the machine
     /// from sleeping while one is active.
     awake: Mutex<crate::awake::KeptAwake>,
@@ -285,6 +288,7 @@ impl Core {
             private_port: std::sync::OnceLock::new(),
             runtime,
             uplink: RwLock::new(uplink),
+            hub_stop_by: std::sync::OnceLock::new(),
             awake: Mutex::default(),
             naming: Mutex::default(),
             clock,
@@ -364,6 +368,18 @@ impl Core {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The server is stopping: every wait on its hub ends within `within`
+    /// from now, on the link it has and on one a join still under way
+    /// makes ([`Uplink::stop_by`](crate::uplink::Uplink::stop_by)).
+    pub(crate) fn stop_hub_within(&self, within: std::time::Duration) {
+        let by = *self
+            .hub_stop_by
+            .get_or_init(|| tokio::time::Instant::now() + within);
+        if let Some(uplink) = self.uplink() {
+            uplink.stop_by(by);
+        }
     }
 
     /// The open session `session` is, shared: what a forwarded call hands

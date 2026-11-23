@@ -102,6 +102,7 @@ pub fn deliver_listens(
         stamps,
         after_ingest,
         MAX_BACKOFF_MS,
+        &|| false,
     )
 }
 
@@ -111,6 +112,11 @@ pub type Ingest<'a> = &'a dyn Fn(&ListenRecord, SendStamps) -> Result<Ingested, 
 /// Delivers listens as [`deliver_listens`] does, to whatever `ingest`
 /// sends them to, waiting at most `max_backoff_ms` before a failed one is
 /// tried again.
+///
+/// `stop` is asked before each listen is sent, and after one fails. Once
+/// it says to stop, the pass ends there: the listens it has not sent, and
+/// one whose sending the stop cut short, are left as they were, staged and
+/// due, for the next run, and no next pass is asked for in this one.
 pub fn deliver_listens_to(
     server: &ServerStore,
     ingest: Ingest<'_>,
@@ -118,6 +124,7 @@ pub fn deliver_listens_to(
     stamps: &dyn Fn() -> SendStamps,
     after_ingest: &dyn Fn() -> Result<(), Error>,
     max_backoff_ms: i64,
+    stop: &dyn Fn() -> bool,
 ) -> Result<Delivered, Error> {
     let now = clock.now_ms();
     let (due, mut next_due_ms) = server.due_deliveries(now, PER_PASS)?;
@@ -128,6 +135,10 @@ pub fn deliver_listens_to(
     }
     let mut done = Delivered::default();
     for delivery in due {
+        if stop() {
+            next_due_ms = None;
+            break;
+        }
         let sent = server
             .staged_listen(delivery.listen_id)?
             .ok_or(Error::Corrupt(
@@ -149,6 +160,12 @@ pub fn deliver_listens_to(
                     done.duplicates += 1;
                 }
                 done.delivered.push(delivery.listen_id);
+            }
+            // Cut short by the stop, it may have reached the hub or not:
+            // the next run sends it again, and the hub takes it once.
+            Err(_) if stop() => {
+                next_due_ms = None;
+                break;
             }
             Err(error) => {
                 let wait = (1000_i64 << delivery.attempts.clamp(0, 20)).min(max_backoff_ms);

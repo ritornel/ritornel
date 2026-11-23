@@ -1553,3 +1553,149 @@ async fn a_satellites_clients_hear_when_the_hub_goes_and_comes_back() {
     })
     .await;
 }
+
+/// A relay between a satellite and its hub that can hold back what the
+/// hub sends while it still passes on what the satellite sends, as a hub
+/// does that has stopped answering without closing its connections.
+struct Relay {
+    address: std::net::SocketAddr,
+    holding: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Relay {
+    async fn to(hub: std::net::SocketAddr) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let holding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = Arc::clone(&holding);
+        tokio::spawn(async move {
+            while let Ok((satellite, _)) = listener.accept().await {
+                let Ok(hub) = tokio::net::TcpStream::connect(hub).await else {
+                    continue;
+                };
+                let (mut from_satellite, mut to_satellite) = satellite.into_split();
+                let (mut from_hub, mut to_hub) = hub.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut from_satellite, &mut to_hub).await;
+                });
+                let held = Arc::clone(&held);
+                tokio::spawn(async move {
+                    let mut chunk = vec![0; 16 * 1024];
+                    while let Ok(read @ 1..) = from_hub.read(&mut chunk).await {
+                        while held.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        if to_satellite.write_all(&chunk[..read]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self { address, holding }
+    }
+
+    fn hold(&self, holding: bool) {
+        self.holding.store(holding, Ordering::SeqCst);
+    }
+}
+
+/// A satellite whose hub stops answering stops within the time its stop
+/// gives the hub, however long a call would wait, and the listens whose
+/// answers it never had are each taken once, from the next run.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_stops_in_time_while_its_hub_does_not_answer_and_its_listens_arrive_once() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let hub = start(&scratch, "hub").await;
+        let mut hub_client = client(&scratch, "hub", &hub).await;
+        hub_client.create_library(key()).await.unwrap();
+        scan(&scratch, &mut hub_client).await;
+        let relay = Relay::to(hub.endpoint()).await;
+        let grace = Duration::from_secs(1);
+        // In real time: a track lasts half a second.
+        let desk = Server::start_run(
+            HeldDir::take(scratch.data_dir("desk")).unwrap(),
+            Listen::on_port(0),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+            Bounds {
+                stop_grace: grace,
+                ..Bounds::default()
+            },
+            Run {
+                playback: PlaybackRun {
+                    output: Some(Output::Null { speed: 1 }),
+                    ..PlaybackRun::default()
+                },
+                ..Run::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut desk_client = client(&scratch, "desk", &desk).await;
+        let link = hub_client
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![relay.address.to_string()],
+            })
+            .await
+            .unwrap()
+            .link;
+        join(&desk_client, &link).await.unwrap();
+        let ids = song_ids(&desk_client.list_open(&songs()).await.unwrap().rows);
+
+        // The hub stops answering while the first of two plays of a song
+        // goes on. The second is ready by then, and the first's listen is
+        // sent after.
+        desk_client.subscribe(&[Topic::Playback]).await.unwrap();
+        desk_client
+            .call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::Tracks {
+                    ids: vec![ids[0], ids[0]],
+                },
+                start: None,
+                context: None,
+                shuffle: None,
+            })
+            .await
+            .unwrap();
+        let mut held = false;
+        loop {
+            if let Event::Playback(event) = desk_client.next_event().await.unwrap() {
+                if event.state.status == PlaybackStatus::Playing && !held {
+                    relay.hold(true);
+                    held = true;
+                }
+                if held && event.state.status == PlaybackStatus::Stopped {
+                    break;
+                }
+            }
+        }
+        // The hub has taken a listen whose answer is held back: one it has
+        // that the satellite still waits to hear of. On a slow machine the
+        // first may have been answered before the hold, but not the second.
+        let id = desk.server_id();
+        while at_hub(&scratch, id).len() + waiting(&scratch) <= 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A call waits on the hub for eight seconds; the stop gives it one.
+        drop(desk_client);
+        let stopping = std::time::Instant::now();
+        desk.stop().await.unwrap();
+        let took = stopping.elapsed();
+        assert!(took < grace + Duration::from_secs(2), "{took:?}");
+        assert!(waiting(&scratch) >= 1);
+
+        // The hub answers again, and the next run sends what waits again:
+        // each listen is taken once.
+        relay.hold(false);
+        let _desk = start_playing_with(&scratch, "desk", 100, None).await;
+        delivered(&scratch).await;
+        assert_eq!(at_hub(&scratch, id).len(), 2);
+        assert_eq!(staged(&scratch), 0);
+    })
+    .await;
+}

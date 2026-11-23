@@ -13,7 +13,7 @@ use rusqlite::OptionalExtension;
 use super::player::{Direction, PlayTracks, Player, PlayerSetup, Request, Status};
 use super::renderer::fake::Fake;
 use super::store::Staged;
-use super::{SendStamps, deliver_listens};
+use super::{SendStamps, deliver_listens, deliver_listens_to};
 use crate::testing::{CountingEntropy, FixedClock};
 use crate::timekeeping::fixed::FixedTimekeeper;
 use crate::{
@@ -1007,6 +1007,96 @@ fn a_listen_delivered_twice_is_written_once() {
         })
         .unwrap();
     assert_eq!(observations, 1);
+}
+
+#[test]
+fn a_pass_told_to_stop_leaves_the_listens_it_has_not_sent_staged_and_due() {
+    let mut rig = Rig::new();
+    let only = rig.tracks[0];
+    rig.tracks = vec![only];
+    rig.play(0);
+    rig.pass(240_000);
+    rig.pass(1_000);
+    for _ in 0..2 {
+        rig.resume();
+        rig.pass(240_000);
+        rig.pass(1_000);
+    }
+    assert_eq!(rig.staged().len(), 3);
+    // The server stops after the first is sent.
+    let sent = std::cell::Cell::new(0);
+    let stamps = rig.stamps();
+    let ingest = |record: &_, stamps| {
+        sent.set(sent.get() + 1);
+        rig.library.ingest_listen(record, stamps)
+    };
+    let pass = |stop: &dyn Fn() -> bool| {
+        deliver_listens_to(
+            &rig.server,
+            &ingest,
+            &*rig.clock,
+            &|| stamps,
+            &|| Ok(()),
+            super::MAX_BACKOFF_MS,
+            stop,
+        )
+        .unwrap()
+    };
+    let first = pass(&|| sent.get() >= 1);
+    assert_eq!((first.delivered.len(), first.failed.len()), (1, 0));
+    assert_eq!(first.next_due_ms, None);
+    // The two left are as they were: not tried, so not put off.
+    let (due, _) = rig.server.due_deliveries(rig.clock.now_ms(), 100).unwrap();
+    assert_eq!(due.len(), 2);
+    assert!(due.iter().all(|delivery| delivery.attempts == 0));
+    assert_eq!(rig.staged().len(), 2);
+
+    // The next run sends them, and each listen is taken once.
+    let next = pass(&|| false);
+    assert_eq!((next.delivered.len(), next.duplicates), (2, 0));
+    assert_eq!(sent.get(), 3);
+    assert!(rig.staged().is_empty());
+    assert_eq!(rig.plays().len(), 3);
+}
+
+/// A send the stop cuts short may have reached the hub or not. It is not
+/// counted as a failure: its row is left as it was, and the next run sends
+/// it again, to be taken once.
+#[test]
+fn a_send_the_stop_cuts_short_is_left_as_it_was_and_taken_once_by_the_next_run() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(240_000);
+    rig.skip(Direction::Next);
+    assert_eq!(rig.staged().len(), 1);
+    let stamps = rig.stamps();
+    let stopping = std::cell::Cell::new(false);
+    // The hub takes it, and the stop cuts the wait for its answer short.
+    let cut = |record: &_, stamps| {
+        rig.library.ingest_listen(record, stamps)?;
+        stopping.set(true);
+        Err(crate::Error::Playback("the server is stopping".to_owned()))
+    };
+    let pass = deliver_listens_to(
+        &rig.server,
+        &cut,
+        &*rig.clock,
+        &|| stamps,
+        &|| Ok(()),
+        super::MAX_BACKOFF_MS,
+        &|| stopping.get(),
+    )
+    .unwrap();
+    assert_eq!(pass, super::Delivered::default());
+    let (due, _) = rig.server.due_deliveries(rig.clock.now_ms(), 100).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].attempts, 0);
+    assert!(rig.server.failing_deliveries().unwrap().is_none());
+
+    let next = rig.deliver();
+    assert_eq!((next.delivered.len(), next.duplicates), (1, 1));
+    assert!(rig.staged().is_empty());
+    assert_eq!(rig.plays().len(), 1);
 }
 
 #[test]
