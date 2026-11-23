@@ -231,6 +231,8 @@ pub struct ImportYear {
     pub joined_during: u64,
     /// By tier C.
     pub joined_renamed: u64,
+    /// By a correction that joins them.
+    pub joined_pinned: u64,
     /// With no scrobble, and counted by the play rule.
     pub alone_counted: u64,
     /// With no scrobble, and not counted: skipped or partial.

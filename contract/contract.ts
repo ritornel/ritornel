@@ -1763,6 +1763,10 @@ export type ImportYear = {
    */
   joinedRenamed: number,
   /**
+   * By a correction that joins them.
+   */
+  joinedPinned: number,
+  /**
    * With no scrobble, and counted by the play rule.
    */
   aloneCounted: number,

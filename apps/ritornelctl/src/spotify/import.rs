@@ -197,6 +197,13 @@ fn report_text(report: &ImportReport, samples: bool) -> String {
             report.paused
         ),
     ));
+    let pinned: u64 = report.years.iter().map(|year| year.joined_pinned).sum();
+    if pinned > 0 {
+        lines.push((
+            "Pinned",
+            format!("{pinned} listens joined to a scrobble by a correction"),
+        ));
+    }
     text.push_str(&server::facts(&lines));
     text.push_str(
         "\nYear  Listens  Joined (A B C)        Alone: counted  not  unknown  Scrobbles alone  \

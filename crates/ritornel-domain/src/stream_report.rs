@@ -183,7 +183,8 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
             row.no_zone += 1;
         }
         match joined_tier.get(&index) {
-            Some(Some(Tier::Start) | None) => row.joined_start += 1,
+            Some(Some(Tier::Start)) => row.joined_start += 1,
+            Some(None) => row.joined_pinned += 1,
             Some(Some(Tier::During)) => row.joined_during += 1,
             Some(Some(Tier::Renamed)) => row.joined_renamed += 1,
             None => {
@@ -546,6 +547,22 @@ mod tests {
             ),
             (3, 3, 1, 1)
         );
+    }
+
+    #[test]
+    fn a_join_a_correction_pins_is_counted_as_pinned_and_in_no_tier() {
+        let streams = keyed(vec![record(221, 221, "Low Tide", "trackdone")]);
+        // An hour on: no tier would join it.
+        let scrobbles = [scrobble(3600, "Low Tide")];
+        let pins = Pins {
+            apart: HashSet::new(),
+            together: vec![(streams[0].key.clone(), 3600)],
+        };
+        let plays = BTreeMap::new();
+        let report = dry_run(&input(&streams, &scrobbles, &plays, &pins));
+        let year = &report.years[0];
+        assert_eq!((year.joined_start, year.joined_pinned), (0, 1));
+        assert!(report.tiers.iter().all(|tier| tier.joined == 0));
     }
 
     #[test]
