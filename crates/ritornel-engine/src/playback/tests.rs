@@ -3157,7 +3157,29 @@ fn a_master_fetched_opens_as_it_is_whether_or_not_the_hub_still_answers() {
     rig.hand_back(wanted, Ok(()));
     assert_eq!(rig.player.state().status, Status::Playing);
     rig.pass(1_000);
-    assert_eq!(rig.began.len(), 1);
+    assert_eq!(
+        rig.began.first().map(|(track, _)| *track),
+        Some(rig.tracks[0])
+    );
+}
+
+#[test]
+fn a_next_master_fetched_too_late_to_join_is_kept_for_its_turn() {
+    // No join: the second loads when its turn comes, from the copy fetched,
+    // though the library says it is elsewhere, as it does while the hub
+    // does not answer.
+    let mut rig = Rig::new();
+    rig.elsewhere(&[1]);
+    rig.play(0);
+    rig.pass(1_000);
+    let next = rig.player.wanted().unwrap();
+    rig.hand_back(next, Ok(()));
+    rig.pass(240_000);
+    assert_eq!(rig.player.state().status, Status::Playing);
+    assert_eq!(
+        rig.began.get(1).map(|(track, _)| *track),
+        Some(rig.tracks[1])
+    );
 }
 
 #[test]
@@ -3198,13 +3220,15 @@ fn a_fetch_for_an_entry_that_no_longer_follows_cannot_touch_what_is_joined() {
         .remove(request, None, &[next.entry], &rig.server, Some(&catalog))
         .unwrap();
     rig.note(&done.events);
+    // The second's fetch fails, late, before a tick: the third still
+    // follows, joined with no load of its own.
+    rig.fetched(next, Err("the hub went away".to_owned()));
     rig.tick();
     assert_eq!(rig.player.wanted(), None);
-    // The second's fetch fails, late: the third still follows, joined.
-    rig.fetched(next, Err("the hub went away".to_owned()));
     let third = rig.entry_at(1);
     rig.pass(240_000);
     assert_eq!(rig.entry(), third);
+    assert_eq!(rig.fake.loads().len(), 1);
     let [first, joined] = rig.staged().try_into().unwrap();
     assert_eq!(first.ended.unwrap().end_reason.as_str(), "finished");
     assert_eq!(joined.started.appearance, rig.tracks[2]);
@@ -3232,18 +3256,64 @@ fn a_track_paused_while_it_buffers_starts_for_the_reason_it_was_to() {
     rig.play(0);
     rig.pass(1_000);
     let next = rig.player.wanted().unwrap();
-    // Not fetched in time: the first ends, and the second waits for the
-    // fetch already asked for, which goes on as its own.
+    // Not fetched in time: the first ends, and the second waits.
     rig.pass(239_000);
     assert_eq!(rig.player.state().status, Status::Buffering);
-    assert_eq!(rig.player.wanted(), Some(next));
+    assert_eq!(
+        rig.player.wanted().map(|wanted| wanted.appearance),
+        Some(next.appearance)
+    );
     rig.pause();
     rig.resume();
     assert_eq!(rig.player.state().status, Status::Buffering);
-    let wanted = rig.player.wanted().unwrap();
-    rig.fetched(wanted, Ok(()));
+    // The fetch asked for as the next, late, is the one it plays from.
+    rig.fetched(next, Ok(()));
+    assert_eq!(rig.player.state().status, Status::Playing);
     rig.pass(1_000);
     let [_, second] = rig.staged().try_into().unwrap();
     assert_eq!(second.started.appearance, rig.tracks[1]);
     assert_eq!(second.started.start_reason.as_str(), "auto_advance");
+}
+
+#[test]
+fn a_fetch_asked_for_before_a_stop_cannot_fail_a_play_that_came_after() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[1]);
+    rig.play(0);
+    rig.pass(1_000);
+    let next = rig.player.wanted().unwrap();
+    rig.stop();
+    // Played afresh from the second, which waits for a fetch of its own.
+    rig.play(1);
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    let fresh = rig.player.wanted().unwrap();
+    assert_ne!(fresh, next);
+    rig.fetched(next, Err("the hub went away".to_owned()));
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    assert_eq!(rig.player.wanted(), Some(fresh));
+    let page = rig.player.window(super::Order::Queue, 1, 1);
+    assert_eq!(page.entries[0].2, None);
+}
+
+#[test]
+fn a_track_paused_while_it_buffers_and_skipped_back_to_starts_as_the_users_pick() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[1, 2]);
+    rig.play(0);
+    // The first ends with the second not fetched: it waits, to start as
+    // the queue moved on.
+    rig.pass(240_000);
+    assert_eq!(rig.player.state().status, Status::Buffering);
+    rig.pause();
+    rig.skip(Direction::Next);
+    rig.skip(Direction::Previous);
+    rig.resume();
+    let wanted = rig.player.wanted().unwrap();
+    assert_eq!(wanted.appearance, rig.tracks[1]);
+    rig.fetched(wanted, Ok(()));
+    rig.pass(1_000);
+    let staged = rig.staged();
+    let second = staged.last().unwrap();
+    assert_eq!(second.started.appearance, rig.tracks[1]);
+    assert_eq!(second.started.start_reason.as_str(), "user_pick");
 }

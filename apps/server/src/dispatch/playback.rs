@@ -387,6 +387,9 @@ impl Core {
         });
         if let Some(Err(error)) = handed {
             error!(%error, "a pulled master could not be handed to the player");
+            // What it came to is said all the same.
+            let state = lock(&self.player).as_ref().map(Player::state);
+            self.publish_player(vec![PlayerEvent::State], state);
         }
     }
 

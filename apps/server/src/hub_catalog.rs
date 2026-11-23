@@ -141,8 +141,9 @@ impl HubCatalog {
     /// The master, pulled from the hub if it is not kept here already.
     fn pull(&self, appearance: Id, copy: &HubCopy) -> Result<PathBuf, Error> {
         let kept = self.kept(copy);
-        // Kept already. Its time is left alone: the player may have it open,
-        // and a file whose time changes is one it no longer plays.
+        // Kept already. A kept master's time is never changed: the player
+        // may have it open, and a file whose time changes is one it no
+        // longer plays. So the cache lets go of the oldest pulled first.
         if facts_of(&kept).is_some_and(|facts| facts.size_bytes == copy.size_bytes) {
             return Ok(kept);
         }
@@ -195,29 +196,6 @@ impl HubCatalog {
                 )))
             }
         }
-    }
-}
-
-/// How often a kept master is marked as played, at most.
-const MARK_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
-/// Marks a kept master as played now, so that it is the newest to keep:
-/// at most once a day. The player checks a file's time each time it reads
-/// it again, so one it opened lately, and may have open still, is never
-/// marked while it plays.
-fn played_again(kept: &Path) {
-    let lately = std::fs::metadata(kept)
-        .and_then(|metadata| metadata.modified())
-        .is_ok_and(|at| at.elapsed().is_ok_and(|ago| ago < MARK_EVERY));
-    if lately {
-        return;
-    }
-    let touched = std::fs::File::options()
-        .append(true)
-        .open(kept)
-        .and_then(|file| file.set_modified(SystemTime::now()));
-    if let Err(error) = touched {
-        warn!(%error, "a kept master could not be marked as played");
     }
 }
 
@@ -325,13 +303,8 @@ impl Catalog for HubCatalog {
         };
         for copy in &copies {
             let kept = self.kept(copy);
-            if !facts_of(&kept).is_some_and(|facts| facts.size_bytes == copy.size_bytes) {
-                continue;
-            }
-            // Marked first, so the facts it plays under are the file's as
-            // it now is.
-            played_again(&kept);
-            if let Some(facts) = facts_of(&kept) {
+            if let Some(facts) = facts_of(&kept).filter(|facts| facts.size_bytes == copy.size_bytes)
+            {
                 return Ok(vec![Copy::fetched(
                     copy.source_item_id,
                     copy.revision,
