@@ -707,7 +707,8 @@ impl ServerStore {
     /// Closes every listen a run that is gone left open, as a crash, where
     /// and when its own last checkpoint was and with what it had heard,
     /// and queues each for delivery. The one cut off in the entry the
-    /// player is on becomes the listen a resume continues. Returns the
+    /// player is on becomes the listen a resume continues, from where that
+    /// listen ended. Returns the
     /// listens closed. This server holds the data directory's lock, so the
     /// run that left them is gone.
     pub fn close_crashed_listens(&self) -> Result<Vec<Id>, Error> {
@@ -745,14 +746,19 @@ impl ServerStore {
                 )?;
                 closed.push(listen.started.listen_id);
                 if listen.started.entry.is_some() && listen.started.entry == current {
-                    resume = Some(listen.started.listen_id);
+                    resume = Some((listen.started.listen_id, listen.checkpoint_position_ms));
                 }
             }
-            if let Some(resume) = resume {
+            // The place can have been saved after the listen's checkpoint,
+            // with a command's receipt: a resume from there would leave what
+            // was heard in between out of the history. It goes back to
+            // where the listen ended.
+            if let Some((resume, position_ms)) = resume {
                 transaction.execute(
-                    "UPDATE playback_session SET resume_listen_pid = ?1, updated_at_ms = ?2
+                    "UPDATE playback_session
+                     SET resume_listen_pid = ?1, position_ms = ?2, updated_at_ms = ?3
                      WHERE id = 1",
-                    (resume.as_bytes(), now_ms),
+                    (resume.as_bytes(), position_ms, now_ms),
                 )?;
             }
             Ok(closed)

@@ -793,6 +793,41 @@ fn a_crash_at_2_40_with_a_checkpoint_at_2_35_is_closed_as_a_crash_and_resumed_as
 }
 
 #[test]
+fn a_place_saved_after_the_last_checkpoint_resumes_from_the_checkpoint() {
+    // At 2:39, four seconds after the 2:35 checkpoint, the volume changes,
+    // which saves the place and not the listen. Then the server dies.
+    let mut rig = Rig::new();
+    rig.play(1);
+    rig.pass(159_000);
+    assert_eq!(rig.staged()[0].heard.ms_played, 155_000);
+    let request = rig.request("playback.setVolume");
+    rig.player
+        .set_volume(request, Some(0.5), None, &rig.server)
+        .unwrap();
+    assert_eq!(rig.server.playback_session().unwrap().position_ms, 159_000);
+    rig.restart(0xb1);
+    // The listen ends at its checkpoint, and the player waits there, so
+    // the four seconds are heard again and counted.
+    let closed = rig.staged()[0].clone();
+    assert_eq!(closed.ended.unwrap().end_position_ms, 155_000);
+    assert_eq!(rig.player.state().position_ms, 155_000);
+    rig.deliver();
+    rig.resume();
+    rig.pass(1_000);
+    let resumed = rig.staged()[0].clone();
+    assert_eq!(resumed.started.continues, Some(closed.started.listen_id));
+    assert_eq!(resumed.started.start_position_ms, 155_000);
+    rig.pass(144_000);
+    rig.deliver();
+    let plays = rig.plays();
+    let play = plays
+        .iter()
+        .find(|play| play.listens.len() == 2)
+        .expect("one play with both listens");
+    assert_eq!(play.ms_played, Some(300_000));
+}
+
+#[test]
 fn a_clean_shutdown_closes_the_listen_as_shutdown_and_a_resume_continues_it() {
     let mut rig = Rig::new();
     rig.play(0);
