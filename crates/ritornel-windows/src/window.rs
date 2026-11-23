@@ -171,14 +171,18 @@ pub fn owner(title: &str) -> Option<u32> {
 }
 
 /// Asks the hidden window named `title`, in this session, to close, as
-/// `taskkill /PID` asks every window of a process. Whether one was open.
-pub fn ask_to_close(title: &str) -> bool {
+/// `taskkill /PID` asks every window of a process. `Ok(false)` when none is
+/// open, and an error when one is but the request could not be posted.
+pub fn ask_to_close(title: &str) -> io::Result<bool> {
     let Some(handle) = find(title) else {
-        return false;
+        return Ok(false);
     };
     // SAFETY: posting to a window that has gone fails and does nothing
     // else.
-    unsafe { PostMessageW(handle, WM_CLOSE, 0, 0) != 0 }
+    if unsafe { PostMessageW(handle, WM_CLOSE, 0, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
 }
 
 /// Registers the class, once for the process, and creates a window of it on
@@ -326,14 +330,14 @@ mod tests {
         let _alone = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
         let title = format!("Ritornel test {}", std::process::id());
         assert_eq!(owner(&title), None);
-        assert!(!ask_to_close(&title));
+        assert!(!ask_to_close(&title).unwrap());
         let (asked, heard) = mpsc::channel();
         let window = Window::open(&title, move |why| {
             let _ = asked.send(why);
         })
         .unwrap();
         assert_eq!(owner(&title), Some(std::process::id()));
-        assert!(ask_to_close(&title));
+        assert!(ask_to_close(&title).unwrap());
         assert_eq!(
             heard.recv_timeout(Duration::from_secs(10)).unwrap(),
             Closing::Asked
