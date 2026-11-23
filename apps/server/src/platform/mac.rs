@@ -59,6 +59,12 @@ pub(crate) fn mdns_host() -> Option<String> {
         .then(|| String::from_utf8_lossy(&found.stdout).into_owned())
 }
 
+/// The name an older build took from this computer, if it differs from
+/// how the computer's name is read now: on this system, none.
+pub(crate) fn legacy_computer_name() -> Option<String> {
+    None
+}
+
 /// The name in System Settings › General › Sharing, as the person wrote
 /// it: "Studio Mac", not the network's `studio-mac.local`.
 pub(crate) fn computer_name() -> Option<String> {

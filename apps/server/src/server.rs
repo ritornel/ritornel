@@ -25,12 +25,12 @@ use crate::{Bounds, Error, Listen, Run, library, memory};
 pub(crate) const DEFAULT_NAME: &str = "Ritornel server";
 
 /// Whether a server called `current` takes its computer's name, `computer`:
-/// when it still has the first-start name, or when it has the computer's
-/// name in another case, as a server on Windows took it from
-/// `COMPUTERNAME`, which Windows upper-cases (`STUDIO-PC` for `Studio-PC`).
-/// Any other name was chosen, and is kept.
-fn takes_computer_name(current: &str, computer: &str) -> bool {
-    current == DEFAULT_NAME || (current != computer && current.eq_ignore_ascii_case(computer))
+/// when it still has the first-start name, or the name an older build took
+/// from the computer, `legacy`, such as `STUDIO-PC` from `COMPUTERNAME` for
+/// a Windows machine set up as `Studio-PC`. Any other name was chosen, and
+/// is kept; one chosen to equal the old name exactly cannot be told apart.
+fn takes_computer_name(current: &str, computer: &str, legacy: Option<&str>) -> bool {
+    current == DEFAULT_NAME || (legacy == Some(current) && current != computer)
 }
 
 /// Ends a server's transports when it is dropped. After a stop there are
@@ -163,7 +163,7 @@ impl Server {
             }
         } else if let Some(name) = run.computer_name.as_deref()
             && name != identity.name
-            && takes_computer_name(&identity.name, name)
+            && takes_computer_name(&identity.name, name, run.legacy_name.as_deref())
             && let Some(renamed) = store.rename(name)?
         {
             info!(name = %renamed.name, "this server is named after its computer");
@@ -554,12 +554,36 @@ mod tests {
 
     #[test]
     fn a_server_takes_its_computers_name_over_the_default_or_a_wrongly_cased_copy() {
-        assert!(takes_computer_name(DEFAULT_NAME, "Studio-PC"));
-        // Taken before from COMPUTERNAME, which Windows upper-cases.
-        assert!(takes_computer_name("STUDIO-PC", "Studio-PC"));
-        assert!(!takes_computer_name("Studio-PC", "Studio-PC"));
-        // A name someone chose is kept.
-        assert!(!takes_computer_name("Living room", "Studio-PC"));
+        let legacy = Some("STUDIO-WORKSTAT");
+        assert!(takes_computer_name(
+            DEFAULT_NAME,
+            "Studio-Workstation",
+            None
+        ));
+        // Taken before from COMPUTERNAME, upper-cased and cut short.
+        assert!(takes_computer_name(
+            "STUDIO-WORKSTAT",
+            "Studio-Workstation",
+            legacy
+        ));
+        assert!(!takes_computer_name(
+            "Studio-Workstation",
+            "Studio-Workstation",
+            legacy
+        ));
+        // A name someone chose is kept, in any case, and where no older
+        // build named it otherwise.
+        assert!(!takes_computer_name(
+            "studio-workstation",
+            "Studio-Workstation",
+            legacy
+        ));
+        assert!(!takes_computer_name(
+            "Living room",
+            "Studio-Workstation",
+            legacy
+        ));
+        assert!(!takes_computer_name("STUDIO-PC", "Studio-PC", None));
     }
 
     #[test]

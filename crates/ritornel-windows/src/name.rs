@@ -4,6 +4,7 @@
 
 use std::io;
 
+use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 use windows_sys::Win32::System::SystemInformation::{
     ComputerNamePhysicalDnsHostname, GetComputerNameExW,
 };
@@ -22,10 +23,12 @@ pub fn dns_host_name() -> io::Result<String> {
             &raw mut length,
         )
     };
-    let size = usize::try_from(length).map_err(io::Error::other)?;
-    if size == 0 {
-        return Err(io::Error::last_os_error());
+    // Any failure but the want of room it was asked into is the answer.
+    let asked = io::Error::last_os_error();
+    if asked.raw_os_error() != i32::try_from(ERROR_MORE_DATA).ok() {
+        return Err(asked);
     }
+    let size = usize::try_from(length).map_err(io::Error::other)?;
     let mut name = vec![0_u16; size];
     // SAFETY: the buffer holds `length` UTF-16 units, as the call is told;
     // it writes at most that many and sets `length` to the units written,

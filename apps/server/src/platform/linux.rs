@@ -50,6 +50,12 @@ pub(crate) fn mdns_host() -> Option<String> {
     host.trim().split('.').next().map(str::to_owned)
 }
 
+/// The name an older build took from this computer, if it differs from
+/// how the computer's name is read now: on this system, none.
+pub(crate) fn legacy_computer_name() -> Option<String> {
+    None
+}
+
 /// The machine's pretty name if one is set, as `hostnamectl` shows it, or
 /// else its host name.
 pub(crate) fn computer_name() -> Option<String> {

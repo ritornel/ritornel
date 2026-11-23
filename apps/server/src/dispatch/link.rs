@@ -168,26 +168,40 @@ impl Core {
     /// joined, as a server named after its computer may be, the hub's
     /// records of it take the new name: its link session, which the hub
     /// lists, and the library's registry of servers.
+    ///
+    /// Each record is looked at on its own, so a later hello puts right one
+    /// that could not be written before, and the name already kept is only
+    /// read. Two hellos at once are taken one after the other.
     pub(super) fn satellite_named(&self, stores: &Stores, peer: Id, name: &str) {
         let name = untrusted_name(name);
-        match stores.server.relabel_link_session(peer, &name) {
-            Ok(false) => return,
-            Ok(true) => {}
-            Err(error) => {
+        let _one_at_a_time = lock(&self.naming);
+        let relabelled = stores
+            .server
+            .relabel_link_session(peer, &name)
+            .unwrap_or_else(|error| {
                 warn!(%error, satellite = %peer, "a satellite's new name could not be kept");
-                return;
-            }
-        }
+                false
+            });
         let library = stores
             .library
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(library) = library.as_ref()
-            && let Err(error) = library.register_server(peer, &name)
-        {
-            warn!(%error, satellite = %peer, "a satellite's new name could not be kept in the library");
+        let registered = library.as_ref().is_some_and(|library| {
+            let known = library.server_name(peer);
+            if matches!(&known, Ok(Some(known)) if *known == name) {
+                return false;
+            }
+            match known.and_then(|_| library.register_server(peer, &name)) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(%error, satellite = %peer, "a satellite's new name could not be kept in the library");
+                    false
+                }
+            }
+        });
+        if relabelled || registered {
+            info!(satellite = %peer, %name, "a satellite has a new name");
         }
-        info!(satellite = %peer, %name, "a satellite has a new name");
     }
 
     /// `link.invite`: a one-time link for a satellite to join with.

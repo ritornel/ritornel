@@ -28,6 +28,12 @@ pub(crate) fn mdns_host() -> Option<String> {
     host_name()
 }
 
+/// The name an older build took from this computer: `COMPUTERNAME`, which
+/// Windows upper-cases and cuts to 15 characters.
+pub(crate) fn legacy_computer_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
 /// The computer's name, in the case it was set.
 pub(crate) fn computer_name() -> Option<String> {
     host_name()

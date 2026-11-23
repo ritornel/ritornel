@@ -134,6 +134,9 @@ pub(crate) struct Core {
     /// On a hub, its linked servers' activity, and what keeps the machine
     /// from sleeping while one is active.
     awake: Mutex<crate::awake::KeptAwake>,
+    /// Held while a satellite's new name is kept, so that two hellos at
+    /// once write it one after the other.
+    naming: Mutex<()>,
     /// What a library created here takes its times and its IDs from.
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
@@ -269,6 +272,7 @@ impl Core {
             runtime,
             uplink: RwLock::new(uplink),
             awake: Mutex::default(),
+            naming: Mutex::default(),
             clock,
             entropy,
             bounds,

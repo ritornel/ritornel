@@ -196,6 +196,20 @@ impl LibraryStore {
     /// Adds the server `server` to the library's registry, with its player
     /// as a place listens come from, so that what it plays can be taken
     /// in. A server already there keeps its rows and takes the new name.
+    /// The name the library's registry gives the server `server`, if it
+    /// has it.
+    pub fn server_name(&self, server: Id) -> Result<Option<String>, Error> {
+        self.read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT name FROM server WHERE public_id = ?1",
+                    [server.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
     pub fn register_server(&self, server: Id, name: &str) -> Result<(), Error> {
         let name = name.to_owned();
         self.write(
