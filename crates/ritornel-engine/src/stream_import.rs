@@ -3,7 +3,7 @@
 //! new and records the run; and undoing it. See "Spotify streams" in
 //! docs/internals/history.md.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ritornel_contract::{DeviceKind, ImportReport, Platform, PlayedVia, SpotifyStream};
 use ritornel_domain::stream_report::{DryRunInput, dry_run, keyed};
@@ -26,6 +26,7 @@ struct Read {
     zone_periods: Vec<ritornel_domain::history::ZonePeriod>,
     stored: HashMap<Vec<u8>, SpotifyStream>,
     in_force: Vec<Stream>,
+    set_aside: HashSet<Vec<u8>>,
 }
 
 /// The streams stored already, by key, as they were stored.
@@ -72,6 +73,37 @@ pub(crate) fn stored_stream(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Res
         device_kind: None,
         via: None,
     })
+}
+
+/// The keys of the streams a correction that stands sets aside, as
+/// derivation reads the corrections.
+fn set_aside_streams(connection: &Connection) -> Result<HashSet<Vec<u8>>, Error> {
+    let set_aside =
+        ritornel_domain::history::excluded(&crate::history_store::corrections(connection)?);
+    let mut key = connection.prepare_cached(
+        "SELECT o.source_key FROM history_observation o
+         JOIN observation_import_stream s ON s.observation_id = o.id WHERE o.id = ?1",
+    )?;
+    let mut keys = HashSet::new();
+    for observation in set_aside {
+        if let Some(found) = key.query_row([observation], |row| row.get(0)).optional()? {
+            keys.insert(found);
+        }
+    }
+    Ok(keys)
+}
+
+/// How many streams are in force. A run applied only adds to them and one
+/// undone only takes from them, so the same count is the same streams.
+fn in_force(connection: &Connection) -> Result<i64, Error> {
+    Ok(connection.query_row(
+        &format!(
+            "SELECT count(*) FROM ({})",
+            crate::history_streams::IN_FORCE
+        ),
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 /// Every scrobble of every account, sorted into those a stream may take,
@@ -176,6 +208,7 @@ fn read(connection: &Connection) -> Result<Read, Error> {
                 record: stream.record,
             })
             .collect(),
+        set_aside: set_aside_streams(connection)?,
     })
 }
 
@@ -192,6 +225,7 @@ fn report(read: &Read, streams: &[Stream], made_at: i64) -> ImportReport {
         zone_periods: &read.zone_periods,
         pins: &Pins::default(),
         stored: &read.stored,
+        set_aside: &read.set_aside,
         made_at,
     })
 }
@@ -548,13 +582,17 @@ impl LibraryStore {
             let _ = sent.send(report(&read, &streams, write.now_ms()));
             // What the report read is not held while the run is stored.
             drop(read);
+            let before = in_force(write.connection())?;
             let stored = apply_in(write, run, &streams, &reader, session)?;
             // The tracks the run brought, and those whose newest stream in
             // force it changed, are judged against the library; and since a
             // stream in force can move its track's length, and so any play
-            // of it, every play is derived again, all in the same write.
-            bind_in(write, Scope::Spotify)?;
-            crate::history_store::derive_every_play(write)?;
+            // of it, every play is derived again, all in the same write. A
+            // run whose every stream was in force already changes neither.
+            if in_force(write.connection())? != before {
+                bind_in(write, Scope::Spotify)?;
+                crate::history_store::derive_every_play(write)?;
+            }
             Ok(serde_json::to_string(&stored)?)
         })?;
         Ok((
@@ -588,13 +626,17 @@ impl LibraryStore {
                 )
                 .optional()?;
             if state.as_deref() == Some("applied") {
+                let before = in_force(connection)?;
                 connection.execute(
                     "INSERT INTO import_run_event (run_id, state, at_ms, rev)
                      VALUES (?1, 'undone', ?2, ?3)",
                     (row, write.now_ms(), write.rev()),
                 )?;
-                bind_in(write, Scope::Spotify)?;
-                crate::history_store::derive_every_play(write)?;
+                // A run whose every stream another holds leaves them in force.
+                if in_force(connection)? != before {
+                    bind_in(write, Scope::Spotify)?;
+                    crate::history_store::derive_every_play(write)?;
+                }
             }
             let stored = stored_run(connection, run)?.ok_or(Error::Corrupt("a run undone"))?;
             Ok(serde_json::to_string(&stored)?)

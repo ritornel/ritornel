@@ -11,7 +11,7 @@
 --   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
---   0008_spotify_streams  1c844427544e429feb1eab3ba05655681e495e3b96e141d986c9850aa49ceb98
+--   0008_spotify_streams  32a9da0755e35eff88bddb1644d748cf1ed8b86b365206e5c1bf7faa3c92fa53
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -947,7 +947,6 @@ CREATE TABLE observation_import_stream (
   offline            INTEGER CHECK (offline IN (0, 1)),
   offline_timestamp  INTEGER,                                    -- as the archive gives it: in seconds in some rows and milliseconds in others
   incognito          INTEGER CHECK (incognito IN (0, 1)),        -- a private session
-  platform           TEXT NOT NULL CHECK (platform IN ('mac', 'windows', 'linux', 'android', 'ios', 'web', 'cast', 'other')),   -- one word, never Spotify's text
   rev                INTEGER NOT NULL
 ) STRICT;
 
@@ -1038,3 +1037,12 @@ BEFORE DELETE ON import_run_stream
 BEGIN
   SELECT RAISE(ABORT, 'import_run_stream is immutable: nothing is deleted');
 END;
+
+CREATE TABLE stream_device (
+  observation_id  INTEGER PRIMARY KEY REFERENCES observation_import_stream(observation_id),
+  platform        TEXT CHECK (platform IN ('ios', 'android', 'mac', 'windows', 'linux', 'other')),   -- the operating system only
+  device_kind     TEXT CHECK (device_kind IN ('computer', 'phone', 'tablet', 'watch', 'speaker', 'tv', 'car', 'console', 'group', 'other')),   -- the hardware the sound came out of
+  via             TEXT CHECK (via IN ('app', 'web', 'cast', 'connect', 'airplay', 'other')),   -- how that device played it
+  run_id          INTEGER NOT NULL REFERENCES import_run(id),   -- the run whose reader said them
+  rev             INTEGER NOT NULL
+) STRICT;

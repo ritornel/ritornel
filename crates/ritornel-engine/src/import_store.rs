@@ -689,7 +689,13 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
         "SELECT o.id, o.rev, o.source_key, i.played_at_utc_ms, i.artist, i.album, i.title,
                 EXISTS (SELECT 1 FROM play_event_observation peo
                         JOIN play_event pe ON pe.id = peo.play_event_id
-                        WHERE peo.observation_id = o.id AND pe.excluded = 1),
+                        WHERE peo.observation_id = o.id AND pe.excluded = 1
+                          AND NOT EXISTS (
+                            SELECT 1 FROM play_event_observation primary_of
+                            JOIN observation_import_stream s
+                              ON s.observation_id = primary_of.observation_id
+                            WHERE primary_of.play_event_id = pe.id
+                              AND primary_of.role = 'primary')),
                 NOT EXISTS (SELECT 1 FROM correction_target t
                             JOIN observation_correction c ON c.observation_id = t.correction_id
                             WHERE t.target_observation_id = o.id AND c.verb = 'exclude')
@@ -1503,10 +1509,12 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
 
+    // The plays the account's scrobbles are the primary of, as its plays
+    // are counted: not those another record speaks for.
     let mut plays_of: HashMap<i64, i64> = HashMap::new();
     let mut statement = connection.prepare(
         "SELECT o.source_item_id, count(*) FROM history_observation o
-         JOIN play_event_observation peo ON peo.observation_id = o.id
+         JOIN play_event_observation peo ON peo.observation_id = o.id AND peo.role = 'primary'
          JOIN play_event pe ON pe.id = peo.play_event_id
          WHERE o.endpoint_id = ?1 AND o.kind = 'import' AND pe.excluded = 0
          GROUP BY o.source_item_id",

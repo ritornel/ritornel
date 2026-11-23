@@ -40,7 +40,9 @@ use jiff::tz::{TimeZone, TimeZoneDatabase};
 /// nothing across sources. Version 2 uses known zones and the full clock
 /// difference when dating a chain, and bounds its accumulated play time.
 /// Version 3 reads Spotify's streams, and joins a scrobble to the stream it
-/// is the report of by the stream matcher in force.
+/// is the report of by the stream matcher, which is part of the grouper: a
+/// change to the matcher is a new version, which derives every play again
+/// and refuses a dry run made before it.
 pub const GROUPER_VERSION: i64 = 3;
 
 /// How long after the end of a listen one that continues it may start and
@@ -1213,8 +1215,20 @@ fn pins(
         .enumerate()
         .map(|(at, scrobble)| (scrobble.observation, at))
         .collect();
-    let mut pins = crate::streams::Pins::default();
-    for correction in corrections {
+    // Of two corrections that pin one listen and one scrobble, by any row
+    // of the listen, the newer says it; and of two that join one scrobble,
+    // the newer is read first and takes it.
+    let listen = |stream: usize| {
+        streams.get(stream).map(|stream| {
+            let r = &stream.record;
+            (r.ended_at, r.ms_played, r.track_uri.clone())
+        })
+    };
+    type Pinned = (i64, bool, usize);
+    let mut newest: HashMap<((i64, i64, String), usize), Pinned> = HashMap::new();
+    let mut in_order: Vec<&Correction> = corrections.iter().collect();
+    in_order.sort_by_key(|correction| correction.observation);
+    for correction in in_order {
         if !active.contains(&correction.observation)
             || !matches!(correction.verb, Verb::Join | Verb::Split)
         {
@@ -1231,16 +1245,36 @@ fn pins(
             .filter_map(|target| scrobble_at.get(target).copied())
             .collect();
         for stream in &named {
+            let Some(listen) = listen(*stream) else {
+                continue;
+            };
             for scrobble in &scrobbled {
-                if correction.verb == Verb::Join {
-                    pins.together.push((*stream, *scrobble));
-                } else {
-                    pins.apart.insert((*stream, *scrobble));
-                }
+                newest.insert(
+                    (listen.clone(), *scrobble),
+                    (
+                        correction.observation,
+                        correction.verb == Verb::Join,
+                        *stream,
+                    ),
+                );
             }
         }
     }
-    pins.together.sort_unstable();
+    let mut pins = crate::streams::Pins::default();
+    let mut together: Vec<(i64, usize, usize)> = Vec::new();
+    for ((_, scrobble), (by, join, stream)) in newest {
+        if join {
+            together.push((by, stream, scrobble));
+        } else {
+            pins.apart.insert((stream, scrobble));
+        }
+    }
+    // Newest first, and in one correction by its rows.
+    together.sort_unstable_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))));
+    pins.together = together
+        .into_iter()
+        .map(|(_, stream, scrobble)| (stream, scrobble))
+        .collect();
     pins
 }
 

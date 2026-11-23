@@ -14,6 +14,7 @@ use ritornel_domain::streams::{
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::Error;
+use crate::stream_import::{STORED_STREAM, STORED_STREAM_JOINS, stored_stream};
 
 /// The runs in force: those whose newest ledger entry is `applied`.
 macro_rules! runs_in_force {
@@ -40,35 +41,22 @@ const HELD: &str = concat!(
     "))"
 );
 
-fn stream_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, i64, i64, Vec<u8>, String)> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-    ))
+/// A stream in force as derivation reads it, from its typed columns, from
+/// [`columns`] and [`STORED_STREAM_JOINS`].
+fn stream_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StreamImport> {
+    Ok(StreamImport {
+        observation: row.get(0)?,
+        endpoint: row.get(1)?,
+        listener: row.get(2)?,
+        source_item: row.get(3)?,
+        key: row.get(4)?,
+        record: stored_stream(row, 5)?,
+    })
 }
 
-fn stream_of(
-    (observation, endpoint, listener, source_item, key, payload): (
-        i64,
-        i64,
-        i64,
-        i64,
-        Vec<u8>,
-        String,
-    ),
-) -> Result<StreamImport, Error> {
-    Ok(StreamImport {
-        observation,
-        endpoint,
-        listener,
-        source_item,
-        key,
-        record: serde_json::from_str(&payload)?,
-    })
+/// What [`stream_row`] reads, from the observation `o`.
+fn columns() -> String {
+    format!("o.id, o.endpoint_id, o.listener_id, o.source_item_id, {STORED_STREAM}")
 }
 
 /// The streams in force with these observation IDs, or every one.
@@ -76,24 +64,24 @@ pub(crate) fn streams(
     connection: &Connection,
     only: Option<&BTreeSet<i64>>,
 ) -> Result<Vec<StreamImport>, Error> {
-    const COLUMNS: &str = "o.id, o.endpoint_id, o.listener_id, o.source_item_id, o.source_key,
-                           o.payload_json";
+    let columns = columns();
     let Some(only) = only else {
         let mut statement = connection.prepare(&format!(
-            "SELECT {COLUMNS} FROM ({IN_FORCE}) f
-             JOIN history_observation o ON o.id = f.observation_id ORDER BY o.id"
+            "SELECT {columns} FROM ({IN_FORCE}) f
+             JOIN history_observation o ON o.id = f.observation_id {STORED_STREAM_JOINS}
+             ORDER BY o.id"
         ))?;
         let rows = statement.query_map([], stream_row)?;
-        return rows.map(|row| stream_of(row?)).collect();
+        return Ok(rows.collect::<Result<_, _>>()?);
     };
     let mut one = connection.prepare_cached(&format!(
-        "SELECT {COLUMNS} FROM history_observation o
+        "SELECT {columns} FROM history_observation o {STORED_STREAM_JOINS}
          WHERE o.id = ?1 AND {HELD}"
     ))?;
     let mut found = Vec::new();
     for observation in only {
-        if let Some(row) = one.query_row([observation], stream_row).optional()? {
-            found.push(stream_of(row)?);
+        if let Some(stream) = one.query_row([observation], stream_row).optional()? {
+            found.push(stream);
         }
     }
     Ok(found)
@@ -118,14 +106,14 @@ pub(crate) fn lengths(
     tracks: &BTreeSet<i64>,
 ) -> Result<HashMap<String, i64>, Error> {
     let mut of_track = connection.prepare_cached(&format!(
-        "SELECT o.id, o.endpoint_id, o.listener_id, o.source_item_id, o.source_key,
-                o.payload_json
-         FROM history_observation o WHERE o.source_item_id = ?1 AND {HELD}"
+        "SELECT {} FROM history_observation o {STORED_STREAM_JOINS}
+         WHERE o.source_item_id = ?1 AND {HELD}",
+        columns()
     ))?;
     let mut found = Vec::new();
     for track in tracks {
-        for row in of_track.query_map([track], stream_row)? {
-            found.push(stream_of(row?)?);
+        for stream in of_track.query_map([track], stream_row)? {
+            found.push(stream?);
         }
     }
     Ok(lengths_of(&found))
