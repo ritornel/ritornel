@@ -18,6 +18,8 @@ Ritornel was built on macOS first. Linux and Windows came early, while the code 
 
 The headless hub is the server built for Linux with `--no-default-features`: no sound, no media session, no Last.fm, and no system library beyond libc.
 
+The headless player is the server built for Linux with `--no-default-features --features audio-output`: sound through ALSA's `default` device, and no media session or Last.fm. It links `libasound` and libc. It is meant for a small board such as a Raspberry Pi, with `--name` saying what the speakers are called. `scripts/player-footprint.sh` reports its size and its memory at idle on the machine it runs on.
+
 Sound goes through `cpal` everywhere, and media keys go through `souvlaki` on macOS and `zbus` on Linux.
 
 ## Code organization
@@ -35,6 +37,7 @@ What differs between systems sits in a `platform` module in each crate that need
 
 ### Linux
 
+- **The arm64 player is built natively in CI, not cross-compiled.** CI's `player-arm64` job builds and tests the headless player on GitHub's arm64 Linux runner, which links ALSA as any Linux machine does. Cross-compiling would need an aarch64 sysroot with ALSA's development files. The job runs beside the others, so the check takes no longer.
 - **Sound goes through ALSA's `default` device, not `cpal`'s PipeWire or PulseAudio hosts.** ALSA needs only `libasound`, and on a desktop with a sound server, `default` routes to that server. The output opens as 32-bit float at the device's own rate and channels, as on macOS.
 - **MPRIS is served with `zbus` directly, not through `souvlaki`.** `souvlaki`'s Linux backend wakes every 10 ms while a player is registered, panics when there is no session bus, does not advance reported position between updates, and never emits `Seeked`. The `zbus` implementation avoids all four:
   - it wakes only for a change or a call;
@@ -74,7 +77,13 @@ What differs between systems sits in a `platform` module in each crate that need
 - The desktop app follows the server; the server uses 1–2% of one core and 27 MB while playing.
 - Because the standard library cannot open a directory handle on Windows to flush it, `sync_dir` in `apps/server/src/platform/windows.rs` is currently a no-op (each file inside a backup is flushed before rename, while the directory rename itself is tracked in [#111](https://github.com/ritornel/ritornel/issues/111)).
 
-**Not yet verified on hardware:** hardware media keys or desktop media widgets, the systemd service across logout/login, real Bluetooth or HDMI output changes, headphone unplug/device loss on Windows, and a USB output unplugged behind PipeWire, which the stall rule ("Audio pipeline" in `docs/internals/playback.md`) is there to catch.
+**arm64 Linux** (the headless player in release, on GitHub's Ubuntu 24.04 arm64 runner, measured by `scripts/player-footprint.sh`):
+
+- The engine's and the server's tests pass, the decoding ones bit for bit.
+- `ritornel-server` is 18 MiB as built and 13 MiB stripped, and links `libasound` and libc only.
+- The server holds 11 MB resident at idle with an empty data directory, 2 MB of it its own memory and the rest its mapped program.
+
+**Not yet verified on hardware:** hardware media keys or desktop media widgets, the systemd service across logout/login, real Bluetooth or HDMI output changes, headphone unplug/device loss on Windows, the headless player on a Raspberry Pi, and a USB output unplugged behind PipeWire, which the stall rule ("Audio pipeline" in `docs/internals/playback.md`) is there to catch.
 
 ## Later
 

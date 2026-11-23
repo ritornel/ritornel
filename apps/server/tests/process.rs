@@ -74,6 +74,7 @@ fn serve(data_dir: &Path, extra: &[&str]) -> Command {
         .env_remove("RITORNEL_LISTEN")
         .env_remove("RITORNEL_LOG_LEVEL")
         .env_remove("RITORNEL_BACKUP_DIR")
+        .env_remove("RITORNEL_NAME")
         // Never the API key and secret of whoever runs the tests.
         .env_remove("SCROBL_API_KEY")
         .env_remove("SCROBL_API_SECRET")
@@ -267,6 +268,7 @@ fn without_listen_flag(data_dir: &Path, variables: &[(&str, &str)]) -> Command {
         .env_remove("RITORNEL_LISTEN")
         .env_remove("RITORNEL_LOG_LEVEL")
         .env_remove("RITORNEL_BACKUP_DIR")
+        .env_remove("RITORNEL_NAME")
         .envs(variables.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -430,6 +432,33 @@ fn a_restart_keeps_the_identity_and_the_credential() {
         .collect();
     let first_reason = if cfg!(windows) { TERM_REASON } else { "SIGINT" };
     assert_eq!(reasons, [first_reason, TERM_REASON]);
+}
+
+#[test]
+fn a_name_given_in_the_settings_wins_over_the_stored_one_and_is_kept_after() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    Server::start(&data_dir, &[]).stop(&data_dir);
+    Server::start(&data_dir, &["--name", "Workbench Speakers"]).stop(&data_dir);
+    Server::start(&data_dir, &[]).stop(&data_dir);
+    std::fs::write(data_dir.join("config.toml"), "name = \"Porch\"\n").unwrap();
+    Server::start(&data_dir, &[]).stop(&data_dir);
+
+    let lines = log_lines(&data_dir);
+    let names: Vec<_> = lines
+        .iter()
+        .filter(|line| line["message"] == "ready")
+        .map(|line| line["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Invented Desk",
+            "Workbench Speakers",
+            "Workbench Speakers",
+            "Porch"
+        ]
+    );
 }
 
 #[test]
@@ -622,6 +651,7 @@ fn the_data_directory_can_come_from_the_environment() {
         .env("RITORNEL_LISTEN", "127.0.0.1:0")
         .env_remove("RITORNEL_LOG_LEVEL")
         .env_remove("RITORNEL_BACKUP_DIR")
+        .env_remove("RITORNEL_NAME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

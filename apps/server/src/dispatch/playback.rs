@@ -29,7 +29,7 @@ use ritornel_engine::playback::{
 use ritornel_engine::{Command, LibraryStore, ServerStore};
 use tracing::{error, warn};
 
-use crate::hub_catalog::HubCatalog;
+use crate::hub_catalog::{DEFAULT_CACHE_BYTES, HubCatalog};
 
 use super::lists::expired;
 use super::{Core, Stores, fingerprint, lock};
@@ -334,10 +334,31 @@ impl Core {
         ticked.unwrap_or(Ok(()))
     }
 
+    /// The most a satellite's cache of pulled masters holds, in bytes: the
+    /// `cache_size` setting, or [`DEFAULT_CACHE_BYTES`] without one.
+    /// The cache is tidied here, as the server starts and before anything
+    /// is pulled.
+    pub(crate) fn set_cache_bytes(&self, bytes: Option<u64>) {
+        let bytes = bytes.unwrap_or(DEFAULT_CACHE_BYTES);
+        let _ = self.cache_bytes.set(bytes);
+        crate::hub_catalog::tidy(&self.audio_cache(), bytes);
+    }
+
     /// On a satellite, the hub's library as its player reads it.
     pub(crate) fn hub_catalog(&self) -> Option<HubCatalog> {
-        self.uplink()
-            .map(|uplink| HubCatalog::new(uplink, self.dir.root().join("cache").join("audio")))
+        self.uplink().map(|uplink| {
+            let bytes = self
+                .cache_bytes
+                .get()
+                .copied()
+                .unwrap_or(DEFAULT_CACHE_BYTES);
+            HubCatalog::new(uplink, self.audio_cache(), bytes)
+        })
+    }
+
+    /// Where a satellite keeps the masters it pulls.
+    fn audio_cache(&self) -> std::path::PathBuf {
+        self.dir.root().join("cache").join("audio")
     }
 
     /// The songs of a view the session holds at the hub, in order: read

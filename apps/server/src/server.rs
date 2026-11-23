@@ -133,15 +133,27 @@ impl Server {
             "server.db is open"
         );
 
-        let (mut identity, issued) = store.ensure_identity(DEFAULT_NAME)?;
+        let first_name = run.name.as_deref().unwrap_or(DEFAULT_NAME);
+        let (mut identity, issued) = store.ensure_identity(first_name)?;
         if issued.is_some() {
             info!(server_id = %identity.server_id, "first start: created this server's identity");
         }
-        // Named after its computer, so that a hub's satellites and a
-        // satellite's hub say which machine each is. A name someone chose
-        // is kept.
-        if identity.name == DEFAULT_NAME
-            && let Some(name) = run.name.as_deref()
+        // A name given in the settings wins over the stored one at every
+        // start, so a machine nobody sits at is called what its settings
+        // say. Without one, a server still called by the default name is
+        // named after its computer, so that a hub's satellites and a
+        // satellite's hub say which machine each is, and a name someone
+        // chose is kept.
+        if let Some(name) = run.name.as_deref() {
+            if name != identity.name
+                && let Some(renamed) = store.rename(name)?
+            {
+                info!(name, "renamed by the name setting");
+                identity = renamed;
+            }
+        } else if identity.name == DEFAULT_NAME
+            && let Some(name) = run.computer_name.as_deref()
+            && name != identity.name
             && let Some(renamed) = store.rename(name)?
         {
             info!(name = %renamed.name, "this server is named after its computer");
@@ -213,6 +225,7 @@ impl Server {
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
         core.set_watch(run.watch);
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
+        core.set_cache_bytes(run.cache_bytes);
         let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         if listen.is_private() {

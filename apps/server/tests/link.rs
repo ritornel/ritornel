@@ -79,8 +79,14 @@ async fn start_on(scratch: &Scratch, name: &str, listen: Listen) -> Server {
     .unwrap()
 }
 
-/// A server with a player on the null output, `speed` times real time.
-async fn start_playing_at(scratch: &Scratch, name: &str, speed: u32) -> Server {
+/// A server with a player on the null output, `speed` times real time,
+/// and a cache of `cache_bytes` for the masters it pulls, or the default.
+async fn start_playing_with(
+    scratch: &Scratch,
+    name: &str,
+    speed: u32,
+    cache_bytes: Option<u64>,
+) -> Server {
     Server::start_run(
         HeldDir::take(scratch.data_dir(name)).unwrap(),
         Listen::on_port(0),
@@ -92,6 +98,7 @@ async fn start_playing_at(scratch: &Scratch, name: &str, speed: u32) -> Server {
                 output: Some(Output::Null { speed }),
                 ..PlaybackRun::default()
             },
+            cache_bytes,
             ..Run::default()
         },
     )
@@ -705,11 +712,20 @@ async fn linked_player(scratch: &Scratch) -> (Server, Client, Server, Client) {
 /// As [`linked_player`], with the satellite playing at `speed` times real
 /// time.
 async fn linked_player_at(scratch: &Scratch, speed: u32) -> (Server, Client, Server, Client) {
+    linked_player_with(scratch, speed, None).await
+}
+
+/// As [`linked_player_at`], with a cache of `cache_bytes` on the satellite.
+async fn linked_player_with(
+    scratch: &Scratch,
+    speed: u32,
+    cache_bytes: Option<u64>,
+) -> (Server, Client, Server, Client) {
     let hub = start(scratch, "hub").await;
     let mut hub_client = client(scratch, "hub", &hub).await;
     hub_client.create_library(key()).await.unwrap();
     scan(scratch, &mut hub_client).await;
-    let desk = start_playing_at(scratch, "desk", speed).await;
+    let desk = start_playing_with(scratch, "desk", speed, cache_bytes).await;
     let desk_client = client(scratch, "desk", &desk).await;
     join(&desk_client, &invite(&hub, &hub_client).await)
         .await
@@ -741,6 +757,59 @@ async fn play_to_the_end(client: &mut Client, source: PlaySource) {
         }
     }
     client.unsubscribe(&[Topic::Playback]).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_keeps_no_more_of_the_hubs_music_than_its_cache_size() {
+    bounded(async {
+        let scratch = Scratch::new();
+        // Two more songs beside the album, each with a master of its own.
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio");
+        for (folder, fixture) in [
+            ("Somebody Else", "a.retagged.flac"),
+            ("Field Notes", "b.no-artist.flac"),
+        ] {
+            let folder = scratch.0.join("music").join(folder);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::copy(fixtures.join(fixture), folder.join("01.flac")).unwrap();
+        }
+        // A cache smaller than any master: each is let go once two newer
+        // are kept, the one playing and the one pulled after it.
+        let (_hub, _hub_client, _desk, mut desk_client) =
+            linked_player_with(&scratch, 100, Some(1)).await;
+        let songs = desk_client.list_open(&songs()).await.unwrap();
+        let ids: Vec<_> = songs
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Song(song) => Some(song.appearance_id),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.len() >= 3, "{ids:?}");
+        play_to_the_end(&mut desk_client, PlaySource::Tracks { ids }).await;
+        // Each played, and only the last two are kept.
+        let window = desk_client
+            .call::<QueueWindow>(&QueueWindowParams {
+                offset: 0,
+                limit: None,
+                order: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            window
+                .entries
+                .iter()
+                .all(|entry| entry.failed_reason.is_none()),
+            "{window:?}"
+        );
+        let kept = std::fs::read_dir(scratch.data_dir("desk").join("cache").join("audio"))
+            .unwrap()
+            .count();
+        assert_eq!(kept, 2);
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1144,7 +1213,7 @@ async fn a_server_takes_its_computers_name_and_keeps_one_chosen() {
     bounded(async {
         let scratch = Scratch::new();
         let named = |name: &str| Run {
-            name: Some(name.to_owned()),
+            computer_name: Some(name.to_owned()),
             ..Run::default()
         };
         let start_named = async |name: &str| {
@@ -1167,6 +1236,54 @@ async fn a_server_takes_its_computers_name_and_keeps_one_chosen() {
         let desk = start_named("Other Name").await;
         assert_eq!(desk.name(), "Studio Mac");
         desk.stop().await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_setting_wins_over_the_computers_name_and_the_stored_one() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let start = async |dir: &str, computer: Option<&str>, setting: Option<&str>| {
+            let run = Run {
+                computer_name: computer.map(str::to_owned),
+                name: setting.map(str::to_owned),
+                ..Run::default()
+            };
+            let server = Server::start_run(
+                HeldDir::take(scratch.data_dir(dir)).unwrap(),
+                Listen::on_port(0),
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+                Bounds::default(),
+                run,
+            )
+            .await
+            .unwrap();
+            let name = server.name();
+            server.stop().await.unwrap();
+            name
+        };
+        // On a first start the setting wins over the computer's name.
+        let porch = Some("Porch Speakers");
+        assert_eq!(
+            start("porch", Some("pi-zero"), porch).await,
+            "Porch Speakers"
+        );
+        // Left out later, the name it gave stands.
+        assert_eq!(
+            start("porch", Some("pi-zero"), None).await,
+            "Porch Speakers"
+        );
+        // Given again, it replaces a name the computer gave.
+        assert_eq!(start("desk", Some("Studio Mac"), None).await, "Studio Mac");
+        assert_eq!(
+            start("desk", Some("Studio Mac"), porch).await,
+            "Porch Speakers"
+        );
+        // A computer with no name leaves the default until it has one.
+        assert_eq!(start("attic", None, None).await, "Ritornel server");
+        assert_eq!(start("attic", Some("Attic Box"), None).await, "Attic Box");
     })
     .await;
 }

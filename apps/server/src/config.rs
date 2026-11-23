@@ -2,16 +2,18 @@
 //! variable, then `config.toml` in the data directory, then its default. See
 //! "Configuration and logging" in docs/internals/server.md.
 //!
-//! `config.toml` holds only what the server needs before a database opens,
-//! and a container needs no file at all. The settings so far are the log
-//! level, the listen address and where backups go, which a migration
-//! needs before it opens a database.
+//! `config.toml` holds only what the server needs as it starts, and a
+//! container needs no file at all. The settings so far are the log level,
+//! the listen address, where backups go, which a migration needs before it
+//! opens a database, the server's name, which a machine nobody sits at can
+//! be given no other way, and the size of a satellite's cache of masters.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use ritornel_contract::MAX_CLIENT_TEXT;
 use serde::Deserialize;
 use tracing::Level;
 
@@ -26,6 +28,12 @@ pub(crate) const LISTEN_VAR: &str = "RITORNEL_LISTEN";
 
 /// The environment variable that names where backups go.
 pub(crate) const BACKUP_DIR_VAR: &str = "RITORNEL_BACKUP_DIR";
+
+/// The environment variable that sets the server's name.
+pub(crate) const NAME_VAR: &str = "RITORNEL_NAME";
+
+/// The environment variable that sets the size of the cache of masters.
+pub(crate) const CACHE_SIZE_VAR: &str = "RITORNEL_CACHE_SIZE";
 
 /// The port a server listens on when nobody has said and it is free.
 pub(crate) const DEFAULT_PORT: u16 = 4747;
@@ -145,6 +153,12 @@ pub(crate) struct Settings {
     /// The folder backups are written to: an absolute path outside the
     /// data directory. With none there is no backup.
     pub(crate) backup_dir: Option<PathBuf>,
+    /// What the server is called, in place of the name it has stored,
+    /// at every start. With none the stored name stands.
+    pub(crate) name: Option<String>,
+    /// The most a satellite's cache of masters pulled from its hub holds,
+    /// in bytes. With none it is the default.
+    pub(crate) cache_bytes: Option<u64>,
 }
 
 /// The settings given on the command line.
@@ -153,6 +167,8 @@ pub(crate) struct Flags {
     pub(crate) log_level: Option<String>,
     pub(crate) listen: Option<String>,
     pub(crate) backup_dir: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) cache_size: Option<String>,
 }
 
 /// `config.toml`. A key it does not know is refused, so a misspelt setting
@@ -163,6 +179,8 @@ struct File {
     log_level: Option<String>,
     listen: Option<String>,
     backup_dir: Option<String>,
+    name: Option<String>,
+    cache_size: Option<String>,
 }
 
 /// Where a setting's value came from.
@@ -203,6 +221,10 @@ pub enum ConfigError {
     /// The backup folder is the data directory or inside it, where a
     /// backup would be lost with what it copies.
     BackupInside(Origin),
+    /// The name is empty, too long, or holds a control character.
+    Name(Origin),
+    /// The cache size is not a whole number of MiB or GiB above 0.
+    CacheSize(Origin),
 }
 
 impl fmt::Display for ConfigError {
@@ -232,6 +254,16 @@ impl fmt::Display for ConfigError {
                  with it",
                 origin.place("--backup-dir", BACKUP_DIR_VAR, "backup_dir")
             ),
+            Self::Name(origin) => write!(
+                f,
+                "{} must be 1 to {MAX_CLIENT_TEXT} characters with no control characters",
+                origin.place("--name", NAME_VAR, "name")
+            ),
+            Self::CacheSize(origin) => write!(
+                f,
+                "{} must be a whole number of MiB or GiB above 0, such as 512 MiB or 8 GiB",
+                origin.place("--cache-size", CACHE_SIZE_VAR, "cache_size")
+            ),
         }
     }
 }
@@ -243,7 +275,9 @@ impl std::error::Error for ConfigError {
             Self::LogLevel(_)
             | Self::Listen(_)
             | Self::BackupRelative(_)
-            | Self::BackupInside(_) => None,
+            | Self::BackupInside(_)
+            | Self::Name(_)
+            | Self::CacheSize(_) => None,
         }
     }
 }
@@ -298,11 +332,58 @@ fn resolve(
         Some((text, origin)) => Some(backup_dir(root, text, origin)?),
         None => None,
     };
+    let name = match chosen(flags.name.as_deref(), env(NAME_VAR), file.name) {
+        Some((text, origin)) => Some(name(text, origin)?),
+        None => None,
+    };
+    let cache_bytes = match chosen(
+        flags.cache_size.as_deref(),
+        env(CACHE_SIZE_VAR),
+        file.cache_size,
+    ) {
+        Some((text, origin)) => Some(
+            text.as_deref()
+                .and_then(bytes)
+                .ok_or(ConfigError::CacheSize(origin))?,
+        ),
+        None => None,
+    };
     Ok(Settings {
         log_level,
         listen,
         backup_dir,
+        name,
+        cache_bytes,
     })
+}
+
+/// A size such as `512 MiB` or `8GiB`, in bytes: a whole number above 0 and
+/// a unit, either case, with or without a space between.
+fn bytes(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let digits = text.find(|c: char| !c.is_ascii_digit())?;
+    let (number, unit) = text.split_at(digits);
+    let shift = match unit.trim().to_ascii_lowercase().as_str() {
+        "mib" => 20,
+        "gib" => 30,
+        _ => return None,
+    };
+    let number: u64 = number.parse().ok().filter(|number| *number > 0)?;
+    number.checked_mul(1 << shift)
+}
+
+/// The server's name, without the spaces around it: some text, no longer
+/// than a client's name may be, with no control character in it.
+fn name(text: Option<String>, origin: Origin) -> Result<String, ConfigError> {
+    let text = text.ok_or(ConfigError::Name(origin))?;
+    let name = text.trim();
+    if name.is_empty()
+        || name.chars().count() > MAX_CLIENT_TEXT
+        || name.chars().any(char::is_control)
+    {
+        return Err(ConfigError::Name(origin));
+    }
+    Ok(name.to_owned())
 }
 
 /// The backup folder, which must be an absolute path and outside the data
@@ -370,7 +451,7 @@ mod tests {
         Flags {
             log_level: log_level.map(str::to_owned),
             listen: listen.map(str::to_owned),
-            backup_dir: None,
+            ..Flags::default()
         }
     }
 
@@ -646,6 +727,140 @@ mod tests {
         );
     }
 
+    fn name(
+        flag: Option<&str>,
+        variable: Option<&str>,
+        file: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let variables: Vec<_> = variable
+            .map(|value| (NAME_VAR, value))
+            .into_iter()
+            .collect();
+        let flags = Flags {
+            name: flag.map(str::to_owned),
+            ..Flags::default()
+        };
+        resolve(Path::new(ROOT), &flags, &env(&variables), file)
+            .map(|settings| settings.name)
+            .map_err(|error| error.to_string())
+    }
+
+    fn cache_bytes(
+        flag: Option<&str>,
+        variable: Option<&str>,
+        file: Option<&str>,
+    ) -> Result<Option<u64>, String> {
+        let variables: Vec<_> = variable
+            .map(|value| (CACHE_SIZE_VAR, value))
+            .into_iter()
+            .collect();
+        let flags = Flags {
+            cache_size: flag.map(str::to_owned),
+            ..Flags::default()
+        };
+        resolve(Path::new(ROOT), &flags, &env(&variables), file)
+            .map(|settings| settings.cache_bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn the_cache_size_follows_the_same_order_in_mib_or_gib() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        const FILE: &str = "cache_size = \"8 GiB\"\n";
+        assert_eq!(cache_bytes(None, None, None), Ok(None));
+        assert_eq!(cache_bytes(None, None, Some(FILE)), Ok(Some(8 * GIB)));
+        assert_eq!(
+            cache_bytes(None, Some("512 MiB"), Some(FILE)),
+            Ok(Some(512 * MIB))
+        );
+        assert_eq!(
+            cache_bytes(Some("1gib"), Some("512 MiB"), Some(FILE)),
+            Ok(Some(GIB))
+        );
+        assert_eq!(cache_bytes(Some(" 64MiB "), None, None), Ok(Some(64 * MIB)));
+    }
+
+    #[test]
+    fn a_cache_size_that_is_not_a_whole_number_of_mib_or_gib_above_0_is_refused() {
+        for wrong in [
+            "0 GiB",
+            "8",
+            "8 GB",
+            "8 TiB",
+            "1.5 GiB",
+            "-1 GiB",
+            "GiB",
+            "",
+            "99999999999 GiB",
+        ] {
+            assert_eq!(
+                cache_bytes(Some(wrong), None, None),
+                Err(
+                    "--cache-size must be a whole number of MiB or GiB above 0, such as 512 \
+                     MiB or 8 GiB"
+                        .to_owned()
+                ),
+                "{wrong:?}"
+            );
+        }
+        assert!(
+            cache_bytes(None, Some("lots"), None)
+                .unwrap_err()
+                .starts_with("RITORNEL_CACHE_SIZE must be")
+        );
+        assert!(
+            cache_bytes(None, None, Some("cache_size = 8"))
+                .unwrap_err()
+                .starts_with("config.toml:")
+        );
+    }
+
+    #[test]
+    fn the_name_follows_the_same_order_and_is_unset_until_given() {
+        const FILE: &str = "name = \"Workbench Speakers\"\n";
+        let named = |name: &str| Ok(Some(name.to_owned()));
+        assert_eq!(name(None, None, None), Ok(None));
+        assert_eq!(name(None, None, Some(FILE)), named("Workbench Speakers"));
+        assert_eq!(name(None, Some("Porch"), Some(FILE)), named("Porch"));
+        assert_eq!(
+            name(Some("Attic"), Some("Porch"), Some(FILE)),
+            named("Attic")
+        );
+        assert_eq!(
+            name(None, Some(""), Some(FILE)),
+            named("Workbench Speakers")
+        );
+        // The spaces around it are not part of it.
+        assert_eq!(name(Some("  Attic \t"), None, None), named("Attic"));
+        let longest = "x".repeat(MAX_CLIENT_TEXT);
+        assert_eq!(name(Some(&longest), None, None), named(&longest));
+    }
+
+    #[test]
+    fn a_name_that_is_blank_too_long_or_holds_a_control_character_is_refused() {
+        let too_long = "x".repeat(MAX_CLIENT_TEXT + 1);
+        for wrong in ["   ", "Two\nLines", "Bell\u{7}", too_long.as_str()] {
+            assert_eq!(
+                name(Some(wrong), None, None),
+                Err(format!(
+                    "--name must be 1 to {MAX_CLIENT_TEXT} characters with no control characters"
+                )),
+                "{wrong:?}"
+            );
+        }
+        assert!(
+            name(None, Some("\t"), None)
+                .unwrap_err()
+                .starts_with("RITORNEL_NAME must be")
+        );
+        assert!(
+            name(None, None, Some("name = \"\""))
+                .unwrap_err()
+                .starts_with("name in config.toml must be")
+        );
+    }
+
     // A link is made differently on each system, and on Windows only with
     // a privilege a test does not have.
     #[cfg(unix)]
@@ -686,6 +901,8 @@ mod tests {
                 log_level: Level::INFO,
                 listen: Listen::DEFAULT,
                 backup_dir: None,
+                name: None,
+                cache_bytes: None,
             }
         );
 

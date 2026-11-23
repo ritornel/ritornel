@@ -41,6 +41,8 @@ Runtime bounds (`apps/server/src/bounds.rs`) keep resource usage bounded: `MAX_C
 
 A server is named after its computer (`platform::computer_name`), so a hub's satellites and a satellite's hub say which machine each is: the computer name on macOS, `PRETTY_HOSTNAME` in `/etc/machine-info` or else the hostname on Linux, and `COMPUTERNAME` on Windows. A server still carrying the first-start name `DEFAULT_NAME` takes its computer's name at start, and a name someone chose is kept. `RITORNEL_TEST_COMPUTER_NAME` stands in for the computer's name in tests.
 
+A name given in the settings (`--name`, `RITORNEL_NAME`, or `name` in `config.toml`) wins over the computer's name and the stored name at every start (`Server::start_run`), so a headless machine is called what a person calls its speakers rather than its hostname. It is trimmed and must be 1 to `MAX_CLIENT_TEXT` (100) characters with no control characters. Without one, the stored name stands, including the last one a setting gave, and a server still called `DEFAULT_NAME` takes its computer's name.
+
 ### Keeping a hub awake
 
 A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so being linked is not reason enough to keep a machine awake. When a hub keeps its machine from idle sleep is the owner's preference, kept in `server.db` (`server_setting` row `link.awake`) so it follows the server, and set with `link.setAwake` (`ritornelctl link awake`). It is one of three modes (`Awake`):
@@ -155,13 +157,17 @@ Ritornel uses ordinary SQLite tables with idempotent command receipts, an outbox
 
 Settings resolve in order: **CLI flag → `RITORNEL_*` environment variable → `config.toml` → default** (`apps/server/src/config.rs`).
 
-`config.toml` holds only what the server needs before a database opens (`#[serde(deny_unknown_fields)]` rejects unknown keys so typos fail loudly):
+`config.toml` holds only what the server needs as it starts (`#[serde(deny_unknown_fields)]` rejects unknown keys so typos fail loudly):
 
 | Setting | Flag | Env var | Default |
 |---|---|---|---|
 | Listen address | `--listen` | `RITORNEL_LISTEN` | `127.0.0.1:4747` (fallback: OS port); or `private:<port>` |
 | Log level | `--log-level` | `RITORNEL_LOG_LEVEL` | `info` |
 | Backup folder | `--backup-dir` | `RITORNEL_BACKUP_DIR` | None (backups disabled until set) |
+| Server name | `--name` | `RITORNEL_NAME` | None (the stored name, or the computer's in place of the default) |
+| Cache of masters a satellite pulls | `--cache-size` | `RITORNEL_CACHE_SIZE` | `2 GiB` |
+
+The name setting is described under "Server name" above.
 
 `--data-dir` / `RITORNEL_DATA_DIR` selects the data directory before `config.toml` is read, and `--output` (`default`, `null`, `none`) selects the audio output mode. All other persistent settings live in `library.db` (library-wide) or `server.db` (machine-local).
 

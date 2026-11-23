@@ -48,6 +48,8 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         log_level: args.log_level.clone(),
         listen: args.listen.clone(),
         backup_dir: args.backup_dir.clone(),
+        name: args.name.clone(),
+        cache_size: args.cache_size.clone(),
     };
     let settings = config::load(held.dir().root(), &flags, env)?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -77,9 +79,11 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         keep_awake: true,
         // `RITORNEL_TEST_COMPUTER_NAME`, for the tests alone, stands in
         // for the machine's name, so that a test need not know it.
-        name: env("RITORNEL_TEST_COMPUTER_NAME")
+        computer_name: env("RITORNEL_TEST_COMPUTER_NAME")
             .and_then(|name| name.to_str().map(str::to_owned))
             .or_else(crate::platform::computer_name),
+        name: settings.name.clone(),
+        cache_bytes: settings.cache_bytes,
     };
     let run = run(held, args, settings, clock, entropy, jobs, out);
     match &run {
