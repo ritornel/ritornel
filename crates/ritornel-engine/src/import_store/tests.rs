@@ -262,6 +262,79 @@ fn a_full_read_sets_aside_a_scrobble_an_earlier_read_stored_twice() {
 }
 
 #[test]
+fn a_full_read_keeps_a_repeat_deleted_at_the_source_and_lifts_one_listed_again() {
+    let rig = rig();
+    let counted = "SELECT count(*) FROM play_event WHERE excluded = 0";
+    // One read stored Paper Kites twice and Lanternfish in one second, as
+    // the source listed them. Then one Paper Kites was deleted there: the
+    // second holds fewer now, which is not the shape of a shifted read.
+    let at = T0 - 3 * HOUR;
+    rig.ingest(&batch(
+        vec![
+            record(at, "Moss Arcade", "Paper Kites", 0),
+            record(at, "Moss Arcade", "Paper Kites", 1),
+            record(at, "moss arcade", "LANTERNFISH", 0),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    ));
+    let deleted = batch(
+        vec![
+            record(at, "Moss Arcade", "Paper Kites", 0),
+            record(at, "moss arcade", "LANTERNFISH", 0),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    );
+    assert_eq!(rig.read(&deleted, true).set_aside, 0);
+    assert_eq!(rig.one(counted), "3");
+
+    // In another second, a shifted read: Salt Road twice, Not Here missed.
+    // A full read sets one aside. Later the source lists a second Salt
+    // Road under the key set aside, as a scrobble added there would be:
+    // the next full read lifts it.
+    let later = T0 - HOUR;
+    rig.ingest(&batch(
+        vec![
+            record(later, "Moss Arcade", "Salt Road (Live)", 0),
+            record(later, "Moss Arcade", "Salt Road (Live)", 1),
+        ],
+        later,
+        later + 1000,
+    ));
+    let shifted_back = batch(
+        vec![
+            record(later, "Moss Arcade", "Salt Road (Live)", 0),
+            record(later, "Somebody Else", "Not Here", 0),
+        ],
+        later,
+        later + 1000,
+    );
+    let stored = rig.read(&shifted_back, true);
+    assert_eq!((stored.new, stored.set_aside), (1, 1));
+    assert_eq!(rig.one(counted), "5");
+    let added = batch(
+        vec![
+            record(later, "Moss Arcade", "Salt Road (Live)", 0),
+            record(later, "Moss Arcade", "Salt Road (Live)", 1),
+            record(later, "Somebody Else", "Not Here", 0),
+        ],
+        later,
+        later + 1000,
+    );
+    assert_eq!(rig.read(&added, true).set_aside, 0);
+    assert_eq!(rig.one(counted), "6");
+    assert_eq!(
+        rig.one("SELECT count(*) FROM observation_correction WHERE verb = 'revoke'"),
+        "1"
+    );
+    // And it stays lifted.
+    let revision = rig.revision();
+    assert_eq!(rig.read(&added, true).set_aside, 0);
+    assert_eq!(rig.revision(), revision);
+}
+
+#[test]
 fn a_scrobble_binds_only_on_a_confident_match_and_the_report_lists_the_doubtful() {
     let rig = rig();
     rig.ingest(&first_batch());

@@ -1040,6 +1040,78 @@ pub(crate) fn exclude(
     rederive(write, &targets.iter().copied().collect(), rule)
 }
 
+/// Revokes the correction `correction`, an observation's row, with a
+/// `revoke` correction on the manual endpoint that says `note`, and derives
+/// every play it touched again by `rule`.
+pub(crate) fn revoke(
+    write: &Write<'_>,
+    correction: i64,
+    note: &str,
+    rule: PlayRule,
+) -> Result<(), Error> {
+    revoke_by(write, correction, Some(note), None, rule).map(|_| ())
+}
+
+/// [`revoke`], by the client session `session` where there is one. Returns
+/// the revocation's key.
+fn revoke_by(
+    write: &Write<'_>,
+    correction: i64,
+    note: Option<&str>,
+    session: Option<Id>,
+    rule: PlayRule,
+) -> Result<Id, Error> {
+    let connection = write.connection();
+    let (manual, listener, target): (i64, i64, [u8; 16]) = connection.query_row(
+        "SELECT endpoint_id, listener_id, source_key FROM history_observation WHERE id = ?1",
+        [correction],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let key = write.new_id()?;
+    let payload = serde_json::json!({
+        "verb": "revoke",
+        "target": Id::from_bytes(target).to_string(),
+        "note": note,
+    })
+    .to_string();
+    connection.execute(
+        "INSERT INTO history_observation
+           (endpoint_id, source_key, kind, listener_id, captured_at_utc_ms,
+            received_at_utc_ms, zone_basis, payload_json, rev)
+         VALUES (?1, ?2, 'correction', ?3, ?4, ?4, 'none', ?5, ?6)",
+        rusqlite::params![
+            manual,
+            key.as_bytes(),
+            listener,
+            write.now_ms(),
+            payload,
+            write.rev(),
+        ],
+    )?;
+    let revocation = connection.last_insert_rowid();
+    connection.execute(
+        "INSERT INTO observation_correction
+           (observation_id, verb, note, actor_session_pid, rev)
+         VALUES (?1, 'revoke', ?2, ?3, ?4)",
+        rusqlite::params![
+            revocation,
+            note,
+            session.as_ref().map(Id::as_bytes),
+            write.rev(),
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO correction_target (correction_id, target_observation_id, rev)
+         VALUES (?1, ?2, ?3)",
+        (revocation, correction, write.rev()),
+    )?;
+    let affected = correction_affected_observations(connection, correction)?;
+    if !affected.is_empty() {
+        rederive(write, &affected, rule)?;
+    }
+    Ok(key)
+}
+
 /// The non-correction observations affected by a correction, following
 /// `revoke` targets down to the corrections they undo.
 fn correction_affected_observations(
@@ -2073,71 +2145,18 @@ impl LibraryStore {
         let session = request.client.map(|client| client.session);
         let written = self.write(request, move |write| {
             let connection = write.connection();
-            let manual: i64 = connection
-                .query_row(
-                    "SELECT id FROM history_endpoint WHERE kind = 'manual'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .ok_or(Error::Corrupt("a library with no manual endpoint"))?;
-            let listener: i64 = connection
-                .query_row("SELECT min(id) FROM listener", [], |row| {
-                    row.get::<_, Option<i64>>(0)
-                })?
-                .ok_or(Error::Invalid("the library has no listener"))?;
             let target: i64 = connection
                 .query_row(
-                    "SELECT id FROM history_observation
-                     WHERE endpoint_id = ?1 AND source_key = ?2 AND kind = 'correction'",
-                    (manual, correction.as_bytes()),
+                    "SELECT o.id FROM history_observation o
+                     JOIN history_endpoint e ON e.id = o.endpoint_id
+                     WHERE e.kind = 'manual' AND o.source_key = ?1 AND o.kind = 'correction'",
+                    [correction.as_bytes()],
                     |row| row.get(0),
                 )
                 .optional()?
                 .ok_or(Error::NotFound("no such correction"))?;
-            let revoke_key = write.new_id()?;
-            let payload = serde_json::json!({
-                "verb": "revoke",
-                "target": correction.to_string(),
-                "note": note,
-            })
-            .to_string();
-            connection.execute(
-                "INSERT INTO history_observation
-                   (endpoint_id, source_key, kind, listener_id, captured_at_utc_ms,
-                    received_at_utc_ms, zone_basis, payload_json, rev)
-                 VALUES (?1, ?2, 'correction', ?3, ?4, ?4, 'none', ?5, ?6)",
-                rusqlite::params![
-                    manual,
-                    revoke_key.as_bytes(),
-                    listener,
-                    write.now_ms(),
-                    payload,
-                    write.rev(),
-                ],
-            )?;
-            let revoke_obs = connection.last_insert_rowid();
-            connection.execute(
-                "INSERT INTO observation_correction
-                   (observation_id, verb, note, actor_session_pid, rev)
-                 VALUES (?1, 'revoke', ?2, ?3, ?4)",
-                rusqlite::params![
-                    revoke_obs,
-                    note,
-                    session.as_ref().map(Id::as_bytes),
-                    write.rev(),
-                ],
-            )?;
-            connection.execute(
-                "INSERT INTO correction_target (correction_id, target_observation_id, rev)
-                 VALUES (?1, ?2, ?3)",
-                (revoke_obs, target, write.rev()),
-            )?;
-            let affected = correction_affected_observations(connection, target)?;
-            if !affected.is_empty() {
-                rederive(write, &affected, PlayRule::CURRENT)?;
-            }
-            Ok(serde_json::to_string(&revoke_key.to_string())?)
+            let key = revoke_by(write, target, note.as_deref(), session, PlayRule::CURRENT)?;
+            Ok(serde_json::to_string(&key.to_string())?)
         })?;
         let key: String = serde_json::from_str(&written.result_json)?;
         let key = key

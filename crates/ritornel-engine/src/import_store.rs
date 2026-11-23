@@ -511,58 +511,142 @@ fn gone(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<u64, Er
 }
 
 /// What an import set aside as a duplicate says, in its correction.
-pub(crate) const DUPLICATE_NOTE: &str =
-    "stored twice by an earlier read: the source holds this record once";
+pub(crate) const DUPLICATE_NOTE: &str = "an earlier read stored this scrobble twice and missed \
+     another of its second: the source lists as many scrobbles in the second, one fewer of this";
 
-/// The imports a full read finds stored twice in the batch's span: each one
-/// the source no longer holds, while it holds a record of the same track at
-/// the same time, as a read of pages whose order shifted between requests
-/// could leave. Only an import whose play is its own is taken, so that a
-/// play of this library's own that an echo joined is never left out, and an
-/// import set aside once, even if that was revoked since, is not taken
-/// again.
-fn duplicates(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Vec<i64>, Error> {
+/// What a revocation of such a correction says, when the source lists the
+/// import again.
+const LISTED_AGAIN_NOTE: &str = "the source lists this scrobble again";
+
+/// What a full read finds of what an earlier read stored wrong in the
+/// batch's span.
+#[derive(Debug, Default)]
+struct Recheck {
+    /// The imports to set aside.
+    set_aside: Vec<i64>,
+    /// The corrections that set aside an import the source lists again,
+    /// to revoke.
+    revoke: Vec<i64>,
+}
+
+/// Finds, in the batch's span, what an earlier read stored wrong. A read
+/// whose pages shifted between requests showed one scrobble of a second
+/// twice and another not at all. That is the one shape taken: a second
+/// whose first read, the write that first stored imports of it, stored as
+/// many as the source lists now, but more of one track and fewer of
+/// another. Of the track it stored more of, the imports the source does not
+/// list are set aside, never more than the surplus. A later read may have
+/// stored the one missed since, which changes nothing here. A scrobble
+/// deleted at the source, or one added to it later, changes how many the
+/// second holds, and is never taken for one. Only an import whose play is its own is set
+/// aside, so that a play of this library's own that an echo joined is never
+/// left out, and one set aside before, even if that was revoked since, is
+/// not set aside again. An import set aside so whose key the source lists
+/// again has its correction revoked.
+fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Recheck, Error> {
+    type Track = (String, Option<String>, String);
     let keys: HashSet<&[u8]> = batch
         .records
         .iter()
         .map(|record| record.source_key.as_slice())
         .collect();
-    let held: HashSet<(i64, &str, Option<&str>, &str)> = batch
-        .records
-        .iter()
-        .map(|record| {
-            let track = &record.track;
-            (
-                record.played_at_ms,
-                track.artist.as_str(),
-                track.album.as_deref(),
-                track.title.as_str(),
-            )
-        })
-        .collect();
+    // Each second's scrobbles, as the source lists them and as the
+    // library holds them, by track.
+    let mut listed: HashMap<i64, HashMap<Track, usize>> = HashMap::new();
+    for record in &batch.records {
+        let track = &record.track;
+        *listed
+            .entry(record.played_at_ms)
+            .or_default()
+            .entry((
+                track.artist.clone(),
+                track.album.clone(),
+                track.title.clone(),
+            ))
+            .or_default() += 1;
+    }
+    struct Held {
+        observation: i64,
+        rev: i64,
+        listed: bool,
+        track: Track,
+        takeable: bool,
+        set_aside_by: Option<i64>,
+    }
     let mut statement = connection.prepare_cached(
-        "SELECT o.id, o.source_key, i.played_at_utc_ms, i.artist, i.album, i.title
+        "SELECT o.id, o.rev, o.source_key, i.played_at_utc_ms, i.artist, i.album, i.title,
+                NOT EXISTS (SELECT 1 FROM correction_target t
+                            JOIN observation_correction c ON c.observation_id = t.correction_id
+                            WHERE t.target_observation_id = o.id AND c.verb = 'exclude')
+                AND (SELECT count(*) FROM play_event_observation mine
+                     JOIN play_event_observation other ON other.play_event_id = mine.play_event_id
+                     WHERE mine.observation_id = o.id) = 1,
+                (SELECT c.observation_id FROM correction_target t
+                 JOIN observation_correction c ON c.observation_id = t.correction_id
+                 WHERE t.target_observation_id = o.id AND c.verb = 'exclude' AND c.note = ?4
+                   AND NOT EXISTS (SELECT 1 FROM correction_target r
+                                   JOIN observation_correction rc
+                                     ON rc.observation_id = r.correction_id
+                                   WHERE r.target_observation_id = c.observation_id
+                                     AND rc.verb = 'revoke'))
          FROM observation_import i
          JOIN history_observation o ON o.id = i.observation_id
          WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms >= ?2 AND i.played_at_utc_ms < ?3
-           AND NOT EXISTS (SELECT 1 FROM correction_target t
-                           JOIN observation_correction c ON c.observation_id = t.correction_id
-                           WHERE t.target_observation_id = o.id AND c.verb = 'exclude')
-           AND (SELECT count(*) FROM play_event_observation mine
-                JOIN play_event_observation other ON other.play_event_id = mine.play_event_id
-                WHERE mine.observation_id = o.id) = 1
          ORDER BY o.id",
     )?;
-    let mut rows = statement.query((endpoint, batch.span.from_ms, batch.span.to_ms))?;
-    let mut found = Vec::new();
+    let mut rows = statement.query(rusqlite::params![
+        endpoint,
+        batch.span.from_ms,
+        batch.span.to_ms,
+        DUPLICATE_NOTE
+    ])?;
+    let mut held: BTreeMap<i64, Vec<Held>> = BTreeMap::new();
     while let Some(row) = rows.next()? {
-        let key: Vec<u8> = row.get(1)?;
-        let (at, artist, album, title): (i64, String, Option<String>, String) =
-            (row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?);
-        if !keys.contains(key.as_slice())
-            && held.contains(&(at, artist.as_str(), album.as_deref(), title.as_str()))
-        {
-            found.push(row.get(0)?);
+        let key: Vec<u8> = row.get(2)?;
+        held.entry(row.get(3)?).or_default().push(Held {
+            observation: row.get(0)?,
+            rev: row.get(1)?,
+            listed: keys.contains(key.as_slice()),
+            track: (row.get(4)?, row.get(5)?, row.get(6)?),
+            takeable: row.get(7)?,
+            set_aside_by: row.get(8)?,
+        });
+    }
+    let mut found = Recheck::default();
+    for (second, imports) in &held {
+        found.revoke.extend(
+            imports
+                .iter()
+                .filter(|import| import.listed)
+                .filter_map(|import| import.set_aside_by),
+        );
+        let Some(listed) = listed.get(second) else {
+            continue;
+        };
+        let first = imports.iter().map(|import| import.rev).min();
+        let first: Vec<&Held> = imports
+            .iter()
+            .filter(|import| Some(import.rev) == first)
+            .collect();
+        if first.len() != listed.values().sum::<usize>() {
+            continue;
+        }
+        let mut stored: HashMap<&Track, usize> = HashMap::new();
+        for import in &first {
+            *stored.entry(&import.track).or_default() += 1;
+        }
+        for (track, stored) in stored {
+            let lists = listed.get(track).copied().unwrap_or(0);
+            if lists == 0 || stored <= lists {
+                continue;
+            }
+            found.set_aside.extend(
+                first
+                    .iter()
+                    .filter(|import| &import.track == track && !import.listed && import.takeable)
+                    .map(|import| import.observation)
+                    .take(stored - lists),
+            );
         }
     }
     Ok(found)
@@ -890,8 +974,9 @@ impl LibraryStore {
     /// derived from them and the batch's cursor, in one transaction. A
     /// batch with nothing new writes nothing, its cursor included. Of a
     /// `full` read, the same transaction sets aside what an earlier read
-    /// stored twice in the batch's span ([`duplicates`]), each with an
-    /// `exclude` correction that says [`DUPLICATE_NOTE`].
+    /// stored twice in the batch's span, each with an `exclude` correction
+    /// that says [`DUPLICATE_NOTE`], and revokes such a correction whose
+    /// import the source lists again ([`recheck`]).
     pub(crate) fn ingest_import_batch(
         &self,
         account: Id,
@@ -901,7 +986,7 @@ impl LibraryStore {
     ) -> Result<Stored, Error> {
         // Read first: a batch that is all stored already writes nothing,
         // and takes no library revision.
-        let (new, gone, doubled) = {
+        let (new, gone, rechecked) = {
             let batch = batch.clone();
             self.read(move |connection| {
                 let rows = rows_of(connection, account)?;
@@ -910,19 +995,20 @@ impl LibraryStore {
                     rows.endpoint,
                     batch.records.iter().map(|record| &record.source_key),
                 )?;
-                let doubled = if full {
-                    duplicates(connection, rows.endpoint, &batch)?.len()
+                let rechecked = if full {
+                    let found = recheck(connection, rows.endpoint, &batch)?;
+                    found.set_aside.len() + found.revoke.len()
                 } else {
                     0
                 };
                 Ok((
                     batch.records.len() - held.len(),
                     gone(connection, rows.endpoint, &batch)?,
-                    doubled,
+                    rechecked,
                 ))
             })?
         };
-        if new == 0 && doubled == 0 {
+        if new == 0 && rechecked == 0 {
             return Ok(Stored {
                 new: 0,
                 gone,
@@ -937,15 +1023,20 @@ impl LibraryStore {
                 client: None,
             },
             move |write| {
-                let new = ingest_imports(write, account, &batch, rule)?;
-                let doubled = if full {
+                // Before the new records go in: what the library held is
+                // what is compared.
+                let found = if full {
                     let endpoint = rows_of(write.connection(), account)?.endpoint;
-                    duplicates(write.connection(), endpoint, &batch)?
+                    recheck(write.connection(), endpoint, &batch)?
                 } else {
-                    Vec::new()
+                    Recheck::default()
                 };
-                crate::history_store::exclude(write, &doubled, DUPLICATE_NOTE, rule)?;
-                Ok(serde_json::to_string(&(new, doubled.len()))?)
+                let new = ingest_imports(write, account, &batch, rule)?;
+                crate::history_store::exclude(write, &found.set_aside, DUPLICATE_NOTE, rule)?;
+                for correction in &found.revoke {
+                    crate::history_store::revoke(write, *correction, LISTED_AGAIN_NOTE, rule)?;
+                }
+                Ok(serde_json::to_string(&(new, found.set_aside.len()))?)
             },
         )?;
         let (new, set_aside): (u64, u64) = serde_json::from_str(&written.result_json)?;
