@@ -3770,14 +3770,62 @@ fn a_shared_appearance_shows_the_same_title_whichever_copy_held_it() {
     world.settle();
     assert_eq!(world.recording(older), world.recording(newer));
     assert_ne!(world.release(older), world.release(newer));
+    let held = world.item(newer).current.unwrap().appearance.unwrap();
     world.library.items[0].facts.album = Some("Long Field".to_owned());
     let resolution = world.settle();
-    let shared = world.item(newer).current.unwrap().appearance;
-    assert_eq!(world.item(older).current.unwrap().appearance, shared);
+    assert_eq!(world.item(newer).current.unwrap().appearance, Some(held));
+    assert_eq!(world.item(older).current.unwrap().appearance, Some(held));
     let shown = resolution
         .appearances
         .iter()
-        .find(|out| out.r == Ref::Row(shared.unwrap()))
+        .find(|out| out.r == Ref::Row(held))
+        .unwrap();
+    assert_eq!(shown.title.as_deref(), Some("Glass Pier"));
+    world.assert_settled();
+}
+
+/// A merged track appearance that no file holds directly shows what the
+/// appearances redirected into it claim, in first-seen order, however the
+/// passes placed their files.
+#[test]
+fn a_merged_appearance_shows_the_same_title_whichever_copy_held_its_parts() {
+    let mut world = World::default();
+    let older = world.add(file("A/1.flac", 1).song("Glass Pier", "Ninefold", 200).on(
+        "Night Drives",
+        None,
+        3,
+    ));
+    let demo = world.add(
+        file("A/2.flac", 1)
+            .song("Glass Pier [Demo]", "Ninefold", 200)
+            .on("Long Field", None, 1),
+    );
+    let newer = world.add(
+        file("A/3.flac", 1)
+            .song("Glass Pier (Live)", "Ninefold", 200)
+            .on("Long Field", None, 3),
+    );
+    world.settle();
+    // The owner merged the two appearances on Long Field into one no file
+    // is on.
+    let merged = 1_000;
+    for id in [demo, newer] {
+        let part = world.item(id).current.unwrap().appearance.unwrap();
+        world.library.appearance_canonical.insert(part, merged);
+    }
+    world.settle();
+    // The older copy joins the newer one's part, which it holds the next
+    // time.
+    world.library.items[0].facts.album = Some("Long Field".to_owned());
+    let resolution = world.settle();
+    assert_eq!(
+        world.item(older).current.unwrap().appearance,
+        world.item(newer).current.unwrap().appearance
+    );
+    let shown = resolution
+        .appearances
+        .iter()
+        .find(|out| out.r == Ref::Row(merged))
         .unwrap();
     assert_eq!(shown.title.as_deref(), Some("Glass Pier"));
     world.assert_settled();

@@ -16,7 +16,9 @@ use std::hash::Hash;
 /// 2: a disc marker before an album title's bracketed notes is a disc.
 /// 3: an album none of whose files names an artist is shown as Unknown
 ///    Artist's, not Various Artists', and is formed and grouped as before.
-pub const CATALOG_VERSION: i64 = 3;
+/// 4: a track appearance several files share shows what they claim in
+///    first-seen order, whichever of them held it before.
+pub const CATALOG_VERSION: i64 = 4;
 
 use crate::extract::{Facts, parse_date};
 use crate::library::{
@@ -771,9 +773,9 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             active.appearance = Some(at);
         }
     }
-    // What an appearance shows is picked from its members in order, so the
-    // order is the files' own, not which pass placed them: a file that joins
-    // a row this time holds it the next.
+    // What an appearance shows is picked from its members in order, so they
+    // are in first-seen order, not the order the passes placed them in: a
+    // file that joins a row this time holds it the next.
     for (_, members) in &mut appearance_rows {
         members.sort_unstable();
     }
