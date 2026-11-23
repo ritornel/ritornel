@@ -1046,6 +1046,39 @@ fn several(rig: &mut Rig) {
 }
 
 #[test]
+fn a_scan_cut_off_after_marking_files_missing_still_counts_them() {
+    // Cut off straight after marking two files missing, before saving that,
+    // and after the resolution that follows, which saved it.
+    for cut in [1, 2] {
+        let mut rig = Rig::new();
+        several(&mut rig);
+        rig.scan();
+        let root = rig.root();
+        std::fs::remove_file(root.join("Loose/b.flac")).unwrap();
+        std::fs::remove_file(root.join("Loose/tone.wav")).unwrap();
+        let source = rig.main.clone();
+        let cut_off = rig.try_scan(
+            &source,
+            ScanSettings {
+                fail_after_step: Some(cut),
+                ..ScanSettings::default()
+            },
+        );
+        assert!(
+            matches!(cut_off, Err(Error::FailPoint)),
+            "{cut}: {cut_off:?}"
+        );
+        // Started again, its walk finds them missing already.
+        let resumed = rig.resume(ScanSettings::default()).unwrap();
+        assert_eq!((resumed.missing, resumed.unchanged), (2, 8), "{cut}");
+        assert_eq!(
+            rig.one("SELECT count(*) FROM source_item WHERE missing_since_ms IS NOT NULL"),
+            "2"
+        );
+    }
+}
+
+#[test]
 fn a_scan_cut_off_after_any_step_converges_to_what_an_uninterrupted_scan_makes() {
     let small = ScanSettings {
         batch_files: 2,
@@ -1087,12 +1120,35 @@ fn a_scan_cut_off_after_any_step_converges_to_what_an_uninterrupted_scan_makes()
         );
 
         // The next run finds the job claimed by a run that is gone, takes
-        // it back, and carries on.
+        // it back, and carries on. Cut off after the resolution, it is
+        // finished without walking the root, which may be offline by then.
+        let root = rig.root();
+        let away = rig.scratch.path().join("unmounted");
+        if cut == steps {
+            std::fs::rename(&root, &away).unwrap();
+        }
         let resumed = rig.resume(small).unwrap();
+        if cut == steps {
+            std::fs::rename(&away, &root).unwrap();
+        }
         assert_eq!(rig.shape(), whole.shape(), "{cut}");
         // No step was done twice: the files of a step that had committed
         // were found unchanged, and its command ID was found.
-        assert_eq!(resumed.unchanged, (2 * cut as u64).min(10), "{cut}");
+        let unchanged = if cut == steps {
+            0
+        } else {
+            (2 * cut as u64).min(10)
+        };
+        assert_eq!(resumed.unchanged, unchanged, "{cut}");
+        // And what it counted was not lost with its checkpoint.
+        assert_eq!(
+            ScanSummary {
+                unchanged: uninterrupted.unchanged,
+                ..resumed
+            },
+            uninterrupted,
+            "{cut}"
+        );
         assert_eq!(
             rig.one("SELECT count(*) FROM library_revision WHERE method = 'scan.step'"),
             steps.to_string()
@@ -1432,6 +1488,7 @@ fn a_file_an_earlier_scan_recorded_as_unreadable_by_a_failed_read_is_read_again(
             request,
             rig.main.row,
             vec![crate::scan_store::RecordOp::Update { item, payload }],
+            String::new(),
         )
         .unwrap();
     assert_eq!(rig.library.stats().unwrap().files_unreadable, 1);

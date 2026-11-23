@@ -538,16 +538,18 @@ impl LibraryStore {
             .call(move |connection| stored_receipt(connection, &command))
     }
 
-    /// Whether the command with this ID has been carried out. A job asks
-    /// before it redoes a step that a crash may have cut off after its
-    /// commit.
-    pub(crate) fn has_command(&self, command: Id) -> Result<bool, Error> {
+    /// The stored result of the command with this ID, if it has been
+    /// carried out. A job asks before it redoes a step that a crash may have
+    /// cut off after its commit.
+    pub(crate) fn command_result(&self, command: Id) -> Result<Option<String>, Error> {
         self.reader.call(|connection| {
-            Ok(connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM library_command WHERE command_id = ?1)",
-                [command.as_bytes()],
-                |row| row.get(0),
-            )?)
+            Ok(connection
+                .query_row(
+                    "SELECT result_json FROM library_command WHERE command_id = ?1",
+                    [command.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?)
         })
     }
 

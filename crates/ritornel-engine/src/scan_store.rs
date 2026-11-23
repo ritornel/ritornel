@@ -508,12 +508,14 @@ impl LibraryStore {
         })
     }
 
-    /// Records what a scan read, in one transaction.
+    /// Records what a scan read, in one transaction, with `receipt` as the
+    /// write's stored result.
     pub(crate) fn record(
         &self,
         request: WriteRequest,
         source: i64,
         ops: Vec<RecordOp>,
+        receipt: String,
     ) -> Result<Written, Error> {
         self.write(request, move |write| {
             let recorder = Recorder::new(write)?;
@@ -535,17 +537,18 @@ impl LibraryStore {
             if !ops.is_empty() {
                 mark_pending(write)?;
             }
-            Ok(ops.len().to_string())
+            Ok(receipt)
         })
     }
 
-    /// Marks items whose files a scan of a reachable root no longer finds.
-    /// An item keeps everything it has, and reclaims it if the file
-    /// returns.
+    /// Marks items whose files a scan of a reachable root no longer finds,
+    /// with `receipt` as the write's stored result. An item keeps everything
+    /// it has, and reclaims it if the file returns.
     pub(crate) fn mark_missing(
         &self,
         request: WriteRequest,
         items: Vec<i64>,
+        receipt: String,
     ) -> Result<Written, Error> {
         self.write(request, move |write| {
             let mut update = write.connection().prepare(
@@ -557,7 +560,7 @@ impl LibraryStore {
             }
             drop(update);
             mark_pending(write)?;
-            Ok(items.len().to_string())
+            Ok(receipt)
         })
     }
 
