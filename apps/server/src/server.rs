@@ -188,14 +188,12 @@ impl Server {
 
         let (identity, library) = library::open(dir, &store, identity, &clock, &entropy)?;
         // A hub renamed at start, as after its computer's name, keeps the
-        // library's registry of servers in step.
+        // library's registry of servers in step, and one a crash or a
+        // failed write left behind catches up.
         if let Some(library) = &library
-            && library
-                .server_name(identity.server_id)
-                .is_ok_and(|known| known.is_some_and(|known| known != identity.name))
-            && let Err(error) = library.register_server(identity.server_id, &identity.name)
+            && let Err(error) = library::keep_registry_name(library, &identity)
         {
-            warn!(%error, "the library's registry keeps this server's old name");
+            warn!(%error, "the library's registry of servers could not be kept in step with this server's name");
         }
 
         // This run holds the directory's lock, so whatever run claimed a
@@ -331,8 +329,11 @@ impl Server {
         memory::attach(&self.core, kind)
     }
 
-    /// Renames the server and sends its new status to every session
-    /// subscribed to the `servers` topic.
+    /// Renames the server, keeps its row in the library's registry of
+    /// servers in step on a hub, and sends its new status to every session
+    /// subscribed to the `servers` topic. If the registry cannot be written,
+    /// the new name is still stored and sent, and the error is returned;
+    /// the registry is caught up at the next start or rename.
     ///
     /// No call of the contract does this yet; it is exposed so tests can
     /// change a server's status and exercise the `servers` topic.

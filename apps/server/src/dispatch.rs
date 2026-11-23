@@ -682,26 +682,38 @@ impl Core {
         library
     }
 
-    /// Renames the server, and sends its new status to every session that
-    /// subscribed to the `servers` topic.
+    /// Renames the server, keeps its row in the library's registry of
+    /// servers in step on a hub, and sends its new status to every session
+    /// that subscribed to the `servers` topic. An error from the registry
+    /// comes after the new name is stored and sent.
     ///
     /// No call of the contract reaches this yet; it is used by tests to
     /// change a server's status and exercise the `servers` topic.
     pub(crate) fn rename(&self, name: &str) -> Result<(), Error> {
-        // The database before the name, as a call takes them: the other
+        // The databases before the name, as a call takes them: the other
         // order could wait on a call while that call waits on this.
         let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
         let stores = stores.as_ref().ok_or(Error::Stopped)?;
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
         // Held from the write to the last publish, so two renames reach
-        // every session in the order they were stored.
+        // every session, and the registry, in the order they were stored.
         let mut this = lock(&self.this);
         let Some(identity) = stores.server.rename(name)? else {
             // A core is made from an identity, so there is always one.
             return Ok(());
         };
+        // The name stored is the name, so it is sent whether or not the
+        // registry took it; a registry left behind is said, and caught up
+        // by the next start or rename.
+        let registry = library.as_ref().map_or(Ok(()), |library| {
+            crate::library::keep_registry_name(library, &identity)
+        });
         this.name = identity.name;
         self.changed(&mut this);
-        Ok(())
+        registry.map_err(Error::Library)
     }
 
     /// Counts a change to this server's status and sends the new status to
@@ -1737,6 +1749,52 @@ mod tests {
         // The library is a file only the OS user can read.
         let library_db = scratch.path().join("data/library.db");
         assert!(crate::platform::path_is_private(&library_db));
+    }
+
+    #[test]
+    fn a_hub_renamed_while_it_runs_keeps_the_librarys_registry_in_step() {
+        let (core, scratch) = core();
+        let session = greeted(&core, SessionKind::Full);
+        call(&core, &session, "library.create", Some(key(0xc0))).unwrap();
+        let registry = || -> (String, i64) {
+            rusqlite::Connection::open(scratch.path().join("data/library.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT name, (SELECT rev FROM library_meta) FROM server WHERE public_id = ?1",
+                    [core.server_id().as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(registry(), ("desk".to_owned(), 1));
+
+        core.rename("attic").unwrap();
+        assert_eq!(registry(), ("attic".to_owned(), 2));
+        // The same name again leaves the library's revision as it was.
+        core.rename("attic").unwrap();
+        assert_eq!(registry(), ("attic".to_owned(), 2));
+
+        // A registry that cannot be written: the rename says so, and the
+        // name is stored and sent all the same. The same name again, once
+        // it can be written, catches the registry up.
+        let library_db = || rusqlite::Connection::open(scratch.path().join("data/library.db"));
+        library_db()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_rename BEFORE UPDATE ON server
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            )
+            .unwrap();
+        assert!(matches!(core.rename("cellar"), Err(Error::Library(_))));
+        let list = call(&core, &session, "servers.list", None).unwrap();
+        assert_eq!(list["servers"][0]["name"], "cellar");
+        assert_eq!(registry(), ("attic".to_owned(), 2));
+        library_db()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_rename")
+            .unwrap();
+        core.rename("cellar").unwrap();
+        assert_eq!(registry(), ("cellar".to_owned(), 3));
     }
 
     #[test]
