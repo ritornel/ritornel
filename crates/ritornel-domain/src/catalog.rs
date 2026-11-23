@@ -16,7 +16,9 @@ use std::hash::Hash;
 /// 2: a disc marker before an album title's bracketed notes is a disc.
 /// 3: an album none of whose files names an artist is shown as Unknown
 ///    Artist's, not Various Artists', and is formed and grouped as before.
-pub const CATALOG_VERSION: i64 = 3;
+/// 4: a track appearance several files share shows what they claim in
+///    first-seen order, whichever of them held it before.
+pub const CATALOG_VERSION: i64 = 4;
 
 use crate::extract::{Facts, parse_date};
 use crate::library::{
@@ -771,6 +773,12 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             active.appearance = Some(at);
         }
     }
+    // What an appearance shows is picked from its members in order, so they
+    // are in first-seen order, not the order the passes placed them in: a
+    // file that joins a row this time holds it the next.
+    for (_, members) in &mut appearance_rows {
+        members.sort_unstable();
+    }
 
     // Artists: each MusicBrainz ID is one, and a name with no ID is the
     // artist of that exact normalised name.
@@ -1244,10 +1252,11 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
     // If a canonical merged track appearance has no direct live assignment of
     // its own, still project its display from its edits and the claims of
     // appearances redirecting into it so playback and lists stay up to date.
-    for (canon, members) in redirected_appearances {
+    for (canon, mut members) in redirected_appearances {
         if emitted_appearances.contains(&canon) {
             continue;
         }
+        members.sort_unstable_by_key(|active| active.seq);
         let Some(first) = members.first() else {
             continue;
         };
