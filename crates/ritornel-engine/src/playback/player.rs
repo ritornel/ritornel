@@ -804,9 +804,9 @@ impl Player {
         }
         self.prepared = None;
         self.ran_out = None;
-        // What was asked for on its behalf no longer is; a copy fetched all
-        // the same is kept.
-        self.fetching = None;
+        // What was asked for the track after it no longer is; a copy fetched
+        // all the same is kept. The current entry's own fetch stands, should
+        // it still be waiting.
         self.fetching_next = None;
         match self
             .recorder
@@ -1743,6 +1743,8 @@ impl Player {
         let joins = self.loaded.is_some()
             && self.prepared.is_none()
             && next.is_some_and(|next| next.appearance == fetch.appearance);
+        // A failure is for the entry that asked, not another of its track.
+        let next_asked = joins && next.is_some_and(|next| next.entry_id == fetch.entry);
         // A copy fetched answers whatever asked for its track; a failure only
         // the attempt that asked.
         let asked_next = self.fetching_next == Some(fetch);
@@ -1761,7 +1763,7 @@ impl Player {
             Ok(copy) => self.keep_fetched(fetch.appearance, copy),
             Err(why) if waiting => self.unfetched = Some((fetch.entry, why)),
             // Fetched again when its turn comes.
-            Err(_) if joins && asked_next => {
+            Err(_) if next_asked && asked_next => {
                 self.prepared = Some(Prepared {
                     entry_id: fetch.entry,
                     loaded: None,

@@ -3391,3 +3391,29 @@ fn a_track_paused_while_it_buffers_and_jumped_to_starts_as_the_users_pick() {
     assert_eq!(last.started.appearance, rig.tracks[2]);
     assert_eq!(last.started.start_reason.as_str(), "user_pick");
 }
+
+#[test]
+fn a_late_failure_for_an_entry_taken_out_does_not_hold_back_another_of_its_track() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[1]);
+    rig.play(0);
+    // The second track again, played next: two entries of it in a row.
+    rig.add(1, super::Place::Next, None).unwrap();
+    rig.pass(1_000);
+    let next = rig.player.wanted().unwrap();
+    // The entry asked for is taken out, and its fetch fails before a tick:
+    // the other entry of the same track, which now follows, is fetched.
+    let request = rig.request("queue.remove");
+    let catalog = Away::new(&rig.library, &rig.away);
+    let done = rig
+        .player
+        .remove(request, None, &[next.entry], &rig.server, Some(&catalog))
+        .unwrap();
+    rig.note(&done.events);
+    rig.fetched(next, Err("the hub went away".to_owned()));
+    rig.tick();
+    rig.tick();
+    let wanted = rig.player.wanted().unwrap();
+    assert_eq!(wanted.appearance, next.appearance);
+    assert_ne!(wanted.entry, next.entry);
+}
