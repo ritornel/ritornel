@@ -427,7 +427,9 @@ impl Settings {
         match &link.state {
             State::Connected(_) => {}
             state => {
-                let said = if matches!(state, State::Looking) {
+                let said = if link.preparing.is_some() {
+                    "Ritornel is updating your library. Settings come back when it is done."
+                } else if matches!(state, State::Looking) {
                     "Looking for the server…"
                 } else {
                     "Ritornel cannot reach its server. Settings come back when it does."

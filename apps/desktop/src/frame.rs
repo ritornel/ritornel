@@ -176,8 +176,10 @@ pub(crate) type OnHover = Rc<dyn Fn(bool, &mut gpui::Window, &mut App)>;
 pub(crate) fn title_bar(
     can_go_back: bool,
     lit: Tab,
-    // The connection, or what is said while there is none.
-    server: Result<Server, &'static str>,
+    // The connection, or `None` when there is none.
+    server: Option<Server>,
+    // What is said while there is none.
+    unconnected: &'static str,
     search: gpui::AnyElement,
     on_back: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut App) + 'static,
     on_tab: OnTab,
@@ -283,7 +285,7 @@ pub(crate) fn title_bar(
                 .text_size(px(12.5))
                 .text_color(theme::dim())
                 .whitespace_nowrap()
-                .child(connection(server)),
+                .child(connection(server, unconnected)),
         )
         .child(search)
         .when(platform::CHROME.app_buttons, |bar| {
@@ -292,30 +294,28 @@ pub(crate) fn title_bar(
 }
 
 /// The connection's dot and name, and what hovering them says.
-fn connection(server: Result<Server, &'static str>) -> impl IntoElement {
+fn connection(server: Option<Server>, unconnected: &'static str) -> impl IntoElement {
     let dot = div().size(px(7.)).flex_none().rounded_full();
     let dot = match &server {
-        Ok(server) if server.away => dot.border(px(1.5)).border_color(theme::warn()),
-        Ok(_) => dot.bg(gpui::rgb(0x3fae6a)),
-        Err(_) => dot.bg(theme::fill2()),
+        Some(server) if server.away => dot.border(px(1.5)).border_color(theme::warn()),
+        Some(_) => dot.bg(gpui::rgb(0x3fae6a)),
+        None => dot.bg(theme::fill2()),
     };
-    let Server {
+    let Some(Server {
         name,
         card,
         on_hover,
         ..
-    } = match server {
-        Ok(server) => server,
-        Err(said) => {
-            return div()
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .min_w_0()
-                .child(dot)
-                .child(div().min_w_0().truncate().child(said))
-                .into_any_element();
-        }
+    }) = server
+    else {
+        return div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .min_w_0()
+            .child(dot)
+            .child(div().min_w_0().truncate().child(unconnected))
+            .into_any_element();
     };
     div()
         .id("connection")

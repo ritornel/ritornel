@@ -237,9 +237,10 @@ impl HistoryPage {
         }));
     }
 
-    /// Whether it is ready to be seen: read, or known not to be readable.
+    /// Whether it is ready to be seen: read, known not to be readable, or
+    /// with no session to read it through.
     pub(crate) fn ready(&self) -> bool {
-        self.read.is_some() || self.failed || self.unheld
+        self.read.is_some() || self.failed || self.unheld || self.net.is_none()
     }
 
     /// Scrolls the page by `dy` at once, as a script's jump does.
@@ -779,7 +780,12 @@ impl Render for HistoryPage {
                 .read
                 .as_ref()
                 .is_some_and(|read| read.stream.months == 0);
-        if self.failed {
+        if self.read.is_none()
+            && let Some(step) = self.link.read(cx).preparing
+        {
+            let (title, text) = crate::link::preparing_words(step);
+            body = body.child(crate::blank::Blank::new(title, text).render(viewport));
+        } else if self.failed {
             body = body.child(
                 div()
                     .px(px(gutter))
@@ -789,14 +795,6 @@ impl Render for HistoryPage {
                     .text_color(theme::faint())
                     .child("Your history could not be read."),
             );
-        } else if let Some(step) = self
-            .read
-            .is_none()
-            .then(|| self.link.read(cx).preparing)
-            .flatten()
-        {
-            let (title, text) = crate::link::preparing_words(step);
-            body = body.child(crate::blank::Blank::new(title, text).render(viewport));
         } else if empty {
             body = body.child(
                 crate::blank::Blank::new(

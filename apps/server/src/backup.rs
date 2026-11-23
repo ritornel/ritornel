@@ -855,6 +855,29 @@ mod tests {
     }
 
     #[test]
+    fn the_copy_and_then_the_migration_are_said_as_they_come() {
+        let pending: &IsPending =
+            &|_, database| Ok((database == Database::Server).then_some(Pending { from: 1, to: 2 }));
+        let none: &IsPending = &|_, _| Ok(None);
+        let said = |place: Option<&Path>, pending: &IsPending| {
+            let scratch = Scratch::new();
+            let dir = data(&scratch);
+            let steps = std::cell::RefCell::new(Vec::new());
+            let done = before_migrations(&dir, place, AT, pending, &|step| {
+                steps.borrow_mut().push(step);
+            });
+            (done.is_ok(), steps.into_inner())
+        };
+        let scratch = Scratch::new();
+        let place = scratch.path().join("elsewhere");
+        std::fs::create_dir(&place).unwrap();
+        assert_eq!(said(Some(&place), none), (true, vec![]));
+        let both = vec![Preparing::Backup, Preparing::Migration];
+        assert_eq!(said(Some(&place), pending), (true, both.clone()));
+        assert_eq!(said(None, pending), (true, both));
+    }
+
+    #[test]
     fn a_migration_is_copied_for_first_to_the_place_or_else_into_the_data_directory() {
         let pending: &dyn Fn(&Path, Database) -> _ =
             &|_, database| Ok((database == Database::Server).then_some(Pending { from: 1, to: 2 }));

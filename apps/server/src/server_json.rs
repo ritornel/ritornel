@@ -63,13 +63,18 @@ pub(crate) fn write_whole(path: &Path, contents: &impl serde::Serialize) -> Resu
     text.push('\n');
 
     let temporary = path.with_extension("json.tmp");
-    std::fs::File::create(&temporary)
+    let written = std::fs::File::create(&temporary)
         .and_then(|mut file| {
             file.write_all(text.as_bytes())?;
             file.sync_all()
         })
-        .map_err(io_error("write", &temporary))?;
-    std::fs::rename(&temporary, path).map_err(io_error("write", path))
+        .map_err(io_error("write", &temporary))
+        .and_then(|()| std::fs::rename(&temporary, path).map_err(io_error("write", path)));
+    if written.is_err() {
+        // Half a file is left for nobody.
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
 }
 
 /// Removes `server.json`, or `preparing.json`, if it is there. A server

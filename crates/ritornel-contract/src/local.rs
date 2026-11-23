@@ -132,6 +132,7 @@ pub struct ServerJson {
 
 /// What `preparing.json` holds: the server's process, and what it is doing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreparingJson {
     /// The server's process.
     pub pid: u32,
@@ -141,7 +142,7 @@ pub struct PreparingJson {
 
 /// What a server is doing before it listens, in the order it does them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum Preparing {
     /// Copying the databases, before a migration.
     Backup,

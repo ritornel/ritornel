@@ -97,13 +97,13 @@ impl Why {
 pub(crate) fn preparing_words(step: Preparing) -> (&'static str, &'static str) {
     let text = match step {
         Preparing::Backup => {
-            "Ritornel is getting your library ready for this version. First it keeps a copy of it as it is now. Your music and history will be here when it is done."
+            "Saving a copy of your library first. Your music and history will be here when it is done."
         }
         Preparing::Migration => {
-            "Ritornel is getting your library ready for this version, and has kept a copy of it as it was. Your music and history will be here when it is done."
+            "A copy of your library is saved, and it is being updated now. Your music and history will be here when it is done."
         }
         Preparing::History => {
-            "Ritornel is bringing your listening history up to date for this version. Your music and history will be here when it is done."
+            "Bringing your listening history up to date. Your music and history will be here when it is done."
         }
     };
     ("Updating your library…", text)
@@ -299,8 +299,16 @@ impl Link {
                     .spawn(async move { local::preparing(&dir) })
                     .await;
                 let changed = link.update(cx, |link, cx| {
-                    if link.preparing != step {
-                        link.preparing = step;
+                    if link.preparing == step {
+                        return;
+                    }
+                    // Done preparing, the server is about to listen: look
+                    // now rather than at the end of a wait between looks.
+                    let done = link.preparing.is_some() && step.is_none();
+                    link.preparing = step;
+                    if done && !link.looking && !matches!(link.state, State::Connected(_)) {
+                        link.look(cx);
+                    } else {
                         cx.notify();
                     }
                 });
