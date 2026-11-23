@@ -62,8 +62,10 @@ pub struct SpotifyStream {
 }
 
 /// What kind of device played a stream. Spotify's own text names the device
-/// and its system, so only this word is kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// and its system, so only this word is kept. A word it does not know is
+/// refused with an error that does not repeat it, so that text sent in its
+/// place is never echoed back or logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SpotifyPlatform {
@@ -83,6 +85,25 @@ pub enum SpotifyPlatform {
     Cast,
     /// Anything else, or nothing said.
     Other,
+}
+
+impl<'de> Deserialize<'de> for SpotifyPlatform {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Word;
+        impl serde::de::Visitor<'_> for Word {
+            type Value = SpotifyPlatform;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a platform word")
+            }
+            fn visit_str<E: serde::de::Error>(self, word: &str) -> Result<SpotifyPlatform, E> {
+                SpotifyPlatform::ALL
+                    .into_iter()
+                    .find(|platform| platform.as_str() == word)
+                    .ok_or_else(|| E::custom("a platform is one of its words"))
+            }
+        }
+        deserializer.deserialize_str(Word)
+    }
 }
 
 impl SpotifyPlatform {
@@ -157,7 +178,18 @@ mod tests {
             );
         }
         let mut wire = stream();
-        wire["platform"] = json!("iOS 17.1 (iPhone15,2)");
-        assert!(serde_json::from_value::<SpotifyStream>(wire).is_err());
+        wire["platform"] = json!("iOS 17.1 (MARKED_DEVICE)");
+        let error = serde_json::from_value::<SpotifyStream>(wire)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("MARKED"), "{error}");
+        for platform in SpotifyPlatform::ALL {
+            let word = serde_json::to_value(platform).unwrap();
+            assert_eq!(word, json!(platform.as_str()));
+            assert_eq!(
+                serde_json::from_value::<SpotifyPlatform>(word).unwrap(),
+                platform
+            );
+        }
     }
 }

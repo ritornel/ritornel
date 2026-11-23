@@ -9,6 +9,7 @@ mod archive;
 mod rows;
 
 pub(crate) use self::archive::Error as ArchiveError;
+use self::archive::shown;
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -98,7 +99,8 @@ impl Archive {
             let stream = match row {
                 Row::Music(stream) => stream,
                 Row::NotMusic(kind) => {
-                    if let Some(count) = tally.not_music.get_mut(kind as usize) {
+                    let at = NotMusic::ALL.iter().position(|each| *each == kind);
+                    if let Some(count) = at.and_then(|at| tally.not_music.get_mut(at)) {
                         *count += 1;
                     }
                     continue;
@@ -242,8 +244,13 @@ fn render(tally: &Tally) -> String {
         lines.push((
             "Not read",
             format!(
-                "{} files of video history: music videos and video shows",
-                tally.video_files
+                "{} {} of video history: music videos and video shows",
+                tally.video_files,
+                if tally.video_files == 1 {
+                    "file"
+                } else {
+                    "files"
+                }
             ),
         ));
     }
@@ -253,14 +260,19 @@ fn render(tally: &Tally) -> String {
         .filter(|(_, count)| *count > 0)
         .map(|(word, count)| format!("{} {count}", word.as_str()))
         .collect();
-    lines.push(("By platform", platforms.join(", ")));
+    if !platforms.is_empty() {
+        lines.push(("By platform", platforms.join(", ")));
+    }
     if !tally.unknown.is_empty() {
-        let names: Vec<&str> = tally.unknown.iter().map(String::as_str).collect();
+        let names: Vec<String> = tally.unknown.iter().map(|name| shown(name)).collect();
         lines.push(("Fields not kept", names.join(", ")));
     }
     let mut text = crate::server::facts(&lines);
     for (file, row, field) in &tally.wrong_named {
-        text.push_str(&format!("  {file}, row {row}: {field} would not read\n"));
+        text.push_str(&format!(
+            "  {}, row {row}: {field} would not read\n",
+            shown(file)
+        ));
     }
     if tally.wrong > tally.wrong_named.len() as u64 {
         text.push_str(&format!(
@@ -308,6 +320,7 @@ mod tests {
             "ms_played": ms,
             "conn_country": "MARKED_COUNTRY",
             "ip_addr": "MARKED_IP",
+            "ip_addr_decrypted": "MARKED_IP_DECRYPTED",
             "user_agent_decrypted": "MARKED_AGENT",
             "master_metadata_track_name": format!("Song {track}"),
             "master_metadata_album_artist_name": "Calla Brandt",
@@ -341,9 +354,20 @@ mod tests {
         episode
     }
 
+    fn audiobook() -> Value {
+        let mut book = row("2019-03-15T23:00:00Z", 900_000, 10, "iOS 12.1");
+        book["spotify_track_uri"] = Value::Null;
+        book["audiobook_title"] = json!("MARKED_BOOK");
+        book["audiobook_uri"] = json!("spotify:audiobook:MARKED");
+        book["audiobook_chapter_uri"] = json!("spotify:chapter:MARKED");
+        book["audiobook_chapter_title"] = json!("MARKED_CHAPTER");
+        book
+    }
+
     /// An invented archive: two years in two files, a repeated row, a row
-    /// repeated with another reason, a short stream, an episode, and a file
-    /// that is not the history.
+    /// repeated with another reason, a short stream, an episode, an
+    /// audiobook, a file of video history and a file that is not the
+    /// history.
     fn files() -> Vec<(&'static str, Vec<u8>)> {
         let first = row("2019-03-15T21:14:09Z", 221_000, 1, "iOS 12.1");
         let mut other_reason = first.clone();
@@ -354,6 +378,7 @@ mod tests {
             other_reason,
             row("2019-03-15T21:14:21Z", 12_000, 2, "iOS 12.1"),
             episode(),
+            audiobook(),
         ]);
         let year_two = json!([
             row("2020-01-02T08:00:00Z", 30_000, 3, "Partner google cast_tv"),
@@ -406,9 +431,9 @@ mod tests {
         Tally {
             files: 2,
             video_files: 1,
-            rows: 7,
+            rows: 8,
             music: 6,
-            not_music: [1, 0, 0, 0],
+            not_music: [1, 1, 0, 0],
             wrong: 0,
             wrong_named: Vec::new(),
             repeats: 2,
@@ -457,26 +482,46 @@ mod tests {
         let read = read(&zip).unwrap();
         let kept = serde_json::to_string(&read.streams).unwrap();
         assert!(!kept.contains("MARKED"), "{kept}");
-        // Each kept record has the kept fields and no other.
+        // Each kept record has the kept fields and no other, by a list
+        // written here rather than taken from the type.
+        let allowed = [
+            "endedAt",
+            "msPlayed",
+            "trackUri",
+            "title",
+            "artist",
+            "album",
+            "reasonStart",
+            "reasonEnd",
+            "shuffle",
+            "skipped",
+            "offline",
+            "offlineTimestamp",
+            "incognito",
+            "platform",
+        ];
         for stream in &read.streams {
             let value = serde_json::to_value(stream).unwrap();
-            let back: SpotifyStream = serde_json::from_value(value).unwrap();
-            assert_eq!(&back, stream);
+            for key in value.as_object().unwrap().keys() {
+                assert!(allowed.contains(&key.as_str()), "{key}");
+            }
         }
         for json in [false, true] {
             let printed = command(&zip, json);
             // The one mark that is printed is the name of a field the
-            // reader does not know, which is a name and no value.
+            // reader does not know, which is a name and no value; and no
+            // kept value is printed either.
             let without_name = printed.replace("MARKED_FIELD", "");
-            assert!(!without_name.contains("MARKED"), "{printed}");
+            for value in ["MARKED", "Calla Brandt", "Glasshouse", "Song ", "spotify:"] {
+                assert!(!without_name.contains(value), "{value}: {printed}");
+            }
         }
     }
 
     #[test]
     fn a_row_that_will_not_read_is_named_by_file_row_and_field_alone() {
         let scratch = Scratch::new("wrong");
-        let mut wrong = row("MARKED_TIME", 1_000, 4, "ios");
-        wrong["ms_played"] = json!(1_000);
+        let wrong = row("MARKED_TIME", 1_000, 4, "ios");
         let file = serde_json::to_vec(&json!([
             row("2019-03-15T21:14:09Z", 221_000, 1, "ios"),
             wrong
@@ -493,6 +538,17 @@ mod tests {
             !printed.replace("MARKED_FIELD", "").contains("MARKED"),
             "{printed}"
         );
+        let json: Value = serde_json::from_str(&command(&zip, true)).unwrap();
+        assert_eq!(
+            json["wrongRows"],
+            json!([{ "file": "Streaming_History_Audio_2019.json", "row": 2, "field": "ts" }])
+        );
+        assert!(
+            !json
+                .to_string()
+                .replace("MARKED_FIELD", "")
+                .contains("MARKED")
+        );
 
         // A file that breaks is named with the row it broke at, and none
         // of what the parser choked on.
@@ -502,6 +558,28 @@ mod tests {
         assert_eq!(
             error,
             "Streaming_History_Audio_2019.json: row 1 is not a row of the history"
+        );
+    }
+
+    #[test]
+    fn a_damaged_file_of_the_history_is_said_and_never_passed_over() {
+        let scratch = Scratch::new("damaged");
+        let zip = scratch.0.join("history.zip");
+        zip_of(&zip, &files());
+        // Break the second file's own header, which the archive's list of
+        // names does not depend on.
+        let mut bytes = std::fs::read(&zip).unwrap();
+        let headers: Vec<usize> = bytes
+            .windows(4)
+            .enumerate()
+            .filter(|(_, window)| *window == b"PK\x03\x04")
+            .map(|(at, _)| at)
+            .collect();
+        bytes[headers[1]] = b'X';
+        std::fs::write(&zip, bytes).unwrap();
+        assert_eq!(
+            read(&zip).unwrap_err().to_string(),
+            "Streaming_History_Audio_2020.json: it cannot be read"
         );
     }
 
@@ -541,18 +619,18 @@ mod tests {
         let printed = command(&zip, false);
         for line in [
             "Files             2\n",
-            "Rows              7\n",
+            "Rows              8\n",
             "Streams of music  6\n",
             "From              2019-03-15 to 2020-01-02\n",
-            "Not music         1: 1 episode\n",
+            "Not music         2: 1 episode, 1 audiobook\n",
             "By platform       mac 1, ios 4, cast 1\n",
-            "Not read          1 files of video history: music videos and video shows\n",
+            "Not read          1 file of video history: music videos and video shows\n",
             "Nothing was stored or sent.\n",
         ] {
             assert!(printed.contains(line), "{line}{printed}");
         }
         let json: Value = serde_json::from_str(&command(&zip, true)).unwrap();
-        assert_eq!(json["rows"], 7);
+        assert_eq!(json["rows"], 8);
         assert_eq!(json["repeats"], 2);
         assert_eq!(json["thirtySecondsDistinct"], 3);
         assert_eq!(json["notMusic"]["episode"], 1);

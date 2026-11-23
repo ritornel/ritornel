@@ -15,6 +15,7 @@ use std::str::FromStr;
 use ritornel_client::contract::{SpotifyPlatform, SpotifyStream};
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 /// The fields that are kept, by the name Spotify gives each.
 const KEPT: [&str; 14] = [
@@ -35,16 +36,21 @@ const KEPT: [&str; 14] = [
 ];
 
 /// The fields that are known and never kept: who and where the listener
-/// was, and what a row that is not music names.
-const DROPPED: [&str; 12] = [
+/// was.
+const DROPPED: [&str; 5] = [
     "ip_addr",
     "ip_addr_decrypted",
     "user_agent_decrypted",
     "username",
     "conn_country",
-    "episode_name",
-    "episode_show_name",
-    "spotify_episode_uri",
+];
+
+/// The fields of an episode of a show: a row that holds any is not music.
+const EPISODE: [&str; 3] = ["episode_name", "episode_show_name", "spotify_episode_uri"];
+
+/// The fields of a chapter of an audiobook: a row that holds any is not
+/// music.
+const AUDIOBOOK: [&str; 4] = [
     "audiobook_title",
     "audiobook_uri",
     "audiobook_chapter_uri",
@@ -106,6 +112,8 @@ pub(crate) enum FileError {
     /// The file is not a JSON list of rows: it broke at this row, from 1,
     /// or before the first when 0.
     NotRows(usize),
+    /// The list of rows is followed by something else.
+    AfterRows,
 }
 
 impl fmt::Display for FileError {
@@ -113,6 +121,7 @@ impl fmt::Display for FileError {
         match self {
             Self::NotRows(0) => f.write_str("it is not a list of rows"),
             Self::NotRows(row) => write!(f, "row {row} is not a row of the history"),
+            Self::AfterRows => f.write_str("something follows its list of rows"),
         }
     }
 }
@@ -126,10 +135,9 @@ pub(crate) fn read(bytes: &[u8]) -> Result<FileRows, FileError> {
         rows: &mut rows,
         seen: &mut seen,
     });
-    match result.and_then(|()| deserializer.end()) {
-        Ok(()) => Ok(rows),
-        Err(_) => Err(FileError::NotRows(seen)),
-    }
+    result.map_err(|_| FileError::NotRows(seen))?;
+    deserializer.end().map_err(|_| FileError::AfterRows)?;
+    Ok(rows)
 }
 
 struct FileVisitor<'a> {
@@ -160,11 +168,12 @@ impl<'de> Visitor<'de> for FileVisitor<'_> {
     }
 }
 
-/// A row's kept fields, before they are checked, and whether the fields of
-/// a row that is not music held anything.
+/// A row's kept fields, as the text of each before it is read, and whether
+/// the fields of a row that is not music held anything. Each kept value is
+/// read on its own, so that one that will not read is told by its field.
 #[derive(Default)]
 struct Raw {
-    kept: [Option<Value>; KEPT.len()],
+    kept: [Option<Box<RawValue>>; KEPT.len()],
     episode: bool,
     audiobook: bool,
 }
@@ -192,7 +201,7 @@ impl<'de> Visitor<'de> for RawSeed<'_> {
         let mut raw = Raw::default();
         while let Some(name) = map.next_key::<String>()? {
             if let Some(at) = KEPT.iter().position(|kept| *kept == name) {
-                let value = map.next_value::<Value>()?;
+                let value = map.next_value::<Box<RawValue>>()?;
                 if let Some(slot) = raw.kept.get_mut(at) {
                     *slot = Some(value);
                 }
@@ -200,9 +209,9 @@ impl<'de> Visitor<'de> for RawSeed<'_> {
             }
             // Only whether it held anything: `null` or a value, never what.
             let held = map.next_value::<Option<IgnoredAny>>()?.is_some();
-            if name.starts_with("episode_") || name == "spotify_episode_uri" {
+            if EPISODE.contains(&name.as_str()) {
                 raw.episode |= held;
-            } else if name.starts_with("audiobook_") {
+            } else if AUDIOBOOK.contains(&name.as_str()) {
                 raw.audiobook |= held;
             } else if !DROPPED.contains(&name.as_str()) {
                 self.unknown.insert(name);
@@ -213,12 +222,19 @@ impl<'de> Visitor<'de> for RawSeed<'_> {
 }
 
 impl Raw {
-    fn take(&mut self, name: &'static str) -> Option<Value> {
-        let at = KEPT.iter().position(|kept| *kept == name)?;
-        self.kept
-            .get_mut(at)?
-            .take()
-            .filter(|value| !value.is_null())
+    /// A kept field's value, or nothing for a field that is not there or
+    /// is `null`. A value that will not read, as a number too large for
+    /// any type, is told by the field's name.
+    fn take(&mut self, name: &'static str) -> Result<Option<Value>, &'static str> {
+        let Some(raw) = KEPT
+            .iter()
+            .position(|kept| *kept == name)
+            .and_then(|at| self.kept.get_mut(at)?.take())
+        else {
+            return Ok(None);
+        };
+        let value: Value = serde_json::from_str(raw.get()).map_err(|_| name)?;
+        Ok(Some(value).filter(|value| !value.is_null()))
     }
 
     fn row(mut self) -> Row {
@@ -273,7 +289,7 @@ impl Raw {
 
 /// A field that is text, or nothing.
 fn text(raw: &mut Raw, name: &'static str) -> Result<Option<String>, &'static str> {
-    match raw.take(name) {
+    match raw.take(name)? {
         None => Ok(None),
         Some(Value::String(text)) => Ok(Some(text)),
         Some(_) => Err(name),
@@ -282,7 +298,7 @@ fn text(raw: &mut Raw, name: &'static str) -> Result<Option<String>, &'static st
 
 /// A field that is true or false, or nothing.
 fn flag(raw: &mut Raw, name: &'static str) -> Result<Option<bool>, &'static str> {
-    match raw.take(name) {
+    match raw.take(name)? {
         None => Ok(None),
         Some(Value::Bool(flag)) => Ok(Some(flag)),
         Some(_) => Err(name),
@@ -291,7 +307,7 @@ fn flag(raw: &mut Raw, name: &'static str) -> Result<Option<bool>, &'static str>
 
 /// A field that is a whole number, or nothing.
 fn whole(raw: &mut Raw, name: &'static str) -> Result<Option<i64>, &'static str> {
-    match raw.take(name) {
+    match raw.take(name)? {
         None => Ok(None),
         Some(Value::Number(number)) => number.as_i64().map(Some).ok_or(name),
         Some(_) => Err(name),
@@ -311,27 +327,32 @@ fn instant(ts: &str) -> Option<i64> {
         .map(jiff::Timestamp::as_millisecond)
 }
 
+/// How a platform's text begins, and the word for it. Spotify's text puts
+/// the system first and the device after it, so only the beginning is
+/// read: a device's own name never decides the word. A Spotify Connect
+/// device, such as a speaker or a television, is a `Partner`.
+const PLATFORMS: [(&str, SpotifyPlatform); 12] = [
+    ("partner", SpotifyPlatform::Cast),
+    ("cast", SpotifyPlatform::Cast),
+    ("webplayer", SpotifyPlatform::Web),
+    ("web_player", SpotifyPlatform::Web),
+    ("web player", SpotifyPlatform::Web),
+    ("android", SpotifyPlatform::Android),
+    ("ios", SpotifyPlatform::Ios),
+    ("os x", SpotifyPlatform::Mac),
+    ("osx", SpotifyPlatform::Mac),
+    ("macos", SpotifyPlatform::Mac),
+    ("windows", SpotifyPlatform::Windows),
+    ("linux", SpotifyPlatform::Linux),
+];
+
 /// The kind of device a platform's text names. Only the word is kept.
 pub(crate) fn platform_word(text: &str) -> SpotifyPlatform {
-    let text = text.to_ascii_lowercase();
-    let has = |word: &str| text.contains(word);
-    if has("web_player") || has("web player") || text.starts_with("web") {
-        SpotifyPlatform::Web
-    } else if has("cast") || text.starts_with("partner") {
-        SpotifyPlatform::Cast
-    } else if has("android") {
-        SpotifyPlatform::Android
-    } else if text.starts_with("ios") || has("iphone") || has("ipad") || has("ipod") {
-        SpotifyPlatform::Ios
-    } else if text.starts_with("os x") || text.starts_with("osx") || text.starts_with("macos") {
-        SpotifyPlatform::Mac
-    } else if text.starts_with("windows") {
-        SpotifyPlatform::Windows
-    } else if text.starts_with("linux") {
-        SpotifyPlatform::Linux
-    } else {
-        SpotifyPlatform::Other
-    }
+    let text = text.trim_start().to_ascii_lowercase();
+    PLATFORMS
+        .iter()
+        .find(|(prefix, _)| text.starts_with(prefix))
+        .map_or(SpotifyPlatform::Other, |(_, word)| *word)
 }
 
 #[cfg(test)]
@@ -444,6 +465,7 @@ mod tests {
             ("ms_played", json!(-1)),
             ("shuffle", json!("MARKED")),
             ("offline_timestamp", json!(1.5)),
+            ("shuffle", json!([true])),
             ("reason_end", json!(7)),
         ] {
             let mut wrong = row();
@@ -453,6 +475,28 @@ mod tests {
                 Row::Wrong(KEPT.iter().find(|k| **k == field).unwrap())
             );
         }
+    }
+
+    #[test]
+    fn a_number_too_large_to_read_is_told_by_its_field_and_the_file_reads_on() {
+        let good = serde_json::to_string(&row()).unwrap();
+        let huge = good.replace("\"ms_played\":221000", "\"ms_played\":1e400");
+        assert_ne!(huge, good);
+        let rows = read(format!("[{huge}, {good}]").as_bytes()).unwrap();
+        assert_eq!(rows.rows.len(), 2);
+        assert_eq!(rows.rows[0], Row::Wrong("ms_played"));
+        assert!(matches!(rows.rows[1], Row::Music(_)));
+    }
+
+    #[test]
+    fn a_new_field_that_begins_like_an_episodes_is_unknown_and_drops_no_row() {
+        let mut new = row();
+        new["episode_playback_setting"] = json!(false);
+        new["audiobook_like_setting"] = json!("MARKED");
+        let bytes = serde_json::to_vec(&json!([new])).unwrap();
+        let rows = read(&bytes).unwrap();
+        assert!(matches!(rows.rows[0], Row::Music(_)));
+        assert_eq!(rows.unknown.len(), 2);
     }
 
     #[test]
@@ -480,6 +524,10 @@ mod tests {
             FileError::NotRows(2)
         );
         assert_eq!(read(b"[]").unwrap().rows, []);
+        assert_eq!(
+            read(format!("[{good}] MARKED").as_bytes()).unwrap_err(),
+            FileError::AfterRows
+        );
     }
 
     #[test]
@@ -502,6 +550,13 @@ mod tests {
             ("Partner google cast_tv;Invented;;", SpotifyPlatform::Cast),
             ("Partner invented_speaker;Model;;", SpotifyPlatform::Cast),
             ("cast_to_device", SpotifyPlatform::Cast),
+            // A device's name never decides it.
+            (
+                "Android OS 9 (Invented Broadcast)",
+                SpotifyPlatform::Android,
+            ),
+            ("iOS 17.1 (Webster's Phone)", SpotifyPlatform::Ios),
+            ("webOS TV", SpotifyPlatform::Other),
             ("", SpotifyPlatform::Other),
             ("something new", SpotifyPlatform::Other),
         ] {

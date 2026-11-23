@@ -1318,6 +1318,40 @@ mod tests {
     }
 
     #[test]
+    fn spotify_read_takes_an_archive_and_json_and_no_data_directory() {
+        assert_eq!(
+            parse(args(&["spotify", "read", "/archive.zip", "--json"]))
+                .unwrap()
+                .command,
+            Command::Spotify(SpotifyCommand::Read(SpotifyReadArgs {
+                archive: PathBuf::from("/archive.zip"),
+                json: true,
+            }))
+        );
+        for line in [
+            &["spotify", "read"][..],
+            &[
+                "spotify",
+                "read",
+                "/archive.zip",
+                "--data-dir",
+                "/srv/ritornel",
+            ],
+            &["spotify"],
+        ] {
+            let (code, out, _) = program(line);
+            assert_eq!((code, out.as_str()), (EXIT_USAGE, ""), "{line:?}");
+        }
+        // It needs no server: a folder with no history says so.
+        let (code, _, err) = program(&["spotify", "read", "/there/is/no/such/archive"]);
+        assert_eq!(code, EXIT_FAILED);
+        assert!(
+            err.starts_with("ritornelctl: cannot read that archive: "),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn help_and_version_print_and_succeed() {
         let (code, out, err) = program(&["--help"]);
         assert_eq!((code, err.as_str()), (0, ""));
