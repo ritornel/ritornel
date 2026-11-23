@@ -498,20 +498,20 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
         ..
     } = whole;
     let applied = core.with_library(|_, library| {
-        let report = library.stream_dry_run(streams.clone())?;
-        let stored = library.apply_streams(
+        library.apply_streams(
             step(&job, ritornel_engine::APPLY_METHOD, run),
             run,
             streams,
             reader,
             params.session,
-        )?;
-        Ok::<_, ritornel_engine::Error>((report, stored))
+        )
     });
     match applied {
-        Some(Ok((report, _))) => {
+        Some(Ok((_, report))) => {
             // The run is applied whatever becomes of its report.
-            if let Err(failed) = staging.save_report(run, begun_at, &report) {
+            if let Some(report) = report
+                && let Err(failed) = staging.save_report(run, begun_at, &report)
+            {
                 warn!(error = %failed, "an applied run's report could not be kept");
             }
             finish(core, &job, JobState::Succeeded, None);

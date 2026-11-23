@@ -145,37 +145,45 @@ impl LibraryStore {
     /// commit and writes nothing.
     pub fn stream_dry_run(&self, records: Vec<SpotifyStream>) -> Result<ImportReport, Error> {
         let made_at = self.clock().now_ms();
-        let read = self.read_snapshot(|connection| {
-            let (scrobbles, excluded, echoes) = scrobbles(connection)?;
-            let listener = connection.query_row(
-                "SELECT coalesce((SELECT id FROM listener ORDER BY id LIMIT 1), 0)",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(Read {
-                scrobbles,
-                excluded,
-                echoes,
-                plays_by_year: plays_by_year(connection)?,
-                listener,
-                zone_periods: zone_periods(connection)?,
-                stored: stored_streams(connection)?,
-            })
-        })?;
+        let read = self.read_snapshot(read)?;
         let streams = keyed(records, &read.stored);
-        Ok(dry_run(&DryRunInput {
-            streams: &streams,
-            scrobbles: &read.scrobbles,
-            excluded: read.excluded,
-            echoes: read.echoes,
-            plays_by_year: &read.plays_by_year,
-            listener: read.listener,
-            zone_periods: &read.zone_periods,
-            pins: &Pins::default(),
-            stored: &read.stored,
-            made_at,
-        }))
+        Ok(report(&read, &streams, made_at))
     }
+}
+
+/// What a dry run reads, as `connection` sees the library.
+fn read(connection: &Connection) -> Result<Read, Error> {
+    let (scrobbles, excluded, echoes) = scrobbles(connection)?;
+    let listener = connection.query_row(
+        "SELECT coalesce((SELECT id FROM listener ORDER BY id LIMIT 1), 0)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(Read {
+        scrobbles,
+        excluded,
+        echoes,
+        plays_by_year: plays_by_year(connection)?,
+        listener,
+        zone_periods: zone_periods(connection)?,
+        stored: stored_streams(connection)?,
+    })
+}
+
+/// The dry run's report of these streams, keyed against what was read.
+fn report(read: &Read, streams: &[Stream], made_at: i64) -> ImportReport {
+    dry_run(&DryRunInput {
+        streams,
+        scrobbles: &read.scrobbles,
+        excluded: read.excluded,
+        echoes: read.echoes,
+        plays_by_year: &read.plays_by_year,
+        listener: read.listener,
+        zone_periods: &read.zone_periods,
+        pins: &Pins::default(),
+        stored: &read.stored,
+        made_at,
+    })
 }
 
 /// The name of the library's Spotify endpoint and source instance. Neither
@@ -499,8 +507,9 @@ impl LibraryStore {
     }
 
     /// Applies a run of streams: stores those not stored yet and records
-    /// the run, in one write. A run applied before writes nothing and
-    /// returns what it is. That is looked at before the write is begun, as
+    /// the run, in one write, and returns it with the report of what it
+    /// did, worked out in the same write from what it saw. A run applied
+    /// before writes nothing, and returns what it is with no report. That is looked at before the write is begun, as
     /// one writer of runs, the hub's job worker, is enough to make sure of;
     /// a second writer racing it would find the run inside the write, and
     /// take a revision that changes nothing.
@@ -511,18 +520,26 @@ impl LibraryStore {
         records: Vec<SpotifyStream>,
         reader: String,
         session: Option<Id>,
-    ) -> Result<StoredRun, Error> {
+    ) -> Result<(StoredRun, Option<ImportReport>), Error> {
         if let Some(stored) = self.stored_run(run)? {
-            return Ok(stored);
+            return Ok((stored, None));
         }
+        // The report goes beside the write's result, which a command sent
+        // again is answered with, and not in it.
+        let (sent, report_of) = std::sync::mpsc::channel();
         let written = self.write(request, move |write| {
             // Keyed against what is stored as this write sees it, so that a
             // row a run stored before keeps its key.
-            let streams = keyed(records, &stored_streams(write.connection())?);
+            let read = read(write.connection())?;
+            let streams = keyed(records, &read.stored);
+            let _ = sent.send(report(&read, &streams, write.now_ms()));
             let stored = apply_in(write, run, &streams, &reader, session)?;
             Ok(serde_json::to_string(&stored)?)
         })?;
-        Ok(serde_json::from_str(&written.result_json)?)
+        Ok((
+            serde_json::from_str(&written.result_json)?,
+            report_of.try_recv().ok(),
+        ))
     }
 
     /// Takes a run out of force: a row of its ledger, in one write. Its

@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn a_join_a_correction_pins_is_counted_as_pinned_and_in_no_tier() {
-        let streams = keyed(vec![record(221, 221, "Low Tide", "trackdone")]);
+        let streams = fresh(vec![record(221, 221, "Low Tide", "trackdone")]);
         // An hour on: no tier would join it.
         let scrobbles = [scrobble(3600, "Low Tide")];
         let pins = Pins {

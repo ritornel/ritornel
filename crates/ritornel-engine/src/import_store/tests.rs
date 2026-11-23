@@ -1252,6 +1252,7 @@ fn apply(rig: &Rig, run: u8, streams: Vec<ritornel_contract::SpotifyStream>) -> 
             None,
         )
         .unwrap()
+        .0
 }
 
 fn undo(rig: &Rig, run: u8) -> crate::StoredRun {
@@ -1265,6 +1266,49 @@ fn undo(rig: &Rig, run: u8) -> crate::StoredRun {
             Id::from_bytes([run; 16]),
         )
         .unwrap()
+}
+
+#[test]
+fn an_apply_reports_what_it_did_as_the_dry_run_would_and_a_second_reports_nothing() {
+    let rig = rig();
+    rig.ingest(&first_batch());
+    let archive = vec![
+        stream(T0 - 3 * HOUR + 2000, 200_000, "Paper Kites"),
+        stream(T0 - 2 * HOUR, 180_000, "Lanternfish"),
+    ];
+    let mut before = rig.library.stream_dry_run(archive.clone()).unwrap();
+    let request = || WriteRequest {
+        method: crate::APPLY_METHOD,
+        command: None,
+        client: None,
+    };
+    let run = Id::from_bytes([1; 16]);
+    let (_, report) = rig
+        .library
+        .apply_streams(
+            request(),
+            run,
+            archive.clone(),
+            "ritornelctl 0.1.0".to_owned(),
+            None,
+        )
+        .unwrap();
+    let mut report = report.expect("an apply that writes reports what it did");
+    // Worked out as the dry run is, from the library as the write saw it,
+    // which nothing changed in between.
+    (before.made_at, report.made_at) = (0, 0);
+    assert_eq!(report, before);
+    let (_, again) = rig
+        .library
+        .apply_streams(
+            request(),
+            run,
+            archive,
+            "ritornelctl 0.1.0".to_owned(),
+            None,
+        )
+        .unwrap();
+    assert!(again.is_none(), "a run applied before reports nothing");
 }
 
 #[test]
