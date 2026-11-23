@@ -3806,7 +3806,7 @@ fn a_merged_appearance_shows_the_same_title_whichever_copy_held_its_parts() {
             .on("Long Field", None, 3),
     );
     world.settle();
-    // The owner merged the two appearances on Long Field into one no file
+    // The two appearances on Long Field were merged into one no file
     // is on.
     let merged = 1_000;
     for id in [demo, newer] {
