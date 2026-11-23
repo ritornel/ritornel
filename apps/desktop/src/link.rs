@@ -57,7 +57,7 @@ impl Why {
         match self {
             Self::NotRunning => (
                 "No server is running.",
-                "Ritornel plays from a server on this Mac. Start one, and this window will find it.",
+                "Ritornel plays from a server on this computer. Start one, and this window will find it.",
                 true,
             ),
             Self::Starting => (
@@ -67,7 +67,7 @@ impl Why {
             ),
             Self::Unreachable => (
                 "The server is not answering.",
-                "One is running on this Mac, but it could not be reached. It may be stopping.",
+                "One is running on this computer, but it could not be reached. It may be stopping.",
                 true,
             ),
             Self::Incompatible => (
