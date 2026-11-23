@@ -319,8 +319,11 @@ impl Server {
         memory::attach(&self.core, kind)
     }
 
-    /// Renames the server and sends its new status to every session
-    /// subscribed to the `servers` topic.
+    /// Renames the server, keeps its row in the library's registry of
+    /// servers in step on a hub, and sends its new status to every session
+    /// subscribed to the `servers` topic. If the registry cannot be written,
+    /// the new name is still stored and sent, and the error is returned;
+    /// the registry is caught up at the next start or rename.
     ///
     /// No call of the contract does this yet; it is exposed so tests can
     /// change a server's status and exercise the `servers` topic.

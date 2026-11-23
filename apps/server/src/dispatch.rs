@@ -1770,9 +1770,31 @@ mod tests {
 
         core.rename("attic").unwrap();
         assert_eq!(registry(), ("attic".to_owned(), 2));
-        // The same name again writes nothing.
+        // The same name again leaves the library's revision as it was.
         core.rename("attic").unwrap();
         assert_eq!(registry(), ("attic".to_owned(), 2));
+
+        // A registry that cannot be written: the rename says so, and the
+        // name is stored and sent all the same. The same name again, once
+        // it can be written, catches the registry up.
+        let library_db = || rusqlite::Connection::open(scratch.path().join("data/library.db"));
+        library_db()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_rename BEFORE UPDATE ON server
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            )
+            .unwrap();
+        assert!(matches!(core.rename("cellar"), Err(Error::Library(_))));
+        let list = call(&core, &session, "servers.list", None).unwrap();
+        assert_eq!(list["servers"][0]["name"], "cellar");
+        assert_eq!(registry(), ("attic".to_owned(), 2));
+        library_db()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_rename")
+            .unwrap();
+        core.rename("cellar").unwrap();
+        assert_eq!(registry(), ("cellar".to_owned(), 3));
     }
 
     #[test]
