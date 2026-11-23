@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks, builds and runs the desktop app (apps/desktop), in GPUI, on macOS
-# and Linux. `mise run check` calls `check`, and CI calls it on its macOS job
-# and its desktop-linux job.
+# and Linux. `mise run check` calls `check`, and so does CI's desktop job on
+# each of them; on Windows the task runs scripts/desktop.ps1 instead.
 #
 #   scripts/desktop.sh check          check formatting, run clippy with
 #                                          warnings denied, run the tests and
@@ -38,8 +38,8 @@
 # yet, nothing starts with it.
 #
 # It is a Cargo workspace of its own, so that GPUI reaches neither the main
-# workspace's build nor its lock file. It is checked on macOS and Linux; it
-# builds on Windows too (`scripts/desktop.ps1`). On Linux it needs the
+# workspace's build nor its lock file. On Windows scripts/desktop.ps1 does
+# what this does. On Linux it needs the
 # development files of the libraries GPUI links, and without them it says
 # which are missing and skips, so the hub's build never needs them; in CI
 # (`CI` set) it fails instead, so a job cannot pass by skipping.
@@ -68,7 +68,9 @@ case $system in
         fi
         ;;
     *)
-        echo "The GPUI desktop app is checked on macOS and Linux only: skipped."
+        needs="This script runs on macOS and Linux; on Windows, scripts/desktop.ps1 does what it does"
+        [[ -z ${CI:-} ]] || { echo "$needs, and CI must not skip it." >&2; exit 1; }
+        echo "$needs: skipped."
         exit 0
         ;;
 esac

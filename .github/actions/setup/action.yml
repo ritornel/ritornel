@@ -1,0 +1,43 @@
+name: Set up
+description: >-
+  The setup every CI job shares, after the checkout: the system packages a
+  Linux job links, the tools mise.toml pins, the Rust that
+  rust-toolchain.toml names, and the Rust build cache.
+
+inputs:
+  packages:
+    description: Debian packages to install, space-separated. Linux only.
+    default: ''
+  workspaces:
+    description: The Cargo workspaces whose builds are cached, one per line, as Swatinem/rust-cache takes them.
+    default: .
+  disable-tools:
+    description: >-
+      The tools of mise.toml not to install, as MISE_DISABLE_TOOLS takes
+      them. A tool no step uses is not installed: ffmpeg alone is some
+      ninety conda packages, and the fixtures it made are committed, so it
+      comes off this list with the first step that needs it.
+    default: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny
+
+runs:
+  using: composite
+  steps:
+    # In the job's environment, so that a later `mise run` does not install
+    # them either.
+    - shell: bash
+      env:
+        TOOLS: ${{ inputs.disable-tools }}
+      run: echo "MISE_DISABLE_TOOLS=$TOOLS" >> "$GITHUB_ENV"
+    - if: runner.os == 'Linux' && inputs.packages != ''
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends $PACKAGES
+    - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+    # Only main saves, so that PRs restore from it and their builds do not
+    # fill the cache quota. The key is the job's, its system and its
+    # architecture.
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        workspaces: ${{ inputs.workspaces }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}

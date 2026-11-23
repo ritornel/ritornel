@@ -296,11 +296,18 @@ mod tests {
         path
     }
 
-    /// Lets everyone read `path`, as a copy from another machine might.
+    /// Lets everyone read `path`, as a copy from another machine might. On a
+    /// folder the entry is inherited, so what is made in it is open too
+    /// whatever the temporary folder's own list says.
     fn open_to_everyone(path: &Path) {
+        let grant = if path.is_dir() {
+            "*S-1-1-0:(OI)(CI)(R)"
+        } else {
+            "*S-1-1-0:(R)"
+        };
         let done = Command::new("icacls")
             .arg(path)
-            .args(["/grant", "*S-1-1-0:(R)"])
+            .args(["/grant", grant])
             .output()
             .unwrap();
         assert!(done.status.success(), "{done:?}");

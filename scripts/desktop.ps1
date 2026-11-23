@@ -1,8 +1,12 @@
 #requires -Version 7.0
-# Builds and runs the desktop app (apps/desktop), in GPUI, on Windows, as
-# scripts/desktop.sh does on a Mac. The server is built here too, from the
-# main workspace.
+# Checks, builds and runs the desktop app (apps/desktop), in GPUI, on
+# Windows, as scripts/desktop.sh does on macOS and Linux. `run`, `tones` and
+# `app` build the server too, from the main workspace.
 #
+#   pwsh -File .\scripts\desktop.ps1 check          check formatting, run clippy with
+#                                        warnings denied, run the tests and
+#                                        build the app, as `mise run
+#                                        desktop:check` and CI do
 #   pwsh -File .\scripts\desktop.ps1 run [args]     run it against an invented library
 #                                        of 8,600 albums, never a real one:
 #                                        made once in apps\desktop\.invented,
@@ -24,7 +28,7 @@
 #   pwsh -File .\scripts\desktop.ps1 run --size 1400x900
 #   pwsh -File .\scripts\desktop.ps1 run --measure 25 --out report.json
 param(
-    [Parameter(Position = 0)][ValidateSet('run', 'tones', 'app')][string]$Command = 'run',
+    [Parameter(Position = 0)][ValidateSet('check', 'run', 'tones', 'app')][string]$Command = 'run',
     [string]$DataDir,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest
 )
@@ -93,6 +97,18 @@ function Invoke-App([string]$Data) {
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 switch ($Command) {
+    'check' {
+        # As scripts/desktop.sh check does. The quoted '--' reaches cargo
+        # whatever PowerShell makes of a bare one.
+        cargo fmt --manifest-path "$app\Cargo.toml" --check
+        Assert-Exit
+        cargo clippy --locked --manifest-path "$app\Cargo.toml" --all-targets '--' -D warnings
+        Assert-Exit
+        cargo test --locked --manifest-path "$app\Cargo.toml"
+        Assert-Exit
+        cargo build --locked --release --manifest-path "$app\Cargo.toml"
+        Assert-Exit
+    }
     'run' {
         Build-App
         Build-Server

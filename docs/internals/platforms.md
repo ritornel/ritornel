@@ -72,6 +72,7 @@ What differs between systems sits in a `platform` module in each crate that need
 **Windows** (Windows 11, Realtek speakers, 48 kHz shared-mode mix):
 
 - The server test suite passes.
+- CI runs clippy and the whole workspace's tests on GitHub's `windows-latest` runner, and checks, tests and builds the desktop app there with `scripts/desktop.ps1 check`.
 - 44.1, 48, and 96 kHz files play at the right pitch; pause, seek, next, previous, end of queue, and gapless joins (including sample-rate changes) match the source files.
 - Reported position runs ~55 ms ahead of what is heard (output latency) without drifting over three minutes.
 - The desktop app follows the server; the server uses 1–2% of one core and 27 MB while playing.

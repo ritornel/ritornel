@@ -46,10 +46,12 @@ run = "scripts/check-deps.sh"
 
 [tasks.docs]
 description = "Check docs/internals citations, doc rules and rustdoc intra-doc links"
-run = [
-    "scripts/check-docs.sh",
-    "cargo doc --locked --workspace --no-deps --all-features --document-private-items",
-]
+run = ["scripts/check-docs.sh", { task = "rustdoc" }]
+
+# Each system documents its own platform code, so CI runs this on each.
+[tasks.rustdoc]
+description = "Check rustdoc intra-doc links"
+run = "cargo doc --locked --workspace --no-deps --all-features --document-private-items"
 env = { RUSTDOCFLAGS = "-D rustdoc::broken_intra_doc_links" }
 
 [tasks.licenses]
@@ -82,12 +84,13 @@ run = "cargo test --locked --package ritornel-contract typescript"
 env = { RITORNEL_BLESS = "1" }
 
 # The desktop app, in GPUI, is a Cargo workspace of its own in apps/desktop,
-# checked and built on macOS and Linux: anywhere else, or on a Linux machine
-# without the libraries it links, these say so and do nothing. See
-# scripts/desktop.sh.
+# checked and built on macOS, Linux and Windows: on a Linux machine without
+# the libraries it links, these say so and do nothing. See scripts/desktop.sh,
+# and on Windows scripts/desktop.ps1, which `desktop:check` runs there.
 [tasks."desktop:check"]
 description = "Check, lint and test the desktop app, and build it"
 run = "scripts/desktop.sh check"
+run_windows = "pwsh -NoProfile -File scripts/desktop.ps1 check"
 
 [tasks."desktop:run"]
 description = "Run the desktop app against an invented library, never a real one"
