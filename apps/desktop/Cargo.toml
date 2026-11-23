@@ -71,6 +71,14 @@ runtime-shaders = ["gpui_platform/runtime_shaders"]
 
 [workspace]
 
+# GPUI's Linux backend, patched so that a touchpad's scroll on Wayland has
+# phases and coasts when the fingers lift: Ritornel's copy of the published
+# crate, at its tag patched/v0.3.13-2 (https://github.com/ritornel/gpui). It
+# moves with the pins above, all to one version, and scripts/desktop.sh
+# check fails without it.
+[patch.crates-io]
+gpui-pre-linux = { git = "https://github.com/ritornel/gpui", rev = "be00463ecc2fa29cee8157d432db3a707add55a1" }
+
 [lints.rust]
 # AppKit, Win32 and Linux's process calls are reached through `unsafe` in
 # `platform/`, each allowed where it is used.

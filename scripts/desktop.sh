@@ -4,8 +4,9 @@
 # each of them; on Windows the task runs scripts/desktop.ps1 instead.
 #
 #   scripts/desktop.sh check          check formatting, run clippy with
-#                                          warnings denied, run the tests and
-#                                          build the app
+#                                          warnings denied, run the tests,
+#                                          check that the patched GPUI
+#                                          backend is used and build the app
 #   scripts/desktop.sh app            build Ritornel.app, with the release
 #                                          ritornel-server inside it, as
 #                                          `mise run build` does, in
@@ -108,6 +109,15 @@ case "${1:-}" in
         gpui fmt --check
         gpui clippy --locked --all-targets -- -D warnings
         gpui test --locked
+        # GPUI's Linux backend comes from Ritornel's patched copy. A
+        # [patch] that no longer matches the pins is only a warning: Cargo
+        # takes the published crate and records the patch as unused. So the
+        # check is what Cargo resolves for Linux, on any system.
+        if ! gpui tree --locked --target x86_64-unknown-linux-gnu --edges normal \
+            --invert gpui-pre-linux --depth 0 2>/dev/null | grep -q 'github.com/ritornel/gpui'; then
+            echo "The desktop app no longer takes gpui-pre-linux from ritornel/gpui: move its [patch] with the GPUI pins." >&2
+            exit 1
+        fi
         gpui build --locked --release
         ;;
     run)
