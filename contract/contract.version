@@ -1,5 +1,5 @@
 # The contract version, and a digest of the wire it was set for. Written by
 # `mise run contract`, which refuses when the wire has changed and the
 # version has not: raise CONTRACT_VERSION in crates/ritornel-contract.
-version 1
-digest 85705f6932f23506
+version 2
+digest 5a5844565a2cd063

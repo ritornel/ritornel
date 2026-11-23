@@ -247,6 +247,11 @@ impl Server {
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
         core.set_cache_bytes(run.cache_bytes);
         core.set_audio_pace(run.audio_pace);
+        core.set_start_up(crate::dispatch::StartUp {
+            listen,
+            log_level: run.log_level.unwrap_or(tracing::Level::INFO),
+            origins: run.origins,
+        });
         let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         if listen.is_private() {

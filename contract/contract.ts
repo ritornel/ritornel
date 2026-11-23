@@ -10,7 +10,7 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 1;
+export const CONTRACT_VERSION = 2;
 
 /** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
@@ -134,7 +134,8 @@ export const METHODS = {
   "link.copies": { kind: "query", needsFull: true },
   "link.listen": { kind: "command", needsFull: true },
   "link.ping": { kind: "session", needsFull: true },
-  "link.setAwake": { kind: "command", needsFull: true },
+  "server.settings": { kind: "query", needsFull: true },
+  "server.setSettings": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -212,7 +213,8 @@ export type MethodMap = {
   "link.copies": { params: LinkCopiesParams; result: LinkCopies };
   "link.listen": { params: LinkListenParams; result: LinkListened };
   "link.ping": { params: LinkPingParams; result: LinkPinged };
-  "link.setAwake": { params: AwakeParams; result: AwakeSet };
+  "server.settings": { params: NoParams; result: ServerSettings };
+  "server.setSettings": { params: SetServerSettingsParams; result: ServerSettingsSet };
 };
 
 /** The name of a method. */
@@ -591,52 +593,14 @@ export type AutoTrigger = "change" | "lost" | "returned" | "start" | "timer";
 
 /**
  * When a hub keeps its machine from sleeping for its linked servers: a
- * preference of the server's own, set with `link.setAwake` and kept with
- * it. The display may sleep in every mode.
+ * preference of the server's own, set with `server.setSettings` and kept
+ * with it. The display may sleep in every mode.
  */
 export type Awake = { "mode": "while_active",
   /**
    * How long after a linked server's last call.
    */
   minutes: number, } | { "mode": "always" } | { "mode": "never" };
-
-/**
- * The params of `link.setAwake`.
- */
-export type AwakeParams = {
-  /**
-   * The command's ID, made by the client.
-   */
-  idempotencyKey: string,
-  /**
-   * When to keep the machine awake from now on.
-   */
-  awake: Awake,
-};
-
-/**
- * The result of `link.setAwake`: the receipt, and the link as
- * `link.status` now says it.
- */
-export type AwakeSet = {
-  /**
-   * The link, as `link.status` now says it.
-   */
-  link: LinkStatus,
-  /**
-   * The command's ID: the idempotency key it was sent with.
-   */
-  commandId: string,
-  /**
-   * How far the command has got.
-   */
-  status: ReceiptStatus,
-  /**
-   * The library revision the command was committed at. It is left out
-   * for a command that changes no library.
-   */
-  revision?: number,
-};
 
 /**
  * The result of `server.backup`: the receipt, and the backup.
@@ -2705,6 +2669,11 @@ export type ListWindowParams = {
 export type ListenTaken = "stored" | "duplicate" | "conflict";
 
 /**
+ * The least severe level the server logs.
+ */
+export type LogLevel = "error" | "warn" | "info" | "debug" | "trace";
+
+/**
  * The result of `media.token`: what a page puts in the query string of a
  * media URL.
  */
@@ -4408,6 +4377,71 @@ export type ServerInfo = {
 export type ServerRole = "unassigned" | "hub" | "satellite";
 
 /**
+ * The result of `server.settings`: the settings of the server called,
+ * a satellite's own on a satellite.
+ *
+ * Only `awake` is changed by a call. The rest are given as the server
+ * starts, by a flag, a `RITORNEL_*` variable or `config.toml`, and hold
+ * until it starts again.
+ */
+export type ServerSettings = {
+  /**
+   * What the server is called. With no name given as it starts, it is
+   * the default: the name it already had, which a new server takes
+   * from its computer.
+   */
+  name: Setting<string>,
+  /**
+   * When it keeps its machine from sleeping for its linked servers.
+   */
+  awake: Setting<Awake>,
+  /**
+   * The most a satellite's cache of masters pulled from its hub holds,
+   * in bytes. 2 GiB by default.
+   */
+  cacheBytes: Setting<number>,
+  /**
+   * Where it listens: `127.0.0.1:<port>`, or `private:<port>` for the
+   * private network. By default `127.0.0.1:4747`, or a port the system
+   * picks when that one is taken.
+   */
+  listen: Setting<string>,
+  /**
+   * The least severe level it logs.
+   */
+  logLevel: Setting<LogLevel>,
+  /**
+   * The folder backups are written to, outside the data directory.
+   * With none there is no backup.
+   */
+  backupDir: Setting<string | null>,
+};
+
+/**
+ * The result of `server.setSettings`: the receipt, and the settings as
+ * `server.settings` now reports them.
+ */
+export type ServerSettingsSet = {
+  /**
+   * The settings, as `server.settings` now reports them.
+   */
+  settings: ServerSettings,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
  * The result of `server.status`. See "Configuration and logging" in
  * docs/internals/server.md.
  */
@@ -4492,6 +4526,26 @@ export type ServersList = {
 export type SessionKind = "full" | "limited";
 
 /**
+ * What gave a setting its value.
+ */
+export type SetBy = "default" | "file" | "environment" | "flag" | "call";
+
+/**
+ * The params of `server.setSettings`: the settings to change, each left
+ * out to keep it as it is. At least one is given.
+ */
+export type SetServerSettingsParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * When to keep the machine awake from now on.
+   */
+  awake?: Awake,
+};
+
+/**
  * The params of `history.setZones`.
  */
 export type SetZonesParams = {
@@ -4503,6 +4557,20 @@ export type SetZonesParams = {
    * Every period, in place of what there was.
    */
   periods: Array<ZonePeriod>,
+};
+
+/**
+ * A setting's value, and what gave it.
+ */
+export type Setting<T> = {
+  /**
+   * The value the server runs with.
+   */
+  value: T,
+  /**
+   * What gave it.
+   */
+  setBy: SetBy,
 };
 
 /**

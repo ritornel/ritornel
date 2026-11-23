@@ -16,15 +16,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ritornel_client::contract::methods::{
-    LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkSetAwake, LinkStatusCall,
-    PlaybackGet, PlaybackPause, PlaybackPlay, QueueWindow, RatingsSet, SourcesAdd,
+    LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, PlaybackGet,
+    PlaybackPause, PlaybackPlay, QueueWindow, RatingsSet, ServerSetSettings, ServerSettingsCall,
+    SourcesAdd,
 };
 use ritornel_client::contract::{
-    Awake, AwakeParams, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink,
+    Awake, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink,
     LinkInviteParams, LinkJoinParams, LinkListenParams, LinkPingParams, LinkRequest, LinkStatus,
     ListKind, ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackCommandParams,
     PlaybackPlayParams, PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole,
-    SourcesAddParams, Topic, Window, capability, hex, link_request_proof, route,
+    SetBy, SetServerSettingsParams, SourcesAddParams, Topic, Window, capability, hex,
+    link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -1255,30 +1257,51 @@ async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_st
             .unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
 
-        // While active, for 30 minutes, until the owner says otherwise.
+        // While active, for 30 minutes, until someone says otherwise.
         let status = hub_client
             .call::<LinkStatusCall>(&NoParams {})
             .await
             .unwrap();
         assert_eq!(status.awake, Awake::default());
-        let never = |awake| AwakeParams {
-            idempotency_key: ritornel_client::idempotency_key().unwrap(),
-            awake,
-        };
-        let set = hub_client
-            .call::<LinkSetAwake>(&never(Awake::Never))
+        let settings = hub_client
+            .call::<ServerSettingsCall>(&NoParams {})
             .await
             .unwrap();
-        assert_eq!(set.link.awake, Awake::Never);
-        assert!(!set.link.kept_awake);
-        // A satellite does not decide when its hub sleeps.
+        assert_eq!(settings.awake.value, Awake::default());
+        assert_eq!(settings.awake.set_by, SetBy::Default);
+        let to = |awake| SetServerSettingsParams {
+            idempotency_key: ritornel_client::idempotency_key().unwrap(),
+            awake: Some(awake),
+        };
+        let set = hub_client
+            .call::<ServerSetSettings>(&to(Awake::Never))
+            .await
+            .unwrap();
+        assert_eq!(set.settings.awake.value, Awake::Never);
+        assert_eq!(set.settings.awake.set_by, SetBy::Call);
+        // A satellite does not decide when its hub sleeps, nor read how
+        // the hub is set.
         let refused = linked
-            .call::<LinkSetAwake>(&never(Awake::Always))
+            .call::<ServerSetSettings>(&to(Awake::Always))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
+        let refused = linked
+            .call::<ServerSettingsCall>(&NoParams {})
             .await
             .unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
         let refused = hub_client
-            .call::<LinkSetAwake>(&never(Awake::WhileActive { minutes: 1_000_000 }))
+            .call::<ServerSetSettings>(&to(Awake::WhileActive { minutes: 1_000_000 }))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::Invalid), "{refused}");
+        let nothing = SetServerSettingsParams {
+            awake: None,
+            ..to(Awake::Never)
+        };
+        let refused = hub_client
+            .call::<ServerSetSettings>(&nothing)
             .await
             .unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Invalid), "{refused}");
@@ -1287,21 +1310,67 @@ async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_st
             .await
             .unwrap();
         assert_eq!(status.awake, Awake::Never);
+        assert!(!status.kept_awake);
         // A command sent again changes nothing, and its ID is not taken
         // for another.
-        let once = never(Awake::Always);
-        hub_client.call::<LinkSetAwake>(&once).await.unwrap();
-        let other = AwakeParams {
-            awake: Awake::Never,
+        let once = to(Awake::Always);
+        hub_client.call::<ServerSetSettings>(&once).await.unwrap();
+        let other = SetServerSettingsParams {
+            awake: Some(Awake::Never),
             ..once
         };
-        assert!(hub_client.call::<LinkSetAwake>(&other).await.is_err());
-        let again = hub_client.call::<LinkSetAwake>(&once).await.unwrap();
-        assert_eq!(again.link.awake, Awake::Always);
-        hub_client
-            .call::<LinkSetAwake>(&never(Awake::default()))
+        assert!(hub_client.call::<ServerSetSettings>(&other).await.is_err());
+        let again = hub_client.call::<ServerSetSettings>(&once).await.unwrap();
+        assert_eq!(again.settings.awake.value, Awake::Always);
+        // Setting the default is a choice, and is kept as one.
+        let set = hub_client
+            .call::<ServerSetSettings>(&to(Awake::default()))
             .await
             .unwrap();
+        assert_eq!(set.settings.awake.value, Awake::default());
+        assert_eq!(set.settings.awake.set_by, SetBy::Call);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_answers_with_its_own_settings_and_changes_only_its_own() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (_hub, hub_client, desk, desk_client) = linked(&scratch).await;
+        let desk_settings = desk_client
+            .call::<ServerSettingsCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(desk_settings.name.value, desk.name());
+
+        let set = desk_client
+            .call::<ServerSetSettings>(&SetServerSettingsParams {
+                idempotency_key: key(),
+                awake: Some(Awake::Always),
+            })
+            .await
+            .unwrap();
+        assert_eq!(set.settings.awake.value, Awake::Always);
+        assert_eq!(set.settings.name.value, desk.name());
+        let hub_settings = hub_client
+            .call::<ServerSettingsCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(hub_settings.awake.value, Awake::default());
+        assert_eq!(hub_settings.awake.set_by, SetBy::Default);
+
+        // Kept with the satellite, across a restart.
+        drop(desk_client);
+        desk.stop().await.unwrap();
+        let desk = start(&scratch, "desk").await;
+        let desk_client = client(&scratch, "desk", &desk).await;
+        let desk_settings = desk_client
+            .call::<ServerSettingsCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(desk_settings.awake.value, Awake::Always);
+        assert_eq!(desk_settings.awake.set_by, SetBy::Call);
     })
     .await;
 }

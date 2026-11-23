@@ -88,6 +88,8 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         name: settings.name.clone(),
         cache_bytes: settings.cache_bytes,
         audio_pace: None,
+        log_level: Some(settings.log_level),
+        origins: settings.origins,
     };
     let run = run(held, args, settings, clock, entropy, jobs, out);
     match &run {

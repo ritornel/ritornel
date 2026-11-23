@@ -72,8 +72,8 @@ pub struct LinkStatus {
 }
 
 /// When a hub keeps its machine from sleeping for its linked servers: a
-/// preference of the server's own, set with `link.setAwake` and kept with
-/// it. The display may sleep in every mode.
+/// preference of the server's own, set with `server.setSettings` and kept
+/// with it. The display may sleep in every mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -106,30 +106,6 @@ impl Default for Awake {
     fn default() -> Self {
         Self::WhileActive { minutes: 30 }
     }
-}
-
-/// The params of `link.setAwake`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct AwakeParams {
-    /// The command's ID, made by the client.
-    pub idempotency_key: Id,
-    /// When to keep the machine awake from now on.
-    pub awake: Awake,
-}
-
-/// The result of `link.setAwake`: the receipt, and the link as
-/// `link.status` now says it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct AwakeSet {
-    /// The receipt.
-    #[serde(flatten)]
-    pub receipt: crate::Receipt,
-    /// The link, as `link.status` now says it.
-    pub link: LinkStatus,
 }
 
 /// A satellite's hub, as the satellite knows it.

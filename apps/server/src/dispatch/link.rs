@@ -7,19 +7,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::PoisonError;
 
-use ritornel_contract::methods::{LinkListen, LinkSetAwake, Method};
+use ritornel_contract::methods::{LinkListen, Method};
 use ritornel_contract::{
-    Awake, AwakeParams, AwakeSet, CONTRACT_VERSION, ErrorCode, HubCopy, HubStatus, Id, InviteLink,
-    LinkCopies, LinkCopiesParams, LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams,
-    LinkListenParams, LinkListened, LinkPingParams, LinkPinged, LinkRequest, LinkStatus,
-    LinkTracks, LinkTracksParams, ListenTaken, MAX_CLIENT_TEXT, Receipt, ReceiptStatus, RpcError,
-    SatelliteStatus, ServerRole, hex, link_request_proof,
+    CONTRACT_VERSION, ErrorCode, HubCopy, HubStatus, Id, InviteLink, LinkCopies, LinkCopiesParams,
+    LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened,
+    LinkPingParams, LinkPinged, LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken,
+    MAX_CLIENT_TEXT, RpcError, SatelliteStatus, ServerRole, hex, link_request_proof,
 };
 use ritornel_engine::playback::{Catalog, Delivered, FileFacts, deliver_listens_to};
-use ritornel_engine::{
-    Clock, Command, HubLink, Ingested, LISTEN_RECORD_VERSION, ListenRecord, SendStamps,
-    SettingChange,
-};
+use ritornel_engine::{Clock, HubLink, Ingested, LISTEN_RECORD_VERSION, ListenRecord, SendStamps};
 use tracing::{info, warn};
 
 use super::{Core, Stores, lock};
@@ -73,7 +69,8 @@ pub(super) fn on_a_satellite(method: &str) -> Route {
     const FOLDERS: &str = "the library's folders are on its hub's machine: do this on the hub";
     match method {
         "server.hello" | "server.status" | "servers.list" | "events.subscribe"
-        | "events.unsubscribe" | "media.token" | "server.backup" => Route::Here,
+        | "events.unsubscribe" | "media.token" | "server.backup" | "server.settings"
+        | "server.setSettings" => Route::Here,
         _ if method.starts_with("playback.")
             || method.starts_with("queue.")
             || method.starts_with("link.") =>
@@ -102,7 +99,8 @@ fn internal(error: impl std::fmt::Display) -> RpcError {
 
 /// Whether `method` is kept from a satellite's link session: what names
 /// the hub's own folders, which a satellite cannot see, and what is for the
-/// hub's own machine alone, such as its backups and its links. A satellite
+/// hub's own machine alone, such as its backups, its settings and its
+/// links. A satellite
 /// is trusted with the library's calls and its own listens, and no more.
 pub(super) fn kept_from_a_link(method: &str) -> bool {
     matches!(
@@ -118,7 +116,8 @@ pub(super) fn kept_from_a_link(method: &str) -> bool {
             | "server.backup"
             | "link.invite"
             | "link.join"
-            | "link.setAwake"
+            | "server.settings"
+            | "server.setSettings"
     )
 }
 
@@ -553,47 +552,6 @@ impl Core {
     /// `link.listen`, on a hub: one listen from a satellite's outbox, taken
     /// in as the hub's own player's are. A satellite reports listens for
     /// its own player only.
-    /// `link.setAwake`: the setting is kept in `server.db` with the
-    /// command's receipt, and followed at once. Sent again, after a newer
-    /// command or not, it changes nothing, and answers with the link as it
-    /// is.
-    pub(super) fn link_set_awake(
-        &self,
-        stores: &Stores,
-        params: &AwakeParams,
-    ) -> Result<AwakeSet, RpcError> {
-        if !params.awake.is_valid() {
-            return Err(RpcError::new(
-                ErrorCode::Invalid,
-                format!("minutes are at most {}, a week", Awake::MAX_MINUTES),
-            ));
-        }
-        let command = Command {
-            id: params.idempotency_key,
-            fingerprint: super::fingerprint::<LinkSetAwake>(params)?,
-        };
-        let changed = stores
-            .server()
-            .change_once(
-                command,
-                LinkSetAwake::NAME,
-                SettingChange::Awake(params.awake),
-            )
-            .map_err(crate::Error::Store)
-            .map_err(super::failed)?;
-        if changed.now {
-            self.follow_stored_awake(stores);
-        }
-        Ok(AwakeSet {
-            receipt: Receipt {
-                command_id: params.idempotency_key,
-                status: ReceiptStatus::Done,
-                revision: None,
-            },
-            link: self.link_status(stores)?,
-        })
-    }
-
     /// `link.ping`: a satellite says it is there and whether it plays.
     pub(super) fn link_ping(
         &self,

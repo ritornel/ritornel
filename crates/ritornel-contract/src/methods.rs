@@ -513,11 +513,18 @@ methods! {
     LinkPing: "link.ping", Session, needs_full: true,
     LinkPingParams => LinkPinged;
 
-    /// `link.setAwake`: when this server keeps its machine from sleeping
-    /// for its linked servers, kept with it. Only a session on its own
-    /// machine may set it, never a satellite's.
-    LinkSetAwake: "link.setAwake", Command, needs_full: true,
-    AwakeParams => AwakeSet;
+    /// `server.settings`: the settings of the server called, each with
+    /// what gave it. A satellite answers with its own. Never a linked
+    /// server's to read.
+    ServerSettingsCall: "server.settings", Query, needs_full: true,
+    NoParams => ServerSettings;
+
+    /// `server.setSettings`: changes the settings of the server called
+    /// that a call may change, and keeps them with it. A satellite changes
+    /// its own. Only a session on the server's own machine may, never a
+    /// linked server's.
+    ServerSetSettings: "server.setSettings", Command, needs_full: true,
+    SetServerSettingsParams => ServerSettingsSet;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -605,7 +612,8 @@ mod tests {
                 "link.copies",
                 "link.listen",
                 "link.ping",
-                "link.setAwake"
+                "server.settings",
+                "server.setSettings"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -656,7 +664,8 @@ mod tests {
                 "link.copies",
                 "link.listen",
                 "link.ping",
-                "link.setAwake"
+                "server.settings",
+                "server.setSettings"
             ]
         );
         // Everything but reading the library and controlling playback
