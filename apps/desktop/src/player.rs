@@ -309,11 +309,15 @@ impl Player {
         player
     }
 
-    /// Whether something is playing now.
+    /// Whether something is playing now, or about to once its master is
+    /// here: the toggle pauses it either way.
     pub(crate) fn playing(&self) -> bool {
-        self.state
-            .as_ref()
-            .is_some_and(|state| state.status == PlaybackStatus::Playing)
+        self.state.as_ref().is_some_and(|state| {
+            matches!(
+                state.status,
+                PlaybackStatus::Playing | PlaybackStatus::Buffering
+            )
+        })
     }
 
     /// Whether the player is on an entry: the transport works.

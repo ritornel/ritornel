@@ -87,6 +87,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
             .or_else(crate::platform::computer_name),
         name: settings.name.clone(),
         cache_bytes: settings.cache_bytes,
+        audio_pace: None,
     };
     let run = run(held, args, settings, clock, entropy, jobs, out);
     match &run {

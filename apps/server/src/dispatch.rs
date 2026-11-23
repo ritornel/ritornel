@@ -160,6 +160,14 @@ pub(crate) struct Core {
     has_player: std::sync::atomic::AtomicBool,
     /// What wakes the thread that delivers finished listens.
     deliveries: crate::playback::Wake,
+    /// What wakes the pulling of a master a satellite's player waits for.
+    pulls: crate::playback::Wake,
+    /// Whether the player is playing, or about to, as the last call or
+    /// tick left it: see [`playing`](Self::playing).
+    sounding: std::sync::atomic::AtomicBool,
+    /// For the tests alone: how long the audio route waits before each
+    /// chunk of a master it sends, so that a pull can be held open.
+    audio_pace: std::sync::OnceLock<std::time::Duration>,
     /// Last.fm, once the server has started.
     lastfm: std::sync::OnceLock<crate::lastfm::Lastfm>,
     /// Watching the hub's folders, once the server has started.
@@ -290,6 +298,9 @@ impl Core {
             player: Mutex::new(None),
             has_player: std::sync::atomic::AtomicBool::new(false),
             deliveries: crate::playback::Wake::default(),
+            pulls: crate::playback::Wake::default(),
+            sounding: std::sync::atomic::AtomicBool::new(false),
+            audio_pace: std::sync::OnceLock::new(),
             lastfm: std::sync::OnceLock::new(),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
@@ -427,11 +438,19 @@ impl Core {
         lock(&self.awake).follow_the_rule(now);
     }
 
-    /// Whether this server's player is playing.
+    /// Whether this server's player is playing, or about to, as the last
+    /// call or tick left it. It is read without waiting on the player, which a
+    /// call may hold while it waits on the hub: the hub's ping reads it on
+    /// the async runtime, which must never wait on a lock held by what
+    /// waits on the runtime.
     pub(crate) fn playing(&self) -> bool {
-        lock(&self.player).as_ref().is_some_and(|player| {
-            player.state().status == ritornel_engine::playback::Status::Playing
-        })
+        self.sounding.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// For a test: holds the player, as a call waiting on the hub does.
+    #[cfg(test)]
+    pub(crate) fn hold_player(&self) -> MutexGuard<'_, Option<ritornel_engine::playback::Player>> {
+        lock(&self.player)
     }
 
     /// Says which port other machines reach this server on: once, when it

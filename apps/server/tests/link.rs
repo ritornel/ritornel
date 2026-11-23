@@ -17,14 +17,14 @@ use std::time::Duration;
 
 use ritornel_client::contract::methods::{
     LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkSetAwake, LinkStatusCall,
-    PlaybackPlay, QueueWindow, RatingsSet, SourcesAdd,
+    PlaybackGet, PlaybackPause, PlaybackPlay, QueueWindow, RatingsSet, SourcesAdd,
 };
 use ritornel_client::contract::{
     Awake, AwakeParams, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink,
     LinkInviteParams, LinkJoinParams, LinkListenParams, LinkPingParams, LinkRequest, LinkStatus,
-    ListKind, ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackPlayParams,
-    PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole, SourcesAddParams,
-    Topic, Window, capability, hex, link_request_proof, route,
+    ListKind, ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackCommandParams,
+    PlaybackPlayParams, PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole,
+    SourcesAddParams, Topic, Window, capability, hex, link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -748,8 +748,9 @@ async fn linked_player_with(
 }
 
 /// Plays `source` on the satellite and waits until the player has stopped
-/// at the end of it.
-async fn play_to_the_end(client: &mut Client, source: PlaySource) {
+/// at the end of it. Whether it said it was buffering, waiting for a master
+/// to be pulled, on the way.
+async fn play_to_the_end(client: &mut Client, source: PlaySource) -> bool {
     client.subscribe(&[Topic::Playback]).await.unwrap();
     client
         .call::<PlaybackPlay>(&PlaybackPlayParams {
@@ -761,9 +762,10 @@ async fn play_to_the_end(client: &mut Client, source: PlaySource) {
         })
         .await
         .unwrap();
-    let mut played = false;
+    let (mut played, mut buffered) = (false, false);
     loop {
         if let Event::Playback(event) = client.next_event().await.unwrap() {
+            buffered |= event.state.status == PlaybackStatus::Buffering;
             played |= event.state.status == PlaybackStatus::Playing;
             if played && event.state.status == PlaybackStatus::Stopped {
                 break;
@@ -771,6 +773,7 @@ async fn play_to_the_end(client: &mut Client, source: PlaySource) {
         }
     }
     client.unsubscribe(&[Topic::Playback]).await.unwrap();
+    buffered
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -827,6 +830,77 @@ async fn a_satellite_keeps_no_more_of_the_hubs_music_than_its_cache_size() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_answers_and_stops_while_a_slow_pull_is_under_way() {
+    bounded(async {
+        let scratch = Scratch::new();
+        // A hub that sends each master slowly, so that the satellite's pull
+        // is held open for longer than any of what follows may take.
+        let hub = Server::start_run(
+            HeldDir::take(scratch.data_dir("hub")).unwrap(),
+            Listen::on_port(0),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+            Bounds::default(),
+            Run {
+                audio_pace: Some(Duration::from_secs(10)),
+                ..Run::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut hub_client = client(&scratch, "hub", &hub).await;
+        hub_client.create_library(key()).await.unwrap();
+        scan(&scratch, &mut hub_client).await;
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        let desk_client = client(&scratch, "desk", &desk).await;
+        join(&desk_client, &invite(&hub, &hub_client).await)
+            .await
+            .unwrap();
+        let ids = song_ids(&desk_client.list_open(&songs()).await.unwrap().rows);
+
+        // Each call is answered at once while the master is pulled.
+        let quick = Duration::from_millis(1_500);
+        tokio::time::timeout(
+            quick,
+            desk_client.call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::Tracks { ids },
+                start: None,
+                context: None,
+                shuffle: None,
+            }),
+        )
+        .await
+        .expect("play waited on the pull")
+        .unwrap();
+        let state = tokio::time::timeout(quick, desk_client.call::<PlaybackGet>(&NoParams {}))
+            .await
+            .expect("the player's state waited on the pull")
+            .unwrap();
+        assert_eq!(state.status, PlaybackStatus::Buffering);
+        tokio::time::timeout(
+            quick,
+            desk_client.call::<PlaybackPause>(&PlaybackCommandParams {
+                idempotency_key: key(),
+            }),
+        )
+        .await
+        .expect("a pause waited on the pull")
+        .unwrap();
+
+        // And the satellite stops while it is still under way.
+        drop(desk_client);
+        tokio::time::timeout(Duration::from_secs(5), desk.stop())
+            .await
+            .expect("the stop waited on the pull")
+            .unwrap();
+        drop(hub_client);
+        hub.stop().await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_satellite_plays_the_hubs_music_from_copies_it_pulls() {
     bounded(async {
         let scratch = Scratch::new();
@@ -841,7 +915,11 @@ async fn a_satellite_plays_the_hubs_music_from_copies_it_pulls() {
             })
             .collect();
         assert!(!ids.is_empty());
-        play_to_the_end(&mut desk_client, PlaySource::Tracks { ids: ids.clone() }).await;
+        // The play is answered before the first master is here, and the
+        // player waits for it, buffering.
+        let buffered =
+            play_to_the_end(&mut desk_client, PlaySource::Tracks { ids: ids.clone() }).await;
+        assert!(buffered);
 
         // Each master was pulled whole into the satellite's own cache.
         let kept = std::fs::read_dir(scratch.data_dir("desk").join("cache").join("audio"))
@@ -1020,16 +1098,22 @@ async fn listens_wait_while_the_hub_is_away_and_arrive_once_when_it_is_back() {
             })
             .await
             .unwrap();
+        // It answers at once, and plays once its master is here.
+        loop {
+            if let Event::Playback(event) = desk_client.next_event().await.unwrap()
+                && event.state.status == PlaybackStatus::Playing
+            {
+                break;
+            }
+        }
         let port = hub.endpoint().port();
         drop(hub_client);
         hub.stop().await.unwrap();
-        let mut played = false;
         loop {
-            if let Event::Playback(event) = desk_client.next_event().await.unwrap() {
-                played |= event.state.status == PlaybackStatus::Playing;
-                if played && event.state.status == PlaybackStatus::Stopped {
-                    break;
-                }
+            if let Event::Playback(event) = desk_client.next_event().await.unwrap()
+                && event.state.status == PlaybackStatus::Stopped
+            {
+                break;
             }
         }
         // The track played to its end, and its listen waits.

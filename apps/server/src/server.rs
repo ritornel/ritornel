@@ -246,6 +246,7 @@ impl Server {
         core.set_watch(run.watch);
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
         core.set_cache_bytes(run.cache_bytes);
+        core.set_audio_pace(run.audio_pace);
         let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         if listen.is_private() {
@@ -494,6 +495,50 @@ mod tests {
 
     async fn start(scratch: &Scratch) -> Server {
         start_with(scratch, Bounds::default()).await
+    }
+
+    #[test]
+    fn whether_the_player_plays_is_read_without_waiting_on_the_player() {
+        watched(|| async {
+            let scratch = Scratch::new();
+            let run = Run {
+                playback: crate::PlaybackRun {
+                    output: Some(crate::Output::Null { speed: 1 }),
+                    ..crate::PlaybackRun::default()
+                },
+                ..Run::default()
+            };
+            let server = Server::start_run(
+                HeldDir::take(scratch.path().join("data")).unwrap(),
+                Listen::on_port(0),
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+                Bounds::default(),
+                run,
+            )
+            .await
+            .unwrap();
+            // A call holds the player, as one that waits on the hub does,
+            // on a thread of its own.
+            let core = Arc::clone(server.core());
+            let (held, holding) = mpsc::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let holder = {
+                let core = Arc::clone(&core);
+                std::thread::spawn(move || {
+                    let _player = core.hold_player();
+                    held.send(()).unwrap();
+                    let _ = released.recv();
+                })
+            };
+            holding.recv().unwrap();
+            // What the hub's ping reads, on the runtime, answers meanwhile:
+            // waiting there would hold up the runtime the call waits on.
+            assert!(!core.playing());
+            release.send(()).unwrap();
+            holder.join().unwrap();
+            server.stop().await.unwrap();
+        });
     }
 
     async fn start_with(scratch: &Scratch, bounds: Bounds) -> Server {

@@ -23,7 +23,7 @@ use ritornel_contract::{
     TrackSummary,
 };
 use ritornel_engine::playback::{
-    self as engine, AddTracks, Catalog, Direction, Done, Order, Place, PlayTracks, Player,
+    self as engine, AddTracks, Catalog, Direction, Done, Fetch, Order, Place, PlayTracks, Player,
     PlayerEvent, PlayerState, Request, Settings, Status, TrackDisplay,
 };
 use ritornel_engine::{Command, LibraryStore, ServerStore};
@@ -195,6 +195,7 @@ impl Core {
                 Status::Stopped => PlaybackStatus::Stopped,
                 Status::Playing => PlaybackStatus::Playing,
                 Status::Paused => PlaybackStatus::Paused,
+                Status::Buffering => PlaybackStatus::Buffering,
             },
             entry_id: current.map(|now| now.entry_id),
             index: current.and_then(|now| u32::try_from(now.index).ok()),
@@ -289,15 +290,22 @@ impl Core {
         let hub = self.hub_catalog();
         let mut player = lock(&self.player);
         let player = player.as_mut().ok_or_else(no_player)?;
-        let (done, events) = work(
+        let worked = work(
             player,
             &stores.server,
             catalog(library.as_ref(), hub.as_ref()),
-        )
-        .map_err(refused)?;
+        );
+        // Kept with the player held, whatever the call came to: a call that
+        // failed may still have changed it.
+        self.note_sounding(player);
+        let (done, events) = worked.map_err(refused)?;
         let state = player.state();
+        let wants = player.wanted().is_some();
         drop(library);
         self.publish_player(events, Some(state));
+        if wants {
+            self.pulls.wake();
+        }
         Ok(done)
     }
 
@@ -319,6 +327,7 @@ impl Core {
                 return Ok(());
             };
             let ticked = player.tick(&stores.server, catalog(library.as_ref(), hub.as_ref()));
+            self.note_sounding(player);
             // The record's sign follows the player's saves, and nothing
             // else a tick can fail at.
             match player.save_failing() {
@@ -327,8 +336,12 @@ impl Core {
             }
             let events = ticked?;
             let state = (!events.is_empty()).then(|| player.state());
+            let wants = player.wanted().is_some();
             drop(library);
             self.publish_player(events, state);
+            if wants {
+                self.pulls.wake();
+            }
             Ok(())
         });
         ticked.unwrap_or(Ok(()))
@@ -344,16 +357,72 @@ impl Core {
         crate::hub_catalog::tidy(&self.audio_cache(), bytes);
     }
 
+    /// Keeps whether the player plays, or is about to, for
+    /// [`playing`](Core::playing): with the player held, so that two calls
+    /// cannot leave it as the earlier one found it.
+    fn note_sounding(&self, player: &Player) {
+        self.sounding
+            .store(player.status().wants_sound(), Ordering::Relaxed);
+    }
+
+    /// For the tests alone: how long the audio route waits before each
+    /// chunk of a master.
+    pub(crate) fn set_audio_pace(&self, pace: Option<std::time::Duration>) {
+        if let Some(pace) = pace {
+            let _ = self.audio_pace.set(pace);
+        }
+    }
+
+    /// How long the audio route waits before each chunk: none but in tests.
+    pub(crate) fn audio_pace(&self) -> Option<std::time::Duration> {
+        self.audio_pace.get().copied()
+    }
+
+    /// What wakes the pulling of a master the player waits for.
+    pub(crate) fn pulls(&self) -> &crate::playback::Wake {
+        &self.pulls
+    }
+
+    /// The master the player waits for, with the hub to pull it from:
+    /// none on a hub, or while the player waits for nothing. The player is
+    /// let go before the pull, so it answers meanwhile.
+    pub(crate) fn wanted_master(&self) -> Option<(Fetch, HubCatalog)> {
+        let hub = self.hub_catalog()?;
+        let fetch = lock(&self.player).as_ref()?.wanted()?;
+        Some((fetch, hub))
+    }
+
+    /// Hands the player a master pulled for it, or why it could not be.
+    /// The cache is trimmed here, with the player held, so that nothing it
+    /// is opening can be let go meanwhile.
+    pub(crate) fn master_fetched(&self, fetch: Fetch, outcome: Result<engine::Copy, String>) {
+        let handed = self.with_stores(|stores| {
+            self.with_player(stores, |player, server, library| {
+                if let Ok(copy) = &outcome {
+                    let limit = self
+                        .cache_bytes
+                        .get()
+                        .copied()
+                        .unwrap_or(DEFAULT_CACHE_BYTES);
+                    let kept = copy.path(&std::collections::HashMap::new());
+                    crate::hub_catalog::trim(&self.audio_cache(), limit, kept.as_deref());
+                }
+                Ok(((), player.fetched(fetch, outcome, server, library)?))
+            })
+        });
+        if let Some(Err(error)) = handed {
+            error!(%error, "a pulled master could not be handed to the player");
+            // What it came to is said all the same.
+            let player = lock(&self.player);
+            let state = player.as_ref().map(Player::state);
+            self.publish_player(vec![PlayerEvent::State], state);
+        }
+    }
+
     /// On a satellite, the hub's library as its player reads it.
     pub(crate) fn hub_catalog(&self) -> Option<HubCatalog> {
-        self.uplink().map(|uplink| {
-            let bytes = self
-                .cache_bytes
-                .get()
-                .copied()
-                .unwrap_or(DEFAULT_CACHE_BYTES);
-            HubCatalog::new(uplink, self.audio_cache(), bytes)
-        })
+        self.uplink()
+            .map(|uplink| HubCatalog::new(uplink, self.audio_cache()))
     }
 
     /// Where a satellite keeps the masters it pulls.

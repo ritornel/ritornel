@@ -536,7 +536,7 @@ impl Player {
             self.resume_listen = None;
             self.start_reason = StartReason::UserPick;
             match (self.current, library) {
-                (Some(_), Some(library)) if self.status == Status::Playing => {
+                (Some(_), Some(library)) if self.status.wants_sound() => {
                     self.start(server, library, &mut events)?;
                 }
                 (Some(_), library) => self.display = self.read_display(library),

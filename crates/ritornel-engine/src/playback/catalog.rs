@@ -155,6 +155,10 @@ pub(crate) enum Location {
     /// A file of this server's own: on a satellite, a master pulled from
     /// the hub.
     File(PathBuf),
+    /// Elsewhere: on a satellite, a master the hub has and this server has
+    /// not pulled yet. It cannot be opened until it is fetched, which is
+    /// done off the player ([`Player::wanted`](crate::playback::Player::wanted)).
+    Elsewhere,
 }
 
 impl Copy {
@@ -192,7 +196,13 @@ impl Copy {
                 Some(crate::walk::under(roots.get(root)?, rel_path))
             }
             Location::File(path) => Some(path.clone()),
+            Location::Elsewhere => None,
         }
+    }
+
+    /// Whether it must be fetched before it can be opened.
+    pub fn is_elsewhere(&self) -> bool {
+        self.location == Location::Elsewhere
     }
 
     /// A copy of the master `source_item` at revision `revision_no`, which
@@ -213,6 +223,23 @@ impl Copy {
             duration_ms,
             location: Location::File(path),
             facts,
+        }
+    }
+
+    /// A copy of the master `source_item` at revision `revision_no`, which
+    /// plays as the asset `asset`, that is not here yet and must be fetched
+    /// before it plays.
+    pub fn elsewhere(source_item: Id, revision_no: i64, asset: Id, duration_ms: i64) -> Self {
+        Self {
+            source_item,
+            revision_no,
+            asset,
+            duration_ms,
+            location: Location::Elsewhere,
+            facts: FileFacts {
+                size_bytes: 0,
+                mtime_ms: 0,
+            },
         }
     }
 }
