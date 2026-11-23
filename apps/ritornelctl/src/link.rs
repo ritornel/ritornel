@@ -3,13 +3,15 @@
 //! "Hub and satellites" in docs/internals/linking.md.
 
 use std::io::Write;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::time::Duration;
 
 use ritornel_client::contract::methods::{
     LinkInvite as Invite, LinkJoin, LinkSetAwake, LinkStatusCall,
 };
 use ritornel_client::contract::{
-    Awake, AwakeParams, AwakeSet, LinkInvite, LinkInviteParams, LinkJoinParams, LinkStatus,
-    NoParams,
+    Awake, AwakeParams, AwakeSet, HubStatus, LinkInvite, LinkInviteParams, LinkJoinParams,
+    LinkStatus, NoParams,
 };
 use ritornel_client::local;
 
@@ -53,7 +55,7 @@ pub(crate) fn link(
                 out,
                 &status,
                 serde_json::to_string_pretty,
-                render_status,
+                |status: &LinkStatus| render_status(status, &resolve_soon),
             )
         }
         LinkCommand::Awake(args) => {
@@ -71,7 +73,7 @@ pub(crate) fn link(
                 out,
                 &set,
                 serde_json::to_string_pretty,
-                |set: &AwakeSet| render_status(&set.link),
+                |set: &AwakeSet| render_status(&set.link, &resolve_soon),
             )
         }
         LinkCommand::Status(args) => {
@@ -83,7 +85,7 @@ pub(crate) fn link(
                 out,
                 &status,
                 serde_json::to_string_pretty,
-                render_status,
+                |status: &LinkStatus| render_status(status, &resolve_soon),
             )
         }
     }
@@ -132,16 +134,74 @@ fn render_awake(status: &LinkStatus) -> String {
     format!("{setting}; {now}")
 }
 
-fn render_status(status: &LinkStatus) -> String {
+/// What a name resolves to on this machine, as the satellite resolves it,
+/// given a moment: a name that does not resolve soon is taken to give
+/// nothing.
+fn resolve_soon(route: &str) -> Vec<SocketAddr> {
+    let route = route.to_owned();
+    let (resolved, found) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let addresses = route
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        let _ = resolved.send(addresses);
+    });
+    found
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_default()
+}
+
+/// The route the satellite reached its hub on, as the link names it, and
+/// the address that was: a route that is that address, or else the name
+/// that resolves to it here. The status says only the address.
+fn connected_via(hub: &HubStatus, resolve: &dyn Fn(&str) -> Vec<SocketAddr>) -> Option<String> {
+    let address: SocketAddr = hub.route.as_deref()?.parse().ok()?;
+    // An address the satellite has as a route, and by a name too, is
+    // dialled as the address.
+    if hub
+        .routes
+        .iter()
+        .any(|route| route.parse::<SocketAddr>().ok() == Some(address))
+    {
+        return Some(address.to_string());
+    }
+    let named = hub
+        .routes
+        .iter()
+        .filter(|route| route.parse::<SocketAddr>().is_err())
+        .find(|route| resolve(route).contains(&address));
+    Some(match named {
+        Some(route) => format!("{route} ({address})"),
+        None => address.to_string(),
+    })
+}
+
+/// Whether the hub answers, as the satellite last found.
+fn render_answers(hub: &HubStatus) -> String {
+    match (hub.answers, &hub.problem) {
+        (Some(true), _) => "yes".to_owned(),
+        (Some(false), Some(problem)) => format!("no: {problem}"),
+        (Some(false), None) => "no".to_owned(),
+        (None, _) => "not asked yet".to_owned(),
+    }
+}
+
+fn render_status(status: &LinkStatus, resolve: &dyn Fn(&str) -> Vec<SocketAddr>) -> String {
     let mut text = String::new();
     if let Some(hub) = &status.hub {
-        text += &server::facts(&[
+        let mut facts = vec![
             ("Role", "satellite".to_owned()),
             ("Hub", format!("{} ({})", hub.name, hub.server_id)),
             ("Library", hub.library_id.to_string()),
             ("Routes", hub.routes.join(", ")),
-            ("Awake", render_awake(status)),
-        ]);
+        ];
+        if let Some(via) = connected_via(hub, resolve) {
+            facts.push(("Connected via", via));
+        }
+        facts.push(("Hub answers", render_answers(hub)));
+        facts.push(("Awake", render_awake(status)));
+        text += &server::facts(&facts);
     } else {
         text += &server::facts(&[("Role", status.role.as_str().to_owned())]);
         for satellite in &status.satellites {
@@ -167,6 +227,71 @@ mod tests {
             minutes: minutes.map(str::to_owned),
             ..AwakeArgs::default()
         }
+    }
+
+    fn hub(route: Option<&str>, answers: Option<bool>) -> HubStatus {
+        HubStatus {
+            server_id: ritornel_client::contract::Id::from_bytes([1; 16]),
+            name: "Studio Mac".to_owned(),
+            library_id: ritornel_client::contract::Id::from_bytes([2; 16]),
+            epoch: 1,
+            routes: [
+                "studio-mac.local:4747",
+                "10.0.0.2:4747",
+                "studio.example-overlay.net:4747",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            linked_at_ms: 0,
+            answers,
+            since_ms: None,
+            route: route.map(str::to_owned),
+            problem: (answers == Some(false)).then(|| "no answer in 4 seconds".to_owned()),
+        }
+    }
+
+    /// What the names resolve to here, in these tests.
+    fn resolve(route: &str) -> Vec<SocketAddr> {
+        match route {
+            "studio-mac.local:4747" => vec!["192.168.1.20:4747".parse().unwrap()],
+            "studio.example-overlay.net:4747" => vec!["100.64.0.9:4747".parse().unwrap()],
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_satellite_says_which_route_it_reached_its_hub_on_and_whether_it_answers() {
+        let at = |route| connected_via(&hub(Some(route), Some(true)), &resolve);
+        assert_eq!(
+            at("192.168.1.20:4747").as_deref(),
+            Some("studio-mac.local:4747 (192.168.1.20:4747)")
+        );
+        assert_eq!(at("10.0.0.2:4747").as_deref(), Some("10.0.0.2:4747"));
+        assert_eq!(
+            at("100.64.0.9:4747").as_deref(),
+            Some("studio.example-overlay.net:4747 (100.64.0.9:4747)")
+        );
+        assert_eq!(connected_via(&hub(None, None), &resolve), None);
+
+        let text = render_status(
+            &LinkStatus {
+                role: ritornel_client::contract::ServerRole::Satellite,
+                hub: Some(hub(Some("192.168.1.20:4747"), Some(true))),
+                satellites: Vec::new(),
+                awake: Awake::default(),
+                kept_awake: false,
+            },
+            &resolve,
+        );
+        assert!(
+            text.contains("Connected via     studio-mac.local:4747 (192.168.1.20:4747)\n"),
+            "{text}"
+        );
+        assert!(text.contains("Hub answers       yes\n"), "{text}");
+        assert_eq!(
+            render_answers(&hub(Some("192.168.1.20:4747"), Some(false))),
+            "no: no answer in 4 seconds"
+        );
     }
 
     #[test]

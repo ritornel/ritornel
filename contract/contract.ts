@@ -1583,7 +1583,8 @@ export type HubStatus = {
    */
   sinceMs?: number,
   /**
-   * The route the satellite last reached it on.
+   * The address the satellite last reached it on, as an address and a
+   * port: what the route it took resolved to.
    */
   route?: string,
   /**

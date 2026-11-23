@@ -159,7 +159,8 @@ pub struct HubStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub since_ms: Option<i64>,
-    /// The route the satellite last reached it on.
+    /// The address the satellite last reached it on, as an address and a
+    /// port: what the route it took resolved to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub route: Option<String>,
