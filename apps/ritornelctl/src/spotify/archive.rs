@@ -89,7 +89,8 @@ impl fmt::Display for Error {
                  with no track IDs; ask Spotify for the extended streaming history instead",
             ),
             Self::NoHistory => f.write_str(
-                "there is no Spotify streaming history there: no Streaming_History_Audio file",
+                "there is no Spotify streaming history there: no Streaming_History_Audio, \
+                 Streaming_History_Video or endsong file",
             ),
             Self::Unreadable(name) => write!(f, "{}: it cannot be read", shown(name)),
             Self::File(name, error) => write!(f, "{}: {error}", shown(name)),
