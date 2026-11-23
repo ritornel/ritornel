@@ -17,14 +17,14 @@ use std::time::Duration;
 
 use ritornel_client::contract::methods::{
     LibraryStats, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkSetAwake, LinkStatusCall,
-    PlaybackPlay, QueueWindow, RatingsSet, SourcesAdd,
+    PlaybackGet, PlaybackPause, PlaybackPlay, QueueWindow, RatingsSet, SourcesAdd,
 };
 use ritornel_client::contract::{
     Awake, AwakeParams, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink,
     LinkInviteParams, LinkJoinParams, LinkListenParams, LinkPingParams, LinkRequest, LinkStatus,
-    ListKind, ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackPlayParams,
-    PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole, SourcesAddParams,
-    Topic, Window, capability, hex, link_request_proof, route,
+    ListKind, ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackCommandParams,
+    PlaybackPlayParams, PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole,
+    SourcesAddParams, Topic, Window, capability, hex, link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -825,6 +825,77 @@ async fn a_satellite_keeps_no_more_of_the_hubs_music_than_its_cache_size() {
             .unwrap()
             .count();
         assert_eq!(kept, 2);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_answers_and_stops_while_a_slow_pull_is_under_way() {
+    bounded(async {
+        let scratch = Scratch::new();
+        // A hub that sends each master slowly, so that the satellite's pull
+        // is held open for seconds.
+        let hub = Server::start_run(
+            HeldDir::take(scratch.data_dir("hub")).unwrap(),
+            Listen::on_port(0),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+            Bounds::default(),
+            Run {
+                audio_pace: Some(Duration::from_secs(3)),
+                ..Run::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut hub_client = client(&scratch, "hub", &hub).await;
+        hub_client.create_library(key()).await.unwrap();
+        scan(&scratch, &mut hub_client).await;
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        let desk_client = client(&scratch, "desk", &desk).await;
+        join(&desk_client, &invite(&hub, &hub_client).await)
+            .await
+            .unwrap();
+        let ids = song_ids(&desk_client.list_open(&songs()).await.unwrap().rows);
+
+        // Each call is answered at once while the master is pulled.
+        let quick = Duration::from_millis(1_500);
+        tokio::time::timeout(
+            quick,
+            desk_client.call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::Tracks { ids },
+                start: None,
+                context: None,
+                shuffle: None,
+            }),
+        )
+        .await
+        .expect("play waited on the pull")
+        .unwrap();
+        let state = tokio::time::timeout(quick, desk_client.call::<PlaybackGet>(&NoParams {}))
+            .await
+            .expect("the player's state waited on the pull")
+            .unwrap();
+        assert_eq!(state.status, PlaybackStatus::Buffering);
+        tokio::time::timeout(
+            quick,
+            desk_client.call::<PlaybackPause>(&PlaybackCommandParams {
+                idempotency_key: key(),
+            }),
+        )
+        .await
+        .expect("a pause waited on the pull")
+        .unwrap();
+
+        // And the satellite stops while it is still under way.
+        drop(desk_client);
+        tokio::time::timeout(Duration::from_secs(5), desk.stop())
+            .await
+            .expect("the stop waited on the pull")
+            .unwrap();
+        drop(hub_client);
+        hub.stop().await.unwrap();
     })
     .await;
 }

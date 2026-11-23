@@ -78,6 +78,10 @@ pub struct Run {
     /// The most a satellite's cache of masters pulled from its hub holds,
     /// in bytes, by the `cache_size` setting. With none it is 2 GiB.
     pub cache_bytes: Option<u64>,
+    /// For the tests alone: how long the audio route waits before each
+    /// chunk of a master it sends, so that a satellite's pull can be held
+    /// open.
+    pub audio_pace: Option<std::time::Duration>,
     /// The name an older build took from the computer, where that differs
     /// from `computer_name` (`COMPUTERNAME` on Windows): a server still
     /// carrying it takes `computer_name`.

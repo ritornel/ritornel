@@ -493,6 +493,7 @@ async fn audio(
     ) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let pace = core.audio_pace();
     // Reading the library and opening the file wait on the disk.
     let opened = tokio::task::spawn_blocking(move || {
         let (path, scanned) = core.master(appearance, item, revision)?;
@@ -512,8 +513,11 @@ async fn audio(
         )
             .into_response();
     }
-    let chunks = futures_util::stream::unfold(Some(file), |file| async move {
+    let chunks = futures_util::stream::unfold(Some(file), move |file| async move {
         let mut file = file?;
+        if let Some(pace) = pace {
+            tokio::time::sleep(pace).await;
+        }
         let read = tokio::task::spawn_blocking(move || {
             let mut chunk = vec![0; AUDIO_CHUNK];
             let read = std::io::Read::read(&mut file, &mut chunk)?;

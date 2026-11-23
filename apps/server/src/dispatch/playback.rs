@@ -235,6 +235,10 @@ impl Core {
     /// wakes the delivery of a listen that closed, and hands Last.fm what
     /// began to play.
     pub(crate) fn publish_player(&self, events: Vec<PlayerEvent>, state: Option<PlayerState>) {
+        if let Some(state) = &state {
+            self.sounding
+                .store(state.status.wants_sound(), Ordering::Relaxed);
+        }
         for event in events {
             match event {
                 PlayerEvent::State => {
@@ -351,6 +355,19 @@ impl Core {
         let bytes = bytes.unwrap_or(DEFAULT_CACHE_BYTES);
         let _ = self.cache_bytes.set(bytes);
         crate::hub_catalog::tidy(&self.audio_cache(), bytes);
+    }
+
+    /// For the tests alone: how long the audio route waits before each
+    /// chunk of a master.
+    pub(crate) fn set_audio_pace(&self, pace: Option<std::time::Duration>) {
+        if let Some(pace) = pace {
+            let _ = self.audio_pace.set(pace);
+        }
+    }
+
+    /// How long the audio route waits before each chunk: none but in tests.
+    pub(crate) fn audio_pace(&self) -> Option<std::time::Duration> {
+        self.audio_pace.get().copied()
     }
 
     /// What wakes the pulling of a master the player waits for.
