@@ -286,7 +286,7 @@ fn a_full_rebuild_equals_what_ingest_derived_on_every_fixture() {
             .1;
         for listen in &listens {
             assert!(
-                matches!(at.send(listen, PlayRule::V1), Ingested::Stored(_)),
+                matches!(at.send(listen, PlayRule::CURRENT), Ingested::Stored(_)),
                 "{name}"
             );
         }
@@ -294,14 +294,14 @@ fn a_full_rebuild_equals_what_ingest_derived_on_every_fixture() {
         assert!(!incremental.is_empty(), "{name}");
         // A dry run finds nothing to change, and writes nothing.
         let revision = at.library.meta().unwrap().revision;
-        let dry = at.rebuild(PlayRule::V1, true);
+        let dry = at.rebuild(PlayRule::CURRENT, true);
         assert_eq!(
             (dry.changed, dry.before, dry.after),
             (0, incremental.len() as i64, incremental.len() as i64),
             "{name}"
         );
         assert_eq!(at.library.meta().unwrap().revision, revision, "{name}");
-        let rebuilt = at.rebuild(PlayRule::V1, false);
+        let rebuilt = at.rebuild(PlayRule::CURRENT, false);
         assert_eq!(rebuilt.changed, 0, "{name}");
         assert_eq!(at.library.derived_history().unwrap(), incremental, "{name}");
         assert!(!at.library.history_needs_rebuild().unwrap());
@@ -331,25 +331,29 @@ fn an_old_derived_zone_is_rebuilt_from_the_original_observation() {
 fn after_the_rule_is_bumped_a_rebuild_equals_ingest_under_the_new_rule() {
     // A stricter rule, for the test: three quarters of the track.
     let v2 = PlayRule {
-        version: 2,
+        version: PlayRule::CURRENT.version + 1,
         share_numerator: 3,
         share_denominator: 4,
-        ..PlayRule::V1
+        ..PlayRule::CURRENT
     };
     let everything = |at: &Library| fixtures(at).pop().unwrap().1;
 
     let bumped = library();
     for listen in everything(&bumped) {
-        bumped.send(&listen, PlayRule::V1);
+        bumped.send(&listen, PlayRule::CURRENT);
     }
     let before = bumped.library.derived_history().unwrap();
     let dry = bumped.rebuild(v2, true);
     assert!(dry.changed > 0);
     let rebuilt = bumped.rebuild(v2, false);
     assert_eq!(rebuilt.changed, before.len() as i64);
-    // The 60% listen counted under rule 1 and does not under rule 2.
+    // The 60% listen counted under the rule in force and does not under
+    // the stricter one.
     assert_eq!(
-        bumped.count("SELECT count(*) FROM play_event WHERE play_rule_version = 2"),
+        bumped.count(String::leak(format!(
+            "SELECT count(*) FROM play_event WHERE play_rule_version = {}",
+            v2.version
+        ))),
         before.len() as i64
     );
     assert!(bumped.library.history_needs_rebuild().unwrap());
@@ -369,7 +373,7 @@ fn a_listen_of_40_percent_is_stored_and_does_not_count_and_one_of_60_percent_cou
     let at = library();
     let (_, listens) = fixtures(&at).into_iter().next().unwrap();
     for listen in &listens {
-        at.send(listen, PlayRule::V1);
+        at.send(listen, PlayRule::CURRENT);
     }
     let plays = at.library.recent_plays(at.listener, 10, None).unwrap();
     let judged: Vec<(i64, bool, &str)> = plays
@@ -389,16 +393,16 @@ fn a_listen_sent_again_writes_once_and_one_with_another_payload_is_kept_as_a_con
     let at = library();
     let listen = at.listen(1, 0, T0, 200_000);
     assert!(matches!(
-        at.send(&listen, PlayRule::V1),
+        at.send(&listen, PlayRule::CURRENT),
         Ingested::Stored(_)
     ));
     let revision = at.library.meta().unwrap().revision;
     // Stamped afresh, the same listen is the same listen.
-    assert_eq!(at.send(&listen, PlayRule::V1), Ingested::Duplicate);
+    assert_eq!(at.send(&listen, PlayRule::CURRENT), Ingested::Duplicate);
     assert_eq!(at.library.meta().unwrap().revision, revision);
     let mut other = listen.clone();
     other.ms_played = 1;
-    assert_eq!(at.send(&other, PlayRule::V1), Ingested::Conflict);
+    assert_eq!(at.send(&other, PlayRule::CURRENT), Ingested::Conflict);
     assert_eq!(at.count("SELECT count(*) FROM history_observation"), 1);
     assert_eq!(at.count("SELECT count(*) FROM history_ingest_conflict"), 1);
     assert_eq!(at.count("SELECT count(*) FROM play_event"), 1);
@@ -410,7 +414,7 @@ fn a_listen_whose_source_item_has_no_assignment_gives_an_unbound_play_that_binds
     let mut loose = at.listen(1, 0, T0, 200_000);
     loose.source_item = at.loose.0;
     loose.asset = at.loose.1;
-    at.send(&loose, PlayRule::V1);
+    at.send(&loose, PlayRule::CURRENT);
     let [play] = at
         .library
         .recent_plays(at.listener, 10, None)
@@ -452,7 +456,7 @@ fn a_listen_whose_source_item_has_no_assignment_gives_an_unbound_play_that_binds
     assert_eq!(play.title.as_deref(), Some("Salt Road"));
     // And a rebuild agrees.
     let incremental = at.library.derived_history().unwrap();
-    assert_eq!(at.rebuild(PlayRule::V1, false).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, false).changed, 0);
     assert_eq!(at.library.derived_history().unwrap(), incremental);
 }
 
@@ -460,7 +464,7 @@ fn a_listen_whose_source_item_has_no_assignment_gives_an_unbound_play_that_binds
 fn an_excluded_play_is_kept_and_marked_and_a_rebuild_keeps_it_excluded() {
     let at = library();
     let listen = at.listen(1, 0, T0, 200_000);
-    at.send(&listen, PlayRule::V1);
+    at.send(&listen, PlayRule::CURRENT);
     // An exclude correction, written as the correction call will write it.
     let (server, key) = (at.server.server_id, listen.listen_id);
     at.library
@@ -498,7 +502,7 @@ fn an_excluded_play_is_kept_and_marked_and_a_rebuild_keeps_it_excluded() {
         )
         .unwrap();
     // A correction triggers a derive; here the rebuild is that derive.
-    assert_eq!(at.rebuild(PlayRule::V1, false).changed, 1);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, false).changed, 1);
     let [play] = at
         .library
         .recent_plays(at.listener, 10, None)
@@ -507,7 +511,7 @@ fn an_excluded_play_is_kept_and_marked_and_a_rebuild_keeps_it_excluded() {
         .unwrap();
     assert!(play.excluded && play.counts);
     assert_eq!(at.count("SELECT count(*) FROM play_effective"), 0);
-    assert_eq!(at.rebuild(PlayRule::V1, false).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, false).changed, 0);
 }
 
 #[test]
@@ -519,7 +523,7 @@ fn on_this_day_reads_the_plays_that_count_on_that_month_and_day_of_any_year() {
     skipped.end_reason = "next".to_owned();
     let tomorrow = at.listen(4, 0, T0 + 24 * 60 * MINUTE, 200_000);
     for listen in [&last_year, &today, &skipped, &tomorrow] {
-        at.send(listen, PlayRule::V1);
+        at.send(listen, PlayRule::CURRENT);
     }
     let plays = at.library.plays_on_this_day(at.listener, 1115).unwrap();
     let dates: Vec<Option<i64>> = plays.iter().map(|play| play.local_date).collect();
@@ -561,7 +565,7 @@ fn what_the_sender_knew_of_its_own_date_is_kept_on_the_observation() {
     let at = library();
     let mut fast = at.listen(1, 0, T0 + 4 * 60 * MINUTE, 200_000);
     fast.started_mono_ms = 77;
-    at.send(&fast, PlayRule::V1);
+    at.send(&fast, PlayRule::CURRENT);
     let row: (String, Option<String>, i64, i64, i64, i64) = at
         .library
         .read(|connection| {
@@ -1053,7 +1057,7 @@ fn a_counted_listen_is_recorded_before_it_is_sent_once_and_its_echo_joins_its_pl
     let skipped = at.listen(2, 1, start + 5 * MINUTE, 120_000);
     let before = at.listen(3, 0, start - 5 * MINUTE, 200_000);
     for listen in [&counted, &skipped, &before] {
-        at.send(listen, PlayRule::V1);
+        at.send(listen, PlayRule::CURRENT);
     }
     let from = start - MINUTE;
     assert_eq!(at.library.plan_deliveries(account, from).unwrap(), 1);
@@ -1123,7 +1127,7 @@ fn a_counted_listen_is_recorded_before_it_is_sent_once_and_its_echo_joins_its_pl
     );
 
     let incremental = at.library.derived_history().unwrap();
-    at.rebuild(PlayRule::V1, false);
+    at.rebuild(PlayRule::CURRENT, false);
     assert_eq!(at.library.derived_history().unwrap(), incremental);
 
     // A Spotify stream at the same moment is never joined to the echo of a
@@ -1179,8 +1183,11 @@ fn a_delivery_a_run_left_sending_is_unknown_and_never_sent_again() {
         .ensure_service_account("lastfm", "someone")
         .unwrap();
     let start = T0 + 10 * MINUTE;
-    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
-    at.send(&at.listen(2, 1, start + 5 * MINUTE, 300_000), PlayRule::V1);
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::CURRENT);
+    at.send(
+        &at.listen(2, 1, start + 5 * MINUTE, 300_000),
+        PlayRule::CURRENT,
+    );
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 2);
     let due = at.library.take_due_deliveries(account, 0, 1).unwrap();
     assert_eq!(due.len(), 1);
@@ -1217,7 +1224,10 @@ fn a_delivery_a_run_left_sending_is_unknown_and_never_sent_again() {
     );
     // A play older than the service takes is not eligible.
     at.clock.set(start + crate::SEND_WITHIN_MS + 30 * MINUTE);
-    at.send(&at.listen(3, 2, start + 30 * MINUTE, 25_000), PlayRule::V1);
+    at.send(
+        &at.listen(3, 2, start + 30 * MINUTE, 25_000),
+        PlayRule::CURRENT,
+    );
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 0);
 }
 
@@ -1260,7 +1270,7 @@ fn exclude_listen(at: &Library, key: Id) {
             },
         )
         .unwrap();
-    at.rebuild(PlayRule::V1, false);
+    at.rebuild(PlayRule::CURRENT, false);
 }
 
 #[test]
@@ -1274,7 +1284,7 @@ fn a_queued_play_that_is_no_longer_eligible_is_withdrawn_and_never_sent() {
     let excluded = at.listen(1, 0, start, 200_000);
     let aged = at.listen(2, 1, start + 5 * MINUTE, 300_000);
     for listen in [&excluded, &aged] {
-        at.send(listen, PlayRule::V1);
+        at.send(listen, PlayRule::CURRENT);
     }
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 2);
     // Excluded after it was queued: it is not sent.
@@ -1323,7 +1333,7 @@ fn a_queued_play_from_before_scrobbling_was_turned_on_again_is_withdrawn() {
         .ensure_service_account("lastfm", "someone")
         .unwrap();
     let start = T0 + 10 * MINUTE;
-    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::CURRENT);
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
     // Scrobbling turned off and on again after the play: from then on.
     let cutoff = start + 20 * MINUTE;
@@ -1349,7 +1359,7 @@ fn an_echo_imported_while_its_scrobble_was_sending_joins_its_play_once_the_answe
         .ensure_service_account("lastfm", "someone")
         .unwrap();
     let start = T0 + 10 * MINUTE;
-    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::CURRENT);
     at.library.plan_deliveries(account, 0).unwrap();
     let [sent] = at
         .library
@@ -1379,7 +1389,7 @@ fn an_echo_imported_while_its_scrobble_was_sending_joins_its_play_once_the_answe
     // The answer names the echo: it joins the play, and counts once.
     assert_eq!(at.count("SELECT count(*) FROM play_event"), 1);
     let incremental = at.library.derived_history().unwrap();
-    at.rebuild(PlayRule::V1, false);
+    at.rebuild(PlayRule::CURRENT, false);
     assert_eq!(at.library.derived_history().unwrap(), incremental);
 }
 
@@ -1393,13 +1403,13 @@ fn a_play_another_scrobbler_already_sent_to_the_account_is_not_sent_again() {
     let start = T0 + 10 * MINUTE;
     let first = at.listen(1, 0, start, 200_000);
     let second = at.listen(2, 1, start + 10 * MINUTE, 300_000);
-    at.send(&first, PlayRule::V1);
+    at.send(&first, PlayRule::CURRENT);
     // Another player scrobbled the first play itself, a second later.
     scrobble_of(&at, account, start / 1000 + 1, "moss arcade", "PAPER KITES");
     // Before it is queued: it is not.
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 0);
     // After it is queued: it is not sent.
-    at.send(&second, PlayRule::V1);
+    at.send(&second, PlayRule::CURRENT);
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 1);
     scrobble_of(
         &at,
@@ -1424,8 +1434,8 @@ fn a_play_another_scrobbler_already_sent_to_the_account_is_not_sent_again() {
     // A play of another track in the same second is not that play.
     let third = at.listen(3, 2, start + 30 * MINUTE, 25_000);
     let fourth = at.listen(4, 0, start + 40 * MINUTE, 200_000);
-    at.send(&third, PlayRule::V1);
-    at.send(&fourth, PlayRule::V1);
+    at.send(&third, PlayRule::CURRENT);
+    at.send(&fourth, PlayRule::CURRENT);
     scrobble_of(
         &at,
         account,
@@ -1507,9 +1517,9 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
     let mut skipped = at.listen(7, 1, start, 20_000);
     skipped.end_reason = "next".to_owned();
     skipped.context_ref = Some(Id::from_bytes(release));
-    at.send(&skipped, PlayRule::V1);
+    at.send(&skipped, PlayRule::CURRENT);
     let finished = at.listen(8, 0, start + 5 * MINUTE, ALBUM[0].length_ms);
-    at.send(&finished, PlayRule::V1);
+    at.send(&finished, PlayRule::CURRENT);
     // One taken out of history again.
     exclude_listen(&at, Id::from_bytes([8; 16]));
     // A scrobble from years before, imported.
@@ -1625,7 +1635,7 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
     );
     assert_eq!(
         manifest["files"]["plays.csv"]["playRuleVersions"],
-        serde_json::json!([1])
+        serde_json::json!([PlayRule::CURRENT.version])
     );
     let observations = reading_an_export::lines(&scratch.path().join("observations.jsonl"));
     let endpoint_kind = |id: &serde_json::Value| {
@@ -1774,7 +1784,7 @@ fn scrobbles_that_ended_unknown_or_withdrawn_are_counted_from_when_they_ended_un
     let sent = at.listen(1, 0, start, 200_000);
     let excluded = at.listen(2, 1, start + 5 * MINUTE, 300_000);
     for listen in [&sent, &excluded] {
-        at.send(listen, PlayRule::V1);
+        at.send(listen, PlayRule::CURRENT);
     }
     assert_eq!(
         at.library
@@ -1860,8 +1870,11 @@ fn scrobbles_refused_with_their_request_count_until_the_account_takes_one_again(
         .ensure_service_account("lastfm", "someone")
         .unwrap();
     let start = T0 + 10 * MINUTE;
-    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
-    at.send(&at.listen(2, 1, start + 5 * MINUTE, 300_000), PlayRule::V1);
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::CURRENT);
+    at.send(
+        &at.listen(2, 1, start + 5 * MINUTE, 300_000),
+        PlayRule::CURRENT,
+    );
     assert_eq!(at.library.plan_deliveries(account, 0).unwrap(), 2);
     // The key is refused: the request and the play in it.
     let first = at.library.take_due_deliveries(account, 0, 1).unwrap();
@@ -1977,7 +1990,7 @@ fn of_two_plays_sharing_one_scrobbled_text_one_moves_to_another_recording_and_su
     let before = at.library.recent_plays(at.listener, 10, None).unwrap();
     assert_eq!(before.len(), 2);
     assert!(before.iter().all(|play| play.recording == Some(rec_a)));
-    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
 
     // Move ONLY the first observation to rec_b (with app_b).
     let (_, corr_id) = at
@@ -2010,8 +2023,8 @@ fn of_two_plays_sharing_one_scrobbled_text_one_moves_to_another_recording_and_su
 
     // history rebuild --dry-run agrees with incremental derive, and a full
     // rebuild keeps the first play on rec_b.
-    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
-    assert_eq!(at.rebuild(PlayRule::V1, false).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, false).changed, 0);
 
     // Running rebind (as after a rescan) leaves the overridden play alone.
     at.library
@@ -2027,7 +2040,7 @@ fn of_two_plays_sharing_one_scrobbled_text_one_moves_to_another_recording_and_su
             },
         )
         .unwrap();
-    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
 
     // Merging rec_b into rec_c moves the corrected play through the redirect
     // while keeping rec_b stored on correction_recording, so undoing the merge
@@ -2056,7 +2069,7 @@ fn of_two_plays_sharing_one_scrobbled_text_one_moves_to_another_recording_and_su
         .unwrap();
     let merged = at.library.recent_plays(at.listener, 10, None).unwrap();
     assert_eq!(merged[1].recording, Some(rec_c));
-    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
 
     // Export records the set_recording correction with its named recording and
     // current canonical recording.
@@ -2101,7 +2114,7 @@ fn of_two_plays_sharing_one_scrobbled_text_one_moves_to_another_recording_and_su
         .unwrap();
     let unmerged = at.library.recent_plays(at.listener, 10, None).unwrap();
     assert_eq!(unmerged[1].recording, Some(rec_b));
-    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
 
     // Revoking the correction returns the first play to rec_a immediately and
     // after a rebuild.
@@ -2118,7 +2131,7 @@ fn of_two_plays_sharing_one_scrobbled_text_one_moves_to_another_recording_and_su
         .unwrap();
     let revoked = at.library.recent_plays(at.listener, 10, None).unwrap();
     assert!(revoked.iter().all(|play| play.recording == Some(rec_a)));
-    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
 }
 
 #[test]
@@ -2200,8 +2213,8 @@ fn a_recording_correction_by_date_range_or_to_unbound_survives_rebuild() {
         plays.iter().map(|play| play.recording).collect::<Vec<_>>(),
         [None, Some(rec_b), Some(rec_c), Some(rec_a)]
     );
-    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
-    assert_eq!(at.rebuild(PlayRule::V1, false).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, false).changed, 0);
 }
 
 #[test]
@@ -2313,7 +2326,7 @@ fn invalid_recording_correction_inputs_are_refused() {
 fn recording_only_correction_on_a_listen_shows_and_exports_the_new_recording() {
     let at = library();
     let listen = at.listen(0x31, 0, T0 - 5 * MINUTE, 180_000);
-    at.send(&listen, PlayRule::V1);
+    at.send(&listen, PlayRule::CURRENT);
 
     // Find the listen's observation endpoint and key.
     let (endpoint, source_key): (Id, Vec<u8>) = at
@@ -2467,8 +2480,8 @@ fn pending_delivery_is_withdrawn_when_its_listen_is_corrected_or_unbound() {
     let start = T0 - 5 * MINUTE;
     let listen1 = at.listen(0x41, 0, start, 180_000);
     let listen2 = at.listen(0x42, 0, start + 10_000, 180_000);
-    at.send(&listen1, PlayRule::V1);
-    at.send(&listen2, PlayRule::V1);
+    at.send(&listen1, PlayRule::CURRENT);
+    at.send(&listen2, PlayRule::CURRENT);
     let queued = at.library.plan_deliveries(account, start - MINUTE).unwrap();
     assert_eq!(queued, 2);
 
@@ -2545,8 +2558,8 @@ fn moving_an_echo_between_two_listens_keeps_both_plays_after_incremental_rederiv
     let start_ms = start_s * 1000;
     let listen_a = at.listen(0x51, 0, start_ms, 180_000);
     let listen_b = at.listen(0x52, 0, start_ms + 200, 180_000);
-    at.send(&listen_a, PlayRule::V1);
-    at.send(&listen_b, PlayRule::V1);
+    at.send(&listen_a, PlayRule::CURRENT);
+    at.send(&listen_b, PlayRule::CURRENT);
 
     let (obs_a, obs_b): (i64, i64) = at
         .library
@@ -2655,7 +2668,7 @@ fn moving_an_echo_between_two_listens_keeps_both_plays_after_incremental_rederiv
             .len(),
         2
     );
-    assert_eq!(at.rebuild(PlayRule::V1, true).changed, 0);
+    assert_eq!(at.rebuild(PlayRule::CURRENT, true).changed, 0);
 }
 
 #[test]
@@ -2767,7 +2780,7 @@ fn a_predecessor_arriving_late_does_not_schedule_its_play_again() {
     resumed.continues = Some(crashed.listen_id);
     resumed.start_position_ms = 155_000;
     // The resumed listen arrives first, counts and is sent.
-    at.send(&resumed, PlayRule::V1);
+    at.send(&resumed, PlayRule::CURRENT);
     assert_eq!(
         at.library.plan_deliveries(account, start - MINUTE).unwrap(),
         1
@@ -2785,7 +2798,7 @@ fn a_predecessor_arriving_late_does_not_schedule_its_play_again() {
     }
     // Its predecessor arrives and leads the play from then on: the play was
     // sent, and is not sent again.
-    at.send(&crashed, PlayRule::V1);
+    at.send(&crashed, PlayRule::CURRENT);
     assert_eq!(
         at.library.plan_deliveries(account, start - MINUTE).unwrap(),
         0
@@ -2805,14 +2818,14 @@ fn a_play_waiting_to_be_sent_when_its_predecessor_arrives_is_sent_once_from_it()
     let mut resumed = at.listen(4, 1, start + 4 * MINUTE, 200_000);
     resumed.continues = Some(crashed.listen_id);
     resumed.start_position_ms = 155_000;
-    at.send(&resumed, PlayRule::V1);
+    at.send(&resumed, PlayRule::CURRENT);
     assert_eq!(
         at.library.plan_deliveries(account, start - MINUTE).unwrap(),
         1
     );
     // Not yet sent when the predecessor arrives: the waiting one is
     // withdrawn at its turn, and the play goes once, at its true start.
-    at.send(&crashed, PlayRule::V1);
+    at.send(&crashed, PlayRule::CURRENT);
     assert_eq!(
         at.library.plan_deliveries(account, start - MINUTE).unwrap(),
         1
@@ -2840,8 +2853,8 @@ fn an_echo_of_one_play_does_not_withdraw_another_play_of_the_same_track() {
     // Two plays of one track a second apart, as two players could make.
     let first = at.listen(1, 0, start, 200_000);
     let second = at.listen(2, 0, start + 1_000, 200_000);
-    at.send(&first, PlayRule::V1);
-    at.send(&second, PlayRule::V1);
+    at.send(&first, PlayRule::CURRENT);
+    at.send(&second, PlayRule::CURRENT);
     assert_eq!(
         at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
         2
@@ -2881,9 +2894,12 @@ fn after_a_restore_the_import_finds_the_plays_the_service_took_and_only_those() 
     let start = (T0 + 10 * MINUTE) / 1000 * 1000;
     // Two plays of one track a second apart, and one of another track, all
     // waiting to be sent when the backup was taken.
-    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
-    at.send(&at.listen(2, 0, start + 1_000, 200_000), PlayRule::V1);
-    at.send(&at.listen(3, 1, start + 10 * MINUTE, 250_000), PlayRule::V1);
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::CURRENT);
+    at.send(&at.listen(2, 0, start + 1_000, 200_000), PlayRule::CURRENT);
+    at.send(
+        &at.listen(3, 1, start + 10 * MINUTE, 250_000),
+        PlayRule::CURRENT,
+    );
     assert_eq!(
         at.library.plan_deliveries(account, start - MINUTE).unwrap(),
         3
@@ -2930,7 +2946,7 @@ fn after_a_restore_the_import_finds_the_plays_the_service_took_and_only_those() 
     }
     assert_eq!(sent, [start / 1000 + 1, (start + 10 * MINUTE) / 1000]);
     let incremental = at.library.derived_history().unwrap();
-    at.rebuild(PlayRule::V1, false);
+    at.rebuild(PlayRule::CURRENT, false);
     assert_eq!(at.library.derived_history().unwrap(), incremental);
 }
 
@@ -2955,7 +2971,7 @@ fn a_play_joined_by_a_late_middle_listen_is_not_sent_again_from_its_first() {
     let mut last = at.listen(5, 1, start + 6 * MINUTE, 160_000);
     last.continues = Some(middle.listen_id);
     last.start_position_ms = 140_000;
-    at.send(&last, PlayRule::V1);
+    at.send(&last, PlayRule::CURRENT);
     assert_eq!(
         at.library.plan_deliveries(account, start - MINUTE).unwrap(),
         1
@@ -2971,13 +2987,13 @@ fn a_play_joined_by_a_late_middle_listen_is_not_sent_again_from_its_first() {
             )])
             .unwrap();
     }
-    at.send(&first, PlayRule::V1);
+    at.send(&first, PlayRule::CURRENT);
     // Not yet one play with the last: the first part is planned alone.
     assert_eq!(
         at.library.plan_deliveries(account, start - MINUTE).unwrap(),
         1
     );
-    at.send(&middle, PlayRule::V1);
+    at.send(&middle, PlayRule::CURRENT);
     // Whatever was planned for the first part before the three were one
     // play is not sent: the play went from its last part.
     let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
@@ -2993,7 +3009,7 @@ fn a_full_read_never_sets_aside_an_echo_that_joined_a_listens_play() {
         .ensure_service_account("lastfm", "someone")
         .unwrap();
     let start = (T0 + 10 * MINUTE) / 1000 * 1000;
-    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::CURRENT);
     at.library.plan_deliveries(account, start - MINUTE).unwrap();
     let due = at.library.take_due_deliveries(account, 0, 50).unwrap();
     at.library
@@ -3063,7 +3079,7 @@ fn an_outside_reader_joins_an_echo_under_corrected_names_to_its_play_from_the_ex
         .ensure_service_account("lastfm", "someone")
         .unwrap();
     let start = (T0 + 10 * MINUTE) / 1000 * 1000;
-    at.send(&at.listen(1, 0, start, 200_000), PlayRule::V1);
+    at.send(&at.listen(1, 0, start, 200_000), PlayRule::CURRENT);
     assert_eq!(
         at.library.plan_deliveries(account, start - MINUTE).unwrap(),
         1

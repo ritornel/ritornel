@@ -68,6 +68,8 @@ fn derive_with(
         corrections,
         zone_periods: periods,
         rule: PlayRule::V1,
+        streams: &[],
+        lengths: &HashMap::new(),
     })
 }
 
@@ -611,6 +613,9 @@ fn import(observation: i64, at_ms: i64) -> Import {
         source_item: 9,
         played_at_ms: at_ms,
         echo_of: None,
+        key: observation.to_be_bytes().to_vec(),
+        artist: "Calla Brandt".to_owned(),
+        title: "Low Tide".to_owned(),
     }
 }
 
@@ -627,6 +632,8 @@ fn derive_all(
         corrections,
         zone_periods: periods,
         rule: PlayRule::V1,
+        streams: &[],
+        lengths: &HashMap::new(),
     })
 }
 
@@ -915,6 +922,8 @@ fn a_recording_correction_by_date_range_moves_only_matching_observations() {
         corrections: &[range],
         zone_periods: &[],
         rule: PlayRule::V1,
+        streams: &[],
+        lengths: &HashMap::new(),
     });
     assert_eq!(
         plays

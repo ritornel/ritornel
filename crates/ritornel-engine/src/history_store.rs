@@ -574,18 +574,18 @@ fn echoes_of(connection: &Connection, listen: i64) -> Result<Vec<i64>, Error> {
 }
 
 const IMPORT_COLUMNS: &str = "o.id, o.endpoint_id, o.listener_id, o.source_item_id,
-    i.played_at_utc_ms, i.artist, i.title";
+    i.played_at_utc_ms, i.artist, i.title, o.source_key";
 
-/// Leaves Spotify's streams out: derivation does not read them yet, so
-/// storing them changes no play ("Spotify streams" in
-/// docs/internals/history.md).
+/// Leaves Spotify's streams out of the scrobbles: derivation reads the
+/// streams in force on their own (`history_streams`).
 const NOT_A_STREAM: &str =
     "NOT EXISTS (SELECT 1 FROM observation_import_stream s WHERE s.observation_id = o.id)";
 
 /// The imports with these observation IDs, or every import, each with the
 /// listen it is the echo of.
 fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<Import>, Error> {
-    let row = |row: &Row<'_>| -> rusqlite::Result<(i64, i64, i64, i64, i64, String, String)> {
+    type Found = (i64, i64, i64, i64, i64, String, String, Vec<u8>);
+    let row = |row: &Row<'_>| -> rusqlite::Result<Found> {
         Ok((
             row.get(0)?,
             row.get(1)?,
@@ -594,9 +594,10 @@ fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<
             row.get(4)?,
             row.get(5)?,
             row.get(6)?,
+            row.get(7)?,
         ))
     };
-    let found: Vec<(i64, i64, i64, i64, i64, String, String)> = match only {
+    let found: Vec<Found> = match only {
         None => {
             let mut statement = connection.prepare_cached(&format!(
                 "SELECT {IMPORT_COLUMNS} FROM history_observation o
@@ -623,7 +624,7 @@ fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<
     found
         .into_iter()
         .map(
-            |(observation, endpoint, listener, source_item, played_at_ms, artist, title)| {
+            |(observation, endpoint, listener, source_item, played_at_ms, artist, title, key)| {
                 Ok(Import {
                     observation,
                     endpoint,
@@ -631,6 +632,9 @@ fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<
                     source_item,
                     played_at_ms,
                     echo_of: echo_of(connection, endpoint, played_at_ms, &artist, &title)?,
+                    key,
+                    artist,
+                    title,
                 })
             },
         )
@@ -683,6 +687,8 @@ fn neighbourhood(connection: &Connection, observation: i64) -> Result<BTreeSet<i
             if let (Some(played_at), Some(artist), Some(title)) = (played_at, artist, title) {
                 near.extend(echo_of(connection, endpoint, played_at, &artist, &title)?);
             }
+            // The streams and scrobbles the matcher could join it with.
+            near.extend(crate::history_streams::neighbours(connection, at)?);
         } else {
             for statement in [&mut back, &mut forward] {
                 let joined: Vec<i64> = statement
@@ -790,13 +796,21 @@ fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
                 play.count_basis.as_str(),
             ])?;
         let event = connection.last_insert_rowid();
+        let joined: HashMap<i64, derive::Joined> = play.joined.iter().copied().collect();
         for (observation, role) in &play.observations {
             connection
                 .prepare_cached(
-                    "INSERT INTO play_event_observation (play_event_id, observation_id, role, rev)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO play_event_observation
+                       (play_event_id, observation_id, role, joined_by, rev)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                 )?
-                .execute((event, observation, role.as_str(), write.rev()))?;
+                .execute((
+                    event,
+                    observation,
+                    role.as_str(),
+                    joined.get(observation).map(|joined| joined.as_str()),
+                    write.rev(),
+                ))?;
         }
     }
     Ok(())
@@ -870,10 +884,16 @@ pub(crate) fn rederive(
     drop_plays_of(connection, &around)?;
     let listens = listens(connection, Some(&around))?;
     let imports = imports(connection, Some(&around))?;
+    let streams = crate::history_streams::streams(connection, Some(&around))?;
     let items: BTreeSet<i64> = listens
         .iter()
         .map(|listen| listen.source_item)
         .chain(imports.iter().map(|import| import.source_item))
+        .chain(streams.iter().map(|stream| stream.source_item))
+        .collect();
+    let tracks: BTreeSet<String> = streams
+        .iter()
+        .map(|stream| stream.record.track_uri.clone())
         .collect();
     let plays = derive::derive(&Inputs {
         listens: &listens,
@@ -882,14 +902,17 @@ pub(crate) fn rederive(
         corrections: &corrections(connection)?,
         zone_periods: &zone_periods(connection)?,
         rule,
+        lengths: &crate::history_streams::lengths(connection, Some(&tracks))?,
+        streams: &streams,
     });
     insert_plays(write, &plays)
 }
 
 /// Every play, derived from scratch, as the rows a rebuild would write.
-fn derive_all(connection: &Connection, rule: PlayRule) -> Result<Vec<Play>, Error> {
+pub(crate) fn derive_all(connection: &Connection, rule: PlayRule) -> Result<Vec<Play>, Error> {
     let listens = listens(connection, None)?;
     let imports = imports(connection, None)?;
+    let streams = crate::history_streams::streams(connection, None)?;
     Ok(derive::derive(&Inputs {
         listens: &listens,
         imports: &imports,
@@ -897,7 +920,19 @@ fn derive_all(connection: &Connection, rule: PlayRule) -> Result<Vec<Play>, Erro
         corrections: &corrections(connection)?,
         zone_periods: &zone_periods(connection)?,
         rule,
+        lengths: &crate::history_streams::lengths(connection, None)?,
+        streams: &streams,
     }))
+}
+
+/// Drops every play and derives each again, in the write: what applying or
+/// undoing a run of streams does, since a stream in force or out of it can
+/// move a track's length, and so any play of it.
+pub(crate) fn derive_every_play(write: &Write<'_>) -> Result<(), Error> {
+    let connection = write.connection();
+    connection.execute("DELETE FROM play_event_observation", [])?;
+    connection.execute("DELETE FROM play_event", [])?;
+    insert_plays(write, &derive_all(connection, PlayRule::CURRENT)?)
 }
 
 /// The derived tables, one line per play with its observations, in the
@@ -913,8 +948,9 @@ fn derived(connection: &Connection) -> Result<Vec<String>, Error> {
                 pe.track_duration_ms, pe.outcome, pe.counts, pe.count_basis,
                 pe.play_rule_version, pe.grouper_version, pe.excluded, pe.context_kind,
                 hex(pe.context_ref), pe.shuffle,
-                (SELECT group_concat(observation_id || ':' || role, ',')
-                 FROM (SELECT observation_id, role FROM play_event_observation
+                (SELECT group_concat(observation_id || ':' || role || ':'
+                                     || coalesce(joined_by, ''), ',')
+                 FROM (SELECT observation_id, role, joined_by FROM play_event_observation
                        WHERE play_event_id = pe.id ORDER BY observation_id))
          FROM play_event pe ORDER BY pe.public_id",
     )?;

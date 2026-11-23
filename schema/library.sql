@@ -11,7 +11,7 @@
 --   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
---   0008_spotify_streams  d95d2cab0108c7d5cb07a869a1b9d0271470fd89f1cba9c82302bb7caadbcaaa
+--   0008_spotify_streams  1c844427544e429feb1eab3ba05655681e495e3b96e141d986c9850aa49ceb98
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -767,7 +767,8 @@ CREATE TABLE play_event_observation (
   play_event_id   INTEGER NOT NULL REFERENCES play_event(id),
   observation_id  INTEGER NOT NULL REFERENCES history_observation(id),
   role            TEXT NOT NULL CHECK (role IN ('primary', 'corroborating')),   -- the primary supplies time, played time and outcome
-  rev             INTEGER NOT NULL,
+  rev             INTEGER NOT NULL, joined_by TEXT
+  CHECK (joined_by IN ('chain', 'echo', 'repeat', 'start', 'during', 'renamed', 'pin')),
   UNIQUE (play_event_id, observation_id)
 ) STRICT;
 
@@ -946,6 +947,7 @@ CREATE TABLE observation_import_stream (
   offline            INTEGER CHECK (offline IN (0, 1)),
   offline_timestamp  INTEGER,                                    -- as the archive gives it: in seconds in some rows and milliseconds in others
   incognito          INTEGER CHECK (incognito IN (0, 1)),        -- a private session
+  platform           TEXT NOT NULL CHECK (platform IN ('mac', 'windows', 'linux', 'android', 'ios', 'web', 'cast', 'other')),   -- one word, never Spotify's text
   rev                INTEGER NOT NULL
 ) STRICT;
 
@@ -975,7 +977,7 @@ CREATE TABLE import_run (
   applied_by_server_id  INTEGER NOT NULL REFERENCES server(id),
   session_pid           BLOB CHECK (length(session_pid) = 16),                -- the session that asked, when one did
   reader                TEXT NOT NULL,                                       -- the reader's name and version, such as 'ritornelctl 0.1.0'
-  records_hash          BLOB NOT NULL CHECK (length(records_hash) = 32),     -- SHA-256 of the kept records in their own order: the same archive has the same hash, whatever is stored
+  records_hash          BLOB NOT NULL CHECK (length(records_hash) = 32),     -- SHA-256 of the kept records in key order: the same archive has the same hash
   streams               INTEGER NOT NULL CHECK (streams >= 0),               -- the streams the archive held
   new_streams           INTEGER NOT NULL CHECK (new_streams BETWEEN 0 AND streams),   -- of those, the ones it stored
   created_at_ms         INTEGER NOT NULL,
@@ -1036,12 +1038,3 @@ BEFORE DELETE ON import_run_stream
 BEGIN
   SELECT RAISE(ABORT, 'import_run_stream is immutable: nothing is deleted');
 END;
-
-CREATE TABLE stream_device (
-  observation_id  INTEGER PRIMARY KEY REFERENCES observation_import_stream(observation_id),
-  platform        TEXT CHECK (platform IN ('ios', 'android', 'mac', 'windows', 'linux', 'other')),   -- the operating system only
-  device_kind     TEXT CHECK (device_kind IN ('computer', 'phone', 'tablet', 'watch', 'speaker', 'tv', 'car', 'console', 'group', 'other')),   -- the hardware the sound came out of
-  via             TEXT CHECK (via IN ('app', 'web', 'cast', 'connect', 'airplay', 'other')),   -- how that device played it
-  run_id          INTEGER NOT NULL REFERENCES import_run(id),   -- the run whose reader said them
-  rev             INTEGER NOT NULL
-) STRICT;

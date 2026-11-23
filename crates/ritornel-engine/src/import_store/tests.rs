@@ -1268,7 +1268,16 @@ fn a_streams_track_binds_as_a_scrobble_of_its_names_does_and_is_held_back_off_it
     // Lanternfish is on the invented album, and the stream says another:
     // it is held back.
     assert_eq!(recording_of("spotify_track", "Lanternfish"), "0");
-    // Nothing shown changes: streams make no plays yet.
+    // The play the stream speaks for, the scrobble joined to it, names the
+    // song.
+    assert_eq!(
+        rig.one(
+            "SELECT coalesce(pe.recording_id, 0) FROM play_event pe
+             JOIN play_event_observation peo ON peo.play_event_id = pe.id
+             WHERE peo.joined_by = 'start'"
+        ),
+        recording_of("scrobble_subject", "Paper Kites")
+    );
     assert_eq!(rig.library.derived_history().unwrap(), plays);
     // Judged again with nothing changed, nothing is written.
     let revision = rig.revision();
@@ -1371,7 +1380,9 @@ fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
     ];
     let observations = "SELECT count(*) FROM observation_import_stream";
 
-    // One revision stores the three, and changes no play.
+    // One revision stores the three and derives every play again: the
+    // scrobbles of Paper Kites and Lanternfish join their streams, which
+    // speak for their plays.
     let revision = rig.revision();
     let first = apply(&rig, 1, archive.clone());
     assert_eq!(rig.revision(), revision + 1);
@@ -1380,7 +1391,11 @@ fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
         (3, 3, true)
     );
     assert_eq!(rig.one(observations), "3");
-    assert_eq!(rig.library.derived_history().unwrap(), plays);
+    assert_ne!(rig.library.derived_history().unwrap(), plays);
+    assert_eq!(
+        rig.one("SELECT count(*) FROM play_event_observation WHERE joined_by = 'start'"),
+        "2"
+    );
     let rebuilt = rig
         .library
         .rebuild_history(
@@ -1393,7 +1408,7 @@ fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
             |rebuilt| rebuilt.changed.to_string(),
         )
         .unwrap();
-    assert_eq!(rebuilt, "0", "a rebuild finds nothing to change");
+    assert_eq!(rebuilt, "0", "a rebuild finds what applying derived");
 
     // The same run again writes nothing; the same archive in a new run
     // stores no stream, and records the run.
@@ -1427,6 +1442,7 @@ fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
     undo(&rig, 3);
     assert_eq!(in_force(&rig), "0");
     assert_eq!(rig.one(observations), "5", "nothing is removed");
+    // With every run undone, every play is as it was, IDs included.
     assert_eq!(rig.library.derived_history().unwrap(), plays);
     assert_eq!(
         rig.library
@@ -1679,4 +1695,98 @@ fn the_owners_binding_of_a_track_is_never_judged_again() {
     // Undone, no stream names it, and the owner's binding stays.
     undo(&rig, 1);
     assert_eq!(track_bound(&rig, "Paper Kites"), owned);
+}
+
+/// A rebuild's dry run: how many plays it would change.
+fn rebuild_changes(rig: &Rig) -> String {
+    rig.library
+        .rebuild_history(
+            WriteRequest {
+                method: "history.rebuild",
+                command: None,
+                client: None,
+            },
+            true,
+            |rebuilt| rebuilt.changed.to_string(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn scrobbles_that_arrive_after_their_streams_join_them_as_a_rebuild_would() {
+    let rig = rig();
+    let mut skipped = stream(T0 - HOUR, 12_000, "Salt Road");
+    skipped.reason_end = Some("fwdbtn".to_owned());
+    apply(
+        &rig,
+        1,
+        vec![
+            stream(T0 - 3 * HOUR + 2000, 200_000, "Paper Kites"),
+            stream(T0 - 2 * HOUR, 180_000, "Lanternfish"),
+            stream(T0 - 2 * HOUR, 180_000, "Lanternfish"),
+            skipped,
+            stream(T0 - HOUR + 60_000, 250_000, "Salt Road (Live)"),
+        ],
+    );
+    // Alone, the short skip does not count and the four minutes do.
+    assert_eq!(
+        rig.one(
+            "SELECT group_concat(pe.outcome || ':' || pe.counts, ',' ORDER BY pe.event_at_utc_ms)
+             FROM play_event pe"
+        ),
+        "listened:1,listened:1,skipped:0,listened:1"
+    );
+    assert_eq!(rebuild_changes(&rig), "0");
+
+    // The scrobbles come later, with a sync: two join their streams, and
+    // one, of a track Spotify did not play, stands alone.
+    rig.ingest(&batch(
+        vec![
+            record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 0),
+            record(T0 - 2 * HOUR + 3000, "Moss Arcade", "Lanternfish", 0),
+            record(T0 - 30 * 60_000, "Somebody Else", "Not Here", 0),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    ));
+    let joined = |how: &str| {
+        rig.one(&format!(
+            "SELECT count(*) FROM play_event_observation WHERE joined_by = '{how}'"
+        ))
+    };
+    assert_eq!(
+        (joined("start"), joined("repeat")),
+        ("2".into(), "1".into())
+    );
+    assert_eq!(rig.one("SELECT count(*) FROM play_event"), "5");
+    // A joined play is dated by its stream, from its end, and counts by the
+    // scrobble's verdict.
+    assert_eq!(
+        rig.one(
+            "SELECT pe.time_anchor || ':' || pe.count_basis || ':' || pe.ms_played
+             FROM play_event pe JOIN play_event_observation peo ON peo.play_event_id = pe.id
+             WHERE peo.joined_by = 'start' ORDER BY pe.event_at_utc_ms LIMIT 1"
+        ),
+        "end:source_verdict:200000"
+    );
+    // The report tells the two joined to streams from an echo, and counts
+    // as the account's plays only the one that stands alone.
+    let report = rig.library.import_report(rig.account, 10).unwrap();
+    assert_eq!(
+        (report.plays, report.echoes, report.joined_to_streams),
+        (1, 0, 2)
+    );
+    // What the sync derived is what a rebuild derives.
+    assert_eq!(rebuild_changes(&rig), "0");
+}
+
+#[test]
+fn no_play_a_stream_speaks_for_is_ever_scrobbled() {
+    let rig = rig();
+    apply(&rig, 1, vec![stream(T0 - HOUR, 250_000, "Paper Kites")]);
+    assert_eq!(
+        rig.one("SELECT counts FROM play_event WHERE recording_id IS NOT NULL"),
+        "1"
+    );
+    assert_eq!(rig.library.plan_deliveries(rig.account, 0).unwrap(), 0);
 }

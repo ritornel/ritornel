@@ -2284,8 +2284,9 @@ export type LastfmReport = {
    */
   imported: number,
   /**
-   * Plays they make, the echoes of plays scrobbled from here not
-   * counted.
+   * Plays they make, the echoes of plays scrobbled from here and the
+   * scrobbles joined to a Spotify stream, whose plays the stream speaks
+   * for, not counted.
    */
   plays: number,
   /**
@@ -2296,6 +2297,10 @@ export type LastfmReport = {
    * Scrobbles that are echoes of plays scrobbled from here.
    */
   echoes: number,
+  /**
+   * Scrobbles joined to a Spotify stream: reports of the same listen.
+   */
+  joinedToStreams: number,
   /**
    * Distinct tracks the history names.
    */

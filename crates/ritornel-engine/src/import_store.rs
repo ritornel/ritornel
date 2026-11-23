@@ -23,6 +23,7 @@ use ritornel_source::{Batch, Love, LovesStored, Stored};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::history_store::{INGEST_METHOD, rebind, rederive};
+use crate::history_streams::IN_FORCE;
 use crate::library_store::Write;
 use crate::{Error, Id, LibraryStore, WriteRequest};
 
@@ -536,14 +537,21 @@ fn changes(connection: &Connection, scope: Scope) -> Result<Vec<Change>, Error> 
 /// the plays of those that moved again. Returns how many bindings changed,
 /// by source instance.
 pub(crate) fn match_in(write: &Write<'_>, scope: Scope) -> Result<BTreeMap<i64, usize>, Error> {
+    let changed = bind_in(write, scope)?;
+    if !changed.is_empty() {
+        rebind(write)?;
+    }
+    Ok(changed)
+}
+
+/// Binds the tracks in scope as the matcher says, in the write, and leaves
+/// their plays as they are: for a write that derives every play next.
+pub(crate) fn bind_in(write: &Write<'_>, scope: Scope) -> Result<BTreeMap<i64, usize>, Error> {
     let mut changed: BTreeMap<i64, usize> = BTreeMap::new();
     for (instance, (item, artist, album, title), outcome) in changes(write.connection(), scope)? {
         if settle(write, item, (&artist, album.as_deref(), &title), outcome)? {
             *changed.entry(instance).or_default() += 1;
         }
-    }
-    if !changed.is_empty() {
-        rebind(write)?;
     }
     Ok(changed)
 }
@@ -883,12 +891,15 @@ pub struct Doubtful {
 pub struct ImportReport {
     /// Import records stored.
     pub imported: i64,
-    /// Plays derived from them, echoes of our own not counted.
+    /// Plays derived from them, echoes of our own and scrobbles joined to a
+    /// stream not counted.
     pub plays: i64,
     /// Of those, the ones bound to a recording.
     pub matched_plays: i64,
     /// Records that are echoes of plays this library sent.
     pub echoes: i64,
+    /// Records joined to a Spotify stream, which speaks for their play.
+    pub joined_to_streams: i64,
     /// Distinct tracks the history names.
     pub tracks: i64,
     /// Of those, the ones bound.
@@ -1370,14 +1381,6 @@ fn judged_subjects(
     Ok(found)
 }
 
-/// The streams in force, as a query: those a run whose newest ledger entry
-/// is `applied` held. The runs are found first, once, rather than for each
-/// stream.
-const IN_FORCE: &str = "SELECT DISTINCT h.observation_id FROM import_run_stream h
-     WHERE h.run_id IN (SELECT r.id FROM import_run r
-                        WHERE (SELECT e.state FROM import_run_event e WHERE e.run_id = r.id
-                               ORDER BY e.id DESC LIMIT 1) = 'applied')";
-
 /// Each of Spotify's tracks that the owner has not bound and a stream in
 /// force names, with its source instance, the names of its newest stream
 /// in force, and what it is bound to now. Of two streams that ended at the
@@ -1487,13 +1490,16 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
         [rows.endpoint],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    report.echoes = connection.query_row(
-        "SELECT count(*) FROM play_event_observation peo
+    (report.echoes, report.joined_to_streams) = connection.query_row(
+        "SELECT count(*) FILTER (WHERE peo.joined_by = 'echo'),
+                count(*) FILTER (WHERE peo.joined_by IN ('start', 'during', 'renamed', 'pin'))
+         FROM play_event_observation peo
          JOIN history_observation o ON o.id = peo.observation_id
          WHERE o.endpoint_id = ?1 AND peo.role = 'corroborating'",
         [rows.endpoint],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+
     let mut plays_of: HashMap<i64, i64> = HashMap::new();
     let mut statement = connection.prepare(
         "SELECT o.source_item_id, count(*) FROM history_observation o

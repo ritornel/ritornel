@@ -1969,14 +1969,14 @@ fn a_record_bought_later_has_its_scrobbles_and_streams_bound_by_the_scan_that_ad
     assert_eq!(bound(&rig), "-");
     let plays = rig.library.derived_history().unwrap();
 
-    // The scan that adds it binds both, with no sync of Last.fm. The
-    // scrobble's play now names the song; the stream has no play yet.
+    // The scan that adds it binds both, with no sync of Last.fm: the
+    // scrobble's play and the stream's both name the song.
     rig.put("Moss Arcade/Tin Weather/a.flac", "a.flac");
     rig.scan();
     assert_eq!(bound(&rig), "scrobble_subject,spotify_track");
     assert_eq!(
         rig.one("SELECT count(*) FROM play_event WHERE recording_id IS NOT NULL"),
-        "1"
+        "2"
     );
     assert_eq!(rig.library.derived_history().unwrap().len(), plays.len());
 }

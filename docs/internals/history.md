@@ -8,13 +8,16 @@ See [`docs/internals/schema.md`](schema.md) for the immutable history tables, [`
 
 All listening history enters `library.db` through one ingest seam (`Observations::{Listen, Imports}`, write method `history.ingest` in `history_store.rs`). Each record is stored verbatim in `history_observation` (`payload_json`) plus its kind-specific detail table (`observation_listen`, `observation_import`, or `observation_correction`), keyed uniquely by `(endpoint_id, source_key)`. Re-ingesting the same key with an identical payload is a no-op; a conflicting payload under an existing key is recorded in `history_ingest_conflict` without altering the original observation.
 
-Pure derivation (`ritornel_domain::history`, `GROUPER_VERSION = 2`) turns durable observations, active corrections, `listener_zone_period`s, and current `source_item` bindings into `play_event` and `play_event_observation` rows:
+Pure derivation (`ritornel_domain::history`, `GROUPER_VERSION = 3`) turns durable observations, the Spotify streams in force, active corrections, `listener_zone_period`s, and current `source_item` bindings into `play_event` and `play_event_observation` rows:
 
 1. **Bind:** Each listen chain or import resolves its recording and optional track appearance through its `source_item`'s current `assignment` (following `recording.canonical_id`), unless overridden by an active `set_recording` correction. Unbound items still become `play_event` rows with `recording_id = NULL`.
 2. **Chain:** Listens on the same endpoint linked by `continues` join into one chain when the later listen starts within `CHAIN_WINDOW_MS` (24 hours) of the earlier listen's end. The chain takes its start time from the first (`primary`) listen and sums `ms_played` across all listens (`corroborating` for subsequent parts).
 3. **Echo matching:** An imported scrobble that matches a recorded delivery from this library (`history_delivery` in `sending`, `accepted`, or `unknown` on the same endpoint, matching exact whole-second `sent_timestamp_s` and normalized artist + title via `same_track` / `words_key`) joins that listen's play as a `corroborating` observation instead of creating a duplicate play.
-4. **Judge (`PlayRule`):** Listen chains are judged by `PlayRule::CURRENT` (`PlayRule::V1`, version `1`): a track counts when `track_duration_ms > 30_000` and (`ms_played >= track_duration_ms / 2` or `ms_played >= 240_000`). The outcome (`Outcome` in `ritornel-domain`, `PlayOutcome` in the contract) is `listened` (counted), `skipped` (did not count and `end_reason.moved_on()`), `partial` (did not count otherwise), or `unknown`. Imported scrobbles count by `source_verdict`.
-5. **Exclude:** Any play containing an observation targeted by an active `exclude` correction is marked `excluded = 1`.
+4. **Streams:** Each listen Spotify reported is one play, its repeats corroborating it, and a scrobble the stream matcher joins to it corroborates it too ("Spotify streams" below). The stream speaks for the play.
+5. **Judge (`PlayRule`):** Listen chains are judged by `PlayRule::CURRENT` (`PlayRule::V2`, version `2`): a track counts when `track_duration_ms > 30_000` and (`ms_played >= track_duration_ms / 2` or `ms_played >= 240_000`). The outcome (`Outcome` in `ritornel-domain`, `PlayOutcome` in the contract) is `listened` (counted), `skipped` (did not count and `end_reason.moved_on()`), `partial` (did not count otherwise), or `unknown`. Imported scrobbles, and streams joined to one, count by `source_verdict`; a stream alone is judged by `streams::judge_alone`, which version 2 added.
+6. **Exclude:** Any play containing an observation targeted by an active `exclude` correction is marked `excluded = 1`.
+
+Every observation of a play that is not its primary records how it joined it, in `play_event_observation.joined_by`: `chain`, `echo`, `repeat`, or the matcher's tier, `start`, `during` or `renamed`, or `pin` for a correction's join.
 
 Each `play_event.public_id` is a deterministic 16-byte hash derived from its primary observation's endpoint and `source_key`, so play IDs are deterministic for a given grouping, though a grouper or chaining change that alters the primary observation can change a play's ID.
 
@@ -117,7 +120,23 @@ Spotify's extended streaming history is a second source of import records beside
 - **A stream as stored:** a `history_observation` of kind `import` keyed by its source key, with `payload_json` written from the typed `SpotifyStream` as it is kept (`kept`: without what it played on), never from text it was handed; an `observation_import` row holding the worked-out start in `played_at_utc_ms` and the names as that archive spelled them; an `observation_import_stream` row with the end as reported, time played, the reasons, the flags and the offline time as given; and a `spotify_track` source item for its URI, bound to the library by the scrobble matcher on the names of its newest stream in force (`match_library`, "Scrobble matching" in `docs/internals/identity.md`). A stored stream is read back from these typed columns (`stored_stream`), never from its `payload_json`, which is its archive. It keeps the record it was stored with: a row of a later archive with the same end, time played and track takes its place, first one the same, then one spelled otherwise in its names alone, then any, and is counted in the dry run (`respelled`) when it differs, and changes nothing.
 - **What it played on** is kept apart, in `stream_device`, since a later reader may say it better: its `platform`, `device_kind` and `via` words, each NULL when the text did not say, and the run whose reader said them. Every run applied says them again for each stream it holds, stored before or not, names itself as the run that said them, and stores no new row for it, so no play changes. Nothing derived reads them. A word added later is this table made again with its checks, and the contract's word: no stream's row is touched. An export gives them in each stream's `stream` object as `platform`, `deviceKind` and `playedVia`.
 - **Undo** (`LibraryStore::undo_streams`) adds an `undone` row to the run's ledger. A stream is in force while any run that held it is, so undoing one run leaves in force what another holds. Nothing is deleted, and importing the archive again is a new run that brings its streams back.
-- **Derivation passes streams over** (`NOT_A_STREAM` in `history_store.rs`): applying or undoing a run changes no play, and a rebuild finds nothing to change.
+- **Every play is derived again** in the same write (`derive_every_play`): a stream in force or out of it can move its track's length, and so any play of it. Undoing every run leaves every play, ID and count as it was before the first was applied.
+
+### Reading streams
+
+Derivation reads the streams in force (`history_streams.rs`) beside the scrobbles, which leave streams out (`NOT_A_STREAM` in `history_store.rs`), and each track's length from its streams in force.
+
+| Of a play a stream speaks for | Comes from |
+|---|---|
+| Time | Its end less the time played, `time_anchor = 'end'`, `clock_basis = 'source_utc'`, to the second, in the listener's zone then |
+| Time played, shuffle | The stream |
+| Binding | The stream's `spotify_track` item, or a `set_recording` correction on any of its observations |
+| Whether it counts | With a scrobble joined as its own, the scrobble's verdict (`count_basis = 'source_verdict'`, `listened`); alone, `judge_alone` (`count_basis = 'play_rule'`) |
+
+- **Offered scrobbles:** a scrobble set aside, or the echo of a listen's delivery, is offered to no stream.
+- **Incremental derivation:** the neighbourhood of an import, which an incremental derive widens to (`neighbourhood` in `history_store.rs`), takes in every stream and scrobble the tiers in force could join it with, and a stream's repeats (`history_streams::neighbours`), transitively. The matcher pairs closest first within what it is given, so a closed set gives the joins a rebuild gives: a scrobble that a sync brings after its stream joins it as a rebuild would join it.
+- **Never scrobbled:** a play a stream speaks for has no listen as its primary, so it is never eligible to be sent.
+- **The Last.fm report** counts the account's scrobbles joined to a stream (`joinedToStreams`) apart from its echoes, and leaves both out of its plays.
 
 ## Export
 
