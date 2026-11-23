@@ -1227,3 +1227,141 @@ fn a_dry_run_offers_no_stream_a_scrobble_set_aside_and_writes_nothing() {
     assert_eq!(year.plays_after, year.plays_before + 1);
     assert_eq!(year.counted_after, year.counted_before + 1);
 }
+
+/// The streams in force: those that a run whose newest ledger entry is
+/// `applied` held.
+fn in_force(rig: &Rig) -> String {
+    rig.one(
+        "SELECT count(DISTINCT h.observation_id) FROM import_run_stream h
+         WHERE (SELECT state FROM import_run_event WHERE run_id = h.run_id
+                ORDER BY id DESC LIMIT 1) = 'applied'",
+    )
+}
+
+fn apply(rig: &Rig, run: u8, streams: Vec<ritornel_contract::SpotifyStream>) -> crate::StoredRun {
+    rig.library
+        .apply_streams(
+            WriteRequest {
+                method: crate::APPLY_METHOD,
+                command: None,
+                client: None,
+            },
+            Id::from_bytes([run; 16]),
+            streams,
+            "ritornelctl 0.1.0".to_owned(),
+            None,
+        )
+        .unwrap()
+}
+
+fn undo(rig: &Rig, run: u8) -> crate::StoredRun {
+    rig.library
+        .undo_streams(
+            WriteRequest {
+                method: crate::UNDO_METHOD,
+                command: None,
+                client: None,
+            },
+            Id::from_bytes([run; 16]),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
+    let rig = rig();
+    rig.ingest(&first_batch());
+    let plays = rig.library.derived_history().unwrap();
+    let archive = vec![
+        stream(T0 - 3 * HOUR + 2000, 200_000, "Paper Kites"),
+        stream(T0 - 2 * HOUR, 180_000, "Lanternfish"),
+        stream(T0 - 2 * HOUR, 180_000, "Lanternfish"),
+    ];
+    let observations = "SELECT count(*) FROM observation_import_stream";
+
+    // One revision stores the three, and changes no play.
+    let revision = rig.revision();
+    let first = apply(&rig, 1, archive.clone());
+    assert_eq!(rig.revision(), revision + 1);
+    assert_eq!(
+        (first.streams, first.new_streams, first.in_force),
+        (3, 3, true)
+    );
+    assert_eq!(rig.one(observations), "3");
+    assert_eq!(rig.library.derived_history().unwrap(), plays);
+    let rebuilt = rig
+        .library
+        .rebuild_history(
+            WriteRequest {
+                method: "history.rebuild",
+                command: None,
+                client: None,
+            },
+            true,
+            |rebuilt| rebuilt.changed.to_string(),
+        )
+        .unwrap();
+    assert_eq!(rebuilt, "0", "a rebuild finds nothing to change");
+
+    // The same run again writes nothing; the same archive in a new run
+    // stores no stream, and records the run.
+    assert_eq!(apply(&rig, 1, archive.clone()), first);
+    assert_eq!(rig.revision(), revision + 1);
+    let again = apply(&rig, 2, archive.clone());
+    assert_eq!((again.streams, again.new_streams), (3, 0));
+    assert_eq!(rig.one(observations), "3");
+    // A later archive stores only what this one lacked.
+    let mut later = archive.clone();
+    later.push(stream(T0 - HOUR, 200_000, "Salt Road"));
+    let third = apply(&rig, 3, later);
+    assert_eq!((third.streams, third.new_streams), (4, 1));
+    assert_eq!(rig.one(observations), "4");
+    assert_eq!(in_force(&rig), "4");
+
+    // Undoing the first of the runs leaves in force what the others held.
+    let revision = rig.revision();
+    let undone = undo(&rig, 1);
+    assert!(!undone.in_force);
+    assert_eq!(rig.revision(), revision + 1);
+    assert_eq!(in_force(&rig), "4");
+    // Undone again, nothing is written.
+    assert_eq!(undo(&rig, 1), undone);
+    assert_eq!(rig.revision(), revision + 1);
+    undo(&rig, 2);
+    undo(&rig, 3);
+    assert_eq!(in_force(&rig), "0");
+    assert_eq!(rig.one(observations), "4", "nothing is removed");
+    assert_eq!(rig.library.derived_history().unwrap(), plays);
+    assert_eq!(
+        rig.library
+            .stored_runs()
+            .unwrap()
+            .iter()
+            .map(|run| run.run)
+            .collect::<Vec<_>>(),
+        [3, 2, 1].map(|run| Id::from_bytes([run; 16]))
+    );
+
+    // The export carries each stream's own fields, the runs with their
+    // ledgers, and what each held.
+    let scratch = crate::testing::Scratch::new();
+    let exported = rig.library.export_record(scratch.path(), T0).unwrap();
+    assert_eq!((exported.runs, exported.run_streams), (3, 10));
+    let observations = std::fs::read_to_string(scratch.path().join("observations.jsonl")).unwrap();
+    let streams: Vec<serde_json::Value> = observations
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|line| line["import"]["stream"].is_object())
+        .collect();
+    assert_eq!(streams.len(), 4);
+    assert_eq!(streams[0]["import"]["stream"]["platform"], "mac");
+    let runs = std::fs::read_to_string(scratch.path().join("runs.jsonl")).unwrap();
+    let first_run: serde_json::Value = serde_json::from_str(runs.lines().next().unwrap()).unwrap();
+    assert_eq!(first_run["ledger"][0]["state"], "applied");
+    assert_eq!(first_run["ledger"][1]["state"], "undone");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(scratch.path().join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["version"], 3);
+}

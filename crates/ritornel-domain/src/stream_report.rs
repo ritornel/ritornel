@@ -43,6 +43,8 @@ pub struct DryRunInput<'a> {
     pub zone_periods: &'a [ZonePeriod],
     /// Pairs a correction has pinned.
     pub pins: &'a Pins,
+    /// The streams stored already, by key, as they were stored.
+    pub stored: &'a HashMap<Vec<u8>, SpotifyStream>,
     /// When the report is made.
     pub made_at: i64,
 }
@@ -179,6 +181,10 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
     for (index, event) in in_force.events.iter().enumerate() {
         let row = row(&mut years, year(event.start_ms));
         row.streams += 1;
+        let first = event.streams.first().and_then(|at| input.streams.get(*at));
+        if first.is_some_and(|stream| input.stored.contains_key(&stream.key)) {
+            row.already_stored += 1;
+        }
         if assumed_zone(input.listener, event.start_ms, input.zone_periods).is_none() {
             row.no_zone += 1;
         }
@@ -246,8 +252,19 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
     ImportReport {
         made_at: input.made_at,
         grouper_version: crate::history::GROUPER_VERSION,
+        play_rule_version: crate::history::PlayRule::CURRENT.version,
         streams: input.streams.len() as u64,
         events: in_force.events.len() as u64,
+        respelled: input
+            .streams
+            .iter()
+            .filter(|stream| {
+                input
+                    .stored
+                    .get(&stream.key)
+                    .is_some_and(|stored| *stored != stream.record)
+            })
+            .count() as u64,
         scrobbles: input.scrobbles.len() as u64,
         scrobbles_excluded: input.excluded,
         scrobbles_echoes: input.echoes,
@@ -485,6 +502,10 @@ mod tests {
         );
     }
 
+    /// No stream stored yet.
+    static EMPTY: std::sync::LazyLock<HashMap<Vec<u8>, SpotifyStream>> =
+        std::sync::LazyLock::new(HashMap::new);
+
     fn input<'a>(
         streams: &'a [Stream],
         scrobbles: &'a [Scrobble],
@@ -500,6 +521,7 @@ mod tests {
             listener: 1,
             zone_periods: &[],
             pins,
+            stored: &EMPTY,
             made_at: 7,
         }
     }
@@ -592,6 +614,7 @@ mod tests {
             listener: 1,
             zone_periods: &[],
             pins: &Pins::default(),
+            stored: &HashMap::new(),
             made_at: 7,
         });
         assert_eq!((report.streams, report.events, report.scrobbles), (4, 4, 2));
@@ -639,6 +662,7 @@ mod tests {
             listener: 1,
             zone_periods: &zones,
             pins: &Pins::default(),
+            stored: &HashMap::new(),
             made_at: 7,
         });
         assert_eq!(report.years[0].no_zone, 0);

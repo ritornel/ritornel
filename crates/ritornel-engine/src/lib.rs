@@ -124,6 +124,7 @@ pub use resolve_store::Resolved;
 pub use ritornel_contract::Id;
 /// The wall clock in a zone at an instant: what a local date is read with.
 pub use ritornel_domain::history::{LocalTime, known_zone, local_time, start_of_day_ms};
+pub use ritornel_domain::streams::STREAM_MATCHER_VERSION;
 pub use scan::{ScanRun, ScanSettings, run_scan, scan_summary};
 pub use scan_store::Source;
 pub use secret::{SessionToken, Signer, verify_signature};
@@ -132,5 +133,9 @@ pub use server_store::{
 };
 pub use service_session::{ServiceKey, ServiceSession};
 pub use sqlite::SQLITE_VERSION;
+pub use stream_import::{APPLY_METHOD, StoredRun, UNDO_METHOD};
+
+/// The version of the play rule in force, which a dry run's report records.
+pub const PLAY_RULE_VERSION: i64 = ritornel_domain::history::PlayRule::CURRENT.version;
 pub use timekeeping::{SystemTimekeeper, Timekeeper, clock_boot};
 pub use walk::folder_id;

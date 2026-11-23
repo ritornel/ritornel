@@ -108,16 +108,28 @@ Spotify's extended streaming history is a second source of import records beside
 - **Keys:** `stream_report::keyed` gives each stream its key from the records alone: `sp1`, its end, its time played, its track's ID, and its place among the streams that share those three, ordered by their other kept fields.
 - **Report:** `stream_report::dry_run` runs the matcher twice over the library's scrobbles, read as of one commit (`LibraryStore::stream_dry_run`): once with the tiers in force (`Tiers::CURRENT`), for what applying would do, and once with every tier (`Tiers::ALL`), for what B and C would add and a sample of each for judging. By year of each event's worked-out start in UTC it counts listens, joins by tier and those a correction pins, events alone and counted, not counted or unknown, scrobbles no stream took, and plays and counted plays now and once applied; a second report joins the play it repeats, so it takes one from the plays after. It counts offline streams and whether each offline time reads as seconds or milliseconds near the stream's end, and the scrobbles no stream took that sit where a pause would put them: after the stream before a stream alone of their names and before its worked-out start, each counted once. `ImportProblem` lists what stands in the way: streams no zone covers, and a tier not in force that finds joins.
 
+
+### Applying and undoing
+
+`imports.apply` and `imports.undo` are jobs (`APPLY_JOB`, `UNDO_JOB` in `apps/server/src/imports.rs`), each one library write whose command is the job's step (`step_command`), so a job taken up again after a crash finds the write it made. `ritornelctl spotify apply <run>`, `spotify undo <run>` and `spotify runs` drive them; `imports.list` lists the runs.
+
+- **Apply** (`LibraryStore::apply_streams`) is refused while the run has no report, or the matcher or the play rule has changed since its dry run (`stale`). It works the report out again just before it writes, and that report is the run's. In one write it makes the `import` endpoint and the `spotify` source instance named `Spotify` if they are missing, stores each stream whose key the endpoint does not hold, records the run (`import_run`) with the reader, a SHA-256 of the kept records in key order, its counts and the session that asked, every stream its archive held (`import_run_stream`), new or not, and an `applied` row of its ledger (`import_run_event`). A run applied before writes nothing.
+- **A stream as stored:** a `history_observation` of kind `import` keyed by its source key, with `payload_json` written from the typed `SpotifyStream`, never from text it was handed; an `observation_import` row holding the worked-out start in `played_at_utc_ms` and the names as that archive spelled them; an `observation_import_stream` row with the end as reported, time played, the reasons, the flags, the offline time as given and the platform's word; and a `spotify_track` source item for its URI, which binds to nothing yet. A stored stream keeps the record it was stored with: a later archive that spells it otherwise is counted in the dry run (`respelled`) and changes nothing.
+- **Undo** (`LibraryStore::undo_streams`) adds an `undone` row to the run's ledger. A stream is in force while any run that held it is, so undoing one run leaves in force what another holds. Nothing is deleted, and importing the archive again is a new run that brings its streams back.
+- **Derivation passes streams over** (`NOT_A_STREAM` in `history_store.rs`): applying or undoing a run changes no play, and a rebuild finds nothing to change.
+
 ## Export
 
-`history.export` (`crates/ritornel-engine/src/export.rs`, `apps/server/src/dispatch/export.rs`, `ritornelctl export`) writes a portable, self-contained directory (`ritornel-record-<timestamp>`, staged under a dotted name and atomically renamed, with owner-only file permissions) from a single read-only SQLite transaction (`EXPORT_FORMAT = "ritornel-record"`, `EXPORT_VERSION = 2`):
+`history.export` (`crates/ritornel-engine/src/export.rs`, `apps/server/src/dispatch/export.rs`, `ritornelctl export`) writes a portable, self-contained directory (`ritornel-record-<timestamp>`, staged under a dotted name and atomically renamed, with owner-only file permissions) from a single read-only SQLite transaction (`EXPORT_FORMAT = "ritornel-record"`, `EXPORT_VERSION = 3`):
 
 | File | Contents |
 |---|---|
 | `manifest.json` | Format, version, library ID, export timestamp, rule/grouper versions, endpoints, listeners, sources, and line counts. |
-| `observations.jsonl` | Every observation oldest first, keyed by endpoint and `source_key`, with verbatim payloads. |
+| `observations.jsonl` | Every observation oldest first, keyed by endpoint and `source_key`, with verbatim payloads. A stream's import line carries a `stream` object with what only a stream knows. |
 | `ratings.jsonl` | Every rating and love row, including clears. |
 | `deliveries.jsonl` | Every scrobble delivery and its outcome, enabling exact echo matching outside Ritornel. |
+| `runs.jsonl` | Every run of streams applied, with its reader, records hash, counts and ledger, so a reader outside Ritornel can tell which streams are in force. |
+| `run_streams.jsonl` | The streams each run's archive held, by run, endpoint and `source_key`. |
 | `plays.csv` | Derived plays table with current track display names for immediate spreadsheet/script use. |
 
 ## Decisions

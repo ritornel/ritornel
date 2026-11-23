@@ -116,6 +116,10 @@ pub struct ImportsStageParams {
     pub piece: u32,
     /// How many pieces the run has.
     pub pieces: u32,
+    /// What read the archive, by name and version, such as
+    /// `ritornelctl 0.1.0`, at most [`MAX_CLIENT_TEXT`](crate::MAX_CLIENT_TEXT)
+    /// characters. The same in every piece.
+    pub reader: String,
     /// Its streams, at most [`MAX_STREAMS_PER_PIECE`].
     pub streams: Vec<SpotifyStream>,
 }
@@ -132,11 +136,11 @@ pub struct ImportsStaged {
     pub run: ImportRun,
 }
 
-/// The params of `imports.dryRun`.
+/// The params of `imports.dryRun`, `imports.apply` and `imports.undo`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct ImportsDryRunParams {
+pub struct ImportsRunParams {
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// The run.
@@ -152,17 +156,51 @@ pub struct ImportsGetParams {
     pub run_id: Id,
 }
 
-/// The result of `imports.dryRun`.
+/// The result of `imports.dryRun`, `imports.apply` and `imports.undo`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct ImportsDryRunStarted {
+pub struct ImportsJobStarted {
     /// The receipt.
     #[serde(flatten)]
     pub receipt: Receipt,
-    /// The job that works the dry run out. Its report is the run's, from
-    /// `imports.get`, once the job has succeeded.
+    /// The job that does it. A dry run's report, and an apply's, is the
+    /// run's, from `imports.get`, once the job has succeeded.
     pub job: Job,
+}
+
+/// A run the library holds: one archive applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedRun {
+    /// The run.
+    pub run_id: Id,
+    /// The streams its archive held.
+    pub streams: u64,
+    /// Of those, the ones it stored: an earlier run stored the rest.
+    pub new_streams: u64,
+    /// Whether it is in force. A stream is in force while any run that
+    /// held it is.
+    pub in_force: bool,
+    /// When it was applied.
+    pub applied_at: i64,
+    /// When it was last undone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub undone_at: Option<i64>,
+    /// What read its archive.
+    pub reader: String,
+}
+
+/// The result of `imports.list`: every run the library holds, newest
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ImportRuns {
+    /// The runs.
+    pub runs: Vec<AppliedRun>,
 }
 
 /// A run of streams staged on the hub. It is removed a day after it was
@@ -181,10 +219,16 @@ pub struct ImportRun {
     pub streams: u64,
     /// When the hub removes it.
     pub expires_at: i64,
-    /// The last dry run's report, once one has finished.
+    /// The last report, once a dry run or an apply has finished: an
+    /// apply works its report out again just before it writes, and that one
+    /// is what applying did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub report: Option<ImportReport>,
+    /// The run as the library holds it, once it has been applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub applied: Option<AppliedRun>,
 }
 
 /// A rule that joins a scrobble to a stream.
@@ -225,6 +269,8 @@ pub struct ImportYear {
     pub year: i32,
     /// Listens Spotify reported: streams, each repeat counted once.
     pub streams: u64,
+    /// Of those, the ones an earlier run stored already.
+    pub already_stored: u64,
     /// Of those, the ones joined to a scrobble by tier A.
     pub joined_start: u64,
     /// By tier B.
@@ -299,12 +345,19 @@ pub enum ImportProblem {
 pub struct ImportReport {
     /// When it was worked out.
     pub made_at: i64,
-    /// The grouper's version, which the stream matcher is part of.
+    /// The grouper's version, which the stream matcher is part of. An
+    /// apply is refused when it has changed since the dry run.
     pub grouper_version: i64,
+    /// The play rule's version. An apply is refused when it has changed
+    /// since the dry run.
+    pub play_rule_version: i64,
     /// Streams in the run, repeats included.
     pub streams: u64,
     /// Listens they report: each repeat counted once.
     pub events: u64,
+    /// Streams stored already whose record this archive spells otherwise.
+    /// The stored record is kept.
+    pub respelled: u64,
     /// Scrobbles offered to the streams: Last.fm's, less those set aside
     /// and those that are this library's own listens come back.
     pub scrobbles: u64,

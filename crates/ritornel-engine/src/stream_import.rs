@@ -1,15 +1,19 @@
 //! Spotify's streams in the library: what applying a run of them would do,
-//! read without writing. See "Spotify streams" in docs/internals/history.md.
+//! read without writing; applying it, which stores the streams that are
+//! new and records the run; and undoing it. See "Spotify streams" in
+//! docs/internals/history.md.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ritornel_contract::{ImportReport, SpotifyStream};
 use ritornel_domain::stream_report::{DryRunInput, dry_run, keyed};
-use ritornel_domain::streams::{Pins, Scrobble};
-use rusqlite::Connection;
+use ritornel_domain::streams::{Pins, Scrobble, Stream};
+use rusqlite::{Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 
 use crate::history_store::{echo_of, zone_periods};
-use crate::{Error, LibraryStore};
+use crate::library_store::Write;
+use crate::{Error, Id, LibraryStore, WriteRequest};
 
 /// What a dry run reads from the library, as of one commit.
 struct Read {
@@ -19,6 +23,24 @@ struct Read {
     plays_by_year: BTreeMap<i32, (u64, u64)>,
     listener: i64,
     zone_periods: Vec<ritornel_domain::history::ZonePeriod>,
+    stored: HashMap<Vec<u8>, SpotifyStream>,
+}
+
+/// The streams stored already, by key, as they were stored.
+fn stored_streams(connection: &Connection) -> Result<HashMap<Vec<u8>, SpotifyStream>, Error> {
+    let mut statement = connection.prepare(
+        "SELECT o.source_key, o.payload_json FROM history_observation o
+           JOIN observation_import_stream s ON s.observation_id = o.id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut stored = HashMap::new();
+    for row in rows {
+        let (key, payload) = row?;
+        stored.insert(key, serde_json::from_str(&payload)?);
+    }
+    Ok(stored)
 }
 
 /// Every scrobble of every account, sorted into those a stream may take,
@@ -108,6 +130,7 @@ impl LibraryStore {
                 plays_by_year: plays_by_year(connection)?,
                 listener,
                 zone_periods: zone_periods(connection)?,
+                stored: stored_streams(connection)?,
             })
         })?;
         let streams = keyed(records);
@@ -120,7 +143,376 @@ impl LibraryStore {
             listener: read.listener,
             zone_periods: &read.zone_periods,
             pins: &Pins::default(),
+            stored: &read.stored,
             made_at,
         }))
+    }
+}
+
+/// The name of the library's Spotify endpoint and source instance. Neither
+/// holds an account's name.
+const SPOTIFY: &str = "Spotify";
+
+/// The item kind of what a stream was of: a track, by its URI.
+const TRACK: &str = "spotify_track";
+
+/// What a write that applies a run is called.
+pub const APPLY_METHOD: &str = "imports.apply";
+
+/// What a write that undoes a run is called.
+pub const UNDO_METHOD: &str = "imports.undo";
+
+/// A run of streams as the library holds it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredRun {
+    /// The run, as it was staged.
+    pub run: Id,
+    /// The streams its archive held.
+    pub streams: i64,
+    /// Of those, the ones it stored: the rest were stored by an earlier run.
+    pub new_streams: i64,
+    /// Whether it is in force.
+    pub in_force: bool,
+    /// When it was applied.
+    pub applied_at_ms: i64,
+    /// When it was last undone, if it has been.
+    pub undone_at_ms: Option<i64>,
+    /// What read the archive.
+    pub reader: String,
+}
+
+/// The rows of the library's Spotify endpoint and source instance, made
+/// when the first run is applied.
+fn spotify_rows(write: &Write<'_>) -> Result<(i64, i64), Error> {
+    let connection = write.connection();
+    let endpoint: Option<i64> = connection
+        .query_row(
+            "SELECT id FROM history_endpoint WHERE kind = 'import' AND name = ?1",
+            [SPOTIFY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint,
+        None => {
+            connection.execute(
+                "INSERT INTO history_endpoint (public_id, kind, name, rev)
+                 VALUES (?1, 'import', ?2, ?3)",
+                (write.new_id()?.as_bytes(), SPOTIFY, write.rev()),
+            )?;
+            connection.last_insert_rowid()
+        }
+    };
+    let instance: Option<i64> = connection
+        .query_row(
+            "SELECT id FROM source_instance WHERE kind = 'spotify'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let instance = match instance {
+        Some(instance) => instance,
+        None => {
+            connection.execute(
+                "INSERT INTO source_instance (public_id, kind, name, created_at_ms, rev)
+                 VALUES (?1, 'spotify', ?2, ?3, ?4)",
+                (
+                    write.new_id()?.as_bytes(),
+                    SPOTIFY,
+                    write.now_ms(),
+                    write.rev(),
+                ),
+            )?;
+            connection.last_insert_rowid()
+        }
+    };
+    Ok((endpoint, instance))
+}
+
+/// The SHA-256 of streams in key order: the same archive has the same hash.
+fn records_hash(streams: &[Stream]) -> Vec<u8> {
+    let mut order: Vec<&Stream> = streams.iter().collect();
+    order.sort_by(|a, b| a.key.cmp(&b.key));
+    let mut hash = Sha256::new();
+    for stream in order {
+        hash.update((stream.key.len() as u64).to_be_bytes());
+        hash.update(&stream.key);
+        let written = serde_json::to_vec(&stream.record).unwrap_or_default();
+        hash.update((written.len() as u64).to_be_bytes());
+        hash.update(written);
+    }
+    hash.finalize().to_vec()
+}
+
+fn stored_run(connection: &Connection, run: Id) -> Result<Option<StoredRun>, Error> {
+    connection
+        .query_row(
+            "SELECT r.streams, r.new_streams, r.reader,
+                    (SELECT min(at_ms) FROM import_run_event WHERE run_id = r.id AND state = 'applied'),
+                    (SELECT state FROM import_run_event WHERE run_id = r.id ORDER BY id DESC LIMIT 1),
+                    (SELECT max(at_ms) FROM import_run_event WHERE run_id = r.id AND state = 'undone')
+               FROM import_run r WHERE r.public_id = ?1",
+            [run.as_bytes()],
+            |row| {
+                Ok(StoredRun {
+                    run,
+                    streams: row.get(0)?,
+                    new_streams: row.get(1)?,
+                    reader: row.get(2)?,
+                    applied_at_ms: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    in_force: row.get::<_, Option<String>>(4)?.as_deref() == Some("applied"),
+                    undone_at_ms: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Error::from)
+}
+
+/// Stores a run's streams that are not stored yet, and records the run, the
+/// streams it held and that it is in force, in one write. A run applied
+/// before is not applied again. Derivation passes streams over, so no play
+/// changes.
+fn apply_in(
+    write: &Write<'_>,
+    run: Id,
+    streams: &[Stream],
+    reader: &str,
+    session: Option<Id>,
+) -> Result<StoredRun, Error> {
+    let connection = write.connection();
+    if let Some(stored) = stored_run(connection, run)? {
+        return Ok(stored);
+    }
+    let (endpoint, instance) = spotify_rows(write)?;
+    let listener: i64 = connection
+        .query_row("SELECT id FROM listener ORDER BY id LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .ok_or(Error::Corrupt("a library with no listener"))?;
+    let server: i64 = connection.query_row(
+        "SELECT hub_server_id FROM library_meta WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut held_by_key = connection.prepare_cached(
+        "SELECT id FROM history_observation WHERE endpoint_id = ?1 AND source_key = ?2",
+    )?;
+    let mut item_by_uri = connection.prepare_cached(
+        "SELECT id FROM source_item WHERE source_instance_id = ?1 AND item_kind = ?2
+           AND provider_key = ?3 AND retired_at_ms IS NULL",
+    )?;
+    let mut items: HashMap<&str, i64> = HashMap::new();
+    let mut observations = Vec::with_capacity(streams.len());
+    let mut new_streams = 0_i64;
+    for stream in streams {
+        if let Some(held) = held_by_key
+            .query_row((endpoint, &stream.key), |row| row.get::<_, i64>(0))
+            .optional()?
+        {
+            observations.push(held);
+            continue;
+        }
+        let r = &stream.record;
+        let item = match items.get(r.track_uri.as_str()) {
+            Some(item) => *item,
+            None => {
+                let found: Option<i64> = item_by_uri
+                    .query_row((instance, TRACK, &r.track_uri), |row| row.get(0))
+                    .optional()?;
+                let item = match found {
+                    Some(item) => item,
+                    None => {
+                        connection
+                            .prepare_cached(
+                                "INSERT INTO source_item
+                                   (public_id, source_instance_id, item_kind, provider_key,
+                                    first_seen_at_ms, rev)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            )?
+                            .execute((
+                                write.new_id()?.as_bytes(),
+                                instance,
+                                TRACK,
+                                &r.track_uri,
+                                write.now_ms(),
+                                write.rev(),
+                            ))?;
+                        connection.last_insert_rowid()
+                    }
+                };
+                items.insert(r.track_uri.as_str(), item);
+                item
+            }
+        };
+        // The record is written from its type, never from text it was
+        // handed: the kept fields, and no other.
+        let payload = serde_json::to_string(r)?;
+        connection
+            .prepare_cached(
+                "INSERT INTO history_observation
+                   (endpoint_id, source_key, kind, source_item_id, listener_id, captured_at_utc_ms,
+                    received_at_utc_ms, zone_basis, payload_json, rev)
+                 VALUES (?1, ?2, 'import', ?3, ?4, ?5, ?6, 'none', ?7, ?8)",
+            )?
+            .execute(rusqlite::params![
+                endpoint,
+                stream.key,
+                item,
+                listener,
+                r.ended_at,
+                write.now_ms(),
+                payload,
+                write.rev(),
+            ])?;
+        let observation = connection.last_insert_rowid();
+        connection
+            .prepare_cached(
+                "INSERT INTO observation_import
+                   (observation_id, played_at_utc_ms, artist, album, title, rev)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(rusqlite::params![
+                observation,
+                r.ended_at.saturating_sub(r.ms_played),
+                r.artist,
+                r.album,
+                r.title,
+                write.rev(),
+            ])?;
+        connection
+            .prepare_cached(
+                "INSERT INTO observation_import_stream
+                   (observation_id, ended_at_utc_ms, ms_played, reason_start, reason_end, shuffle,
+                    skipped, offline, offline_timestamp, incognito, platform, rev)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            )?
+            .execute(rusqlite::params![
+                observation,
+                r.ended_at,
+                r.ms_played,
+                r.reason_start,
+                r.reason_end,
+                r.shuffle,
+                r.skipped,
+                r.offline,
+                r.offline_timestamp,
+                r.incognito,
+                r.platform.as_str(),
+                write.rev(),
+            ])?;
+        observations.push(observation);
+        new_streams += 1;
+    }
+    connection.execute(
+        "INSERT INTO import_run
+           (public_id, endpoint_id, applied_by_server_id, session_pid, reader, records_hash,
+            streams, new_streams, created_at_ms, rev)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            run.as_bytes(),
+            endpoint,
+            server,
+            session.as_ref().map(Id::as_bytes),
+            reader,
+            records_hash(streams),
+            streams.len() as i64,
+            new_streams,
+            write.now_ms(),
+            write.rev(),
+        ],
+    )?;
+    let row = connection.last_insert_rowid();
+    let mut held = connection.prepare_cached(
+        "INSERT OR IGNORE INTO import_run_stream (run_id, observation_id, rev) VALUES (?1, ?2, ?3)",
+    )?;
+    for observation in observations {
+        held.execute((row, observation, write.rev()))?;
+    }
+    connection.execute(
+        "INSERT INTO import_run_event (run_id, state, at_ms, rev) VALUES (?1, 'applied', ?2, ?3)",
+        (row, write.now_ms(), write.rev()),
+    )?;
+    stored_run(connection, run)?.ok_or(Error::Corrupt("a run that was just applied"))
+}
+
+impl LibraryStore {
+    /// A run as the library holds it, or `None` if it was never applied.
+    pub fn stored_run(&self, run: Id) -> Result<Option<StoredRun>, Error> {
+        self.read(move |connection| stored_run(connection, run))
+    }
+
+    /// Applies a run of streams: stores those not stored yet and records
+    /// the run, in one write. A run applied before writes nothing and
+    /// returns what it is.
+    pub fn apply_streams(
+        &self,
+        request: WriteRequest,
+        run: Id,
+        records: Vec<SpotifyStream>,
+        reader: String,
+        session: Option<Id>,
+    ) -> Result<StoredRun, Error> {
+        if let Some(stored) = self.stored_run(run)? {
+            return Ok(stored);
+        }
+        let streams = keyed(records);
+        let written = self.write(request, move |write| {
+            let stored = apply_in(write, run, &streams, &reader, session)?;
+            Ok(serde_json::to_string(&stored)?)
+        })?;
+        Ok(serde_json::from_str(&written.result_json)?)
+    }
+
+    /// Takes a run out of force: a row of its ledger, in one write. Its
+    /// streams stay stored, and those another run in force holds stay in
+    /// force. A run already out of force writes nothing.
+    pub fn undo_streams(&self, request: WriteRequest, run: Id) -> Result<StoredRun, Error> {
+        let stored = self
+            .stored_run(run)?
+            .ok_or(Error::NotFound("no run of that ID was applied"))?;
+        if !stored.in_force {
+            return Ok(stored);
+        }
+        let written = self.write(request, move |write| {
+            let connection = write.connection();
+            let row: i64 = connection.query_row(
+                "SELECT id FROM import_run WHERE public_id = ?1",
+                [run.as_bytes()],
+                |row| row.get(0),
+            )?;
+            let state: Option<String> = connection
+                .query_row(
+                    "SELECT state FROM import_run_event WHERE run_id = ?1 ORDER BY id DESC LIMIT 1",
+                    [row],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if state.as_deref() == Some("applied") {
+                connection.execute(
+                    "INSERT INTO import_run_event (run_id, state, at_ms, rev)
+                     VALUES (?1, 'undone', ?2, ?3)",
+                    (row, write.now_ms(), write.rev()),
+                )?;
+            }
+            let stored = stored_run(connection, run)?.ok_or(Error::Corrupt("a run undone"))?;
+            Ok(serde_json::to_string(&stored)?)
+        })?;
+        Ok(serde_json::from_str(&written.result_json)?)
+    }
+
+    /// Every run the library holds, newest first.
+    pub fn stored_runs(&self) -> Result<Vec<StoredRun>, Error> {
+        self.read(|connection| {
+            let runs: Vec<[u8; 16]> = connection
+                .prepare("SELECT public_id FROM import_run ORDER BY id DESC")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            runs.into_iter()
+                .filter_map(|run| stored_run(connection, Id::from_bytes(run)).transpose())
+                .collect()
+        })
     }
 }
