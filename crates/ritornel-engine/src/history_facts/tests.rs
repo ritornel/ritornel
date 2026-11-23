@@ -189,6 +189,32 @@ fn a_record_says_when_it_was_found_its_year_and_its_song() {
 }
 
 #[test]
+fn a_record_first_heard_after_now_is_not_found_then() {
+    // Found in 2024, and once dated next year by a clock that was wrong.
+    let gathered = Gathered {
+        record: Some(record(vec![
+            heard(-300, 20270911, 1, 20, 0),
+            heard(900, 20240530, 1, 20, 0),
+            heard(10, 20261105, 1, 20, 0),
+        ])),
+        ..Gathered::default()
+    };
+    assert_eq!(
+        of(&facts(&gathered, TODAY), FactKind::FirstHeard).unwrap(),
+        (
+            "You first heard this record *2 years ago*.".to_owned(),
+            "30 May 2024. 3 plays since.".to_owned()
+        )
+    );
+    // Only after now: when it was found is not said.
+    let ahead = Gathered {
+        record: Some(record(vec![heard(-300, 20270911, 1, 20, 0)])),
+        ..Gathered::default()
+    };
+    assert_eq!(of(&facts(&ahead, TODAY), FactKind::FirstHeard), None);
+}
+
+#[test]
 fn a_time_of_day_is_said_only_where_it_stands_out() {
     // Every play in the evening, from a listener who plays mostly then.
     let plays = (0..40)
@@ -209,6 +235,13 @@ fn a_time_of_day_is_said_only_where_it_stands_out() {
     gathered.record = Some(record(
         (0..29)
             .map(|at| heard(300 + at, 20260101, 1, 20, 0))
+            .collect(),
+    ));
+    assert_eq!(of(&facts(&gathered, TODAY), FactKind::TimeOfDay), None);
+    // Dated after now, by a clock that was wrong: no time of day.
+    gathered.record = Some(record(
+        (0..40)
+            .map(|at| heard(-300 - at, 20270101, 1, 20, 0))
             .collect(),
     ));
     assert_eq!(of(&facts(&gathered, TODAY), FactKind::TimeOfDay), None);
@@ -348,6 +381,13 @@ fn a_record_unplayed_for_a_year_before_today_says_since_when() {
         ..Gathered::default()
     };
     assert_eq!(of(&facts(&undated(30), TODAY), FactKind::NotSince), None);
+    // Dated next month by a clock that was wrong: not played since.
+    assert_eq!(
+        of(&facts(&undated(-30), TODAY), FactKind::NotSince)
+            .unwrap()
+            .0,
+        "Before today, you had not played it *since May 2024*."
+    );
     // At the same instant as one with a local date, that one is taken.
     let at = |date| Heard {
         // 23:30 UTC on 31 January 2024.
@@ -563,6 +603,16 @@ fn a_songs_last_time_is_the_day_of_its_latest_play() {
         ),
     );
     assert_eq!(last_time(), "The last time was earlier today.");
+    // A play dated next month, by a clock that was wrong, is not the last.
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET event_at_utc_ms = {}, local_date = 20261225 WHERE id = {}",
+            NOW + 40 * DAY,
+            nth_play(2)
+        ),
+    );
+    assert_eq!(last_time(), "The last time was earlier today.");
     // With no local date, the day of the latest play is not known, but
     // its month is that of its instant in UTC.
     tamper(
@@ -573,6 +623,25 @@ fn a_songs_last_time_is_the_day_of_its_latest_play() {
         ),
     );
     assert_eq!(last_time(), "The last time was in November 2026.");
+    // Every play dated next month: still counted, and when the last was is
+    // not said.
+    let song = format!(
+        "recording_id = (SELECT recording_id FROM play_event WHERE id = {})",
+        nth_play(0)
+    );
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET event_at_utc_ms = {} WHERE {song}",
+            NOW + 40 * DAY
+        ),
+    );
+    let history = store
+        .track_history(listener, appearance, TODAY)
+        .unwrap()
+        .unwrap();
+    let (head, more) = of(&history.facts, FactKind::SongPlays).unwrap();
+    assert!(head.starts_with("You have played this song *") && more.is_empty());
     // With no instants, its plays are still counted, and when the last
     // was is not said.
     tamper(

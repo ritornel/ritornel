@@ -36,8 +36,8 @@ const MOST_PLAYS: u64 = 10;
 pub(crate) struct Song {
     /// Its plays, wherever it was heard.
     pub(crate) plays: u64,
-    /// The play of it with the latest instant: that instant, and its local
-    /// date, YYYYMMDD, where it has one.
+    /// The play of it with the latest instant not after now: that instant,
+    /// and its local date, YYYYMMDD, where it has one.
     pub(crate) last: Option<(i64, Option<i64>)>,
     /// Whether the listener gave it five stars.
     pub(crate) five_stars: bool,
@@ -119,9 +119,13 @@ fn long(date: i64) -> String {
 /// The part of the day most of a record's plays fall in, when it holds
 /// 45% of them and there are enough to say: the part, its plays, and all
 /// the plays with an hour.
-fn leaning(plays: &[Heard]) -> Option<(usize, u64, u64)> {
+fn leaning(plays: &[Heard], now_ms: i64) -> Option<(usize, u64, u64)> {
     let mut parts = [0_u64; 4];
-    for heard in plays {
+    // A play after now, by a clock that was wrong, has no time of day.
+    for heard in plays
+        .iter()
+        .filter(|heard| heard.at_ms.is_none_or(|at| at <= now_ms))
+    {
         if let Some(part) = heard
             .hour
             .and_then(|hour| usize::try_from(hour / 6).ok())
@@ -206,18 +210,22 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
         return out;
     };
     let plays = u64::try_from(record.plays.len()).unwrap_or(u64::MAX);
+    // A play's instant, unless it is after now, by a clock that was wrong:
+    // such a play is taken as one with no instant, so it is never said as
+    // past.
+    let instant = |heard: &Heard| heard.at_ms.filter(|&at| at <= today.now_ms);
     // The plays with a day, each with its instant and its date.
     let dated: Vec<(i64, i64, &Heard)> = record
         .plays
         .iter()
-        .filter_map(|heard| Some((heard.at_ms?, heard.date?, heard)))
+        .filter_map(|heard| Some((instant(heard)?, heard.date?, heard)))
         .collect();
 
     // A play with no local date before it may be from a day earlier still,
     // so nothing is said.
     if let Some(&(first_at, first, _)) = dated.iter().min_by_key(|(at, ..)| *at)
         && !record.plays.iter().any(|heard| {
-            heard.date.is_none() && heard.at_ms.is_some_and(|earlier| earlier < first_at)
+            heard.date.is_none() && instant(heard).is_some_and(|earlier| earlier < first_at)
         })
         && let Some(ago) = ago(first, today.date)
     {
@@ -270,7 +278,7 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
     // A part of the day that holds most of its plays, and half as many
     // again as the listener's plays at that time hold of theirs.
     let all: u64 = gathered.parts.iter().sum();
-    if let Some((part, most, timed)) = leaning(&record.plays)
+    if let Some((part, most, timed)) = leaning(&record.plays, today.now_ms)
         && all > 0
         && 2 * most * all >= 3 * gathered.parts.get(part).copied().unwrap_or(0) * timed
         && let Some(name) = PARTS.get(part)
@@ -364,7 +372,7 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
         .plays
         .iter()
         .filter(|heard| heard.date.is_none_or(|date| date < today.date))
-        .filter_map(|heard| Some((heard.at_ms?, heard.date)))
+        .filter_map(|heard| Some((instant(heard)?, heard.date)))
         .max()
         && last.0 < today.now_ms - YEAR_MS
     {
@@ -392,15 +400,17 @@ LEFT JOIN release rel ON rel.id = heard.canonical_id
 WHERE ta.public_id = ?1";
 
 /// A song's plays, wherever heard, and the last of them: the play with the
-/// latest instant, which is not always the one with the latest local date
-/// when plays were heard in zones far apart, and one with a local date of
-/// those at the same instant. Its instant and its local date.
+/// latest instant not after now (`?3`), which is not always the one with
+/// the latest local date when plays were heard in zones far apart, and one
+/// with a local date of those at the same instant. Its instant and its
+/// local date. A play dated after now, by a clock that was wrong, is
+/// counted and is not the last.
 const SONG_PLAYS: &str = "
 SELECT count(*), last.event_at_utc_ms, last.local_date
 FROM play_event
 LEFT JOIN (SELECT event_at_utc_ms, local_date FROM play_event
            WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0
-             AND event_at_utc_ms IS NOT NULL
+             AND event_at_utc_ms <= ?3
            ORDER BY event_at_utc_ms DESC, local_date IS NULL, id DESC LIMIT 1) last
   ON true
 WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0";
@@ -506,7 +516,7 @@ fn read_track(
     };
     let (plays, last_at, last_date): (i64, Option<i64>, Option<i64>) = connection
         .prepare_cached(SONG_PLAYS)?
-        .query_row(params![listener, recording], |row| {
+        .query_row(params![listener, recording, today.now_ms], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
     let five_stars = crate::ratings::said(connection, &[recording])?
@@ -522,7 +532,7 @@ fn read_track(
     let mut parts = [0_u64; 4];
     if record
         .as_ref()
-        .is_some_and(|record| leaning(&record.plays).is_some())
+        .is_some_and(|record| leaning(&record.plays, today.now_ms).is_some())
     {
         let mut statement = connection.prepare_cached(PARTS_OF_DAY)?;
         let mut rows = statement.query([listener])?;

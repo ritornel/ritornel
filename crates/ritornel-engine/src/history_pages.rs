@@ -74,7 +74,7 @@ pub(crate) struct Facts {
     pub(crate) last: Option<(i64, Option<i64>)>,
     /// The plays in the last year.
     pub(crate) last_year: u64,
-    /// The dated plays by year.
+    /// The dated plays by year, those dated after now left out.
     pub(crate) years: BTreeMap<i32, u64>,
     /// The plays of each record they were heard from, keyed by the record's
     /// release group.
@@ -98,10 +98,13 @@ impl Facts {
         if let Some(record) = record {
             self.records.entry(record).or_default().plays += 1;
         }
-        let Some(at) = at_ms else {
+        // A play dated after now, by a clock that was wrong, is counted as
+        // one with no instant: in no year, and neither the first nor the
+        // last, which would be said as past.
+        let Some(at) = at_ms.filter(|&at| at <= today.now_ms) else {
             return;
         };
-        if at > today.now_ms - YEAR_MS && at <= today.now_ms {
+        if at > today.now_ms - YEAR_MS {
             self.last_year += 1;
         }
         // Of plays at the same instant, one with a local date is taken.
@@ -220,7 +223,9 @@ impl Said {
 /// plays.
 ///
 /// The first and last months are those of the first and last plays in
-/// time, whether they have a local date or not ([`month_of`]).
+/// time, whether they have a local date or not ([`month_of`]). A play
+/// whose instant is after now is counted as one with no instant, so it is
+/// never said as past.
 ///
 /// What waits on sessions is left out: "played start to finish".
 pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Vec<Phrase> {
@@ -228,7 +233,8 @@ pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Ve
         return Vec::new();
     }
     let (Some(first), Some(last)) = (facts.first, facts.last) else {
-        // Plays with no instant: how many is all there is to say.
+        // Plays with no instant, or only after now: how many is all there
+        // is to say.
         return Said::default()
             .plain("Played ")
             .strong(&counted(facts.plays, "time", "times"))
@@ -359,10 +365,10 @@ fn history_of(
 /// local date: from the local year of their first dated play to this year,
 /// or to the next, where a play already heard in a zone ahead of the
 /// server's has reached it. A play dated after now, by a clock that was
-/// wrong, does not stretch it. The first dated play in time is not always
-/// the first by local date: one heard just after midnight on New
-/// Year's Day in a zone far ahead can come before one heard late on New
-/// Year's Eve in a zone far behind. So each end is the earliest or latest
+/// wrong, neither begins nor stretches it. The first dated play in time is
+/// not always the first by local date: one heard just after midnight on
+/// New Year's Day in a zone far ahead can come before one heard late on
+/// New Year's Eve in a zone far behind. So each end is the earliest or latest
 /// local date among the plays near it in time.
 fn span(connection: &Connection, listener: i64, today: Today) -> Result<Option<YearSpan>, Error> {
     let (first, last): (Option<i64>, Option<i64>) = connection
@@ -371,11 +377,11 @@ fn span(connection: &Connection, listener: i64, today: Today) -> Result<Option<Y
                (SELECT min(pe.local_date) FROM play_event pe,
                   (SELECT event_at_utc_ms AS at FROM play_event
                    WHERE listener_id = ?1 AND counts = 1 AND excluded = 0
-                     AND local_date IS NOT NULL AND event_at_utc_ms IS NOT NULL
+                     AND local_date IS NOT NULL AND event_at_utc_ms <= ?3
                    ORDER BY event_at_utc_ms LIMIT 1) began
                 WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
                   AND pe.local_date IS NOT NULL
-                  AND pe.event_at_utc_ms BETWEEN began.at AND began.at + ?2),
+                  AND pe.event_at_utc_ms BETWEEN began.at AND min(began.at + ?2, ?3)),
                (SELECT max(pe.local_date) FROM play_event pe,
                   (SELECT event_at_utc_ms AS at FROM play_event
                    WHERE listener_id = ?1 AND counts = 1 AND excluded = 0

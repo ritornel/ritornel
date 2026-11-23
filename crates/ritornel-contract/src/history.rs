@@ -349,7 +349,9 @@ pub struct HistoryOf {
     /// The plays, dated or not.
     pub plays: u64,
     /// The local date of the first play, as `YYYY-MM-DD`. Left out when the
-    /// first play has no local date, though a later one has.
+    /// first play has no local date, though a later one has. A play whose
+    /// instant is after now, by a clock that was wrong, is neither the
+    /// first nor the last, so both are left out when every play is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub first_played: Option<String>,
@@ -360,7 +362,8 @@ pub struct HistoryOf {
     pub last_played: Option<String>,
     /// The plays in the 365 days before now.
     pub last_year: u64,
-    /// The dated plays by year, oldest first. A year with none is left out.
+    /// The dated plays by year, oldest first. A year with none is left out,
+    /// and so is a play whose instant is after now.
     pub years: Vec<YearPlays>,
     /// The years the listener's whole history runs over. Left out while
     /// there is no dated play at all, of anything.

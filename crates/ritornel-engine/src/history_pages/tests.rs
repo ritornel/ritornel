@@ -360,6 +360,51 @@ fn the_first_and_last_months_are_those_of_the_first_and_last_plays_dated_or_not(
 }
 
 #[test]
+fn a_play_dated_after_now_is_counted_and_never_said_as_past() {
+    let since = Some(NOW - 6_000 * DAY);
+    // Dated next year by a clock that was wrong: the last play said is
+    // the one before now.
+    let mut ahead = Facts::default();
+    play(&mut ahead, 1_000, 20240219);
+    play(&mut ahead, 500, 20250703);
+    play(&mut ahead, -300, 20270911);
+    assert_eq!(ahead.plays, 3);
+    assert_eq!(ahead.last, Some((NOW - 500 * DAY, Some(20250703))));
+    // Nor is it in a year.
+    assert_eq!(ahead.years, [(2024, 1), (2025, 1)].into());
+    assert_eq!(
+        said(&sentence(&ahead, since, TODAY)),
+        "With you since *February 2024*. Last played in *July 2025*."
+    );
+
+    // Not played for two years but for one dated ahead: still not played
+    // since then.
+    let mut gone = Facts::default();
+    play(&mut gone, 4_000, 20151201);
+    play(&mut gone, 900, 20240530);
+    gone.add(Some(NOW + 40 * DAY), None, None, TODAY);
+    assert_eq!(
+        said(&sentence(&gone, since, TODAY)),
+        "With you since *December 2015*. Not played since *May 2024*."
+    );
+
+    // Every play dated ahead: how many, and no month.
+    let mut only = Facts::default();
+    play(&mut only, -30, 20261215);
+    play(&mut only, -60, 20270114);
+    assert_eq!((only.first, only.last), (None, None));
+    assert_eq!(said(&sentence(&only, since, TODAY)), "Played *2 times*.");
+
+    // A play at this very instant is not ahead.
+    let mut now = Facts::default();
+    play(&mut now, 0, 20261115);
+    assert_eq!(
+        said(&sentence(&now, since, TODAY)),
+        "With you since *November 2026*. *1 play* in the last year."
+    );
+}
+
+#[test]
 fn a_months_day_with_no_local_date_is_its_day_in_utc() {
     // 23:30 UTC on 31 January 2024.
     let at = 1_706_743_800_000;
@@ -394,8 +439,12 @@ fn a_records_plays_count_its_undated_ones_and_only_dated_ones_have_a_year() {
     }
     facts.add(Some(NOW - 900 * DAY), Some(20240530), Some(7), TODAY);
     facts.add(None, None, Some(8), TODAY);
+    // Dated after now: counted, and in no year, so never its peak.
+    for _ in 0..2 {
+        facts.add(Some(NOW + 300 * DAY), Some(20270911), Some(7), TODAY);
+    }
     let seven = &facts.records[&7];
-    assert_eq!(seven.plays, 4);
+    assert_eq!(seven.plays, 6);
     assert_eq!(seven.years, [(2024, 1)].into());
     let eight = &facts.records[&8];
     assert_eq!((eight.plays, eight.years.len()), (1, 0));
@@ -451,7 +500,8 @@ fn the_span_holds_every_local_year_played_across_the_date_line() {
     // 2020, and the next, by local date, in 2019. And 00:30 on New Year's
     // Day 2027 in Kiritimati is still 2026 where the server is, and comes
     // before 01:00 on New Year's Eve in Honolulu. A play stamped a year
-    // ahead, by a clock that was wrong, is not heard yet.
+    // ahead, by a clock that was wrong, is not heard yet: it is in no year
+    // and does not stretch the span.
     tamper(
         store,
         &format!(
@@ -479,7 +529,7 @@ fn the_span_holds_every_local_year_played_across_the_date_line() {
         .unwrap()
         .unwrap();
     let years: Vec<i32> = history.years.iter().map(|year| year.year).collect();
-    assert_eq!((years.first(), years.last()), (Some(&2019), Some(&2028)));
+    assert_eq!((years.first(), years.last()), (Some(&2019), Some(&2027)));
     let span = history.span.unwrap();
     assert_eq!((span.from, span.to), (2019, 2027));
 }

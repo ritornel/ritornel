@@ -1334,7 +1334,9 @@ export type HistoryOf = {
   plays: number,
   /**
    * The local date of the first play, as `YYYY-MM-DD`. Left out when the
-   * first play has no local date, though a later one has.
+   * first play has no local date, though a later one has. A play whose
+   * instant is after now, by a clock that was wrong, is neither the
+   * first nor the last, so both are left out when every play is.
    */
   firstPlayed?: string,
   /**
@@ -1347,7 +1349,8 @@ export type HistoryOf = {
    */
   lastYear: number,
   /**
-   * The dated plays by year, oldest first. A year with none is left out.
+   * The dated plays by year, oldest first. A year with none is left out,
+   * and so is a play whose instant is after now.
    */
   years: Array<YearPlays>,
   /**
