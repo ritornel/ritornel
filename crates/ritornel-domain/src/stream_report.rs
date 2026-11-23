@@ -28,9 +28,12 @@ const OFFLINE_NEAR_MS: i64 = 24 * 60 * 60 * 1000;
 pub struct DryRunInput<'a> {
     /// The run's streams, with their keys.
     pub streams: &'a [Stream],
-    /// The streams in force now, with their keys, which applying keeps in
-    /// force beside the run's.
+    /// The listener's streams in force now, with their keys, which applying
+    /// keeps in force beside the run's.
     pub in_force: &'a [Stream],
+    /// Other listeners' streams in force, which a track's length is taken
+    /// from too, as derivation takes it from every stream in force.
+    pub others: &'a [Stream],
     /// The scrobbles that may be offered to a stream.
     pub scrobbles: &'a [Scrobble],
     /// Scrobbles set aside, which are offered to none.
@@ -336,7 +339,15 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         Tiers::ALL,
         &pins(input.streams),
     );
-    let lengths = lengths(input.streams, &matched.events);
+    // A track's length, from these streams and every other listener's.
+    let lengths_of = |streams: &[Stream], events: &[Event]| {
+        if input.others.is_empty() {
+            return lengths(streams, events);
+        }
+        let every: Vec<Stream> = streams.iter().chain(input.others).cloned().collect();
+        lengths(&every, &crate::streams::events(&every))
+    };
+    let lengths = lengths_of(input.streams, &matched.events);
 
     let counts = crate::streams::counts(&matched);
     let tiers = Tier::ALL
@@ -428,7 +439,7 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
             Tiers::ALL,
             &pins(input.in_force),
         );
-        let lengths_now = crate::streams::lengths(input.in_force, &matched.events);
+        let lengths_now = lengths_of(input.in_force, &matched.events);
         added(
             input.in_force,
             input.scrobbles,
@@ -761,6 +772,7 @@ mod tests {
         DryRunInput {
             streams,
             in_force: &[],
+            others: &[],
             scrobbles,
             excluded: 0,
             echoes: 0,
@@ -825,12 +837,21 @@ mod tests {
         let streams = fresh(vec![record(221, 221, "Low Tide", "trackdone")]);
         // An hour on: no tier would join it.
         let scrobbles = [scrobble(3600, "Low Tide")];
-        let pins = Pins {
-            apart: HashSet::new(),
-            together: vec![(streams[0].key.clone(), 3600)],
-        };
+        // The stream is stored, as observation 10.
+        let observations = HashMap::from([(streams[0].key.clone(), 10)]);
+        let corrections = [Correction {
+            observation: 20,
+            verb: crate::history::Verb::Join,
+            targets: vec![10, 3600],
+            window: None,
+            recording: None,
+        }];
         let plays = BTreeMap::new();
-        let report = dry_run(&input(&streams, &scrobbles, &plays, &pins));
+        let report = dry_run(&DryRunInput {
+            corrections: &corrections,
+            observations: &observations,
+            ..input(&streams, &scrobbles, &plays)
+        });
         let year = &report.years[0];
         assert_eq!((year.joined_start, year.joined_pinned), (0, 1));
         assert!(report.tiers.iter().all(|tier| tier.joined == 0));
@@ -947,6 +968,26 @@ mod tests {
     }
 
     #[test]
+    fn a_tracks_length_is_taken_from_other_listeners_streams_too() {
+        // Another listener played Low Tide to its end, in 2:40.
+        let theirs = fresh(vec![record(5000, 160, "Low Tide", "trackdone")]);
+        // This run's stream of it played a minute and a half and stopped.
+        let streams = fresh(vec![record(221, 90, "Low Tide", "endplay")]);
+        let plays = BTreeMap::new();
+        let alone = |others: &[Stream]| {
+            let year = dry_run(&DryRunInput {
+                others,
+                ..input(&streams, &[], &plays)
+            })
+            .years[0];
+            (year.alone_counted, year.alone_unknown)
+        };
+        assert_eq!(alone(&[]), (0, 1));
+        // Over half its length: it counts, as derivation counts it.
+        assert_eq!(alone(&theirs), (1, 0));
+    }
+
+    #[test]
     fn a_dry_run_counts_by_year_and_says_what_stands_in_the_way() {
         let streams = fresh(vec![
             // Joined by tier A.
@@ -969,6 +1010,7 @@ mod tests {
         let report = dry_run(&DryRunInput {
             streams: &streams,
             in_force: &[],
+            others: &[],
             scrobbles: &scrobbles,
             excluded: 3,
             echoes: 2,
@@ -1018,6 +1060,7 @@ mod tests {
         let report = dry_run(&DryRunInput {
             streams: &streams,
             in_force: &[],
+            others: &[],
             scrobbles: &scrobbles,
             excluded: 0,
             echoes: 0,

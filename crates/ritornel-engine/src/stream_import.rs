@@ -3,7 +3,7 @@
 //! new and records the run; and undoing it. See "Spotify streams" in
 //! docs/internals/history.md.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ritornel_contract::{DeviceKind, ImportReport, Platform, PlayedVia, SpotifyStream};
 use ritornel_domain::history::Correction;
@@ -29,6 +29,7 @@ struct Read {
     observations: HashMap<Vec<u8>, i64>,
     corrections: Vec<Correction>,
     in_force: Vec<Stream>,
+    others: Vec<Stream>,
     set_aside: HashSet<Vec<u8>>,
 }
 
@@ -103,16 +104,13 @@ fn in_force(connection: &Connection) -> Result<i64, Error> {
 /// come back.
 /// An import is an echo when it matches a delivery of a listen, as
 /// derivation finds it, so that a second copy of an echo, which stands as a
-/// play of its own, is an echo too; and it is set aside when a correction
-/// that stands excludes it.
+/// play of its own, is an echo too; and it is set aside when it is one of
+/// `set_aside`, those a correction that stands excludes.
 fn scrobbles(
     connection: &Connection,
-    corrections: &[Correction],
+    set_aside: &BTreeSet<i64>,
     listener: i64,
 ) -> Result<(Vec<Scrobble>, u64, u64), Error> {
-    // Set aside as derivation has it: by the corrections that stand, and
-    // never by what a play of it shows, which another record can decide.
-    let set_aside = ritornel_domain::history::excluded(corrections);
     let mut statement = connection.prepare(
         "SELECT o.id, o.source_key, i.played_at_utc_ms, i.artist, i.title, o.endpoint_id
            FROM observation_import i
@@ -192,15 +190,29 @@ fn read(connection: &Connection) -> Result<Read, Error> {
         |row| row.get(0),
     )?;
     let corrections = crate::history_store::corrections(connection)?;
-    let (scrobbles, excluded, echoes) = scrobbles(connection, &corrections, listener)?;
-    let (stored, observations) = stored_streams(connection)?;
-    // A stream set aside, as derivation reads the corrections.
+    // Set aside as derivation has it: by the corrections that stand, and
+    // never by what a play of a record shows, which another record can
+    // decide.
     let set_aside_ids = ritornel_domain::history::excluded(&corrections);
+    let (scrobbles, excluded, echoes) = scrobbles(connection, &set_aside_ids, listener)?;
+    let (stored, observations) = stored_streams(connection)?;
     let set_aside = observations
         .iter()
         .filter(|(_, observation)| set_aside_ids.contains(observation))
         .map(|(key, _)| key.clone())
         .collect();
+    let (in_force, others): (Vec<_>, Vec<_>) = crate::history_streams::streams(connection, None)?
+        .into_iter()
+        .partition(|stream| stream.listener == listener);
+    let keyed = |streams: Vec<ritornel_domain::history::StreamImport>| -> Vec<Stream> {
+        streams
+            .into_iter()
+            .map(|stream| Stream {
+                key: stream.key,
+                record: stream.record,
+            })
+            .collect()
+    };
     Ok(Read {
         scrobbles,
         excluded,
@@ -211,14 +223,8 @@ fn read(connection: &Connection) -> Result<Read, Error> {
         stored,
         observations,
         corrections,
-        in_force: crate::history_streams::streams(connection, None)?
-            .into_iter()
-            .filter(|stream| stream.listener == listener)
-            .map(|stream| Stream {
-                key: stream.key,
-                record: stream.record,
-            })
-            .collect(),
+        in_force: keyed(in_force),
+        others: keyed(others),
         set_aside,
     })
 }
@@ -228,6 +234,7 @@ fn report(read: &Read, streams: &[Stream], made_at: i64) -> ImportReport {
     dry_run(&DryRunInput {
         streams,
         in_force: &read.in_force,
+        others: &read.others,
         scrobbles: &read.scrobbles,
         excluded: read.excluded,
         echoes: read.echoes,
