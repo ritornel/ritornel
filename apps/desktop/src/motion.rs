@@ -1,7 +1,8 @@
 //! How fast the wall is moving, and where a flick will come to rest.
 //!
 //! macOS and Windows both send a touchpad's momentum as a stream of scroll
-//! events after the fingers lift, slowing roughly exponentially. The wall
+//! events after the fingers lift, slowing roughly exponentially, and so does
+//! Ritornel's patched GPUI on Wayland (github.com/ritornel/gpui). The wall
 //! reads the velocity from those events and estimates the decay's time
 //! constant from how the velocity falls, so it can say where the flick
 //! will stop: `top + v·τ`. That point is where covers are wanted first.

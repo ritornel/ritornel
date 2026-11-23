@@ -15,6 +15,7 @@ Ritornel was built on macOS first. Linux and Windows came early, while the code 
 | Desktop app | Yes | Wayland or X11 | Yes | None |
 | Installed app (`mise run install`) | `/Applications/Ritornel.app` | `~/.local/lib/ritornel`, with a launcher entry and an icon | Not yet | None |
 | App menus | The menu bar | A button in the title bar | A button in the title bar | None |
+| Touchpad scrolling that coasts | AppKit's momentum | On Wayland, GTK 4's coast in patched GPUI; not on X11 | Direct Manipulation's inertia | None |
 | Data directory | `~/Library/Application Support/Ritornel` | `$XDG_DATA_HOME/ritornel` | `%LOCALAPPDATA%\Ritornel` | As Linux |
 
 The headless hub is the server built for Linux with `--no-default-features`: no sound, no media session, no Last.fm, and no system library beyond libc.
@@ -50,6 +51,7 @@ What differs between systems sits in a `platform` module in each crate that need
   Each queue entry gets its own track ID so `SetPosition` can refuse a stale one. The bus name is `org.mpris.MediaPlayer2.ritornel`.
 - **The background service is a systemd user unit, not a system unit,** for the same reason macOS uses a user agent: the user's session owns the session bus and the sound server. It restarts ten seconds after an unclean exit, matching the launchd agent.
 - **The installed app is a folder in `~/.local/lib`, not in the data directory.** `scripts/install.sh` copies the bundle `scripts/desktop.sh app` makes, the app with its server beside it, to `~/.local/lib/ritornel`, staged and swapped in as on macOS. `$XDG_DATA_HOME/ritornel` is the data directory and is never written by an install: on both systems the script replaces only a folder that already holds the app, and stops before writing anything when another folder is in the way. Without the desktop app's libraries, `scripts/desktop.sh app` skips the app and the script installs the programs alone. The launcher entry and the 512-pixel icon go in `$XDG_DATA_HOME/applications` and `$XDG_DATA_HOME/icons/hicolor`, named `dev.ritornel.desktop` after the window's app ID, which is how a launcher, a Wayland compositor (`app_id`), X11 (`WM_CLASS`) and MPRIS (`DesktopEntry`) match the window and the media session to the entry and its icon.
+- **A touchpad's scroll on Wayland coasts in a patched copy of GPUI's Linux backend, not in the app.** GPUI ignores Wayland's `axis_stop`, so its scroll events carry no phase and the page stopped dead at the lift. [ritornel/gpui](https://github.com/ritornel/gpui), Ritornel's copy of the published `gpui-pre-linux`, put in its place with `[patch.crates-io]` at a pinned commit, reports the scroll as `Started`, `Moved` and `Ended` and then sends the coast as `Moved` events, one a frame, as macOS sends momentum and Windows inertia. Coasting there moves every scrolling view the same way, GPUI's own lists included, where the app would need a coast in each page. The coast, in the fork's `src/linux/wayland/kinetic.rs`, follows the numbers GTK 4 uses in `GtkScrolledWindow`: the speed over the last 150 ms before the lift, slowing at a rate of 4 a second, a flick that catches a coast adding to it, and stopping on a click, the pointer leaving the window, or fingers resting on the touchpad where the compositor offers the pointer gestures protocol's version 3. The app pins the commit of a `patched/v<version>-<n>` tag there, of the same version as its other `gpui-pre-*` pins, and the fork's README says how a new snapshot gets its own patched branch. A `[patch]` that stops matching the pins is only a warning, so `scripts/desktop.sh check` fails unless Cargo resolves `gpui-pre-linux` for Linux from that repository. X11 has no lift event to start a coast from.
 - **The desktop app starts its server detached,** in its own session and with nothing tied to the app, so the server outlives it. A server the app started carries `RITORNEL_STARTED_BY_APP=1`, so Quit can distinguish it from one the app only found.
 
 ### Windows
@@ -70,6 +72,7 @@ What differs between systems sits in a `platform` module in each crate that need
 - Changing the default output moves the stream with no gap.
 - MPRIS handles every call and reports the right track and position.
 - The desktop app follows the server, and menus, shortcuts, and closing the window while playing were verified in the running app.
+- The coast's arithmetic is tested in ritornel/gpui's CI.
 - The server uses 2–3% CPU and 28 MB while playing.
 
 **Windows** (Windows 11, Realtek speakers, 48 kHz shared-mode mix):
