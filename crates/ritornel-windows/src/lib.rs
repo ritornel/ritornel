@@ -11,7 +11,8 @@
 //! - `private`: a file or folder only its owner can open, and the check
 //!   that one is.
 //! - `file`: which file a path is (its volume and file index), the path a
-//!   handle really has, and the room left on a disk.
+//!   handle really has, the room left on a disk, and a rename that is on
+//!   the disk when it returns.
 //! - `clock`: milliseconds since the machine started, through sleep.
 //! - `name`: the machine's host name, in the case it was set.
 //! - `window`: a hidden window, for a process that has none: it hears a
@@ -41,4 +42,40 @@ pub mod window;
 fn wide(path: &std::path::Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     path.as_os_str().encode_wide().chain([0]).collect()
+}
+
+/// A path as Win32 takes it past `MAX_PATH`, as the standard library passes
+/// one: made absolute, in the `\\?\` form, in UTF-16 and ending in a NUL. A
+/// path with a NUL in it is refused, since Win32 would read only what comes
+/// before it.
+fn wide_verbatim(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let path = std::path::absolute(path)?;
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if units.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path holds a NUL",
+        ));
+    }
+    let starts = |text: &str| {
+        units
+            .iter()
+            .copied()
+            .take(text.len())
+            .eq(text.encode_utf16())
+    };
+    let (prefix, skip) = if starts(r"\\?\") || starts(r"\\.\") {
+        ("", 0)
+    } else if starts(r"\\") {
+        // `\\server\share` is `\\?\UNC\server\share`.
+        (r"\\?\UNC\", 2)
+    } else {
+        (r"\\?\", 0)
+    };
+    Ok(prefix
+        .encode_utf16()
+        .chain(units.into_iter().skip(skip))
+        .chain([0])
+        .collect())
 }

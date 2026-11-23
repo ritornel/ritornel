@@ -56,6 +56,7 @@ What differs between systems sits in a `platform` module in each crate that need
 - **The server stops cleanly** on Ctrl+C or Ctrl+Break, the console closing, signing out or shutting down, and a plain `taskkill` (via a hidden window in `ritornel-windows`).
 - **The lock is one byte past the end of `server.lock`,** held exclusively. The PID in the file stays readable, and a client probes the lock with a shared lock on the whole file.
 - **Files only the user can open** carry an access list naming that user alone, where Unix uses modes `0600` and `0700`. Folders Ritornel creates receive this ACL, and files created inside inherit it; an existing data directory keeps its prior access list, as on Unix.
+- **A finished backup's rename asks to be written through to the disk** (`MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, as `ritornel_windows::file::rename_through`), where Unix syncs the folder that holds it. A folder handle opened for writing can be flushed on NTFS, but that is not promised on every file system a backup may go to, such as a network share, and a flush that failed would discard a backup that is whole. So `sync_dir` does nothing on Windows, and `rename_dir` returns once Windows says the dotted folder has its plain name on the disk. Microsoft states that guarantee plainly only for a move that copies; a rename on one volume relies on the file system's journal, and has not been tested against a cut in power. Each file inside was flushed before. Paths past `MAX_PATH` are passed in the `\\?\` form, as the standard library passes them.
 - **The listen clock is `QueryInterruptTimePrecise`.** It counts through sleep as the tick count does, in 100 ns steps rather than 10 to 16 ms, so back-to-back listens meet.
 
 ## Verification
@@ -77,7 +78,6 @@ What differs between systems sits in a `platform` module in each crate that need
 - 44.1, 48, and 96 kHz files play at the right pitch; pause, seek, next, previous, end of queue, and gapless joins (including sample-rate changes) match the source files.
 - Reported position runs ~55 ms ahead of what is heard (output latency) without drifting over three minutes.
 - The desktop app follows the server; the server uses 1–2% of one core and 27 MB while playing.
-- Because the standard library cannot open a directory handle on Windows to flush it, `sync_dir` in `apps/server/src/platform/windows.rs` is currently a no-op (each file inside a backup is flushed before rename, while the directory rename itself is tracked in [#111](https://github.com/ritornel/ritornel/issues/111)).
 
 **arm64 Linux** (the headless player in release, on GitHub's Ubuntu 24.04 arm64 runner, measured by `scripts/player-footprint.sh`):
 

@@ -1,5 +1,6 @@
 //! What a handle says about the file it is open on: which file it is, and
-//! the path it really has; and the room left on a disk.
+//! the path it really has; the room left on a disk; and a rename written
+//! through to it.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -11,7 +12,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED,
     FILE_READ_ATTRIBUTES, GetDiskFreeSpaceExW, GetFileInformationByHandle,
-    GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    GetFinalPathNameByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW, VOLUME_NAME_DOS,
 };
 
 /// Which file or folder is at `path`: the serial number of its volume and
@@ -80,6 +81,20 @@ pub fn free_bytes(path: &Path) -> io::Result<u64> {
     Ok(free)
 }
 
+/// Renames the file or folder at `from` to `to`, on the same volume, and
+/// asks for the rename to be written through to the disk before this
+/// returns (`MOVEFILE_WRITE_THROUGH`), where Unix would sync the folder that
+/// holds it: a folder cannot be flushed everywhere a rename works. It fails
+/// if something is at `to` already. A path may be longer than `MAX_PATH`.
+pub fn rename_through(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (crate::wide_verbatim(from)?, crate::wide_verbatim(to)?);
+    // SAFETY: both names end in their only NUL.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +140,49 @@ mod tests {
         let dir = scratch("free");
         assert!(free_bytes(&dir).unwrap() > 0);
         assert!(free_bytes(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_renamed_through_keeps_what_it_holds() {
+        let dir = scratch("rename");
+        let partial = dir.join(".backup.partial");
+        std::fs::create_dir(&partial).unwrap();
+        std::fs::write(partial.join("server.db"), "x").unwrap();
+        let finished = dir.join("backup");
+        rename_through(&partial, &finished).unwrap();
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(finished.join("server.db")).unwrap(), b"x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_through_never_replaces_what_is_there() {
+        let dir = scratch("replace");
+        std::fs::write(dir.join("new"), "new").unwrap();
+        std::fs::write(dir.join("old"), "old").unwrap();
+        assert!(rename_through(&dir.join("new"), &dir.join("old")).is_err());
+        assert_eq!(std::fs::read(dir.join("new")).unwrap(), b"new");
+        assert_eq!(std::fs::read(dir.join("old")).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_through_takes_a_path_past_max_path_and_refuses_a_nul() {
+        let dir = scratch("long");
+        let deep = dir.join("a".repeat(120)).join("b".repeat(120));
+        std::fs::create_dir_all(deep.join(".backup.partial")).unwrap();
+        let finished = deep.join("backup");
+        assert!(finished.as_os_str().len() > 260);
+        rename_through(&deep.join(".backup.partial"), &finished).unwrap();
+        assert!(finished.is_dir());
+
+        std::fs::create_dir(deep.join(".other.partial")).unwrap();
+        let mut cut = deep.join(".other.partial").into_os_string();
+        cut.push("\0bogus");
+        let error = rename_through(Path::new(&cut), &deep.join("other")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(deep.join(".other.partial").is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

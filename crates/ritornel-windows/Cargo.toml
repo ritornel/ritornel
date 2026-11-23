@@ -1,6 +1,6 @@
 [package]
 name = "ritornel-windows"
-description = "What Ritornel asks of Windows that the standard library cannot: a lock on one byte, owner-only access, a file's identity, a clock that counts through sleep, the machine's name as it was set, and a hidden window."
+description = "What Ritornel asks of Windows that the standard library cannot: a lock on one byte, owner-only access, a file's identity, a rename written through to the disk, a clock that counts through sleep, the machine's name as it was set, and a hidden window."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

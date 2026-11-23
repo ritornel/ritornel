@@ -5,8 +5,9 @@
 //! Each system has a file of its own (`mac.rs`, `linux.rs`, `windows.rs`),
 //! and each offers the same names:
 //!
-//! - files and folders only the OS user can open, a folder synced, and
-//!   the free space beside them;
+//! - files and folders only the OS user can open, a folder synced, a
+//!   folder renamed so that the new name survives a loss of power, and the
+//!   free space beside them;
 //! - the lock on `server.lock`, which a client tries as the contract says
 //!   (`ritornel_contract::local`);
 //! - what asks a running server to stop, and the main thread's wait for
@@ -61,8 +62,8 @@ use other_unix as system;
 pub(crate) use system::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
 pub(crate) use system::{
     close_to_others, create_new_private_dir, create_owner_only, create_private_dir,
-    create_private_file, free_bytes, install_service, is_private, lock_shareable, service_status,
-    stay_awake, sync_dir, take_lock, uninstall_service, wait, watch_signals,
+    create_private_file, free_bytes, install_service, is_private, lock_shareable, rename_dir,
+    service_status, stay_awake, sync_dir, take_lock, uninstall_service, wait, watch_signals,
 };
 
 /// The computer's name, as the person who set it up named it: what a server
