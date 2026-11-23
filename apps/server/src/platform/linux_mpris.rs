@@ -433,6 +433,14 @@ impl Root {
         "Ritornel"
     }
 
+    /// The desktop app's launcher entry, `dev.ritornel.desktop.desktop`,
+    /// which `scripts/install.sh` installs: a shell's media widget shows
+    /// its icon.
+    #[zbus(property(emits_changed_signal = "const"))]
+    fn desktop_entry(&self) -> &str {
+        "dev.ritornel.desktop"
+    }
+
     #[zbus(property(emits_changed_signal = "const"))]
     fn supported_uri_schemes(&self) -> Vec<String> {
         Vec::new()
