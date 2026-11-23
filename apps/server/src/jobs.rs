@@ -82,6 +82,13 @@ pub struct Run {
     /// chunk of a master it sends, so that a satellite's pull can be held
     /// open.
     pub audio_pace: Option<std::time::Duration>,
+    /// The level this run logs at, which `serve` has set up already. With
+    /// none it is `info`. `server.settings` reports it.
+    pub log_level: Option<tracing::Level>,
+    /// Where `serve` was given each setting: the flag, the environment or
+    /// `config.toml`. `server.settings` reports it. A value given here with
+    /// no origin, as by a test, is reported as the default.
+    pub origins: crate::Origins,
     /// The name an older build took from the computer, where that differs
     /// from `computer_name` (`COMPUTERNAME` on Windows): a server still
     /// carrying it takes `computer_name`.

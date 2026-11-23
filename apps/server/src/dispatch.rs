@@ -18,12 +18,13 @@ use ritornel_contract::methods::{
     IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall,
     LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
     LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkCopiesCall,
-    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkSetAwake, LinkStatusCall, LinkTracksCall,
-    ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
-    PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek,
-    PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove,
-    QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerStatus,
-    ServersList, SourcesAdd, SourcesList, SourcesTracks, TracksGet,
+    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall, ListClose,
+    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
+    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
+    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
+    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerSetSettings,
+    ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks,
+    TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -61,11 +62,13 @@ mod pages;
 mod playback;
 mod ratings;
 mod record;
+mod settings;
 mod watch;
 
 pub(crate) use backup::record_backup;
 pub(crate) use calls::job_state;
 use lists::Fanout;
+pub(crate) use settings::StartUp;
 
 /// The largest frame the server reads, in bytes: 1 MiB, which keeps bulk
 /// out of the control channel ("Listener and transport boundaries" in
@@ -177,6 +180,9 @@ pub(crate) struct Core {
     /// The most a satellite's cache of pulled masters holds, in bytes,
     /// once the server has started.
     cache_bytes: std::sync::OnceLock<u64>,
+    /// The settings given as the server started that it reports and does
+    /// not keep elsewhere, once it has started.
+    start_up: std::sync::OnceLock<settings::StartUp>,
     /// What the record's sign knows only while the server runs.
     signs: Mutex<record::Signs>,
     /// The system's media session, once `serve` has started one.
@@ -305,6 +311,7 @@ impl Core {
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
             cache_bytes: std::sync::OnceLock::new(),
+            start_up: std::sync::OnceLock::new(),
             signs: Mutex::default(),
             #[cfg(feature = "media-session")]
             media_session: std::sync::OnceLock::new(),
@@ -374,24 +381,24 @@ impl Core {
     }
 
     /// Follows the wake setting `server.db` keeps: at start, and after
-    /// `link.setAwake`. It is read while the wake state is held, so of two
+    /// `server.setSettings`. It is read while the wake state is held, so of two
     /// settings made at once, the one the database kept last is the one
     /// followed. The machine is held, or let go, at once.
     pub(crate) fn follow_stored_awake(&self, stores: &Stores) {
         let mut awake = lock(&self.awake);
-        awake.setting = match stores.server().awake() {
-            Ok(Some(setting)) if setting.is_valid() => setting,
-            Ok(None) => ritornel_contract::Awake::default(),
+        (awake.setting, awake.set_by_call) = match stores.server().awake() {
+            Ok(Some(setting)) if setting.is_valid() => (setting, true),
+            Ok(None) => (ritornel_contract::Awake::default(), false),
             Ok(Some(setting)) => {
                 warn!(
                     ?setting,
                     "the stored wake setting is out of range: the default holds until it is set again"
                 );
-                ritornel_contract::Awake::default()
+                (ritornel_contract::Awake::default(), false)
             }
             Err(error) => {
                 warn!(%error, "the stored wake setting cannot be read: the default holds until it is set again");
-                ritornel_contract::Awake::default()
+                (ritornel_contract::Awake::default(), false)
             }
         };
         awake.follow_the_rule(self.clock.now_ms());
@@ -1000,8 +1007,11 @@ impl Core {
                 run::<LinkListen>(params, |params| self.link_listen(stores, session, params))
             }
             LinkPing::NAME => run::<LinkPing>(params, |params| self.link_ping(session, params)),
-            LinkSetAwake::NAME => {
-                run::<LinkSetAwake>(params, |params| self.link_set_awake(stores, &params))
+            ServerSettingsCall::NAME => {
+                run::<ServerSettingsCall>(params, |_| Ok(self.server_settings()))
+            }
+            ServerSetSettings::NAME => {
+                run::<ServerSetSettings>(params, |params| self.server_set_settings(stores, &params))
             }
             HistoryZones::NAME => run::<HistoryZones>(params, |_| self.history_zones(stores)),
             HistorySetZones::NAME => {

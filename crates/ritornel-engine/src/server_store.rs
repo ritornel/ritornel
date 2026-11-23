@@ -660,12 +660,12 @@ mod tests {
         assert_eq!(store.awake().unwrap(), None);
         let command = crate::Command {
             id: Id::from_bytes([7; 16]),
-            fingerprint: crate::Fingerprint::of("link.setAwake", b"never"),
+            fingerprint: crate::Fingerprint::of("server.setSettings", b"never"),
         };
         let changed = store
             .change_once(
                 command,
-                "link.setAwake",
+                "server.setSettings",
                 SettingChange::Awake(ritornel_contract::Awake::Never),
             )
             .unwrap();
@@ -678,7 +678,7 @@ mod tests {
         let again = store
             .change_once(
                 command,
-                "link.setAwake",
+                "server.setSettings",
                 SettingChange::Awake(ritornel_contract::Awake::Always),
             )
             .unwrap();

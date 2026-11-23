@@ -86,6 +86,8 @@ impl Activity {
 #[derive(Debug, Default)]
 pub(crate) struct KeptAwake {
     pub(crate) setting: Awake,
+    /// Whether `setting` is one a call stored, and not the default.
+    pub(crate) set_by_call: bool,
     pub(crate) activity: Activity,
     held: Option<crate::platform::Awake>,
     /// Whether this run asks the system at all (`Run::keep_awake`).

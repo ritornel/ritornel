@@ -31,7 +31,8 @@
 //! ritornelctl link invite [--route <host:port>]...
 //! ritornelctl link join <link>
 //! ritornelctl link status
-//! ritornelctl link awake <while-active [<minutes>] | always | never>
+//! ritornelctl settings
+//! ritornelctl settings awake <while-active [<minutes>] | always | never>
 //! ```
 //!
 //! Every command takes `--data-dir <dir>` and `--json`.
@@ -50,7 +51,8 @@ use ritornel_client::contract::SkipDirection;
 use ritornel_client::contract::local::Env;
 
 use crate::{
-    artists, backup, export, history, identity, jobs, lastfm, library, link, playback, scan, status,
+    artists, backup, export, history, identity, jobs, lastfm, library, link, playback, scan,
+    settings, status,
 };
 
 const USAGE: &str = "\
@@ -92,8 +94,9 @@ Usage:
   ritornelctl link invite [--route <host:port>]... [--data-dir <dir>] [--json]
   ritornelctl link join <link> [--data-dir <dir>] [--json]
   ritornelctl link status [--data-dir <dir>] [--json]
-  ritornelctl link awake <while-active [<minutes>] | always | never>
-                         [--data-dir <dir>] [--json]
+  ritornelctl settings [--data-dir <dir>] [--json]
+  ritornelctl settings awake <while-active [<minutes>] | always | never>
+                             [--data-dir <dir>] [--json]
 
 Commands:
   status           Show the running server's ID, name and role, the versions
@@ -214,10 +217,15 @@ Commands:
                    of the hub that made the link
   link status      Show this server's hub, or its satellites, and when it
                    keeps its machine awake
-  link awake       When this hub keeps its machine from sleeping for its
+  settings         Show the running server's settings, a satellite's own on
+                   a satellite, each with what gave it: the default, the
+                   server's command line, its environment, config.toml in
+                   its data directory, or a call such as `settings awake`
+  settings awake   When this server keeps its machine from sleeping for its
                    linked servers: while one plays or has made a call
                    within the minutes given, 30 unless said, which is the
-                   default; always; or never. The display may sleep
+                   default; always; or never. The display may sleep. The
+                   server keeps it
 
 Options:
   --name <name>         scan, artists pictures: the name the folder is
@@ -405,6 +413,7 @@ enum Command {
     Link(LinkCommand),
     #[command(subcommand)]
     Server(ServerCommand),
+    Settings(SettingsArgs),
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
@@ -417,10 +426,25 @@ pub(crate) enum LinkCommand {
     Invite(InviteArgs),
     Join(JoinArgs),
     Status(ServerArgs),
+}
+
+/// What `settings` takes. Its options are for showing the settings, and
+/// one given before a command is refused, as for `history`.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub(crate) struct SettingsArgs {
+    #[command(subcommand)]
+    pub(crate) command: Option<SettingsCommand>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub(crate) enum SettingsCommand {
     Awake(AwakeArgs),
 }
 
-/// What `link awake` takes.
+/// What `settings awake` takes.
 #[derive(Debug, Default, PartialEq, Eq, Args)]
 pub(crate) struct AwakeArgs {
     /// `while-active`, `always` or `never`.
@@ -843,6 +867,7 @@ fn try_run(
         Command::Show(args) => lastfm::show(&args, env, out),
         Command::Lastfm(command) => lastfm::lastfm(&command, env, out, err),
         Command::Link(command) => link::link(&command, env, out),
+        Command::Settings(args) => settings::settings(&args, env, out),
     }
 }
 
@@ -1116,6 +1141,45 @@ mod tests {
                 command: None,
                 limit: Some(5),
                 server: given,
+            })
+        );
+    }
+
+    #[test]
+    fn settings_takes_its_options_after_its_command() {
+        let line = ["settings", "--data-dir", "/srv/ritornel", "awake", "never"];
+        assert!(parse(args(&line)).is_err());
+        assert_eq!(
+            parse(args(&[
+                "settings",
+                "awake",
+                "while-active",
+                "45",
+                "--data-dir",
+                "/srv/ritornel"
+            ]))
+            .unwrap()
+            .command,
+            Command::Settings(SettingsArgs {
+                command: Some(SettingsCommand::Awake(AwakeArgs {
+                    mode: "while-active".to_owned(),
+                    minutes: Some("45".to_owned()),
+                    server: ServerArgs {
+                        data_dir: Some(PathBuf::from("/srv/ritornel")),
+                        json: false,
+                    },
+                })),
+                server: ServerArgs::default(),
+            })
+        );
+        assert_eq!(
+            parse(args(&["settings", "--json"])).unwrap().command,
+            Command::Settings(SettingsArgs {
+                command: None,
+                server: ServerArgs {
+                    data_dir: None,
+                    json: true,
+                },
             })
         );
     }

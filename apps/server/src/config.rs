@@ -143,6 +143,21 @@ impl Listen {
     }
 }
 
+impl From<Listen> for ritornel_contract::ListenOn {
+    /// The setting as `server.settings` reports it. The default is
+    /// reported with the port it tries first.
+    fn from(listen: Listen) -> Self {
+        Self {
+            network: if listen.private {
+                ritornel_contract::ListenNetwork::Private
+            } else {
+                ritornel_contract::ListenNetwork::Loopback
+            },
+            port: listen.port.unwrap_or(DEFAULT_PORT),
+        }
+    }
+}
+
 /// The settings a run uses, each already resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Settings {
@@ -159,6 +174,24 @@ pub(crate) struct Settings {
     /// The most a satellite's cache of masters pulled from its hub holds,
     /// in bytes. With none it is the default.
     pub(crate) cache_bytes: Option<u64>,
+    /// Where each was given.
+    pub(crate) origins: Origins,
+}
+
+/// Where each setting of a run was given: none for one left at its
+/// default. `server.settings` reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Origins {
+    /// The log level.
+    pub log_level: Option<Origin>,
+    /// The listen address.
+    pub listen: Option<Origin>,
+    /// The backup folder.
+    pub backup_dir: Option<Origin>,
+    /// The name.
+    pub name: Option<Origin>,
+    /// The cache size.
+    pub cache_size: Option<Origin>,
 }
 
 /// The settings given on the command line.
@@ -309,19 +342,25 @@ fn resolve(
         .map_err(ConfigError::File)?
         .unwrap_or_default();
 
+    let mut origins = Origins::default();
     let log_level = match chosen(
         flags.log_level.as_deref(),
         env(LOG_LEVEL_VAR),
         file.log_level,
     ) {
-        Some((text, origin)) => level(text.as_deref(), origin)?,
+        Some((text, origin)) => {
+            origins.log_level = Some(origin);
+            level(text.as_deref(), origin)?
+        }
         None => Level::INFO,
     };
     let listen = match chosen(flags.listen.as_deref(), env(LISTEN_VAR), file.listen) {
-        Some((text, origin)) => text
-            .as_deref()
-            .and_then(Listen::parse)
-            .ok_or(ConfigError::Listen(origin))?,
+        Some((text, origin)) => {
+            origins.listen = Some(origin);
+            text.as_deref()
+                .and_then(Listen::parse)
+                .ok_or(ConfigError::Listen(origin))?
+        }
         None => Listen::DEFAULT,
     };
     let backup_dir = match chosen(
@@ -329,11 +368,17 @@ fn resolve(
         env(BACKUP_DIR_VAR),
         file.backup_dir,
     ) {
-        Some((text, origin)) => Some(backup_dir(root, text, origin)?),
+        Some((text, origin)) => {
+            origins.backup_dir = Some(origin);
+            Some(backup_dir(root, text, origin)?)
+        }
         None => None,
     };
     let name = match chosen(flags.name.as_deref(), env(NAME_VAR), file.name) {
-        Some((text, origin)) => Some(name(text, origin)?),
+        Some((text, origin)) => {
+            origins.name = Some(origin);
+            Some(name(text, origin)?)
+        }
         None => None,
     };
     let cache_bytes = match chosen(
@@ -341,11 +386,14 @@ fn resolve(
         env(CACHE_SIZE_VAR),
         file.cache_size,
     ) {
-        Some((text, origin)) => Some(
-            text.as_deref()
-                .and_then(bytes)
-                .ok_or(ConfigError::CacheSize(origin))?,
-        ),
+        Some((text, origin)) => {
+            origins.cache_size = Some(origin);
+            Some(
+                text.as_deref()
+                    .and_then(bytes)
+                    .ok_or(ConfigError::CacheSize(origin))?,
+            )
+        }
         None => None,
     };
     Ok(Settings {
@@ -354,6 +402,7 @@ fn resolve(
         backup_dir,
         name,
         cache_bytes,
+        origins,
     })
 }
 
@@ -369,7 +418,10 @@ fn bytes(text: &str) -> Option<u64> {
         _ => return None,
     };
     let number: u64 = number.parse().ok().filter(|number| *number > 0)?;
-    number.checked_mul(1 << shift)
+    // Every number of the contract fits in 53 bits, and the size is one.
+    number
+        .checked_mul(1 << shift)
+        .filter(|bytes| *bytes < 1 << 53)
 }
 
 /// The server's name, without the spaces around it: some text, no longer
@@ -903,6 +955,7 @@ mod tests {
                 backup_dir: None,
                 name: None,
                 cache_bytes: None,
+                origins: Origins::default(),
             }
         );
 
@@ -913,6 +966,55 @@ mod tests {
                 .unwrap()
                 .log_level,
             Level::DEBUG
+        );
+    }
+
+    #[test]
+    fn the_listen_setting_is_reported_with_the_port_it_takes_first() {
+        use ritornel_contract::{ListenNetwork, ListenOn};
+        let on = |network, port| ListenOn { network, port };
+        assert_eq!(
+            ListenOn::from(Listen::DEFAULT),
+            on(ListenNetwork::Loopback, DEFAULT_PORT)
+        );
+        assert_eq!(
+            ListenOn::from(Listen::on_port(0)),
+            on(ListenNetwork::Loopback, 0)
+        );
+        assert_eq!(
+            ListenOn::from(Listen::private_on_port(4800)),
+            on(ListenNetwork::Private, 4800)
+        );
+    }
+
+    #[test]
+    fn a_cache_size_fits_in_53_bits() {
+        assert_eq!(bytes("8388607 GiB"), Some(8_388_607 << 30));
+        assert_eq!(bytes("8388608 GiB"), None);
+    }
+
+    #[test]
+    fn each_setting_keeps_where_it_was_given() {
+        let flags = Flags {
+            name: Some("Kitchen Speakers".to_owned()),
+            ..Flags::default()
+        };
+        let settings = resolve(
+            Path::new(ROOT),
+            &flags,
+            &env(&[(LISTEN_VAR, "private:4747")]),
+            Some("log_level = \"warn\"\nname = \"Den\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            settings.origins,
+            Origins {
+                log_level: Some(Origin::File),
+                listen: Some(Origin::Environment),
+                backup_dir: None,
+                name: Some(Origin::Flag),
+                cache_size: None,
+            }
         );
     }
 }

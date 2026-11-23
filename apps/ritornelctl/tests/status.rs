@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// How long a test waits for a process to do what it should before it
 /// kills the process and fails. It is a bound, not a wait: a process that
@@ -168,6 +168,11 @@ struct Server {
 impl Server {
     /// Starts a server on `data_dir` and waits for its ready line.
     fn start(data_dir: &Path) -> Self {
+        Self::start_with(data_dir, &[])
+    }
+
+    /// As [`start`](Self::start), with these variables set.
+    fn start_with(data_dir: &Path, variables: &[(&str, &str)]) -> Self {
         let mut child = Command::new(server_binary())
             .arg("serve")
             .arg("--data-dir")
@@ -178,7 +183,9 @@ impl Server {
             .env_remove("RITORNEL_LOG_LEVEL")
             .env_remove("RITORNEL_BACKUP_DIR")
             .env_remove("RITORNEL_NAME")
+            .env_remove("RITORNEL_CACHE_SIZE")
             .env("RITORNEL_TEST_COMPUTER_NAME", "Invented Desk")
+            .envs(variables.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -309,7 +316,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             ("Name", "Invented Desk"),
             ("Role", "unassigned"),
             ("Server version", env!("CARGO_PKG_VERSION")),
-            ("Contract version", "1"),
+            ("Contract version", "2"),
             ("SQLite version", "3.54.1"),
             ("Server schema", "2"),
         ]
@@ -345,7 +352,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             "role": "unassigned",
             "versions": {
                 "server": env!("CARGO_PKG_VERSION"),
-                "contract": 1,
+                "contract": 2,
                 "sqlite": "3.54.1",
                 "serverSchema": 2,
             },
@@ -623,4 +630,82 @@ fn server_stop_stops_the_server_cleanly_and_then_finds_none() {
     let none = run(command);
     assert_eq!(none.code, Some(NO_SERVER), "{none:?}");
     assert_eq!(none.stderr, no_server(&data_dir));
+}
+
+#[test]
+fn settings_say_what_gave_each_and_the_wake_setting_is_changed_from_a_terminal() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join("config.toml"), "cache_size = \"512 MiB\"\n").unwrap();
+    let server = Server::start_with(&data_dir, &[("RITORNEL_NAME", "Kitchen Speakers")]);
+    let settings = |extra: &[&str]| {
+        let mut command = ritornelctl(&["settings", "--data-dir"]);
+        command.arg(&data_dir).args(extra);
+        let ended = run(command);
+        assert_eq!(ended.code, Some(0), "{ended:?}");
+        ended.stdout
+    };
+    let read = || serde_json::from_str::<Value>(&settings(&["--json"])).unwrap();
+
+    let shown = read();
+    assert_eq!(
+        shown["name"],
+        json!({ "value": "Kitchen Speakers", "setBy": "environment" })
+    );
+    assert_eq!(
+        shown["cacheBytes"],
+        json!({ "value": 512 << 20, "setBy": "file" })
+    );
+    assert_eq!(
+        shown["listen"],
+        json!({ "value": { "network": "loopback", "port": 0 }, "setBy": "flag" })
+    );
+    assert_eq!(
+        shown["logLevel"],
+        json!({ "value": "info", "setBy": "default" })
+    );
+    assert_eq!(
+        shown["backupDir"],
+        json!({ "value": null, "setBy": "default" })
+    );
+    assert_eq!(
+        shown["awake"],
+        json!({ "value": { "mode": "while_active", "minutes": 30 }, "setBy": "default" })
+    );
+
+    let mut command = ritornelctl(&["settings", "awake", "never", "--data-dir"]);
+    command.arg(&data_dir);
+    let set = run(command);
+    assert_eq!(set.code, Some(0), "{set:?}");
+    assert!(
+        set.stdout
+            .contains("Awake             never (set by a call)\n"),
+        "{set:?}"
+    );
+    let text = settings(&[]);
+    assert!(
+        text.contains("Name              Kitchen Speakers (environment)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Cache             512 MiB (config.toml)\n"),
+        "{text}"
+    );
+
+    // The change is kept with the server. The name stays too, though
+    // nothing gives it now, as the name a server already had.
+    assert_eq!(server.end("TERM").code, Some(0));
+    let server = Server::start(&data_dir);
+    let shown = read();
+    assert_eq!(
+        shown["awake"],
+        json!({ "value": { "mode": "never" }, "setBy": "call" })
+    );
+    assert_eq!(
+        shown["name"],
+        json!({ "value": "Kitchen Speakers", "setBy": "default" })
+    );
+    assert_eq!(shown["cacheBytes"]["setBy"], "file");
+    assert_eq!(server.end("TERM").code, Some(0));
 }

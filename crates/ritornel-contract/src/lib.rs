@@ -58,6 +58,7 @@ mod playback;
 mod rating;
 mod search;
 mod server;
+mod settings;
 mod ticket;
 #[cfg(test)]
 mod typescript;
@@ -94,10 +95,10 @@ pub use library::{
     SourcesAddParams, SourcesList,
 };
 pub use link::{
-    Awake, AwakeParams, AwakeSet, HubCopy, HubStatus, InviteLink, LinkCopies, LinkCopiesParams,
-    LinkGranted, LinkInvite, LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened,
-    LinkPingParams, LinkPinged, LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken,
-    SatelliteStatus, link_request_proof,
+    Awake, HubCopy, HubStatus, InviteLink, LinkCopies, LinkCopiesParams, LinkGranted, LinkInvite,
+    LinkInviteParams, LinkJoinParams, LinkListenParams, LinkListened, LinkPingParams, LinkPinged,
+    LinkRequest, LinkStatus, LinkTracks, LinkTracksParams, ListenTaken, SatelliteStatus,
+    link_request_proof,
 };
 pub use list::{
     AlbumRef, AlbumTile, ArtistRow, CopyRole, Credit, FILTER_VERSION, Filter, Format, GoneRow,
@@ -128,6 +129,10 @@ pub use server::{
     SessionKind, Versions, WatchState, WatchStatus, WatchedFolder, WatchedKind, WatchingParams,
     WatchingSet, descriptor_proof,
 };
+pub use settings::{
+    ListenNetwork, ListenOn, LogLevel, ServerSettings, ServerSettingsSet, SetBy,
+    SetServerSettingsParams, Setting,
+};
 pub use ticket::{SocketTicket, TICKET_PARAM};
 
 /// The version of the contract these types are.
@@ -137,7 +142,7 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 /// one contract. A server refuses a client whose number is not its own,
 /// and a satellite refuses a hub of another ("Session and frames" in
 /// docs/internals/contract.md).
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// The capability flags a server may list in its descriptor.
 pub mod capability {

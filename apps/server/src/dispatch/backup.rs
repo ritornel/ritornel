@@ -43,7 +43,7 @@ impl Core {
         let _ = self.backups.set(backups);
     }
 
-    fn backups(&self) -> Option<&Backups> {
+    pub(super) fn backups(&self) -> Option<&Backups> {
         self.backups.get()
     }
 

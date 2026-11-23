@@ -27,6 +27,7 @@ mod link;
 mod playback;
 mod scan;
 mod server;
+mod settings;
 mod status;
 
 use std::process::ExitCode;

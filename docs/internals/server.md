@@ -45,7 +45,7 @@ A name given in the settings (`--name`, `RITORNEL_NAME`, or `name` in `config.to
 
 ### Keeping a hub awake
 
-A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so being linked is not reason enough to keep a machine awake. When a hub keeps its machine from idle sleep is a stored preference, kept in `server.db` (`server_setting` row `link.awake`) so it follows the server, and set with `link.setAwake` (`ritornelctl link awake`). It is one of three modes (`Awake`):
+A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so being linked is not reason enough to keep a machine awake. When a hub keeps its machine from idle sleep is a setting of the server's own, kept in `server.db` (`server_setting` row `link.awake`) so it follows the server, and set with `server.setSettings` (`ritornelctl settings awake`; see "Settings" below). It is one of three modes (`Awake`):
 
 - **While active**, the default, for 30 minutes: while a linked server plays, or has made a call within the minutes given. The window is at most a week (`Awake::MAX_MINUTES`), and zero means while one plays only. A stored setting that cannot be read, or is out of range, gives way to the default with a warning in the log.
 - **Always**, for as long as the server runs.
@@ -169,6 +169,14 @@ Settings resolve in order: **CLI flag → `RITORNEL_*` environment variable → 
 
 The name setting is described under "Server name" above.
 
+### Settings
+
+`server.settings` reports the settings of the server called, each as a `Setting`: its value and `setBy`, what gave it (`SetBy`: `default`, `file` for `config.toml`, `environment`, `flag`, or `call`). It covers the name, the stay-awake policy (`awake`), the cache size (`cacheBytes`), where it is set to listen (`ListenOn`: the network and the port it is set to take, not the one the system picked), the log level and the backup folder (`ServerSettings` in `crates/ritornel-contract/src/settings.rs`, answered in `apps/server/src/dispatch/settings.rs`). `ritornelctl settings` prints it.
+
+- **Where a start-up setting came from is kept.** `config::resolve` records each setting's `Origin` in `Origins`, which `serve` hands the run (`Run::origins`). A setting nothing gave is the default. The name a server already had, or took from its computer, is reported as the default when no setting gives it at this start.
+- **Only the stay-awake policy is changed by a call.** `server.setSettings` takes the settings to change, each optional, and refuses one that names none. The change and its receipt are written in one `server.db` transaction (`ServerStore::change_once`), the same command sent again changes nothing, and the server follows the new policy at once. A policy a call stored is reported as `call`, even when it equals the default. The other settings are given as the server starts and hold until it starts again.
+- **Each server answers its own.** A satellite answers both calls itself and never forwards them, so they read and change the satellite's settings. Both are kept from a link session, so a satellite can neither read nor change its hub's.
+
 `--data-dir` / `RITORNEL_DATA_DIR` selects the data directory before `config.toml` is read, and `--output` (`default`, `null`, `none`) selects the audio output mode. All other persistent settings live in `library.db` (library-wide) or `server.db` (machine-local).
 
 Logs (`apps/server/src/logs.rs`) write daily-rotated JSON lines under `<data-dir>/logs/`, stamped with `boot_id` and correlation IDs where applicable, without logging secrets. `ritornelctl status` reports server/contract/SQLite/schema versions, role, library revision, job counts, outbox depth and oldest age, free disk space, log path, backup configuration, watch state, and record health.
@@ -193,6 +201,7 @@ Logs (`apps/server/src/logs.rs`) write daily-rotated JSON lines under `<data-dir
 - **Two SQLite files rather than one.** Separating `library.db` from `server.db` lets a library move cleanly between machines without carrying machine-local keys, paths, or queues, while keeping every atomic transaction inside one file.
 - **Ordinary tables with receipts and revision stamps, not event sourcing.** Durable domain facts are already stored as append-only evidence with tested rebuilds; a parallel generic event log would duplicate existing append-only evidence.
 - **`synchronous = FULL` on both WAL databases.** Pays one sync per committed batch so acknowledged writes and staged listens survive power loss.
+- **Typed settings, each with what gave it.** `server.settings` answers with a struct of named settings rather than a bag of keys, so `contract.ts` and `ritornelctl settings` carry every setting the day it is added, and a person can tell a value they chose from one a start-up setting forces.
 - **Backups live outside `<data-dir>` and run beside the writer.** Putting backups on a separate path prevents losing the backup with the data directory, and running `VACUUM INTO` on a separate read-only connection keeps playback uninterrupted.
 
 ## Later
