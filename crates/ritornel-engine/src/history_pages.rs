@@ -67,10 +67,10 @@ pub struct Today {
 pub(crate) struct Facts {
     /// The plays, dated or not.
     pub(crate) plays: u64,
-    /// The first play in time, dated or not: its instant and its local
-    /// date, YYYYMMDD, where it has one.
+    /// The first play in time, dated or not, of those not after now: its
+    /// instant and its local date, YYYYMMDD, where it has one.
     pub(crate) first: Option<(i64, Option<i64>)>,
-    /// The last.
+    /// The last of those not after now.
     pub(crate) last: Option<(i64, Option<i64>)>,
     /// The plays in the last year.
     pub(crate) last_year: u64,
@@ -104,15 +104,19 @@ impl Facts {
         if at > today.now_ms - YEAR_MS && at <= today.now_ms {
             self.last_year += 1;
         }
-        // Of plays at the same instant, one with a local date is taken.
-        if self
-            .first
-            .is_none_or(|(first, day)| (at, date.is_none(), date) < (first, day.is_none(), day))
-        {
-            self.first = Some((at, date));
-        }
-        if self.last.is_none_or(|last| (at, date) > last) {
-            self.last = Some((at, date));
+        // A play dated after now, by a clock that was wrong, is neither the
+        // first nor the last: it would be said as past.
+        if at <= today.now_ms {
+            // Of plays at the same instant, one with a local date is taken.
+            if self
+                .first
+                .is_none_or(|(first, day)| (at, date.is_none(), date) < (first, day.is_none(), day))
+            {
+                self.first = Some((at, date));
+            }
+            if self.last.is_none_or(|last| (at, date) > last) {
+                self.last = Some((at, date));
+            }
         }
         let Some(date) = date else {
             return;
@@ -220,7 +224,8 @@ impl Said {
 /// plays.
 ///
 /// The first and last months are those of the first and last plays in
-/// time, whether they have a local date or not ([`month_of`]).
+/// time, whether they have a local date or not ([`month_of`]). A play
+/// dated after now is counted and never said as past.
 ///
 /// What waits on sessions is left out: "played start to finish".
 pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Vec<Phrase> {
@@ -228,7 +233,8 @@ pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Ve
         return Vec::new();
     }
     let (Some(first), Some(last)) = (facts.first, facts.last) else {
-        // Plays with no instant: how many is all there is to say.
+        // Plays with no instant, or only after now: how many is all there
+        // is to say.
         return Said::default()
             .plain("Played ")
             .strong(&counted(facts.plays, "time", "times"))

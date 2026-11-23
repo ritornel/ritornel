@@ -214,8 +214,12 @@ pub(crate) fn facts(gathered: &Gathered, today: Today) -> Vec<Fact> {
         .collect();
 
     // A play with no local date before it may be from a day earlier still,
-    // so nothing is said.
-    if let Some(&(first_at, first, _)) = dated.iter().min_by_key(|(at, ..)| *at)
+    // so nothing is said. A play dated after now is not when it was first
+    // heard.
+    if let Some(&(first_at, first, _)) = dated
+        .iter()
+        .filter(|(at, ..)| *at <= today.now_ms)
+        .min_by_key(|(at, ..)| *at)
         && !record.plays.iter().any(|heard| {
             heard.date.is_none() && heard.at_ms.is_some_and(|earlier| earlier < first_at)
         })
@@ -392,15 +396,17 @@ LEFT JOIN release rel ON rel.id = heard.canonical_id
 WHERE ta.public_id = ?1";
 
 /// A song's plays, wherever heard, and the last of them: the play with the
-/// latest instant, which is not always the one with the latest local date
-/// when plays were heard in zones far apart, and one with a local date of
-/// those at the same instant. Its instant and its local date.
+/// latest instant not after now (`?3`), which is not always the one with
+/// the latest local date when plays were heard in zones far apart, and one
+/// with a local date of those at the same instant. Its instant and its
+/// local date. A play dated after now, by a clock that was wrong, is
+/// counted and is not the last.
 const SONG_PLAYS: &str = "
 SELECT count(*), last.event_at_utc_ms, last.local_date
 FROM play_event
 LEFT JOIN (SELECT event_at_utc_ms, local_date FROM play_event
            WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0
-             AND event_at_utc_ms IS NOT NULL
+             AND event_at_utc_ms <= ?3
            ORDER BY event_at_utc_ms DESC, local_date IS NULL, id DESC LIMIT 1) last
   ON true
 WHERE listener_id = ?1 AND recording_id = ?2 AND counts = 1 AND excluded = 0";
@@ -506,7 +512,7 @@ fn read_track(
     };
     let (plays, last_at, last_date): (i64, Option<i64>, Option<i64>) = connection
         .prepare_cached(SONG_PLAYS)?
-        .query_row(params![listener, recording], |row| {
+        .query_row(params![listener, recording, today.now_ms], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
     let five_stars = crate::ratings::said(connection, &[recording])?

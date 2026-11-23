@@ -189,6 +189,32 @@ fn a_record_says_when_it_was_found_its_year_and_its_song() {
 }
 
 #[test]
+fn a_record_first_heard_after_now_is_not_found_then() {
+    // Found in 2024, and once dated next year by a clock that was wrong.
+    let gathered = Gathered {
+        record: Some(record(vec![
+            heard(-300, 20270911, 1, 20, 0),
+            heard(900, 20240530, 1, 20, 0),
+            heard(10, 20261105, 1, 20, 0),
+        ])),
+        ..Gathered::default()
+    };
+    assert_eq!(
+        of(&facts(&gathered, TODAY), FactKind::FirstHeard).unwrap(),
+        (
+            "You first heard this record *2 years ago*.".to_owned(),
+            "30 May 2024. 3 plays since.".to_owned()
+        )
+    );
+    // Only after now: when it was found is not said.
+    let ahead = Gathered {
+        record: Some(record(vec![heard(-300, 20270911, 1, 20, 0)])),
+        ..Gathered::default()
+    };
+    assert_eq!(of(&facts(&ahead, TODAY), FactKind::FirstHeard), None);
+}
+
+#[test]
 fn a_time_of_day_is_said_only_where_it_stands_out() {
     // Every play in the evening, from a listener who plays mostly then.
     let plays = (0..40)
@@ -560,6 +586,16 @@ fn a_songs_last_time_is_the_day_of_its_latest_play() {
             nth_play(0),
             NOW - 60_000,
             nth_play(1),
+        ),
+    );
+    assert_eq!(last_time(), "The last time was earlier today.");
+    // A play dated next month, by a clock that was wrong, is not the last.
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET event_at_utc_ms = {}, local_date = 20261225 WHERE id = {}",
+            NOW + 40 * DAY,
+            nth_play(2)
         ),
     );
     assert_eq!(last_time(), "The last time was earlier today.");
