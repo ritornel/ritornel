@@ -20,13 +20,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use ritornel_client::Client;
 use ritornel_client::contract::methods::{PlaybackGet, PlaybackPlay, SourcesTracks};
 use ritornel_client::contract::{
     CONTRACT_VERSION, ClientKind, Event, HelloParams, NoParams, PlaySource, PlaybackPlayParams,
     PlaybackStatus, SourcesTracksParams, Topic,
 };
 use ritornel_client::launch::{Launcher, Program, STOP_WAIT, Stopped};
+use ritornel_client::local::LocalServer;
+use ritornel_client::{Client, Error, NotRunning};
 
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -65,6 +66,24 @@ fn program() -> Program {
 
 fn launcher(data_dir: &Path) -> Launcher {
     Launcher::new(data_dir.to_owned(), Some(program()))
+}
+
+/// Finds or starts the server as the app does. Told that one is starting,
+/// which a launcher that lost the race to start one says when the winner's
+/// server takes more than a moment to say where it listens, it looks again.
+async fn find_or_start(launcher: &Launcher) -> LocalServer {
+    loop {
+        match launcher.find_or_start().await {
+            Err(Error::NotRunning {
+                why: NotRunning::Starting,
+                ..
+            }) => {
+                // sleep: between looks; the caller's WAIT bounds them.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            found => return found.unwrap(),
+        }
+    }
 }
 
 async fn hello(client: &Client) {
@@ -123,8 +142,7 @@ async fn two_launches_at_once_end_on_one_server_and_one_owns_it() {
         let scratch = Scratch::new();
         let data_dir = scratch.data_dir();
         let (one, other) = (launcher(&data_dir), launcher(&data_dir));
-        let (a, b) = tokio::join!(one.find_or_start(), other.find_or_start());
-        let (a, b) = (a.unwrap(), b.unwrap());
+        let (a, b) = tokio::join!(find_or_start(&one), find_or_start(&other));
         assert_eq!(a.descriptor.server_id, b.descriptor.server_id);
         let owners: Vec<u32> = [one.owned_pid(), other.owned_pid()]
             .into_iter()
