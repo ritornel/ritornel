@@ -100,12 +100,11 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let path = tempfile::Builder::new()
+        tempfile::Builder::new()
             .prefix(&format!("ritornel-windows-file-{name}-"))
             .tempdir()
             .unwrap()
-            .keep();
-        path
+            .keep()
     }
 
     #[test]

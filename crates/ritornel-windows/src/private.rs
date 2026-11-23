@@ -287,12 +287,11 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let path = tempfile::Builder::new()
+        tempfile::Builder::new()
             .prefix(&format!("ritornel-windows-private-{name}-"))
             .tempdir()
             .unwrap()
-            .keep();
-        path
+            .keep()
     }
 
     /// Lets everyone read `path`, as a copy from another machine might. On a
