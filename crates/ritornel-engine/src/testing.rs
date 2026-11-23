@@ -43,13 +43,11 @@ pub(crate) struct Scratch(std::path::PathBuf);
 
 impl Scratch {
     pub(crate) fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "ritornel-engine-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
+        let path = tempfile::Builder::new()
+            .prefix("ritornel-engine-test-")
+            .tempdir()
+            .unwrap()
+            .keep();
         Self(path)
     }
 

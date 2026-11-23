@@ -115,14 +115,11 @@ pub(crate) mod tests {
     /// A folder of its own for each test, even for two that start at the
     /// same instant in parallel.
     pub(crate) fn dir() -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "ritornel-lastfm-credentials-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        tempfile::Builder::new()
+            .prefix("ritornel-lastfm-credentials-")
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]

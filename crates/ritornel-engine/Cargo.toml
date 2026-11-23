@@ -82,5 +82,10 @@ default = ["audio-output"]
 # output, which discards what it is given.
 audio-output = ["dep:cpal"]
 
+[dev-dependencies]
+# A folder of its own for each test, named at random and created only if
+# it is new, so no test finds another's.
+tempfile = "3.27.0"
+
 [lints]
 workspace = true

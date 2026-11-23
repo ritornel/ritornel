@@ -54,3 +54,8 @@ unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
 indexing_slicing = "warn"
+
+[dev-dependencies]
+# A folder of its own for each test, named at random and created only if
+# it is new, so no test finds another's.
+tempfile = "3.27.0"

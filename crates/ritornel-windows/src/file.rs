@@ -100,12 +100,11 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "ritornel-windows-file-{}-{name}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
+        let path = tempfile::Builder::new()
+            .prefix(&format!("ritornel-windows-file-{name}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         path
     }
 
