@@ -174,6 +174,23 @@ impl Core {
     /// read. Two hellos at once are taken one after the other.
     pub(super) fn satellite_named(&self, stores: &Stores, peer: Id, name: &str) {
         let name = untrusted_name(name);
+        // What the hub keeps already is only read, and waits on nothing.
+        let labelled = stores.server.link_sessions().is_ok_and(|sessions| {
+            sessions
+                .iter()
+                .any(|session| session.peer == peer && session.label == name)
+        });
+        let registered = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(
+                |library| matches!(library.server_name(peer), Ok(Some(known)) if known == name),
+            );
+        if labelled && registered {
+            return;
+        }
         let _one_at_a_time = lock(&self.naming);
         let relabelled = stores
             .server

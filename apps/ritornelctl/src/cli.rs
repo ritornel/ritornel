@@ -327,6 +327,8 @@ pub(crate) enum Error {
     Job(&'static str),
     /// There was nothing to do it to.
     Nothing(&'static str),
+    /// The server was asked to stop and had not when the wait ended.
+    StillStopping,
 }
 
 impl Error {
@@ -352,6 +354,7 @@ impl fmt::Display for Error {
             Self::PlayFolder(error) => write!(f, "cannot play that folder: {error}"),
             Self::Job(state) => write!(f, "the job {state}"),
             Self::Nothing(what) => f.write_str(what),
+            Self::StillStopping => f.write_str("the server was asked to stop and has not yet"),
         }
     }
 }

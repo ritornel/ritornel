@@ -16,9 +16,9 @@ use crate::cli::{Error, ServerArgs};
 /// milliseconds.
 pub(crate) const ANSWER_WAIT: Duration = Duration::from_secs(10);
 
-/// Finds the server the arguments name, says hello, and makes one call.
 /// `ritornelctl server stop`: asks the server on the data directory to
-/// stop, and waits for it to have stopped.
+/// stop, and waits for it to have stopped. One still stopping when the
+/// wait ends is a failure, so that what runs next does not find it.
 pub(crate) fn stop(
     args: &ServerArgs,
     env: local::Env<'_>,
@@ -26,7 +26,7 @@ pub(crate) fn stop(
 ) -> Result<(), Error> {
     let data_dir = local::data_dir(args.data_dir.as_deref(), env)?;
     let stopped = local::stop(&data_dir, ritornel_client::launch::STOP_WAIT)?;
-    print(
+    let printed = print(
         args,
         out,
         &stopped,
@@ -38,9 +38,14 @@ pub(crate) fn stop(
                 "The server was asked to stop, and is still stopping.\n".to_owned()
             }
         },
-    )
+    );
+    match (printed, stopped) {
+        (Ok(()), false) => Err(Error::StillStopping),
+        (printed, _) => printed,
+    }
 }
 
+/// Finds the server the arguments name, says hello, and makes one call.
 pub(crate) fn ask<T>(
     args: &ServerArgs,
     env: local::Env<'_>,

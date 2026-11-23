@@ -16,16 +16,17 @@ pub fn dns_host_name() -> io::Result<String> {
     // SAFETY: with no buffer and a length of 0, the call only writes the
     // length it needs, NUL included, through the pointer, which is to a
     // local that outlives it. It fails for want of room, as asked.
-    unsafe {
+    let sized = unsafe {
         GetComputerNameExW(
             ComputerNamePhysicalDnsHostname,
             std::ptr::null_mut(),
             &raw mut length,
         )
     };
-    // Any failure but the want of room it was asked into is the answer.
+    // It must fail, and for want of the room it was asked into: any other
+    // answer is the answer.
     let asked = io::Error::last_os_error();
-    if asked.raw_os_error() != i32::try_from(ERROR_MORE_DATA).ok() {
+    if sized != 0 || asked.raw_os_error() != i32::try_from(ERROR_MORE_DATA).ok() || length == 0 {
         return Err(asked);
     }
     let size = usize::try_from(length).map_err(io::Error::other)?;

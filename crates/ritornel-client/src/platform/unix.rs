@@ -8,20 +8,26 @@ pub(crate) fn start_without_console(_command: &mut Command) {}
 
 /// Asks the process `pid` to stop, as the system does at shutdown: a
 /// SIGTERM, which a server answers by stopping cleanly. Only a process of
-/// the same user can be asked.
+/// the same user can be asked. A pid no process can have, such as one past
+/// what `kill` takes, which it would read as every process, is refused.
 pub(crate) fn ask_to_stop(pid: u32) -> std::io::Result<()> {
-    let asked = Command::new("kill")
+    if pid == 0 || i32::try_from(pid).is_err() {
+        return Err(std::io::Error::other(format!("{pid} is not a process")));
+    }
+    let program = ["/bin/kill", "/usr/bin/kill"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .unwrap_or("kill");
+    let asked = Command::new(program)
         .args(["-TERM", &pid.to_string()])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if asked.success() {
+        .output()
+        .map_err(|error| std::io::Error::new(error.kind(), format!("{program}: {error}")))?;
+    if asked.status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::other(format!(
-            "kill could not signal process {pid}"
-        )))
+        let said = String::from_utf8_lossy(&asked.stderr).trim().to_owned();
+        Err(std::io::Error::other(format!("{program}: {said}")))
     }
 }
 

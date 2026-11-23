@@ -193,9 +193,6 @@ impl ServerStore {
 pub(crate) const REGISTER_METHOD: &str = "link.register";
 
 impl LibraryStore {
-    /// Adds the server `server` to the library's registry, with its player
-    /// as a place listens come from, so that what it plays can be taken
-    /// in. A server already there keeps its rows and takes the new name.
     /// The name the library's registry gives the server `server`, if it
     /// has it.
     pub fn server_name(&self, server: Id) -> Result<Option<String>, Error> {
@@ -210,6 +207,9 @@ impl LibraryStore {
         })
     }
 
+    /// Adds the server `server` to the library's registry, with its player
+    /// as a place listens come from, so that what it plays can be taken
+    /// in. A server already there keeps its rows and takes the new name.
     pub fn register_server(&self, server: Id, name: &str) -> Result<(), Error> {
         let name = name.to_owned();
         self.write(

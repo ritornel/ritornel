@@ -179,6 +179,16 @@ impl Server {
         }
 
         let (identity, library) = library::open(dir, &store, identity, &clock, &entropy)?;
+        // A hub renamed at start, as after its computer's name, keeps the
+        // library's registry of servers in step.
+        if let Some(library) = &library
+            && library
+                .server_name(identity.server_id)
+                .is_ok_and(|known| known.is_some_and(|known| known != identity.name))
+            && let Err(error) = library.register_server(identity.server_id, &identity.name)
+        {
+            warn!(%error, "the library's registry keeps this server's old name");
+        }
 
         // This run holds the directory's lock, so whatever run claimed a
         // job before it is gone: each such job goes back in the queue, and
@@ -553,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn a_server_takes_its_computers_name_over_the_default_or_a_wrongly_cased_copy() {
+    fn a_server_takes_its_computers_name_over_the_default_or_the_name_an_older_build_took() {
         let legacy = Some("STUDIO-WORKSTAT");
         assert!(takes_computer_name(
             DEFAULT_NAME,
