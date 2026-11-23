@@ -376,7 +376,7 @@ impl Core {
             )
         })?;
         let name = self.name();
-        let (address, descriptor) = runtime
+        let (_, address, descriptor) = runtime
             .block_on(async {
                 let (candidates, mut tried) = link::candidates(&invite.routes).await;
                 let reached = link::first_answer(candidates, |address| {

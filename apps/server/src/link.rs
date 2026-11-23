@@ -274,14 +274,15 @@ fn usable(route: &str, found: &[SocketAddr]) -> Vec<SocketAddr> {
 const STAGGER: Duration = Duration::from_millis(500);
 
 /// Tries `attempt` at each of `candidates`, best first, each given
-/// [`CONNECT_WAIT`], and returns the first that succeeds. The next is
+/// [`CONNECT_WAIT`], and returns the first that succeeds, with the route and
+/// the address it was. The next is
 /// started when the one before fails or has not answered within
 /// [`STAGGER`], so the best way that answers soon is taken, and one that
 /// never answers does not hold up the rest. What failed is said.
 pub(crate) async fn first_answer<T, F>(
     candidates: Vec<(String, SocketAddr)>,
     attempt: impl Fn(SocketAddr) -> F,
-) -> Result<(SocketAddr, T), Vec<String>>
+) -> Result<(String, SocketAddr, T), Vec<String>>
 where
     F: Future<Output = Result<T, String>>,
 {
@@ -302,7 +303,7 @@ where
         }
         tokio::select! {
             Some((route, address, tried)) = running.next() => match tried {
-                Ok(answer) => return Ok((address, answer)),
+                Ok(answer) => return Ok((route, address, answer)),
                 Err(why) => {
                     failed.push(format!("{route} ({address}): {why}"));
                     if let Some(next) = waiting.next() {
@@ -722,7 +723,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(answered.0, lan.parse().unwrap());
+        assert_eq!(answered.1, lan.parse().unwrap());
 
         // One that never answers: the next is asked after the stagger, not
         // after the whole connect wait.
@@ -735,7 +736,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(answered.0, tunnel.parse().unwrap());
+        assert_eq!(answered.1, tunnel.parse().unwrap());
         assert!(started.elapsed() < CONNECT_WAIT, "{:?}", started.elapsed());
 
         // None answers: each says why.

@@ -358,6 +358,20 @@ async fn a_route_may_be_a_name_resolved_at_each_dial_and_a_name_for_another_serv
             .await
             .unwrap();
         assert_eq!(stats.artists, 0);
+        // It says how it reached the hub: the route as the link names it,
+        // and the address that was.
+        let reached = desk_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap()
+            .hub
+            .unwrap();
+        let port = hub.endpoint().port();
+        assert_eq!(reached.answers, Some(true));
+        assert_eq!(
+            reached.route.as_deref(),
+            Some(format!("localhost:{port} (127.0.0.1:{port})").as_str())
+        );
     })
     .await;
 }
