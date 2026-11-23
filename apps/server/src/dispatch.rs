@@ -1096,12 +1096,18 @@ impl Core {
         })
     }
 
+    /// `server.status`. The library's metadata and the server's name and
+    /// role are copied under one read of the library, taking the two in the
+    /// order `library.create` does, so they agree. That read is let go
+    /// before the record's health reads the library again: a read kept
+    /// while another is taken would wait behind a writer queued between
+    /// them, which waits on the first.
     fn status(&self, stores: &Stores) -> Result<ritornel_contract::ServerStatus, RpcError> {
-        let library = stores
+        let read = stores
             .library
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        let (library_schema, library) = match library.as_ref() {
+        let (library_schema, library) = match read.as_ref() {
             Some(library) => {
                 let meta = library.meta().map_err(Error::Library).map_err(failed)?;
                 let status = LibraryStatus {
@@ -1121,12 +1127,18 @@ impl Core {
                 }),
             ),
         };
+        let (name, role) = {
+            let this = lock(&self.this);
+            (this.name.clone(), this.role)
+        };
+        drop(read);
         let watch = self.watch_status(stores);
-        let this = lock(&self.this);
+        let backup = self.backup_status(stores);
+        let record = self.record_status(stores);
         Ok(ritornel_contract::ServerStatus {
             server_id: self.server_id,
-            name: this.name.clone(),
-            role: this.role,
+            name,
+            role,
             versions: Versions {
                 server: env!("CARGO_PKG_VERSION").to_owned(),
                 contract: CONTRACT_VERSION,
@@ -1140,8 +1152,8 @@ impl Core {
             },
             log_path: self.dir.logs().to_string_lossy().into_owned(),
             watch: Some(watch),
-            backup: Some(self.backup_status(stores)),
-            record: Some(self.record_status(stores)),
+            backup: Some(backup),
+            record: Some(record),
             hub: self.uplink().map(|uplink| uplink.status()),
         })
     }
@@ -2416,5 +2428,65 @@ mod tests {
         go.send(()).unwrap();
         assert_eq!(answered.recv_timeout(Duration::from_secs(5)), Ok(true));
         drop(session);
+    }
+
+    /// A status asked for while a library is being made: neither waits on
+    /// the other. The status holds its read of the library while it waits
+    /// for the name, and a writer queues behind that read. A status that
+    /// then read the library again, before letting go of the first read,
+    /// would wait behind the writer while the writer waited on it.
+    #[test]
+    fn a_status_and_a_library_made_meanwhile_both_answer() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        // Leaked, so that a call that hangs does not hold the test up.
+        let (core, scratch) = core();
+        let core: &'static Core = Box::leak(Box::new(core));
+        Box::leak(Box::new(scratch));
+        let (status, create) = (
+            greeted(core, SessionKind::Full),
+            greeted(core, SessionKind::Full),
+        );
+        // Waits until `seen` says the library's lock is as wanted.
+        let until = |seen: fn(&RwLock<Option<LibraryStore>>) -> bool, what: &str| {
+            let started = std::time::Instant::now();
+            loop {
+                let stores = core.stores.read().unwrap();
+                if seen(&stores.as_ref().unwrap().library) {
+                    return;
+                }
+                drop(stores);
+                assert!(started.elapsed() < Duration::from_secs(5), "{what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let (answered, answers) = mpsc::channel();
+        // The name is held, as a rename holds it, so the status waits on
+        // it with its read of the library.
+        let held = lock(&core.this);
+        let send = answered.clone();
+        std::thread::spawn(move || {
+            send.send(("status", call(core, &status, "server.status", None).is_ok()))
+                .unwrap();
+        });
+        until(
+            |library| library.try_write().is_err(),
+            "the status never read",
+        );
+        // The library is made meanwhile: its write queues behind the read.
+        std::thread::spawn(move || {
+            let created = call(core, &create, "library.create", Some(key(0xc0)));
+            answered.send(("create", created.is_ok())).unwrap();
+        });
+        until(
+            |library| library.try_read().is_err(),
+            "the write never queued",
+        );
+        drop(held);
+        let mut got: Vec<_> = (0..2)
+            .map_while(|_| answers.recv_timeout(Duration::from_secs(5)).ok())
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, [("create", true), ("status", true)]);
     }
 }

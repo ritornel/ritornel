@@ -228,7 +228,10 @@ impl Core {
         params: &LinkInviteParams,
     ) -> Result<LinkInvite, RpcError> {
         not_through_a_link(session, "link.invite")?;
-        let is_hub = lock(&self.this).role == ServerRole::Hub
+        // The role is let go before the library is read: `library.create`
+        // takes them the other way round.
+        let role = lock(&self.this).role;
+        let is_hub = role == ServerRole::Hub
             && stores
                 .library
                 .read()
