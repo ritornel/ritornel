@@ -36,8 +36,8 @@ const MOST_PLAYS: u64 = 10;
 pub(crate) struct Song {
     /// Its plays, wherever it was heard.
     pub(crate) plays: u64,
-    /// The play of it with the latest instant: that instant, and its local
-    /// date, YYYYMMDD, where it has one.
+    /// The play of it with the latest instant not after now: that instant,
+    /// and its local date, YYYYMMDD, where it has one.
     pub(crate) last: Option<(i64, Option<i64>)>,
     /// Whether the listener gave it five stars.
     pub(crate) five_stars: bool,

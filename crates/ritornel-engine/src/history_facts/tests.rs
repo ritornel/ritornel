@@ -616,6 +616,25 @@ fn a_songs_last_time_is_the_day_of_its_latest_play() {
         ),
     );
     assert_eq!(last_time(), "The last time was in November 2026.");
+    // Every play dated next month: still counted, and when the last was is
+    // not said.
+    let song = format!(
+        "recording_id = (SELECT recording_id FROM play_event WHERE id = {})",
+        nth_play(0)
+    );
+    tamper(
+        store,
+        &format!(
+            "UPDATE play_event SET event_at_utc_ms = {} WHERE {song}",
+            NOW + 40 * DAY
+        ),
+    );
+    let history = store
+        .track_history(listener, appearance, TODAY)
+        .unwrap()
+        .unwrap();
+    let (head, more) = of(&history.facts, FactKind::SongPlays).unwrap();
+    assert!(head.starts_with("You have played this song *") && more.is_empty());
     // With no instants, its plays are still counted, and when the last
     // was is not said.
     tamper(
