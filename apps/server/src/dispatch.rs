@@ -684,7 +684,8 @@ impl Core {
 
     /// Renames the server, keeps its row in the library's registry of
     /// servers in step on a hub, and sends its new status to every session
-    /// that subscribed to the `servers` topic.
+    /// that subscribed to the `servers` topic. An error from the registry
+    /// comes after the new name is stored and sent.
     ///
     /// No call of the contract reaches this yet; it is used by tests to
     /// change a server's status and exercise the `servers` topic.
@@ -704,12 +705,15 @@ impl Core {
             // A core is made from an identity, so there is always one.
             return Ok(());
         };
-        if let Some(library) = library.as_ref() {
-            crate::library::keep_registry_name(library, &identity);
-        }
+        // The name stored is the name, so it is sent whether or not the
+        // registry took it; a registry left behind is said, and caught up
+        // by the next start or rename.
+        let registry = library.as_ref().map_or(Ok(()), |library| {
+            crate::library::keep_registry_name(library, &identity)
+        });
         this.name = identity.name;
         self.changed(&mut this);
-        Ok(())
+        registry.map_err(Error::Library)
     }
 
     /// Counts a change to this server's status and sends the new status to

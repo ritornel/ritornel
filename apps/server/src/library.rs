@@ -89,17 +89,19 @@ pub(crate) fn open(
 }
 
 /// Gives this server's row in the library's registry of servers the name
-/// `server.db` gives it, after a rename at start or while it runs. The two
-/// files cannot commit together, so a registry left behind, as by a crash
-/// between them, is put right at the next start. Nothing is written when
-/// the names already agree.
-pub(crate) fn keep_registry_name(library: &LibraryStore, identity: &ServerIdentity) {
-    let behind = library
-        .server_name(identity.server_id)
-        .is_ok_and(|known| known.is_some_and(|known| known != identity.name));
-    if behind && let Err(error) = library.register_server(identity.server_id, &identity.name) {
-        warn!(%error, "the library's registry keeps this server's old name");
+/// `server.db` gives it, after a rename at start or while it runs. Nothing
+/// is written when the names already agree. The two files cannot commit
+/// together, so a registry left behind, as by a crash between them or a
+/// write that failed, is put right at the next start or rename.
+pub(crate) fn keep_registry_name(
+    library: &LibraryStore,
+    identity: &ServerIdentity,
+) -> Result<(), ritornel_engine::Error> {
+    let known = library.server_name(identity.server_id)?;
+    if known.is_some_and(|known| known != identity.name) {
+        library.register_server(identity.server_id, &identity.name)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -227,7 +229,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hub_renamed_at_start_keeps_the_librarys_registry_in_step() {
+    async fn a_registry_left_behind_by_a_rename_catches_up_at_the_next_start() {
         let scratch = Scratch::new();
         let data_dir = scratch.path().join("data");
         let server = start(&data_dir).await.unwrap();
@@ -237,11 +239,11 @@ mod tests {
             .create_library(key(0xc0))
             .await
             .unwrap();
-        let first = server.name();
+        let name = server.name();
         server.stop().await.unwrap();
+        let library_db = || rusqlite::Connection::open(data_dir.join("library.db")).unwrap();
         let registry = || -> String {
-            rusqlite::Connection::open(data_dir.join("library.db"))
-                .unwrap()
+            library_db()
                 .query_row(
                     "SELECT name FROM server WHERE public_id = ?1",
                     [this.as_bytes()],
@@ -249,25 +251,19 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(registry(), first);
+        assert_eq!(registry(), name);
 
-        // Named by its settings now: the registry follows.
-        let server = Server::start_run(
-            HeldDir::take(data_dir.clone()).unwrap(),
-            Listen::on_port(0),
-            Arc::new(SystemClock),
-            Arc::new(OsEntropy),
-            crate::Bounds::default(),
-            crate::Run {
-                name: Some("Porch Speakers".to_owned()),
-                ..crate::Run::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(server.name(), "Porch Speakers");
+        // As a crash between the two files' commits would leave it.
+        library_db()
+            .execute(
+                "UPDATE server SET name = 'Old Name' WHERE public_id = ?1",
+                [this.as_bytes()],
+            )
+            .unwrap();
+        let server = start(&data_dir).await.unwrap();
+        assert_eq!(server.name(), name);
         server.stop().await.unwrap();
-        assert_eq!(registry(), "Porch Speakers");
+        assert_eq!(registry(), name);
     }
 
     #[tokio::test]
