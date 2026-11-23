@@ -143,7 +143,6 @@ impl ServerStore {
         })
     }
 
-    /// The link sessions that have not been revoked, oldest first.
     /// Names the link session of the satellite `peer` `label`, and says
     /// whether that was a new name. The same name again is only read.
     pub fn relabel_link_session(&self, peer: Id, label: &str) -> Result<bool, Error> {
@@ -165,6 +164,7 @@ impl ServerStore {
         })
     }
 
+    /// The link sessions that have not been revoked, oldest first.
     pub fn link_sessions(&self) -> Result<Vec<LinkSession>, Error> {
         self.read(|connection| {
             let mut statement = connection.prepare(
