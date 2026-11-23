@@ -1120,16 +1120,29 @@ fn a_scan_cut_off_after_any_step_converges_to_what_an_uninterrupted_scan_makes()
         );
 
         // The next run finds the job claimed by a run that is gone, takes
-        // it back, and carries on.
+        // it back, and carries on. Cut off after the resolution, it is
+        // finished without walking the root, which may be offline by then.
+        let root = rig.root();
+        let away = rig.scratch.path().join("unmounted");
+        if cut == steps {
+            std::fs::rename(&root, &away).unwrap();
+        }
         let resumed = rig.resume(small).unwrap();
+        if cut == steps {
+            std::fs::rename(&away, &root).unwrap();
+        }
         assert_eq!(rig.shape(), whole.shape(), "{cut}");
         // No step was done twice: the files of a step that had committed
         // were found unchanged, and its command ID was found.
-        assert_eq!(resumed.unchanged, (2 * cut as u64).min(10), "{cut}");
+        let unchanged = if cut == steps {
+            0
+        } else {
+            (2 * cut as u64).min(10)
+        };
+        assert_eq!(resumed.unchanged, unchanged, "{cut}");
         // And what it counted was not lost with its checkpoint.
         assert_eq!(
             ScanSummary {
-                files: uninterrupted.files,
                 unchanged: uninterrupted.unchanged,
                 ..resumed
             },

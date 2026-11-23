@@ -16,7 +16,8 @@
 //! unchanged, and reads only what is left. A step that committed just
 //! before a crash, and whose number was never saved, is found by its
 //! command ID and counted as done, and its counters are read from what it
-//! stored as its result ([`Stepped`]).
+//! stored as its result ([`StepResult`]). Once the resolver's step has
+//! committed, the scan is finished.
 //!
 //! The resolver runs once, at the end, over the whole library, and only if
 //! the scan changed something. So a rescan that finds nothing changed
@@ -77,7 +78,7 @@ struct Checkpoint {
 /// between the two leaves this to carry on from. The resolver's step stores
 /// what it wrote ([`Resolved`]) instead.
 #[derive(Debug, Serialize, Deserialize)]
-struct Stepped {
+struct StepResult {
     checkpoint: Checkpoint,
 }
 
@@ -202,25 +203,36 @@ impl ScanRun {
             .unwrap_or_default();
         // A step that committed and whose checkpoint was never saved is
         // found by its command ID, and is not done again. What it counted
-        // is in what it stored.
+        // is in what it stored. A step an older build wrote stored only how
+        // many rows it wrote, and its counts are not known.
         let (mut step, mut summary, mut dirty) = (job.step, checkpoint.summary, checkpoint.dirty);
         while let Some(result) = library.command_result(step_command(job.public_id, step + 1))? {
             step += 1;
             dirty = true;
-            if let Ok(stepped) = serde_json::from_str::<Stepped>(&result) {
-                summary = stepped.checkpoint.summary;
+            if let Ok(stored) = serde_json::from_str::<StepResult>(&result) {
+                summary = stored.checkpoint.summary;
             } else if let Ok(resolved) = serde_json::from_str::<Resolved>(&result) {
                 summary.assignments += resolved.assignments;
                 summary.recordings += resolved.recordings;
                 summary.releases += resolved.releases;
             }
         }
+        // The resolver's step is the scan's last. Once it has committed, the
+        // scan is finished, saved or not, and nothing is walked again: a
+        // root that is offline now does not fail a scan that was done.
+        let finished = step > 0
+            && library
+                .command_result(step_command(job.public_id, step))?
+                .is_some_and(|result| serde_json::from_str::<Resolved>(&result).is_ok());
+        if finished {
+            dirty = false;
+        }
         Ok(Self {
             job,
             source,
             root,
             settings,
-            phase: Phase::Walk,
+            phase: if finished { Phase::Done } else { Phase::Walk },
             step,
             summary,
             dirty,
@@ -335,8 +347,8 @@ impl ScanRun {
 
     /// What a step of the scan's own stores as its result: the checkpoint
     /// once it has committed, with `summary` as its counters.
-    fn stepped(&self, summary: ScanSummary) -> Result<String, Error> {
-        Ok(serde_json::to_string(&Stepped {
+    fn step_result(&self, summary: ScanSummary) -> Result<String, Error> {
+        Ok(serde_json::to_string(&StepResult {
             checkpoint: Checkpoint {
                 summary,
                 dirty: true,
@@ -369,7 +381,7 @@ impl ScanRun {
                 self.phase = Phase::Replaced;
                 if !gone.is_empty() {
                     let request = self.next_step();
-                    let receipt = self.stepped(self.summary)?;
+                    let receipt = self.step_result(self.summary)?;
                     library.mark_missing(request, gone, receipt)?;
                     self.committed()?;
                 }
@@ -568,7 +580,7 @@ impl ScanRun {
         self.summary.bytes_read = counted.bytes_read;
         if !ops.is_empty() {
             let request = self.next_step();
-            let receipt = self.stepped(counted)?;
+            let receipt = self.step_result(counted)?;
             library.record(request, self.source.row, ops, receipt)?;
             self.summary = counted;
             self.committed()?;
@@ -648,7 +660,7 @@ impl ScanRun {
             }
         }
         let request = self.next_step();
-        let receipt = self.stepped(self.summary)?;
+        let receipt = self.step_result(self.summary)?;
         library.record(request, self.source.row, ops, receipt)?;
         self.committed()
     }
