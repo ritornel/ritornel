@@ -1375,9 +1375,16 @@ fn run<M: Method>(
         }
     };
     let params = serde_json::from_value(params).map_err(|error| {
+        // A staged stream's values are a listener's history, and serde's
+        // message can quote one: that call is told only that one is wrong.
+        let why = if M::NAME == ImportsStage::NAME {
+            "a field is unknown or holds a value of another kind".to_owned()
+        } else {
+            error.to_string()
+        };
         RpcError::new(
             ErrorCode::Invalid,
-            format!("the params of {} are wrong: {error}", M::NAME),
+            format!("the params of {} are wrong: {why}", M::NAME),
         )
     })?;
     serde_json::to_value(handler(params)?).map_err(|error| {
@@ -2585,5 +2592,25 @@ mod tests {
             .collect();
         got.sort_unstable();
         assert_eq!(got, [("create", true), ("status", true)]);
+    }
+
+    #[test]
+    fn a_staged_stream_of_the_wrong_kind_is_refused_without_its_value() {
+        let params = json!({
+            "idempotencyKey": Id::from_bytes([1; 16]),
+            "runId": Id::from_bytes([2; 16]),
+            "piece": 0,
+            "pieces": 1,
+            "streams": [{
+                "endedAt": 1, "msPlayed": 1, "trackUri": "spotify:track:1",
+                "title": "Low Tide", "artist": "Calla Brandt", "shuffle": "MARKED_VALUE",
+            }],
+        });
+        let refused = run::<ImportsStage>(Some(params.clone()), |_| unreachable!()).unwrap_err();
+        assert!(!refused.message.contains("MARKED"), "{}", refused.message);
+        let mut unknown = params;
+        unknown["archivePath"] = json!("MARKED_PATH");
+        let refused = run::<ImportsStage>(Some(unknown), |_| unreachable!()).unwrap_err();
+        assert!(!refused.message.contains("MARKED"), "{}", refused.message);
     }
 }

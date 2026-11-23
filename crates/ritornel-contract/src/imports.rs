@@ -105,7 +105,7 @@ pub const MAX_STREAMS_PER_PIECE: usize = 1_000;
 /// an archive, which the hub keeps until the run is dry run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ImportsStageParams {
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
@@ -297,8 +297,8 @@ pub enum ImportProblem {
 pub struct ImportReport {
     /// When it was worked out.
     pub made_at: i64,
-    /// The matcher's version.
-    pub matcher_version: i64,
+    /// The grouper's version, which the stream matcher is part of.
+    pub grouper_version: i64,
     /// Streams in the run, repeats included.
     pub streams: u64,
     /// Listens they report: each repeat counted once.

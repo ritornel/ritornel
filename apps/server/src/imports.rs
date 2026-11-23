@@ -184,8 +184,10 @@ impl Staging {
                 "a piece's number is from 0 to one less than the run's pieces",
             ));
         }
-        if streams.len() > MAX_STREAMS_PER_PIECE {
-            return Err(Refused::Invalid("a piece holds too many streams"));
+        if streams.is_empty() || streams.len() > MAX_STREAMS_PER_PIECE {
+            return Err(Refused::Invalid(
+                "a piece holds from one stream to the most a piece may hold",
+            ));
         }
         if streams.iter().any(|stream| stream.plausible().is_err()) {
             return Err(Refused::Invalid(
@@ -373,7 +375,6 @@ pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &Atomic
 
 #[cfg(test)]
 mod tests {
-    use ritornel_contract::SpotifyPlatform;
 
     use super::*;
     use crate::platform::path_is_private;
@@ -396,7 +397,9 @@ mod tests {
             offline: None,
             offline_timestamp: None,
             incognito: None,
-            platform: SpotifyPlatform::Ios,
+            platform: None,
+            device_kind: None,
+            via: None,
         }
     }
 
@@ -485,6 +488,11 @@ mod tests {
                 Err(Refused::Invalid(_))
             ));
         }
+        // A piece holds a stream at least.
+        assert!(matches!(
+            staging.stage(run(), 0, 1, &[], NOW),
+            Err(Refused::Invalid(_))
+        ));
     }
 
     #[test]
@@ -504,7 +512,7 @@ mod tests {
             .unwrap();
         let report = ImportReport {
             made_at: NOW,
-            matcher_version: 1,
+            grouper_version: 1,
             streams: 1,
             events: 1,
             scrobbles: 0,

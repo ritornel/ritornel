@@ -1167,7 +1167,9 @@ pub(crate) fn stream(
         offline: Some(false),
         offline_timestamp: None,
         incognito: Some(false),
-        platform: ritornel_contract::SpotifyPlatform::Mac,
+        platform: None,
+        device_kind: None,
+        via: None,
     }
 }
 

@@ -84,7 +84,7 @@ Spotify's extended streaming history is a second source of import records beside
 
 ### Matching streams to scrobbles
 
-`ritornel_domain::streams` (`STREAM_MATCHER_VERSION = 1`) decides which stream and which Last.fm scrobble are one listen. It is pure and asks nothing of the library, so owning a record never changes which reports are one listen.
+`ritornel_domain::streams` decides which stream and which Last.fm scrobble are one listen. It is pure and asks nothing of the library, so owning a record never changes which reports are one listen.
 
 - **Events:** streams with the same end time, time played and track URI are one event, reported more than once. They are ordered by their other kept fields (`repeat_order`), with their names only to break a tie, so the order rows arrive in never decides which speaks; the first speaks for the event.
 - **Names:** `name_key` compares artist and title after Unicode NFKC and case folding, with white space and punctuation, brackets of every kind among it, removed. Accents, symbols, credits and version words stay. The album is not compared, and in tier C a name that folds to nothing agrees with nothing.
@@ -93,10 +93,10 @@ Spotify's extended streaming history is a second source of import records beside
 | Tier | A scrobble joins an event when | In force |
 |---|---|---|
 | A, `Tier::Start` | It names the same track and is stamped within `WITHIN_MS` (10 s) of the event's worked-out start, its end less the time played. One scrobble to an event | Yes |
-| B, `Tier::During` | It names the same track and is stamped while the event played, up to 10 s past its end. An event with no scrobble takes it as its own; then an event that has one takes it as a second report | No |
+| B, `Tier::During` | It names the same track and is stamped while the event played, up to 10 s past its end. An event with no scrobble takes it as its own when it played more than 15 s (`NEVER_COUNTS_MS`), so a skip takes no scrobble from the play after it; then an event that has one takes it as a second report, stamped from as early as tier A takes one | No |
 | C, `Tier::Renamed` | It is stamped as in A, the artist or the title agrees, each is the other's only candidate, the event played 30 s or more, and neither has a record of its own names within `PARTNER_WITHIN_MS` (an hour) | No |
 
-- **Offered scrobbles:** a scrobble whose play is excluded, as one an earlier read stored twice is, is offered to no stream, and neither is the echo of a listen's delivery (`echo_of`), a second copy of one included: a listen and a stream are two players.
+- **Offered scrobbles:** a scrobble an `exclude` correction that stands sets aside, as one an earlier read stored twice is, is offered to no stream, by the corrections as derivation reads them and never by what a play of it shows, and neither is the echo of a listen's delivery (`echo_of`), a second copy of one included: a listen and a stream are two players.
 - **Pins:** `Pins` names pairs a correction has kept apart or joined, read before the tiers. No correction writes them yet.
 - **A stream alone:** `judge_alone` counts an event with no scrobble when it played four minutes, never when it played 15 s or less, and otherwise when it played half of its track's length. `lengths` takes a track's length as the median time played among its events that ended `trackdone` and played over 30 s, the lower of two middles. With no length it does not count and its outcome is `unknown`. Not counted, it is `skipped` when `reason_end` says the listener moved on (`moved_on`) and `partial` otherwise.
 

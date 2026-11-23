@@ -15,10 +15,6 @@ use unicode_normalization::char::is_combining_mark;
 
 use crate::history::Outcome;
 
-/// The version of the matcher: which tiers there are and how each pairs.
-/// A change to them is a new version, and plays are derived again.
-pub const STREAM_MATCHER_VERSION: i64 = 1;
-
 /// How far a scrobble's stamp may be from a stream's worked-out start, or
 /// past its end, for the two to be one listen.
 pub const WITHIN_MS: i64 = 10_000;
@@ -212,22 +208,32 @@ fn names(record: &SpotifyStream) -> (String, String) {
     (name_key(&record.artist), name_key(&record.title))
 }
 
+/// A field that says something before one that says nothing.
+fn said<T: Ord>(field: Option<T>) -> (bool, Option<T>) {
+    (field.is_none(), field)
+}
+
 /// The order of records that repeat one another: their other kept fields,
-/// and their names only where all of those are the same, so that which
-/// speaks for a listen never depends on the order the rows came in.
+/// a field that says something before one that does not, and their names
+/// only where all of those are the same, so that which speaks for a listen
+/// never depends on the order the rows came in. The device it played on is
+/// no part of it, since a later reader may say it otherwise.
 pub fn repeat_order(r: &SpotifyStream) -> impl Ord + '_ {
     (
         (
-            r.reason_start.as_deref(),
-            r.reason_end.as_deref(),
-            r.shuffle,
-            r.skipped,
-            r.offline,
-            r.offline_timestamp,
-            r.incognito,
-            r.platform,
+            said(r.reason_start.as_deref()),
+            said(r.reason_end.as_deref()),
+            said(r.shuffle),
+            said(r.skipped),
+            said(r.offline),
+            said(r.offline_timestamp),
+            said(r.incognito),
         ),
-        (r.title.as_str(), r.artist.as_str(), r.album.as_deref()),
+        (
+            r.title.as_str(),
+            r.artist.as_str(),
+            said(r.album.as_deref()),
+        ),
     )
 }
 
@@ -448,8 +454,10 @@ pub fn match_streams(
     }
 
     // Tier B: a scrobble stamped while the stream played. An event with no
-    // scrobble takes it as its own, stamped late; then an event that has
-    // one takes it as a second report.
+    // scrobble takes it as its own, stamped late, when it played longer than
+    // any play that never counts, so a skip takes no scrobble from the play
+    // after it; then an event that has one takes it as a second report,
+    // stamped from as early as tier A takes one.
     if tiers.during {
         let longest = event_played.iter().copied().max().unwrap_or(0);
         for second in [false, true] {
@@ -462,15 +470,26 @@ pub fn match_streams(
                     continue;
                 };
                 let from = s.at_ms.saturating_sub(longest).saturating_sub(WITHIN_MS);
-                for event in near(names, from, s.at_ms) {
+                let to = if second {
+                    s.at_ms.saturating_add(WITHIN_MS)
+                } else {
+                    s.at_ms
+                };
+                for event in near(names, from, to) {
                     let Some(e) = events.get(event) else {
                         continue;
                     };
                     let has_own = !event_free.get(event).copied().unwrap_or(false);
+                    let earliest = if second {
+                        e.start_ms.saturating_sub(WITHIN_MS)
+                    } else {
+                        e.start_ms
+                    };
                     if has_own != second
                         || !allowed(event, scrobble)
-                        || s.at_ms < e.start_ms
+                        || s.at_ms < earliest
                         || s.at_ms > e.end_ms.saturating_add(WITHIN_MS)
+                        || (!second && e.end_ms.saturating_sub(e.start_ms) <= NEVER_COUNTS_MS)
                     {
                         continue;
                     }
@@ -693,7 +712,6 @@ pub fn counts(matched: &Matched) -> BTreeMap<Tier, (u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use ritornel_contract::SpotifyPlatform;
 
     use super::*;
 
@@ -723,7 +741,9 @@ mod tests {
                 offline: Some(false),
                 offline_timestamp: None,
                 incognito: Some(false),
-                platform: SpotifyPlatform::Ios,
+                platform: None,
+                device_kind: None,
+                via: None,
             },
         }
     }
@@ -863,6 +883,26 @@ mod tests {
         );
         let matched = match_streams(&streams, &scrobbles, Tiers::ALL, &Pins::default());
         assert_eq!(matched.scrobble_of().get(&0), Some(&0));
+    }
+
+    #[test]
+    fn a_skip_takes_no_scrobble_as_its_own_and_a_second_report_may_come_early() {
+        // Skipped after two seconds; the scrobble stamped eleven seconds in
+        // is not the skip's.
+        let skip = [stream("Low Tide", 2, 2)];
+        assert!(all(&skip, &[scrobble("Low Tide", 11)]).is_empty());
+        // A second copy stamped two seconds before the start is one more
+        // report of the play that took the first.
+        let streams = [stream("Low Tide", 221, 221)];
+        let mut copy = scrobble("Low Tide", -2);
+        copy.key.push(b'2');
+        assert_eq!(
+            all(&streams, &[scrobble("Low Tide", -2), copy])
+                .into_iter()
+                .map(|(_, _, tier, second)| (tier, second))
+                .collect::<Vec<_>>(),
+            [(Some(Tier::Start), false), (Some(Tier::During), true)]
+        );
     }
 
     #[test]

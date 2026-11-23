@@ -259,7 +259,6 @@ fn report_text(report: &ImportReport, samples: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ritornel_client::contract::SpotifyPlatform;
 
     use super::*;
 
@@ -278,7 +277,9 @@ mod tests {
             offline: None,
             offline_timestamp: None,
             incognito: None,
-            platform: SpotifyPlatform::Ios,
+            platform: None,
+            device_kind: None,
+            via: None,
         }
     }
 

@@ -12,8 +12,8 @@ use ritornel_contract::{
 
 use crate::history::{Outcome, ZonePeriod, assumed_zone};
 use crate::streams::{
-    Event, Matched, Pins, STREAM_MATCHER_VERSION, Scrobble, Stream, Tier, Tiers, judge_alone,
-    lengths, match_streams, name_key, repeat_order,
+    Event, Matched, Pins, Scrobble, Stream, Tier, Tiers, judge_alone, lengths, match_streams,
+    name_key, repeat_order,
 };
 
 /// How many joins of each tier not in force a report shows for judging it.
@@ -244,7 +244,7 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
 
     ImportReport {
         made_at: input.made_at,
-        matcher_version: STREAM_MATCHER_VERSION,
+        grouper_version: crate::history::GROUPER_VERSION,
         streams: input.streams.len() as u64,
         events: in_force.events.len() as u64,
         scrobbles: input.scrobbles.len() as u64,
@@ -393,7 +393,6 @@ fn samples(input: &DryRunInput<'_>, every: &Matched) -> Vec<JoinSample> {
 
 #[cfg(test)]
 mod tests {
-    use ritornel_contract::SpotifyPlatform;
 
     use super::*;
 
@@ -415,7 +414,9 @@ mod tests {
             offline: Some(false),
             offline_timestamp: None,
             incognito: Some(false),
-            platform: SpotifyPlatform::Mac,
+            platform: None,
+            device_kind: None,
+            via: None,
         }
     }
 

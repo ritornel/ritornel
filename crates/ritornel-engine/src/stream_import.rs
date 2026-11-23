@@ -25,36 +25,35 @@ struct Read {
 /// those set aside and those that are this library's own listens come back.
 /// An import is an echo when it matches a delivery of a listen, as
 /// derivation finds it, so that a second copy of an echo, which stands as a
-/// play of its own, is an echo too; and it is set aside when its play is
-/// excluded.
+/// play of its own, is an echo too; and it is set aside when a correction
+/// that stands excludes it.
 fn scrobbles(connection: &Connection) -> Result<(Vec<Scrobble>, u64, u64), Error> {
+    // Set aside as derivation has it: by the corrections that stand, and
+    // never by what a play of it shows, which another record can decide.
+    let set_aside =
+        ritornel_domain::history::excluded(&crate::history_store::corrections(connection)?);
     let mut statement = connection.prepare(
-        "SELECT a.id, o.source_key, i.played_at_utc_ms, i.artist, i.title, pe.excluded,
-                o.endpoint_id
+        "SELECT o.id, o.source_key, i.played_at_utc_ms, i.artist, i.title, o.endpoint_id
            FROM observation_import i
            JOIN history_observation o ON o.id = i.observation_id
-           JOIN service_account a ON a.endpoint_id = o.endpoint_id
-           LEFT JOIN play_event_observation peo ON peo.observation_id = o.id
-           LEFT JOIN play_event pe ON pe.id = peo.play_event_id",
+           JOIN service_account a ON a.endpoint_id = o.endpoint_id",
     )?;
     let mut rows = statement.query([])?;
     let (mut offered, mut excluded, mut echoes) = (Vec::new(), 0, 0);
     while let Some(row) = rows.next()? {
-        let account: i64 = row.get(0)?;
-        let source_key: Vec<u8> = row.get(1)?;
+        let observation: i64 = row.get(0)?;
         let (at_ms, artist, title): (i64, String, String) = (row.get(2)?, row.get(3)?, row.get(4)?);
-        if echo_of(connection, row.get(6)?, at_ms, &artist, &title)?.is_some() {
+        if echo_of(connection, row.get(5)?, at_ms, &artist, &title)?.is_some() {
             echoes += 1;
             continue;
         }
-        if row.get::<_, Option<i64>>(5)? == Some(1) {
+        if set_aside.contains(&observation) {
             excluded += 1;
             continue;
         }
-        let mut key = account.to_be_bytes().to_vec();
-        key.extend(source_key);
+        // Keyed as derivation keys it, so that a tie goes the same way.
         offered.push(Scrobble {
-            key,
+            key: row.get(1)?,
             at_ms,
             artist,
             title,
