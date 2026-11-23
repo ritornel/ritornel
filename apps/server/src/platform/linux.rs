@@ -13,7 +13,7 @@ use super::service::{installed, prepare};
 use super::systemd::{UNIT, install, status, uninstall, unit};
 use crate::{Env, Error};
 
-pub(crate) use super::fallback::wait;
+pub(crate) use super::fallback::{run_service, wait};
 #[cfg(feature = "media-session")]
 pub(crate) use super::linux_mpris::Controls as MediaControls;
 

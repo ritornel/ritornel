@@ -83,6 +83,9 @@ tempfile = "3.27.0"
 # hidden window that hears `taskkill` and the end of the session.
 [target.'cfg(windows)'.dependencies]
 ritornel-windows.workspace = true
+# Stages the background service's task definition, which schtasks reads
+# from a file.
+tempfile = "3.27.0"
 
 # The media session on macOS: souvlaki for Now Playing and the remote
 # commands, and Core Foundation's run loop for the main thread, which objc2

@@ -23,7 +23,7 @@ By default the server tries `127.0.0.1:4747` and falls back to an OS-assigned lo
 
 ### Background service
 
-`ritornel-server service install [--data-dir <dir>]` registers the binary as a user-session service—a `launchd` user agent on macOS or a `systemd` user unit on Linux—so it runs inside the user's login session where audio output and media keys are reachable, and restarts after an unclean exit. `service uninstall` stops and removes it, and `service status` reports whether it is installed and running. When the background service is active, the desktop app attaches to it and starts no server of its own.
+`ritornel-server service install [--data-dir <dir>]` registers the binary as a user-session service—a `launchd` user agent on macOS, a `systemd` user unit on Linux, or a Task Scheduler task at sign-in on Windows, which runs a supervisor (`service run`) that restarts the server ("Windows" in docs/internals/platforms.md)—so it runs inside the user's login session where audio output and media keys are reachable, and restarts after an unclean exit. `service uninstall` stops and removes it, and `service status` reports whether it is installed and running. When the background service is active, the desktop app attaches to it and starts no server of its own.
 
 ### Single-instance lock
 

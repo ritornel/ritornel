@@ -9,7 +9,7 @@ Ritornel was built on macOS first. Linux and Windows came early, while the code 
 | Server, library, scan, Last.fm | Yes | Yes | Yes | Yes, without Last.fm |
 | Sound | CoreAudio | ALSA's `default` device (PipeWire or PulseAudio on a desktop) | WASAPI, shared mode | None (`--output null` plays into nothing) |
 | Media keys and Now Playing | Now Playing | MPRIS | Not yet | None |
-| Background service | launchd user agent | systemd user unit | Not yet | Any service manager running `serve` |
+| Background service | launchd user agent | systemd user unit | Task Scheduler task at sign-in | Any service manager running `serve` |
 | A hub found by its `.local` name | Bonjour | With Avahi, and nss-mdns on a satellite | Yes | As Linux |
 | A hub kept from idle sleep | `caffeinate -i` | `systemd-inhibit --what=idle` | Not yet | As Linux |
 | Desktop app | Yes | Wayland or X11 | Yes | None |
@@ -57,6 +57,8 @@ What differs between systems sits in a `platform` module in each crate that need
 - **The lock is one byte past the end of `server.lock`,** held exclusively. The PID in the file stays readable, and a client probes the lock with a shared lock on the whole file.
 - **Files only the user can open** carry an access list naming that user alone, where Unix uses modes `0600` and `0700`. Folders Ritornel creates receive this ACL, and files created inside inherit it; an existing data directory keeps its prior access list, as on Unix.
 - **A finished backup's rename asks to be written through to the disk** (`MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, as `ritornel_windows::file::rename_through`), where Unix syncs the folder that holds it. A folder handle opened for writing can be flushed on NTFS, but that is not promised on every file system a backup may go to, such as a network share, and a flush that failed would discard a backup that is whole. So `sync_dir` does nothing on Windows, and `rename_dir` returns once Windows says the dotted folder has its plain name on the disk. Microsoft states that guarantee plainly only for a move that copies; a rename on one volume relies on the file system, on NTFS its journal, and has not been tested against a cut in power. Each file inside was flushed before. A path too long for its plain form is passed in the `\\?\` form, as the standard library passes it, and the rename never replaces what is at the new name, an empty folder included.
+- **The background service is a Task Scheduler task at sign-in, not a Windows service.** A service runs in session 0, away from the user's default audio device and media controls, as a system daemon would on macOS. The task `dev.ritornel.server` starts with the user's sign-in token at normal priority; Task Scheduler's default priority is below normal, which a player cannot have. It runs `conhost.exe --headless`, so no console window opens, and that runs `ritornel-server service run`, the supervisor (`windows_service.rs`).
+- **The supervisor, not Task Scheduler, starts the server again.** The headless console does not pass on its program's exit code, so Task Scheduler cannot tell a crash from a clean stop. The supervisor runs `serve --owned` and starts it again ten seconds after an exit that was not clean, as the systemd unit does, writing why to `service.log`. A clean stop, as by `ritornelctl server stop`, ends it until the next sign-in. Ending the task in Task Scheduler ends only the console, so `service uninstall` and a reinstall ask the supervisor's hidden window, `Ritornel service`, to close instead; it closes the server's input and waits up to 15 seconds for it to stop.
 - **The listen clock is `QueryInterruptTimePrecise`.** It counts through sleep as the tick count does, in 100 ns steps rather than 10 to 16 ms, so back-to-back listens meet.
 
 ## Verification
@@ -78,6 +80,7 @@ What differs between systems sits in a `platform` module in each crate that need
 - 44.1, 48, and 96 kHz files play at the right pitch; pause, seek, next, previous, end of queue, and gapless joins (including sample-rate changes) match the source files.
 - Reported position runs ~55 ms ahead of what is heard (output latency) without drifting over three minutes.
 - The desktop app follows the server; the server uses 1–2% of one core and 27 MB while playing.
+- The background service installs, runs with no console window at normal priority, starts the server again 10 seconds after it is killed, stops for `ritornelctl server stop`, is replaced while running, and uninstalls with nothing left running. It has not yet been seen across a sign-out and sign-in.
 
 **arm64 Linux** (the headless player in release, on GitHub's Ubuntu 24.04 arm64 runner, measured by `scripts/player-footprint.sh`):
 

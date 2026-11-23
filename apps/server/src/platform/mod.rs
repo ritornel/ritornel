@@ -14,7 +14,8 @@
 //!   it ([`wait`]), which is a Mac's run loop;
 //! - the background service: launchd's agent (`launchd.rs`) on a Mac and a
 //!   systemd user unit (`systemd.rs`) on Linux, both built for the tests on
-//!   every Unix, with what they share in `service.rs`;
+//!   every Unix, with what they share in `service.rs`, and on Windows a
+//!   task at sign-in and the supervisor it runs (`windows_service.rs`);
 //! - the media session: Now Playing on a Mac (`mac_now_playing.rs`) and
 //!   MPRIS on Linux (`linux_mpris.rs`);
 //! - the computer's own name, which a server takes by default, and keeping
@@ -31,7 +32,7 @@ mod unix;
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod launchd;
-#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, all(test, unix)))]
 mod service;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod systemd;
@@ -53,6 +54,8 @@ use linux as system;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+mod windows_service;
+#[cfg(windows)]
 use windows as system;
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
@@ -63,7 +66,8 @@ pub(crate) use system::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaContro
 pub(crate) use system::{
     close_to_others, create_new_private_dir, create_owner_only, create_private_dir,
     create_private_file, free_bytes, install_service, is_private, lock_shareable, rename_dir,
-    service_status, stay_awake, sync_dir, take_lock, uninstall_service, wait, watch_signals,
+    run_service, service_status, stay_awake, sync_dir, take_lock, uninstall_service, wait,
+    watch_signals,
 };
 
 /// The computer's name, as the person who set it up named it: what a server
@@ -136,8 +140,8 @@ mod other_unix {
     #[cfg(feature = "media-session")]
     pub(crate) use super::fallback::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
     pub(crate) use super::fallback::{
-        computer_name, install_service, legacy_computer_name, mdns_host, service_status,
-        stay_awake, uninstall_service, wait,
+        computer_name, install_service, legacy_computer_name, mdns_host, run_service,
+        service_status, stay_awake, uninstall_service, wait,
     };
     pub(crate) use super::unix::*;
 }
@@ -156,15 +160,20 @@ mod fallback {
         stopped.recv().ok()
     }
 
-    /// There is no background service yet. On Windows it is still to come:
-    /// a task at sign-in, in the user's session, where the media keys and
-    /// the default audio device are.
+    /// There is no background service here.
     fn no_service() -> Error {
         Error::Service(
-            "it is built for macOS and Linux only so far; elsewhere run `ritornel-server serve` under \
-             the system's service manager"
+            "it is built for macOS, Linux and Windows only so far; elsewhere run              `ritornel-server serve` under the system's service manager"
                 .to_owned(),
         )
+    }
+
+    /// Only Windows runs a supervisor of its own: elsewhere the service
+    /// manager starts the server again.
+    pub(crate) fn run_service(_: &Path, _: Env<'_>) -> Result<(), Error> {
+        Err(Error::Service(
+            "`service run` is what the background service runs on Windows".to_owned(),
+        ))
     }
 
     pub(crate) fn install_service(_: Option<&Path>, _: Env<'_>) -> Result<String, Error> {

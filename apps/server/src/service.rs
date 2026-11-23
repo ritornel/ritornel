@@ -11,9 +11,12 @@
 //! keys work; a system daemon would have no media session. On Linux it is
 //! a systemd user unit, for the same reason: the user's manager runs it with
 //! the session bus and the sound server that MPRIS and ALSA's default
-//! device reach. Either way it runs `serve` on the data directory, starts
-//! at login, and starts again if it fails. The desktop app then finds it
-//! and starts nothing, and quitting the app leaves it playing.
+//! device reach. On Windows it is a task at sign-in, in the user's session,
+//! which runs `service run`, a supervisor that starts `serve` again when it
+//! fails, since Task Scheduler cannot. Each way it runs `serve` on the data
+//! directory, starts at login, and starts again if it fails. The desktop
+//! app then finds it and starts nothing, and quitting the app leaves it
+//! playing.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -41,6 +44,13 @@ enum Action {
     Uninstall,
     /// Says whether it is registered and running.
     Status,
+    /// What the service runs on Windows, and not in the help: `serve` on
+    /// the data directory, started again when it fails.
+    #[command(hide = true)]
+    Run {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
 }
 
 /// Runs `ritornel-server service`. What registers the service is the
@@ -50,6 +60,7 @@ pub(crate) fn run(args: &ServiceArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         Action::Install { data_dir } => platform::install_service(data_dir.as_deref(), env)?,
         Action::Uninstall => platform::uninstall_service(env)?,
         Action::Status => platform::service_status(env)?,
+        Action::Run { data_dir } => return platform::run_service(data_dir, env),
     };
     writeln!(out, "{said}").map_err(Error::Output)
 }
