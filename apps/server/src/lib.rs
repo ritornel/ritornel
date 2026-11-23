@@ -63,7 +63,9 @@ mod uplink;
 mod views;
 mod watch;
 
-pub use bounds::{Bounds, HEADER_WAIT, MAX_CONNECTIONS, MAX_SESSIONS, STOP_GRACE, TICKET_LIFE};
+pub use bounds::{
+    Bounds, HEADER_WAIT, HUB_CALL_WAIT, MAX_CONNECTIONS, MAX_SESSIONS, STOP_GRACE, TICKET_LIFE,
+};
 pub use cli::run;
 pub use config::{ConfigError, Listen, Origin, Origins};
 pub use data_dir::HeldDir;

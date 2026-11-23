@@ -53,12 +53,6 @@ struct Reach {
     failed_at_ms: Option<i64>,
 }
 
-/// The longest a call waits for the hub's answer. The longest call a
-/// client makes through a satellite, such as a history page, takes a
-/// fraction of this on a hub, and the satellite must say the hub is away
-/// before its own clients give up on it: `ritornelctl` waits ten seconds.
-const CALL_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
-
 /// How long after a failed try a call is answered at once, without trying
 /// again: a client that calls ten times a second while the hub is away is
 /// not kept waiting on each.
@@ -72,6 +66,9 @@ pub(crate) struct Uplink {
     runtime: Handle,
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
+    /// The longest a call waits for the hub's answer:
+    /// [`HUB_CALL_WAIT`](crate::bounds::HUB_CALL_WAIT), but for a test.
+    call_wait: std::time::Duration,
     reach: Mutex<Reach>,
     /// Each client session's connection, by the session's ID.
     sessions: Mutex<HashMap<u64, Arc<Client>>>,
@@ -96,6 +93,7 @@ impl Uplink {
         runtime: Handle,
         clock: Arc<dyn Clock>,
         entropy: Arc<dyn Entropy>,
+        call_wait: std::time::Duration,
     ) -> Self {
         Self {
             link,
@@ -103,6 +101,7 @@ impl Uplink {
             runtime,
             clock,
             entropy,
+            call_wait,
             reach: Mutex::default(),
             sessions: Mutex::default(),
             changes: tokio::sync::watch::Sender::new(0),
@@ -393,7 +392,7 @@ impl Uplink {
     }
 
     /// Makes one call on a connection and waits for its answer, for at
-    /// most [`CALL_WAIT`], and never past a stop's deadline. A connection
+    /// most [`call_wait`](Self::call_wait), and never past a stop's deadline. A connection
     /// whose hub has gone without closing it, as one does when the network
     /// drops, would otherwise be waited on for good. Also says whether the
     /// call may be sent again at once on a new connection: not after a
@@ -404,13 +403,13 @@ impl Uplink {
         method: &str,
         params: Value,
     ) -> (Result<Value, ritornel_client::Error>, bool) {
-        match self.wait_on(Some(CALL_WAIT), client.call_raw(method, params)) {
+        match self.wait_on(Some(self.call_wait), client.call_raw(method, params)) {
             Some(answer) => (answer, true),
             None => (
                 Err(ritornel_client::Error::Transport(if self.stopped() {
                     "the server is stopping".to_owned()
                 } else {
-                    format!("no answer in {} seconds", CALL_WAIT.as_secs())
+                    format!("no answer in {} seconds", self.call_wait.as_secs())
                 })),
                 false,
             ),

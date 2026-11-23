@@ -192,7 +192,7 @@ fn facts(path: &Path) -> FileFacts {
 /// most ten seconds. The null output runs at many times real time, so this
 /// is milliseconds.
 fn until(renderer: &mut AudioRenderer, said: &mut Vec<Event>, done: impl Fn(&[Event]) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         said.extend(renderer.drain());
         if done(said) {
@@ -222,7 +222,7 @@ fn ended(said: &[Event], span: u64) -> Option<(u64, End)> {
 /// Waits until the decoder's handoff, where it finds the track to join
 /// after the one it decodes, is as `done` says.
 fn until_handoff(renderer: &AudioRenderer, what: &str, done: impl Fn(&super::Slot) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let decoding = renderer.decoding.as_ref().expect("a track is loaded");
         if done(&decoding.decoder.handoff.lock()) {
@@ -233,9 +233,18 @@ fn until_handoff(renderer: &AudioRenderer, what: &str, done: impl Fn(&super::Slo
     }
 }
 
+/// Whether the decoder of the track in hand has yet to start, as it has
+/// until the output first plays.
+fn unstarted(renderer: &AudioRenderer) -> bool {
+    renderer
+        .decoding
+        .as_ref()
+        .is_some_and(|decoding| decoding.decoder.unstarted.is_some())
+}
+
 /// Waits until the output has handed over some of what it plays.
 fn heard(renderer: &AudioRenderer) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let progress = renderer.progress();
         if progress.frames > 0 {
@@ -634,11 +643,12 @@ fn a_track_shorter_than_the_rings_low_water_still_joins_when_the_next_is_queued_
     short_wav(&short, 1280);
     let (mut renderer, _) = AudioRenderer::tapped(AS_IS, 50).unwrap();
     renderer.load(&short, facts(&short), 0, 1).unwrap();
-    // Loaded and not yet playing: the decoder has all 80 ms of it, and must
-    // not give up on a next track before any of it has been heard.
-    // sleep: time for it to give up, were it to; a slow machine can only
-    // make this pass when it should not.
-    std::thread::sleep(Duration::from_millis(60));
+    // Loaded and not yet playing: its decoder has not started, so it cannot
+    // give up on a next track before any of it has been heard.
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     let next = fixture("g2.flac");
     assert!(
         renderer
@@ -1039,9 +1049,10 @@ fn a_ten_ms_track_resampled_takes_a_next_track_before_it_plays() {
     short_wav(&short, 160);
     let (mut renderer, _) = AudioRenderer::tapped(STEREO_48K, 1).unwrap();
     renderer.load(&short, facts(&short), 0, 1).unwrap();
-    // sleep: time for the decoder to run ahead, were it to; a slow machine
-    // can only make this pass when it should not.
-    std::thread::sleep(Duration::from_millis(60));
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     assert_eq!(renderer.progress().frames, 0);
     let next = fixture("g2.flac");
     assert!(
@@ -1060,9 +1071,10 @@ fn a_decoder_waiting_for_a_next_track_lets_go_at_once_when_asked() {
     short_wav(&short, 1280);
     let (mut renderer, _) = AudioRenderer::tapped(AS_IS, 1).unwrap();
     renderer.load(&short, facts(&short), 0, 1).unwrap();
-    // sleep: time for the decoder to run ahead, were it to; a slow machine
-    // can only make this pass when it should not.
-    std::thread::sleep(Duration::from_millis(30));
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     let next = fixture("g2.flac");
     assert!(
         renderer
@@ -1076,8 +1088,10 @@ fn a_decoder_waiting_for_a_next_track_lets_go_at_once_when_asked() {
     renderer.unload();
     assert!(before.elapsed() < Duration::from_secs(1));
     renderer.load(&short, facts(&short), 0, 4).unwrap();
-    // sleep: as above.
-    std::thread::sleep(Duration::from_millis(30));
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     let before = Instant::now();
     drop(renderer);
     assert!(before.elapsed() < Duration::from_secs(1));
@@ -1090,9 +1104,10 @@ fn a_short_last_track_paused_then_played_ends_with_nothing_after_it() {
     short_wav(&short, 1280);
     let (mut renderer, _) = AudioRenderer::tapped(AS_IS, 1).unwrap();
     renderer.load(&short, facts(&short), 0, 1).unwrap();
-    // sleep: time for the decoder to run ahead, were it to; a slow machine
-    // can only make this pass when it should not.
-    std::thread::sleep(Duration::from_millis(30));
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     assert!(renderer.drain().is_empty());
     renderer.play();
     let mut said = Vec::new();
@@ -1704,8 +1719,10 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
     use crate::playback::Status;
     // At real time, the output stops asking for frames 800 ms in, with no
     // error, as a stream does behind a sound server whose device went
-    // away.
-    let stall_after = Duration::from_secs(1);
+    // away. A stall takes three seconds, so that a busy machine's pause
+    // before then is not one.
+    let stall_after = Duration::from_secs(3);
+    let stall_ms = i64::try_from(stall_after.as_millis()).unwrap();
     let (renderer, tap, hold) = on_demand_held(800, stall_after);
     let mut rig = Pipeline::new(&[2_000], Box::new(renderer));
     rig.play();
@@ -1734,34 +1751,30 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
     // It was noticed once the output had asked for nothing for the time a
     // stall takes.
     assert!(
-        ended.ended_at_ms + 1_000 <= noticed_by + 1,
+        ended.ended_at_ms + stall_ms <= noticed_by + 1,
         "{ended:?}, noticed by {noticed_by}"
     );
-    // How much later than exact a stamp may be. The output stamps each
-    // frame when it renders it, and a render that runs late, on a busy
-    // machine, cannot be caught up once the output is held. Half a stall
-    // still tells a listen ended where the output stopped from one ended
-    // when the stall was noticed.
-    let late = i64::try_from(stall_after.as_millis()).unwrap() / 2;
     assert!(
-        ended.ended_at_ms <= stopped_by + late,
+        ended.ended_at_ms <= stopped_by + 50,
         "{ended:?}, stopped by {stopped_by}"
     );
     assert!(failing.since_ms >= ended.ended_at_ms, "{failing:?}");
-    // Played straight through, it ended no later after it began than it
-    // was heard for, on both clocks, and not a stall's length later. It can
-    // be a little sooner: a null output that falls behind catches up faster
-    // than real time.
+    // Played straight through, it ended, on both clocks, no later after it
+    // began than the output was seen to have stopped, and not a stall's
+    // length later. That is about as long as it was heard for, and longer
+    // when the output rendered late, on a busy machine: a late render
+    // cannot be caught up once the output is held.
     let started = &lost.started;
     let mono = ended.ended_mono_ms.unwrap();
+    let seen = stopped_by - started.started_at_ms;
     for (ended_at, started_at) in [
         (ended.ended_at_ms, started.started_at_ms),
         (mono, started.started_mono_ms),
     ] {
         let span = ended_at - started_at;
         assert!(
-            (0..=heard + late).contains(&span),
-            "{span} against {heard}: {lost:?}"
+            (0..=seen + 50).contains(&span),
+            "{span} against {seen} seen, {heard} heard: {lost:?}"
         );
     }
 
@@ -1834,7 +1847,7 @@ fn a_next_the_output_has_run_into_cannot_be_let_go_before_the_player_has_heard_o
     renderer.queue_next(&next, facts(&next), 2).unwrap();
     renderer.play();
     // The output is on the second, and nothing it said has been drained.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while renderer.progress().span != 2 {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(1));

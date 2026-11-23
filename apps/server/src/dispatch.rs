@@ -266,6 +266,7 @@ impl Core {
                 runtime.clone(),
                 Arc::clone(&clock),
                 Arc::clone(&entropy),
+                bounds.hub_call_wait,
             ))),
             _ => None,
         };

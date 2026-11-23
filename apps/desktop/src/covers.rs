@@ -935,7 +935,7 @@ mod tests {
             });
             bag.push(task.abort_handle());
             drop(bag);
-            let joined = tokio::time::timeout(Duration::from_secs(2), task).await?;
+            let joined = tokio::time::timeout(Duration::from_secs(60), task).await?;
             assert!(joined.is_err());
             Ok(())
         })

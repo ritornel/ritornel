@@ -1008,7 +1008,7 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
     bounded(async {
         let scratch = Scratch::new();
         invent(&scratch.data_dir(), &scratch.root(), 8);
-        let child = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
             .arg("serve")
             .arg("--data-dir")
             .arg(scratch.data_dir())
@@ -1026,6 +1026,13 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
         let found = loop {
             if let Ok(server) = ritornel_client::local::find(&scratch.data_dir()).await {
                 break server;
+            }
+            if let Some(ended) = child.try_wait().unwrap() {
+                let mut said = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    std::io::Read::read_to_string(&mut stderr, &mut said).unwrap();
+                }
+                panic!("the server ended before it was found, with {ended}: {said}");
             }
             // sleep: between looks while it starts; the test's WAIT bounds them.
             tokio::time::sleep(Duration::from_millis(20)).await;

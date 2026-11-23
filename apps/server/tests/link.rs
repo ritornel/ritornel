@@ -717,7 +717,9 @@ async fn while_the_hub_is_away_a_satellite_says_so_and_comes_back_with_it() {
             .await;
             match tried {
                 Ok(hub) => break hub,
-                Err(ritornel_server::Error::Listen { .. }) => {
+                Err(ritornel_server::Error::Listen { source, .. })
+                    if source.kind() == std::io::ErrorKind::AddrInUse =>
+                {
                     // sleep: between tries; the test's WAIT bounds them.
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
@@ -1726,8 +1728,11 @@ async fn a_satellite_stops_in_time_while_its_hub_does_not_answer_and_its_listens
             Listen::on_port(0),
             Arc::new(SystemClock),
             Arc::new(OsEntropy),
+            // A call to the hub waits a minute here, so that a stop that
+            // waited for one would be plain to see.
             Bounds {
                 stop_grace: grace,
+                hub_call_wait: Duration::from_secs(60),
                 ..Bounds::default()
             },
             Run {
@@ -1787,14 +1792,14 @@ async fn a_satellite_stops_in_time_while_its_hub_does_not_answer_and_its_listens
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // A call waits on the hub for eight seconds (`CALL_WAIT`); the stop
-        // gives it one, and spends that at most twice. A stop that waited
-        // for the call would take the eight.
+        // A call waits on the hub for a minute; the stop gives it one
+        // second, and spends that at most twice. A stop that waited for the
+        // call would take the minute.
         drop(desk_client);
         let stopping = std::time::Instant::now();
         desk.stop().await.unwrap();
         let took = stopping.elapsed();
-        assert!(took < Duration::from_secs(8), "{took:?}");
+        assert!(took < Duration::from_secs(30), "{took:?}");
         assert!(waiting(&scratch) >= 1);
 
         // The hub answers again, and the next run sends what waits again:

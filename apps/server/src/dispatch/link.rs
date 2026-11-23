@@ -447,6 +447,7 @@ impl Core {
                 runtime.clone(),
                 std::sync::Arc::clone(&self.clock),
                 std::sync::Arc::clone(&self.entropy),
+                self.bounds.hub_call_wait,
             );
             let mut held = self.uplink.write().unwrap_or_else(PoisonError::into_inner);
             // A stop that began meanwhile holds this link to its deadline.

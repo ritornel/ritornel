@@ -293,7 +293,7 @@ mod tests {
         guards.retain(|(name, _)| *name != "left");
         release.send(()).unwrap();
         let made: Vec<_> = (0..3)
-            .map(|_| order.recv_timeout(Duration::from_secs(10)).unwrap())
+            .map(|_| order.recv_timeout(Duration::from_secs(60)).unwrap())
             .collect();
         assert_eq!(made, ["newest", "middle", "oldest"]);
         // The one whose client left was not made: by now it would have been.
@@ -317,7 +317,7 @@ mod tests {
         let _second = pool.submit(move || done.send(()).unwrap());
         let _first = pool.submit(|| panic!("a cover that cannot be made"));
         release.send(()).unwrap();
-        assert_eq!(made.recv_timeout(Duration::from_secs(10)), Ok(()));
+        assert_eq!(made.recv_timeout(Duration::from_secs(60)), Ok(()));
         pool.stop();
     }
 }

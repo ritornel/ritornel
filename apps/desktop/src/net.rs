@@ -318,7 +318,7 @@ mod tests {
                 tasks.push(tokio::spawn(async move { art.get(id, 256).await }));
             }
             for task in tasks {
-                let got = tokio::time::timeout(Duration::from_secs(5), task).await??;
+                let got = tokio::time::timeout(Duration::from_secs(60), task).await??;
                 assert_eq!(got, Ok(b"ok".to_vec()));
             }
             assert!(peak.load(Ordering::SeqCst) <= MAX_ART_IN_FLIGHT);

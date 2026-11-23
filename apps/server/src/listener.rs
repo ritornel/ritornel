@@ -114,7 +114,7 @@ pub(crate) async fn bind(listen: Listen) -> Result<TcpListener, Error> {
                     ErrorKind::AddrInUse | ErrorKind::PermissionDenied
                 ) =>
             {
-                info!(%address, "the default port is taken: asking the system for another");
+                info!(%address, error = %taken, "the default port cannot be had: asking the system for another");
                 TcpListener::bind(fallback)
                     .await
                     .map_err(|source| Error::Listen {
