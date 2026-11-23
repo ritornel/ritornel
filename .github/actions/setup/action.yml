@@ -18,6 +18,14 @@ inputs:
       ninety conda packages, and the fixtures it made are committed, so it
       comes off this list with the first step that needs it.
     default: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny
+  rust-cache:
+    description: >-
+      The Rust build cache the job uses. `own` restores the job's own and,
+      on main, saves it. `workspace` restores the workspace job's on the same
+      system and saves nothing, for a job whose build is mostly the same.
+      `crates` keeps only the crates downloaded, for a job that rebuilds
+      quickly enough to be worth no build cache.
+    default: own
 
 runs:
   using: composite
@@ -33,11 +41,18 @@ runs:
       env:
         PACKAGES: ${{ inputs.packages }}
       run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends $PACKAGES
+    # Only main saves caches, so that PRs restore from it and do not fill
+    # the repository's cache quota, 10 GB, which evicts the least recently
+    # used when it is full.
     - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
-    # Only main saves, so that PRs restore from it and their builds do not
-    # fill the cache quota. The key is the job's, its system and its
-    # architecture.
+      with:
+        cache_save: ${{ github.ref == 'refs/heads/main' }}
+    # The key is the job's, or with `workspace` the workspace job's (a
+    # shared key named for that job is the same key), and the system's and
+    # architecture's.
     - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         workspaces: ${{ inputs.workspaces }}
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        shared-key: ${{ inputs.rust-cache == 'workspace' && 'workspace' || '' }}
+        cache-targets: ${{ inputs.rust-cache != 'crates' }}
+        save-if: ${{ github.ref == 'refs/heads/main' && inputs.rust-cache != 'workspace' }}

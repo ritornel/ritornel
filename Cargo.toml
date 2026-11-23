@@ -53,3 +53,14 @@ unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
 indexing_slicing = "warn"
+
+# Many tests invent a library first, and drawing and encoding its covers
+# unoptimised took most of the time the tests run. The drawing is in the
+# engine, so it and the image crate it encodes with are optimised even in a
+# debug build: inventing is six times faster, and the engine takes a little
+# longer to compile.
+[profile.dev.package.ritornel-engine]
+opt-level = 1
+
+[profile.dev.package.image]
+opt-level = 3

@@ -11,6 +11,8 @@ idiomatic_version_file_enable_tools = ["rust"]
 "conda:ffmpeg" = "9.0.2"
 # Checks every dependency's licence against deny.toml.
 "aqua:EmbarkStudios/cargo-deny" = "0.21.0"
+# Runs the tests, each in a process of its own, all binaries at once.
+"aqua:nextest-rs/nextest/cargo-nextest" = "0.9.151"
 
 [tasks.build]
 description = "Build every crate and both programs, and on macOS and Linux the desktop app"
@@ -71,7 +73,16 @@ run = [
 
 [tasks.test]
 description = "Run the tests"
-run = "cargo test --locked --workspace --all-features"
+run = [
+    "cargo nextest run --locked --workspace --all-features",
+    # nextest runs no doc tests.
+    "cargo test --locked --workspace --all-features --doc",
+]
+# nextest runs each test in a process of its own. The tests name their
+# folders by process id, which Windows soon gives out again, and a folder
+# Windows could not remove while it was in use is then found by another
+# test. There cargo test runs each binary's tests in one process.
+run_windows = "cargo test --locked --workspace --all-features"
 
 [tasks.schema]
 description = "Write the schema snapshots in schema/ again from the migrations"
