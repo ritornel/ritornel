@@ -312,9 +312,17 @@ fn scan_adds_the_folder_scans_it_and_the_stats_say_what_came_out() {
     assert_eq!(again["job"]["state"], "succeeded");
     assert_eq!(again["job"]["scan"]["unchanged"], 4);
     assert_eq!(json(&data_dir, &["library", "stats"])["libraryRevision"], 4);
+    // The server watches its sources, and the system may tell it of a
+    // change in the folder after the scans, so it may have rescanned it as
+    // well: every job listed is a scan, and the second scan is one.
     let listed = json(&data_dir, &["jobs"]);
-    assert_eq!(listed["jobs"].as_array().unwrap().len(), 2);
-    assert_eq!(listed["jobs"][0]["jobId"], again["job"]["jobId"]);
+    let jobs = listed["jobs"].as_array().unwrap();
+    assert!(jobs.len() >= 2, "{listed}");
+    assert!(jobs.iter().all(|job| job["kind"] == "scan"), "{listed}");
+    assert!(
+        jobs.iter().any(|job| job["jobId"] == again["job"]["jobId"]),
+        "{listed}"
+    );
     let one = json(
         &data_dir,
         &["jobs", again["job"]["jobId"].as_str().unwrap()],

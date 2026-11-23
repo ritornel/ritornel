@@ -400,8 +400,10 @@ fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_on
         ABORTED
     );
 
-    // The run after that is a normal one.
-    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
+    // The run after that is a normal one. At twice real time, the rest of
+    // the first track lasts long after the test stops it, however slowly
+    // the stop comes.
+    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "2")]);
     // The queue and the position are back, and nothing plays.
     let now = json(&data_dir, &["now"]);
     assert_eq!(now["status"], "paused");
