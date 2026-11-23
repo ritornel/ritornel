@@ -91,10 +91,9 @@ pub struct Stored {
     /// Records stored before for the span that the source no longer
     /// holds. They stay: a record is never removed.
     pub gone: u64,
-    /// Of those, the ones a full read found stored twice, as an earlier
-    /// read could: the source holds one record of the same track at the
-    /// same time, and the core holds more. Each is left out of the plays,
-    /// and stays. None on a read that is not full.
+    /// Of those, the ones a full read found an earlier read stored twice,
+    /// in place of another record of the same second it missed. Each is
+    /// left out of the plays, and stays. None on a read that is not full.
     pub set_aside: u64,
 }
 
@@ -154,8 +153,8 @@ pub trait Sink {
     /// The cursor the last stored batch left, if any batch is stored.
     fn cursor(&mut self) -> Result<Option<String>, Error>;
     /// Stores a batch and its cursor, in one transaction. A record stored
-    /// before writes nothing, and a batch with nothing new writes nothing
-    /// at all, its cursor included.
+    /// before writes nothing, and a batch with nothing new moves no cursor
+    /// and writes nothing, but what the core sets aside on a full read.
     fn commit(&mut self, batch: Batch) -> Result<Stored, Error>;
     /// Makes the stored loved tracks the list as it stands now.
     fn loves(&mut self, loves: Vec<Love>) -> Result<LovesStored, Error>;

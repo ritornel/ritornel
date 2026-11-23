@@ -535,7 +535,8 @@ struct Recheck {
 /// whose first read, the write that first stored imports of it, stored as
 /// many as the source lists now, but more of one track and fewer of
 /// another. Of the track it stored more of, the imports the source does not
-/// list are set aside, never more than the surplus. A later read may have
+/// list are set aside, never so many that fewer of it count than the
+/// source lists. A later read may have
 /// stored the one missed since, which changes nothing here. A scrobble
 /// deleted at the source, or one added to it later, changes how many the
 /// second holds, and is never taken for one. Only an import whose play is its own is set
@@ -570,11 +571,15 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
         rev: i64,
         listed: bool,
         track: Track,
+        excluded: bool,
         takeable: bool,
         set_aside_by: Option<i64>,
     }
     let mut statement = connection.prepare_cached(
         "SELECT o.id, o.rev, o.source_key, i.played_at_utc_ms, i.artist, i.album, i.title,
+                EXISTS (SELECT 1 FROM play_event_observation peo
+                        JOIN play_event pe ON pe.id = peo.play_event_id
+                        WHERE peo.observation_id = o.id AND pe.excluded = 1),
                 NOT EXISTS (SELECT 1 FROM correction_target t
                             JOIN observation_correction c ON c.observation_id = t.correction_id
                             WHERE t.target_observation_id = o.id AND c.verb = 'exclude')
@@ -608,8 +613,9 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
             rev: row.get(1)?,
             listed: keys.contains(key.as_slice()),
             track: (row.get(4)?, row.get(5)?, row.get(6)?),
-            takeable: row.get(7)?,
-            set_aside_by: row.get(8)?,
+            excluded: row.get(7)?,
+            takeable: row.get(8)?,
+            set_aside_by: row.get(9)?,
         });
     }
     let mut found = Recheck::default();
@@ -631,13 +637,17 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
         if first.len() != listed.values().sum::<usize>() {
             continue;
         }
-        let mut stored: HashMap<&Track, usize> = HashMap::new();
+        // How many of each track the first read stored, and how many of
+        // those still count.
+        let mut stored: HashMap<&Track, (usize, usize)> = HashMap::new();
         for import in &first {
-            *stored.entry(&import.track).or_default() += 1;
+            let (all, counting) = stored.entry(&import.track).or_default();
+            *all += 1;
+            *counting += usize::from(!import.excluded);
         }
-        for (track, stored) in stored {
+        for (track, (stored, counting)) in stored {
             let lists = listed.get(track).copied().unwrap_or(0);
-            if lists == 0 || stored <= lists {
+            if lists == 0 || stored <= lists || counting <= lists {
                 continue;
             }
             found.set_aside.extend(
@@ -645,7 +655,7 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
                     .iter()
                     .filter(|import| &import.track == track && !import.listed && import.takeable)
                     .map(|import| import.observation)
-                    .take(stored - lists),
+                    .take(counting - lists),
             );
         }
     }
@@ -972,7 +982,8 @@ impl LibraryStore {
     /// Takes in a batch of import records through the one ingest call (see
     /// [`LibraryStore::ingest`]): every record that is new, the plays
     /// derived from them and the batch's cursor, in one transaction. A
-    /// batch with nothing new writes nothing, its cursor included. Of a
+    /// batch with nothing new moves no cursor, and writes nothing unless a
+    /// full read finds something to set aside or lift. Of a
     /// `full` read, the same transaction sets aside what an earlier read
     /// stored twice in the batch's span, each with an `exclude` correction
     /// that says [`DUPLICATE_NOTE`], and revokes such a correction whose
@@ -984,8 +995,8 @@ impl LibraryStore {
         full: bool,
         rule: ritornel_domain::history::PlayRule,
     ) -> Result<Stored, Error> {
-        // Read first: a batch that is all stored already writes nothing,
-        // and takes no library revision.
+        // Read first: a batch that is all stored already, with nothing to
+        // set aside or lift, writes nothing and takes no library revision.
         let (new, gone, rechecked) = {
             let batch = batch.clone();
             self.read(move |connection| {
@@ -1279,7 +1290,7 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
         "SELECT count(*), count(pe.recording_id) FROM play_event pe
          JOIN play_event_observation peo ON peo.play_event_id = pe.id AND peo.role = 'primary'
          JOIN history_observation o ON o.id = peo.observation_id
-         WHERE o.endpoint_id = ?1",
+         WHERE o.endpoint_id = ?1 AND pe.excluded = 0",
         [rows.endpoint],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1292,8 +1303,11 @@ fn report(connection: &Connection, account: Id, limit: usize) -> Result<ImportRe
     )?;
     let mut plays_of: HashMap<i64, i64> = HashMap::new();
     let mut statement = connection.prepare(
-        "SELECT source_item_id, count(*) FROM history_observation
-         WHERE endpoint_id = ?1 AND kind = 'import' GROUP BY source_item_id",
+        "SELECT o.source_item_id, count(*) FROM history_observation o
+         JOIN play_event_observation peo ON peo.observation_id = o.id
+         JOIN play_event pe ON pe.id = peo.play_event_id
+         WHERE o.endpoint_id = ?1 AND o.kind = 'import' AND pe.excluded = 0
+         GROUP BY o.source_item_id",
     )?;
     for row in statement.query_map([rows.endpoint], |row| Ok((row.get(0)?, row.get(1)?)))? {
         let (item, plays) = row?;

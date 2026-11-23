@@ -197,8 +197,10 @@ fn a_full_read_sets_aside_a_scrobble_an_earlier_read_stored_twice() {
         T0,
     );
     let counted = "SELECT count(*) FROM play_event WHERE excluded = 0";
-    let corrections =
-        "SELECT count(*) FROM observation_correction WHERE verb = 'exclude' AND note IS NOT NULL";
+    let corrections = format!(
+        "SELECT count(*) FROM observation_correction WHERE verb = 'exclude' AND note = '{}'",
+        super::DUPLICATE_NOTE
+    );
 
     // A read that is not full stores what is new and sets nothing aside.
     let stored = rig.ingest(&held);
@@ -210,7 +212,7 @@ fn a_full_read_sets_aside_a_scrobble_an_earlier_read_stored_twice() {
     let stored = rig.read(&held, true);
     assert_eq!((stored.new, stored.gone, stored.set_aside), (0, 2, 1));
     assert_eq!(rig.one(counted), "3");
-    assert_eq!(rig.one(corrections), "1");
+    assert_eq!(rig.one(&corrections), "1");
     assert_eq!(
         rig.one("SELECT count(*) FROM history_observation WHERE kind = 'import'"),
         "4",
@@ -332,6 +334,56 @@ fn a_full_read_keeps_a_repeat_deleted_at_the_source_and_lifts_one_listed_again()
     let revision = rig.revision();
     assert_eq!(rig.read(&added, true).set_aside, 0);
     assert_eq!(rig.revision(), revision);
+}
+
+#[test]
+fn a_full_read_never_leaves_fewer_counted_than_the_source_lists() {
+    let rig = rig();
+    let at = T0 - 3 * HOUR;
+    rig.ingest(&batch(
+        vec![
+            record(at, "Moss Arcade", "Paper Kites", 0),
+            record(at, "Moss Arcade", "Paper Kites", 1),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    ));
+    // The first copy is already left out, by a correction of the owner's.
+    let first = rig.one("SELECT min(id) FROM history_observation WHERE kind = 'import'");
+    let first: i64 = first.parse().unwrap();
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.exclude",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                crate::history_store::exclude(
+                    write,
+                    &[first],
+                    "the owner's",
+                    ritornel_domain::history::PlayRule::CURRENT,
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    // A shifted read's shape, but the copy the source does not list is the
+    // one that still counts: it stays.
+    let held = batch(
+        vec![
+            record(at, "Moss Arcade", "Paper Kites", 0),
+            record(at, "moss arcade", "LANTERNFISH", 0),
+        ],
+        T0 - 4 * HOUR,
+        T0,
+    );
+    assert_eq!(rig.read(&held, true).set_aside, 0);
+    assert_eq!(
+        rig.one("SELECT count(*) FROM play_event WHERE excluded = 0"),
+        "2"
+    );
 }
 
 #[test]
