@@ -72,6 +72,12 @@ rustix = { version = "1.1.6", features = ["fs", "time"] }
 # really is.
 [target.'cfg(windows)'.dependencies]
 ritornel-windows.workspace = true
+# cpal's own thread, which WASAPI wakes every few milliseconds for the next
+# frames, joins the system's audio scheduling (MMCSS) through `realtime`: at
+# normal priority it wakes late whenever every core is busy, and the sound
+# drops out. CoreAudio's threads are real-time already. See
+# docs/internals/platforms.md, "Windows".
+cpal = { version = "=0.18.2", optional = true, features = ["realtime"] }
 
 # The system's audio output: CoreAudio on macOS, WASAPI on Windows, and ALSA
 # on Linux, which reaches PipeWire and PulseAudio through their ALSA
