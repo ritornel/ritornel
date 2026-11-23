@@ -36,8 +36,11 @@ use tokio::net::TcpStream;
 use crate::{Client, Credential, Error, NotRunning, http};
 
 /// How long a server on this machine gets to answer for its descriptor
-/// before the client takes it for gone.
-const ANSWER_WAIT: Duration = Duration::from_secs(2);
+/// before the client takes it for gone. It answers in milliseconds, but a
+/// busy or slow machine, such as a Raspberry Pi, can keep it waiting for
+/// seconds, and one that is running is not gone: this is as long as any
+/// other exchange with it may take.
+const ANSWER_WAIT: Duration = Duration::from_secs(10);
 
 /// Where the data directory is: `flag` (`--data-dir`), then
 /// `RITORNEL_DATA_DIR`, then the platform's default, exactly as the server
