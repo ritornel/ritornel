@@ -460,6 +460,9 @@ pub(crate) enum Scope {
     /// Spotify's tracks alone: what a run of streams applied or undone can
     /// move.
     Spotify,
+    /// One account's scrobbled tracks, by its source instance: what its
+    /// sync can move.
+    Account(i64),
 }
 
 /// A track whose binding the matcher would change: its source instance,
@@ -470,22 +473,35 @@ type Change = (i64, Subject, Result<Wanted, UnbindReason>);
 /// says, the owner's own bindings left out. A track of Spotify's that no
 /// stream in force names is released, when the matcher bound it.
 fn changes(connection: &Connection, scope: Scope) -> Result<Vec<Change>, Error> {
-    let mut judged = judged_tracks(connection)?;
-    if scope == Scope::Library {
-        let instances: Vec<i64> = connection
+    // Spotify's tracks are judged but for one account's sync.
+    let account_only = matches!(scope, Scope::Account(_));
+    let mut judged = if account_only {
+        Vec::new()
+    } else {
+        judged_tracks(connection)?
+    };
+    let instances: Vec<i64> = match scope {
+        Scope::Library => connection
             .prepare("SELECT source_instance_id FROM service_account ORDER BY id")?
             .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        for instance in instances {
-            judged.extend(
-                judged_subjects(connection, instance)?
-                    .into_iter()
-                    .map(|(subject, now)| (instance, subject, now)),
-            );
-        }
+            .collect::<Result<_, _>>()?,
+        Scope::Spotify => Vec::new(),
+        Scope::Account(instance) => vec![instance],
+    };
+    for instance in instances {
+        judged.extend(
+            judged_subjects(connection, instance)?
+                .into_iter()
+                .map(|(subject, now)| (instance, subject, now)),
+        );
     }
     let mut found = Vec::new();
-    for (instance, item, now) in unnamed_tracks(connection)? {
+    let unnamed = if account_only {
+        Vec::new()
+    } else {
+        unnamed_tracks(connection)?
+    };
+    for (instance, item, now) in unnamed {
         if now.is_some() {
             let unnamed = UnbindReason {
                 verdict: "unnamed",
@@ -1227,26 +1243,33 @@ impl LibraryStore {
     /// Spotify's tracks by the names of its newest stream in force. Binds
     /// those the matcher is now sure of, moves or releases a binding that no
     /// longer holds, and derives their plays again, in one write. Run after
-    /// anything that changed what the library holds: a resolve or a sync.
+    /// a resolve that changed what the library holds; a sync judges its own
+    /// account with [`match_library_for`](Self::match_library_for).
     /// Returns how many bindings changed; with none, nothing is written.
     pub fn match_library(&self) -> Result<usize, Error> {
-        Ok(self.match_all()?.values().sum())
+        Ok(self.match_scope(Scope::Library)?.values().sum())
     }
 
     /// As [`match_library`](Self::match_library), and returns how many of
     /// the bindings that changed are the account's: what its sync says.
+    /// Only the account's tracks are judged: a scan and a run of streams
+    /// judge the rest of the library when they change it.
     pub fn match_library_for(&self, account: Id) -> Result<usize, Error> {
         let instance = self.read(move |connection| Ok(rows_of(connection, account)?.instance))?;
-        Ok(self.match_all()?.get(&instance).copied().unwrap_or(0))
+        Ok(self
+            .match_scope(Scope::Account(instance))?
+            .get(&instance)
+            .copied()
+            .unwrap_or(0))
     }
 
-    /// Matches the whole library, by source instance. Whether anything
+    /// Matches the tracks in scope, by source instance. Whether anything
     /// differs is read first, so that nothing is written when nothing
     /// does; what is written is judged again inside the write, against what
     /// the library holds then.
-    fn match_all(&self) -> Result<BTreeMap<i64, usize>, Error> {
+    fn match_scope(&self, scope: Scope) -> Result<BTreeMap<i64, usize>, Error> {
         let differ =
-            self.read_snapshot(|connection| Ok(!changes(connection, Scope::Library)?.is_empty()))?;
+            self.read_snapshot(move |connection| Ok(!changes(connection, scope)?.is_empty()))?;
         if !differ {
             return Ok(BTreeMap::new());
         }
@@ -1256,7 +1279,7 @@ impl LibraryStore {
                 command: None,
                 client: None,
             },
-            move |write| Ok(serde_json::to_string(&match_in(write, Scope::Library)?)?),
+            move |write| Ok(serde_json::to_string(&match_in(write, scope)?)?),
         )?;
         Ok(serde_json::from_str(&written.result_json)?)
     }

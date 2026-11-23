@@ -1600,12 +1600,16 @@ fn of_two_streams_that_ended_together_the_names_decide_whichever_came_first() {
     there.reason_end = Some("endplay".to_owned());
     let mut elsewhere = stream(T0 - HOUR, 200_000, "Paper Kites");
     elsewhere.album = Some("A Record It Is Not On".to_owned());
+    // One archive reports the stream twice, with other fields; whichever row
+    // comes first, both are stored.
     let first = rig();
-    apply(&first, 1, vec![there.clone()]);
-    apply(&first, 2, vec![elsewhere.clone()]);
+    apply(&first, 1, vec![there.clone(), elsewhere.clone()]);
     let second = rig();
-    apply(&second, 1, vec![elsewhere]);
-    apply(&second, 2, vec![there]);
+    apply(&second, 1, vec![elsewhere, there]);
+    assert_eq!(
+        first.one("SELECT count(*) FROM observation_import_stream"),
+        "2"
+    );
     // "A Record It Is Not On" sorts before "Tin Weather": its names win in
     // both, and hold the track back.
     assert_eq!(track_bound(&first, "Paper Kites"), "0");
