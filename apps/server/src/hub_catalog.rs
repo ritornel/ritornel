@@ -24,7 +24,7 @@ const TRACKS_PER_CALL: usize = 500;
 /// The most the cache of pulled masters holds, in bytes, unless the
 /// `cache_size` setting says otherwise. The oldest go first once it holds
 /// more.
-pub(crate) const CACHE_BYTES: u64 = 2 << 30;
+pub(crate) const DEFAULT_CACHE_BYTES: u64 = 2 << 30;
 
 /// The hub's library, as a satellite's player reads it.
 #[derive(Debug)]
@@ -150,7 +150,7 @@ impl HubCatalog {
                     ms = started.elapsed().as_millis(),
                     "a master was pulled from the hub"
                 );
-                trim(&self.cache, self.cache_bytes, &kept);
+                trim(&self.cache, self.cache_bytes, Some(&kept));
                 Ok(kept)
             }
             Ok(bytes) => {
@@ -171,27 +171,35 @@ impl HubCatalog {
 }
 
 /// Lets the oldest masters kept in `cache` go until it holds no more than
-/// `limit` bytes, but never `keep`, the one just pulled, nor one being
+/// `limit` bytes. It never lets go of `keep`, the one just pulled, nor of
+/// the newest other, which is playing or about to, nor of one being
 /// pulled.
-fn trim(cache: &Path, limit: u64, keep: &Path) {
+fn trim(cache: &Path, limit: u64, keep: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(cache) else {
         return;
     };
     let mut kept: Vec<(SystemTime, u64, PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
+            let metadata = entry.metadata().ok().filter(std::fs::Metadata::is_file)?;
             Some((metadata.modified().ok()?, metadata.len(), entry.path()))
         })
         .collect();
-    let mut total: u64 = kept.iter().map(|(_, size, _)| size).sum();
+    let mut total = kept
+        .iter()
+        .fold(0_u64, |total, (_, size, _)| total.saturating_add(*size));
     kept.sort();
     let pulling = |path: &Path| {
         path.extension()
             .is_some_and(|extension| extension == "part")
     };
+    let newest = kept
+        .iter()
+        .rev()
+        .find(|(_, _, path)| Some(path.as_path()) != keep && !pulling(path))
+        .map(|(_, _, path)| path.clone());
     for (_, size, path) in kept {
-        if path == keep || pulling(&path) {
+        if Some(path.as_path()) == keep || Some(&path) == newest.as_ref() || pulling(&path) {
             continue;
         }
         if total <= limit {
@@ -203,6 +211,26 @@ fn trim(cache: &Path, limit: u64, keep: &Path) {
             warn!(path = %path.display(), "a kept master could not be let go");
         }
     }
+}
+
+/// Tidies the cache as the server starts, when no pull can be under way:
+/// what a pull cut off left is let go, and the cache is brought within
+/// `limit`, which may have been lowered since it was filled.
+pub(crate) fn tidy(cache: &Path, limit: u64) {
+    let Ok(entries) = std::fs::read_dir(cache) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "part")
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            warn!(%error, path = %path.display(), "a master cut off as it was pulled could not be let go");
+        }
+    }
+    trim(cache, limit, None);
 }
 
 impl Catalog for HubCatalog {
@@ -309,11 +337,11 @@ impl Catalog for HubCatalog {
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use super::trim;
+    use super::{tidy, trim};
     use crate::testing::Scratch;
 
     #[test]
-    fn the_oldest_masters_go_until_the_cache_fits_but_never_the_one_kept_or_one_being_pulled() {
+    fn the_oldest_masters_go_until_the_cache_fits_but_never_the_newest_two_or_one_being_pulled() {
         let scratch = Scratch::new();
         let cache = scratch.path().join("audio");
         std::fs::create_dir_all(&cache).unwrap();
@@ -327,8 +355,8 @@ mod tests {
             let at = start + Duration::from_secs(60 * u64::try_from(at).unwrap());
             file.set_modified(at).unwrap();
         }
-        // The one just pulled is the oldest of all, as a master played
-        // again from a slow disk could be.
+        // The one just pulled is the oldest of all, as a file whose time was
+        // set by a clock that was wrong could be.
         let keep = cache.join("d.flac");
         std::fs::File::options()
             .append(true)
@@ -337,16 +365,25 @@ mod tests {
             .set_modified(start - Duration::from_secs(60))
             .unwrap();
 
-        trim(&cache, 300, &keep);
-        let mut left: Vec<_> = std::fs::read_dir(&cache)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        left.sort();
-        assert_eq!(left, ["c.flac", "d.flac", "e.part"]);
-
+        let left = || {
+            let mut left: Vec<_> = std::fs::read_dir(&cache)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            left.sort();
+            left
+        };
+        // The newest besides it, which plays, stays too, and so does the
+        // one being pulled.
+        trim(&cache, 300, Some(&keep));
+        assert_eq!(left(), ["c.flac", "d.flac", "e.part"]);
         // A cache already within its limit loses nothing.
-        trim(&cache, 300, &keep);
-        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 3);
+        trim(&cache, 300, Some(&keep));
+        assert_eq!(left(), ["c.flac", "d.flac", "e.part"]);
+
+        // As the server starts, a pull cut off is let go, and a limit
+        // lowered since is kept to, sparing the newest.
+        tidy(&cache, 100);
+        assert_eq!(left(), ["c.flac"]);
     }
 }

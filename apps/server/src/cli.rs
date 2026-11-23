@@ -300,7 +300,7 @@ mod tests {
             output: None,
             backup_dir: None,
             name: Some("Workbench Speakers".to_owned()),
-            cache_size: None,
+            cache_size: Some("8 GiB".to_owned()),
         });
         for line in [
             &[
@@ -314,6 +314,8 @@ mod tests {
                 "debug",
                 "--name",
                 "Workbench Speakers",
+                "--cache-size",
+                "8 GiB",
             ][..],
             &[
                 "serve",
@@ -324,6 +326,8 @@ mod tests {
                 "/srv/ritornel",
                 "--name",
                 "Workbench Speakers",
+                "--cache-size",
+                "8 GiB",
                 "--listen",
                 "127.0.0.1:5000",
             ],
@@ -334,6 +338,7 @@ mod tests {
                 "--data-dir=/srv/ritornel",
                 "--listen=127.0.0.1:5000",
                 "--name=Workbench Speakers",
+                "--cache-size=8 GiB",
             ],
         ] {
             assert_eq!(parse(args(line)).unwrap().command, expected, "{line:?}");

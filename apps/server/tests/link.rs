@@ -763,13 +763,18 @@ async fn play_to_the_end(client: &mut Client, source: PlaySource) {
 async fn a_satellite_keeps_no_more_of_the_hubs_music_than_its_cache_size() {
     bounded(async {
         let scratch = Scratch::new();
-        // Another song beside the album's one, with a master of its own.
+        // Two more songs beside the album, each with a master of its own.
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio");
-        let other = scratch.0.join("music").join("Somebody Else");
-        std::fs::create_dir_all(&other).unwrap();
-        std::fs::copy(fixtures.join("a.retagged.flac"), other.join("01.flac")).unwrap();
-        // A cache smaller than any master: each is let go once the next
-        // is pulled, and only the last is kept.
+        for (folder, fixture) in [
+            ("Somebody Else", "a.retagged.flac"),
+            ("Field Notes", "b.no-artist.flac"),
+        ] {
+            let folder = scratch.0.join("music").join(folder);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::copy(fixtures.join(fixture), folder.join("01.flac")).unwrap();
+        }
+        // A cache smaller than any master: each is let go once two newer
+        // are kept, the one playing and the one pulled after it.
         let (_hub, _hub_client, _desk, mut desk_client) =
             linked_player_with(&scratch, 100, Some(1)).await;
         let songs = desk_client.list_open(&songs()).await.unwrap();
@@ -781,12 +786,28 @@ async fn a_satellite_keeps_no_more_of_the_hubs_music_than_its_cache_size() {
                 _ => None,
             })
             .collect();
-        assert!(ids.len() > 1, "{ids:?}");
+        assert!(ids.len() >= 3, "{ids:?}");
         play_to_the_end(&mut desk_client, PlaySource::Tracks { ids }).await;
+        // Each played, and only the last two are kept.
+        let window = desk_client
+            .call::<QueueWindow>(&QueueWindowParams {
+                offset: 0,
+                limit: None,
+                order: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            window
+                .entries
+                .iter()
+                .all(|entry| entry.failed_reason.is_none()),
+            "{window:?}"
+        );
         let kept = std::fs::read_dir(scratch.data_dir("desk").join("cache").join("audio"))
             .unwrap()
             .count();
-        assert_eq!(kept, 1);
+        assert_eq!(kept, 2);
     })
     .await;
 }
