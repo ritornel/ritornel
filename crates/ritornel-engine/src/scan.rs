@@ -90,6 +90,10 @@ enum Phase {
     Missing,
     Replaced,
     Resolve,
+    /// The tracks other services named are judged against what the scan
+    /// made: after a resolve that wrote anything, and after a scan taken up
+    /// again whose resolve had committed.
+    Match,
     Done,
 }
 
@@ -235,7 +239,10 @@ impl ScanRun {
             source,
             root,
             settings,
-            phase: if finished { Phase::Done } else { Phase::Walk },
+            // A scan whose resolve committed may have stopped before it
+            // judged the tracks; judging them again changes nothing if it
+            // did not.
+            phase: if finished { Phase::Match } else { Phase::Walk },
             step,
             summary,
             dirty,
@@ -419,19 +426,30 @@ impl ScanRun {
                             self.summary.releases += resolved.releases;
                             self.committed()?;
                             // What the library holds changed: the tracks other
-                            // services named are judged against it again, so
-                            // that a record bought has its plays at once. A
-                            // write of its own, which writes nothing when
-                            // nothing moves, and so is safe to repeat.
-                            library.match_library()?;
+                            // services named are judged again next, so that
+                            // a record bought has its plays at once.
+                            self.phase = Phase::Match;
                         }
                         // Nothing was written, so the step was not taken.
-                        None => self.step -= 1,
+                        None => {
+                            self.step -= 1;
+                            self.phase = Phase::Done;
+                        }
                     }
                     self.dirty = false;
+                } else {
+                    self.phase = Phase::Done;
                 }
-                self.phase = Phase::Done;
                 self.label = None;
+                if self.phase == Phase::Done {
+                    return Ok(Some(self.summary));
+                }
+            }
+            Phase::Match => {
+                // A write of its own, which writes nothing when no binding
+                // moves, and so is safe to repeat.
+                library.match_library()?;
+                self.phase = Phase::Done;
                 return Ok(Some(self.summary));
             }
             Phase::Done => return Ok(Some(self.summary)),

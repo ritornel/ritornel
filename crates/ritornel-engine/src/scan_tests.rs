@@ -1961,9 +1961,9 @@ fn a_record_bought_later_has_its_scrobbles_and_streams_bound_by_the_scan_that_ad
         .unwrap();
     let bound = |rig: &Rig| {
         rig.one(
-            "SELECT group_concat(si.item_kind, ',') FROM source_item si
+            "SELECT group_concat(si.item_kind, ',' ORDER BY si.item_kind) FROM source_item si
              WHERE si.item_kind IN ('scrobble_subject', 'spotify_track')
-               AND si.current_recording_id IS NOT NULL ORDER BY si.item_kind",
+               AND si.current_recording_id IS NOT NULL",
         )
     };
     assert_eq!(bound(&rig), "-");
@@ -1979,4 +1979,65 @@ fn a_record_bought_later_has_its_scrobbles_and_streams_bound_by_the_scan_that_ad
         "1"
     );
     assert_eq!(rig.library.derived_history().unwrap().len(), plays.len());
+}
+
+#[test]
+fn a_scan_cut_off_after_its_resolve_judges_the_imported_tracks_when_it_is_taken_up() {
+    let mut first = Rig::new();
+    first.put("Moss Arcade/Tin Weather/a.flac", "a.flac");
+    first.scan();
+    let text = first.one(
+        "SELECT ac.display_text || '|' || r.display_title FROM recording r
+         JOIN artist_credit ac ON ac.id = r.display_artist_credit_id",
+    );
+    let (artist, title) = text.split_once('|').unwrap();
+
+    let mut rig = Rig::new();
+    let account = rig
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let batch = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: b"one".to_vec(),
+            played_at_ms: T0 - 60_000,
+            track: ritornel_source::TrackText {
+                artist: artist.to_owned(),
+                album: None,
+                title: title.to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: T0 - 60_000,
+            to_ms: T0,
+        },
+        cursor: "{}".to_owned(),
+    };
+    rig.library
+        .ingest(crate::Observations::Imports {
+            account,
+            batch: &batch,
+            full: false,
+        })
+        .unwrap();
+    let bound = "SELECT count(*) FROM source_item
+                 WHERE item_kind = 'scrobble_subject' AND current_recording_id IS NOT NULL";
+    rig.put("Moss Arcade/Tin Weather/a.flac", "a.flac");
+    // The run dies straight after the resolve, its second step, has
+    // committed: the scrobble is not judged yet.
+    let source = rig.main.clone();
+    let cut_off = rig.try_scan(
+        &source,
+        ScanSettings {
+            fail_after_step: Some(2),
+            ..ScanSettings::default()
+        },
+    );
+    assert!(matches!(cut_off, Err(Error::FailPoint)), "{cut_off:?}");
+    assert_eq!(rig.one(bound), "0");
+    // Taken up, the scan walks nothing again and judges the tracks.
+    rig.resume(ScanSettings::default()).unwrap();
+    assert_eq!(rig.one(bound), "1");
 }

@@ -452,6 +452,86 @@ fn settle(
     Ok(true)
 }
 
+/// Which tracks [`changes`] judges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Every account's scrobbled tracks, and Spotify's tracks.
+    Library,
+    /// Spotify's tracks alone: what a run of streams applied or undone can
+    /// move.
+    Spotify,
+}
+
+/// A track whose binding the matcher would change: its source instance,
+/// its item with its text, and what the matcher says of it.
+type Change = (i64, Subject, Result<Wanted, UnbindReason>);
+
+/// Every track in scope whose binding in force is not what the matcher
+/// says, the owner's own bindings left out. A track of Spotify's that no
+/// stream in force names is released, when the matcher bound it.
+fn changes(connection: &Connection, scope: Scope) -> Result<Vec<Change>, Error> {
+    let mut judged = judged_tracks(connection)?;
+    if scope == Scope::Library {
+        let instances: Vec<i64> = connection
+            .prepare("SELECT source_instance_id FROM service_account ORDER BY id")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for instance in instances {
+            judged.extend(
+                judged_subjects(connection, instance)?
+                    .into_iter()
+                    .map(|(subject, now)| (instance, subject, now)),
+            );
+        }
+    }
+    let mut found = Vec::new();
+    for (instance, item, now) in unnamed_tracks(connection)? {
+        if now.is_some() {
+            let unnamed = UnbindReason {
+                verdict: "unnamed",
+                doubt: None,
+                candidates: 0,
+            };
+            found.push((
+                instance,
+                (item, String::new(), None, String::new()),
+                Err(unnamed),
+            ));
+        }
+    }
+    if judged.is_empty() {
+        return Ok(found);
+    }
+    let catalog = catalog(connection)?;
+    let except = exclusions(connection)?;
+    let none = HashSet::new();
+    for (instance, subject, now) in judged {
+        let (item, artist, album, title) = &subject;
+        let except = except.get(item).unwrap_or(&none);
+        let wanted = wanted(&catalog, except, artist, album.as_deref(), title);
+        if !holds(connection, now, wanted.as_ref().ok().copied())? {
+            found.push((instance, subject, wanted));
+        }
+    }
+    Ok(found)
+}
+
+/// Binds the tracks in scope as the matcher says, in the write, and derives
+/// the plays of those that moved again. Returns how many bindings changed,
+/// by source instance.
+pub(crate) fn match_in(write: &Write<'_>, scope: Scope) -> Result<BTreeMap<i64, usize>, Error> {
+    let mut changed: BTreeMap<i64, usize> = BTreeMap::new();
+    for (instance, (item, artist, album, title), outcome) in changes(write.connection(), scope)? {
+        if settle(write, item, (&artist, album.as_deref(), &title), outcome)? {
+            *changed.entry(instance).or_default() += 1;
+        }
+    }
+    if !changed.is_empty() {
+        rebind(write)?;
+    }
+    Ok(changed)
+}
+
 /// Judges these subject items and binds them as the matcher says. Returns
 /// how many bindings changed.
 fn match_items(write: &Write<'_>, catalog: &Catalog, items: &[Subject]) -> Result<usize, Error> {
@@ -1142,81 +1222,33 @@ impl LibraryStore {
         Ok(stored)
     }
 
-    /// Judges every one of the account's tracks again, bound or not, but
-    /// those the owner bound: binds those the matcher is now sure of, moves
-    /// or releases a binding that no longer holds, and derives their plays
-    /// again. Run after a sync, since the library may have changed since a
-    /// track was judged. Returns how many bindings changed; with none,
-    /// nothing is written.
-    pub fn match_scrobbles(&self, account: Id) -> Result<usize, Error> {
-        let sure = self.read(move |connection| {
-            let rows = rows_of(connection, account)?;
-            let catalog = catalog(connection)?;
-            let except = exclusions(connection)?;
-            let none = HashSet::new();
-            let mut differ = Vec::new();
-            for (subject, now) in judged_subjects(connection, rows.instance)? {
-                let (_, artist, album, title) = &subject;
-                let except = except.get(&subject.0).unwrap_or(&none);
-                let wanted = wanted(&catalog, except, artist, album.as_deref(), title).ok();
-                if !holds(connection, now, wanted)? {
-                    differ.push(subject);
-                }
-            }
-            Ok(differ)
-        })?;
-        if sure.is_empty() {
-            return Ok(0);
-        }
-        let written = self.write(
-            WriteRequest {
-                method: MATCH_METHOD,
-                command: None,
-                client: None,
-            },
-            move |write| {
-                let bound = match_items(write, &catalog(write.connection())?, &sure)?;
-                rebind(write)?;
-                Ok(bound.to_string())
-            },
-        )?;
-        Ok(written.result_json.parse().unwrap_or(0))
-    }
-
     /// Judges again every track another service named, bound or not, but
     /// those the owner bound: every account's scrobbled tracks, and each of
     /// Spotify's tracks by the names of its newest stream in force. Binds
     /// those the matcher is now sure of, moves or releases a binding that no
     /// longer holds, and derives their plays again, in one write. Run after
-    /// anything that changed what the library holds: a resolve, a sync, a
-    /// run of streams applied or undone. Returns how many bindings changed;
-    /// with none, nothing is written.
+    /// anything that changed what the library holds: a resolve or a sync.
+    /// Returns how many bindings changed; with none, nothing is written.
     pub fn match_library(&self) -> Result<usize, Error> {
-        let sure = self.read(move |connection| {
-            let catalog = catalog(connection)?;
-            let except = exclusions(connection)?;
-            let none = HashSet::new();
-            let instances: Vec<i64> = connection
-                .prepare("SELECT source_instance_id FROM service_account ORDER BY id")?
-                .query_map([], |row| row.get(0))?
-                .collect::<Result<_, _>>()?;
-            let mut judged = judged_tracks(connection)?;
-            for instance in instances {
-                judged.extend(judged_subjects(connection, instance)?);
-            }
-            let mut differ = Vec::new();
-            for (subject, now) in judged {
-                let (_, artist, album, title) = &subject;
-                let except = except.get(&subject.0).unwrap_or(&none);
-                let wanted = wanted(&catalog, except, artist, album.as_deref(), title).ok();
-                if !holds(connection, now, wanted)? {
-                    differ.push(subject);
-                }
-            }
-            Ok(differ)
-        })?;
-        if sure.is_empty() {
-            return Ok(0);
+        Ok(self.match_all()?.values().sum())
+    }
+
+    /// As [`match_library`](Self::match_library), and returns how many of
+    /// the bindings that changed are the account's: what its sync says.
+    pub fn match_library_for(&self, account: Id) -> Result<usize, Error> {
+        let instance = self.read(move |connection| Ok(rows_of(connection, account)?.instance))?;
+        Ok(self.match_all()?.get(&instance).copied().unwrap_or(0))
+    }
+
+    /// Matches the whole library, by source instance. Whether anything
+    /// differs is read first, so that nothing is written when nothing
+    /// does; what is written is judged again inside the write, against what
+    /// the library holds then.
+    fn match_all(&self) -> Result<BTreeMap<i64, usize>, Error> {
+        let differ =
+            self.read_snapshot(|connection| Ok(!changes(connection, Scope::Library)?.is_empty()))?;
+        if !differ {
+            return Ok(BTreeMap::new());
         }
         let written = self.write(
             WriteRequest {
@@ -1224,13 +1256,9 @@ impl LibraryStore {
                 command: None,
                 client: None,
             },
-            move |write| {
-                let bound = match_items(write, &catalog(write.connection())?, &sure)?;
-                rebind(write)?;
-                Ok(bound.to_string())
-            },
+            move |write| Ok(serde_json::to_string(&match_in(write, Scope::Library)?)?),
         )?;
-        Ok(written.result_json.parse().unwrap_or(0))
+        Ok(serde_json::from_str(&written.result_json)?)
     }
 
     /// How much of the account's history matched the library, and the
@@ -1319,60 +1347,82 @@ fn judged_subjects(
     Ok(found)
 }
 
-/// Each of Spotify's tracks that the owner has not bound, with the names
-/// of its newest stream in force and what it is bound to now. A track no
-/// stream in force names is left as it is.
-fn judged_tracks(connection: &Connection) -> Result<Vec<(Subject, Option<Bound>)>, Error> {
-    let mut statement = connection.prepare(
-        "WITH runs AS (
-           SELECT r.id FROM import_run r
-            WHERE (SELECT state FROM import_run_event e WHERE e.run_id = r.id
-                   ORDER BY e.id DESC LIMIT 1) = 'applied'),
-         in_force AS (
-           SELECT DISTINCT observation_id FROM import_run_stream
-            WHERE run_id IN (SELECT id FROM runs))
-         SELECT si.id, i.artist, i.album, i.title, s.ended_at_utc_ms, o.source_key,
-                r.canonical_id, ta.canonical_id
-           FROM in_force f
-           JOIN history_observation o ON o.id = f.observation_id
-           JOIN observation_import i ON i.observation_id = o.id
-           JOIN observation_import_stream s ON s.observation_id = o.id
-           JOIN source_item si ON si.id = o.source_item_id
+/// The streams in force, as a query: those a run whose newest ledger entry
+/// is `applied` held. The runs are found first, once, rather than for each
+/// stream.
+const IN_FORCE: &str = "SELECT DISTINCT h.observation_id FROM import_run_stream h
+     WHERE h.run_id IN (SELECT r.id FROM import_run r
+                        WHERE (SELECT e.state FROM import_run_event e WHERE e.run_id = r.id
+                               ORDER BY e.id DESC LIMIT 1) = 'applied')";
+
+/// Each of Spotify's tracks that the owner has not bound and a stream in
+/// force names, with its source instance, the names of its newest stream
+/// in force, and what it is bound to now. Of two streams that ended at the
+/// same moment the names decide, so which archive came first never does.
+fn judged_tracks(connection: &Connection) -> Result<Vec<(i64, Subject, Option<Bound>)>, Error> {
+    let mut statement = connection.prepare(&format!(
+        "WITH newest AS (
+           SELECT o.id AS observation, o.source_item_id AS item,
+                  row_number() OVER (
+                    PARTITION BY o.source_item_id
+                    ORDER BY s.ended_at_utc_ms DESC, i.title, i.artist, coalesce(i.album, ''),
+                             o.source_key) AS rank
+             FROM ({IN_FORCE}) f
+             JOIN history_observation o ON o.id = f.observation_id
+             JOIN observation_import_stream s ON s.observation_id = o.id
+             JOIN observation_import i ON i.observation_id = o.id)
+         SELECT si.source_instance_id, si.id, i.artist, i.album, i.title, r.canonical_id,
+                ta.canonical_id
+           FROM newest n
+           JOIN observation_import i ON i.observation_id = n.observation
+           JOIN source_item si ON si.id = n.item
            LEFT JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
            LEFT JOIN identity_decision d ON d.id = a.decision_id
            LEFT JOIN recording r ON r.id = a.recording_id
            LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
-          WHERE si.item_kind = 'spotify_track' AND si.retired_at_ms IS NULL
-            AND (a.id IS NULL OR d.actor_kind = 'resolver')",
-    )?;
-    type Row = (Subject, (i64, Vec<u8>), Option<Bound>);
-    let mut newest: BTreeMap<i64, Row> = BTreeMap::new();
+          WHERE n.rank = 1 AND si.item_kind = 'spotify_track' AND si.retired_at_ms IS NULL
+            AND (a.id IS NULL OR d.actor_kind = 'resolver')"
+    ))?;
     let rows = statement.query_map([], |row| {
+        let appearance: Option<i64> = row.get(6)?;
         Ok((
+            row.get::<_, i64>(0)?,
             (
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
             ),
-            (row.get::<_, i64>(4)?, row.get::<_, Vec<u8>>(5)?),
-            row.get::<_, Option<i64>>(6)?
-                .map(|recording| (recording, row.get::<_, Option<i64>>(7).ok().flatten())),
+            row.get::<_, Option<i64>>(5)?
+                .map(|recording| (recording, appearance)),
         ))
     })?;
-    for row in rows {
-        let (subject, when, bound): Row = row?;
-        let newer = newest
-            .get(&subject.0)
-            .is_none_or(|(_, held, _)| when > *held);
-        if newer {
-            newest.insert(subject.0, (subject, when, bound));
-        }
-    }
-    Ok(newest
-        .into_values()
-        .map(|(subject, _, bound)| (subject, bound))
-        .collect())
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Each of Spotify's tracks that no stream in force names, with its source
+/// instance and the binding the matcher gave it, if any.
+fn unnamed_tracks(connection: &Connection) -> Result<Vec<(i64, i64, Option<Bound>)>, Error> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT si.source_instance_id, si.id, r.canonical_id, ta.canonical_id
+           FROM source_item si
+           JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+           JOIN identity_decision d ON d.id = a.decision_id AND d.actor_kind = 'resolver'
+           JOIN recording r ON r.id = a.recording_id
+           LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
+          WHERE si.item_kind = 'spotify_track' AND si.retired_at_ms IS NULL
+            AND si.id NOT IN (SELECT o.source_item_id FROM ({IN_FORCE}) f
+                              JOIN history_observation o ON o.id = f.observation_id)"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        let appearance: Option<i64> = row.get(3)?;
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            Some((row.get::<_, i64>(2)?, appearance)),
+        ))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// The account's subject items that no assignment binds, with their text.

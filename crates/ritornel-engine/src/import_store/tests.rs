@@ -435,7 +435,7 @@ fn a_scrobble_binds_only_on_a_confident_match_and_the_report_lists_the_doubtful(
     assert_eq!(report.first_ms, Some(T0 - 3 * HOUR));
     // Nothing more binds when matched again: the library has not changed.
     let before = rig.revision();
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 0);
     assert_eq!(rig.revision(), before);
 }
 
@@ -681,7 +681,7 @@ fn a_bound_track_is_judged_again_at_each_sync() {
         ["Paper Kites -> Paper Kites", "Salt Road -> Lanternfish"]
     );
     // Judged again, the one is released and the other moved.
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 2);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 2);
     assert_eq!(rig.bound(), ["Paper Kites -> -", "Salt Road -> Salt Road"]);
     assert_eq!(
         rig.one(
@@ -692,7 +692,7 @@ fn a_bound_track_is_judged_again_at_each_sync() {
     );
     // A second judgement changes nothing and writes nothing.
     let before = rig.revision();
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 0);
     assert_eq!(rig.revision(), before);
 
     // The owner's own binding is never judged again.
@@ -701,7 +701,7 @@ fn a_bound_track_is_judged_again_at_each_sync() {
         "Paper Kites",
         "person",
     );
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 0);
     assert_eq!(
         rig.bound(),
         ["Paper Kites -> Paper Kites", "Salt Road -> Salt Road"]
@@ -748,7 +748,7 @@ fn a_recording_the_owner_excluded_is_never_bound_even_through_a_merge() {
             },
         )
         .unwrap();
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 1);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 1);
     assert_eq!(rig.bound(), ["Paper Kites -> -"]);
     // The report counts it, as absent: the library has nothing else it
     // could be.
@@ -756,7 +756,7 @@ fn a_recording_the_owner_excluded_is_never_bound_even_through_a_merge() {
     assert_eq!((report.matched_tracks, report.absent_tracks), (0, 1));
     // And judged again, nothing is written.
     let before = rig.revision();
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 0);
     assert_eq!(rig.revision(), before);
 }
 
@@ -864,7 +864,7 @@ fn a_binding_through_a_merge_is_kept_so_that_undoing_the_merge_is_exact() {
     // Judged again, it is where the merge sends it: nothing is written, and
     // the binding still names the recording a merge's undo gives back.
     let before = rig.revision();
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 0);
     assert_eq!(rig.revision(), before);
     assert_eq!(rig.one(bound), "900 -");
     // The write, given it, agrees.
@@ -886,7 +886,7 @@ fn a_binding_through_a_merge_is_kept_so_that_undoing_the_merge_is_exact() {
         "1"
     );
     let before = rig.revision();
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 0);
     assert_eq!(rig.revision(), before);
     assert_eq!(rig.one(bound), "900 900");
     assert_eq!(rig.rematch(), "0");
@@ -907,7 +907,7 @@ fn a_binding_through_a_merge_is_kept_so_that_undoing_the_merge_is_exact() {
            (source_item_id, recording_id, appearance_id, decision_id, effective_from_ms, rev)
            SELECT source_item_id, 950, 950, 901, 3, ?1 FROM identity_decision WHERE id = 901;",
     );
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 1);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 1);
     assert_eq!(rig.one(bound), "1 1");
     // And its play counts for the recording it is bound to now.
     assert_eq!(rig.one(PLAYED), "1 1");
@@ -956,7 +956,7 @@ fn a_song_whose_own_recording_was_merged_keeps_its_binding() {
     assert_eq!(rig.one(PLAYED), "1 970");
     // Judged again, by both passes, it is kept as it is.
     let before = rig.revision();
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 0);
     assert_eq!(rig.revision(), before);
     assert_eq!(rig.rematch(), "0");
     assert_eq!(rig.one(bound), "970 970");
@@ -1000,10 +1000,10 @@ fn a_play_bound_to_a_song_no_file_reaches_is_bound_again() {
     // At the next judgement the play follows the song to the copy a file
     // reaches, and stays on its recording.
     assert_eq!(rig.one(PLAYED), "1 1");
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 1);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 1);
     assert_eq!(rig.one(bound), "1 960");
     assert_eq!(rig.one(PLAYED), "1 960");
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 0);
 }
 
 #[test]
@@ -1090,7 +1090,7 @@ fn releasing_a_scrobble_binding_records_an_unbind_decision() {
          VALUES (990, 990, 990, 990, 1, ?1);",
     );
 
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 1);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 1);
     assert_eq!(rig.bound(), ["Paper Kites -> -"]);
     assert_eq!(rig.one(PLAYED), "-");
 
@@ -1117,7 +1117,7 @@ fn releasing_a_scrobble_binding_records_an_unbind_decision() {
     assert_eq!(evidence["title"], "Paper Kites");
 
     // Re-running the matcher writes nothing more and adds no duplicate unbind decision.
-    assert_eq!(rig.library.match_scrobbles(rig.account).unwrap(), 0);
+    assert_eq!(rig.library.match_library_for(rig.account).unwrap(), 0);
     assert_eq!(
         rig.one("SELECT count(*) FROM identity_decision WHERE action = 'unbind'"),
         "1"
@@ -1135,7 +1135,7 @@ fn releasing_a_scrobble_binding_records_an_unbind_decision() {
         "INSERT INTO identity_exclusion (source_item_id, recording_id, actor_kind, created_at_ms, rev)
          SELECT id, 1, 'person', 1, ?1 FROM source_item WHERE item_kind = 'scrobble_subject';",
     );
-    assert_eq!(rig2.library.match_scrobbles(rig2.account).unwrap(), 1);
+    assert_eq!(rig2.library.match_library_for(rig2.account).unwrap(), 1);
     assert_eq!(rig2.bound(), ["Paper Kites -> -"]);
     assert_eq!(rig2.one(PLAYED), "-");
     let absent_json: String =
@@ -1248,7 +1248,8 @@ fn a_streams_track_binds_as_a_scrobble_of_its_names_does_and_is_held_back_off_it
         ],
     );
     let plays = rig.library.derived_history().unwrap();
-    assert_eq!(rig.library.match_library().unwrap(), 1);
+    // Applying judged the run's tracks in its own write.
+    assert_eq!(rig.library.match_library().unwrap(), 0);
     // The stream's Paper Kites is bound where the scrobble of the same
     // names is.
     let recording_of = |kind: &str, title: &str| {
@@ -1554,4 +1555,124 @@ fn a_stored_stream_and_a_runs_rows_are_never_changed_or_removed() {
         );
         assert!(refused.is_err(), "{sql}");
     }
+}
+
+/// The recording a Spotify track is bound to, by its title, or 0.
+fn track_bound(rig: &Rig, title: &str) -> String {
+    rig.one(&format!(
+        "SELECT coalesce(current_recording_id, 0) FROM source_item
+         WHERE item_kind = 'spotify_track' AND provider_key = 'spotify:track:{}'",
+        title.replace(' ', "")
+    ))
+}
+
+#[test]
+fn a_tracks_names_are_its_newest_stream_in_force_and_go_with_its_runs() {
+    let rig = rig();
+    // Run 1 heard Paper Kites from the invented album, and binds it.
+    apply(&rig, 1, vec![stream(T0 - 3 * HOUR, 200_000, "Paper Kites")]);
+    let bound = track_bound(&rig, "Paper Kites");
+    assert_ne!(bound, "0");
+    // Run 2 heard it later from another record, which fits no album of
+    // the song: its newest stream holds it back.
+    let mut later = stream(T0 - HOUR, 200_000, "Paper Kites");
+    later.album = Some("A Record It Is Not On".to_owned());
+    apply(&rig, 2, vec![later]);
+    assert_eq!(track_bound(&rig, "Paper Kites"), "0");
+    // Undone, run 1's names are the newest in force again.
+    undo(&rig, 2);
+    assert_eq!(track_bound(&rig, "Paper Kites"), bound);
+    // With no stream in force, the binding the matcher made is released.
+    undo(&rig, 1);
+    assert_eq!(track_bound(&rig, "Paper Kites"), "0");
+    assert_eq!(
+        rig.one(
+            "SELECT count(*) FROM identity_decision
+             WHERE action = 'unbind' AND evidence_json LIKE '%unnamed%'"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn of_two_streams_that_ended_together_the_names_decide_whichever_came_first() {
+    let mut there = stream(T0 - HOUR, 200_000, "Paper Kites");
+    there.reason_end = Some("endplay".to_owned());
+    let mut elsewhere = stream(T0 - HOUR, 200_000, "Paper Kites");
+    elsewhere.album = Some("A Record It Is Not On".to_owned());
+    let first = rig();
+    apply(&first, 1, vec![there.clone()]);
+    apply(&first, 2, vec![elsewhere.clone()]);
+    let second = rig();
+    apply(&second, 1, vec![elsewhere]);
+    apply(&second, 2, vec![there]);
+    // "A Record It Is Not On" sorts before "Tin Weather": its names win in
+    // both, and hold the track back.
+    assert_eq!(track_bound(&first, "Paper Kites"), "0");
+    assert_eq!(track_bound(&second, "Paper Kites"), "0");
+}
+
+#[test]
+fn the_owners_binding_of_a_track_is_never_judged_again() {
+    let rig = rig();
+    let mut elsewhere = stream(T0 - HOUR, 200_000, "Paper Kites");
+    elsewhere.album = Some("A Record It Is Not On".to_owned());
+    apply(&rig, 1, vec![elsewhere]);
+    assert_eq!(track_bound(&rig, "Paper Kites"), "0");
+    // The owner says which song it is.
+    rig.library
+        .write(
+            WriteRequest {
+                method: "test.own",
+                command: None,
+                client: None,
+            },
+            |write| {
+                let connection = write.connection();
+                let item: i64 = connection.query_row(
+                    "SELECT id FROM source_item WHERE provider_key = 'spotify:track:PaperKites'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let (recording, appearance): (i64, i64) = connection.query_row(
+                    "SELECT recording_id, id FROM track_appearance
+                     WHERE display_title = 'Paper Kites'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                connection.execute(
+                    "INSERT INTO identity_decision
+                       (action, source_item_id, method, resolver_version, normalizer_version,
+                        evidence_json, actor_kind, decided_at_ms, rev)
+                     VALUES ('bind', ?1, 'user', 1, 1, '{}', 'person', ?2, ?3)",
+                    (item, write.now_ms(), write.rev()),
+                )?;
+                connection.execute(
+                    "INSERT INTO assignment
+                       (source_item_id, recording_id, appearance_id, decision_id,
+                        effective_from_ms, rev)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (
+                        item,
+                        recording,
+                        appearance,
+                        connection.last_insert_rowid(),
+                        write.now_ms(),
+                        write.rev(),
+                    ),
+                )?;
+                connection.execute(
+                    "UPDATE source_item SET current_recording_id = ?2 WHERE id = ?1",
+                    (item, recording),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    let owned = track_bound(&rig, "Paper Kites");
+    assert_ne!(owned, "0");
+    assert_eq!(rig.library.match_library().unwrap(), 0);
+    // Undone, no stream names it, and the owner's binding stays.
+    undo(&rig, 1);
+    assert_eq!(track_bound(&rig, "Paper Kites"), owned);
 }

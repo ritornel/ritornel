@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::history_store::{echo_of, zone_periods};
+use crate::import_store::{Scope, match_in};
 use crate::library_store::Write;
 use crate::{Error, Id, LibraryStore, WriteRequest};
 
@@ -540,6 +541,10 @@ impl LibraryStore {
             // What the report read is not held while the run is stored.
             drop(read);
             let stored = apply_in(write, run, &streams, &reader, session)?;
+            // The tracks the run brought, and those whose newest stream in
+            // force it changed, are judged against the library in the same
+            // write.
+            match_in(write, Scope::Spotify)?;
             Ok(serde_json::to_string(&stored)?)
         })?;
         Ok((
@@ -578,6 +583,7 @@ impl LibraryStore {
                      VALUES (?1, 'undone', ?2, ?3)",
                     (row, write.now_ms(), write.rev()),
                 )?;
+                match_in(write, Scope::Spotify)?;
             }
             let stored = stored_run(connection, run)?.ok_or(Error::Corrupt("a run undone"))?;
             Ok(serde_json::to_string(&stored)?)
