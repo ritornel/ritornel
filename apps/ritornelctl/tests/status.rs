@@ -237,7 +237,7 @@ impl Server {
                 .status()
                 .unwrap()
         };
-        assert!(sent.success());
+        assert!(sent.success(), "asking it to stop: {sent}");
     }
 
     /// Sends the server a signal and waits for it to end. It is killed, and

@@ -731,7 +731,9 @@ impl Process {
             });
         }
         let process = Self(child);
-        let ready = printed.recv_timeout(WAIT).expect("no ready line");
+        let ready = printed
+            .recv_timeout(WAIT)
+            .unwrap_or_else(|error| panic!("no ready line within {WAIT:?}: {error}"));
         assert!(ready.starts_with("ready pid="), "{ready}");
         (process, printed)
     }
@@ -752,8 +754,9 @@ impl Process {
                 .status()
                 .unwrap()
         };
-        assert!(asked.success());
-        assert!(self.0.wait().unwrap().success());
+        assert!(asked.success(), "asking it to stop: {asked}");
+        let ended = self.0.wait().unwrap();
+        assert!(ended.success(), "the server ended with {ended}");
     }
 }
 

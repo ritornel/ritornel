@@ -107,9 +107,11 @@ fn invent(data_dir: &Path, root: &Path, albums: usize) {
         .env_remove("RITORNEL_DATA_DIR")
         .output()
         .unwrap();
+    // A process a signal ended has no code, and may have said nothing.
     assert!(
         output.status.success(),
-        "{}",
+        "ritornel-server invent: {}\n--- stderr\n{}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
 }

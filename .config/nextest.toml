@@ -2,7 +2,9 @@
 
 [profile.ci]
 # Every test runs, whatever fails first, and the summary lists those that
-# took over ten seconds, so a run says where its time went.
+# took over ten seconds, so a run says where its time went. A test still
+# running after five minutes is stuck, not slow: it is ended and reported
+# with what it printed, instead of holding the job until its own limit.
 fail-fast = false
-slow-timeout = "10s"
+slow-timeout = { period = "10s", terminate-after = 30 }
 final-status-level = "slow"

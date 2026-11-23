@@ -151,7 +151,9 @@ async fn a_server_started_by_hand_is_used_and_never_stopped() {
         .args(["--listen", "127.0.0.1:0", "--output", "none"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // The server logs to a file and says on stderr only what went wrong,
+        // which then shows with the failing test.
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let mut ready = String::new();
@@ -181,7 +183,8 @@ async fn a_server_started_by_hand_is_used_and_never_stopped() {
     } else {
         let _ = Command::new("kill").arg(by_hand.id().to_string()).status();
     }
-    assert!(by_hand.wait().unwrap().success());
+    let ended = by_hand.wait().unwrap();
+    assert!(ended.success(), "the server ended with {ended}");
     launched.unwrap();
 }
 

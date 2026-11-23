@@ -199,9 +199,20 @@ fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) 
 fn json(data_dir: &Path, args: &[&str]) -> Value {
     let mut args = args.to_vec();
     args.push("--json");
-    let (code, stdout, stderr) = ritornelctl(data_dir, &args);
-    assert_eq!(code, Some(0), "{args:?}: {stderr}");
-    serde_json::from_str(&stdout).unwrap()
+    serde_json::from_str(&ok(data_dir, &args)).unwrap()
+}
+
+/// Runs `ritornelctl` and returns what it printed. Unless it succeeded,
+/// the test fails with its exit code, `None` when a signal ended it, and
+/// everything it printed.
+fn ok(data_dir: &Path, args: &[&str]) -> String {
+    let (code, stdout, stderr) = ritornelctl(data_dir, args);
+    assert_eq!(
+        code,
+        Some(0),
+        "ritornelctl {args:?}\n--- stdout\n{stdout}--- stderr\n{stderr}"
+    );
+    stdout
 }
 
 /// Asks again and again until `done` says so, for at most [`WAIT`].
@@ -256,7 +267,9 @@ fn spawn(data_dir: &Path, fake: &FakeLastfm, more: &[(&str, &str)]) -> (Child, R
         .envs(more.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // The server logs to a file and says on stderr only what went wrong,
+        // which then shows with the failing test.
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let stdout = lines(child.stdout.take().unwrap());
@@ -303,7 +316,7 @@ impl Server {
                 .status()
                 .unwrap()
         };
-        assert!(sent.success());
+        assert!(sent.success(), "asking it to stop: {sent}");
         assert_eq!(self.ended(), Some(0));
     }
 }
@@ -457,8 +470,8 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
         &fake,
         &[("RITORNEL_TEST_FAIL_AFTER_IMPORT_BATCH", "2")],
     );
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
+    ok(&data_dir, &["scan", folder]);
 
     // Signing in prints the address to approve, then the account.
     let status = json(&data_dir, &["lastfm", "status"]);
@@ -503,10 +516,7 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
     assert_eq!(zones["periods"][1]["from"], "2009-06-01");
 
     // Started, it dies part way.
-    assert_eq!(
-        ritornelctl(&data_dir, &["lastfm", "sync", "--no-wait"]).0,
-        Some(0)
-    );
+    ok(&data_dir, &["lastfm", "sync", "--no-wait"]);
     assert_eq!(dying.ended(), ABORTED);
 
     // The next run carries the sync on from its cursor, by itself.
@@ -569,10 +579,7 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
     // Scrobbling on, the album played: each play that counts is sent once,
     // and its echo joins it when the next sync brings it back.
     json(&data_dir, &["lastfm", "scrobbling", "on"]);
-    assert_eq!(
-        ritornelctl(&data_dir, &["play", folder, "--follow"]).0,
-        Some(0)
-    );
+    ok(&data_dir, &["play", folder, "--follow"]);
     let deadline = Instant::now() + WAIT;
     while fake.scrobbled().len() < 2 {
         assert!(Instant::now() < deadline, "{:?}", fake.scrobbled());
@@ -626,7 +633,7 @@ fn the_hub_imports_on_its_own_when_it_starts_and_a_failure_waits_for_the_next_tr
 
     // Set up, and never imported: the next is due now.
     let server = Server::start(&data_dir, &fake, &[]);
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
     let (code, stdout, stderr) = ritornelctl(&data_dir, &["lastfm", "signin", "--json"]);
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(
@@ -640,7 +647,7 @@ fn the_hub_imports_on_its_own_when_it_starts_and_a_failure_waits_for_the_next_tr
         "{text}"
     );
     let zone = ["history", "zone", "add", "America/New_York"];
-    assert_eq!(ritornelctl(&data_dir, &zone).0, Some(0));
+    ok(&data_dir, &zone);
     let status = json(&data_dir, &["lastfm", "status"]);
     assert!(status["import"]["next"].is_i64(), "{status}");
     server.stop();
@@ -729,12 +736,12 @@ fn what_begins_to_play_is_shown_as_playing_now_only_while_scrobbling_is_on() {
         &fake,
         &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "1")],
     );
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["scan", folder]).0, Some(0));
-    assert_eq!(ritornelctl(&data_dir, &["lastfm", "signin"]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
+    ok(&data_dir, &["scan", folder]);
+    ok(&data_dir, &["lastfm", "signin"]);
 
     // Scrobbling off: a track heard for seconds is shown nowhere.
-    assert_eq!(ritornelctl(&data_dir, &["play", folder]).0, Some(0));
+    ok(&data_dir, &["play", folder]);
     until(&data_dir, &["now"], past(2_500));
     assert!(fake.now_playing().is_empty(), "{:?}", fake.now_playing());
 

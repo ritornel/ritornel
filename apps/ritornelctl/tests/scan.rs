@@ -135,9 +135,20 @@ fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) 
 fn json(data_dir: &Path, args: &[&str]) -> Value {
     let mut args = args.to_vec();
     args.push("--json");
-    let (code, stdout, stderr) = ritornelctl(data_dir, &args);
-    assert_eq!(code, Some(0), "{args:?}: {stderr}");
-    serde_json::from_str(&stdout).unwrap()
+    serde_json::from_str(&ok(data_dir, &args)).unwrap()
+}
+
+/// Runs `ritornelctl` and returns what it printed. Unless it succeeded,
+/// the test fails with its exit code, `None` when a signal ended it, and
+/// everything it printed.
+fn ok(data_dir: &Path, args: &[&str]) -> String {
+    let (code, stdout, stderr) = ritornelctl(data_dir, args);
+    assert_eq!(
+        code,
+        Some(0),
+        "ritornelctl {args:?}\n--- stdout\n{stdout}--- stderr\n{stderr}"
+    );
+    stdout
 }
 
 /// A `ritornel-server` that is running. It is killed if a test ends
@@ -170,7 +181,9 @@ impl Server {
             .envs(variables.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // The server logs to a file and says on stderr only what went wrong,
+            // which then shows with the failing test.
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
         let stdout = lines(child.stdout.take().unwrap());
@@ -214,7 +227,7 @@ impl Server {
                 .status()
                 .unwrap()
         };
-        assert!(sent.success());
+        assert!(sent.success(), "asking it to stop: {sent}");
         assert_eq!(self.ended(), Some(0));
     }
 }
@@ -244,7 +257,7 @@ fn scan_adds_the_folder_scans_it_and_the_stats_say_what_came_out() {
     let (code, _, stderr) = ritornelctl(&data_dir, &["scan", folder]);
     assert_eq!(code, Some(1));
     assert!(stderr.contains("this server holds no library"), "{stderr}");
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
     assert_eq!(ritornelctl(&data_dir, &["jobs"]).1, "No jobs.\n");
 
     let (code, stdout, stderr) = ritornelctl(&data_dir, &["scan", folder]);
@@ -329,7 +342,7 @@ fn a_scan_cut_off_when_the_server_dies_is_taken_up_by_the_next_run_and_finishes(
             ("RITORNEL_TEST_FAIL_AFTER_SCAN_STEP", "2"),
         ],
     );
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
     let started = json(&data_dir, &["scan", folder, "--no-wait"]);
     let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
     // It was killed by a signal, not stopped: no exit code, and it left
@@ -386,7 +399,7 @@ fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was(
     let scratch = Scratch::new();
     let (data_dir, music) = (scratch.data_dir(), scratch.music());
     let server = Server::start(&data_dir, &[]);
-    assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
+    ok(&data_dir, &["library", "create"]);
     let (code, _, stderr) = ritornelctl(&data_dir, &["scan", music.to_str().unwrap()]);
     assert_eq!(code, Some(0), "{stderr}");
     let before = library_bytes(&data_dir);
