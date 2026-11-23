@@ -1196,112 +1196,60 @@ fn stream_time(stream: &StreamImport, periods: &[ZonePeriod]) -> PlayTime {
     }
 }
 
-/// The stream and scrobble pairs that active `join` and `split`
-/// corrections name, as the matcher's pins: by the index of each in what
-/// it is given.
-fn pins(
-    corrections: &[Correction],
-    streams: &[StreamImport],
-    scrobbles: &[&Import],
-) -> crate::streams::Pins {
-    let active = active_corrections(corrections);
-    let stream_at: HashMap<i64, usize> = streams
-        .iter()
-        .enumerate()
-        .map(|(at, stream)| (stream.observation, at))
-        .collect();
-    let scrobble_at: HashMap<i64, usize> = scrobbles
-        .iter()
-        .enumerate()
-        .map(|(at, scrobble)| (scrobble.observation, at))
-        .collect();
-    // Of two corrections that pin one listen and one scrobble, by any row
-    // of the listen, the newer says it; and of two that join one scrobble,
-    // the newer is read first and takes it.
-    let listen = |stream: usize| {
-        streams.get(stream).map(|stream| {
-            let r = &stream.record;
-            (r.ended_at, r.ms_played, r.track_uri.clone())
-        })
-    };
-    type Pinned = (i64, bool, usize);
-    let mut newest: HashMap<((i64, i64, String), usize), Pinned> = HashMap::new();
-    let mut in_order: Vec<&Correction> = corrections.iter().collect();
-    in_order.sort_by_key(|correction| correction.observation);
-    for correction in in_order {
-        if !active.contains(&correction.observation)
-            || !matches!(correction.verb, Verb::Join | Verb::Split)
-        {
-            continue;
-        }
-        let named: Vec<usize> = correction
-            .targets
-            .iter()
-            .filter_map(|target| stream_at.get(target).copied())
-            .collect();
-        let scrobbled: Vec<usize> = correction
-            .targets
-            .iter()
-            .filter_map(|target| scrobble_at.get(target).copied())
-            .collect();
-        for stream in &named {
-            let Some(listen) = listen(*stream) else {
-                continue;
-            };
-            for scrobble in &scrobbled {
-                newest.insert(
-                    (listen.clone(), *scrobble),
-                    (
-                        correction.observation,
-                        correction.verb == Verb::Join,
-                        *stream,
-                    ),
-                );
-            }
-        }
-    }
-    let mut pins = crate::streams::Pins::default();
-    let mut together: Vec<(i64, usize, usize)> = Vec::new();
-    for ((_, scrobble), (by, join, stream)) in newest {
-        if join {
-            together.push((by, stream, scrobble));
-        } else {
-            pins.apart.insert((stream, scrobble));
-        }
-    }
-    // Newest first, and in one correction by its rows.
-    together.sort_unstable_by(|a, b| b.0.cmp(&a.0).then((a.1, a.2).cmp(&(b.1, b.2))));
-    pins.together = together
-        .into_iter()
-        .map(|(_, stream, scrobble)| (stream, scrobble))
-        .collect();
-    pins
-}
-
 /// The plays of Spotify's streams: one for each listen Spotify reported,
 /// with the scrobbles the stream matcher joins to it, which the stream
 /// speaks for. A joined play counts by the scrobble's verdict; a stream
-/// alone is judged by its track's length. Returns the scrobbles joined.
+/// alone is judged by its track's length. A listener's streams are offered
+/// that listener's scrobbles alone. Returns the scrobbles joined.
 fn derive_streams(
     inputs: &Inputs<'_>,
     excluded: &BTreeSet<i64>,
     overrides: &RecordingOverrides<'_>,
     plays: &mut Vec<Play>,
 ) -> BTreeSet<i64> {
-    use crate::streams::{Scrobble, Stream, Tier, Tiers, judge_alone, match_streams};
-    if inputs.streams.is_empty() {
-        return BTreeSet::new();
-    }
-    // A scrobble set aside, or a listen of this library's own come back, is
-    // offered to no stream.
-    let mut offered: Vec<&Import> = inputs
-        .imports
-        .iter()
-        .filter(|import| import.echo_of.is_none() && !excluded.contains(&import.observation))
-        .collect();
-    offered.sort_by_key(|import| import.observation);
-    let streams: Vec<Stream> = inputs
+    let listeners: BTreeSet<i64> = inputs
         .streams
+        .iter()
+        .map(|stream| stream.listener)
+        .collect();
+    let mut taken = BTreeSet::new();
+    for listener in listeners {
+        let streams: Vec<&StreamImport> = inputs
+            .streams
+            .iter()
+            .filter(|stream| stream.listener == listener)
+            .collect();
+        // A scrobble set aside, or a listen of this library's own come
+        // back, is offered to no stream.
+        let mut offered: Vec<&Import> = inputs
+            .imports
+            .iter()
+            .filter(|import| {
+                import.listener == listener
+                    && import.echo_of.is_none()
+                    && !excluded.contains(&import.observation)
+            })
+            .collect();
+        offered.sort_by_key(|import| import.observation);
+        taken.extend(derive_streams_of(
+            &streams, &offered, inputs, excluded, overrides, plays,
+        ));
+    }
+    taken
+}
+
+/// The plays of one listener's streams, `theirs`, with the scrobbles
+/// offered to them.
+fn derive_streams_of(
+    theirs: &[&StreamImport],
+    offered: &[&Import],
+    inputs: &Inputs<'_>,
+    excluded: &BTreeSet<i64>,
+    overrides: &RecordingOverrides<'_>,
+    plays: &mut Vec<Play>,
+) -> BTreeSet<i64> {
+    use crate::streams::{Scrobble, Stream, Tier, Tiers, judge_alone, match_streams, pins};
+    let streams: Vec<Stream> = theirs
         .iter()
         .map(|stream| Stream {
             key: stream.key.clone(),
@@ -1311,13 +1259,20 @@ fn derive_streams(
     let scrobbles: Vec<Scrobble> = offered
         .iter()
         .map(|import| Scrobble {
+            observation: import.observation,
             key: import.key.clone(),
             at_ms: import.played_at_ms,
             artist: import.artist.clone(),
             title: import.title.clone(),
         })
         .collect();
-    let pins = pins(inputs.corrections, inputs.streams, &offered);
+    let pins = pins(
+        inputs.corrections,
+        theirs
+            .iter()
+            .zip(&streams)
+            .map(|(stored, stream)| (stored.observation, stream)),
+    );
     let matched = match_streams(&streams, &scrobbles, Tiers::ALL, &pins);
     let mut joins: HashMap<usize, Vec<(usize, Option<Tier>, bool)>> = HashMap::new();
     let mut taken = BTreeSet::new();
@@ -1334,7 +1289,7 @@ fn derive_streams(
         let members: Vec<&StreamImport> = event
             .streams
             .iter()
-            .filter_map(|at| inputs.streams.get(*at))
+            .filter_map(|at| theirs.get(*at).copied())
             .collect();
         let Some(&head) = members.first() else {
             continue;

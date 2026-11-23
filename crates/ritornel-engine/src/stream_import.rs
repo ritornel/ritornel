@@ -6,8 +6,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ritornel_contract::{DeviceKind, ImportReport, Platform, PlayedVia, SpotifyStream};
+use ritornel_domain::history::Correction;
 use ritornel_domain::stream_report::{DryRunInput, dry_run, keyed};
-use ritornel_domain::streams::{Pins, Scrobble, Stream, kept, repeat_order};
+use ritornel_domain::streams::{Scrobble, Stream, kept, repeat_order};
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
@@ -25,19 +26,28 @@ struct Read {
     listener: i64,
     zone_periods: Vec<ritornel_domain::history::ZonePeriod>,
     stored: HashMap<Vec<u8>, SpotifyStream>,
+    observations: HashMap<Vec<u8>, i64>,
+    corrections: Vec<Correction>,
     in_force: Vec<Stream>,
     set_aside: HashSet<Vec<u8>>,
 }
 
-/// The streams stored already, by key, as they were stored.
-fn stored_streams(connection: &Connection) -> Result<HashMap<Vec<u8>, SpotifyStream>, Error> {
+/// The streams stored already, by key: as they were stored, and their
+/// observations.
+type Stored = (HashMap<Vec<u8>, SpotifyStream>, HashMap<Vec<u8>, i64>);
+
+fn stored_streams(connection: &Connection) -> Result<Stored, Error> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {STORED_STREAM} FROM history_observation o {STORED_STREAM_JOINS}"
+        "SELECT o.id, {STORED_STREAM} FROM history_observation o {STORED_STREAM_JOINS}"
     ))?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, stored_stream(row, 1)?))
-    })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    let mut rows = statement.query([])?;
+    let (mut records, mut observations) = (HashMap::new(), HashMap::new());
+    while let Some(row) = rows.next()? {
+        let key: Vec<u8> = row.get(1)?;
+        observations.insert(key.clone(), row.get(0)?);
+        records.insert(key, stored_stream(row, 2)?);
+    }
+    Ok((records, observations))
 }
 
 /// A stored stream's columns, after its source key: what [`stored_stream`]
@@ -75,24 +85,6 @@ pub(crate) fn stored_stream(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Res
     })
 }
 
-/// The keys of the streams a correction that stands sets aside, as
-/// derivation reads the corrections.
-fn set_aside_streams(connection: &Connection) -> Result<HashSet<Vec<u8>>, Error> {
-    let set_aside =
-        ritornel_domain::history::excluded(&crate::history_store::corrections(connection)?);
-    let mut key = connection.prepare_cached(
-        "SELECT o.source_key FROM history_observation o
-         JOIN observation_import_stream s ON s.observation_id = o.id WHERE o.id = ?1",
-    )?;
-    let mut keys = HashSet::new();
-    for observation in set_aside {
-        if let Some(found) = key.query_row([observation], |row| row.get(0)).optional()? {
-            keys.insert(found);
-        }
-    }
-    Ok(keys)
-}
-
 /// How many streams are in force. A run applied only adds to them and one
 /// undone only takes from them, so the same count is the same streams.
 fn in_force(connection: &Connection) -> Result<i64, Error> {
@@ -106,24 +98,29 @@ fn in_force(connection: &Connection) -> Result<i64, Error> {
     )?)
 }
 
-/// Every scrobble of every account, sorted into those a stream may take,
-/// those set aside and those that are this library's own listens come back.
+/// Every scrobble of a listener's accounts, sorted into those a stream may
+/// take, those set aside and those that are this library's own listens
+/// come back.
 /// An import is an echo when it matches a delivery of a listen, as
 /// derivation finds it, so that a second copy of an echo, which stands as a
 /// play of its own, is an echo too; and it is set aside when a correction
 /// that stands excludes it.
-fn scrobbles(connection: &Connection) -> Result<(Vec<Scrobble>, u64, u64), Error> {
+fn scrobbles(
+    connection: &Connection,
+    corrections: &[Correction],
+    listener: i64,
+) -> Result<(Vec<Scrobble>, u64, u64), Error> {
     // Set aside as derivation has it: by the corrections that stand, and
     // never by what a play of it shows, which another record can decide.
-    let set_aside =
-        ritornel_domain::history::excluded(&crate::history_store::corrections(connection)?);
+    let set_aside = ritornel_domain::history::excluded(corrections);
     let mut statement = connection.prepare(
         "SELECT o.id, o.source_key, i.played_at_utc_ms, i.artist, i.title, o.endpoint_id
            FROM observation_import i
            JOIN history_observation o ON o.id = i.observation_id
-           JOIN service_account a ON a.endpoint_id = o.endpoint_id",
+           JOIN service_account a ON a.endpoint_id = o.endpoint_id
+          WHERE o.listener_id = ?1",
     )?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query([listener])?;
     let (mut offered, mut excluded, mut echoes) = (Vec::new(), 0, 0);
     while let Some(row) = rows.next()? {
         let observation: i64 = row.get(0)?;
@@ -187,12 +184,23 @@ impl LibraryStore {
 
 /// What a dry run reads, as `connection` sees the library.
 fn read(connection: &Connection) -> Result<Read, Error> {
-    let (scrobbles, excluded, echoes) = scrobbles(connection)?;
+    // The run's streams are the first listener's, as applying
+    // stores them, and they are matched with that listener's own.
     let listener = connection.query_row(
         "SELECT coalesce((SELECT id FROM listener ORDER BY id LIMIT 1), 0)",
         [],
         |row| row.get(0),
     )?;
+    let corrections = crate::history_store::corrections(connection)?;
+    let (scrobbles, excluded, echoes) = scrobbles(connection, &corrections, listener)?;
+    let (stored, observations) = stored_streams(connection)?;
+    // A stream set aside, as derivation reads the corrections.
+    let set_aside_ids = ritornel_domain::history::excluded(&corrections);
+    let set_aside = observations
+        .iter()
+        .filter(|(_, observation)| set_aside_ids.contains(observation))
+        .map(|(key, _)| key.clone())
+        .collect();
     Ok(Read {
         scrobbles,
         excluded,
@@ -200,15 +208,18 @@ fn read(connection: &Connection) -> Result<Read, Error> {
         plays_by_year: plays_by_year(connection)?,
         listener,
         zone_periods: zone_periods(connection)?,
-        stored: stored_streams(connection)?,
+        stored,
+        observations,
+        corrections,
         in_force: crate::history_streams::streams(connection, None)?
             .into_iter()
+            .filter(|stream| stream.listener == listener)
             .map(|stream| Stream {
                 key: stream.key,
                 record: stream.record,
             })
             .collect(),
-        set_aside: set_aside_streams(connection)?,
+        set_aside,
     })
 }
 
@@ -223,7 +234,8 @@ fn report(read: &Read, streams: &[Stream], made_at: i64) -> ImportReport {
         plays_by_year: &read.plays_by_year,
         listener: read.listener,
         zone_periods: &read.zone_periods,
-        pins: &Pins::default(),
+        corrections: &read.corrections,
+        observations: &read.observations,
         stored: &read.stored,
         set_aside: &read.set_aside,
         made_at,

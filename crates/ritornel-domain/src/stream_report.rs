@@ -10,9 +10,9 @@ use ritornel_contract::{
     ImportProblem, ImportReport, ImportYear, JoinSample, SpotifyStream, StreamTier, TierJoins,
 };
 
-use crate::history::{Outcome, ZonePeriod, assumed_zone};
+use crate::history::{Correction, Outcome, ZonePeriod, assumed_zone};
 use crate::streams::{
-    Event, Matched, Pins, Scrobble, Stream, Tier, Tiers, judge_alone, kept, lengths, match_streams,
+    Event, Matched, Scrobble, Stream, Tier, Tiers, judge_alone, kept, lengths, match_streams,
     name_key, repeat_order,
 };
 
@@ -44,8 +44,12 @@ pub struct DryRunInput<'a> {
     pub listener: i64,
     /// The zones listeners were in.
     pub zone_periods: &'a [ZonePeriod],
-    /// Pairs a correction has pinned.
-    pub pins: &'a Pins,
+    /// Every correction, of which the `join` and `split` corrections that
+    /// stand pin a stored stream to a scrobble, as derivation reads them.
+    pub corrections: &'a [Correction],
+    /// The stored streams' observations, by key, which a correction names
+    /// a stream by.
+    pub observations: &'a HashMap<Vec<u8>, i64>,
     /// The streams stored already, by key, as they were stored.
     pub stored: &'a HashMap<Vec<u8>, SpotifyStream>,
     /// The keys of the streams a correction that stands sets aside: a play
@@ -316,7 +320,22 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         ..*input
     };
     let of_run: HashSet<&[u8]> = run.iter().map(|stream| stream.key.as_slice()).collect();
-    let matched = match_streams(input.streams, input.scrobbles, Tiers::ALL, input.pins);
+    // The pins of the streams matched, as derivation finds them among the
+    // streams it is given.
+    let pins = |streams: &[Stream]| {
+        crate::streams::pins(
+            input.corrections,
+            streams
+                .iter()
+                .filter_map(|stream| Some((*input.observations.get(&stream.key)?, stream))),
+        )
+    };
+    let matched = match_streams(
+        input.streams,
+        input.scrobbles,
+        Tiers::ALL,
+        &pins(input.streams),
+    );
     let lengths = lengths(input.streams, &matched.events);
 
     let counts = crate::streams::counts(&matched);
@@ -403,7 +422,12 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         input.set_aside,
     );
     let now = {
-        let matched = match_streams(input.in_force, input.scrobbles, Tiers::ALL, input.pins);
+        let matched = match_streams(
+            input.in_force,
+            input.scrobbles,
+            Tiers::ALL,
+            &pins(input.in_force),
+        );
         let lengths_now = crate::streams::lengths(input.in_force, &matched.events);
         added(
             input.in_force,
@@ -725,11 +749,14 @@ mod tests {
     static EMPTY: std::sync::LazyLock<HashMap<Vec<u8>, SpotifyStream>> =
         std::sync::LazyLock::new(HashMap::new);
 
+    /// No stream with an observation.
+    static UNOBSERVED: std::sync::LazyLock<HashMap<Vec<u8>, i64>> =
+        std::sync::LazyLock::new(HashMap::new);
+
     fn input<'a>(
         streams: &'a [Stream],
         scrobbles: &'a [Scrobble],
         plays: &'a BTreeMap<i32, (u64, u64)>,
-        pins: &'a Pins,
     ) -> DryRunInput<'a> {
         DryRunInput {
             streams,
@@ -740,7 +767,8 @@ mod tests {
             plays_by_year: plays,
             listener: 1,
             zone_periods: &[],
-            pins,
+            corrections: &[],
+            observations: &UNOBSERVED,
             stored: &EMPTY,
             set_aside: &NONE,
             made_at: 7,
@@ -762,8 +790,8 @@ mod tests {
             // Between the stream before and the worked-out start.
             scrobble(130, "Low Tide"),
         ];
-        let (plays, pins) = (BTreeMap::new(), Pins::default());
-        let report = dry_run(&input(&streams, &scrobbles, &plays, &pins));
+        let plays = BTreeMap::new();
+        let report = dry_run(&input(&streams, &scrobbles, &plays));
         assert_eq!(report.paused, 1);
     }
 
@@ -779,8 +807,8 @@ mod tests {
         millis.offline = Some(true);
         millis.offline_timestamp = Some(EVENING + 899_000);
         let streams = fresh(vec![far, seconds, millis]);
-        let (plays, pins) = (BTreeMap::new(), Pins::default());
-        let report = dry_run(&input(&streams, &[], &plays, &pins));
+        let plays = BTreeMap::new();
+        let report = dry_run(&input(&streams, &[], &plays));
         assert_eq!(
             (
                 report.offline,
@@ -818,10 +846,9 @@ mod tests {
         // The plays now: the scrobble's, joined to the first stream, and
         // the second stream alone, which counts.
         let plays = BTreeMap::from([(2019, (2, 2))]);
-        let pins = Pins::default();
         let again = DryRunInput {
             in_force: &older,
-            ..input(&older, &scrobbles, &plays, &pins)
+            ..input(&older, &scrobbles, &plays)
         };
         let year = dry_run(&again).years[0];
         assert_eq!((year.streams, year.already_stored), (2, 0));
@@ -831,7 +858,7 @@ mod tests {
         later.extend(fresh(vec![record(2000, 12, "Paper Lanterns", "fwdbtn")]));
         let next = DryRunInput {
             in_force: &older,
-            ..input(&later, &scrobbles, &plays, &pins)
+            ..input(&later, &scrobbles, &plays)
         };
         let report = dry_run(&next);
         assert_eq!((report.streams, report.events), (3, 3));
@@ -849,8 +876,7 @@ mod tests {
         // is dated by the stream, which began in 2019.
         let scrobbles = [scrobble(NEW_YEAR + 10, "Low Tide")];
         let plays = BTreeMap::from([(2020, (1, 1))]);
-        let pins = Pins::default();
-        let report = dry_run(&input(&streams, &scrobbles, &plays, &pins));
+        let report = dry_run(&input(&streams, &scrobbles, &plays));
         let by_year: Vec<(i32, u64, u64)> = report
             .years
             .iter()
@@ -864,14 +890,60 @@ mod tests {
         let streams = fresh(vec![record(221, 221, "Low Tide", "trackdone")]);
         let scrobbles = [scrobble(1, "Low Tide")];
         let plays = BTreeMap::from([(2019, (1, 1))]);
-        let pins = Pins::default();
         let set_aside: HashSet<Vec<u8>> = HashSet::from([streams[0].key.clone()]);
         let report = dry_run(&DryRunInput {
             set_aside: &set_aside,
-            ..input(&streams, &scrobbles, &plays, &pins)
+            ..input(&streams, &scrobbles, &plays)
         });
         let year = &report.years[0];
         assert_eq!((year.plays_after, year.counted_after), (0, 0));
+    }
+
+    #[test]
+    fn a_correction_pins_a_stored_stream_in_the_dry_run_as_in_derivation() {
+        // A run undone and applied again: its streams are stored, as
+        // observations 10 and 11, and none is in force.
+        let streams = fresh(vec![
+            record(221, 221, "Low Tide", "trackdone"),
+            record(1300, 12, "Night Ferry", "fwdbtn"),
+        ]);
+        let stored: HashMap<Vec<u8>, SpotifyStream> = streams
+            .iter()
+            .map(|stream| (stream.key.clone(), stream.record.clone()))
+            .collect();
+        let observations =
+            HashMap::from([(streams[0].key.clone(), 10), (streams[1].key.clone(), 11)]);
+        // Tier A would join the first; the second's scrobble is an hour on.
+        let scrobbles = [scrobble(1, "Low Tide"), scrobble(5000, "Night Ferry")];
+        let correction = |observation, verb, targets: Vec<i64>| Correction {
+            observation,
+            verb,
+            targets,
+            window: None,
+            recording: None,
+        };
+        let corrections = [
+            correction(20, crate::history::Verb::Split, vec![10, 1]),
+            correction(21, crate::history::Verb::Join, vec![11, 5000]),
+        ];
+        // The plays now: the two scrobbles, each counted.
+        let plays = BTreeMap::from([(2019, (2, 2))]);
+        let report = dry_run(&DryRunInput {
+            stored: &stored,
+            corrections: &corrections,
+            observations: &observations,
+            ..input(&streams, &scrobbles, &plays)
+        });
+        let start = report
+            .tiers
+            .iter()
+            .find(|tier| tier.tier == StreamTier::Start)
+            .unwrap();
+        assert_eq!(start.joined, 0);
+        // Once applied: the first stream and its scrobble apart, each
+        // counted, and the skip joined to its scrobble, which counts it.
+        let year = &report.years[0];
+        assert_eq!((year.plays_after, year.counted_after), (3, 3));
     }
 
     #[test]
@@ -903,7 +975,8 @@ mod tests {
             plays_by_year: &plays,
             listener: 1,
             zone_periods: &[],
-            pins: &Pins::default(),
+            corrections: &[],
+            observations: &UNOBSERVED,
             stored: &HashMap::new(),
             set_aside: &NONE,
             made_at: 7,
@@ -951,7 +1024,8 @@ mod tests {
             plays_by_year: &plays,
             listener: 1,
             zone_periods: &zones,
-            pins: &Pins::default(),
+            corrections: &[],
+            observations: &UNOBSERVED,
             stored: &HashMap::new(),
             set_aside: &NONE,
             made_at: 7,
