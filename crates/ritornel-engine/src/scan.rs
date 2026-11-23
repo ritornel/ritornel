@@ -106,9 +106,10 @@ pub struct ScanRun {
     dirty: bool,
     walked: Option<Walked>,
     known: HashMap<String, Known>,
-    /// Items a file at a new path may have moved from, by audio hash: those
-    /// whose path the walk did not find, and those whose path now holds
-    /// other audio.
+    /// Items a file may have moved from, by audio hash: those whose path
+    /// the walk did not find, and those whose path now holds other audio.
+    /// A file at a new path is matched as it is read, and one at a known
+    /// path once every file is read ([`ScanRun::settle_moves`]).
     gone_by_audio: HashMap<String, Vec<i64>>,
     gone: Vec<i64>,
     /// The files to read, and how far the reading has got.
@@ -116,7 +117,8 @@ pub struct ScanRun {
     cursor: usize,
     batch: Vec<Payload>,
     images: HashMap<String, Vec<FolderImage>>,
-    /// Files whose audio changed at a known path, held for the resolver.
+    /// Files whose audio changed at a known path, held until every file is
+    /// read: each is then a move, or is judged by the resolver.
     replaced: Vec<(i64, Payload)>,
     failed: Vec<(String, &'static str, String)>,
     label: Option<String>,
@@ -492,6 +494,7 @@ impl ScanRun {
         self.gone.sort_unstable();
         // Known paths are read first, so that by the time a new path is
         // recorded, every item whose path now holds other audio is known.
+        // Files at known paths are matched once all are read.
         let known = &self.known;
         self.queue
             .sort_by_key(|file| !known.contains_key(&file.path));
@@ -553,12 +556,16 @@ impl ScanRun {
             }
             // The item's own file: the same audio under other tags, a file
             // that is back, or one that cannot be read now. After a failed
-            // read, it is the only audio the item has had, or any audio if
-            // it has had none.
+            // read, it is the only audio the item has had. An item that has
+            // had none is judged, as another item's file may have moved
+            // onto its path.
             let own = |known: &Known| match (&known.audio, &audio) {
                 (_, None) => true,
                 (Some(had), Some(now)) => had == now,
-                (None, Some(now)) => known.earlier_audio.iter().all(|had| had == now),
+                (None, Some(now)) => {
+                    !known.earlier_audio.is_empty()
+                        && known.earlier_audio.iter().all(|had| had == now)
+                }
             };
             match self.known.get(&payload.path) {
                 Some(known) if own(known) => {

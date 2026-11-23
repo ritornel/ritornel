@@ -943,6 +943,56 @@ fn a_file_moved_onto_another_files_path_keeps_its_item_and_retires_the_other() {
 }
 
 #[test]
+fn a_file_moved_onto_a_path_and_new_audio_at_its_own_keep_apart() {
+    for unreadable_first in [false, true] {
+        let mut rig = Rig::new();
+        let first = if unreadable_first {
+            "not-audio.flac"
+        } else {
+            "a.flac"
+        };
+        rig.put("Tin Weather/01.flac", first);
+        rig.put("Tin Weather/02.flac", "b.flac");
+        rig.scan();
+        let before = bound_items(&rig);
+        // 02 is moved onto 01, and other audio is put where 02 was.
+        let root = rig.root().join("Tin Weather");
+        std::fs::rename(root.join("02.flac"), root.join("01.flac")).unwrap();
+        rig.put("Tin Weather/02.flac", "a.retagged.opus");
+
+        let summary = rig.scan();
+        assert_eq!(
+            (summary.moved, summary.new, summary.retired, summary.missing),
+            (1, 1, 1, 0),
+            "{unreadable_first}"
+        );
+        // 02's item followed its file, 01's is retired, and the audio at
+        // 02 is an item of its own.
+        let after = bound_items(&rig);
+        assert_eq!(
+            after[0],
+            before[1].replace("Tin Weather/02.flac", "Tin Weather/01.flac"),
+            "{unreadable_first}"
+        );
+        assert_eq!(after.len(), 2, "{unreadable_first}");
+        assert!(
+            after[1].contains("|Tin Weather/02.flac|"),
+            "{unreadable_first}"
+        );
+        assert_eq!(
+            rig.one(&format!(
+                "SELECT retired_at_ms IS NOT NULL FROM source_item WHERE id = {}",
+                before[0].split('|').next().unwrap()
+            )),
+            "1"
+        );
+        let revision = rig.revision();
+        rig.scan();
+        assert_eq!(rig.revision(), revision, "{unreadable_first}");
+    }
+}
+
+#[test]
 fn an_item_whose_audio_is_now_at_two_known_paths_follows_neither() {
     let mut rig = Rig::new();
     rig.put("Tin Weather/01.flac", "a.flac");
