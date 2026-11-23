@@ -201,9 +201,16 @@ pub(crate) const COLUMN_GAP: f32 = 64.;
 
 /// An artist's page: its words and how it takes its room.
 pub(crate) mod artist {
-    use ritornel_contract::Shelf;
+    use ritornel_contract::{HistoryOf, Shelf};
 
-    use super::plural;
+    use super::{pictured, plural};
+
+    /// Whether an artist's page has history with them to show: a picture
+    /// of the years, or the records played most, which undated plays rank
+    /// too.
+    pub(crate) fn has_history(history: Option<&HistoryOf>) -> bool {
+        pictured(history).is_some() || history.is_some_and(|history| !history.records.is_empty())
+    }
 
     /// The facts under an artist's name: their albums and their other
     /// records, or their records, and their songs. The records of others they
@@ -492,5 +499,53 @@ mod tests {
         assert_eq!(song_columns(1020.), 1);
         assert_eq!(song_columns(1040.), 2);
         assert_eq!(song_columns(1920.), 3);
+    }
+
+    #[test]
+    fn an_artist_played_only_without_dates_still_has_history() {
+        use ritornel_contract::{AlbumRef, AlbumTile, Id, RecordPlayed};
+        let of = |years: Vec<YearPlays>, span: Option<YearSpan>, records: usize| HistoryOf {
+            plays: 12,
+            first_played: None,
+            last_played: None,
+            last_year: 0,
+            years,
+            span,
+            records: (0..records)
+                .map(|at| RecordPlayed {
+                    tile: AlbumTile {
+                        album: AlbumRef::ReleaseGroup {
+                            id: Id::from_bytes([at as u8; 16]),
+                        },
+                        title: Some("Night".to_owned()),
+                        artist_credit: None,
+                        year: None,
+                        track_count: 10,
+                        duration_ms: 2_400_000,
+                        version_count: 1,
+                        art_id: None,
+                        quality: None,
+                    },
+                    plays: 12,
+                    peak_year: None,
+                })
+                .collect(),
+            sentence: Vec::new(),
+            library_revision: 1,
+        };
+        let span = Some(YearSpan {
+            from: 2008,
+            to: 2026,
+        });
+        let dated = vec![YearPlays {
+            year: 2020,
+            plays: 12,
+        }];
+        assert!(!has_history(None));
+        assert!(!has_history(Some(&of(Vec::new(), None, 0))));
+        assert!(!has_history(Some(&of(Vec::new(), span, 0))));
+        assert!(has_history(Some(&of(Vec::new(), None, 2))));
+        assert!(has_history(Some(&of(Vec::new(), span, 2))));
+        assert!(has_history(Some(&of(dated, span, 0))));
     }
 }
