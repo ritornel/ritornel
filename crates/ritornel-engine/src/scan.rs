@@ -86,6 +86,7 @@ struct StepResult {
 enum Phase {
     Walk,
     Read,
+    Moves,
     Missing,
     Replaced,
     Resolve,
@@ -105,9 +106,10 @@ pub struct ScanRun {
     dirty: bool,
     walked: Option<Walked>,
     known: HashMap<String, Known>,
-    /// Items a file at a new path may have moved from, by audio hash: those
-    /// whose path the walk did not find, and those whose path now holds
-    /// other audio.
+    /// Items a file may have moved from, by audio hash: those whose path
+    /// the walk did not find, and those whose path now holds other audio.
+    /// A file at a new path is matched as it is read, and one at a known
+    /// path once every file is read ([`ScanRun::settle_moves`]).
     gone_by_audio: HashMap<String, Vec<i64>>,
     gone: Vec<i64>,
     /// The files to read, and how far the reading has got.
@@ -115,7 +117,8 @@ pub struct ScanRun {
     cursor: usize,
     batch: Vec<Payload>,
     images: HashMap<String, Vec<FolderImage>>,
-    /// Files whose audio changed at a known path, held for the resolver.
+    /// Files whose audio changed at a known path, held until every file is
+    /// read: each is then a move, or is judged by the resolver.
     replaced: Vec<(i64, Payload)>,
     failed: Vec<(String, &'static str, String)>,
     label: Option<String>,
@@ -322,7 +325,10 @@ impl ScanRun {
         // longer that folder, as when its disk went away or another was
         // mounted at its path, ends the scan: nothing more is recorded, and
         // nothing is taken for gone or replaced.
-        let judged = matches!(self.phase, Phase::Read | Phase::Missing | Phase::Replaced);
+        let judged = matches!(
+            self.phase,
+            Phase::Read | Phase::Moves | Phase::Missing | Phase::Replaced
+        );
         let walked_id = self.walked.as_ref().and_then(|walked| walked.root_id);
         if judged && folder_id(&self.root) != walked_id {
             return Err(Error::RootOffline {
@@ -371,6 +377,16 @@ impl ScanRun {
         match self.phase {
             Phase::Walk => self.sort_walk(library)?,
             Phase::Read => self.record(library)?,
+            Phase::Moves => {
+                self.phase = Phase::Missing;
+                let ops = self.settle_moves();
+                if !ops.is_empty() {
+                    let request = self.next_step();
+                    let receipt = self.step_result(self.summary)?;
+                    library.record(request, self.source.row, ops, receipt)?;
+                    self.committed()?;
+                }
+            }
             Phase::Missing => {
                 // What the walk did not find and no file moved from. The
                 // root was reachable, or the walk would have failed.
@@ -478,6 +494,7 @@ impl ScanRun {
         self.gone.sort_unstable();
         // Known paths are read first, so that by the time a new path is
         // recorded, every item whose path now holds other audio is known.
+        // Files at known paths are matched once all are read.
         let known = &self.known;
         self.queue
             .sort_by_key(|file| !known.contains_key(&file.path));
@@ -488,7 +505,7 @@ impl ScanRun {
         self.summary.files = walked.files.len() as u64;
         self.summary.unchanged = unchanged;
         self.phase = if self.queue.is_empty() {
-            Phase::Missing
+            Phase::Moves
         } else {
             Phase::Read
         };
@@ -539,12 +556,16 @@ impl ScanRun {
             }
             // The item's own file: the same audio under other tags, a file
             // that is back, or one that cannot be read now. After a failed
-            // read, it is the only audio the item has had, or any audio if
-            // it has had none.
+            // read, it is the only audio the item has had. An item that has
+            // had none is judged, as another item's file may have moved
+            // onto its path.
             let own = |known: &Known| match (&known.audio, &audio) {
                 (_, None) => true,
                 (Some(had), Some(now)) => had == now,
-                (None, Some(now)) => known.earlier_audio.iter().all(|had| had == now),
+                (None, Some(now)) => {
+                    !known.earlier_audio.is_empty()
+                        && known.earlier_audio.iter().all(|had| had == now)
+                }
             };
             match self.known.get(&payload.path) {
                 Some(known) if own(known) => {
@@ -575,7 +596,7 @@ impl ScanRun {
         }
         self.cursor = (self.cursor + self.settings.batch_files.max(1)).min(self.queue.len());
         if self.cursor >= self.queue.len() {
-            self.phase = Phase::Missing;
+            self.phase = Phase::Moves;
         }
         self.summary.bytes_read = counted.bytes_read;
         if !ops.is_empty() {
@@ -620,6 +641,64 @@ impl ScanRun {
                 next = Some(self.replaced.swap_remove(at).1);
             }
         }
+    }
+
+    /// Settles the files at known paths that hold other audio, once every
+    /// file has been read. Where that audio is one gone item's, and no
+    /// other such file holds it, the item moved here: files that swapped
+    /// paths, or moved round a ring, each take another's place, and an item
+    /// another's file moved onto, whose own file this scan found nowhere,
+    /// is retired with everything it has, as when a different song takes a
+    /// path. A file at a path whose item moved away is a new item, as in
+    /// [`place`](Self::place). The rest are judged as replaced audio.
+    fn settle_moves(&mut self) -> Vec<RecordOp> {
+        let replaced = std::mem::take(&mut self.replaced);
+        let audio = |payload: &Payload| payload.audio.as_ref().map(|audio| audio.hash.clone());
+        // Two files with an item's audio leave unclear which it moved to.
+        let mut holders: HashMap<String, usize> = HashMap::new();
+        for (_, payload) in &replaced {
+            if let Some(hash) = audio(payload) {
+                *holders.entry(hash).or_default() += 1;
+            }
+        }
+        let found: Vec<Option<i64>> = replaced
+            .iter()
+            .map(|(_, payload)| {
+                let hash = audio(payload).filter(|hash| holders.get(hash) == Some(&1))?;
+                match self.gone_by_audio.get(&hash)?.as_slice() {
+                    [item] => Some(*item),
+                    _ => None,
+                }
+            })
+            .collect();
+        let moved: HashSet<i64> = found.iter().flatten().copied().collect();
+        let mut ops: Vec<RecordOp> = replaced
+            .iter()
+            .zip(&found)
+            .filter(|((here, _), item)| item.is_some() && !moved.contains(here))
+            .map(|((here, _), _)| RecordOp::Displace(*here))
+            .collect();
+        self.summary.retired += ops.len() as u64;
+        self.summary.moved += moved.len() as u64;
+        let mut left = Vec::new();
+        for ((here, payload), item) in replaced.into_iter().zip(found) {
+            match item {
+                Some(item) => {
+                    self.gone.retain(|gone| *gone != item);
+                    ops.push(RecordOp::Move { item, payload });
+                }
+                None => left.push((here, payload)),
+            }
+        }
+        for (here, payload) in left {
+            if moved.contains(&here) {
+                self.summary.new += 1;
+                ops.push(RecordOp::New(payload));
+            } else {
+                self.replaced.push((here, payload));
+            }
+        }
+        ops
     }
 
     /// Settles the files whose audio changed at a path the library knew.

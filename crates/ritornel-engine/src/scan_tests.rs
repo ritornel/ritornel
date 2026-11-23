@@ -835,6 +835,223 @@ fn files_each_renamed_into_the_next_ones_place_keep_their_items() {
     );
 }
 
+/// Each live item's ID, path, audio and current assignment row, by ID.
+fn bound_items(rig: &Rig) -> Vec<String> {
+    rig.rows(
+        "SELECT si.id, si.provider_key, sr.audio_asset_id, a.id FROM source_item si
+         JOIN source_item_revision sr ON sr.id = si.current_revision_id
+         LEFT JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+         WHERE si.retired_at_ms IS NULL ORDER BY si.id",
+    )
+}
+
+#[test]
+fn files_that_swap_paths_or_move_round_a_ring_keep_their_items() {
+    for ring in [2, 3] {
+        let mut rig = Rig::new();
+        let files = [
+            ("01.flac", "a.flac"),
+            ("02.flac", "b.flac"),
+            ("03.mp3", "a.mp3"),
+        ];
+        for (file, fixture) in &files[..ring] {
+            rig.put(&format!("Tin Weather/{file}"), fixture);
+        }
+        rig.scan();
+        let before = bound_items(&rig);
+        // Each file takes the next one's path, and the last the first's.
+        let root = rig.root().join("Tin Weather");
+        let aside = rig.scratch.path().join("aside");
+        std::fs::rename(root.join(files[ring - 1].0), &aside).unwrap();
+        for at in (1..ring).rev() {
+            std::fs::rename(root.join(files[at - 1].0), root.join(files[at].0)).unwrap();
+        }
+        std::fs::rename(&aside, root.join(files[0].0)).unwrap();
+
+        let summary = rig.scan();
+        assert_eq!(
+            (
+                summary.moved,
+                summary.new,
+                summary.retired,
+                summary.changed,
+                summary.missing
+            ),
+            (ring as u64, 0, 0, 0, 0),
+            "{ring}"
+        );
+        // The same items and bindings, each at the next path.
+        let path = |row: &String| row.split('|').nth(1).unwrap().to_owned();
+        let expected: Vec<String> = (0..ring)
+            .map(|at| before[at].replace(&path(&before[at]), &path(&before[(at + 1) % ring])))
+            .collect();
+        assert_eq!(bound_items(&rig), expected, "{ring}");
+        assert_eq!(
+            rig.one("SELECT count(*) FROM source_item"),
+            ring.to_string()
+        );
+        // And then nothing: the next scan is quiet.
+        let revision = rig.revision();
+        rig.scan();
+        assert_eq!(rig.revision(), revision, "{ring}");
+    }
+}
+
+#[test]
+fn a_file_moved_onto_another_files_path_keeps_its_item_and_retires_the_other() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    let before = bound_items(&rig);
+    // 02 is moved onto 01, in its place.
+    let root = rig.root().join("Tin Weather");
+    std::fs::rename(root.join("02.flac"), root.join("01.flac")).unwrap();
+
+    let summary = rig.scan();
+    assert_eq!(
+        (
+            summary.moved,
+            summary.new,
+            summary.retired,
+            summary.changed,
+            summary.missing
+        ),
+        (1, 0, 1, 0, 0)
+    );
+    // The moved file's item is at 01 with its binding. The item whose file
+    // it replaced is retired, with everything it had.
+    assert_eq!(
+        bound_items(&rig),
+        [before[1].replace("Tin Weather/02.flac", "Tin Weather/01.flac")]
+    );
+    assert_eq!(
+        rig.rows(
+            "SELECT si.id, si.provider_key, si.missing_since_ms IS NULL, a.id
+             FROM source_item si JOIN assignment a ON a.source_item_id = si.id
+               AND a.superseded_at_ms IS NULL
+             WHERE si.retired_at_ms IS NOT NULL"
+        ),
+        [{
+            let row: Vec<&str> = before[0].split('|').collect();
+            format!("{}|{}|1|{}", row[0], row[1], row[3])
+        }]
+    );
+    let revision = rig.revision();
+    rig.scan();
+    assert_eq!(rig.revision(), revision);
+}
+
+#[test]
+fn a_file_moved_onto_a_path_and_new_audio_at_its_own_keep_apart() {
+    for unreadable_first in [false, true] {
+        let mut rig = Rig::new();
+        let first = if unreadable_first {
+            "not-audio.flac"
+        } else {
+            "a.flac"
+        };
+        rig.put("Tin Weather/01.flac", first);
+        rig.put("Tin Weather/02.flac", "b.flac");
+        rig.scan();
+        let before = bound_items(&rig);
+        // 02 is moved onto 01, and other audio is put where 02 was.
+        let root = rig.root().join("Tin Weather");
+        std::fs::rename(root.join("02.flac"), root.join("01.flac")).unwrap();
+        rig.put("Tin Weather/02.flac", "a.retagged.opus");
+
+        let summary = rig.scan();
+        assert_eq!(
+            (summary.moved, summary.new, summary.retired, summary.missing),
+            (1, 1, 1, 0),
+            "{unreadable_first}"
+        );
+        // 02's item followed its file, 01's is retired, and the audio at
+        // 02 is an item of its own.
+        let after = bound_items(&rig);
+        assert_eq!(
+            after[0],
+            before[1].replace("Tin Weather/02.flac", "Tin Weather/01.flac"),
+            "{unreadable_first}"
+        );
+        assert_eq!(after.len(), 2, "{unreadable_first}");
+        assert!(
+            after[1].contains("|Tin Weather/02.flac|"),
+            "{unreadable_first}"
+        );
+        assert_eq!(
+            rig.one(&format!(
+                "SELECT retired_at_ms IS NOT NULL FROM source_item WHERE id = {}",
+                before[0].split('|').next().unwrap()
+            )),
+            "1"
+        );
+        let revision = rig.revision();
+        rig.scan();
+        assert_eq!(rig.revision(), revision, "{unreadable_first}");
+    }
+}
+
+#[test]
+fn an_item_whose_audio_is_now_at_two_known_paths_follows_neither() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.put("Tin Weather/03.flac", "b.no-artist.flac");
+    rig.scan();
+    let first = rig.one("SELECT id FROM source_item WHERE provider_key = 'Tin Weather/01.flac'");
+    // 01 is moved onto 02, and a copy of it is put over 03: which one the
+    // item went to is not known, whatever order they are read in.
+    let root = rig.root().join("Tin Weather");
+    std::fs::copy(root.join("01.flac"), root.join("03.flac")).unwrap();
+    std::fs::rename(root.join("01.flac"), root.join("02.flac")).unwrap();
+
+    let summary = rig.scan();
+    assert_eq!((summary.moved, summary.missing), (0, 1));
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT provider_key, missing_since_ms IS NOT NULL, retired_at_ms IS NULL
+             FROM source_item WHERE id = {first}"
+        )),
+        "Tin Weather/01.flac|1|1"
+    );
+}
+
+#[test]
+fn a_swap_cut_off_after_its_moves_are_written_keeps_its_items_and_its_counts() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    let before = bound_items(&rig);
+    let root = rig.root().join("Tin Weather");
+    let aside = rig.scratch.path().join("aside");
+    std::fs::rename(root.join("01.flac"), &aside).unwrap();
+    std::fs::rename(root.join("02.flac"), root.join("01.flac")).unwrap();
+    std::fs::rename(&aside, root.join("02.flac")).unwrap();
+    // Both files are read with nothing to write, so the moves are the
+    // first step.
+    let source = rig.main.clone();
+    let settings = ScanSettings {
+        fail_after_step: Some(1),
+        ..ScanSettings::default()
+    };
+    assert!(matches!(
+        rig.try_scan(&source, settings),
+        Err(Error::FailPoint)
+    ));
+    let resumed = rig.resume(ScanSettings::default()).unwrap();
+    assert_eq!((resumed.moved, resumed.retired, resumed.new), (2, 0, 0));
+    let path = |row: &String| row.split('|').nth(1).unwrap().to_owned();
+    assert_eq!(
+        bound_items(&rig),
+        [
+            before[0].replace(&path(&before[0]), &path(&before[1])),
+            before[1].replace(&path(&before[1]), &path(&before[0])),
+        ]
+    );
+}
+
 #[test]
 fn a_file_that_vanishes_is_marked_missing_and_reclaims_its_rows_when_it_returns() {
     let mut rig = Rig::new();
@@ -1366,7 +1583,9 @@ fn another_disk_mounted_at_the_root_after_the_walk_is_not_judged_against_it() {
     {
         if swapped_before_judging {
             // The walk sees only other audio at 01, which is read from
-            // the disk walked. The swap comes before it is judged.
+            // the disk walked: a copy of 02's, which is there, so no file
+            // moved. The swap comes before it is judged.
+            rig.put("Tin Weather/02.flac", "b.flac");
             rig.scan();
             rig.put("Tin Weather/01.flac", "b.flac");
         } else if nothing_to_read {
@@ -1385,8 +1604,8 @@ fn another_disk_mounted_at_the_root_after_the_walk_is_not_judged_against_it() {
         let (mut run, row) = walked(&mut rig);
         let stop = std::sync::atomic::AtomicBool::new(false);
         if swapped_before_judging {
-            // The batch is read, and nothing is missing.
-            for _ in 0..2 {
+            // The batch is read, no file moved, and nothing is missing.
+            for _ in 0..3 {
                 assert!(run.prepare(&stop, &mut |_| {}).unwrap());
                 assert_eq!(run.commit(&rig.library).unwrap(), None);
             }

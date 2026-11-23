@@ -65,6 +65,9 @@ pub(crate) enum RecordOp {
     /// A different song has taken this item's path: the item is retired
     /// with everything it has, and a new item takes the path.
     Retire { item: i64, payload: Payload },
+    /// Another item's file has moved onto this item's path, and this item's
+    /// own file is nowhere: the item is retired with everything it has.
+    Displace(i64),
 }
 
 const SOURCE_COLUMNS: &str = "src.id, src.public_id, src.name, src.kind,
@@ -519,6 +522,31 @@ impl LibraryStore {
     ) -> Result<Written, Error> {
         self.write(request, move |write| {
             let recorder = Recorder::new(write)?;
+            let retire = |item: &i64| {
+                write.connection().execute(
+                    "UPDATE source_item SET retired_at_ms = ?2, rev = ?3 WHERE id = ?1",
+                    (item, write.now_ms(), write.rev()),
+                )
+            };
+            // Paths are let go before any is taken: an item another's file
+            // moved onto is retired, and an item that moves is keyed apart
+            // until it is recorded at its new path, a key no path has as
+            // paths are relative. So files that swapped paths, or moved
+            // round a ring, each take another's.
+            for op in &ops {
+                match op {
+                    RecordOp::Displace(item) => {
+                        retire(item)?;
+                    }
+                    RecordOp::Move { item, .. } => {
+                        write.connection().execute(
+                            "UPDATE source_item SET provider_key = '/' || id WHERE id = ?1",
+                            [item],
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
             for op in &ops {
                 match op {
                     RecordOp::New(payload) => recorder.new_item(source, payload)?,
@@ -526,12 +554,10 @@ impl LibraryStore {
                         recorder.revision(*item, payload, false)?;
                     }
                     RecordOp::Retire { item, payload } => {
-                        write.connection().execute(
-                            "UPDATE source_item SET retired_at_ms = ?2, rev = ?3 WHERE id = ?1",
-                            (item, write.now_ms(), write.rev()),
-                        )?;
+                        retire(item)?;
                         recorder.new_item(source, payload)?;
                     }
+                    RecordOp::Displace(_) => {}
                 }
             }
             if !ops.is_empty() {
