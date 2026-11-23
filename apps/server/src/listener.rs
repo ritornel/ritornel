@@ -106,7 +106,14 @@ pub(crate) async fn bind(listen: Listen) -> Result<TcpListener, Error> {
     match TcpListener::bind(address).await {
         Ok(listener) => Ok(listener),
         Err(taken) => match listen.fallback() {
-            Some(fallback) if taken.kind() == ErrorKind::AddrInUse => {
+            // Windows refuses a port in a range the system has reserved,
+            // as Hyper-V and WSL do, as a permission it lacks, not as taken.
+            Some(fallback)
+                if matches!(
+                    taken.kind(),
+                    ErrorKind::AddrInUse | ErrorKind::PermissionDenied
+                ) =>
+            {
                 info!(%address, "the default port is taken: asking the system for another");
                 TcpListener::bind(fallback)
                     .await
