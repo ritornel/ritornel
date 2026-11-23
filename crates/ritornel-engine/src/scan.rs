@@ -637,42 +637,52 @@ impl ScanRun {
     }
 
     /// Settles the files at known paths that hold other audio, once every
-    /// file has been read. Where that audio is exactly one gone item's, the
-    /// item moved here: files that swapped paths, or moved round a ring,
-    /// each take another's place, and an item another's file moved onto,
-    /// whose own file is nowhere, is retired, as when a different song takes
-    /// a path. A file at a path whose item moved away is a new item, as in
+    /// file has been read. Where that audio is one gone item's, and no
+    /// other such file holds it, the item moved here: files that swapped
+    /// paths, or moved round a ring, each take another's place, and an item
+    /// another's file moved onto, whose own file this scan found nowhere,
+    /// is retired with everything it has, as when a different song takes a
+    /// path. A file at a path whose item moved away is a new item, as in
     /// [`place`](Self::place). The rest are judged as replaced audio.
     fn settle_moves(&mut self) -> Vec<RecordOp> {
-        let mut moves = Vec::new();
-        let mut moved = HashSet::new();
-        let mut taken = Vec::new();
+        let replaced = std::mem::take(&mut self.replaced);
+        let audio = |payload: &Payload| payload.audio.as_ref().map(|audio| audio.hash.clone());
+        // Two files with an item's audio leave unclear which it moved to.
+        let mut holders: HashMap<String, usize> = HashMap::new();
+        for (_, payload) in &replaced {
+            if let Some(hash) = audio(payload) {
+                *holders.entry(hash).or_default() += 1;
+            }
+        }
+        let found: Vec<Option<i64>> = replaced
+            .iter()
+            .map(|(_, payload)| {
+                let hash = audio(payload).filter(|hash| holders.get(hash) == Some(&1))?;
+                match self.gone_by_audio.get(&hash)?.as_slice() {
+                    [item] => Some(*item),
+                    _ => None,
+                }
+            })
+            .collect();
+        let moved: HashSet<i64> = found.iter().flatten().copied().collect();
+        let mut ops: Vec<RecordOp> = replaced
+            .iter()
+            .zip(&found)
+            .filter(|((here, _), item)| item.is_some() && !moved.contains(here))
+            .map(|((here, _), _)| RecordOp::Displace(*here))
+            .collect();
+        self.summary.retired += ops.len() as u64;
+        self.summary.moved += moved.len() as u64;
         let mut left = Vec::new();
-        for (here, payload) in std::mem::take(&mut self.replaced) {
-            let item = payload
-                .audio
-                .as_ref()
-                .and_then(|audio| self.gone_by_audio.get_mut(&audio.hash))
-                .filter(|items| items.len() == 1)
-                .and_then(Vec::pop);
+        for ((here, payload), item) in replaced.into_iter().zip(found) {
             match item {
                 Some(item) => {
                     self.gone.retain(|gone| *gone != item);
-                    moved.insert(item);
-                    taken.push(here);
-                    moves.push(RecordOp::Move { item, payload });
+                    ops.push(RecordOp::Move { item, payload });
                 }
                 None => left.push((here, payload)),
             }
         }
-        let mut ops: Vec<RecordOp> = taken
-            .into_iter()
-            .filter(|here| !moved.contains(here))
-            .map(RecordOp::Displace)
-            .collect();
-        self.summary.retired += ops.len() as u64;
-        self.summary.moved += moves.len() as u64;
-        ops.extend(moves);
         for (here, payload) in left {
             if moved.contains(&here) {
                 self.summary.new += 1;

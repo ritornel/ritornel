@@ -943,6 +943,66 @@ fn a_file_moved_onto_another_files_path_keeps_its_item_and_retires_the_other() {
 }
 
 #[test]
+fn an_item_whose_audio_is_now_at_two_known_paths_follows_neither() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.put("Tin Weather/03.flac", "b.no-artist.flac");
+    rig.scan();
+    let first = rig.one("SELECT id FROM source_item WHERE provider_key = 'Tin Weather/01.flac'");
+    // 01 is moved onto 02, and a copy of it is put over 03: which one the
+    // item went to is not known, whatever order they are read in.
+    let root = rig.root().join("Tin Weather");
+    std::fs::copy(root.join("01.flac"), root.join("03.flac")).unwrap();
+    std::fs::rename(root.join("01.flac"), root.join("02.flac")).unwrap();
+
+    let summary = rig.scan();
+    assert_eq!((summary.moved, summary.missing), (0, 1));
+    assert_eq!(
+        rig.one(&format!(
+            "SELECT provider_key, missing_since_ms IS NOT NULL, retired_at_ms IS NULL
+             FROM source_item WHERE id = {first}"
+        )),
+        "Tin Weather/01.flac|1|1"
+    );
+}
+
+#[test]
+fn a_swap_cut_off_after_its_moves_are_written_keeps_its_items_and_its_counts() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    let before = bound_items(&rig);
+    let root = rig.root().join("Tin Weather");
+    let aside = rig.scratch.path().join("aside");
+    std::fs::rename(root.join("01.flac"), &aside).unwrap();
+    std::fs::rename(root.join("02.flac"), root.join("01.flac")).unwrap();
+    std::fs::rename(&aside, root.join("02.flac")).unwrap();
+    // Both files are read with nothing to write, so the moves are the
+    // first step.
+    let source = rig.main.clone();
+    let settings = ScanSettings {
+        fail_after_step: Some(1),
+        ..ScanSettings::default()
+    };
+    assert!(matches!(
+        rig.try_scan(&source, settings),
+        Err(Error::FailPoint)
+    ));
+    let resumed = rig.resume(ScanSettings::default()).unwrap();
+    assert_eq!((resumed.moved, resumed.retired, resumed.new), (2, 0, 0));
+    let path = |row: &String| row.split('|').nth(1).unwrap().to_owned();
+    assert_eq!(
+        bound_items(&rig),
+        [
+            before[0].replace(&path(&before[0]), &path(&before[1])),
+            before[1].replace(&path(&before[1]), &path(&before[0])),
+        ]
+    );
+}
+
+#[test]
 fn a_file_that_vanishes_is_marked_missing_and_reclaims_its_rows_when_it_returns() {
     let mut rig = Rig::new();
     album(&mut rig);
