@@ -42,6 +42,7 @@ What differs between systems sits in a `platform` module in each crate that need
 - **MPRIS is served with `zbus` directly, not through `souvlaki`.** `souvlaki`'s Linux backend wakes every 10 ms while a player is registered, panics when there is no session bus, does not advance reported position between updates, and never emits `Seeked`. The `zbus` implementation avoids all four:
   - it wakes only for a change or a call;
   - with no session bus there is simply no media session, logged only at debug, as on a hub, in a container, or in a login with no desktop;
+  - a bus that does not take an update within a second is left, with a warning, and MPRIS stays off until the server starts again, so a bus that has stopped reading holds neither the media session nor the server's stop;
   - it computes position when asked;
   - it emits `Seeked` when the position jumps.
 
