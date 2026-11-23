@@ -72,20 +72,21 @@ rustix = { version = "1.1.6", features = ["fs", "time"] }
 # really is.
 [target.'cfg(windows)'.dependencies]
 ritornel-windows.workspace = true
-# cpal's own thread, which WASAPI wakes every few milliseconds for the next
-# frames, joins the system's audio scheduling (MMCSS) through `realtime`: at
-# normal priority it wakes late whenever every core is busy, and the sound
-# drops out. CoreAudio's threads are real-time already. See
+# The system's audio output, WASAPI, as on macOS and Linux below; with
+# `realtime`, cpal's own thread, which WASAPI wakes every few milliseconds
+# for the next frames, asks to join the system's audio scheduling (MMCSS):
+# at normal priority it wakes late whenever every core is busy. See
 # docs/internals/platforms.md, "Windows".
 cpal = { version = "=0.18.2", optional = true, features = ["realtime"] }
 
-# The system's audio output: CoreAudio on macOS, WASAPI on Windows, and ALSA
-# on Linux, which reaches PipeWire and PulseAudio through their ALSA
-# plugins. On Linux cpal links libasound, so a build with the feature needs
-# ALSA's development files (alsa-lib, or libasound2-dev); WASAPI is part of
-# Windows and needs nothing installed. The headless hub is built without it
-# and links no audio library. See docs/internals/platforms.md.
-[target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dependencies]
+# The system's audio output: CoreAudio on macOS, and ALSA on Linux, which
+# reaches PipeWire and PulseAudio through their ALSA plugins, as WASAPI is
+# on Windows above. On Linux cpal links libasound, so a build with the
+# feature needs ALSA's development files (alsa-lib, or libasound2-dev);
+# WASAPI is part of Windows and needs nothing installed. The headless hub is
+# built without it and links no audio library. CoreAudio's threads are
+# real-time already. See docs/internals/platforms.md.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 cpal = { version = "=0.18.2", optional = true }
 
 [features]
