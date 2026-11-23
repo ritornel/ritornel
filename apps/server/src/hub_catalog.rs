@@ -109,8 +109,14 @@ impl HubCatalog {
     /// Pulls the first of the hub's copies of an appearance that can be
     /// pulled into the cache, unless one is kept already, and returns it as
     /// the player opens it. It may take as long as the master takes to
-    /// cross the network, so it is done off the player.
-    pub(crate) fn fetch(&self, appearance: Id) -> Result<Copy, Error> {
+    /// cross the network, so it is done off the player. Once `cancel` says
+    /// so, or its sender has gone, a pull under way ends and its partial
+    /// file is removed before this returns.
+    pub(crate) fn fetch(
+        &self,
+        appearance: Id,
+        cancel: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Copy, Error> {
         let Some(LinkCopies { copies }) = self.offered(appearance) else {
             return Err(Error::Playback(
                 "the hub did not say where this track is".to_owned(),
@@ -118,7 +124,10 @@ impl HubCatalog {
         };
         let mut last = Error::Playback("the hub has no copy of this track".to_owned());
         for copy in &copies {
-            match self.pull(appearance, copy) {
+            if *cancel.borrow() {
+                return Err(stopping());
+            }
+            match self.pull(appearance, copy, cancel) {
                 Ok(path) => {
                     let Some(facts) = facts_of(&path) else {
                         continue;
@@ -139,7 +148,12 @@ impl HubCatalog {
     }
 
     /// The master, pulled from the hub if it is not kept here already.
-    fn pull(&self, appearance: Id, copy: &HubCopy) -> Result<PathBuf, Error> {
+    fn pull(
+        &self,
+        appearance: Id,
+        copy: &HubCopy,
+        cancel: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<PathBuf, Error> {
         let kept = self.kept(copy);
         // Kept already. A kept master's time is never changed: the player
         // may have it open, and a file whose time changes is one it no
@@ -160,18 +174,30 @@ impl HubCatalog {
         );
         let credential = self.uplink.credential();
         let started = std::time::Instant::now();
-        let pulled = self.uplink.block_on(ritornel_client::download(
-            route_to,
-            &path,
-            &credential,
-            &part,
-            copy.size_bytes,
-        ));
+        let mut cancel = cancel.clone();
+        let pulled = self.uplink.block_on(async {
+            tokio::select! {
+                pulled = ritornel_client::download(
+                    route_to,
+                    &path,
+                    &credential,
+                    &part,
+                    copy.size_bytes,
+                ) => Some(pulled),
+                _ = cancel.wait_for(|cancelled| *cancelled) => None,
+            }
+        });
+        // Cancelled, or cut short by the stop: the download, and the file
+        // it wrote to, are dropped by now.
+        let Some(pulled) = pulled.flatten() else {
+            discard(&part);
+            return Err(stopping());
+        };
         match pulled {
             Ok(bytes) if bytes == copy.size_bytes => {
                 std::fs::rename(&part, &kept)
                     .inspect_err(|_| {
-                        let _ = std::fs::remove_file(&part);
+                        discard(&part);
                     })
                     .map_err(Error::Io)?;
                 info!(
@@ -183,19 +209,36 @@ impl HubCatalog {
                 Ok(kept)
             }
             Ok(bytes) => {
-                let _ = std::fs::remove_file(&part);
+                discard(&part);
                 Err(Error::Playback(format!(
                     "the hub sent {bytes} bytes of a master of {}",
                     copy.size_bytes
                 )))
             }
             Err(error) => {
-                let _ = std::fs::remove_file(&part);
+                discard(&part);
                 Err(Error::Playback(format!(
                     "the master could not be pulled from the hub: {error}"
                 )))
             }
         }
+    }
+}
+
+/// What a pull the server's stop ended says.
+fn stopping() -> Error {
+    Error::Playback("the server is stopping".to_owned())
+}
+
+/// Removes what a pull that did not finish wrote. One that cannot be
+/// removed is said in the log: the next start removes it, as it does
+/// what a crash leaves.
+fn discard(part: &Path) {
+    match std::fs::remove_file(part) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            warn!(%error, path = %part.display(), "a partial master could not be removed");
+        }
+        _ => {}
     }
 }
 
