@@ -45,7 +45,7 @@ A name given in the settings (`--name`, `RITORNEL_NAME`, or `name` in `config.to
 
 ### Keeping a hub awake
 
-A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so being linked is not reason enough to keep a machine awake. When a hub keeps its machine from idle sleep is the owner's preference, kept in `server.db` (`server_setting` row `link.awake`) so it follows the server, and set with `link.setAwake` (`ritornelctl link awake`). It is one of three modes (`Awake`):
+A sleeping hub is one its satellites cannot reach, but a satellite or a player stays linked for good, so being linked is not reason enough to keep a machine awake. When a hub keeps its machine from idle sleep is a stored preference, kept in `server.db` (`server_setting` row `link.awake`) so it follows the server, and set with `link.setAwake` (`ritornelctl link awake`). It is one of three modes (`Awake`):
 
 - **While active**, the default, for 30 minutes: while a linked server plays, or has made a call within the minutes given. The window is at most a week (`Awake::MAX_MINUTES`), and zero means while one plays only. A stored setting that cannot be read, or is out of range, gives way to the default with a warning in the log.
 - **Always**, for as long as the server runs.
