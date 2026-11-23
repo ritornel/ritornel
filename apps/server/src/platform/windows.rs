@@ -86,10 +86,18 @@ pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
     })
 }
 
-/// Nothing yet: the standard library cannot open a folder to flush it, so
-/// a rename is not flushed (docs/internals/platforms.md, "Verification").
+/// Nothing: a folder cannot be flushed on every file system a rename works
+/// on, so [`rename_dir`] writes its rename through to the disk instead
+/// (docs/internals/platforms.md, "Windows").
 pub(crate) fn sync_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Renames the folder at `from` to `to`, asking for the rename to be
+/// written through to the disk before this returns. It fails if something
+/// is at `to`.
+pub(crate) fn rename_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    ritornel_windows::file::rename_through(from, to)
 }
 
 /// Closes the file at `path` to everyone but the OS user.

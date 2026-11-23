@@ -38,7 +38,8 @@ use tracing::{info, warn};
 
 use crate::data_dir::DataDir;
 use crate::platform::{
-    close_to_others, create_new_private_dir, create_private_dir, create_private_file, sync_dir,
+    close_to_others, create_new_private_dir, create_private_dir, create_private_file, rename_dir,
+    sync_dir,
 };
 
 /// The version of `backup.json`.
@@ -415,13 +416,15 @@ pub(crate) fn reserve_named(place: &Path, base: &str) -> Result<(String, PathBuf
 
 /// Makes the folder written under `partial` whole, as `name` in `place`:
 /// it is synced, so that its names are kept, renamed, and the place synced,
-/// so that the new name is. Each file in it was synced as it was written.
-/// On an error nothing of it is left, and it is not to be called whole.
+/// so that the new name is. On Windows, where a folder is not synced, the
+/// rename asks to be written through to the disk instead. Each file in it
+/// was synced as it was written. On an error nothing of it is left, and it
+/// is not to be called whole.
 pub(crate) fn publish(partial: &Path, place: &Path, name: &str) -> Result<PathBuf, BackupError> {
     let finished = place.join(name);
     let renamed = sync_dir(partial)
         .map_err(io("sync", partial))
-        .and_then(|()| std::fs::rename(partial, &finished).map_err(io("finish", &finished)));
+        .and_then(|()| rename_dir(partial, &finished).map_err(io("finish", &finished)));
     if let Err(error) = renamed {
         let _ = std::fs::remove_dir_all(partial);
         return Err(error);

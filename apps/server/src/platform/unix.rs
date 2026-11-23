@@ -38,6 +38,13 @@ pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+/// Renames the folder at `from` to `to`, and nothing more: a caller that
+/// needs the new name to survive a loss of power syncs the folder that
+/// holds it after ([`sync_dir`]), as `backup::publish` does.
+pub(crate) fn rename_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
 /// Closes the file at `path` to everyone but the OS user: mode `0600`.
 pub(crate) fn close_to_others(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
