@@ -495,13 +495,15 @@ fn while_a_listen_cannot_be_saved_playback_goes_on_and_the_status_says_so_and_si
     let scratch = Scratch::new();
     let data_dir = scratch.data_dir();
     let album = scratch.album("Long Album", [600, 600]);
-    // Twenty times real time; past ten seconds into a track, every save of
-    // its listen fails, as a full disk's would.
+    // Past a minute into a track, every save of its listen fails, as a full
+    // disk's would. It plays in real time, so that the next track's first
+    // minute, while its saves work again, outlasts any wait for the status
+    // to say so.
     let server = Server::start(
         &data_dir,
         &[
-            ("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20"),
-            ("RITORNEL_TEST_FAIL_SAVES_AFTER_MS", "10000"),
+            ("RITORNEL_TEST_NULL_OUTPUT_SPEED", "1"),
+            ("RITORNEL_TEST_FAIL_SAVES_AFTER_MS", "60000"),
         ],
     );
     ok(&data_dir, &["library", "create"]);
@@ -513,6 +515,8 @@ fn while_a_listen_cannot_be_saved_playback_goes_on_and_the_status_says_so_and_si
     assert!(stdout.contains("Record            advancing"), "{stdout}");
 
     ok(&data_dir, &["play", folder]);
+    // A seek is saved at once: there, the save fails.
+    ok(&data_dir, &["seek", "1:01"]);
     let status = until(&data_dir, &["status"], |status| {
         !status["record"]["problems"].as_array().unwrap().is_empty()
     });

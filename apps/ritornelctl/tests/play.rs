@@ -327,13 +327,15 @@ fn ritornelctl_play_plays_a_folder_start_to_finish_and_every_listen_reaches_hist
     let scratch = Scratch::new();
     let (data_dir, music) = (scratch.data_dir(), scratch.music());
     let folder = music.to_str().unwrap();
-    // Fifty times real time: the album is over in under a second. The
-    // server's zone is one far from midnight, so that "today" cannot turn
-    // between the plays and the question of what was played on it.
+    // Ten times real time: each track lasts four seconds, through several
+    // of the looks `play --follow` takes every half second, so a slow
+    // machine misses neither. The server's zone is one far from midnight,
+    // so that "today" cannot turn between the plays and the question of
+    // what was played on it.
     let zone = a_zone_at_noon();
     let server = Server::start(
         &data_dir,
-        &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "50"), ("TZ", &zone)],
+        &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "10"), ("TZ", &zone)],
     );
     ok(&data_dir, &["library", "create"]);
     ok(&data_dir, &["scan", folder]);
@@ -398,8 +400,10 @@ fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_on
         ABORTED
     );
 
-    // The run after that is a normal one.
-    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
+    // The run after that is a normal one. At twice real time, the rest of
+    // the first track lasts long after the test stops it, however slowly
+    // the stop comes.
+    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "2")]);
     // The queue and the position are back, and nothing plays.
     let now = json(&data_dir, &["now"]);
     assert_eq!(now["status"], "paused");

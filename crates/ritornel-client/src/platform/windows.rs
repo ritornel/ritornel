@@ -60,12 +60,20 @@ pub(crate) fn try_hold_as_a_server(file: &std::fs::File) -> bool {
     .unwrap_or(false)
 }
 
-/// A program beside `path` that is a batch file, `windows`, standing in for
-/// another; `unix` is the same script for the shell.
+/// A program in `dir` that is a batch file, `windows`, standing in for
+/// another; `unix` is the same script for the shell. Each is a new file, so
+/// none is written over while one run before it may still hold it open.
 #[cfg(test)]
-pub(crate) fn script(path: &std::path::Path, _unix: &str, windows: &str) -> std::path::PathBuf {
-    let path = path.with_extension("cmd");
+pub(crate) fn script(dir: &std::path::Path, _unix: &str, windows: &str) -> crate::launch::Program {
     let lines: Vec<&str> = windows.lines().collect();
+    let path = tempfile::Builder::new()
+        .prefix("fake-server-")
+        .suffix(".cmd")
+        .tempfile_in(dir)
+        .unwrap()
+        .into_temp_path()
+        .keep()
+        .unwrap();
     std::fs::write(&path, format!("@echo off\r\n{}\r\n", lines.join("\r\n"))).unwrap();
-    path
+    crate::launch::Program::new(path)
 }

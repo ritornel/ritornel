@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stands in for ritornel-server in the launcher's tests: it runs the script
+# the test gives it in RITORNEL_FAKE_SERVER. See `script` in unix.rs.
+eval "$RITORNEL_FAKE_SERVER"
