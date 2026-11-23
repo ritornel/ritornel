@@ -6,8 +6,8 @@
 //! and each offers the same names:
 //!
 //! - files and folders only the OS user can open, a folder synced, a
-//!   folder renamed so that the new name survives a loss of power, and the
-//!   free space beside them;
+//!   folder renamed (on Windows, asking for it to be written through to
+//!   the disk), and the free space beside them;
 //! - the lock on `server.lock`, which a client tries as the contract says
 //!   (`ritornel_contract::local`);
 //! - what asks a running server to stop, and the main thread's wait for

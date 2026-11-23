@@ -87,7 +87,7 @@ pub fn free_bytes(path: &Path) -> io::Result<u64> {
 /// holds it: a folder cannot be flushed everywhere a rename works. It fails
 /// if something is at `to` already. A path may be longer than `MAX_PATH`.
 pub fn rename_through(from: &Path, to: &Path) -> io::Result<()> {
-    let (from, to) = (crate::wide_verbatim(from)?, crate::wide_verbatim(to)?);
+    let (from, to) = (crate::wide_absolute(from)?, crate::wide_absolute(to)?);
     // SAFETY: both names end in their only NUL.
     if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
         return Err(io::Error::last_os_error());
@@ -164,6 +164,13 @@ mod tests {
         assert!(rename_through(&dir.join("new"), &dir.join("old")).is_err());
         assert_eq!(std::fs::read(dir.join("new")).unwrap(), b"new");
         assert_eq!(std::fs::read(dir.join("old")).unwrap(), b"old");
+        // Nor an empty folder, which `std::fs::rename` would replace.
+        std::fs::create_dir(dir.join(".backup.partial")).unwrap();
+        std::fs::write(dir.join(".backup.partial").join("server.db"), "x").unwrap();
+        std::fs::create_dir(dir.join("backup")).unwrap();
+        assert!(rename_through(&dir.join(".backup.partial"), &dir.join("backup")).is_err());
+        assert!(dir.join(".backup.partial").join("server.db").exists());
+        assert!(!dir.join("backup").join("server.db").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -38,8 +38,9 @@ pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-/// Renames the folder at `from` to `to`. The folder that holds it is synced
-/// after ([`sync_dir`]), so that the new name survives a loss of power.
+/// Renames the folder at `from` to `to`, and nothing more: a caller that
+/// needs the new name to survive a loss of power syncs the folder that
+/// holds it after ([`sync_dir`]), as `backup::publish` does.
 pub(crate) fn rename_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
