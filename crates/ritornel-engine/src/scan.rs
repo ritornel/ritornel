@@ -418,6 +418,12 @@ impl ScanRun {
                             self.summary.recordings += resolved.recordings;
                             self.summary.releases += resolved.releases;
                             self.committed()?;
+                            // What the library holds changed: the tracks other
+                            // services named are judged against it again, so
+                            // that a record bought has its plays at once. A
+                            // write of its own, which writes nothing when
+                            // nothing moves, and so is safe to repeat.
+                            library.match_library()?;
                         }
                         // Nothing was written, so the step was not taken.
                         None => self.step -= 1,

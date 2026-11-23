@@ -527,7 +527,14 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
     // ended, is applied: its staged run is gone with the restart, and is
     // not needed.
     match core.with_library(|_, library| library.stored_run(run)) {
-        Some(Ok(Some(_))) => return finish(core, &job, JobState::Succeeded, None),
+        Some(Ok(Some(_))) => {
+            // Its tracks are judged, which a stop between its write and this
+            // may have left undone; judging again writes nothing otherwise.
+            if let Some(Err(failed)) = core.with_library(|_, library| library.match_library()) {
+                warn!(error = %failed, "the tracks of an applied run could not be judged");
+            }
+            return finish(core, &job, JobState::Succeeded, None);
+        }
         Some(Err(failed)) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
         Some(Ok(None)) | None => {}
     }
@@ -554,13 +561,17 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
         ..
     } = whole;
     let applied = core.with_library(|_, library| {
-        library.apply_streams(
+        let applied = library.apply_streams(
             step(&job, ritornel_engine::APPLY_METHOD, run),
             run,
             streams,
             reader,
             params.session,
-        )
+        )?;
+        // The tracks are judged against the library: those the run brought,
+        // and those whose newest stream in force it changed.
+        library.match_library()?;
+        Ok::<_, ritornel_engine::Error>(applied)
     });
     match applied {
         Some(Ok((_, report))) => {
@@ -596,10 +607,12 @@ pub(crate) fn run_undo(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBoo
         );
     };
     let undone = core.with_library(|_, library| {
-        library.undo_streams(
+        let undone = library.undo_streams(
             step(&job, ritornel_engine::UNDO_METHOD, params.run_id),
             params.run_id,
-        )
+        )?;
+        library.match_library()?;
+        Ok::<_, ritornel_engine::Error>(undone)
     });
     match undone {
         Some(Ok(_)) => finish(core, &job, JobState::Succeeded, None),

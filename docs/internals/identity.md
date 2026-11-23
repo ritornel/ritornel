@@ -78,7 +78,8 @@ Matching text-only imported scrobbles (`scrobble_subject` source items) to the l
 
 - **Never creates catalog entities:** A scrobble either binds to an existing canonical recording or stays unbound.
 - **Two-pass matching:** First compares normalized `(artist, title)` (`Rule::Exact`), then compares loosely (`Rule::Loose`, folding spacing, punctuation, leading `"The"`, accents, and featured artists). Album titles disambiguate multiple matching recordings and hold back single-recording matches when the scrobble's album fits none of the recording's appearances. Service-supplied MBIDs support matching and never bind alone.
-- **Verdicts and re-matching:** Returns `Verdict::Bind`, `Verdict::Doubtful` (`Doubt::{Several, Album, Near}`), or `Verdict::Absent`. Doubtful matches are surfaced by `lastfm.report`, and bindings are re-evaluated automatically after library changes (internal write method `identity.matchScrobbles`, `MATCH_METHOD` in `import_store.rs`).
+- **Verdicts and re-matching:** Returns `Verdict::Bind`, `Verdict::Doubtful` (`Doubt::{Several, Album, Near}`), or `Verdict::Absent`. Doubtful matches are surfaced by `lastfm.report`. `LibraryStore::match_library` judges every track another service named again, but those the owner bound, in one write (internal write method `identity.matchScrobbles`, `MATCH_METHOD` in `import_store.rs`) that writes nothing when no binding moves. It runs after a scan's resolve that wrote anything, so a record added by a scan has its plays bound without a sync, at the end of a Last.fm sync, and after a run of Spotify streams is applied or undone.
+- **Spotify's tracks:** A `spotify_track` source item is judged as a scrobble's text is, by the artist, album and title of its newest stream in force ("Spotify streams" in `docs/internals/history.md`), so a stream's track binds as a scrobble of the same names does and is held back where its album fits none. A track no stream in force names is left as it is.
 
 ## Decisions
 

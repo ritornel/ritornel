@@ -1228,6 +1228,53 @@ fn a_dry_run_offers_no_stream_a_scrobble_set_aside_and_writes_nothing() {
     assert_eq!(year.counted_after, year.counted_before + 1);
 }
 
+#[test]
+fn a_streams_track_binds_as_a_scrobble_of_its_names_does_and_is_held_back_off_its_album() {
+    let rig = rig();
+    let scrobbled = batch(
+        vec![record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 0)],
+        T0 - 4 * HOUR,
+        T0,
+    );
+    rig.ingest(&scrobbled);
+    let mut elsewhere = stream(T0 - 2 * HOUR, 200_000, "Lanternfish");
+    elsewhere.album = Some("A Record It Is Not On".to_owned());
+    apply(
+        &rig,
+        1,
+        vec![
+            stream(T0 - 3 * HOUR + 2000, 200_000, "Paper Kites"),
+            elsewhere,
+        ],
+    );
+    let plays = rig.library.derived_history().unwrap();
+    assert_eq!(rig.library.match_library().unwrap(), 1);
+    // The stream's Paper Kites is bound where the scrobble of the same
+    // names is.
+    let recording_of = |kind: &str, title: &str| {
+        rig.one(&format!(
+            "SELECT coalesce(si.current_recording_id, 0) FROM source_item si
+             JOIN history_observation o ON o.source_item_id = si.id
+             JOIN observation_import i ON i.observation_id = o.id
+             WHERE si.item_kind = '{kind}' AND i.title = '{title}' LIMIT 1"
+        ))
+    };
+    assert_ne!(recording_of("spotify_track", "Paper Kites"), "0");
+    assert_eq!(
+        recording_of("spotify_track", "Paper Kites"),
+        recording_of("scrobble_subject", "Paper Kites")
+    );
+    // Lanternfish is on the invented album, and the stream says another:
+    // it is held back.
+    assert_eq!(recording_of("spotify_track", "Lanternfish"), "0");
+    // Nothing shown changes: streams make no plays yet.
+    assert_eq!(rig.library.derived_history().unwrap(), plays);
+    // Judged again with nothing changed, nothing is written.
+    let revision = rig.revision();
+    assert_eq!(rig.library.match_library().unwrap(), 0);
+    assert_eq!(rig.revision(), revision);
+}
+
 /// The streams in force: those that a run whose newest ledger entry is
 /// `applied` held.
 fn in_force(rig: &Rig) -> String {

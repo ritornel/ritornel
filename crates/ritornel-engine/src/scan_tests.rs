@@ -1898,3 +1898,85 @@ fn a_song_the_item_has_since_left_is_judged_after_a_failed_read() {
         ["1|Paper Kites", "0|Salt Road"]
     );
 }
+
+#[test]
+fn a_record_bought_later_has_its_scrobbles_and_streams_bound_by_the_scan_that_adds_it() {
+    // What the record's file says it is, read from a library of its own.
+    let mut first = Rig::new();
+    first.put("Moss Arcade/Tin Weather/a.flac", "a.flac");
+    first.scan();
+    let text = first.one(
+        "SELECT ac.display_text || '|' || r.display_title FROM recording r
+         JOIN artist_credit ac ON ac.id = r.display_artist_credit_id",
+    );
+    let (artist, title) = text.split_once('|').unwrap();
+
+    // Before the record is there, its scrobble and its stream are stored
+    // and bound to nothing.
+    let mut rig = Rig::new();
+    let account = rig
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let batch = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: b"one".to_vec(),
+            played_at_ms: T0 - 60_000,
+            track: ritornel_source::TrackText {
+                artist: artist.to_owned(),
+                album: None,
+                title: title.to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: T0 - 60_000,
+            to_ms: T0,
+        },
+        cursor: "{}".to_owned(),
+    };
+    rig.library
+        .ingest(crate::Observations::Imports {
+            account,
+            batch: &batch,
+            full: false,
+        })
+        .unwrap();
+    let mut stream = crate::import_store::tests::stream(T0 - 30_000, 20_000, title);
+    stream.artist = artist.to_owned();
+    stream.album = None;
+    rig.library
+        .apply_streams(
+            WriteRequest {
+                method: crate::APPLY_METHOD,
+                command: None,
+                client: None,
+            },
+            id(7),
+            vec![stream],
+            "ritornelctl 0.1.0".to_owned(),
+            None,
+        )
+        .unwrap();
+    let bound = |rig: &Rig| {
+        rig.one(
+            "SELECT group_concat(si.item_kind, ',') FROM source_item si
+             WHERE si.item_kind IN ('scrobble_subject', 'spotify_track')
+               AND si.current_recording_id IS NOT NULL ORDER BY si.item_kind",
+        )
+    };
+    assert_eq!(bound(&rig), "-");
+    let plays = rig.library.derived_history().unwrap();
+
+    // The scan that adds it binds both, with no sync of Last.fm. The
+    // scrobble's play now names the song; the stream has no play yet.
+    rig.put("Moss Arcade/Tin Weather/a.flac", "a.flac");
+    rig.scan();
+    assert_eq!(bound(&rig), "scrobble_subject,spotify_track");
+    assert_eq!(
+        rig.one("SELECT count(*) FROM play_event WHERE recording_id IS NOT NULL"),
+        "1"
+    );
+    assert_eq!(rig.library.derived_history().unwrap().len(), plays.len());
+}
