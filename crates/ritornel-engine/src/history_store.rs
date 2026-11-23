@@ -413,7 +413,7 @@ fn bindings(
 }
 
 /// Every correction, with its targets, window and recording override.
-fn corrections(connection: &Connection) -> Result<Vec<Correction>, Error> {
+pub(crate) fn corrections(connection: &Connection) -> Result<Vec<Correction>, Error> {
     let mut statement = connection.prepare_cached(
         "SELECT c.observation_id, c.verb, c.target_endpoint_id, c.target_from_utc_ms,
                 c.target_to_utc_ms, cr.correction_id IS NOT NULL, r.canonical_id,
@@ -984,12 +984,14 @@ fn window_observations(connection: &Connection, window: Window) -> Result<Vec<i6
 
 /// Sets aside each of `targets`, observations of the account's history,
 /// with an `exclude` correction of its own on the manual endpoint, which
-/// says `note`, and derives their plays again by `rule`. Nothing is
-/// removed, and a correction is revoked as any other is.
+/// says `note` and whose payload names its `reason` where it has one, and
+/// derives their plays again by `rule`. Nothing is removed, and a
+/// correction is revoked as any other is.
 pub(crate) fn exclude(
     write: &Write<'_>,
     targets: &[i64],
     note: &str,
+    reason: Option<&str>,
     rule: PlayRule,
 ) -> Result<(), Error> {
     if targets.is_empty() {
@@ -1004,7 +1006,8 @@ pub(crate) fn exclude(
         )
         .optional()?
         .ok_or(Error::Corrupt("a library with no manual endpoint"))?;
-    let payload = serde_json::json!({ "verb": "exclude", "note": note }).to_string();
+    let payload =
+        serde_json::json!({ "verb": "exclude", "reason": reason, "note": note }).to_string();
     for target in targets {
         let listener: i64 = connection.query_row(
             "SELECT listener_id FROM history_observation WHERE id = ?1",

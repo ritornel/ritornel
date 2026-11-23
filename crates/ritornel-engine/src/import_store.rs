@@ -511,8 +511,13 @@ fn gone(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<u64, Er
 }
 
 /// What an import set aside as a duplicate says, in its correction.
-pub(crate) const DUPLICATE_NOTE: &str = "an earlier read stored this scrobble twice and missed \
-     another of its second: the source lists as many scrobbles in the second, one fewer of this";
+pub(crate) const DUPLICATE_NOTE: &str = "set aside by a full sync: the source lists as many \
+     scrobbles in this second as its first read stored, with one fewer of this one, as a read \
+     whose pages shifted leaves";
+
+/// What such a correction is marked with in its payload, as its `reason`:
+/// how a later full sync knows it for its own, whatever its note says.
+const SHIFTED_READ: &str = "shifted_read";
 
 /// What a revocation of such a correction says, when the source lists the
 /// import again.
@@ -543,7 +548,7 @@ struct Recheck {
 /// aside, so that a play of this library's own that an echo joined is never
 /// left out, and one set aside before, even if that was revoked since, is
 /// not set aside again. An import set aside so whose key the source lists
-/// again has its correction revoked.
+/// again has its correction revoked, if it stands.
 fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Recheck, Error> {
     type Track = (String, Option<String>, String);
     let keys: HashSet<&[u8]> = batch
@@ -586,14 +591,11 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
                 AND (SELECT count(*) FROM play_event_observation mine
                      JOIN play_event_observation other ON other.play_event_id = mine.play_event_id
                      WHERE mine.observation_id = o.id) = 1,
-                (SELECT c.observation_id FROM correction_target t
+                (SELECT max(c.observation_id) FROM correction_target t
                  JOIN observation_correction c ON c.observation_id = t.correction_id
-                 WHERE t.target_observation_id = o.id AND c.verb = 'exclude' AND c.note = ?4
-                   AND NOT EXISTS (SELECT 1 FROM correction_target r
-                                   JOIN observation_correction rc
-                                     ON rc.observation_id = r.correction_id
-                                   WHERE r.target_observation_id = c.observation_id
-                                     AND rc.verb = 'revoke'))
+                 JOIN history_observation co ON co.id = c.observation_id
+                 WHERE t.target_observation_id = o.id AND c.verb = 'exclude'
+                   AND json_extract(co.payload_json, '$.reason') = ?4)
          FROM observation_import i
          JOIN history_observation o ON o.id = i.observation_id
          WHERE o.endpoint_id = ?1 AND i.played_at_utc_ms >= ?2 AND i.played_at_utc_ms < ?3
@@ -603,7 +605,7 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
         endpoint,
         batch.span.from_ms,
         batch.span.to_ms,
-        DUPLICATE_NOTE
+        SHIFTED_READ
     ])?;
     let mut held: BTreeMap<i64, Vec<Held>> = BTreeMap::new();
     while let Some(row) = rows.next()? {
@@ -618,13 +620,19 @@ fn recheck(connection: &Connection, endpoint: i64, batch: &Batch) -> Result<Rech
             set_aside_by: row.get(9)?,
         });
     }
+    // Which corrections stand, as derivation has it: a revocation that is
+    // itself revoked lets its target stand again.
+    let active = ritornel_domain::history::active_corrections(&crate::history_store::corrections(
+        connection,
+    )?);
     let mut found = Recheck::default();
     for (second, imports) in &held {
         found.revoke.extend(
             imports
                 .iter()
                 .filter(|import| import.listed)
-                .filter_map(|import| import.set_aside_by),
+                .filter_map(|import| import.set_aside_by)
+                .filter(|correction| active.contains(correction)),
         );
         let Some(listed) = listed.get(second) else {
             continue;
@@ -1043,7 +1051,13 @@ impl LibraryStore {
                     Recheck::default()
                 };
                 let new = ingest_imports(write, account, &batch, rule)?;
-                crate::history_store::exclude(write, &found.set_aside, DUPLICATE_NOTE, rule)?;
+                crate::history_store::exclude(
+                    write,
+                    &found.set_aside,
+                    DUPLICATE_NOTE,
+                    Some(SHIFTED_READ),
+                    rule,
+                )?;
                 for correction in &found.revoke {
                     crate::history_store::revoke(write, *correction, LISTED_AGAIN_NOTE, rule)?;
                 }

@@ -247,19 +247,34 @@ fn a_full_read_sets_aside_a_scrobble_an_earlier_read_stored_twice() {
     .to_lowercase()
     .parse()
     .unwrap();
-    rig.library
-        .revoke_correction(
-            WriteRequest {
-                method: "history.revoke",
-                command: None,
-                client: None,
-            },
-            correction,
-            None,
-        )
-        .unwrap();
+    let revoke = |correction| {
+        rig.library
+            .revoke_correction(
+                WriteRequest {
+                    method: "history.revoke",
+                    command: None,
+                    client: None,
+                },
+                correction,
+                None,
+            )
+            .unwrap()
+            .1
+    };
+    let revocation = revoke(correction);
     assert_eq!(rig.one(counted), "4");
     assert_eq!(rig.read(&held, true).set_aside, 0);
+    assert_eq!(rig.one(counted), "4");
+
+    // The revocation revoked in turn: set aside again, and lifted when the
+    // source lists it again.
+    revoke(revocation);
+    assert_eq!(rig.one(counted), "3");
+    let mut listed = held.clone();
+    listed
+        .records
+        .push(record(T0 - 3 * HOUR, "Moss Arcade", "Paper Kites", 1));
+    rig.read(&listed, true);
     assert_eq!(rig.one(counted), "4");
 }
 
@@ -363,6 +378,7 @@ fn a_full_read_never_leaves_fewer_counted_than_the_source_lists() {
                     write,
                     &[first],
                     "the owner's",
+                    None,
                     ritornel_domain::history::PlayRule::CURRENT,
                 )?;
                 Ok(String::new())
