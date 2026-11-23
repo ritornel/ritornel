@@ -619,6 +619,22 @@ async fn find_or_start(
     }
 }
 
+/// A link that never looks for a server, for tests of views that hold one.
+#[cfg(test)]
+pub(crate) fn unlinked(cx: &mut gpui::App) -> gpui::Entity<Link> {
+    cx.new(|_| Link {
+        state: State::Looking,
+        launcher: None,
+        apart: None,
+        pending: Arc::default(),
+        looking: false,
+        attempt: None,
+        restating: 0,
+        preparing: None,
+        watching: None,
+    })
+}
+
 /// The link, made once for the app.
 pub(crate) fn new(data_dir: Option<&Path>, cx: &mut gpui::App) -> gpui::Entity<Link> {
     cx.new(|cx| Link::new(data_dir, cx))

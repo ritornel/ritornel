@@ -319,13 +319,15 @@ impl Shell {
                 }
             },
         );
-        let search = cx.new(|cx| SearchBox::new(link.clone(), cx));
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        // Search gives the keys back to the shell, whose keys are the
+        // window's shortcuts.
+        let search = cx.new(|cx| SearchBox::new(link.clone(), focus.clone(), window, cx));
         let from_search = cx.subscribe_in(&search, window, Self::on_search);
         // The menus' items open pages through the shell.
         let here = cx.entity().downgrade();
         cx.set_global(crate::menu::Here(here));
-        let focus = cx.focus_handle();
-        window.focus(&focus, cx);
         let mut arrival = Arrival::new(false, false, true);
         arrival.ready = Some(arrival.started);
         Self {
@@ -688,7 +690,6 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus, cx);
         match event {
             SearchEvent::OpenArtist(artist, name) => {
                 self.open_artist(*artist, name.clone(), window, cx);

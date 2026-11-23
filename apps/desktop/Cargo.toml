@@ -69,6 +69,11 @@ raw-window-handle = "=0.6.2"
 default = ["runtime-shaders"]
 runtime-shaders = ["gpui_platform/runtime_shaders"]
 
+[dev-dependencies]
+# GPUI's test platform: windows, focus and input without a display, for
+# the tests of what has the keys (`search.rs`).
+gpui = { package = "gpui-pre", version = "=0.3.13", features = ["test-support"] }
+
 [workspace]
 
 # GPUI's Linux backend, patched so that a touchpad's scroll on Wayland has

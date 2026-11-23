@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, AppContext, Bounds, BoxShadow, Context, Entity, EventEmitter, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement, Pixels, Render,
-    RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task,
-    Window, canvas, deferred, div, img, prelude::FluentBuilder, px,
+    AnyElement, AppContext, Bounds, BoxShadow, Context, Entity, EventEmitter, FocusHandle,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ObjectFit, ParentElement,
+    Pixels, Render, RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage,
+    Subscription, Task, Window, canvas, deferred, div, img, prelude::FluentBuilder, px,
 };
 use ritornel_contract::methods::LibrarySearch;
 use ritornel_contract::{
@@ -204,23 +204,32 @@ pub(crate) struct SearchBox {
     /// Where the dropdown is, so a press in it does not close it.
     drop_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     hovered_song: Option<usize>,
-    /// Closed without a window to hand: the field is emptied and let go
-    /// when next drawn.
-    close_field: bool,
+    /// What has the keys when the field lets them go: the window's own
+    /// keys, so that its shortcuts work again.
+    home: FocusHandle,
     _field: Subscription,
 }
 
 impl EventEmitter<SearchEvent> for SearchBox {}
 
 impl SearchBox {
-    pub(crate) fn new(link: Entity<Link>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        link: Entity<Link>,
+        home: FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let field = cx.new(|cx| Field::new("Search", cx));
-        let followed = cx.subscribe(&field, |search, _, event: &FieldEvent, cx| match event {
-            FieldEvent::Changed(text) => search.typed(text.to_string(), cx),
-            FieldEvent::Moved(by) => search.move_by(*by, cx),
-            FieldEvent::Entered => search.enter(cx),
-            FieldEvent::Escaped => search.close(cx),
-        });
+        let followed = cx.subscribe_in(
+            &field,
+            window,
+            |search, _, event: &FieldEvent, window, cx| match event {
+                FieldEvent::Changed(text) => search.typed(text.to_string(), window, cx),
+                FieldEvent::Moved(by) => search.move_by(*by, cx),
+                FieldEvent::Entered => search.enter(window, cx),
+                FieldEvent::Escaped => search.close(window, cx),
+            },
+        );
         cx.on_release(|search, cx| {
             for image in search.pictures.drain() {
                 crate::covers::drop_unshared(image, None, cx);
@@ -241,7 +250,7 @@ impl SearchBox {
             arts: Rc::default(),
             drop_bounds: Rc::default(),
             hovered_song: None,
-            close_field: false,
+            home,
             _field: followed,
         }
     }
@@ -258,7 +267,7 @@ impl SearchBox {
     }
 
     /// The field's text changed.
-    fn typed(&mut self, text: String, cx: &mut Context<Self>) {
+    fn typed(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.asked += 1;
         self.hovered_song = None;
         if text.trim().is_empty() {
@@ -276,15 +285,15 @@ impl SearchBox {
         }
         self.view.start(text.clone());
         let asked = self.asked;
-        self.asking = Some(cx.spawn(async move |this, cx| {
+        self.asking = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(SETTLE).await;
-            this.update(cx, |search, cx| search.ask(text, asked, cx))
+            this.update_in(cx, |search, window, cx| search.ask(text, asked, window, cx))
                 .ok();
         }));
         cx.notify();
     }
 
-    fn ask(&mut self, text: String, asked: u64, cx: &mut Context<Self>) {
+    fn ask(&mut self, text: String, asked: u64, window: &mut Window, cx: &mut Context<Self>) {
         if asked != self.asked || !self.view.dispatch() {
             return;
         }
@@ -303,9 +312,9 @@ impl SearchBox {
                 })
                 .await
         });
-        self.asking = Some(cx.spawn(async move |this, cx| {
+        self.asking = Some(cx.spawn_in(window, async move |this, cx| {
             let answer = answer.await;
-            this.update(cx, |search, cx| {
+            this.update_in(cx, |search, window, cx| {
                 if asked != search.asked {
                     return;
                 }
@@ -326,7 +335,7 @@ impl SearchBox {
                         };
                         search.pictures_wanted(cx);
                         if waiting {
-                            search.pick(selected, cx);
+                            search.pick(selected, window, cx);
                         }
                     }
                     _ => {
@@ -406,21 +415,21 @@ impl SearchBox {
 
     /// Return: chooses the chosen result; typed faster than the settle, it
     /// asks at once and chooses the first of the answer.
-    fn enter(&mut self, cx: &mut Context<Self>) {
+    fn enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.view.open {
             return;
         }
         if self.view.settled {
-            self.pick(self.view.selected, cx);
+            self.pick(self.view.selected, window, cx);
             return;
         }
         self.view.waiting = true;
         let (text, asked) = (self.view.text.clone(), self.asked);
-        self.ask(text, asked, cx);
+        self.ask(text, asked, window, cx);
     }
 
     /// Chooses the result at `index`, and the dropdown closes.
-    fn pick(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn pick(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(hit) = self.view.hits.get(index).cloned() else {
             return;
         };
@@ -457,13 +466,16 @@ impl SearchBox {
                 },
             },
         };
-        self.close(cx);
+        self.close(window, cx);
         cx.emit(event);
     }
 
     /// Esc, a press elsewhere, or a choice: the text goes, and the dropdown
-    /// with it, and the field lets go of the keys.
-    pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
+    /// with it. If the field still has the keys, they go back to the
+    /// window's own. A press elsewhere closes this before it reaches what
+    /// it pressed, so a control that takes the keys on a press still takes
+    /// them after.
+    pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.asked += 1;
         self.hovered_song = None;
         self.asking = None;
@@ -473,7 +485,10 @@ impl SearchBox {
         };
         self.dropped = None;
         self.arts.borrow_mut().clear();
-        self.close_field = true;
+        self.field.update(cx, |field, cx| field.clear(window, cx));
+        if self.focused(window, cx) {
+            window.focus(&self.home, cx);
+        }
         cx.notify();
     }
 }
@@ -629,10 +644,14 @@ impl SearchBox {
                 card = card.child(self.row(index, hit, window, cx));
             }
         }
+        // Where the whole card is, for a press in it not to close it: from
+        // its top left, not after its rows, where it would otherwise sit.
         let bounds = Rc::clone(&self.drop_bounds);
         card = card.child(
             canvas(move |at, _, _| bounds.set(Some(at)), |_, (), _, _| {})
                 .absolute()
+                .top_0()
+                .left_0()
                 .size_full(),
         );
         Some(deferred(card).with_priority(1).into_any_element())
@@ -713,7 +732,7 @@ impl SearchBox {
                             window.prevent_default();
                             cx.stop_propagation();
                             if search.asked == asked {
-                                search.close(cx);
+                                search.close(window, cx);
                                 cx.emit(SearchEvent::Play(appearance));
                             }
                         }),
@@ -742,9 +761,9 @@ impl SearchBox {
                         cx.notify();
                     }
                 }))
-                .on_click(cx.listener(move |search, _, _, cx| {
+                .on_click(cx.listener(move |search, _, window, cx| {
                     if search.asked == asked {
-                        search.pick(index, cx);
+                        search.pick(index, window, cx);
                     }
                 }))
             })
@@ -794,11 +813,6 @@ pub(crate) fn shadow() -> Vec<BoxShadow> {
 
 impl Render for SearchBox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.close_field {
-            self.close_field = false;
-            self.field.update(cx, |field, cx| field.clear(window, cx));
-            window.blur(cx);
-        }
         let focused = self.field.read(cx).focused(window);
         let width = f32::from(window.viewport_size().width);
         let wide = (width - 720.).clamp(180., 320.);
@@ -848,17 +862,20 @@ impl Render for SearchBox {
                     });
                 }),
             )
-            // A press anywhere but the field and its results puts them away.
-            .on_mouse_down_out(
-                cx.listener(move |search, event: &gpui::MouseDownEvent, _, cx| {
+            // A press anywhere but the field and its results puts them
+            // away, and gives the keys back: also with nothing typed, since a
+            // control that keeps its press to itself gives the window
+            // nothing to take them back with.
+            .on_mouse_down_out(cx.listener(
+                move |search, event: &gpui::MouseDownEvent, window, cx| {
                     let inside = drop_bounds
                         .get()
                         .is_some_and(|bounds| bounds.contains(&event.position));
-                    if search.view.open && !inside {
-                        search.close(cx);
+                    if (search.view.open || search.focused(window, cx)) && !inside {
+                        search.close(window, cx);
                     }
-                }),
-            )
+                },
+            ))
             .child(icon("search", 16., theme::faint()))
             .child(field)
             .when(!focused, |bar| {
@@ -906,6 +923,216 @@ mod tests {
         assert!(view.failed && view.settled);
         assert!(!view.waiting);
         assert!(view.hits.get(view.selected).is_none());
+    }
+
+    /// The window around the field: it has the keys when nothing else
+    /// does, as the shell does, and keeps the keys that reach it.
+    struct Host {
+        search: Entity<SearchBox>,
+        home: gpui::FocusHandle,
+        /// Something else that takes the keys when pressed.
+        other: gpui::FocusHandle,
+        /// How often the control that keeps its press to itself was pressed.
+        kept: usize,
+        keys: Vec<String>,
+        chosen: usize,
+        _chosen: Subscription,
+    }
+
+    impl Host {
+        fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+            crate::input::bind_keys(cx);
+            let home = cx.focus_handle();
+            window.focus(&home, cx);
+            let link = crate::link::unlinked(cx);
+            let search = cx.new(|cx| SearchBox::new(link, home.clone(), window, cx));
+            let chosen = cx.subscribe(&search, |host: &mut Self, _, _: &SearchEvent, _| {
+                host.chosen += 1;
+            });
+            Self {
+                search,
+                home,
+                other: cx.focus_handle(),
+                kept: 0,
+                keys: Vec::new(),
+                chosen: 0,
+                _chosen: chosen,
+            }
+        }
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .track_focus(&self.home)
+                .size_full()
+                .on_key_down(cx.listener(|host, event: &gpui::KeyDownEvent, _, _| {
+                    host.keys.push(event.keystroke.key.clone());
+                }))
+                // At the right, as in the title bar: the dropdown hangs
+                // from the field's right edge.
+                .child(
+                    div()
+                        .h(px(40.))
+                        .flex()
+                        .justify_end()
+                        .child(self.search.clone()),
+                )
+                .child(div().id("other").track_focus(&self.other).size(px(100.)))
+                // As a tab in the title bar does.
+                .child(div().id("keeps").size(px(100.)).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|host, _, _, cx| {
+                        host.kept += 1;
+                        cx.stop_propagation();
+                    }),
+                ))
+        }
+    }
+
+    /// Below the field and the other controls: the page itself.
+    const PAGE: gpui::Point<Pixels> = gpui::point(px(400.), px(400.));
+    /// Where the control that takes the keys is.
+    const OTHER: gpui::Point<Pixels> = gpui::point(px(50.), px(90.));
+    /// Where the control that keeps its press to itself is.
+    const KEEPS: gpui::Point<Pixels> = gpui::point(px(50.), px(190.));
+    const HARBOUR: Id = Id::from_bytes([1; 16]);
+
+    fn open(cx: &mut gpui::TestAppContext) -> (Entity<Host>, &mut gpui::VisualTestContext) {
+        let (host, cx) = cx.add_window_view(Host::new);
+        let search = host.read_with(cx, |host, _| host.search.clone());
+        type_in(&search, "harbour", cx);
+        (host, cx)
+    }
+
+    /// ⌘F, and `text` typed: the dropdown is down.
+    fn type_in(search: &Entity<SearchBox>, text: &str, cx: &mut gpui::VisualTestContext) {
+        search.update_in(cx, |search, window, cx| search.find(window, cx));
+        cx.simulate_input(text);
+        cx.run_until_parked();
+        assert!(search.read_with(cx, |search, _| search.view.open));
+    }
+
+    /// The library's answer, drawn: one artist, Harbour.
+    fn answer(search: &Entity<SearchBox>, cx: &mut gpui::VisualTestContext) {
+        search.update(cx, |search, cx| {
+            search.view.hits = vec![Hit::Artist(ArtistRow {
+                artist_id: HARBOUR,
+                name: Some("Harbour".to_owned()),
+                sort_name: None,
+                album_count: 1,
+                track_count: 1,
+                art_id: None,
+                portrait: false,
+            })];
+            search.view.settled = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    /// Whether the page has the keys, and so the window's shortcuts work:
+    /// keys pressed now reach it, and nothing is typed into the field.
+    fn page_has_the_keys(host: &Entity<Host>, cx: &mut gpui::VisualTestContext) -> bool {
+        let before = host.read_with(cx, |host, _| host.keys.len());
+        let focused = cx.update(|window, cx| host.read(cx).home.is_focused(window));
+        cx.simulate_keystrokes("space x");
+        let (keys, typed) = host.read_with(cx, |host, cx| {
+            (
+                host.keys.get(before..).unwrap_or_default().to_vec(),
+                host.search.read(cx).view.open,
+            )
+        });
+        focused && keys == ["space", "x"] && !typed
+    }
+
+    #[gpui::test]
+    fn choosing_a_result_with_return_gives_the_keys_back(cx: &mut gpui::TestAppContext) {
+        let (host, cx) = open(cx);
+        let search = host.read_with(cx, |host, _| host.search.clone());
+        answer(&search, cx);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(host.read_with(cx, |host, _| host.chosen), 1);
+        assert!(page_has_the_keys(&host, cx));
+    }
+
+    #[gpui::test]
+    fn choosing_a_result_with_a_click_gives_the_keys_back(cx: &mut gpui::TestAppContext) {
+        let (host, cx) = open(cx);
+        let search = host.read_with(cx, |host, _| host.search.clone());
+        answer(&search, cx);
+        let row = search.read_with(cx, |search, _| search.arts.borrow().get(&HARBOUR).copied());
+        assert!(row.is_some(), "the row is drawn");
+        let at = row.map(|row| row.center()).unwrap_or_default();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        assert_eq!(host.read_with(cx, |host, _| host.chosen), 1);
+        assert!(page_has_the_keys(&host, cx));
+    }
+
+    #[gpui::test]
+    fn escape_gives_the_keys_back(cx: &mut gpui::TestAppContext) {
+        let (host, cx) = open(cx);
+        cx.simulate_keystrokes("escape");
+        assert!(page_has_the_keys(&host, cx));
+    }
+
+    #[gpui::test]
+    fn a_press_on_the_page_gives_the_keys_back(cx: &mut gpui::TestAppContext) {
+        let (host, cx) = open(cx);
+        cx.simulate_click(PAGE, gpui::Modifiers::none());
+        assert!(page_has_the_keys(&host, cx));
+    }
+
+    #[gpui::test]
+    fn a_press_on_a_control_that_keeps_it_gives_the_keys_back(cx: &mut gpui::TestAppContext) {
+        let (host, cx) = cx.add_window_view(Host::new);
+        let search = host.read_with(cx, |host, _| host.search.clone());
+        // With nothing typed, and with the dropdown down.
+        search.update_in(cx, |search, window, cx| search.find(window, cx));
+        cx.simulate_click(KEEPS, gpui::Modifiers::none());
+        assert!(page_has_the_keys(&host, cx));
+        type_in(&search, "harbour", cx);
+        cx.simulate_click(KEEPS, gpui::Modifiers::none());
+        assert!(page_has_the_keys(&host, cx));
+        assert_eq!(host.read_with(cx, |host, _| host.kept), 2);
+    }
+
+    #[gpui::test]
+    fn a_press_on_another_control_leaves_it_the_keys(cx: &mut gpui::TestAppContext) {
+        let (host, cx) = open(cx);
+        cx.simulate_click(OTHER, gpui::Modifiers::none());
+        let (open, other) = cx.update(|window, cx| {
+            let host = host.read(cx);
+            (
+                host.search.read(cx).view.open,
+                host.other.is_focused(window),
+            )
+        });
+        assert!(!open && other);
+    }
+
+    #[gpui::test]
+    fn search_opens_again_after_each_way_out(cx: &mut gpui::TestAppContext) {
+        let (host, cx) = open(cx);
+        let search = host.read_with(cx, |host, _| host.search.clone());
+        for out in ["escape", "click", "return", "escape"] {
+            match out {
+                "escape" => cx.simulate_keystrokes("escape"),
+                "click" => cx.simulate_click(PAGE, gpui::Modifiers::none()),
+                _ => {
+                    answer(&search, cx);
+                    cx.simulate_keystrokes("enter");
+                }
+            }
+            assert!(page_has_the_keys(&host, cx));
+            // ⌘F again: the field has the keys, and typing goes into it.
+            type_in(&search, "north", cx);
+            let (typed, field) = cx.update(|window, cx| {
+                let search = search.read(cx);
+                (search.view.text.clone(), search.focused(window, cx))
+            });
+            assert_eq!((typed.as_str(), field), ("north", true));
+        }
     }
 
     fn tiny_image() -> Arc<RenderImage> {
