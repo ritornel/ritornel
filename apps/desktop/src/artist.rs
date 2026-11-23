@@ -1039,29 +1039,32 @@ impl Artist {
     }
 
     /// Your history with them: the picture of your years, and the records
-    /// you played most, under it or, `across`, beside it.
+    /// you played most, under it or, `across`, beside it. With no dated
+    /// play there is no picture, but the records still rank, undated plays
+    /// and all. `None` when there is neither.
     fn history(
         &mut self,
         history: &HistoryOf,
-        span: ritornel_contract::YearSpan,
         across: bool,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> Option<gpui::Div> {
+        let title = format!("You and {}", self.name);
         let color = self.page.as_ref().and_then(|page| page.art_color);
-        let picture = record::years(
-            format!("You and {}", self.name),
-            &history.years,
-            span,
-            color,
-            window,
-        );
-        if history.records.is_empty() {
-            return picture;
-        }
-        let records = self.played(&history.records, window, cx);
-        if across {
-            div()
+        let picture = pictured(Some(history)).map(|(history, span)| {
+            record::years(title.clone(), &history.years, span, color, window)
+        });
+        let records =
+            (!history.records.is_empty()).then(|| self.played(&history.records, window, cx));
+        Some(match (picture, records) {
+            (None, None) => return None,
+            (Some(picture), None) => picture,
+            (None, Some(records)) => div()
+                .flex()
+                .flex_col()
+                .child(div().mb(px(14.)).child(record::heading(title, window)))
+                .child(records),
+            (Some(picture), Some(records)) if across => div()
                 .flex()
                 .items_start()
                 .gap(px(48.))
@@ -1073,10 +1076,9 @@ impl Artist {
                         .flex_1()
                         .mt(px(39.))
                         .child(records),
-                )
-        } else {
-            picture.child(div().mt(px(14.)).child(records))
-        }
+                ),
+            (Some(picture), Some(records)) => picture.child(div().mt(px(14.)).child(records)),
+        })
     }
 
     /// The records played most, each with the year it was most yours.
@@ -1222,7 +1224,9 @@ impl Render for Artist {
             .flex()
             .flex_col();
         let history = self.history.clone();
-        let shown_history = pictured(history.as_ref());
+        let shows_history = history.as_ref().is_some_and(|history| {
+            pictured(Some(history)).is_some() || !history.records.is_empty()
+        });
         if self.problem {
             body = body.child(
                 div()
@@ -1237,7 +1241,7 @@ impl Render for Artist {
                 .iter()
                 .map(|(_, records)| records.len())
                 .collect();
-            let beside = history_beside(content, &counts, shown_history.is_some());
+            let beside = history_beside(content, &counts, shows_history);
             let across = !beside && content >= HISTORY_ACROSS;
             let column = history_column(content);
             let area = if beside {
@@ -1268,8 +1272,9 @@ impl Render for Artist {
                         .child(self.tracks.clone()),
                 )
             };
-            let history_part = shown_history
-                .map(|(history, span)| self.history(history, span, across && !beside, window, cx));
+            let history_part = history
+                .as_ref()
+                .and_then(|history| self.history(history, across && !beside, window, cx));
             if beside {
                 // The column stays under the banner's strip as the records
                 // scroll, until what it stands beside has gone by.

@@ -30,7 +30,7 @@ See [`docs/internals/contract.md`](contract.md) for the wire protocol and list v
 ### Album and artist pages
 
 - **Discography shelves (`artist.rs`, `album.rs`, `crates/ritornel-engine/src/list/discography.rs`):** An artist's records are ordered server-side (`SortKey::Discography`) into shelves—albums and EPs (including untyped releases), singles, live recordings, collections and rarities, and appearances—newest first by original release year, with undated records last.
-- **History on pages (`history.artist`, `history.album`):** Artist and album pages display a banner summary sentence (`Phrase`), yearly play counts (`YearPlays`), and (for artists) top played records, re-reading when plays change.
+- **History on pages (`history.artist`, `history.album`):** Artist and album pages display a banner summary sentence (`Phrase`), yearly play counts (`YearPlays`), and (for artists) top played records, re-reading when plays change. The yearly picture needs dated plays; an artist's played-most records show without it, since undated plays rank them too.
 
 ### History tab and Lean back
 
