@@ -828,6 +828,24 @@ fn a_place_saved_after_the_last_checkpoint_resumes_from_the_checkpoint() {
 }
 
 #[test]
+fn a_stop_whose_listen_was_not_saved_stands_after_a_crash() {
+    // Stopped at 0:20, which saves the place at the start, and the listen
+    // cannot be closed. The server dies before it is tried again.
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(20_000);
+    rig.break_writes("BEFORE UPDATE OF end_reason ON listen_staging");
+    let request = rig.request("playback.stop");
+    rig.player.stop(request, &rig.server).unwrap();
+    rig.heal();
+    rig.restart(0xb1);
+    // The listen ends at its checkpoint, and the place is still the start.
+    let closed = rig.staged()[0].clone();
+    assert_eq!(closed.ended.unwrap().end_position_ms, 20_000);
+    assert_eq!(rig.player.state().position_ms, 0);
+}
+
+#[test]
 fn a_clean_shutdown_closes_the_listen_as_shutdown_and_a_resume_continues_it() {
     let mut rig = Rig::new();
     rig.play(0);
