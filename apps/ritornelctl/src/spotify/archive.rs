@@ -16,10 +16,9 @@ const DEPTH: usize = 4;
 /// What a file of an archive is, by its name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    /// A file of the extended streaming history of audio.
+    /// A file of the extended streaming history, of audio or of video:
+    /// a music video's row is read as a song's.
     Extended,
-    /// A file of the extended streaming history of video, which is not read.
-    Video,
     /// A file of the history in the account data, a year to the minute.
     AccountData,
     /// Anything else, which is not read.
@@ -46,13 +45,15 @@ fn kind(name: &str) -> Kind {
     let base = base(name);
     let json = base.ends_with(".json");
     if json
-        && ["Streaming_History_Audio_", "endsong_"]
-            .iter()
-            .any(|prefix| base.starts_with(prefix))
+        && [
+            "Streaming_History_Audio_",
+            "Streaming_History_Video_",
+            "endsong_",
+        ]
+        .iter()
+        .any(|prefix| base.starts_with(prefix))
     {
         Kind::Extended
-    } else if json && base.starts_with("Streaming_History_Video_") {
-        Kind::Video
     } else if json && base.starts_with("StreamingHistory") {
         Kind::AccountData
     } else {
@@ -96,13 +97,12 @@ impl fmt::Display for Error {
     }
 }
 
-/// Calls `each` with each audio history file's own name and its bytes, in
-/// the order of their names, and returns how many files of video history
-/// it passed over.
+/// Calls `each` with each history file's own name and its bytes, in the
+/// order of their names.
 pub(crate) fn each_file(
     path: &Path,
     mut each: impl FnMut(&str, &[u8]) -> Result<(), Error>,
-) -> Result<u64, Error> {
+) -> Result<(), Error> {
     let metadata = std::fs::metadata(path).map_err(Error::Open)?;
     if metadata.is_dir() {
         let mut found = Vec::new();
@@ -116,14 +116,14 @@ pub(crate) fn each_file(
             .collect();
         files.sort();
         let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
-        let video = check(&names)?;
+        check(&names)?;
         for (name, path) in &files {
             if kind(name) == Kind::Extended {
                 let bytes = std::fs::read(path).map_err(|_| Error::Unreadable(name.clone()))?;
                 each(name, &bytes)?;
             }
         }
-        return Ok(video);
+        return Ok(());
     }
     let file = File::open(path).map_err(Error::Open)?;
     let mut zip = zip::ZipArchive::new(file).map_err(|_| Error::NotZip)?;
@@ -142,7 +142,7 @@ pub(crate) fn each_file(
     }
     entries.sort();
     let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
-    let video = check(&names)?;
+    check(&names)?;
     for (name, at) in &entries {
         if kind(name) != Kind::Extended {
             continue;
@@ -154,16 +154,15 @@ pub(crate) fn each_file(
             .ok_or_else(|| Error::Unreadable(name.clone()))?;
         each(name, &bytes)?;
     }
-    Ok(video)
+    Ok(())
 }
 
-/// Refuses an archive with no extended history of audio, and says which
-/// export to ask for when it holds the account data's. Returns how many
-/// files of video history it holds.
-fn check(names: &[&str]) -> Result<u64, Error> {
+/// Refuses an archive with no extended history, and says which export to
+/// ask for when it holds the account data's.
+fn check(names: &[&str]) -> Result<(), Error> {
     let kinds: Vec<Kind> = names.iter().map(|name| kind(name)).collect();
     if kinds.contains(&Kind::Extended) {
-        Ok(kinds.iter().filter(|kind| **kind == Kind::Video).count() as u64)
+        Ok(())
     } else if kinds.contains(&Kind::AccountData) {
         Err(Error::AccountData)
     } else {
@@ -207,7 +206,7 @@ mod tests {
                 "Spotify Extended Streaming History/Streaming_History_Audio_2014_1.json",
                 Kind::Extended,
             ),
-            ("Streaming_History_Video_2020.json", Kind::Video),
+            ("Streaming_History_Video_2020.json", Kind::Extended),
             ("MyData/endsong_0.json", Kind::Extended),
             (
                 "Spotify Account Data/StreamingHistory_music_0.json",
@@ -238,21 +237,7 @@ mod tests {
             Err(Error::AccountData)
         ));
         assert!(matches!(check(&["Userdata.json"]), Err(Error::NoHistory)));
-        assert_eq!(
-            check(&["StreamingHistory0.json", "endsong_0.json"]).unwrap(),
-            0
-        );
-        assert_eq!(
-            check(&[
-                "Streaming_History_Audio_2020.json",
-                "Streaming_History_Video_2020.json"
-            ])
-            .unwrap(),
-            1
-        );
-        assert!(matches!(
-            check(&["Streaming_History_Video_2020.json"]),
-            Err(Error::NoHistory)
-        ));
+        assert!(check(&["StreamingHistory0.json", "endsong_0.json"]).is_ok());
+        assert!(check(&["Streaming_History_Video_2020.json"]).is_ok());
     }
 }

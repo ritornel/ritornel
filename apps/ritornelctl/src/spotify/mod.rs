@@ -44,8 +44,6 @@ const UNKNOWN: &str = "unknown";
 pub(crate) struct Tally {
     /// The files of the history read.
     pub(crate) files: u64,
-    /// The files of video history passed over.
-    pub(crate) video_files: u64,
     /// Every row of them.
     pub(crate) rows: u64,
     /// The streams of music.
@@ -82,13 +80,12 @@ pub(crate) struct Tally {
 pub(crate) fn read(path: &Path) -> Result<Archive, archive::Error> {
     let mut read = Archive::default();
     let mut first: HashMap<(i64, i64, String), usize> = HashMap::new();
-    let video_files = archive::each_file(path, |name, bytes| {
+    archive::each_file(path, |name, bytes| {
         let rows =
             rows::read(bytes).map_err(|error| archive::Error::File(name.to_owned(), error))?;
         read.add(name, rows, &mut first);
         Ok(())
     })?;
-    read.tally.video_files = video_files;
     Ok(read)
 }
 
@@ -194,7 +191,6 @@ fn to_json(tally: &Tally) -> serde_json::Value {
     let unknown: Vec<String> = tally.unknown.iter().map(|name| shown(name)).collect();
     json!({
         "files": tally.files,
-        "videoFiles": tally.video_files,
         "rows": tally.rows,
         "music": tally.music,
         "notMusic": not_music,
@@ -252,20 +248,6 @@ fn render(tally: &Tally) -> String {
         },
     ));
     lines.push(("Would not read", tally.wrong.to_string()));
-    if tally.video_files > 0 {
-        lines.push((
-            "Not read",
-            format!(
-                "{} {} of video history: music videos and video shows",
-                tally.video_files,
-                if tally.video_files == 1 {
-                    "file"
-                } else {
-                    "files"
-                }
-            ),
-        ));
-    }
     for (label, counts) in [
         ("By platform", &tally.platforms),
         ("By device", &tally.devices),
@@ -382,8 +364,8 @@ mod tests {
 
     /// An invented archive: two years in two files, a repeated row, a row
     /// repeated with another reason, a short stream, an episode, an
-    /// audiobook, a file of video history and a file that is not the
-    /// history.
+    /// audiobook, a file of video history, whose music video is read as a
+    /// song is, and a file that is not the history.
     fn files() -> Vec<(&'static str, Vec<u8>)> {
         let first = row("2019-03-15T21:14:09Z", 221_000, 1, "iOS 12.1");
         let mut other_reason = first.clone();
@@ -445,21 +427,20 @@ mod tests {
 
     fn expected() -> Tally {
         Tally {
-            files: 2,
-            video_files: 1,
-            rows: 8,
-            music: 6,
+            files: 3,
+            rows: 9,
+            music: 7,
             not_music: [1, 1, 0, 0],
             wrong: 0,
             wrong_named: Vec::new(),
             repeats: 2,
             repeats_differing: 1,
-            thirty: 5,
-            thirty_distinct: 3,
-            span: Some((1_552_684_449_000, 1_577_952_240_000)),
-            platforms: BTreeMap::from([("ios", 4), ("mac", 1), ("unknown", 1)]),
-            devices: BTreeMap::from([("computer", 1), ("tv", 1), ("unknown", 4)]),
-            vias: BTreeMap::from([("app", 5), ("cast", 1)]),
+            thirty: 6,
+            thirty_distinct: 4,
+            span: Some((1_552_684_449_000, 1_578_038_400_000)),
+            platforms: BTreeMap::from([("ios", 5), ("mac", 1), ("unknown", 1)]),
+            devices: BTreeMap::from([("computer", 1), ("tv", 1), ("unknown", 5)]),
+            vias: BTreeMap::from([("app", 6), ("cast", 1)]),
             unknown: BTreeSet::from(["MARKED_FIELD".to_owned()]),
         }
     }
@@ -489,7 +470,7 @@ mod tests {
         assert_eq!(from_zip.tally, expected());
         assert_eq!(from_folder.tally, expected());
         assert_eq!(from_zip.streams, from_folder.streams);
-        assert_eq!(from_zip.streams.len(), 6);
+        assert_eq!(from_zip.streams.len(), 7);
     }
 
     #[test]
@@ -638,25 +619,24 @@ mod tests {
         zip_of(&zip, &files());
         let printed = command(&zip, false);
         for line in [
-            "Files             2\n",
-            "Rows              8\n",
-            "Streams of music  6\n",
-            "From              2019-03-15 to 2020-01-02\n",
+            "Files             3\n",
+            "Rows              9\n",
+            "Streams of music  7\n",
+            "From              2019-03-15 to 2020-01-03\n",
             "Not music         2: 1 episode, 1 audiobook\n",
-            "By platform       ios 4, mac 1, unknown 1\n",
-            "By device         computer 1, tv 1, unknown 4\n",
-            "Played via        app 5, cast 1\n",
-            "Not read          1 file of video history: music videos and video shows\n",
+            "By platform       ios 5, mac 1, unknown 1\n",
+            "By device         computer 1, tv 1, unknown 5\n",
+            "Played via        app 6, cast 1\n",
             "Nothing was stored or sent.\n",
         ] {
             assert!(printed.contains(line), "{line}{printed}");
         }
         let json: Value = serde_json::from_str(&command(&zip, true)).unwrap();
-        assert_eq!(json["rows"], 8);
+        assert_eq!(json["rows"], 9);
         assert_eq!(json["repeats"], 2);
-        assert_eq!(json["thirtySecondsDistinct"], 3);
+        assert_eq!(json["thirtySecondsDistinct"], 4);
         assert_eq!(json["notMusic"]["episode"], 1);
-        assert_eq!(json["platforms"]["ios"], 4);
+        assert_eq!(json["platforms"]["ios"], 5);
         assert_eq!(json["deviceKinds"]["tv"], 1);
         assert_eq!(json["playedVia"]["cast"], 1);
     }
