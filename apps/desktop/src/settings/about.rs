@@ -60,7 +60,7 @@ pub(super) fn render(model: &Model, cx: &App) -> impl IntoElement {
                 )))
                 .child(actions().child(push(
                     "show-data",
-                    "Show in Finder",
+                    crate::platform::SHOW_FOLDER,
                     reveal.is_some(),
                     move |_, _, cx| {
                         if let Some(dir) = &reveal {
