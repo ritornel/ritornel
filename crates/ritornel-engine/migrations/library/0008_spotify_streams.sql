@@ -146,65 +146,75 @@ ALTER TABLE play_event_observation ADD COLUMN joined_by TEXT
 -- =============================================================================
 -- Who and what each play was of, when there are no files for it: derived,
 -- and rewritten with the plays and by nothing else. A play bound to a song
--- has its credit's artists and the record it was heard from. Otherwise its
--- names find the library's artist, when exactly one with a record has that
--- key, and that artist's record, when exactly one of theirs has the
--- album's; or stand as names. The History lists read these, so that no
--- query folds every play's names as it runs.
+-- has its credit's artists and the record it was heard from. Any other
+-- has its names, by their keys: an artist's name, and an album's under it.
+-- A name is the library's artist when exactly one artist with a record has
+-- that key, and an album's name is that artist's record when exactly one
+-- of theirs has its title; which, the catalog decides, and it is found
+-- again whenever the catalog changes, without touching a play. The History
+-- lists read these, so that no query folds every play's names as it runs.
 -- =============================================================================
 
 CREATE TABLE heard_artist (
-  id         INTEGER PRIMARY KEY,
-  artist_id  INTEGER UNIQUE REFERENCES artist(id),   -- the library's artist, as canonical when linked; NULL for a name
-  name_key   TEXT,                                   -- a name's key (accents folded, no leading 'The' or featured credit); NULL for the library's
-  name       TEXT,                                   -- a name's spelling played most; NULL for the library's
-  rev        INTEGER NOT NULL,
+  id                 INTEGER PRIMARY KEY,
+  artist_id          INTEGER UNIQUE REFERENCES artist(id),   -- the library's artist a bound play's credit names, as canonical when linked; NULL for a name
+  name_key           TEXT,                                   -- a name's key (accents folded, no leading 'The' or featured credit); NULL for the library's
+  name               TEXT,                                   -- a name's spelling played most; NULL for the library's
+  library_artist_id  INTEGER REFERENCES artist(id),          -- for a name, the library's artist it is, when exactly one with a record has its key
+  rev                INTEGER NOT NULL,
   CHECK ((artist_id IS NULL) = (name_key IS NOT NULL)),
-  CHECK ((name_key IS NULL) = (name IS NULL))
+  CHECK ((name_key IS NULL) = (name IS NULL)),
+  CHECK (name_key IS NOT NULL OR library_artist_id IS NULL)
 ) STRICT;
 
 CREATE UNIQUE INDEX heard_artist_name ON heard_artist (name_key) WHERE name_key IS NOT NULL;
 
 CREATE TABLE heard_album (
   id                INTEGER PRIMARY KEY,
-  release_group_id  INTEGER UNIQUE REFERENCES release_group(id),   -- the library's record; NULL for a name
-  heard_artist_id   INTEGER REFERENCES heard_artist(id),           -- whose name it is; NULL for the library's
+  release_group_id  INTEGER UNIQUE REFERENCES release_group(id),   -- the record a bound play was heard from; NULL for a name
+  heard_artist_id   INTEGER REFERENCES heard_artist(id),           -- the artist's name it is under; NULL for the library's
   name_key          TEXT,                                          -- a name's key under its artist; NULL for the library's
   name              TEXT,                                          -- a name's spelling played most; NULL for the library's
+  library_group_id  INTEGER REFERENCES release_group(id),          -- for a name, the library's record it is, when its artist is the library's and exactly one of theirs has its title
   rev               INTEGER NOT NULL,
   CHECK ((release_group_id IS NULL) = (heard_artist_id IS NOT NULL)),
   CHECK ((heard_artist_id IS NULL) = (name_key IS NULL)),
-  CHECK ((name_key IS NULL) = (name IS NULL))
+  CHECK ((name_key IS NULL) = (name IS NULL)),
+  CHECK (name_key IS NOT NULL OR library_group_id IS NULL)
 ) STRICT;
 
 CREATE UNIQUE INDEX heard_album_name ON heard_album (heard_artist_id, name_key)
   WHERE heard_artist_id IS NOT NULL;
 
 -- A play's artists: one for each of its credit's artists, or its name's.
--- Whether it counts and its local date are copied from the play, so that a
--- list is read from the index on them alone.
+-- Whose it is, whether it counts and its local date are copied from the
+-- play, so that a list is read from the index on them alone.
 CREATE TABLE play_event_artist (
   id               INTEGER PRIMARY KEY,
   heard_artist_id  INTEGER NOT NULL REFERENCES heard_artist(id),
   play_event_id    INTEGER NOT NULL REFERENCES play_event(id),
+  listener_id      INTEGER NOT NULL REFERENCES listener(id),     -- the play's
   counted          INTEGER NOT NULL CHECK (counted IN (0, 1)),   -- counts and not excluded
   local_date       INTEGER,                                      -- YYYYMMDD
-  spelling         TEXT,                                         -- the name as the play gave it, when it was found by its name
+  spelling         TEXT,                                         -- the name as the play gave it, for a name
   rev              INTEGER NOT NULL,
   UNIQUE (play_event_id, heard_artist_id)
 ) STRICT;
 
-CREATE INDEX play_event_artist_heard ON play_event_artist (heard_artist_id, counted, local_date);
+CREATE INDEX play_event_artist_heard ON play_event_artist (heard_artist_id, counted);
+CREATE INDEX play_event_artist_listed ON play_event_artist (listener_id, counted, heard_artist_id, local_date);
 
 -- A play's album, when it has one.
 CREATE TABLE play_event_album (
   id              INTEGER PRIMARY KEY,
   heard_album_id  INTEGER NOT NULL REFERENCES heard_album(id),
   play_event_id   INTEGER NOT NULL UNIQUE REFERENCES play_event(id),
+  listener_id     INTEGER NOT NULL REFERENCES listener(id),
   counted         INTEGER NOT NULL CHECK (counted IN (0, 1)),
   local_date      INTEGER,
   spelling        TEXT,
   rev             INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted, local_date);
+CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted);
+CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date);

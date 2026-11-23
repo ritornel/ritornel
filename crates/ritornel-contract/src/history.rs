@@ -446,16 +446,18 @@ pub enum HeardOrder {
 #[serde(rename_all = "camelCase")]
 pub struct HeardListParams {
     /// The order. Played most first when left out.
-    #[serde(default)]
-    pub order: HeardOrder,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub order: Option<HeardOrder>,
     /// How many to give, at most [`MAX_HEARD`]. [`DEFAULT_HEARD`] when left
     /// out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub limit: Option<u32>,
-    /// How many to pass over first.
-    #[serde(default)]
-    pub offset: u32,
+    /// How many to pass over first. None when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub offset: Option<u32>,
 }
 
 /// How many artists or albums a History list gives when not told.

@@ -3,13 +3,15 @@
 //! an artist, the records played most ("Album and artist pages" in
 //! docs/internals/desktop.md).
 //!
-//! It counts the plays that count and are not excluded, of songs the
-//! library has bound them to. An artist's are the plays of their songs, by
-//! each song's credit; an album's are those heard from one of its versions.
-//! A play bound to no song reaches no page ("Queries" in
-//! docs/internals/history.md), and a play bound to a song but to no record
-//! counts for its artist and for no album. Everything is read from
-//! `play_event` through its index on counted plays, with no rollup table.
+//! It counts the plays that count and are not excluded. The library's
+//! artist's are the plays of their songs, by each song's credit, and the
+//! library's album's those heard from one of its versions: a play bound to
+//! no song reaches neither ("Queries" in docs/internals/history.md), and a
+//! play bound to a song but to no record counts for its artist and for no
+//! album. These are read from `play_event` through its index on counted
+//! plays. An artist or an album heard by its name alone has the plays
+//! linked to its name ("History by artist and album"), read from the index
+//! on those links. There is no rollup table.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -18,6 +20,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::history_heard::{library_artists, only, record_named, records_of};
 use crate::{Error, Id, LibraryStore};
+use ritornel_domain::normalize::artist_key;
 
 const DAY_MS: i64 = 86_400_000;
 /// "The last year": the 365 days before now.
@@ -470,16 +473,16 @@ WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
 const NAME_PLAYS: &str = "
 SELECT pe.event_at_utc_ms, pe.local_date, NULL
 FROM play_event_artist pa
-JOIN play_event pe ON pe.id = pa.play_event_id
-WHERE pe.listener_id = ?1 AND pa.heard_artist_id = ?2 AND pe.counts = 1 AND pe.excluded = 0";
+CROSS JOIN play_event pe ON pe.id = pa.play_event_id
+WHERE pa.heard_artist_id = ?2 AND pa.counted = 1 AND pa.listener_id = ?1";
 
 /// The plays of an album heard by name: those linked to its row. `?2` is
 /// the row.
 const NAMED_ALBUM_PLAYS: &str = "
 SELECT pe.event_at_utc_ms, pe.local_date, NULL
 FROM play_event_album pa
-JOIN play_event pe ON pe.id = pa.play_event_id
-WHERE pe.listener_id = ?1 AND pa.heard_album_id = ?2 AND pe.counts = 1 AND pe.excluded = 0";
+CROSS JOIN play_event pe ON pe.id = pa.play_event_id
+WHERE pa.heard_album_id = ?2 AND pa.counted = 1 AND pa.listener_id = ?1";
 
 impl LibraryStore {
     /// What an artist's page says of `listener`'s history with them, read
@@ -560,7 +563,32 @@ impl LibraryStore {
                     |row| row.get(0),
                 )
                 .optional()?;
-            row.map(|row| history_of(connection, listener, row, NAME_PLAYS, today, false))
+            if let Some(row) = row {
+                return Ok(
+                    history_of(connection, listener, row, NAME_PLAYS, today, false)
+                        .map(Some)?
+                        .filter(|of| of.plays > 0),
+                );
+            }
+            // The library's artist a song's credit names who has no record
+            // of their own, as History lists them.
+            let mut credited = connection.prepare(
+                "SELECT DISTINCT ca.id, ca.display_name FROM heard_artist h
+                 JOIN artist a ON a.id = h.artist_id
+                 JOIN artist ca ON ca.id = a.canonical_id
+                 WHERE ca.display_name IS NOT NULL",
+            )?;
+            let named: Vec<i64> = credited
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .filter_map(|row| match row {
+                    Ok((artist, name)) => (artist_key(&name) == key).then_some(Ok(artist)),
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<Result<_, _>>()?;
+            only(Some(&named))
+                .map(|artist| history_of(connection, listener, artist, ARTIST_PLAYS, today, true))
                 .transpose()
         })
     }
@@ -585,30 +613,19 @@ impl LibraryStore {
                 return history_of(connection, listener, group, ALBUM_PLAYS, today, false)
                     .map(Some);
             }
-            let row: Option<i64> = match artist {
-                Some(artist) => connection
-                    .query_row(
-                        "SELECT h.id FROM heard_album h
-                         JOIN heard_artist ha ON ha.id = h.heard_artist_id
-                         JOIN artist a ON a.id = ha.artist_id
-                         WHERE a.canonical_id = ?1 AND h.name_key = ?2
-                         ORDER BY h.id LIMIT 1",
-                        rusqlite::params![artist, key],
-                        |row| row.get(0),
-                    )
-                    .optional()?,
-                None => connection
-                    .query_row(
-                        "SELECT h.id FROM heard_album h
-                         JOIN heard_artist ha ON ha.id = h.heard_artist_id
-                         WHERE ha.name_key = ?1 AND h.name_key = ?2",
-                        [&artist_key, &key],
-                        |row| row.get(0),
-                    )
-                    .optional()?,
-            };
-            row.map(|row| history_of(connection, listener, row, NAMED_ALBUM_PLAYS, today, false))
-                .transpose()
+            let row: Option<i64> = connection
+                .query_row(
+                    "SELECT h.id FROM heard_album h
+                     JOIN heard_artist ha ON ha.id = h.heard_artist_id
+                     WHERE ha.name_key = ?1 AND h.name_key = ?2",
+                    [&artist_key, &key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(row
+                .map(|row| history_of(connection, listener, row, NAMED_ALBUM_PLAYS, today, false))
+                .transpose()?
+                .filter(|of| of.plays > 0))
         })
     }
 }

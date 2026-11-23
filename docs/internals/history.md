@@ -6,7 +6,7 @@ See [`docs/internals/schema.md`](schema.md) for the immutable history tables, [`
 
 ## Observations and derivation
 
-All listening history enters `library.db` through one ingest seam (`Observations::{Listen, Imports}`, write method `history.ingest` in `history_store.rs`). Each record is stored verbatim in `history_observation` (`payload_json`) plus its kind-specific detail table (`observation_listen`, `observation_import`, or `observation_correction`), keyed uniquely by `(endpoint_id, source_key)`. Re-ingesting the same key with an identical payload is a no-op; a conflicting payload under an existing key is recorded in `history_ingest_conflict` without altering the original observation.
+Listening history enters `library.db` through two seams: ingest (`Observations::{Listen, Imports}`, write method `history.ingest` in `history_store.rs`) for listens and Last.fm's scrobbles, and a run of Spotify's streams applied (`imports.apply`, "Spotify streams"). Each record is stored verbatim in `history_observation` (`payload_json`) plus its kind-specific detail table (`observation_listen`, `observation_import`, or `observation_correction`), keyed uniquely by `(endpoint_id, source_key)`. Re-ingesting the same key with an identical payload is a no-op; a conflicting payload under an existing key is recorded in `history_ingest_conflict` without altering the original observation.
 
 Pure derivation (`ritornel_domain::history`, `GROUPER_VERSION = 3`) turns durable observations, the Spotify streams in force, active corrections, `listener_zone_period`s, and current `source_item` bindings into `play_event` and `play_event_observation` rows:
 
@@ -65,19 +65,20 @@ History views query `play_event` directly using its partial indexes (`play_event
 
 ## History by artist and album
 
-Every play is linked to the artists and the album it was heard as, whether or not there are files for them (`history_heard.rs`). The links are derived: written with the plays by `insert_plays`, dropped with them, and written again whenever the catalog changes.
+Every play is linked to the artists and the album it was heard as, whether or not there are files for them (`history_heard.rs`). The links are derived: written with the plays by `insert_plays` and dropped with them.
 
-| A play's | Is the library's, when | Otherwise |
+| A play's | Is linked to | And when the library has none |
 |---|---|---|
-| Artists | It is bound to a song: each artist of the song's credit, as canonical. Or its names' artist key is the name of exactly one artist the Artists list files (`library_artists`) | The name, by its key |
-| Album | It is bound to an appearance: its release's record. Or its artist is the library's, and exactly one of that artist's records has a version whose title has the album's key (`record_named`) | The album's name under the play's first artist, by its key. None when the play named no album |
+| Artists | When it is bound to a song: each artist of the credit of the appearance it was heard from, or else of the recording, as canonical | Its names' artist, by its key |
+| Album | When it was heard from an appearance: its release's record | Its names' album, by its key, under its artist's name. None when the play named no album |
 
 - **Keys:** `artist_key` is the normaliser's key with accents folded and a leading "The" and a featured credit left out; `album_key` is the normaliser's key with accents folded (`normalize.rs`). They are narrower than the scrobble matcher's loose key, which also drops spaces and every "and": safe beside a title, and not on a name alone.
-- **Rows:** `heard_artist` and `heard_album` hold a library artist or record by ID, or a name by its key and its spelling played most. A play links to each of its artists in `play_event_artist` and to its album, if any, in `play_event_album`, each link copying whether the play counts and its local date, so a list is read from the index on the links (`play_event_artist_heard`, `play_event_album_heard`) without touching `play_event`. A row no link holds is deleted.
-- **Namesakes:** two of the library's artists with one key take no play by name; it stays under the name until a binding moves it.
-- **When the catalog changes:** a resolve, a display rebuild and a metadata edit or its withdrawal call `catalog_changed`, which derives again the plays whose binding moved and links every play again (`relink`) in the same write. So a record bought later takes its bound plays, and a play of a bonus track the edition lacks finds the record by its names, and the album's row in the list stays one.
-- **Merges:** the library's rows hold the artist as canonical when linked; the list reads each artist's canonical row, and adds together the rows that a merge made one.
-- **Pages by key:** `heard_artist_history` and `heard_album_history` answer a key with the library's artist or record when the rules above find exactly one, so a key kept from before the record was bought still arrives, and otherwise with the name's plays.
+- **Rows:** `heard_artist` and `heard_album` hold a library artist or record by ID, or a name by its key and its spelling played most, counted plays first. A play links to each of its artists in `play_event_artist` and to its album, if any, in `play_event_album`, each link copying whether the play counts and its local date, so a list is read from the index on the links that begins with the listener (`play_event_artist_listed`, `play_event_album_listed`) without touching `play_event`, and a name's page from the one that begins with its row (`play_event_artist_heard`, `play_event_album_heard`). A row nothing links to is deleted.
+- **A name found to be the library's:** a name row's `library_artist_id` is the library's artist when exactly one artist the Artists list files has its key (`library_artists`), and an album name's `library_group_id` is that artist's record when exactly one of their records has a version whose title has its key (`record_named`). The lists count a name found so with the library's artist or record, so a record bought later takes its bound plays by their binding and a bonus track the edition lacks by its name, and the album stays one entry. Two of the library's artists with one key find no name.
+- **When the catalog changes:** a resolve, a display rebuild and a metadata edit or its withdrawal call `catalog_changed`, which derives again the plays whose binding moved, links again a bound play whose credit or record is not what it is linked to, and finds every name again, all in the same write and without touching a play otherwise. A scan's write that retires a file finds the names again too, since the resolve that follows may be cut off.
+- **Merges:** the library's rows hold the artist as canonical when linked, and the list reads each one's canonical artist and adds together the rows that are one.
+- **Lists:** ordered by counted plays, first local date or last, then by key and a row's number, so that a page never repeats or skips a tie. A library album lists under the first artist of its credit, whose key and the album's find it again.
+- **Pages by key:** `heard_artist_history` and `heard_album_history` answer a key with the library's artist or record when the rules above find exactly one, so a key kept from before the record was bought still arrives, and otherwise with the name's plays. The library's pages still count only the plays bound to their songs.
 
 ## Last.fm
 

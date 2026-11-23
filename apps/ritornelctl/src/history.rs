@@ -321,13 +321,13 @@ fn candidate(row: Row) -> Option<Candidate> {
 /// What `history artists` and `history albums` ask for.
 fn heard_params(args: &HeardArgs) -> HeardListParams {
     HeardListParams {
-        order: match args.by.as_deref() {
+        order: Some(match args.by.as_deref() {
             Some("first") => HeardOrder::First,
             Some("last") => HeardOrder::Last,
             _ => HeardOrder::Plays,
-        },
+        }),
         limit: args.limit,
-        offset: 0,
+        offset: None,
     }
 }
 

@@ -256,14 +256,14 @@ impl Rig {
 
     fn artists(&self) -> Vec<HeardArtist> {
         self.library
-            .heard_artists(HeardListParams::default())
+            .heard_artists(self.listener, HeardListParams::default())
             .unwrap()
             .artists
     }
 
     fn albums(&self) -> Vec<HeardAlbum> {
         self.library
-            .heard_albums(HeardListParams::default())
+            .heard_albums(self.listener, HeardListParams::default())
             .unwrap()
             .albums
     }
@@ -456,7 +456,83 @@ fn a_song_credited_to_two_artists_counts_for_each() {
         plays_of(&artists, "Odile Castellan"),
         [("odile castellan", 1, true)]
     );
-    assert_eq!(rig.albums().len(), 1);
+    // The album the list gives is found again by its keys.
+    let albums = rig.albums();
+    assert_eq!(albums.len(), 1);
+    let page = rig
+        .library
+        .heard_album_history(
+            rig.listener,
+            albums[0].artist_key.clone(),
+            albums[0].key.clone(),
+            rig.today(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.plays, 1);
+}
+
+#[test]
+fn a_bound_play_follows_the_credit_of_the_appearance_it_was_heard_from() {
+    let rig = rig();
+    rig.record(&["Calla Brandt"], "Glasshouse", &["Low Tide"]);
+    rig.ingest(vec![scrobble(1, "Calla Brandt", "Glasshouse", "Low Tide")]);
+    assert_eq!(plays_of(&rig.artists(), "Odile Castellan"), []);
+    // The edition's credit names a second artist, which the catalog's
+    // change carries to the play without moving its binding.
+    rig.library
+        .write(request("test.credit"), |write| {
+            let (c, rev) = (write.connection(), write.rev());
+            let artist: i64 =
+                c.query_row("SELECT coalesce(max(id), 0) + 1 FROM artist", [], |row| {
+                    row.get(0)
+                })?;
+            c.execute(
+                "INSERT INTO artist (id, public_id, canonical_id, display_name, rev)
+                 VALUES (?1, ?2, ?1, 'Odile Castellan', ?3)",
+                (artist, write.new_id()?.as_bytes().to_vec(), rev),
+            )?;
+            c.execute(
+                "INSERT INTO artist_credit (display_text, rev)
+                 VALUES ('Calla Brandt & Odile Castellan', ?1)",
+                [rev],
+            )?;
+            let credit = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO artist_credit_name (artist_credit_id, position, artist_id,
+                                                 credited_name, rev)
+                 SELECT ?1, 0, id, display_name, ?2 FROM artist WHERE display_name = 'Calla Brandt'
+                 UNION ALL SELECT ?1, 1, ?3, 'Odile Castellan', ?2",
+                (credit, rev, artist),
+            )?;
+            c.execute(
+                "UPDATE track_appearance SET display_artist_credit_id = ?1",
+                [credit],
+            )?;
+            crate::history_store::catalog_changed(write)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let artists = rig.artists();
+    assert_eq!(
+        plays_of(&artists, "Calla Brandt"),
+        [("calla brandt", 1, true)]
+    );
+    assert_eq!(
+        plays_of(&artists, "Odile Castellan"),
+        [("odile castellan", 1, true)]
+    );
+    // Her key, as the list gives it, finds her page, though she has no
+    // record of her own.
+    assert!(
+        rig.library
+            .heard_artist_history(rig.listener, "odile castellan".to_owned(), rig.today())
+            .unwrap()
+            .is_some()
+    );
+    let incremental = rig.links();
+    rig.rebuild();
+    assert_eq!(rig.links(), incremental);
 }
 
 #[test]
@@ -544,11 +620,14 @@ fn a_list_is_ordered_as_asked_and_paged() {
     ]);
     let names = |order: HeardOrder, offset: u32| -> Vec<String> {
         rig.library
-            .heard_artists(HeardListParams {
-                order,
-                limit: Some(2),
-                offset,
-            })
+            .heard_artists(
+                rig.listener,
+                HeardListParams {
+                    order: Some(order),
+                    limit: Some(2),
+                    offset: Some(offset),
+                },
+            )
             .unwrap()
             .artists
             .into_iter()
@@ -570,7 +649,7 @@ fn a_list_is_ordered_as_asked_and_paged() {
     );
     assert_eq!(
         rig.library
-            .heard_artists(HeardListParams::default())
+            .heard_artists(rig.listener, HeardListParams::default())
             .unwrap()
             .total,
         3

@@ -277,7 +277,9 @@ impl Core {
         params: &HeardListParams,
     ) -> Result<HeardArtists, RpcError> {
         Self::library(stores, |library| {
-            library.heard_artists(*params).map_err(refused)
+            library
+                .heard_artists(Self::listener(library)?, *params)
+                .map_err(refused)
         })
     }
 
@@ -287,7 +289,9 @@ impl Core {
         params: &HeardListParams,
     ) -> Result<HeardAlbums, RpcError> {
         Self::library(stores, |library| {
-            library.heard_albums(*params).map_err(refused)
+            library
+                .heard_albums(Self::listener(library)?, *params)
+                .map_err(refused)
         })
     }
 

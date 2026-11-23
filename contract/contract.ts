@@ -1391,16 +1391,16 @@ export type HeardListParams = {
   /**
    * The order. Played most first when left out.
    */
-  order: HeardOrder,
+  order?: HeardOrder,
   /**
    * How many to give, at most [`MAX_HEARD`]. [`DEFAULT_HEARD`] when left
    * out.
    */
   limit?: number,
   /**
-   * How many to pass over first.
+   * How many to pass over first. None when left out.
    */
-  offset: number,
+  offset?: number,
 };
 
 /**

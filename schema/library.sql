@@ -11,7 +11,7 @@
 --   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
---   0008_spotify_streams  d067c323336c8fe53e31bc42ba22f787f804c68a3a7c134b59031e27317a16e6
+--   0008_spotify_streams  62a4e054e6c6833952387546d0ba257b8cff5e1e63d427a237a519a5d5e306aa
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -1048,27 +1048,31 @@ CREATE TABLE stream_device (
 ) STRICT;
 
 CREATE TABLE heard_artist (
-  id         INTEGER PRIMARY KEY,
-  artist_id  INTEGER UNIQUE REFERENCES artist(id),   -- the library's artist, as canonical when linked; NULL for a name
-  name_key   TEXT,                                   -- a name's key (accents folded, no leading 'The' or featured credit); NULL for the library's
-  name       TEXT,                                   -- a name's spelling played most; NULL for the library's
-  rev        INTEGER NOT NULL,
+  id                 INTEGER PRIMARY KEY,
+  artist_id          INTEGER UNIQUE REFERENCES artist(id),   -- the library's artist a bound play's credit names, as canonical when linked; NULL for a name
+  name_key           TEXT,                                   -- a name's key (accents folded, no leading 'The' or featured credit); NULL for the library's
+  name               TEXT,                                   -- a name's spelling played most; NULL for the library's
+  library_artist_id  INTEGER REFERENCES artist(id),          -- for a name, the library's artist it is, when exactly one with a record has its key
+  rev                INTEGER NOT NULL,
   CHECK ((artist_id IS NULL) = (name_key IS NOT NULL)),
-  CHECK ((name_key IS NULL) = (name IS NULL))
+  CHECK ((name_key IS NULL) = (name IS NULL)),
+  CHECK (name_key IS NOT NULL OR library_artist_id IS NULL)
 ) STRICT;
 
 CREATE UNIQUE INDEX heard_artist_name ON heard_artist (name_key) WHERE name_key IS NOT NULL;
 
 CREATE TABLE heard_album (
   id                INTEGER PRIMARY KEY,
-  release_group_id  INTEGER UNIQUE REFERENCES release_group(id),   -- the library's record; NULL for a name
-  heard_artist_id   INTEGER REFERENCES heard_artist(id),           -- whose name it is; NULL for the library's
+  release_group_id  INTEGER UNIQUE REFERENCES release_group(id),   -- the record a bound play was heard from; NULL for a name
+  heard_artist_id   INTEGER REFERENCES heard_artist(id),           -- the artist's name it is under; NULL for the library's
   name_key          TEXT,                                          -- a name's key under its artist; NULL for the library's
   name              TEXT,                                          -- a name's spelling played most; NULL for the library's
+  library_group_id  INTEGER REFERENCES release_group(id),          -- for a name, the library's record it is, when its artist is the library's and exactly one of theirs has its title
   rev               INTEGER NOT NULL,
   CHECK ((release_group_id IS NULL) = (heard_artist_id IS NOT NULL)),
   CHECK ((heard_artist_id IS NULL) = (name_key IS NULL)),
-  CHECK ((name_key IS NULL) = (name IS NULL))
+  CHECK ((name_key IS NULL) = (name IS NULL)),
+  CHECK (name_key IS NOT NULL OR library_group_id IS NULL)
 ) STRICT;
 
 CREATE UNIQUE INDEX heard_album_name ON heard_album (heard_artist_id, name_key)
@@ -1078,23 +1082,29 @@ CREATE TABLE play_event_artist (
   id               INTEGER PRIMARY KEY,
   heard_artist_id  INTEGER NOT NULL REFERENCES heard_artist(id),
   play_event_id    INTEGER NOT NULL REFERENCES play_event(id),
+  listener_id      INTEGER NOT NULL REFERENCES listener(id),     -- the play's
   counted          INTEGER NOT NULL CHECK (counted IN (0, 1)),   -- counts and not excluded
   local_date       INTEGER,                                      -- YYYYMMDD
-  spelling         TEXT,                                         -- the name as the play gave it, when it was found by its name
+  spelling         TEXT,                                         -- the name as the play gave it, for a name
   rev              INTEGER NOT NULL,
   UNIQUE (play_event_id, heard_artist_id)
 ) STRICT;
 
-CREATE INDEX play_event_artist_heard ON play_event_artist (heard_artist_id, counted, local_date);
+CREATE INDEX play_event_artist_heard ON play_event_artist (heard_artist_id, counted);
+
+CREATE INDEX play_event_artist_listed ON play_event_artist (listener_id, counted, heard_artist_id, local_date);
 
 CREATE TABLE play_event_album (
   id              INTEGER PRIMARY KEY,
   heard_album_id  INTEGER NOT NULL REFERENCES heard_album(id),
   play_event_id   INTEGER NOT NULL UNIQUE REFERENCES play_event(id),
+  listener_id     INTEGER NOT NULL REFERENCES listener(id),
   counted         INTEGER NOT NULL CHECK (counted IN (0, 1)),
   local_date      INTEGER,
   spelling        TEXT,
   rev             INTEGER NOT NULL
 ) STRICT;
 
-CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted, local_date);
+CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted);
+
+CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date);

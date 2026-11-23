@@ -1,7 +1,8 @@
 //! History at the size of a long Last.fm import: 250,000 plays against an
 //! invented library of 1,200 albums. It measures what a wall and a page ask
 //! of history with no rollup table, the counts of every song and one
-//! artist's plays by year ("Queries" in docs/internals/history.md), and
+//! artist's plays by year ("Queries" in docs/internals/history.md), History's
+//! lists of what was heard and what a change to the catalog adds, and
 //! checks a small history gives the same answers as counting by hand.
 //!
 //! The measurement is slow to set up, so it is ignored by default. Run it
@@ -334,6 +335,31 @@ fn imported_size() {
     let report = slowest(1, || {
         store.import_report(account, 50).unwrap();
     });
+    // What History's lists read: every artist and every album heard.
+    let heard = ritornel_contract::HeardListParams::default();
+    let artists = slowest(5, || {
+        assert!(store.heard_artists(listener, heard).unwrap().total > 0);
+    });
+    let albums = slowest(5, || {
+        assert!(store.heard_albums(listener, heard).unwrap().total > 0);
+    });
+    // What a change to the catalog adds to its write, where nothing of it
+    // moves a play.
+    let catalog = slowest(3, || {
+        store
+            .write(
+                WriteRequest {
+                    method: "test.catalog_changed",
+                    command: None,
+                    client: None,
+                },
+                |write| {
+                    crate::history_store::catalog_changed(write)?;
+                    Ok(String::new())
+                },
+            )
+            .unwrap();
+    });
     let began = Instant::now();
     store
         .rebuild_history(
@@ -356,6 +382,9 @@ fn imported_size() {
          Lean back's facts: {lean_back:?}\n\
          the History tab's stream: {stream:?}\n\
          the import report: {report:?}\n\
+         History's artists: {artists:?}\n\
+         History's albums: {albums:?}\n\
+         a change to the catalog: {catalog:?}\n\
          a full rebuild: {rebuild:?}\n\
          plays {}, matched {}",
         counts.len(),

@@ -805,6 +805,7 @@ fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
         let event = connection.last_insert_rowid();
         heard.link(&crate::history_heard::ToLink {
             event,
+            listener: play.listener,
             recording: play.recording,
             appearance: play.appearance,
             primary: head,
@@ -1320,11 +1321,11 @@ fn stale_bindings(connection: &Connection) -> Result<BTreeSet<i64>, Error> {
 }
 
 /// What a change to the catalog moves, in its write: plays follow their
-/// source items' new bindings, and every play is linked again to the
-/// artists and the record it was heard as.
+/// source items' new bindings, and what each play was heard as follows the
+/// catalog.
 pub(crate) fn catalog_changed(write: &Write<'_>) -> Result<(), Error> {
     rebind(write)?;
-    crate::history_heard::relink(write.connection(), write.rev())
+    crate::history_heard::catalog_changed(write.connection(), write.rev())
 }
 
 /// Derives again the plays whose binding has moved, in the transaction that

@@ -324,19 +324,26 @@ pub fn fold_accents(key: &str) -> String {
 }
 
 /// The key an artist heard is told by, in History: [`normalize`]d with its
-/// accents folded, and without a leading "The" or a featured credit. It is
-/// narrower than the scrobble matcher's loose key, which also drops spaces
-/// and every "and": safe beside a title, and not on a name alone.
+/// accents folded, and without a featured credit or a leading "the" before
+/// a word. It is narrower than the scrobble matcher's loose key, which also
+/// drops spaces and every "and": safe beside a title, and not on a name
+/// alone.
 pub fn artist_key(name: &str) -> String {
-    let name = crate::scrobble::without_featured(name);
-    let trimmed = name.trim();
-    let name = trimmed
-        .get(..4)
-        .filter(|the| the.eq_ignore_ascii_case("the "))
-        .and_then(|_| trimmed.get(4..))
-        .filter(|rest| !rest.trim().is_empty())
-        .unwrap_or(trimmed);
-    fold_accents(&normalize(name))
+    let key = fold_accents(&normalize(&artist_spelling(name)));
+    match key.strip_prefix("the ") {
+        Some(rest) if rest.chars().any(char::is_alphanumeric) => rest.to_owned(),
+        _ => key,
+    }
+}
+
+/// An artist's name as heard, without a featured credit: what History
+/// shows for it.
+pub fn artist_spelling(name: &str) -> String {
+    let without = crate::scrobble::without_featured(name);
+    match without.trim() {
+        "" => name.trim().to_owned(),
+        trimmed => trimmed.to_owned(),
+    }
 }
 
 /// The key an album heard is told by under its artist, in History:
@@ -394,6 +401,12 @@ mod tests {
         // "The" alone is a name, and "and" and spaces still part two.
         assert_eq!(artist_key("The The"), "the");
         assert_eq!(artist_key("The"), "the");
+        assert_eq!(artist_key("The !!!"), "the");
+        assert_eq!(artist_key("Ｔｈｅ\tCalla Brandt"), key);
+        assert_eq!(
+            artist_spelling("Calla Brandt feat. Odile Castellan"),
+            "Calla Brandt"
+        );
         assert_ne!(
             artist_key("Brandt and Castellan"),
             artist_key("Brandt Castellan")
