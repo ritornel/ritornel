@@ -264,6 +264,16 @@ mod tests {
         assert_eq!(server.name(), name);
         server.stop().await.unwrap();
         assert_eq!(registry(), name);
+
+        // Once they agree, a start writes nothing.
+        let revision = || -> i64 {
+            library_db()
+                .query_row("SELECT rev FROM library_meta", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = revision();
+        start(&data_dir).await.unwrap().stop().await.unwrap();
+        assert_eq!(revision(), before);
     }
 
     #[tokio::test]
