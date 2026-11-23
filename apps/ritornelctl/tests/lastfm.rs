@@ -39,6 +39,10 @@ const ABORTED: Option<i32> = if cfg!(windows) {
 /// How long a track of the invented album is.
 const TRACK_SECONDS: u32 = 40;
 
+/// How long a track is where nothing may play long enough to be
+/// scrobbled: half of it is two minutes, far longer than the test takes.
+const LONG_TRACK_SECONDS: u32 = 240;
+
 /// 2009-06-30 23:30 UTC: 1 July in Helsinki, 30 June in New York.
 const MIDSUMMER_2009: u64 = 1_246_404_600;
 
@@ -58,16 +62,16 @@ impl Scratch {
         self.0.join("data")
     }
 
-    /// A folder of two invented tracks by an invented artist: forty
-    /// seconds of tone each, as 16-bit AIFF at 8 kHz with ID3 tags.
-    fn music(&self) -> PathBuf {
+    /// A folder of two invented tracks by an invented artist: `seconds` of
+    /// tone each, as 16-bit AIFF at 8 kHz with ID3 tags.
+    fn music(&self, seconds: u32) -> PathBuf {
         let folder = self.0.canonicalize().unwrap().join("music/Invented Album");
         std::fs::create_dir_all(&folder).unwrap();
         for (name, title, number, hz) in [
             ("01 First.aiff", "First Light", "1", 440.0),
             ("02 Second.aiff", "Second Wind", "2", 660.0),
         ] {
-            write_aiff(&folder.join(name), title, number, hz);
+            write_aiff(&folder.join(name), title, number, hz, seconds);
         }
         folder
     }
@@ -105,12 +109,12 @@ fn id3(frames: &[Vec<u8>]) -> Vec<u8> {
     tag
 }
 
-/// An AIFF file of forty seconds of tone, 16-bit at 8 kHz, with an `ID3 `
+/// An AIFF file of `seconds` of tone, 16-bit at 8 kHz, with an `ID3 `
 /// chunk naming the track, its artist, album and place. AIFF because
 /// symphonia reads an ID3 tag there and not in a WAV file.
-fn write_aiff(path: &Path, title: &str, number: &str, hz: f64) {
+fn write_aiff(path: &Path, title: &str, number: &str, hz: f64, seconds: u32) {
     let rate: u32 = 8000;
-    let frames = rate * TRACK_SECONDS;
+    let frames = rate * seconds;
     let data = frames * 2;
     let mut tag = id3(&[
         frame(b"TIT2", title),
@@ -458,7 +462,7 @@ fn page_agrees_with_the_plays(data_dir: &Path, what: &str, name: &str, plays: &V
 #[test]
 fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
     let scratch = Scratch::new();
-    let (data_dir, music) = (scratch.data_dir(), scratch.music());
+    let (data_dir, music) = (scratch.data_dir(), scratch.music(TRACK_SECONDS));
     let folder = music.to_str().unwrap();
     let fake = FakeLastfm::start("someone", history(now_s()));
     fake.set_loved(vec![(
@@ -596,10 +600,19 @@ fn a_last_fm_history_is_imported_through_a_kill_and_a_play_is_scrobbled_once() {
     );
     assert_eq!(sent[0].artist, "Invented Artist");
     assert_eq!(sent[0].album, "Invented Album");
+    // Each is recorded as accepted once its answer is in, and the counts
+    // come by state, so wait until neither is still on its way.
     let status = until(&data_dir, &["lastfm", "status"], |status| {
-        status["deliveries"][0]["state"] == "accepted"
+        status["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|count| !matches!(count["state"].as_str(), Some("pending" | "sending")))
     });
-    assert_eq!(status["deliveries"][0]["count"], 2);
+    assert_eq!(
+        status["deliveries"],
+        serde_json::json!([{ "state": "accepted", "count": 2 }])
+    );
 
     let synced = json(&data_dir, &["lastfm", "sync"]);
     assert_eq!(synced["sync"]["new"], 2);
@@ -658,9 +671,13 @@ fn the_hub_imports_on_its_own_when_it_starts_and_a_failure_waits_for_the_next_tr
 
     // Last.fm cannot be reached: the import the hub starts with fails,
     // once, and the next waits for a trigger.
+    // Each connection is closed unanswered. The listener is kept, so that
+    // no other test's server can be given its port meanwhile.
     let dead = {
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}/2.0/", closed.local_addr().unwrap())
+        let unanswering = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/2.0/", unanswering.local_addr().unwrap());
+        std::thread::spawn(move || unanswering.incoming().for_each(drop));
+        url
     };
     let server = Server::start(
         &data_dir,
@@ -731,7 +748,7 @@ fn past(ms: u64) -> impl Fn(&Value) -> bool {
 #[test]
 fn what_begins_to_play_is_shown_as_playing_now_only_while_scrobbling_is_on() {
     let scratch = Scratch::new();
-    let (data_dir, music) = (scratch.data_dir(), scratch.music());
+    let (data_dir, music) = (scratch.data_dir(), scratch.music(LONG_TRACK_SECONDS));
     let folder = music.to_str().unwrap();
     let fake = FakeLastfm::start("someone", Vec::new());
     // At real time, so that a track is heard long enough to be shown.
@@ -764,13 +781,18 @@ fn what_begins_to_play_is_shown_as_playing_now_only_while_scrobbling_is_on() {
         "the album's artist is the track's"
     );
     assert_eq!(field("trackNumber"), Some("2"));
-    assert_eq!(field("duration"), Some(TRACK_SECONDS.to_string().as_str()));
+    assert_eq!(
+        field("duration"),
+        Some(LONG_TRACK_SECONDS.to_string().as_str())
+    );
     assert_eq!(field("sk"), Some(SESSION_KEY));
     until(&data_dir, &["now"], past(3_000));
     assert_eq!(fake.now_playing().len(), 1, "shown once while it plays");
 
     // A pause shows nothing; playing again shows it again.
     json(&data_dir, &["pause"]);
+    // sleep: time for a wrong "now playing" to be sent. A slow machine can
+    // only make this pass when it should not, never fail when it should not.
     std::thread::sleep(Duration::from_millis(1_500));
     assert_eq!(fake.now_playing().len(), 1);
     json(&data_dir, &["resume"]);
@@ -780,6 +802,7 @@ fn what_begins_to_play_is_shown_as_playing_now_only_while_scrobbling_is_on() {
         Some("Second Wind")
     );
     json(&data_dir, &["stop"]);
+    // sleep: as above, time for a wrong one to be sent.
     std::thread::sleep(Duration::from_millis(1_500));
     assert_eq!(fake.now_playing().len(), 2);
     assert!(
