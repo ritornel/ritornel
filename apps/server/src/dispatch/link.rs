@@ -441,14 +441,21 @@ impl Core {
             .map_err(internal)?;
         info!(hub = %invite.hub, library_id = %granted.library_id, %address, "linked to a hub");
         if let Some(link) = stores.server.hub_link().map_err(internal)? {
-            *self.uplink.write().unwrap_or_else(PoisonError::into_inner) =
-                Some(std::sync::Arc::new(crate::uplink::Uplink::new(
-                    link,
-                    name,
-                    runtime.clone(),
-                    std::sync::Arc::clone(&self.clock),
-                    std::sync::Arc::clone(&self.entropy),
-                )));
+            let uplink = crate::uplink::Uplink::new(
+                link,
+                name,
+                runtime.clone(),
+                std::sync::Arc::clone(&self.clock),
+                std::sync::Arc::clone(&self.entropy),
+            );
+            let mut held = self.uplink.write().unwrap_or_else(PoisonError::into_inner);
+            // A stop that began meanwhile holds this link to its deadline.
+            // It is read with the link held, so that of the stop and this
+            // join, one sees the other's.
+            if let Some(by) = self.hub_stop_by.get() {
+                uplink.stop_by(*by);
+            }
+            *held = Some(std::sync::Arc::new(uplink));
         }
         {
             let mut this = lock(&self.this);
@@ -693,6 +700,7 @@ impl Core {
             stamps,
             after_ingest,
             HUB_BACKOFF_MS,
+            &|| uplink.stopped(),
         ))
     }
 

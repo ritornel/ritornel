@@ -384,6 +384,11 @@ impl Server {
     /// without a bound is a call that has started: closing the database
     /// waits for it to finish.
     pub async fn stop(self) -> Result<(), Error> {
+        // From here on every wait on a satellite's hub ends within the
+        // grace: a hub that does not answer holds neither the player, nor
+        // a call, nor the outbox, past it. A listen not sent by then stays
+        // staged for the next run.
+        self.core.stop_hub_within(self.bounds.stop_grace);
         drop(self.hub);
         drop(self.awake);
         self.core.close_sessions();

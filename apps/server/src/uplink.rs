@@ -80,6 +80,9 @@ pub(crate) struct Uplink {
     changes: tokio::sync::watch::Sender<u64>,
     /// The server's own connection.
     own: Mutex<Option<Arc<Client>>>,
+    /// Once the server is stopping: when every wait on the hub ends,
+    /// those already waiting too.
+    stop_by: tokio::sync::watch::Sender<Option<tokio::time::Instant>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -104,7 +107,73 @@ impl Uplink {
             sessions: Mutex::default(),
             changes: tokio::sync::watch::Sender::new(0),
             own: Mutex::default(),
+            stop_by: tokio::sync::watch::Sender::new(None),
         }
+    }
+
+    /// The server is stopping: every wait on the hub ends by `by`, and no
+    /// call is made after that, so that a hub that does not answer cannot
+    /// hold the stop. What was not sent waits for the next run.
+    pub(crate) fn stop_by(&self, by: tokio::time::Instant) {
+        self.stop_by.send_if_modified(|stop_by| {
+            let first = stop_by.is_none();
+            stop_by.get_or_insert(by);
+            first
+        });
+    }
+
+    /// Whether the time a stop gave the hub has run out.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop_by
+            .borrow()
+            .is_some_and(|by| tokio::time::Instant::now() >= by)
+    }
+
+    /// Resolves once the time a stop gave the hub has run out, and never
+    /// while the server is not stopping.
+    async fn stop_passed(&self) {
+        let mut stop_by = self.stop_by.subscribe();
+        let by = match stop_by.wait_for(Option::is_some).await {
+            Ok(by) => *by,
+            // The sender is this uplink's own, so it outlives the wait.
+            Err(_) => None,
+        };
+        match by {
+            Some(by) => tokio::time::sleep_until(by).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// What a call is answered with once the stop's time has run out.
+    fn stopping() -> RpcError {
+        RpcError::new(ErrorCode::Unavailable, "the server is stopping")
+    }
+
+    /// Runs `work` on the server's runtime and waits for it: for at most
+    /// `wait`, if given, and never past the stop's deadline, though the
+    /// stop began after the wait did. `None` if the wait ran out first.
+    /// Past the deadline `work` is not begun, so no call is sent then.
+    fn wait_on<T>(
+        &self,
+        wait: Option<std::time::Duration>,
+        work: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
+        // The timers are made inside the runtime: a caller may be a thread
+        // of the server's own, outside it, such as the outbox's.
+        self.runtime.block_on(async {
+            let waited = async {
+                match wait {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                () = self.stop_passed() => None,
+                done = work => Some(done),
+                () = waited => None,
+            }
+        })
     }
 
     /// The library the hub holds.
@@ -276,6 +345,9 @@ impl Uplink {
                 self.answered(None);
                 Err(error)
             }
+            // Cut short by the stop: the hub was not given the time to
+            // answer, so nothing is known of it.
+            Err(_) if self.stopped() => Err(Self::stopping()),
             Err(other) => {
                 self.lost(&other.to_string());
                 Err(self.unreachable())
@@ -299,6 +371,9 @@ impl Uplink {
         // view that went with the old connection is reported expired.
         let mut result = None;
         for _ in 0..2 {
+            if self.stopped() {
+                return Err(Self::stopping());
+            }
             let client = self.session_client(session, false)?;
             let (sent, again) = self.ask(&client, method, params.clone());
             let lost =
@@ -318,28 +393,25 @@ impl Uplink {
     }
 
     /// Makes one call on a connection and waits for its answer, for at
-    /// most [`CALL_WAIT`]. A connection whose hub has gone without closing
-    /// it, as one does when the network drops, would otherwise be waited on
-    /// for good. Also says whether the call may be sent again at once on a
-    /// new connection: not after a wait that ran out, which would double it.
+    /// most [`CALL_WAIT`], and never past a stop's deadline. A connection
+    /// whose hub has gone without closing it, as one does when the network
+    /// drops, would otherwise be waited on for good. Also says whether the
+    /// call may be sent again at once on a new connection: not after a
+    /// wait that ran out, which would double it.
     fn ask(
         &self,
         client: &Client,
         method: &str,
         params: Value,
     ) -> (Result<Value, ritornel_client::Error>, bool) {
-        // The timer is made inside the runtime: a caller may be a thread
-        // of the server's own, outside it, such as the outbox's.
-        let asked = self.runtime.block_on(async {
-            tokio::time::timeout(CALL_WAIT, client.call_raw(method, params)).await
-        });
-        match asked {
-            Ok(answer) => (answer, true),
-            Err(_) => (
-                Err(ritornel_client::Error::Transport(format!(
-                    "no answer in {} seconds",
-                    CALL_WAIT.as_secs()
-                ))),
+        match self.wait_on(Some(CALL_WAIT), client.call_raw(method, params)) {
+            Some(answer) => (answer, true),
+            None => (
+                Err(ritornel_client::Error::Transport(if self.stopped() {
+                    "the server is stopping".to_owned()
+                } else {
+                    format!("no answer in {} seconds", CALL_WAIT.as_secs())
+                })),
                 false,
             ),
         }
@@ -370,8 +442,8 @@ impl Uplink {
             Some(client) => (client, subscribe),
             None => {
                 let mut client = self
-                    .runtime
-                    .block_on(self.connect())
+                    .wait_on(None, self.connect())
+                    .ok_or_else(Self::stopping)?
                     .map_err(|_| self.unreachable())?;
                 let events = client.take_events();
                 let client = Arc::new(client);
@@ -405,13 +477,16 @@ impl Uplink {
     pub(crate) fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let mut result = None;
         for _ in 0..2 {
+            if self.stopped() {
+                return Err(Self::stopping());
+            }
             let held = lock(&self.own).clone();
             let client = match held {
                 Some(client) => client,
                 None => {
                     let client = Arc::new(
-                        self.runtime
-                            .block_on(self.connect())
+                        self.wait_on(None, self.connect())
+                            .ok_or_else(Self::stopping)?
                             .map_err(|_| self.unreachable())?,
                     );
                     *lock(&self.own) = Some(Arc::clone(&client));
