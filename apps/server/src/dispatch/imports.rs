@@ -344,12 +344,12 @@ mod tests {
         })
     }
 
-    /// A report of run 9 by this matcher, kept as its dry run's.
-    fn dry_run(core: &Core, matcher: i64) {
+    /// A report of run 9 by this grouper, kept as its dry run's.
+    fn dry_run(core: &Core, grouper: i64) {
         let run = Id::from_bytes([9; 16]);
         let (_, begun_at) = core.staging().streams(run, T0).unwrap().unwrap();
         let report: ImportReport = serde_json::from_value(json!({
-            "madeAt": T0, "matcherVersion": matcher,
+            "madeAt": T0, "grouperVersion": grouper,
             "playRuleVersion": ritornel_engine::PLAY_RULE_VERSION, "streams": 1, "events": 1,
             "respelled": 0, "scrobbles": 0, "scrobblesExcluded": 0, "scrobblesEchoes": 0,
             "tiers": [], "years": [], "offline": 0, "offlineTimestamped": 0,
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn an_apply_is_refused_without_every_piece_or_a_dry_run_by_the_matcher_in_force() {
+    fn an_apply_is_refused_without_every_piece_or_a_dry_run_by_the_grouper_in_force() {
         let clock = Arc::new(SetClock::at(T0));
         let (core, _scratch, session) = staged(&clock, 2);
         assert_eq!(
@@ -379,13 +379,13 @@ mod tests {
             Err(ErrorCode::Invalid),
             "no dry run"
         );
-        dry_run(&core, ritornel_engine::STREAM_MATCHER_VERSION - 1);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION - 1);
         assert_eq!(
             call(&core, &session, "imports.apply", apply(4)),
             Err(ErrorCode::Invalid),
-            "a dry run by another matcher"
+            "a dry run by another grouper"
         );
-        dry_run(&core, ritornel_engine::STREAM_MATCHER_VERSION);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION);
         assert!(call(&core, &session, "imports.apply", apply(5)).is_ok());
     }
 
@@ -393,7 +393,7 @@ mod tests {
     fn an_apply_that_wrote_before_the_server_stopped_ends_as_done_with_its_run_gone() {
         let clock = Arc::new(SetClock::at(T0));
         let (core, _scratch, session) = staged(&clock, 1);
-        dry_run(&core, ritornel_engine::STREAM_MATCHER_VERSION);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION);
         let started = call(&core, &session, "imports.apply", apply(4)).unwrap();
         // The write is made, and then the server stops: the restart
         // removes the staged run, and the job is taken up again.
@@ -430,7 +430,7 @@ mod tests {
     fn a_command_sent_again_is_answered_with_its_job_after_its_run_has_gone() {
         let clock = Arc::new(SetClock::at(T0));
         let (core, _scratch, session) = staged(&clock, 1);
-        dry_run(&core, ritornel_engine::STREAM_MATCHER_VERSION);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION);
         let started = call(&core, &session, "imports.apply", apply(4)).unwrap();
 
         // A day later the staged run is gone. The command sent again is

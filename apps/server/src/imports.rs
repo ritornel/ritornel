@@ -202,9 +202,12 @@ impl Staging {
         streams: &[SpotifyStream],
         now: i64,
     ) -> Result<ImportRun, Refused> {
-        if reader.trim().is_empty() || reader.chars().count() > MAX_CLIENT_TEXT {
+        if reader.trim().is_empty()
+            || reader.chars().count() > MAX_CLIENT_TEXT
+            || reader.chars().any(char::is_control)
+        {
             return Err(Refused::Invalid(
-                "a run names what read it, in at most a hundred characters",
+                "a run names what read it, in at most a hundred characters and none a control",
             ));
         }
         if pieces == 0 || pieces > MAX_PIECES || piece >= pieces {
@@ -441,10 +444,10 @@ pub(crate) fn stale(report: Option<&ImportReport>) -> Option<&'static str> {
     match report {
         None => Some("the run has no dry run: dry run it first"),
         Some(report)
-            if report.matcher_version != ritornel_engine::STREAM_MATCHER_VERSION
+            if report.grouper_version != ritornel_engine::GROUPER_VERSION
                 || report.play_rule_version != ritornel_engine::PLAY_RULE_VERSION =>
         {
-            Some("the matcher or the play rule has changed since the dry run: dry run it again")
+            Some("the grouper or the play rule has changed since the dry run: dry run it again")
         }
         Some(_) => None,
     }
@@ -670,9 +673,20 @@ mod tests {
                 Err(Refused::Invalid(_))
             ));
         }
-        // A piece holds a stream at least.
+        // A piece holds a stream at least, and what read it is plain text.
         assert!(matches!(
-            staging.stage(run(), 0, 1, &[], NOW),
+            staging.stage(run(), 0, 1, READER, &[], NOW),
+            Err(Refused::Invalid(_))
+        ));
+        assert!(matches!(
+            staging.stage(
+                run(),
+                0,
+                1,
+                "ritornelctl\u{1b}[2J",
+                &[stream("Low Tide")],
+                NOW
+            ),
             Err(Refused::Invalid(_))
         ));
     }

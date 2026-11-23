@@ -1167,9 +1167,9 @@ pub(crate) fn stream(
         offline: Some(false),
         offline_timestamp: None,
         incognito: Some(false),
-        platform: None,
-        device_kind: None,
-        via: None,
+        platform: Some(ritornel_contract::Platform::Mac),
+        device_kind: Some(ritornel_contract::DeviceKind::Computer),
+        via: Some(ritornel_contract::PlayedVia::App),
     }
 }
 
@@ -1359,6 +1359,7 @@ fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
         .collect();
     assert_eq!(streams.len(), 5);
     assert_eq!(streams[0]["import"]["stream"]["platform"], "mac");
+    assert_eq!(streams[0]["import"]["stream"]["deviceKind"], "computer");
     let runs = std::fs::read_to_string(scratch.path().join("runs.jsonl")).unwrap();
     let first_run: serde_json::Value = serde_json::from_str(runs.lines().next().unwrap()).unwrap();
     assert_eq!(first_run["ledger"][0]["state"], "applied");
@@ -1388,6 +1389,51 @@ fn a_row_a_later_archive_spells_otherwise_keeps_the_record_it_was_stored_with() 
         stored
     );
     assert_eq!(rig.one("SELECT count(*) FROM history_ingest_conflict"), "0");
+}
+
+#[test]
+fn a_later_reader_says_again_what_a_stream_played_on_and_stores_no_row() {
+    use ritornel_contract::{DeviceKind, PlayedVia};
+    let rig = rig();
+    let first = stream(T0 - 3 * HOUR, 200_000, "Paper Kites");
+    apply(&rig, 1, vec![first.clone()]);
+    let device = "SELECT coalesce(platform, '-') || ' ' || coalesce(device_kind, '-') || ' ' || \
+                  coalesce(via, '-') || ' ' || run_id FROM stream_device";
+    assert_eq!(rig.one(device), "mac computer app 1");
+    let payload = rig.one("SELECT payload_json FROM history_observation WHERE kind = 'import'");
+    assert!(!payload.contains("mac"), "{payload}");
+    let plays = "SELECT group_concat(hex(public_id), ',' ORDER BY public_id) FROM play_event";
+    let played = rig.one(plays);
+    // A later reader says the same row otherwise, and Spotify marks it
+    // skipped where it did not before: it is the same stream, which keeps
+    // its record and its plays, and is said to have played on what the
+    // later run says.
+    let mut later = first;
+    later.platform = None;
+    later.device_kind = Some(DeviceKind::Speaker);
+    later.via = Some(PlayedVia::Cast);
+    later.skipped = Some(true);
+    let again = apply(&rig, 2, vec![later.clone()]);
+    assert_eq!(again.new_streams, 0);
+    assert_eq!(rig.one(device), "- speaker cast 2");
+    assert_eq!(
+        rig.one("SELECT payload_json FROM history_observation WHERE kind = 'import'"),
+        payload
+    );
+    assert_eq!(
+        rig.one("SELECT count(*) FROM observation_import_stream"),
+        "1"
+    );
+    assert_eq!(rig.one(plays), played);
+    // Undone and the same archive applied again, by the same words: the run
+    // that said them now is the one named, and the archive has its hash.
+    undo(&rig, 2);
+    apply(&rig, 3, vec![later]);
+    assert_eq!(rig.one(device), "- speaker cast 3");
+    assert_eq!(
+        rig.one("SELECT count(DISTINCT records_hash) FROM import_run WHERE id IN (2, 3)"),
+        "1"
+    );
 }
 
 #[test]

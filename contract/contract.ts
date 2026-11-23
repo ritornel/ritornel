@@ -938,6 +938,11 @@ export type Descriptor = {
 };
 
 /**
+ * The hardware the sound came out of.
+ */
+export type DeviceKind = "computer" | "phone" | "tablet" | "watch" | "speaker" | "tv" | "car" | "console" | "group" | "other";
+
+/**
  * The params of `record.dismiss`.
  */
 export type DismissParams = {
@@ -1643,10 +1648,10 @@ export type ImportReport = {
    */
   madeAt: number,
   /**
-   * The matcher's version. An apply is refused when it has changed
-   * since the dry run.
+   * The grouper's version, which the stream matcher is part of. An
+   * apply is refused when it has changed since the dry run.
    */
-  matcherVersion: number,
+  grouperVersion: number,
   /**
    * The play rule's version. An apply is refused when it has changed
    * since the dry run.
@@ -3365,6 +3370,12 @@ export type PicturesImported = {
 };
 
 /**
+ * The operating system of the device that made the sound, and only
+ * that: a web player or a cast is how it played, never a system.
+ */
+export type Platform = "ios" | "android" | "mac" | "windows" | "linux" | "other";
+
+/**
  * One play.
  */
 export type Play = {
@@ -3790,6 +3801,11 @@ export type PlayedTrack = {
    */
   album?: string,
 };
+
+/**
+ * How the device that made the sound played it.
+ */
+export type PlayedVia = "app" | "web" | "cast" | "connect" | "airplay" | "other";
 
 /**
  * The policy one dry run decides by: a named policy, and values to put in
@@ -5378,14 +5394,6 @@ export type SourcesTracksParams = {
 };
 
 /**
- * What kind of device played a stream. Spotify's own text names the device
- * and its system, so only this word is kept. A word it does not know is
- * refused with an error that does not repeat it, so that text sent in its
- * place is never echoed back or logged.
- */
-export type SpotifyPlatform = "mac" | "windows" | "linux" | "android" | "ios" | "web" | "cast" | "other";
-
-/**
  * One row of Spotify's extended streaming history, as Ritornel keeps it.
  *
  * It is the whole of what is taken from a row. The row's IP address, user
@@ -5448,9 +5456,18 @@ export type SpotifyStream = {
    */
   incognito?: boolean,
   /**
-   * What kind of device played it, as one word.
+   * The operating system of the device that played it, when the row
+   * says.
    */
-  platform: SpotifyPlatform,
+  platform?: Platform,
+  /**
+   * The hardware the sound came out of, when the row says.
+   */
+  deviceKind?: DeviceKind,
+  /**
+   * How that device played it, when the row says.
+   */
+  via?: PlayedVia,
 };
 
 /**

@@ -122,9 +122,9 @@ pub use resolve_store::Resolved;
 /// What a server, a session and every stored entity is named by. The type
 /// is the contract's.
 pub use ritornel_contract::Id;
+pub use ritornel_domain::history::GROUPER_VERSION;
 /// The wall clock in a zone at an instant: what a local date is read with.
 pub use ritornel_domain::history::{LocalTime, known_zone, local_time, start_of_day_ms};
-pub use ritornel_domain::streams::STREAM_MATCHER_VERSION;
 pub use scan::{ScanRun, ScanSettings, run_scan, scan_summary};
 pub use scan_store::Source;
 pub use secret::{SessionToken, Signer, verify_signature};

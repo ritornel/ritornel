@@ -402,9 +402,10 @@ fn import(connection: &Connection, observation: i64) -> Result<Value, Error> {
         "SELECT i.played_at_utc_ms, i.artist, i.album, i.title, i.artist_mbid, i.album_mbid,
                 i.track_mbid, s.observation_id IS NOT NULL, s.ended_at_utc_ms, s.ms_played,
                 s.reason_start, s.reason_end, s.shuffle, s.skipped, s.offline,
-                s.offline_timestamp, s.incognito, s.platform
+                s.offline_timestamp, s.incognito, d.platform, d.device_kind, d.via
          FROM observation_import i
          LEFT JOIN observation_import_stream s ON s.observation_id = i.observation_id
+         LEFT JOIN stream_device d ON d.observation_id = i.observation_id
          WHERE i.observation_id = ?1",
     )?;
     Ok(statement.query_row([observation], |row| {
@@ -432,7 +433,9 @@ fn import(connection: &Connection, observation: i64) -> Result<Value, Error> {
                     "offline": row.get::<_, Option<bool>>(14)?,
                     "offlineTimestamp": row.get::<_, Option<i64>>(15)?,
                     "incognito": row.get::<_, Option<bool>>(16)?,
-                    "platform": row.get::<_, String>(17)?,
+                    "platform": row.get::<_, Option<String>>(17)?,
+                    "deviceKind": row.get::<_, Option<String>>(18)?,
+                    "playedVia": row.get::<_, Option<String>>(19)?,
                 }),
             );
         }

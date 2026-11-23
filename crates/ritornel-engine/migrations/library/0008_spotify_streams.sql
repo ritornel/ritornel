@@ -29,7 +29,6 @@ CREATE TABLE observation_import_stream (
   offline            INTEGER CHECK (offline IN (0, 1)),
   offline_timestamp  INTEGER,                                    -- as the archive gives it: in seconds in some rows and milliseconds in others
   incognito          INTEGER CHECK (incognito IN (0, 1)),        -- a private session
-  platform           TEXT NOT NULL CHECK (platform IN ('mac', 'windows', 'linux', 'android', 'ios', 'web', 'cast', 'other')),   -- one word, never Spotify's text
   rev                INTEGER NOT NULL
 ) STRICT;
 
@@ -120,3 +119,20 @@ BEFORE DELETE ON import_run_stream
 BEGIN
   SELECT RAISE(ABORT, 'import_run_stream is immutable: nothing is deleted');
 END;
+
+-- What a stream was played on, as words a reader chose from the platform's
+-- text, which is never kept: the device that made the sound, never one
+-- that controlled it. They are apart from the stream, since a later reader
+-- may say them better: every run says them again for each stream it holds,
+-- new or stored before, and the row names that run, whose reader it names.
+-- A word is NULL when the text did not say, and 'other' when it named
+-- something outside these. Nothing derived reads them. A word added later
+-- is this table made again with its checks, and touches no stream.
+CREATE TABLE stream_device (
+  observation_id  INTEGER PRIMARY KEY REFERENCES observation_import_stream(observation_id),
+  platform        TEXT CHECK (platform IN ('ios', 'android', 'mac', 'windows', 'linux', 'other')),   -- the operating system only
+  device_kind     TEXT CHECK (device_kind IN ('computer', 'phone', 'tablet', 'watch', 'speaker', 'tv', 'car', 'console', 'group', 'other')),   -- the hardware the sound came out of
+  via             TEXT CHECK (via IN ('app', 'web', 'cast', 'connect', 'airplay', 'other')),   -- how that device played it
+  run_id          INTEGER NOT NULL REFERENCES import_run(id),   -- the run whose reader said them
+  rev             INTEGER NOT NULL
+) STRICT;

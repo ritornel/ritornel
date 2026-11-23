@@ -12,7 +12,7 @@ use ritornel_contract::{
 
 use crate::history::{Outcome, ZonePeriod, assumed_zone};
 use crate::streams::{
-    Event, Matched, Pins, Scrobble, Stream, Tier, Tiers, judge_alone, lengths, match_streams,
+    Event, Matched, Pins, Scrobble, Stream, Tier, Tiers, judge_alone, kept, lengths, match_streams,
     name_key, repeat_order,
 };
 
@@ -100,16 +100,25 @@ fn key_at(r: &SpotifyStream, place: u32) -> Vec<u8> {
     format!("sp1:{}:{}:{id}:{place}", r.ended_at, r.ms_played).into_bytes()
 }
 
-/// Whether two records of one stream differ in their names alone: the same
-/// row, spelled otherwise by a later archive.
-fn respelling(held: &SpotifyStream, record: &SpotifyStream) -> bool {
-    let unnamed = |r: &SpotifyStream| SpotifyStream {
+/// How near a stored record a row of an archive must be to take its place.
+#[derive(Clone, Copy)]
+enum Pass {
+    /// The same record.
+    Same,
+    /// The same but for its names.
+    Respelled,
+    /// Any of its group.
+    Any,
+}
+
+/// A record without its names.
+fn unnamed(r: &SpotifyStream) -> SpotifyStream {
+    SpotifyStream {
         title: String::new(),
         artist: String::new(),
         album: None,
         ..r.clone()
-    };
-    unnamed(held) == unnamed(record)
+    }
 }
 
 /// The keys of an archive's streams, made from the records alone and from
@@ -117,10 +126,11 @@ fn respelling(held: &SpotifyStream, record: &SpotifyStream) -> bool {
 ///
 /// The streams with the same end, time played and track are one group, in
 /// the order of their other kept fields. A stream takes the place of a
-/// stored stream of its group with the same record; then one that differs
-/// from a stored stream that is left in its names alone takes its place,
-/// as a row the archive spells otherwise, which keeps the record it was
-/// stored with; and the rest take places no stored stream has. So the same archive gives the
+/// stored stream of its group with the same record as it is kept; then one
+/// takes the place of a stored stream of its group that is left, first one
+/// that differs in its names alone, as a row a later archive gives
+/// otherwise, which keeps the record it was stored with; and the rest take
+/// places no stored stream has. So the same archive gives the
 /// same keys, and a later one gives the rows it shares with an earlier one
 /// their keys, whatever rows it adds and wherever they sort.
 pub fn keyed(records: Vec<SpotifyStream>, stored: &HashMap<Vec<u8>, SpotifyStream>) -> Vec<Stream> {
@@ -152,8 +162,9 @@ pub fn keyed(records: Vec<SpotifyStream>, stored: &HashMap<Vec<u8>, SpotifyStrea
         let stored = held.get(&group).map(Vec::as_slice).unwrap_or_default();
         let mut taken: HashSet<u32> = HashSet::new();
         let mut place: Vec<Option<u32>> = vec![None; members.len()];
-        // The same record first, then a record spelled otherwise.
-        for same in [true, false] {
+        // The same record first, then one spelled otherwise in its names
+        // alone, then any left of the group.
+        for pass in [Pass::Same, Pass::Respelled, Pass::Any] {
             for (slot, at) in place.iter_mut().zip(&members) {
                 if slot.is_some() {
                     continue;
@@ -161,12 +172,13 @@ pub fn keyed(records: Vec<SpotifyStream>, stored: &HashMap<Vec<u8>, SpotifyStrea
                 let Some(record) = records.get(*at) else {
                     continue;
                 };
+                let record = kept(record);
                 let found = stored.iter().find(|(held_at, held)| {
                     !taken.contains(held_at)
-                        && if same {
-                            *held == record
-                        } else {
-                            respelling(held, record)
+                        && match pass {
+                            Pass::Same => kept(held) == record,
+                            Pass::Respelled => unnamed(&kept(held)) == unnamed(&record),
+                            Pass::Any => true,
                         }
                 });
                 if let Some((held_at, _)) = found {
@@ -328,7 +340,7 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
                 input
                     .stored
                     .get(&stream.key)
-                    .is_some_and(|stored| *stored != stream.record)
+                    .is_some_and(|stored| *stored != kept(&stream.record))
             })
             .count() as u64,
         scrobbles: input.scrobbles.len() as u64,

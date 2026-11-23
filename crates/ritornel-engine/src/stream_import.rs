@@ -5,9 +5,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use ritornel_contract::{ImportReport, SpotifyStream};
+use ritornel_contract::{DeviceKind, ImportReport, Platform, PlayedVia, SpotifyStream};
 use ritornel_domain::stream_report::{DryRunInput, dry_run, keyed};
-use ritornel_domain::streams::{Pins, Scrobble, Stream};
+use ritornel_domain::streams::{Pins, Scrobble, Stream, kept, repeat_order};
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
@@ -28,19 +28,48 @@ struct Read {
 
 /// The streams stored already, by key, as they were stored.
 fn stored_streams(connection: &Connection) -> Result<HashMap<Vec<u8>, SpotifyStream>, Error> {
-    let mut statement = connection.prepare(
-        "SELECT o.source_key, o.payload_json FROM history_observation o
-           JOIN observation_import_stream s ON s.observation_id = o.id",
-    )?;
+    let mut statement = connection.prepare(&format!(
+        "SELECT {STORED_STREAM} FROM history_observation o {STORED_STREAM_JOINS}"
+    ))?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        Ok((row.get::<_, Vec<u8>>(0)?, stored_stream(row, 1)?))
     })?;
-    let mut stored = HashMap::new();
-    for row in rows {
-        let (key, payload) = row?;
-        stored.insert(key, serde_json::from_str(&payload)?);
-    }
-    Ok(stored)
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// A stored stream's columns, after its source key: what [`stored_stream`]
+/// reads, from the observation `o` and [`STORED_STREAM_JOINS`].
+pub(crate) const STORED_STREAM: &str = "o.source_key, si.provider_key, i.title, i.artist, i.album,
+    s.ended_at_utc_ms, s.ms_played, s.reason_start, s.reason_end, s.shuffle, s.skipped,
+    s.offline, s.offline_timestamp, s.incognito";
+
+/// What [`STORED_STREAM`] reads from, joined to the observation `o`.
+pub(crate) const STORED_STREAM_JOINS: &str = "JOIN observation_import i ON i.observation_id = o.id
+     JOIN observation_import_stream s ON s.observation_id = o.id
+     JOIN source_item si ON si.id = o.source_item_id";
+
+/// A stored stream's record from its typed columns, from column `at` on: as
+/// it was kept, with nothing of what it was played on. Its stored JSON is
+/// the record's archive, and is never read back.
+pub(crate) fn stored_stream(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<SpotifyStream> {
+    Ok(SpotifyStream {
+        track_uri: row.get(at)?,
+        title: row.get(at + 1)?,
+        artist: row.get(at + 2)?,
+        album: row.get(at + 3)?,
+        ended_at: row.get(at + 4)?,
+        ms_played: row.get(at + 5)?,
+        reason_start: row.get(at + 6)?,
+        reason_end: row.get(at + 7)?,
+        shuffle: row.get(at + 8)?,
+        skipped: row.get(at + 9)?,
+        offline: row.get(at + 10)?,
+        offline_timestamp: row.get(at + 11)?,
+        incognito: row.get(at + 12)?,
+        platform: None,
+        device_kind: None,
+        via: None,
+    })
 }
 
 /// Every scrobble of every account, sorted into those a stream may take,
@@ -230,15 +259,23 @@ fn spotify_rows(write: &Write<'_>) -> Result<(i64, i64), Error> {
     Ok((endpoint, instance))
 }
 
-/// The SHA-256 of streams in key order: the same archive has the same hash.
+/// The SHA-256 of an archive's records as they are kept, in an order of
+/// their own and not by their keys: the same archive has the same hash.
 fn records_hash(streams: &[Stream]) -> Vec<u8> {
-    let mut order: Vec<&Stream> = streams.iter().collect();
-    order.sort_by(|a, b| a.key.cmp(&b.key));
+    // The archive's own records as they are kept, in an order of their
+    // own, so that the same archive has the same hash whatever is stored.
+    let mut order: Vec<SpotifyStream> = streams.iter().map(|stream| kept(&stream.record)).collect();
+    order.sort_by(|a, b| {
+        (a.ended_at, a.ms_played, &a.track_uri, repeat_order(a)).cmp(&(
+            b.ended_at,
+            b.ms_played,
+            &b.track_uri,
+            repeat_order(b),
+        ))
+    });
     let mut hash = Sha256::new();
-    for stream in order {
-        hash.update((stream.key.len() as u64).to_be_bytes());
-        hash.update(&stream.key);
-        let written = serde_json::to_vec(&stream.record).unwrap_or_default();
+    for record in order {
+        let written = serde_json::to_vec(&record).unwrap_or_default();
         hash.update((written.len() as u64).to_be_bytes());
         hash.update(written);
     }
@@ -348,8 +385,9 @@ fn apply_in(
             }
         };
         // The record is written from its type, never from text it was
-        // handed: the kept fields, and no other.
-        let payload = serde_json::to_string(r)?;
+        // handed: the kept fields, and no other. What it was played on is
+        // kept apart, where a later reader may say it again.
+        let payload = serde_json::to_string(&kept(r))?;
         connection
             .prepare_cached(
                 "INSERT INTO history_observation
@@ -386,8 +424,8 @@ fn apply_in(
             .prepare_cached(
                 "INSERT INTO observation_import_stream
                    (observation_id, ended_at_utc_ms, ms_played, reason_start, reason_end, shuffle,
-                    skipped, offline, offline_timestamp, incognito, platform, rev)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    skipped, offline, offline_timestamp, incognito, rev)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?
             .execute(rusqlite::params![
                 observation,
@@ -400,7 +438,6 @@ fn apply_in(
                 r.offline,
                 r.offline_timestamp,
                 r.incognito,
-                r.platform.as_str(),
                 write.rev(),
             ])?;
         observations.push(observation);
@@ -428,8 +465,25 @@ fn apply_in(
     let mut held = connection.prepare_cached(
         "INSERT INTO import_run_stream (run_id, observation_id, rev) VALUES (?1, ?2, ?3)",
     )?;
-    for observation in observations {
+    // What each stream was played on is said again by this run's reader,
+    // for a stream stored before as for a new one.
+    let mut device = connection.prepare_cached(
+        "INSERT INTO stream_device (observation_id, platform, device_kind, via, run_id, rev)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (observation_id) DO UPDATE
+           SET platform = excluded.platform, device_kind = excluded.device_kind,
+               via = excluded.via, run_id = excluded.run_id, rev = excluded.rev",
+    )?;
+    for (observation, stream) in observations.iter().zip(streams) {
         held.execute((row, observation, write.rev()))?;
+        device.execute(rusqlite::params![
+            observation,
+            stream.record.platform.map(Platform::as_str),
+            stream.record.device_kind.map(DeviceKind::as_str),
+            stream.record.via.map(PlayedVia::as_str),
+            row,
+            write.rev(),
+        ])?;
     }
     connection.execute(
         "INSERT INTO import_run_event (run_id, state, at_ms, rev) VALUES (?1, 'applied', ?2, ?3)",
