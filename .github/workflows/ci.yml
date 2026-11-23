@@ -16,11 +16,45 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Debug builds keep line numbers for backtraces and no more, which makes
+  # them, their link and the cache smaller.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  NEXTEST_PROFILE: ci
 
 # The jobs together run what `mise run check` runs, each part where it can
 # fail: what is the same on every system once, and what differs by system on
 # each. The setup they share is .github/actions/setup.
 jobs:
+  changes:
+    # Which jobs a pull request's changes can affect, by scripts/ci-changes.sh:
+    # one that touches only the desktop app skips the main workspace's jobs,
+    # and one that touches only what the desktop app does not build skips
+    # the desktop jobs. A push to main runs every job, so its caches are all
+    # saved.
+    name: Jobs the change needs
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    outputs:
+      workspace: ${{ steps.paths.outputs.workspace }}
+      desktop: ${{ steps.paths.outputs.desktop }}
+    steps:
+      # A pull request's run checks out its merge into the base branch, whose
+      # first parent is the base: the two differ by what the pull request
+      # changes. Without renames, a moved file is listed at both its paths.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ $EVENT == pull_request ]]; then
+            git diff --name-only --no-renames HEAD^1 HEAD | scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
+          else
+            printf 'workspace=true\ndesktop=true\n' | tee -a "$GITHUB_OUTPUT"
+          fi
+
   checks:
     name: Formatting, dependencies, docs and licences
     runs-on: ubuntu-26.04
@@ -33,7 +67,8 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           packages: libasound2-dev
-          disable-tools: conda:ffmpeg
+          disable-tools: conda:ffmpeg,aqua:nextest-rs/nextest/cargo-nextest
+          rust-cache: workspace
       - run: mise run fmt
       - run: mise run deps
       - run: mise run docs
@@ -45,6 +80,8 @@ jobs:
     # job installs ALSA's development files; the hub job proves the hub
     # needs none.
     name: Workspace on ${{ matrix.name }}
+    needs: changes
+    if: needs.changes.outputs.workspace == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +111,8 @@ jobs:
     # without them, and fails instead in CI, so the job cannot pass by
     # skipping. On Windows the task runs scripts/desktop.ps1.
     name: Desktop app on ${{ matrix.name }}
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -94,6 +133,7 @@ jobs:
         with:
           packages: ${{ matrix.packages }}
           workspaces: apps/desktop
+          disable-tools: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny,aqua:nextest-rs/nextest/cargo-nextest
       - run: mise run desktop:check
 
   hub:
@@ -103,6 +143,8 @@ jobs:
     # that would link a system library (ALSA among them) fails the build.
     # `mise run lint` lints it.
     name: Hub on Linux, linking no system library
+    needs: changes
+    if: needs.changes.outputs.workspace == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
@@ -112,7 +154,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup
-      - run: cargo test --locked --package ritornel-server --no-default-features
+        with:
+          rust-cache: workspace
+      - run: cargo nextest run --locked --package ritornel-server --no-default-features
+      - run: cargo test --locked --package ritornel-server --no-default-features --doc
 
   player-arm64:
     # The headless player, as it is built for a small arm64 board: the
@@ -122,6 +167,8 @@ jobs:
     # server's tests on arm64. The last step prints the release build's
     # size and the server's memory at idle.
     name: Player on arm64 Linux
+    needs: changes
+    if: needs.changes.outputs.workspace == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -131,21 +178,65 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           packages: pkg-config libasound2-dev
+          rust-cache: crates
       - run: cargo clippy --locked --package ritornel-server --no-default-features --features audio-output --all-targets -- -D warnings
-      - run: cargo test --locked --package ritornel-engine --package ritornel-server --no-default-features --features ritornel-server/audio-output
+      - run: cargo nextest run --locked --package ritornel-engine --package ritornel-server --no-default-features --features ritornel-server/audio-output
+      - run: cargo test --locked --package ritornel-engine --package ritornel-server --no-default-features --features ritornel-server/audio-output --doc
       - run: cargo build --locked --release --package ritornel-server --no-default-features --features audio-output
       - run: cargo build --locked --release --package ritornelctl
       - run: scripts/player-footprint.sh target/release
 
   passed:
     # The one check for branch protection to require: it passes only when
-    # every job above passed, so it stays the same as jobs are added. A job
-    # added above goes in this list too.
+    # every job above passed, or was skipped because the changes job said
+    # it was not needed. A job added above goes in this list and, if it is
+    # one the changes job can skip, in the condition below.
     name: CI passed
-    if: always()
-    needs: [checks, workspace, desktop, hub, player-arm64]
+    # Not in a run a newer one cancelled: its jobs say cancelled, and
+    # failing here as well would mark the commit failed, though the newer
+    # run tests the same commit. On a stacked PR one push to the stack is
+    # two events, one for the PR's base and one for its head.
+    if: ${{ !cancelled() }}
+    needs: [changes, checks, workspace, desktop, hub, player-arm64]
     runs-on: ubuntu-slim
     timeout-minutes: 5
     steps:
-      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+      - if: >-
+          needs.changes.result != 'success' || needs.checks.result != 'success' ||
+          (needs.changes.outputs.workspace != 'false' && (needs.workspace.result != 'success' || needs.hub.result != 'success' || needs.player-arm64.result != 'success')) ||
+          (needs.changes.outputs.desktop != 'false' && needs.desktop.result != 'success') ||
+          contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
+
+  prune-caches:
+    # On main, once every job has saved its cache: deletes each cache on main
+    # that a newer one of the same kind replaced, such as the whole set saved
+    # before Cargo.lock last changed. A PR restores the newest of a kind
+    # when its own key is not found, so nothing restores the older ones, and
+    # left to the quota they would evict newer caches instead.
+    name: Prune replaced caches
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    needs: [checks, workspace, desktop, hub, player-arm64]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          declare -A kept
+          gh api --paginate "repos/$GH_REPO/actions/caches?ref=refs/heads/main&per_page=100" \
+            --jq '.actions_caches[] | "\(.created_at) \(.id) \(.key)"' |
+            sort -r |
+            while read -r created id key; do
+              # The key without the hashes at its end: the kind of cache.
+              kind=$(sed -E 's/(-p[0-9]+)?(-[0-9a-f]{8,})+$//' <<<"$key")
+              if [[ -n ${kept[$kind]:-} ]]; then
+                echo "deleting $key, saved $created: ${kept[$kind]} replaced it"
+                gh api --method DELETE "repos/$GH_REPO/actions/caches/$id" > /dev/null
+              else
+                kept[$kind]=$key
+              fi
+            done

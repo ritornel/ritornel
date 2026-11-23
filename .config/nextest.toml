@@ -1,0 +1,8 @@
+# cargo-nextest, which `mise run test` runs. CI uses the `ci` profile.
+
+[profile.ci]
+# Every test runs, whatever fails first, and the summary lists those that
+# took over ten seconds, so a run says where its time went.
+fail-fast = false
+slow-timeout = "10s"
+final-status-level = "slow"
