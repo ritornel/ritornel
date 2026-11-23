@@ -771,6 +771,12 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             active.appearance = Some(at);
         }
     }
+    // What an appearance shows is picked from its members in order, so the
+    // order is the files' own, not which pass placed them: a file that joins
+    // a row this time holds it the next.
+    for (_, members) in &mut appearance_rows {
+        members.sort_unstable();
+    }
 
     // Artists: each MusicBrainz ID is one, and a name with no ID is the
     // artist of that exact normalised name.
@@ -1244,10 +1250,11 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
     // If a canonical merged track appearance has no direct live assignment of
     // its own, still project its display from its edits and the claims of
     // appearances redirecting into it so playback and lists stay up to date.
-    for (canon, members) in redirected_appearances {
+    for (canon, mut members) in redirected_appearances {
         if emitted_appearances.contains(&canon) {
             continue;
         }
+        members.sort_unstable_by_key(|active| active.seq);
         let Some(first) = members.first() else {
             continue;
         };

@@ -3748,3 +3748,37 @@ fn fullwidth_title_notes_use_the_selected_file_policy() {
         assert_eq!(result.method, expected);
     }
 }
+
+/// Two copies of one song with different titles come to share a track
+/// appearance when the older is retagged onto the newer's album and track.
+/// The newer copy holds the appearance and the older joins it, so the two
+/// meet in another order than they will the next time, and the title the
+/// appearance shows must not depend on that.
+#[test]
+fn a_shared_appearance_shows_the_same_title_whichever_copy_held_it() {
+    let mut world = World::default();
+    let older = world.add(file("A/1.flac", 1).song("Glass Pier", "Ninefold", 200).on(
+        "Night Drives",
+        None,
+        3,
+    ));
+    let newer = world.add(
+        file("A/2.flac", 1)
+            .song("Glass Pier (Live)", "Ninefold", 200)
+            .on("Long Field", None, 3),
+    );
+    world.settle();
+    assert_eq!(world.recording(older), world.recording(newer));
+    assert_ne!(world.release(older), world.release(newer));
+    world.library.items[0].facts.album = Some("Long Field".to_owned());
+    let resolution = world.settle();
+    let shared = world.item(newer).current.unwrap().appearance;
+    assert_eq!(world.item(older).current.unwrap().appearance, shared);
+    let shown = resolution
+        .appearances
+        .iter()
+        .find(|out| out.r == Ref::Row(shared.unwrap()))
+        .unwrap();
+    assert_eq!(shown.title.as_deref(), Some("Glass Pier"));
+    world.assert_settled();
+}
