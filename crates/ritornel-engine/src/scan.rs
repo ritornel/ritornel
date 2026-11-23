@@ -15,7 +15,8 @@
 //! stored, so a job that starts again walks the root, finds those files
 //! unchanged, and reads only what is left. A step that committed just
 //! before a crash, and whose number was never saved, is found by its
-//! command ID and counted as done.
+//! command ID and counted as done, and its counters are read from what it
+//! stored as its result ([`Stepped`]).
 //!
 //! The resolver runs once, at the end, over the whole library, and only if
 //! the scan changed something. So a rescan that finds nothing changed
@@ -35,7 +36,7 @@ use crate::jobs::{Job, Progress, step_command};
 use crate::media::{UNAVAILABLE, read_file, read_folder_image};
 use crate::scan_store::{Known, RecordOp, Source};
 use crate::walk::{Seen, Walked, folder_id, folder_of, under, walk};
-use crate::{Command, Error, Fingerprint, LibraryStore, ServerStore, WriteRequest};
+use crate::{Command, Error, Fingerprint, LibraryStore, Resolved, ServerStore, WriteRequest};
 
 /// How a scan runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,16 @@ struct Checkpoint {
     /// Whether the job has recorded something the resolver has not seen.
     #[serde(default)]
     dirty: bool,
+}
+
+/// What a step of the scan's own stores as its result in the library, in
+/// the transaction that commits it: the checkpoint as it is once the step
+/// has committed. The checkpoint in `server.db` is saved after, and a crash
+/// between the two leaves this to carry on from. The resolver's step stores
+/// what it wrote ([`Resolved`]) instead.
+#[derive(Debug, Serialize, Deserialize)]
+struct Stepped {
+    checkpoint: Checkpoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,11 +201,19 @@ impl ScanRun {
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_default();
         // A step that committed and whose checkpoint was never saved is
-        // found by its command ID, and is not done again.
-        let (mut step, mut dirty) = (job.step, checkpoint.dirty);
-        while library.has_command(step_command(job.public_id, step + 1))? {
+        // found by its command ID, and is not done again. What it counted
+        // is in what it stored.
+        let (mut step, mut summary, mut dirty) = (job.step, checkpoint.summary, checkpoint.dirty);
+        while let Some(result) = library.command_result(step_command(job.public_id, step + 1))? {
             step += 1;
             dirty = true;
+            if let Ok(stepped) = serde_json::from_str::<Stepped>(&result) {
+                summary = stepped.checkpoint.summary;
+            } else if let Ok(resolved) = serde_json::from_str::<Resolved>(&result) {
+                summary.assignments += resolved.assignments;
+                summary.recordings += resolved.recordings;
+                summary.releases += resolved.releases;
+            }
         }
         Ok(Self {
             job,
@@ -203,7 +222,7 @@ impl ScanRun {
             settings,
             phase: Phase::Walk,
             step,
-            summary: checkpoint.summary,
+            summary,
             dirty,
             walked: None,
             known: HashMap::new(),
@@ -314,6 +333,17 @@ impl ScanRun {
         }
     }
 
+    /// What a step of the scan's own stores as its result: the checkpoint
+    /// once it has committed, with `summary` as its counters.
+    fn stepped(&self, summary: ScanSummary) -> Result<String, Error> {
+        Ok(serde_json::to_string(&Stepped {
+            checkpoint: Checkpoint {
+                summary,
+                dirty: true,
+            },
+        })?)
+    }
+
     /// What follows every library commit of the job: the fail point.
     fn committed(&mut self) -> Result<(), Error> {
         self.dirty = true;
@@ -332,12 +362,15 @@ impl ScanRun {
             Phase::Missing => {
                 // What the walk did not find and no file moved from. The
                 // root was reachable, or the walk would have failed.
+                // A job that started again adds to what it marked before,
+                // which its walk now finds missing already.
                 let gone: Vec<i64> = std::mem::take(&mut self.gone);
-                self.summary.missing = gone.len() as u64;
+                self.summary.missing += gone.len() as u64;
                 self.phase = Phase::Replaced;
                 if !gone.is_empty() {
                     let request = self.next_step();
-                    library.mark_missing(request, gone)?;
+                    let receipt = self.stepped(self.summary)?;
+                    library.mark_missing(request, gone, receipt)?;
                     self.committed()?;
                 }
             }
@@ -535,7 +568,8 @@ impl ScanRun {
         self.summary.bytes_read = counted.bytes_read;
         if !ops.is_empty() {
             let request = self.next_step();
-            library.record(request, self.source.row, ops)?;
+            let receipt = self.stepped(counted)?;
+            library.record(request, self.source.row, ops, receipt)?;
             self.summary = counted;
             self.committed()?;
         }
@@ -614,7 +648,8 @@ impl ScanRun {
             }
         }
         let request = self.next_step();
-        library.record(request, self.source.row, ops)?;
+        let receipt = self.stepped(self.summary)?;
+        library.record(request, self.source.row, ops, receipt)?;
         self.committed()
     }
 
