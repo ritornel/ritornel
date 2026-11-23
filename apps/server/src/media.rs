@@ -278,10 +278,12 @@ mod tests {
         let (done, order) = mpsc::channel();
         // Holds the one thread until every request is queued.
         let (release, held) = mpsc::channel::<()>();
+        let (took, taken) = mpsc::channel();
         let _busy = pool.submit(move || {
+            took.send(()).unwrap();
             let _ = held.recv();
         });
-        std::thread::sleep(Duration::from_millis(20));
+        taken.recv_timeout(Duration::from_secs(60)).unwrap();
         let mut guards = Vec::new();
         for name in ["oldest", "middle", "left", "newest"] {
             let done = done.clone();
@@ -291,9 +293,10 @@ mod tests {
         guards.retain(|(name, _)| *name != "left");
         release.send(()).unwrap();
         let made: Vec<_> = (0..3)
-            .map(|_| order.recv_timeout(Duration::from_secs(10)).unwrap())
+            .map(|_| order.recv_timeout(Duration::from_secs(60)).unwrap())
             .collect();
         assert_eq!(made, ["newest", "middle", "oldest"]);
+        // The one whose client left was not made: by now it would have been.
         assert!(order.recv_timeout(Duration::from_millis(50)).is_err());
         pool.stop();
     }
@@ -304,15 +307,17 @@ mod tests {
         // Holds the one thread until both are queued. The newest is made
         // first: the one that panics.
         let (release, held) = mpsc::channel::<()>();
+        let (took, taken) = mpsc::channel();
         let _busy = pool.submit(move || {
+            took.send(()).unwrap();
             let _ = held.recv();
         });
-        std::thread::sleep(Duration::from_millis(20));
+        taken.recv_timeout(Duration::from_secs(60)).unwrap();
         let (done, made) = mpsc::channel();
         let _second = pool.submit(move || done.send(()).unwrap());
         let _first = pool.submit(|| panic!("a cover that cannot be made"));
         release.send(()).unwrap();
-        assert_eq!(made.recv_timeout(Duration::from_secs(10)), Ok(()));
+        assert_eq!(made.recv_timeout(Duration::from_secs(60)), Ok(()));
         pool.stop();
     }
 }

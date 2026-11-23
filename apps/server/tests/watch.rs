@@ -131,10 +131,20 @@ async fn a_file_copied_into_a_watched_root_is_scanned_in_on_its_own() {
         assert_eq!(rescan.scan.unwrap().new, 1);
         let stats = client.call::<LibraryStats>(&NoParams {}).await.unwrap();
         assert_eq!(stats.files, 2);
+        // A copy the system reports in parts more than the quiet period
+        // apart (Windows does, under load) is rescanned again, so the last
+        // automatic rescan is the one waited for or a later one. A job's
+        // id begins with the millisecond it was made in, and a second
+        // rescan is made only once the first has ended.
         let shown = client.status().await.unwrap().watch.unwrap();
         let last = shown.folders[0].last_auto.as_ref().unwrap();
         assert_eq!(last.trigger, AutoTrigger::Change);
-        assert_eq!(last.job_id, Some(rescan.job_id));
+        assert!(
+            last.job_id >= Some(rescan.job_id),
+            "{:?} is older than {:?}",
+            last.job_id,
+            rescan.job_id
+        );
 
         // Turned off from Settings, the hub says so; turned on, it watches.
         let set = |on: bool| WatchingParams {

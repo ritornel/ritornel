@@ -38,6 +38,12 @@ pub const STOP_GRACE: Duration = Duration::from_secs(5);
 /// nothing by the time anyone reads it.
 pub const TICKET_LIFE: Duration = Duration::from_secs(10);
 
+/// The longest a satellite waits for its hub to answer a call. The longest
+/// call a client makes through a satellite, such as a history page, takes
+/// a fraction of this on a hub, and a client that asks while the hub is
+/// away hears so in seconds, not after its own wait runs out.
+pub const HUB_CALL_WAIT: Duration = Duration::from_secs(8);
+
 /// The bounds one server runs with. [`Default`] is what a server uses. A
 /// test makes them small, so that it reaches one without opening a hundred
 /// connections or waiting ten seconds.
@@ -53,6 +59,8 @@ pub struct Bounds {
     pub stop_grace: Duration,
     /// See [`TICKET_LIFE`].
     pub ticket_life: Duration,
+    /// See [`HUB_CALL_WAIT`].
+    pub hub_call_wait: Duration,
 }
 
 impl Default for Bounds {
@@ -63,6 +71,7 @@ impl Default for Bounds {
             header_wait: HEADER_WAIT,
             stop_grace: STOP_GRACE,
             ticket_life: TICKET_LIFE,
+            hub_call_wait: HUB_CALL_WAIT,
         }
     }
 }

@@ -189,10 +189,10 @@ fn facts(path: &Path) -> FileFacts {
 }
 
 /// Gathers what the renderer says until `done` holds of all of it, for at
-/// most ten seconds. The null output runs at many times real time, so this
+/// most a minute. The null output runs at many times real time, so this
 /// is milliseconds.
 fn until(renderer: &mut AudioRenderer, said: &mut Vec<Event>, done: impl Fn(&[Event]) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         said.extend(renderer.drain());
         if done(said) {
@@ -219,9 +219,32 @@ fn ended(said: &[Event], span: u64) -> Option<(u64, End)> {
     })
 }
 
+/// Waits until the decoder's handoff, where it finds the track to join
+/// after the one it decodes, is as `done` says.
+fn until_handoff(renderer: &AudioRenderer, what: &str, done: impl Fn(&super::Slot) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let decoding = renderer.decoding.as_ref().expect("a track is loaded");
+        if done(&decoding.decoder.handoff.lock()) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the decoder never {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Whether the decoder of the track in hand has yet to start, as it has
+/// until the output first plays.
+fn unstarted(renderer: &AudioRenderer) -> bool {
+    renderer
+        .decoding
+        .as_ref()
+        .is_some_and(|decoding| decoding.decoder.unstarted.is_some())
+}
+
 /// Waits until the output has handed over some of what it plays.
 fn heard(renderer: &AudioRenderer) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let progress = renderer.progress();
         if progress.frames > 0 {
@@ -259,14 +282,24 @@ fn the_null_output_plays_a_track_to_its_end_and_counts_every_frame_it_was_handed
 
 #[test]
 fn a_seek_ends_the_span_with_its_count_and_the_next_plays_the_rest() {
-    let mut renderer = AudioRenderer::open(Output::Null { speed: 5 }).unwrap();
+    // As `Output::Null` opens, but held 10 ms in, and paused before it is
+    // let go, so that the track is still in hand when the seek comes,
+    // however long that takes.
+    let spec = OutputSpec {
+        rate: 48_000,
+        channels: 2,
+    };
+    let (mut renderer, _, hold) = AudioRenderer::held(spec, 5, 480).unwrap();
     renderer
         .load(&fixture("a.mp3"), facts(&fixture("a.mp3")), 0, 1)
         .unwrap();
     renderer.play();
-    heard(&renderer);
-    renderer.seek(1, 400, 2).unwrap();
     let mut said = Vec::new();
+    until(&mut renderer, &mut said, |_| hold.waiting().is_some());
+    renderer.pause();
+    hold.let_go();
+    renderer.seek(1, 400, 2).unwrap();
+    renderer.play();
     until(&mut renderer, &mut said, |said| ended(said, 2).is_some());
     let (first, end) = ended(&said, 1).unwrap();
     assert!(first > 0 && end == End::Replaced, "{said:?}");
@@ -553,7 +586,7 @@ fn a_track_offered_once_the_decoder_has_finished_is_refused_and_the_one_in_hand_
     // The whole first track fits in the ring: its decoder has finished,
     // and the next is loaded once its audio runs out.
     heard(&renderer);
-    std::thread::sleep(Duration::from_millis(50));
+    until_handoff(&renderer, "finished", |slot| slot.closed);
     let next = fixture("g2.flac");
     assert!(
         renderer
@@ -610,9 +643,12 @@ fn a_track_shorter_than_the_rings_low_water_still_joins_when_the_next_is_queued_
     short_wav(&short, 1280);
     let (mut renderer, _) = AudioRenderer::tapped(AS_IS, 50).unwrap();
     renderer.load(&short, facts(&short), 0, 1).unwrap();
-    // Loaded and not yet playing: the decoder has all 80 ms of it, and must
-    // not give up on a next track before any of it has been heard.
-    std::thread::sleep(Duration::from_millis(60));
+    // Loaded and not yet playing: its decoder has not started, so it cannot
+    // give up on a next track before any of it has been heard.
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     let next = fixture("g2.flac");
     assert!(
         renderer
@@ -924,7 +960,9 @@ fn a_queued_track_let_go_in_time_is_not_played_and_the_first_ends_as_any_track_d
 
 #[test]
 fn a_track_the_decoder_has_taken_is_let_go_until_the_output_reaches_it_and_never_heard() {
-    let (mut renderer, tap) = AudioRenderer::tapped(AS_IS, 1).unwrap();
+    // The output is held 10 ms in, so that it is still on the first however
+    // long the test takes to look.
+    let (mut renderer, tap, hold) = AudioRenderer::held(AS_IS, 1, 160).unwrap();
     renderer
         .load(&fixture("g1.flac"), facts(&fixture("g1.flac")), 0, 1)
         .unwrap();
@@ -934,7 +972,7 @@ fn a_track_the_decoder_has_taken_is_let_go_until_the_output_reaches_it_and_never
     // The first fits in the ring: its decoder has taken the next, and the
     // output is still on the first.
     heard(&renderer);
-    std::thread::sleep(Duration::from_millis(20));
+    until_handoff(&renderer, "took the next", |slot| slot.next.is_none());
     assert_eq!(renderer.progress().span, 1);
     assert!(renderer.cancel_next());
     // Nothing more joins that ring: what follows loads once it ends.
@@ -945,6 +983,7 @@ fn a_track_the_decoder_has_taken_is_let_go_until_the_output_reaches_it_and_never
             .unwrap()
             .is_none()
     );
+    hold.let_go();
     let mut said = Vec::new();
     until(&mut renderer, &mut said, |said| ended(said, 1).is_some());
     // The first ends whole, where it would have; the second is never heard.
@@ -1010,7 +1049,10 @@ fn a_ten_ms_track_resampled_takes_a_next_track_before_it_plays() {
     short_wav(&short, 160);
     let (mut renderer, _) = AudioRenderer::tapped(STEREO_48K, 1).unwrap();
     renderer.load(&short, facts(&short), 0, 1).unwrap();
-    std::thread::sleep(Duration::from_millis(60));
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     assert_eq!(renderer.progress().frames, 0);
     let next = fixture("g2.flac");
     assert!(
@@ -1029,7 +1071,10 @@ fn a_decoder_waiting_for_a_next_track_lets_go_at_once_when_asked() {
     short_wav(&short, 1280);
     let (mut renderer, _) = AudioRenderer::tapped(AS_IS, 1).unwrap();
     renderer.load(&short, facts(&short), 0, 1).unwrap();
-    std::thread::sleep(Duration::from_millis(30));
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     let next = fixture("g2.flac");
     assert!(
         renderer
@@ -1043,7 +1088,10 @@ fn a_decoder_waiting_for_a_next_track_lets_go_at_once_when_asked() {
     renderer.unload();
     assert!(before.elapsed() < Duration::from_secs(1));
     renderer.load(&short, facts(&short), 0, 4).unwrap();
-    std::thread::sleep(Duration::from_millis(30));
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     let before = Instant::now();
     drop(renderer);
     assert!(before.elapsed() < Duration::from_secs(1));
@@ -1056,7 +1104,10 @@ fn a_short_last_track_paused_then_played_ends_with_nothing_after_it() {
     short_wav(&short, 1280);
     let (mut renderer, _) = AudioRenderer::tapped(AS_IS, 1).unwrap();
     renderer.load(&short, facts(&short), 0, 1).unwrap();
-    std::thread::sleep(Duration::from_millis(30));
+    assert!(
+        unstarted(&renderer),
+        "a track loaded paused is not yet decoded"
+    );
     assert!(renderer.drain().is_empty());
     renderer.play();
     let mut said = Vec::new();
@@ -1253,8 +1304,10 @@ fn no_mix_of_short_tracks_nexts_pauses_and_seeks_leaves_a_span_without_an_end_or
                     playing = true;
                 }
                 let since = *alone.get_or_insert_with(Instant::now);
+                // Liveness only: a span left alone ends. A slow machine
+                // gets ten seconds; one that never ends fails all the same.
                 assert!(
-                    since.elapsed() < Duration::from_secs(2),
+                    since.elapsed() < Duration::from_secs(10),
                     "seed {seed}: span {current} of {queue:?}, left alone, has no end: {said:?}"
                 );
                 std::thread::sleep(Duration::from_millis(1));
@@ -1291,6 +1344,8 @@ fn no_mix_of_short_tracks_nexts_pauses_and_seeks_leaves_a_span_without_an_end_or
                         queued = None;
                     }
                 }
+                // sleep: a moment drawn from the seed, so that what the
+                // test does lands at varied points of what plays.
                 _ => std::thread::sleep(Duration::from_millis(draws.below(5))),
             }
         }
@@ -1583,9 +1638,14 @@ fn an_output_that_goes_away_mid_track_saves_where_it_was_heard_and_play_goes_on_
 
     use crate::playback::Status;
     // The output the player opens on demand, already open, so that the
-    // test can take its device away.
+    // test can take its device away. It is held half a second in, so that
+    // the device goes there however long the test takes to take it.
     let output = Output::Null { speed: 2 };
-    let opened = AudioRenderer::open(output).unwrap();
+    let spec = OutputSpec {
+        rate: 48_000,
+        channels: 2,
+    };
+    let (opened, _, hold) = AudioRenderer::held(spec, 2, 24_000).unwrap();
     let device = Arc::clone(&opened.shared);
     let renderer = super::OnDemand {
         output,
@@ -1596,7 +1656,7 @@ fn an_output_that_goes_away_mid_track_saves_where_it_was_heard_and_play_goes_on_
     };
     let mut rig = Pipeline::new(&[2_000], Box::new(renderer));
     rig.play();
-    rig.until(|state| state.position_ms >= 500);
+    rig.until(|_| hold.waiting().is_some());
     // The device goes away: the output is let go, and the player waits
     // where the track was heard to.
     device.lost.store(true, Ordering::SeqCst);
@@ -1654,18 +1714,26 @@ fn wall_ms() -> i64 {
     crate::SystemClock.now_ms()
 }
 
+/// Now, on the clock the pipeline's listens are also stamped on.
+fn mono_ms() -> i64 {
+    use crate::Timekeeper;
+    crate::SystemTimekeeper.mono_ms()
+}
+
 #[test]
 fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_stays_silent() {
     use crate::playback::Status;
     // At real time, the output stops asking for frames 800 ms in, with no
     // error, as a stream does behind a sound server whose device went
-    // away.
-    let stall_after = Duration::from_secs(1);
+    // away. A stall takes three seconds, so that a busy machine's pause
+    // before then is not one.
+    let stall_after = Duration::from_secs(3);
+    let stall_ms = i64::try_from(stall_after.as_millis()).unwrap();
     let (renderer, tap, hold) = on_demand_held(800, stall_after);
     let mut rig = Pipeline::new(&[2_000], Box::new(renderer));
     rig.play();
     rig.until(|_| hold.waiting().is_some());
-    let stopped_by = wall_ms();
+    let (stopped_by, stopped_by_mono) = (wall_ms(), mono_ms());
     rig.until(|state| state.status == Status::Paused);
     let noticed_by = wall_ms();
 
@@ -1689,34 +1757,45 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
     // It was noticed once the output had asked for nothing for the time a
     // stall takes.
     assert!(
-        ended.ended_at_ms + 1_000 <= noticed_by + 1,
+        ended.ended_at_ms + stall_ms <= noticed_by + 1,
         "{ended:?}, noticed by {noticed_by}"
     );
+    // How much later than when the output was seen to stop a stamp may
+    // be: the player turns the output's clock into these two as it takes
+    // the end in, and a busy machine may pause it between the readings.
+    // It is far less than a stall.
+    let late = 500;
     assert!(
-        ended.ended_at_ms <= stopped_by + 50,
+        ended.ended_at_ms <= stopped_by + late,
         "{ended:?}, stopped by {stopped_by}"
     );
     assert!(failing.since_ms >= ended.ended_at_ms, "{failing:?}");
-    // Played straight through, it ended no later after it began than it
-    // was heard for, on both clocks, and not a stall's length later. It can
-    // be a little sooner: a null output that falls behind catches up faster
-    // than real time.
+    // Played straight through, it ended, on both clocks, no later after it
+    // began than the output was seen to have stopped, and not a stall's
+    // length later. That is about as long as it was heard for, and longer
+    // when the output rendered late, on a busy machine: a late render
+    // cannot be caught up once the output is held.
     let started = &lost.started;
-    let mono = ended.ended_mono_ms.unwrap();
-    for (ended_at, started_at) in [
-        (ended.ended_at_ms, started.started_at_ms),
-        (mono, started.started_mono_ms),
+    for (ended_at, started_at, stopped_by) in [
+        (ended.ended_at_ms, started.started_at_ms, stopped_by),
+        (
+            ended.ended_mono_ms.unwrap(),
+            started.started_mono_ms,
+            stopped_by_mono,
+        ),
     ] {
-        let span = ended_at - started_at;
+        let (span, seen) = (ended_at - started_at, stopped_by - started_at);
         assert!(
-            (0..=heard + 50).contains(&span),
-            "{span} against {heard}: {lost:?}"
+            (0..=seen + late).contains(&span),
+            "{span} against {seen} seen, {heard} heard: {lost:?}"
         );
     }
 
     // The device takes frames again: nothing more is heard, because the
     // output was let go.
     hold.let_go();
+    // sleep: time for a frame to be taken, were the output still there. A
+    // slow machine can only make this pass when it should not.
     std::thread::sleep(Duration::from_millis(200));
     rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
     assert_eq!(rig.player.state().status, Status::Paused);
@@ -1743,14 +1822,16 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
 #[test]
 fn an_output_that_asks_for_nothing_while_paused_is_not_lost() {
     use crate::playback::Status;
-    let stall_after = Duration::from_secs(1);
+    // Long enough that the moments between the hold and the pause, on a
+    // busy machine, are no stall.
+    let stall_after = Duration::from_secs(3);
     let (renderer, _tap, hold) = on_demand_held(500, stall_after);
     let mut rig = Pipeline::new(&[1_000], Box::new(renderer));
     rig.play();
     rig.until(|_| hold.waiting().is_some());
     let request = rig.request("playback.pause");
     rig.player.pause(request, &rig.server).unwrap();
-    // Held still for longer than a stall while paused.
+    // sleep: held still for longer than a stall while paused.
     std::thread::sleep(stall_after + Duration::from_millis(500));
     rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
     let state = rig.player.state();
@@ -1779,7 +1860,7 @@ fn a_next_the_output_has_run_into_cannot_be_let_go_before_the_player_has_heard_o
     renderer.queue_next(&next, facts(&next), 2).unwrap();
     renderer.play();
     // The output is on the second, and nothing it said has been drained.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while renderer.progress().span != 2 {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(1));

@@ -212,7 +212,11 @@ impl Elastic {
 
     /// Scrolls `top`, between 0 and `max`, as WebKit scrolls a page.
     pub(crate) fn scroll(&mut self, top: &mut f32, wheel: Wheel, max: f32) {
-        let now = Instant::now();
+        self.scroll_at(top, wheel, max, Instant::now());
+    }
+
+    /// As [`scroll`](Self::scroll), with the wheel's event come at `now`.
+    fn scroll_at(&mut self, top: &mut f32, wheel: Wheel, max: f32, now: Instant) {
         // A touch surface sends a gesture or momentum phase; a wheel, however
         // fine its steps, sends neither, and never stretches the page.
         let touch = wheel.precise && (wheel.phase != Phase::None || wheel.momentum != Phase::None);
@@ -382,6 +386,14 @@ mod tests {
         }
     }
 
+    /// Scrolls as if `wheel` came when its time says, counted from `t0`,
+    /// so that the spring's clock and the wheel's agree however long the
+    /// test takes.
+    fn scroll(elastic: &mut Elastic, top: &mut f32, wheel: Wheel, t0: Instant) {
+        let now = t0 + Duration::from_secs_f64(wheel.time);
+        elastic.scroll_at(top, wheel, 1000., now);
+    }
+
     #[test]
     fn the_spring_is_appkits() {
         // Read from `_NSElasticDeltaForTimeDelta` on macOS 26.
@@ -430,17 +442,28 @@ mod tests {
 
     #[test]
     fn it_springs_back_when_the_fingers_lift() {
+        let t0 = Instant::now();
         let mut elastic = Elastic::default();
         let mut top = 10.;
-        elastic.scroll(&mut top, wheel(0., Phase::Began, Phase::None, 0.), 1000.);
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, 0.),
+            t0,
+        );
         for at in 1..40 {
             let event = wheel(-20., Phase::Changed, Phase::None, f64::from(at) * 0.01);
-            elastic.scroll(&mut top, event, 1000.);
+            scroll(&mut elastic, &mut top, event, t0);
         }
         let pulled = elastic.shown();
         assert!(pulled < -30., "{pulled}");
-        elastic.scroll(&mut top, wheel(0., Phase::Ended, Phase::None, 0.4), 1000.);
-        let start = Instant::now();
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, 0.4),
+            t0,
+        );
+        let start = t0 + Duration::from_secs_f64(0.4);
         let mut now = start;
         while elastic.step(now) {
             now += Duration::from_millis(8);
@@ -452,33 +475,52 @@ mod tests {
 
     #[test]
     fn a_flick_that_reaches_the_end_bounces_by_its_speed() {
+        let t0 = Instant::now();
         let mut elastic = Elastic::default();
         let mut top = 900.;
-        elastic.scroll(&mut top, wheel(0., Phase::Began, Phase::None, 0.), 1000.);
-        elastic.scroll(
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, 0.),
+            t0,
+        );
+        scroll(
+            &mut elastic,
             &mut top,
             wheel(10., Phase::Changed, Phase::None, 0.01),
-            1000.,
+            t0,
         );
-        elastic.scroll(&mut top, wheel(0., Phase::Ended, Phase::None, 0.02), 1000.);
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, 0.02),
+            t0,
+        );
         let mut time = 0.03;
-        elastic.scroll(&mut top, wheel(30., Phase::None, Phase::Began, time), 1000.);
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Began, time),
+            t0,
+        );
         while top < 1000. {
             time += 0.01;
-            elastic.scroll(
+            scroll(
+                &mut elastic,
                 &mut top,
                 wheel(30., Phase::None, Phase::Changed, time),
-                1000.,
+                t0,
             );
         }
         time += 0.01;
-        elastic.scroll(
+        scroll(
+            &mut elastic,
             &mut top,
             wheel(30., Phase::None, Phase::Changed, time),
-            1000.,
+            t0,
         );
         // 3,000 points a second: a bounce of about 27 points at 80 ms.
-        let start = Instant::now();
+        let start = t0 + Duration::from_secs_f64(time);
         let mut most: f32 = 0.;
         let mut now = start;
         while elastic.step(now) {
@@ -487,10 +529,11 @@ mod tests {
         }
         assert!((24. ..=30.).contains(&most), "{most}");
         // The rest of the flick is let go.
-        elastic.scroll(
+        scroll(
+            &mut elastic,
             &mut top,
             wheel(30., Phase::None, Phase::Changed, time + 0.01),
-            1000.,
+            t0,
         );
         assert_eq!(elastic.shown(), 0.);
     }

@@ -776,10 +776,11 @@ mod tests {
     /// so that neither a play nor the server's stop waits on it for ever.
     #[test]
     fn a_bus_that_never_answers_is_no_bus() {
-        let dir = std::env::temp_dir().join(format!("ritornel-mpris-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("bus");
-        let _ = std::fs::remove_file(&socket);
+        let dir = tempfile::Builder::new()
+            .prefix("ritornel-mpris-")
+            .tempdir()
+            .unwrap();
+        let socket = dir.path().join("bus");
         // Listening, it takes each connection into its backlog, and never
         // answers.
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -798,9 +799,10 @@ mod tests {
         assert!(opened.is_none());
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(200), "{waited:?}");
-        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        // Given up on, not waited on for ever: a generous bound, far below
+        // anything that would look like a hang.
+        assert!(waited < Duration::from_secs(30), "{waited:?}");
         drop(listener);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A bus that lets the player in and then stops reading is left at
@@ -863,7 +865,8 @@ mod tests {
         });
         let (gone, after) = left.recv_timeout(Duration::from_secs(30)).unwrap();
         assert!(gone, "a bus that stopped reading was not left");
-        assert!(after < Duration::from_millis(100), "{after:?}");
+        // A change still sent to the bus would wait the whole of it.
+        assert!(after < UPDATE_WITHIN, "{after:?}");
     }
 
     #[test]
