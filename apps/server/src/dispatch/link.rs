@@ -164,6 +164,63 @@ fn untrusted_name(name: &str) -> String {
 }
 
 impl Core {
+    /// A satellite said hello as `name`. If it has been renamed since it
+    /// joined, as a server named after its computer may be, the hub's
+    /// records of it take the new name: its link session, which the hub
+    /// lists, and the library's registry of servers.
+    ///
+    /// Each record is looked at on its own, so a later hello puts right one
+    /// that could not be written before, and the name already kept is only
+    /// read. Two hellos at once are taken one after the other.
+    pub(super) fn satellite_named(&self, stores: &Stores, peer: Id, name: &str) {
+        let name = untrusted_name(name);
+        // What the hub keeps already is only read, and waits on nothing.
+        let labelled = stores.server.link_sessions().is_ok_and(|sessions| {
+            sessions
+                .iter()
+                .any(|session| session.peer == peer && session.label == name)
+        });
+        let registered = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(
+                |library| matches!(library.server_name(peer), Ok(Some(known)) if known == name),
+            );
+        if labelled && registered {
+            return;
+        }
+        let _one_at_a_time = lock(&self.naming);
+        let relabelled = stores
+            .server
+            .relabel_link_session(peer, &name)
+            .unwrap_or_else(|error| {
+                warn!(%error, satellite = %peer, "a satellite's new name could not be kept");
+                false
+            });
+        let library = stores
+            .library
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let registered = library.as_ref().is_some_and(|library| {
+            let known = library.server_name(peer);
+            if matches!(&known, Ok(Some(known)) if *known == name) {
+                return false;
+            }
+            match known.and_then(|_| library.register_server(peer, &name)) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(%error, satellite = %peer, "a satellite's new name could not be kept in the library");
+                    false
+                }
+            }
+        });
+        if relabelled || registered {
+            info!(satellite = %peer, %name, "a satellite has a new name");
+        }
+    }
+
     /// `link.invite`: a one-time link for a satellite to join with.
     pub(super) fn link_invite(
         &self,
@@ -336,7 +393,7 @@ impl Core {
             )
         })?;
         let name = self.name();
-        let (address, descriptor) = runtime
+        let (_, address, descriptor) = runtime
             .block_on(async {
                 let (candidates, mut tried) = link::candidates(&invite.routes).await;
                 let reached = link::first_answer(candidates, |address| {

@@ -1,6 +1,6 @@
 [package]
 name = "ritornel-windows"
-description = "What Ritornel asks of Windows that the standard library cannot: a lock on one byte, owner-only access, a file's identity, a clock that counts through sleep, and a hidden window."
+description = "What Ritornel asks of Windows that the standard library cannot: a lock on one byte, owner-only access, a file's identity, a clock that counts through sleep, the machine's name as it was set, and a hidden window."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,6 +19,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_UI_WindowsAndMessaging",

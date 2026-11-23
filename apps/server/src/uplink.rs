@@ -43,8 +43,10 @@ struct Reach {
     answers: Option<bool>,
     /// Since when it has, or has not.
     since_ms: Option<i64>,
-    /// The route the last connection was made on.
+    /// The address the last connection was made at.
     route: Option<String>,
+    /// The route, as the link names it, that gave that address.
+    via: Option<String>,
     /// Why the last try failed, while the hub does not answer.
     problem: Option<String>,
     /// When a connection was last tried and failed.
@@ -144,7 +146,10 @@ impl Uplink {
             linked_at_ms: self.link.linked_at_ms,
             answers: reach.answers,
             since_ms: reach.since_ms,
-            route: reach.route,
+            route: reach.route.map(|address| match reach.via {
+                Some(via) if via != address => format!("{via} ({address})"),
+                _ => address,
+            }),
             problem: reach.problem,
         }
     }
@@ -174,7 +179,7 @@ impl Uplink {
 
     /// The hub answered: on a connection just opened to `route`, or on one
     /// already open.
-    fn answered(&self, route: Option<SocketAddr>) {
+    fn answered(&self, route: Option<(String, SocketAddr)>) {
         let mut reach = lock(&self.reach);
         if reach.answers != Some(true) {
             info!(hub = %self.link.hub, "the hub answers");
@@ -182,8 +187,9 @@ impl Uplink {
             self.changes.send_modify(|count| *count += 1);
         }
         reach.answers = Some(true);
-        if let Some(route) = route {
-            reach.route = Some(route.to_string());
+        if let Some((via, address)) = route {
+            reach.route = Some(address.to_string());
+            reach.via = Some(via);
         }
         reach.problem = None;
         reach.failed_at_ms = None;
@@ -242,8 +248,8 @@ impl Uplink {
         // next tried soon when one does not answer (`link::first_answer`).
         let (candidates, mut tried) = link::candidates(&self.link.routes).await;
         match link::first_answer(candidates, |address| self.open(address)).await {
-            Ok((address, client)) => {
-                self.answered(Some(address));
+            Ok((via, address, client)) => {
+                self.answered(Some((via, address)));
                 return Ok(client);
             }
             Err(failed) => tried.extend(failed),

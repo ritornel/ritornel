@@ -14,6 +14,37 @@ pub(crate) fn start_without_console(command: &mut Command) {
     std::os::windows::process::CommandExt::creation_flags(command, CREATE_NO_WINDOW);
 }
 
+/// Asks the process `pid` to stop, as the system asks a program to end:
+/// `taskkill` without `/F` closes its windows, and the server's hidden one
+/// stops it cleanly. Only a process the user may end can be asked.
+pub(crate) fn ask_to_stop(pid: u32) -> std::io::Result<()> {
+    if pid == 0 {
+        return Err(std::io::Error::other("0 is not a process"));
+    }
+    // The system's own, not one a folder on the path may hold.
+    let program = std::env::var_os("SystemRoot").map_or_else(
+        || std::path::PathBuf::from("taskkill"),
+        |root| {
+            std::path::Path::new(&root)
+                .join("System32")
+                .join("taskkill.exe")
+        },
+    );
+    let mut command = Command::new(&program);
+    start_without_console(&mut command);
+    let asked = command
+        .args(["/PID", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| std::io::Error::new(error.kind(), format!("taskkill: {error}")))?;
+    if asked.status.success() {
+        Ok(())
+    } else {
+        let said = String::from_utf8_lossy(&asked.stderr).trim().to_owned();
+        Err(std::io::Error::other(format!("taskkill: {said}")))
+    }
+}
+
 /// Tries to hold a lock file as a running server does: the one byte past
 /// its end that a server holds, which leaves the pid in it readable
 /// (`local::WINDOWS_LOCK_BYTE`).

@@ -77,6 +77,9 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         watch: crate::WatchRun::on(),
         backup_dir: settings.backup_dir.clone(),
         keep_awake: true,
+        legacy_name: env("RITORNEL_TEST_LEGACY_COMPUTER_NAME")
+            .and_then(|name| name.to_str().map(str::to_owned))
+            .or_else(crate::platform::legacy_computer_name),
         // `RITORNEL_TEST_COMPUTER_NAME`, for the tests alone, stands in
         // for the machine's name, so that a test need not know it.
         computer_name: env("RITORNEL_TEST_COMPUTER_NAME")

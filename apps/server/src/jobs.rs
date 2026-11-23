@@ -78,6 +78,10 @@ pub struct Run {
     /// The most a satellite's cache of masters pulled from its hub holds,
     /// in bytes, by the `cache_size` setting. With none it is 2 GiB.
     pub cache_bytes: Option<u64>,
+    /// The name an older build took from the computer, where that differs
+    /// from `computer_name` (`COMPUTERNAME` on Windows): a server still
+    /// carrying it takes `computer_name`.
+    pub legacy_name: Option<String>,
     /// Whether this run asks the system to keep the machine awake when its
     /// wake setting says to. `serve` does. A server in a test does not, so
     /// that a test neither changes the machine's power settings nor starts

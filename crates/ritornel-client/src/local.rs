@@ -17,8 +17,9 @@
 //! ID is public, so anything can answer there as that server. It cannot
 //! hold the lock: only the data directory's owner can open the lock file.
 //!
-//! Starting a server when none answers, and stopping one, belong to the
-//! desktop's launcher, in [`crate::launch`].
+//! Starting a server when none answers, and stopping one it started,
+//! belong to the desktop's launcher, in [`crate::launch`]. Asking any
+//! server on a directory to stop is [`stop`].
 
 use std::fs::{File, TryLockError};
 use std::io::{ErrorKind, Read};
@@ -263,6 +264,56 @@ pub async fn find(data_dir: &Path) -> Result<LocalServer, Error> {
         named,
         credential: Credential::new(credential),
     })
+}
+
+/// Asks the server running on `data_dir` to stop, as the system does at
+/// shutdown, and waits up to `wait` for it to have stopped: for it to let
+/// the lock go, which it does once its databases are closed. A server
+/// stops cleanly when asked: it pauses the player, keeps where it was and
+/// lets its databases go. Only the server's own user, or an administrator,
+/// can ask it: the system lets no one else signal it. Any contract version
+/// is asked alike, so an old server can be stopped before it is replaced.
+/// Says whether it stopped within `wait`; one that has not is still
+/// stopping, and is not killed.
+pub fn stop(data_dir: &Path, wait: Duration) -> Result<bool, Error> {
+    let named = alive(data_dir)?;
+    let lock = data_dir.join(local::SERVER_LOCK);
+    // No process is named 0, which would ask the whole process group.
+    if named.pid == 0 {
+        return Err(Error::ServerJson {
+            path: data_dir.join(local::SERVER_JSON),
+        });
+    }
+    // Gone by itself, or by another asking, between the look and the ask:
+    // stopped all the same.
+    let gone = || -> Result<bool, Error> {
+        Ok(match probe(data_dir)? {
+            Lock::Free => true,
+            Lock::Held { pid } => pid.is_some_and(|pid| pid != named.pid),
+        })
+    };
+    if let Err(source) = crate::platform::ask_to_stop(named.pid) {
+        if gone()? {
+            return Ok(true);
+        }
+        return Err(Error::File {
+            doing: "stop the server holding",
+            path: lock,
+            source,
+        });
+    }
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        // The lock let go, or taken already by a server started in its
+        // place, such as by a desktop app that is open.
+        if gone()? {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(test)]

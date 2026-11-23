@@ -24,6 +24,15 @@ use crate::{Bounds, Error, Listen, Run, library, memory};
 /// do that with.
 pub(crate) const DEFAULT_NAME: &str = "Ritornel server";
 
+/// Whether a server called `current` takes its computer's name, `computer`:
+/// when it still has the first-start name, or the name an older build took
+/// from the computer, `legacy`, such as `STUDIO-PC` from `COMPUTERNAME` for
+/// a Windows machine set up as `Studio-PC`. Any other name was chosen, and
+/// is kept; one chosen to equal the old name exactly cannot be told apart.
+fn takes_computer_name(current: &str, computer: &str, legacy: Option<&str>) -> bool {
+    current == DEFAULT_NAME || (legacy == Some(current) && current != computer)
+}
+
 /// Ends a server's transports when it is dropped. After a stop there are
 /// none, and this does nothing.
 #[derive(Debug)]
@@ -140,9 +149,10 @@ impl Server {
         }
         // A name given in the settings wins over the stored one at every
         // start, so a machine nobody sits at is called what its settings
-        // say. Without one, a server still called by the default name is
-        // named after its computer, so that a hub's satellites and a
-        // satellite's hub say which machine each is, and a name someone
+        // say. Without one, a server is named after its computer while it
+        // still has the default name or the name an older build took from
+        // the computer (`takes_computer_name`), so that a hub's satellites
+        // and a satellite's hub say which machine each is; a name someone
         // chose is kept.
         if let Some(name) = run.name.as_deref() {
             if name != identity.name
@@ -151,9 +161,9 @@ impl Server {
                 info!(name, "renamed by the name setting");
                 identity = renamed;
             }
-        } else if identity.name == DEFAULT_NAME
-            && let Some(name) = run.computer_name.as_deref()
+        } else if let Some(name) = run.computer_name.as_deref()
             && name != identity.name
+            && takes_computer_name(&identity.name, name, run.legacy_name.as_deref())
             && let Some(renamed) = store.rename(name)?
         {
             info!(name = %renamed.name, "this server is named after its computer");
@@ -169,6 +179,16 @@ impl Server {
         }
 
         let (identity, library) = library::open(dir, &store, identity, &clock, &entropy)?;
+        // A hub renamed at start, as after its computer's name, keeps the
+        // library's registry of servers in step.
+        if let Some(library) = &library
+            && library
+                .server_name(identity.server_id)
+                .is_ok_and(|known| known.is_some_and(|known| known != identity.name))
+            && let Err(error) = library.register_server(identity.server_id, &identity.name)
+        {
+            warn!(%error, "the library's registry keeps this server's old name");
+        }
 
         // This run holds the directory's lock, so whatever run claimed a
         // job before it is gone: each such job goes back in the queue, and
@@ -540,6 +560,40 @@ mod tests {
             "contractVersion": ritornel_contract::CONTRACT_VERSION,
         });
         request(id, "server.hello", &params)
+    }
+
+    #[test]
+    fn a_server_takes_its_computers_name_over_the_default_or_the_name_an_older_build_took() {
+        let legacy = Some("STUDIO-WORKSTAT");
+        assert!(takes_computer_name(
+            DEFAULT_NAME,
+            "Studio-Workstation",
+            None
+        ));
+        // Taken before from COMPUTERNAME, upper-cased and cut short.
+        assert!(takes_computer_name(
+            "STUDIO-WORKSTAT",
+            "Studio-Workstation",
+            legacy
+        ));
+        assert!(!takes_computer_name(
+            "Studio-Workstation",
+            "Studio-Workstation",
+            legacy
+        ));
+        // A name someone chose is kept, in any case, and where no older
+        // build named it otherwise.
+        assert!(!takes_computer_name(
+            "studio-workstation",
+            "Studio-Workstation",
+            legacy
+        ));
+        assert!(!takes_computer_name(
+            "Living room",
+            "Studio-Workstation",
+            legacy
+        ));
+        assert!(!takes_computer_name("STUDIO-PC", "Studio-PC", None));
     }
 
     #[test]

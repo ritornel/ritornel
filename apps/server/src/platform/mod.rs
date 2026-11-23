@@ -74,6 +74,13 @@ pub(crate) fn computer_name() -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
+/// The name an older build took from this computer, where it differs from
+/// how the name is read now (`COMPUTERNAME` on Windows): a server still
+/// carrying it takes the computer's name as it is read now.
+pub(crate) fn legacy_computer_name() -> Option<String> {
+    system::legacy_computer_name()
+}
+
 /// The name this machine answers to on the local network by multicast DNS
 /// (Bonjour), such as `studio-mac.local`, when it answers to one: what an
 /// invite offers first, so that a hub whose address changes is still
@@ -128,8 +135,8 @@ mod other_unix {
     #[cfg(feature = "media-session")]
     pub(crate) use super::fallback::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
     pub(crate) use super::fallback::{
-        computer_name, install_service, mdns_host, service_status, stay_awake, uninstall_service,
-        wait,
+        computer_name, install_service, legacy_computer_name, mdns_host, service_status,
+        stay_awake, uninstall_service, wait,
     };
     pub(crate) use super::unix::*;
 }
@@ -173,6 +180,11 @@ mod fallback {
 
     /// The computer's name is not read here yet.
     pub(crate) fn computer_name() -> Option<String> {
+        None
+    }
+
+    /// No older build named a server otherwise here.
+    pub(crate) fn legacy_computer_name() -> Option<String> {
         None
     }
 

@@ -8,8 +8,8 @@ use ritornel_client::contract::methods::{
     LinkInvite as Invite, LinkJoin, LinkSetAwake, LinkStatusCall,
 };
 use ritornel_client::contract::{
-    Awake, AwakeParams, AwakeSet, LinkInvite, LinkInviteParams, LinkJoinParams, LinkStatus,
-    NoParams,
+    Awake, AwakeParams, AwakeSet, HubStatus, LinkInvite, LinkInviteParams, LinkJoinParams,
+    LinkStatus, NoParams,
 };
 use ritornel_client::local;
 
@@ -132,16 +132,40 @@ fn render_awake(status: &LinkStatus) -> String {
     format!("{setting}; {now}")
 }
 
+/// Whether the hub answers, as the satellite last found, and how it last
+/// reached it: the route as the link names it and the address it resolved
+/// to. Nothing before the satellite has tried.
+fn reach(hub: &HubStatus) -> Vec<(&'static str, String)> {
+    let mut facts = Vec::new();
+    if let Some(route) = &hub.route {
+        let label = if hub.answers == Some(true) {
+            "Connected via"
+        } else {
+            "Last reached via"
+        };
+        facts.push((label, route.clone()));
+    }
+    match (hub.answers, &hub.problem) {
+        (Some(true), _) => facts.push(("Hub answers", "yes".to_owned())),
+        (Some(false), Some(problem)) => facts.push(("Hub answers", format!("no: {problem}"))),
+        (Some(false), None) => facts.push(("Hub answers", "no".to_owned())),
+        (None, _) => {}
+    }
+    facts
+}
+
 fn render_status(status: &LinkStatus) -> String {
     let mut text = String::new();
     if let Some(hub) = &status.hub {
-        text += &server::facts(&[
+        let mut facts = vec![
             ("Role", "satellite".to_owned()),
             ("Hub", format!("{} ({})", hub.name, hub.server_id)),
             ("Library", hub.library_id.to_string()),
             ("Routes", hub.routes.join(", ")),
-            ("Awake", render_awake(status)),
-        ]);
+        ];
+        facts.extend(reach(hub));
+        facts.push(("Awake", render_awake(status)));
+        text += &server::facts(&facts);
     } else {
         text += &server::facts(&[("Role", status.role.as_str().to_owned())]);
         for satellite in &status.satellites {
@@ -167,6 +191,66 @@ mod tests {
             minutes: minutes.map(str::to_owned),
             ..AwakeArgs::default()
         }
+    }
+
+    fn hub(route: Option<&str>, answers: Option<bool>) -> HubStatus {
+        HubStatus {
+            server_id: ritornel_client::contract::Id::from_bytes([1; 16]),
+            name: "Studio Mac".to_owned(),
+            library_id: ritornel_client::contract::Id::from_bytes([2; 16]),
+            epoch: 1,
+            routes: [
+                "studio-mac.local:4747",
+                "10.0.0.2:4747",
+                "studio.example-overlay.net:4747",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            linked_at_ms: 0,
+            answers,
+            since_ms: None,
+            route: route.map(str::to_owned),
+            problem: (answers == Some(false)).then(|| "no answer in 4 seconds".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_satellite_says_how_it_reached_its_hub_and_whether_it_answers() {
+        let status = |hub| LinkStatus {
+            role: ritornel_client::contract::ServerRole::Satellite,
+            hub: Some(hub),
+            satellites: Vec::new(),
+            awake: Awake::default(),
+            kept_awake: false,
+        };
+        let via = "studio-mac.local:4747 (192.168.1.20:4747)";
+        let text = render_status(&status(hub(Some(via), Some(true))));
+        assert!(
+            text.contains(&format!("Connected via     {via}\n")),
+            "{text}"
+        );
+        assert!(text.contains("Hub answers       yes\n"), "{text}");
+
+        let text = render_status(&status(hub(Some(via), Some(false))));
+        assert!(
+            text.contains(&format!("Last reached via  {via}\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains("Hub answers       no: no answer in 4 seconds\n"),
+            "{text}"
+        );
+
+        // Not tried yet, or never reached: no route to speak of.
+        let text = render_status(&status(hub(None, None)));
+        assert!(!text.contains("via"), "{text}");
+        assert!(!text.contains("Hub answers"), "{text}");
+        let text = render_status(&status(hub(None, Some(false))));
+        assert!(!text.contains("via"), "{text}");
+        assert!(
+            text.contains("Hub answers       no: no answer in 4 seconds\n"),
+            "{text}"
+        );
     }
 
     #[test]

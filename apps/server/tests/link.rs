@@ -358,6 +358,20 @@ async fn a_route_may_be_a_name_resolved_at_each_dial_and_a_name_for_another_serv
             .await
             .unwrap();
         assert_eq!(stats.artists, 0);
+        // It says how it reached the hub: the route as the link names it,
+        // and the address that was.
+        let reached = desk_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap()
+            .hub
+            .unwrap();
+        let port = hub.endpoint().port();
+        assert_eq!(reached.answers, Some(true));
+        assert_eq!(
+            reached.route.as_deref(),
+            Some(format!("localhost:{port} (127.0.0.1:{port})").as_str())
+        );
     })
     .await;
 }
@@ -1204,6 +1218,63 @@ async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_st
             .call::<LinkSetAwake>(&never(Awake::default()))
             .await
             .unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_renamed_after_its_computer_is_listed_by_its_new_name() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, desk, desk_client) = linked(&scratch).await;
+        let desk_id = desk.server_id();
+        let before = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_ne!(before.satellites[0].name, "Studio PC");
+
+        // Started again where an older build had named it after the
+        // computer otherwise, it takes the computer's name as read now.
+        drop(desk_client);
+        desk.stop().await.unwrap();
+        let desk = Server::start_run(
+            HeldDir::take(scratch.data_dir("desk")).unwrap(),
+            Listen::on_port(0),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+            Bounds::default(),
+            Run {
+                computer_name: Some("Studio PC".to_owned()),
+                legacy_name: Some(before.satellites[0].name.clone()),
+                ..Run::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(desk.name(), "Studio PC");
+        // Its next call to the hub says hello under that name.
+        let desk_client = client(&scratch, "desk", &desk).await;
+        desk_client
+            .call::<LibraryStats>(&NoParams {})
+            .await
+            .unwrap();
+        let after = hub_client
+            .call::<LinkStatusCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(after.satellites[0].name, "Studio PC");
+        let registry: String =
+            rusqlite::Connection::open(scratch.data_dir("hub").join("library.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT name FROM server WHERE public_id = ?1",
+                    [desk_id.as_bytes()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(registry, "Studio PC");
+        drop(hub);
     })
     .await;
 }

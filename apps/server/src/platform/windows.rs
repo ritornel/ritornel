@@ -25,12 +25,28 @@ pub(crate) use super::fallback::{
 /// The host name Windows answers to by multicast DNS, which it does for its
 /// own name since Windows 10.
 pub(crate) fn mdns_host() -> Option<String> {
+    host_name()
+}
+
+/// The name an older build took from this computer: `COMPUTERNAME`, which
+/// Windows upper-cases and cuts to 15 characters.
+pub(crate) fn legacy_computer_name() -> Option<String> {
     std::env::var("COMPUTERNAME").ok()
 }
 
-/// The computer's name, as Windows gives it to every program.
+/// The computer's name, in the case it was set.
 pub(crate) fn computer_name() -> Option<String> {
-    std::env::var("COMPUTERNAME").ok()
+    host_name()
+}
+
+/// The machine's DNS host name, as it was set (`Studio-PC`), or else
+/// `COMPUTERNAME`, the NetBIOS name, which Windows upper-cases and cuts to
+/// 15 characters.
+fn host_name() -> Option<String> {
+    ritornel_windows::name::dns_host_name()
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
 }
 
 /// Creates the folder at `path`, and those above it that are missing, with

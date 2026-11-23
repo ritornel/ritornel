@@ -585,3 +585,30 @@ fn a_wrong_command_line_exits_with_2_and_help_with_0() {
         help.stdout
     );
 }
+
+#[test]
+fn server_stop_stops_the_server_cleanly_and_then_finds_none() {
+    let scratch = Scratch::new();
+    let data_dir = scratch.data_dir();
+    let mut server = Server::start(&data_dir);
+
+    let mut command = ritornelctl(&["server", "stop", "--data-dir"]);
+    command.arg(&data_dir);
+    let stopped = run(command);
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
+    assert_eq!(stopped.stdout, "The server has stopped.\n");
+    // It stopped as a signal stops it, and cleanly.
+    assert_eq!(server.child.wait().unwrap().code(), Some(0));
+    assert!(
+        logs(&data_dir).contains("\"stopped\""),
+        "{}",
+        logs(&data_dir)
+    );
+    assert!(!data_dir.join("server.json").exists());
+
+    let mut command = ritornelctl(&["server", "stop", "--data-dir"]);
+    command.arg(&data_dir);
+    let none = run(command);
+    assert_eq!(none.code, Some(NO_SERVER), "{none:?}");
+    assert_eq!(none.stderr, no_server(&data_dir));
+}

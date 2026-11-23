@@ -1583,7 +1583,9 @@ export type HubStatus = {
    */
   sinceMs?: number,
   /**
-   * The route the satellite last reached it on.
+   * How the satellite last reached it: the route as the link names it,
+   * and the address it resolved to where that differs, such as
+   * `studio-mac.local:4747 (192.168.1.20:4747)`.
    */
   route?: string,
   /**
