@@ -27,11 +27,12 @@ pub(crate) use super::windows_service::{
 
 /// The media controls are tied to the hidden window, and Windows delivers
 /// their buttons on a thread of its own: they need neither the main thread
-/// nor the runtime, and go with the process.
+/// nor the runtime. They are let go as the server stops, while the window
+/// is still open.
 #[cfg(feature = "media-session")]
 pub(crate) const HAS_MEDIA_SESSION: bool = true;
 #[cfg(feature = "media-session")]
-pub(crate) const MEDIA_SESSION_ON_RUNTIME: bool = false;
+pub(crate) const STOP_MEDIA_SESSION_WITH_SERVER: bool = true;
 
 /// The host name Windows answers to by multicast DNS, which it does for its
 /// own name since Windows 10.
@@ -157,11 +158,27 @@ pub(crate) fn lock_shareable(file: &File) -> std::io::Result<bool> {
 }
 
 /// What watches for a stop: the hidden window, which the run keeps until
-/// it has stopped, and then tells so ([`Window::stopped`]), as a session
-/// that is ending waits for that before it ends the process.
-///
-/// [`Window::stopped`]: ritornel_windows::window::Window::stopped
-pub(crate) type Signals = ritornel_windows::window::Window;
+/// it has stopped, and then tells so ([`Signals::stopped`]), as a session
+/// that is ending waits for that before it ends the process. The media
+/// controls are tied to it while it is open.
+#[derive(Debug)]
+pub(crate) struct Signals(ritornel_windows::window::Window);
+
+impl Signals {
+    /// Says that the server has stopped, so that a session that is ending
+    /// may end the process.
+    pub(crate) fn stopped(&self) {
+        self.0.stopped();
+    }
+}
+
+impl Drop for Signals {
+    fn drop(&mut self) {
+        // Nothing more is tied to the window, which closes after this.
+        #[cfg(feature = "media-session")]
+        super::windows_media::tie_to(0);
+    }
+}
 
 /// Sends a stop on what Windows has in place of signals: Ctrl+C, Ctrl+Break
 /// and the console closing, when the server runs in one, and for a server
@@ -200,7 +217,7 @@ pub(crate) fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::
     })?;
     #[cfg(feature = "media-session")]
     super::windows_media::tie_to(window.handle());
-    Ok(window)
+    Ok(Signals(window))
 }
 
 /// Whether only the owner can open a file or directory: an access list that

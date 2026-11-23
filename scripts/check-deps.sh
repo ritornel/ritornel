@@ -74,7 +74,7 @@ only ritornel-windows
 # builds with no ALSA or D-Bus library installed.
 without_defaults=$(cargo tree --manifest-path Cargo.toml --package ritornel-server --no-default-features \
     --edges normal --target all --prefix none --format '{p}' | awk '{ print $1 }')
-for crate in ritornel-lastfm scrobl souvlaki zbus cpal alsa alsa-sys; do
+for crate in ritornel-lastfm scrobl souvlaki zbus windows cpal alsa alsa-sys; do
     if grep --quiet --line-regexp --fixed-strings "$crate" <<<"$without_defaults"; then
         echo "error: ritornel-server without its default features is built with $crate" >&2
         failed=1

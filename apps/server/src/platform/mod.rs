@@ -65,7 +65,7 @@ use windows as system;
 use other_unix as system;
 
 #[cfg(feature = "media-session")]
-pub(crate) use system::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
+pub(crate) use system::{HAS_MEDIA_SESSION, MediaControls, STOP_MEDIA_SESSION_WITH_SERVER};
 pub(crate) use system::{
     close_to_others, create_new_private_dir, create_owner_only, create_private_dir,
     create_private_file, free_bytes, install_service, is_private, lock_shareable, rename_dir,
@@ -141,7 +141,9 @@ pub(crate) use system::{open_to_others, path_is_private};
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 mod other_unix {
     #[cfg(feature = "media-session")]
-    pub(crate) use super::fallback::{HAS_MEDIA_SESSION, MEDIA_SESSION_ON_RUNTIME, MediaControls};
+    pub(crate) use super::fallback::{
+        HAS_MEDIA_SESSION, MediaControls, STOP_MEDIA_SESSION_WITH_SERVER,
+    };
     pub(crate) use super::fallback::{
         computer_name, install_service, legacy_computer_name, mdns_host, run_service,
         service_status, stay_awake, uninstall_service, wait,
@@ -220,7 +222,7 @@ mod fallback {
     #[cfg(feature = "media-session")]
     pub(crate) const HAS_MEDIA_SESSION: bool = false;
     #[cfg(feature = "media-session")]
-    pub(crate) const MEDIA_SESSION_ON_RUNTIME: bool = false;
+    pub(crate) const STOP_MEDIA_SESSION_WITH_SERVER: bool = false;
 
     /// Controls that are never opened.
     #[cfg(feature = "media-session")]
@@ -239,7 +241,7 @@ mod fallback {
         pub(crate) fn set_track(
             &mut self,
             _: &ritornel_engine::playback::PlayerState,
-            _: Option<&str>,
+            _: Option<&std::path::Path>,
         ) {
             match *self {}
         }

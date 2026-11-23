@@ -49,13 +49,14 @@ impl Controls {
     }
 
     /// Shows the track the player is on, with its cover.
-    pub(crate) fn set_track(&mut self, state: &PlayerState, cover: Option<&str>) {
+    pub(crate) fn set_track(&mut self, state: &PlayerState, cover: Option<&std::path::Path>) {
+        let cover = cover.map(crate::media_session::file_url);
         let track = state.current.as_ref().and_then(|now| now.track.as_ref());
         let metadata = MediaMetadata {
             title: track.and_then(|track| track.title.as_deref()),
             album: track.and_then(|track| track.album.as_deref()),
             artist: track.and_then(|track| track.artist.as_deref()),
-            cover_url: cover,
+            cover_url: cover.as_deref(),
             duration: state.duration_ms.map(millis),
         };
         if let Err(error) = self.0.set_metadata(metadata) {

@@ -403,11 +403,12 @@ impl Server {
             .await
             .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))?;
         // A media session served from the runtime (MPRIS) leaves the
-        // session bus while the runtime still runs. Elsewhere (a Mac) the
-        // session's thread is left to end by itself, as souvlaki may need
-        // the main run loop, which has stopped by now.
+        // session bus while the runtime still runs, and Windows' controls
+        // are let go while the hidden window they are tied to is open. On
+        // a Mac the session's thread is left to end by itself, as souvlaki
+        // may need the main run loop, which has stopped by now.
         #[cfg(feature = "media-session")]
-        if crate::platform::MEDIA_SESSION_ON_RUNTIME {
+        if crate::platform::STOP_MEDIA_SESSION_WITH_SERVER {
             let core = Arc::clone(&self.core);
             tokio::task::spawn_blocking(move || core.stop_media_session())
                 .await

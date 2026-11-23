@@ -22,7 +22,7 @@ pub(crate) use super::linux_mpris::Controls as MediaControls;
 #[cfg(feature = "media-session")]
 pub(crate) const HAS_MEDIA_SESSION: bool = true;
 #[cfg(feature = "media-session")]
-pub(crate) const MEDIA_SESSION_ON_RUNTIME: bool = true;
+pub(crate) const STOP_MEDIA_SESSION_WITH_SERVER: bool = true;
 
 /// Where systemd looks for a user's own units.
 fn units_dir(env: Env<'_>) -> Result<PathBuf, Error> {

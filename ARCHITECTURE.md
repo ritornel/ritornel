@@ -29,7 +29,7 @@ The main Cargo workspace (`Cargo.toml`) holds seven library crates and two binar
 | `crates/ritornel-client` | Shared Rust client: server discovery/launch and typed contract calls. |
 | `crates/ritornel-source` | Traits and wire-independent types for optional external-source plugins (`HistorySource`, `Sink`). |
 | `crates/ritornel-lastfm` | Last.fm plugin implementing `ritornel-source` behind the server's `lastfm` feature. |
-| `crates/ritornel-windows` | Safe wrappers around the few Win32 calls the standard library cannot make (byte-range locks, owner-only ACLs, file identity, interrupt clock, hidden shutdown window). Empty on non-Windows. |
+| `crates/ritornel-windows` | Safe wrappers around the few Win32 calls the standard library cannot make (byte-range locks, owner-only ACLs, file identity, interrupt clock, hidden shutdown window, and, with its `media` feature, the system media transport controls). Empty on non-Windows. |
 | `apps/server` | `ritornel-server`: socket listener, auth/sessions, job runner, file watcher, media keys/Now Playing, and platform service integration. |
 | `apps/ritornelctl` | Command-line client over `ritornel-client`. |
 | `apps/desktop` | GPUI desktop app (`ritornel-desktop-gpui`), built on `ritornel-client` and `ritornel-contract`. |
