@@ -47,6 +47,12 @@ pub(crate) fn away(net: &Net) -> Option<Away> {
     away_of(net.hub.as_ref())
 }
 
+/// Whether the hub, away in `before`, answers in `now`: what its absence
+/// kept from being read is read again, once.
+pub(crate) fn back(before: &Net, now: &Net) -> bool {
+    away(before).is_some() && away(now).is_none()
+}
+
 fn away_of(hub: Option<&HubStatus>) -> Option<Away> {
     let hub = hub?;
     (hub.answers == Some(false)).then(|| Away {
@@ -195,5 +201,17 @@ mod tests {
             notice(None, Some(&again), later + 10 + QUIET_MS).1,
             Some(later + 10)
         );
+    }
+
+    #[tokio::test]
+    async fn the_hub_is_back_only_from_away_to_answering() {
+        let (send, _calls) = tokio::sync::mpsc::channel(1);
+        let (_answers, receive) = tokio::sync::mpsc::channel(1);
+        let client = std::sync::Arc::new(ritornel_client::Client::over_memory(send, receive));
+        let session = |answers| Net::satellite(std::sync::Arc::clone(&client), answers);
+        assert!(back(&session(false), &session(true)));
+        assert!(!back(&session(true), &session(true)));
+        assert!(!back(&session(false), &session(false)));
+        assert!(!back(&session(true), &session(false)));
     }
 }

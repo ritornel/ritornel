@@ -169,6 +169,36 @@ struct Read {
     revision: u64,
 }
 
+/// The page's pictures whose last read failed this time, as reads do
+/// while a satellite's hub is away: not those the server has none of or
+/// cannot make. They are kept for the picture the page shows, and let go
+/// with it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Unread {
+    face: bool,
+    portrait: bool,
+    /// The banner's blur and the wash's, read together.
+    blurs: bool,
+}
+
+/// One of the page's pictures, as `Unread` keeps them.
+#[derive(Debug, Clone, Copy)]
+enum Picture {
+    Face,
+    Portrait,
+    Blurs,
+}
+
+impl Unread {
+    fn of(&mut self, picture: Picture) -> &mut bool {
+        match picture {
+            Picture::Face => &mut self.face,
+            Picture::Portrait => &mut self.portrait,
+            Picture::Blurs => &mut self.blurs,
+        }
+    }
+}
+
 pub(crate) struct Artist {
     net: Arc<Net>,
     player: Entity<Player>,
@@ -225,6 +255,21 @@ pub(crate) struct Artist {
     face_read: u64,
     portrait_read: u64,
     blur_read: u64,
+    /// The pictures that failed this time, and those to ask for again at
+    /// the next draw, once each: once a session begins, or the hub is back.
+    unread: Unread,
+    read_unread: Unread,
+    /// Counts the sessions begun and the hub's returns: a read begun before
+    /// the last that fails after it is asked for again.
+    returns: u64,
+    /// Whether the face and the blurs shown are another picture's, or
+    /// none: then one that cannot be read gives soft colour in its place,
+    /// and otherwise what is shown stays.
+    stale_face: bool,
+    stale_blurs: bool,
+    /// How many reads of pictures are under way, for tests to wait on.
+    #[cfg(test)]
+    pictures_in_flight: usize,
     pub top: f32,
     elastic: crate::elastic::Elastic,
     /// How tall the page was when last drawn, and the column of history
@@ -235,6 +280,15 @@ pub(crate) struct Artist {
     /// How it shows while it arrives or leaves, as the stage moves it.
     pub look: crate::moves::Look,
     _link: Subscription,
+}
+
+/// How far the banner's blur and the wash's spread, for the window's size.
+fn blur_radii(window: &Window) -> (usize, usize) {
+    let (width, viewport) = viewport_of(window);
+    (
+        crate::blur::radius(crate::blur::BANNER.0, width + 120.),
+        crate::blur::radius(crate::blur::WASH.0, width.max(viewport + 128.) + 180.),
+    )
 }
 
 impl EventEmitter<ArtistEvent> for Artist {}
@@ -248,8 +302,9 @@ impl Artist {
         name: SharedString,
         cx: &mut Context<Self>,
     ) -> Self {
-        // When the library changes, what the page shows is read again, and
-        // through a new session when the server is found again.
+        // When the library changes, what the page shows is read again: through
+        // a new session when the server is found again, and when a
+        // satellite's hub is back.
         let followed = cx.subscribe(link, |page: &mut Self, _, event: &LinkEvent, cx| {
             let plays_only = match event {
                 LinkEvent::Connected(net) => {
@@ -259,6 +314,21 @@ impl Artist {
                     page.revision = 0;
                     // What could not be read is asked for again at once.
                     page.retries = crate::covers::Retries::default();
+                    page.returns += 1;
+                    page.read_unread = page.unread;
+                    false
+                }
+                // The same session, its hub back: what could not be read
+                // while it was away is read again, once.
+                LinkEvent::Restated(net) => {
+                    let back = crate::away::back(&page.net, net);
+                    page.net = Arc::clone(net);
+                    if !back {
+                        return;
+                    }
+                    page.retries = crate::covers::Retries::default();
+                    page.returns += 1;
+                    page.read_unread = page.unread;
                     false
                 }
                 LinkEvent::Server(Event::Library(event))
@@ -310,6 +380,13 @@ impl Artist {
             face_read: 0,
             portrait_read: 0,
             blur_read: 0,
+            unread: Unread::default(),
+            read_unread: Unread::default(),
+            returns: 0,
+            stale_face: true,
+            stale_blurs: true,
+            #[cfg(test)]
+            pictures_in_flight: 0,
             top: 0.,
             elastic: crate::elastic::Elastic::default(),
             height: Rc::new(Cell::new(0.)),
@@ -606,32 +683,74 @@ impl Artist {
         let (art, wants_portrait) = (artist.artist.art_id, artist.artist.portrait);
         let scale = window.scale_factor();
         if self.pictured_for == Some((art, wants_portrait)) {
-            if self.pictured_scale != scale {
-                self.sharpen(art, scale, window, cx);
+            // On another display, read sharp there first, so that what is
+            // asked for again below is asked for at its scale, and once.
+            let sharpened = self.pictured_scale != scale;
+            let portrait_read = sharpened && self.sharpen(art, scale, window, cx);
+            // Those that failed this time, and only those, are asked for
+            // again, once.
+            let again = std::mem::take(&mut self.read_unread);
+            if let Some(art) = art {
+                if again.face && !sharpened {
+                    self.read_face(art, scale, cx);
+                }
+                if again.portrait && !portrait_read {
+                    self.read_portrait(art, scale, cx);
+                }
+                if again.blurs {
+                    self.read_blurs(art, window, cx);
+                }
             }
             return;
         }
         self.pictured_for = Some((art, wants_portrait));
         self.pictured_scale = scale;
-        self.blur_read += 1;
-        let blur_read = self.blur_read;
+        self.unread = Unread::default();
+        self.read_unread = Unread::default();
+        self.stale_face = true;
+        self.stale_blurs = true;
         // A portrait of another picture, or of none, is not kept meanwhile.
         self.forget_portrait(Some(window), cx);
         self.picture_failed = false;
-        let (width, viewport) = viewport_of(window);
-        let banner_radius = crate::blur::radius(crate::blur::BANNER.0, width + 120.);
-        let wash_radius =
-            crate::blur::radius(crate::blur::WASH.0, width.max(viewport + 128.) + 180.);
         let Some(art) = art else {
+            self.blur_read += 1;
+            let (banner_radius, wash_radius) = blur_radii(window);
             self.soft_pictures(banner_radius, wash_radius, Some(window), cx);
             return;
         };
         self.read_face(art, scale, cx);
         self.read_portrait(art, scale, cx);
+        self.read_blurs(art, window, cx);
+    }
+
+    /// A read of `picture` came back, `failed` this time or not, having
+    /// begun when `returns` counted `since`. One that failed is asked for
+    /// again: at the next draw if a session began or the hub came back
+    /// since it began, else when that next happens.
+    fn came_back(&mut self, picture: Picture, failed: bool, since: u64) {
+        *self.unread.of(picture) = failed;
+        if failed && since != self.returns {
+            *self.read_unread.of(picture) = true;
+        }
+    }
+
+    /// The blurs of their picture for the banner and the wash, read
+    /// together. Where another picture's are shown, or none, one the server
+    /// cannot make, or that could not be read for now, gives soft colour
+    /// from their name instead; otherwise what is shown stays.
+    fn read_blurs(&mut self, art: Id, window: &Window, cx: &mut Context<Self>) {
+        self.blur_read += 1;
+        let blur_read = self.blur_read;
+        let since = self.returns;
+        #[cfg(test)]
+        {
+            self.pictures_in_flight += 1;
+        }
+        let (banner_radius, wash_radius) = blur_radii(window);
         let http = Arc::clone(&self.net.art);
         let tone = crate::blur::wash_tone(theme::dark());
         let blurs = self.net.rt().spawn(async move {
-            let bytes = http.get(art, crate::blur::SIDE).await.ok()?;
+            let bytes = http.get(art, crate::blur::SIDE).await?;
             crate::covers::decode(move || {
                 Some((
                     crate::blur::jpeg(&bytes, banner_radius, crate::blur::BANNER.1)?,
@@ -639,17 +758,23 @@ impl Artist {
                 ))
             })
             .await
+            .ok_or(NoArt::Missing)
         });
         self.fetches.push(blurs.abort_handle());
         cx.spawn(async move |this, cx| {
-            let blurs = blurs.await.ok().flatten();
+            let blurs = blurs.await.unwrap_or(Err(NoArt::Failed));
             this.update(cx, |page, cx| {
+                #[cfg(test)]
+                {
+                    page.pictures_in_flight -= 1;
+                }
                 // Too late: the page has asked for its pictures again since.
                 if page.blur_read != blur_read {
                     return;
                 }
+                page.came_back(Picture::Blurs, blurs == Err(NoArt::Failed), since);
                 match blurs {
-                    Some((banner, wash)) => {
+                    Ok((banner, wash)) => {
                         let now = Instant::now();
                         let gone = [
                             crate::blur::replace(&mut page.banner_blur, Arc::new(banner), now),
@@ -658,11 +783,15 @@ impl Artist {
                         for old in gone.into_iter().flatten() {
                             crate::covers::drop_unshared(old, None, cx);
                         }
+                        page.stale_blurs = false;
                     }
                     // A picture the server cannot make (one in a format it
                     // does not read) is no picture: the page takes its
                     // colour from their name, rather than no colour.
-                    None => page.soft_pictures(banner_radius, wash_radius, None, cx),
+                    Err(_) if page.stale_blurs => {
+                        page.soft_blurs(banner_radius, wash_radius, None, cx);
+                    }
+                    Err(_) => {}
                 }
                 cx.notify();
             })
@@ -673,14 +802,15 @@ impl Artist {
 
     /// Moved to a display of another scale: the face read again for it, and
     /// the portrait when the server has it larger. Each shown is kept until
-    /// its sharper one comes; the blurs do not depend on the scale.
+    /// its sharper one comes; the blurs do not depend on the scale. Returns
+    /// whether the portrait was asked for.
     fn sharpen(
         &mut self,
         art: Option<Id>,
         scale: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let before = self.pictured_scale;
         self.pictured_scale = scale;
         // A soft face, as with no picture or one that cannot be read, is
@@ -688,38 +818,60 @@ impl Artist {
         if self.face.as_ref().is_some_and(theme::soft_holds) {
             self.soft_face(Some(window), cx);
         }
-        let Some(art) = art else { return };
+        let Some(art) = art else { return false };
         self.read_face(art, scale, cx);
         let portrait_px = |scale: f32| self.net.bucket((2. * 380. * scale).ceil() as u32);
-        if !self.picture_failed && portrait_px(before) != portrait_px(scale) {
+        let sharper = !self.picture_failed && portrait_px(before) != portrait_px(scale);
+        if sharper {
             self.read_portrait(art, scale, cx);
         }
+        sharper
     }
 
     /// The face that stands in for a picture: soft colour from their name.
     /// A read of a face still to come is let go.
     fn soft_face(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         self.face_read += 1;
+        self.stale_face = false;
         let face = theme::soft_cached(&self.name, (28. * self.pictured_scale).ceil() as u32);
         if let Some(old) = self.face.replace(face) {
             crate::covers::drop_unshared(old, window, cx);
         }
     }
 
-    /// The face for the strip, read for the display's `scale`.
+    /// The face for the strip, read for the display's `scale`. Where another
+    /// picture's face is shown, or none, one that cannot be read gives soft
+    /// colour from their name; otherwise what is shown stays.
     fn read_face(&mut self, art: Id, scale: f32, cx: &mut Context<Self>) {
         self.face_read += 1;
         let read = self.face_read;
+        let since = self.returns;
+        #[cfg(test)]
+        {
+            self.pictures_in_flight += 1;
+        }
         self.fetch(
             art,
             (28. * scale).ceil() as u32,
             cx,
             move |page, image, cx| {
+                #[cfg(test)]
+                {
+                    page.pictures_in_flight -= 1;
+                }
                 // Asked for before the last: for a display the window has
                 // left since, or another picture.
-                let Some(image) = image.ok().filter(|_| page.face_read == read) else {
+                if page.face_read != read {
+                    return;
+                }
+                page.came_back(Picture::Face, matches!(image, Err(NoArt::Failed)), since);
+                let Ok(image) = image else {
+                    if page.stale_face {
+                        page.soft_face(None, cx);
+                    }
                     return;
                 };
+                page.stale_face = false;
                 if let Some(old) = page.face.replace(image) {
                     crate::covers::drop_unshared(old, None, cx);
                 }
@@ -733,6 +885,11 @@ impl Artist {
     fn read_portrait(&mut self, art: Id, scale: f32, cx: &mut Context<Self>) {
         self.portrait_read += 1;
         let asked = self.portrait_read;
+        let since = self.returns;
+        #[cfg(test)]
+        {
+            self.pictures_in_flight += 1;
+        }
         // Their portrait stands at most 380 points wide at the banner's right
         // end; with none, the cover their picture is stands in for it, so that
         // every artist's circle on the wall has somewhere to fly to. It is
@@ -743,13 +900,19 @@ impl Artist {
         let http = Arc::clone(&self.net.art);
         let bucket = self.net.bucket((2. * 380. * scale).ceil() as u32);
         let read = self.net.rt().spawn(async move {
-            let bytes = http.get(art, bucket).await.ok()?;
-            crate::covers::decode(move || crate::covers::decode_picture(&bytes)).await
+            let bytes = http.get(art, bucket).await?;
+            crate::covers::decode(move || crate::covers::decode_picture(&bytes))
+                .await
+                .ok_or(NoArt::Missing)
         });
         self.fetches.push(read.abort_handle());
         cx.spawn(async move |this, cx| {
-            let source = read.await.ok().flatten();
+            let source = read.await.unwrap_or(Err(NoArt::Failed));
             this.update(cx, |page, cx| {
+                #[cfg(test)]
+                {
+                    page.pictures_in_flight -= 1;
+                }
                 // Too late: the page shows another picture now, or a later
                 // read was asked for, for another display.
                 if page.pictured_for.map(|(at, _)| at) != Some(Some(art))
@@ -759,18 +922,24 @@ impl Artist {
                 }
                 let again = page.portrait.is_some();
                 match source {
-                    Some(source) => {
+                    Ok(source) => {
                         // The same picture read sharper is made again from
                         // this at the next render; the one shown stays until then.
                         if let Some(made) = page.melted.as_mut().filter(|_| again) {
                             made.0 = (0, 0);
                         }
                         page.portrait = Some(Arc::new(source));
+                        page.picture_failed = false;
+                        page.came_back(Picture::Portrait, false, since);
                     }
-                    None if again => {}
-                    None => {
+                    // Read sharper for another display: the one shown stays.
+                    Err(failed) if again => {
+                        page.came_back(Picture::Portrait, failed == NoArt::Failed, since);
+                    }
+                    Err(failed) => {
                         page.forget_portrait(None, cx);
                         page.picture_failed = true;
+                        page.came_back(Picture::Portrait, failed == NoArt::Failed, since);
                     }
                 }
                 cx.notify();
@@ -791,6 +960,19 @@ impl Artist {
         mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
+        self.soft_blurs(banner_radius, wash_radius, window.as_deref_mut(), cx);
+        self.soft_face(window, cx);
+    }
+
+    /// Soft colour from their name for the banner's blur and the wash's.
+    fn soft_blurs(
+        &mut self,
+        banner_radius: usize,
+        wash_radius: usize,
+        mut window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.stale_blurs = false;
         let soft = theme::soft_pixels(&self.name, crate::blur::SIDE);
         let tone = crate::blur::wash_tone(theme::dark());
         let now = Instant::now();
@@ -804,7 +986,6 @@ impl Artist {
         for old in gone.into_iter().flatten() {
             crate::covers::drop_unshared(old, window.as_deref_mut(), cx);
         }
-        self.soft_face(window, cx);
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1426,5 +1607,400 @@ impl Render for Artist {
                     .opacity(self.look.banner)
                     .child(crate::frost::faded(self.look.banner, banner)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    use super::*;
+    use crate::link::{Link, LinkEvent};
+
+    const ARTIST: Id = Id::from_bytes([1; 16]);
+    /// Their picture, which the pictures' server has.
+    const PICTURE: Id = Id::from_bytes([2; 16]);
+    /// A picture the pictures' server has none of.
+    const NONE: Id = Id::from_bytes([3; 16]);
+    /// The sizes the pictures' server makes: the face is read at the
+    /// smallest, the portrait at the largest, and the blurs at theirs.
+    const SIZES: [u32; 3] = [64, crate::blur::SIDE, 1024];
+    const FACE: u32 = 64;
+    const PORTRAIT: u32 = 1024;
+    const BLURS: u32 = crate::blur::SIDE;
+
+    /// A server of pictures on loopback, over HTTP as the app reads them.
+    /// It has a JPEG of every picture but `NONE`, and fails a request for
+    /// a size in `failing` when it comes, as a satellite does whose hub has
+    /// gone. It holds its answer to a size in `held` until that size is
+    /// let go. It counts the requests for each picture at each size.
+    #[derive(Clone)]
+    struct Pictures {
+        asked: Arc<Mutex<HashMap<(String, u32), usize>>>,
+        unanswered: Arc<AtomicUsize>,
+        failing: Arc<Mutex<HashSet<u32>>>,
+        held: Arc<tokio::sync::watch::Sender<HashSet<u32>>>,
+    }
+
+    impl Pictures {
+        /// Starts it, and says where it listens.
+        fn start() -> (Self, std::net::SocketAddr) {
+            let pictures = Self {
+                asked: Arc::default(),
+                unanswered: Arc::default(),
+                failing: Arc::default(),
+                held: Arc::new(tokio::sync::watch::Sender::new(HashSet::new())),
+            };
+            let rt = crate::net::rt();
+            let bound = rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                Ok::<_, std::io::Error>((listener.local_addr()?, listener))
+            });
+            assert!(bound.is_ok(), "no port for the pictures");
+            let Ok((address, listener)) = bound else {
+                return (pictures, std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+            };
+            let serving = pictures.clone();
+            rt.spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(serving.clone().serve(stream));
+                }
+            });
+            (pictures, address)
+        }
+
+        /// Answers each request on one connection, kept alive.
+        async fn serve(self, stream: tokio::net::TcpStream) {
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            loop {
+                let mut first = String::new();
+                if read.read_line(&mut first).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                loop {
+                    let mut header = String::new();
+                    if read.read_line(&mut header).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if header == "\r\n" {
+                        break;
+                    }
+                }
+                // `GET /v1/art/{art}/{size}?token= HTTP/1.1`
+                let path = first.split(' ').nth(1).unwrap_or_default();
+                let path = path.split('?').next().unwrap_or_default();
+                let mut parts = path.rsplit('/');
+                let size: u32 = parts.next().and_then(|size| size.parse().ok()).unwrap_or(0);
+                let art = parts.next().unwrap_or_default().to_owned();
+                // What it answers is settled as the request comes, before
+                // it is counted: a test that sees it counted can change
+                // what the next is answered.
+                let (status, body) = if art == NONE.to_string() {
+                    ("404 Not Found", Vec::new())
+                } else if lock(&self.failing).contains(&size) {
+                    ("503 Service Unavailable", Vec::new())
+                } else {
+                    ("200 OK", jpeg())
+                };
+                let mut held = self.held.subscribe();
+                self.unanswered.fetch_add(1, Ordering::SeqCst);
+                *lock(&self.asked).entry((art.clone(), size)).or_default() += 1;
+                let _ = held.wait_for(|held| !held.contains(&size)).await;
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let sent = write.write_all(head.as_bytes()).await.is_ok()
+                    && write.write_all(&body).await.is_ok();
+                self.unanswered.fetch_sub(1, Ordering::SeqCst);
+                if !sent {
+                    return;
+                }
+            }
+        }
+
+        fn fail(&self, sizes: &[u32]) {
+            *lock(&self.failing) = sizes.iter().copied().collect();
+        }
+
+        fn hold(&self, sizes: &[u32]) {
+            self.held.send_replace(sizes.iter().copied().collect());
+        }
+
+        /// How often `art` was asked for at `size`.
+        fn asked(&self, art: Id, size: u32) -> usize {
+            lock(&self.asked)
+                .get(&(art.to_string(), size))
+                .copied()
+                .unwrap_or(0)
+        }
+
+        fn all(&self) -> usize {
+            lock(&self.asked).values().sum()
+        }
+    }
+
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A small square picture, as the server makes them.
+    fn jpeg() -> Vec<u8> {
+        let picture = image::RgbImage::from_pixel(64, 64, image::Rgb([180, 110, 70]));
+        let mut bytes = Vec::new();
+        let encoded = image::codecs::jpeg::JpegEncoder::new(&mut bytes).encode_image(&picture);
+        assert!(encoded.is_ok(), "the picture could not be made");
+        bytes
+    }
+
+    /// A session with the artist's page to read, whose picture is `art`,
+    /// on a satellite whose hub answers or not, reading pictures from
+    /// `pictures`.
+    fn session(art: Id, answers: bool, pictures: std::net::SocketAddr) -> Net {
+        let (send, mut calls) = tokio::sync::mpsc::channel::<String>(64);
+        let (answer, receive) = tokio::sync::mpsc::channel(64);
+        let _runtime = crate::net::rt().enter();
+        let client = Arc::new(ritornel_client::Client::over_memory(send, receive));
+        crate::net::rt().spawn(async move {
+            while let Some(text) = calls.recv().await {
+                let Ok(ritornel_contract::Frame::Request(request)) =
+                    ritornel_contract::Frame::decode(&text)
+                else {
+                    continue;
+                };
+                let outcome = match request.method.as_str() {
+                    "artist.get" => Ok(json!({
+                        "artistId": ARTIST.to_string(),
+                        "name": "Invented Artist",
+                        "sortName": null,
+                        "albumCount": 0,
+                        "trackCount": 0,
+                        "artId": art.to_string(),
+                        "portrait": true,
+                        "artColor": null,
+                        "libraryRevision": 1,
+                    })),
+                    "list.open" => Ok(json!({
+                        "view": "view", "total": 0, "libraryRevision": 1, "offset": 0, "rows": [],
+                    })),
+                    "list.sections" => Ok(json!({ "sections": [] })),
+                    "list.close" => Ok(json!({ "closed": true })),
+                    _ => Err(ritornel_contract::RpcError::new(
+                        ritornel_contract::ErrorCode::Unsupported,
+                        "not in this test",
+                    )),
+                };
+                let frame = ritornel_contract::Frame::Response(ritornel_contract::Response {
+                    id: Some(request.id),
+                    outcome,
+                });
+                if answer.send(frame.encode()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Net::satellite(client, answers).with_art(pictures, SIZES.to_vec())
+    }
+
+    /// The artist's page in a window, and the link it follows.
+    fn open(
+        net: Net,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Artist>, Entity<Link>, &mut gpui::VisualTestContext) {
+        // The pictures come from the app's own network runtime, as they do
+        // when it runs: from another thread. The clock stays the test's.
+        cx.executor().allow_parking();
+        let link = cx.update(crate::link::unlinked);
+        let followed = link.clone();
+        let (page, cx) = cx.add_window_view(move |_, cx| {
+            let player = cx.new(|cx| Player::new(&followed, cx));
+            Artist::new(
+                Arc::new(net),
+                &followed,
+                player,
+                ARTIST,
+                "Invented Artist".into(),
+                cx,
+            )
+        });
+        (page, link, cx)
+    }
+
+    /// Runs the window until `done` holds of the page.
+    fn until(
+        page: &Entity<Artist>,
+        cx: &mut gpui::VisualTestContext,
+        what: &str,
+        done: impl Fn(&Artist) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < deadline, "the page never {what}");
+            cx.run_until_parked();
+            if page.read_with(cx, |page, _| done(page)) {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Runs the window until every picture asked for has come back to the
+    /// page and been taken in.
+    fn settle(page: &Entity<Artist>, pictures: &Pictures, cx: &mut gpui::VisualTestContext) {
+        until(page, cx, "took in its pictures", |page| {
+            page.pictures_in_flight == 0 && pictures.unanswered.load(Ordering::SeqCst) == 0
+        });
+    }
+
+    /// A minute of the test clock, a frame drawn each second, and whatever
+    /// the page asked meanwhile taken in.
+    fn wait_a_minute(page: &Entity<Artist>, pictures: &Pictures, cx: &mut gpui::VisualTestContext) {
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.update(|window, _| window.refresh());
+            settle(page, pictures, cx);
+        }
+    }
+
+    fn say(link: &Entity<Link>, net: Net, cx: &mut gpui::VisualTestContext) {
+        link.update(cx, |_, cx| cx.emit(LinkEvent::Restated(Arc::new(net))));
+        cx.update(|window, _| window.refresh());
+    }
+
+    /// Whether the page shows their face as read, not soft colour.
+    fn face_read(page: &Artist) -> bool {
+        page.face
+            .as_ref()
+            .is_some_and(|face| !theme::soft_holds(face))
+    }
+
+    fn unread(face: bool, portrait: bool, blurs: bool) -> Unread {
+        Unread {
+            face,
+            portrait,
+            blurs,
+        }
+    }
+
+    #[gpui::test]
+    fn pictures_that_failed_while_the_hub_was_away_are_read_again_once(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (pictures, address) = Pictures::start();
+        // The hub is away: the portrait and the blurs fail, the face is read.
+        pictures.fail(&[PORTRAIT, BLURS]);
+        let (page, link, cx) = open(session(PICTURE, false, address), cx);
+        until(&page, cx, "asked for its pictures", |_| pictures.all() == 3);
+        settle(&page, &pictures, cx);
+        assert_eq!(
+            page.read_with(cx, |page, _| page.unread),
+            unread(false, true, true)
+        );
+        wait_a_minute(&page, &pictures, cx);
+        assert_eq!(pictures.all(), 3);
+
+        // Back: the two that failed are asked for again, once; the face,
+        // which was read, is not, and stays.
+        pictures.fail(&[]);
+        say(&link, session(PICTURE, true, address), cx);
+        wait_a_minute(&page, &pictures, cx);
+        assert_eq!(pictures.asked(PICTURE, FACE), 1);
+        assert_eq!(pictures.asked(PICTURE, PORTRAIT), 2);
+        assert_eq!(pictures.asked(PICTURE, BLURS), 2);
+        let (shown, failed, left) = page.read_with(cx, |page, _| {
+            (
+                face_read(page) && page.portrait.is_some(),
+                page.picture_failed,
+                page.unread,
+            )
+        });
+        assert!(shown && !failed);
+        assert_eq!(left, Unread::default());
+
+        // Away and back again with every picture read: nothing is asked.
+        say(&link, session(PICTURE, false, address), cx);
+        say(&link, session(PICTURE, true, address), cx);
+        wait_a_minute(&page, &pictures, cx);
+        assert_eq!(pictures.all(), 5);
+    }
+
+    #[gpui::test]
+    fn a_picture_that_fails_again_is_asked_for_once_each_return(cx: &mut gpui::TestAppContext) {
+        let (pictures, address) = Pictures::start();
+        pictures.fail(&[FACE, PORTRAIT, BLURS]);
+        let (page, link, cx) = open(session(PICTURE, false, address), cx);
+        until(&page, cx, "asked for its pictures", |_| pictures.all() == 3);
+        settle(&page, &pictures, cx);
+        assert_eq!(
+            page.read_with(cx, |page, _| page.unread),
+            unread(true, true, true)
+        );
+
+        // Back, but the pictures still fail: each is asked for once, and
+        // not again however long the page waits.
+        say(&link, session(PICTURE, true, address), cx);
+        wait_a_minute(&page, &pictures, cx);
+        assert_eq!(pictures.all(), 6);
+        assert_eq!(
+            page.read_with(cx, |page, _| page.unread),
+            unread(true, true, true)
+        );
+
+        // Away and back once more, and they are read.
+        pictures.fail(&[]);
+        say(&link, session(PICTURE, false, address), cx);
+        say(&link, session(PICTURE, true, address), cx);
+        wait_a_minute(&page, &pictures, cx);
+        for size in [FACE, PORTRAIT, BLURS] {
+            assert_eq!(pictures.asked(PICTURE, size), 3);
+        }
+        let shown = page.read_with(cx, |page, _| face_read(page) && page.portrait.is_some());
+        assert!(shown);
+    }
+
+    #[gpui::test]
+    fn a_read_that_fails_after_the_hub_is_back_is_asked_for_again(cx: &mut gpui::TestAppContext) {
+        let (pictures, address) = Pictures::start();
+        // The portrait's read is under way as the hub comes back, and fails
+        // after: it was asked of the hub that went.
+        pictures.fail(&[PORTRAIT]);
+        pictures.hold(&[PORTRAIT]);
+        let (page, link, cx) = open(session(PICTURE, false, address), cx);
+        until(&page, cx, "asked for its pictures", |page| {
+            pictures.all() == 3 && page.pictures_in_flight == 1
+        });
+        say(&link, session(PICTURE, true, address), cx);
+        cx.run_until_parked();
+        pictures.fail(&[]);
+        pictures.hold(&[]);
+        until(&page, cx, "read its portrait", |page| {
+            page.portrait.is_some()
+        });
+        settle(&page, &pictures, cx);
+        assert_eq!(pictures.asked(PICTURE, PORTRAIT), 2);
+        assert_eq!(pictures.all(), 4);
+    }
+
+    #[gpui::test]
+    fn a_picture_the_server_has_none_of_is_not_asked_for_again(cx: &mut gpui::TestAppContext) {
+        let (pictures, address) = Pictures::start();
+        let (page, link, cx) = open(session(NONE, true, address), cx);
+        until(&page, cx, "asked for its pictures", |_| pictures.all() == 3);
+        settle(&page, &pictures, cx);
+        assert_eq!(page.read_with(cx, |page, _| page.unread), Unread::default());
+        for _ in 0..3 {
+            say(&link, session(NONE, false, address), cx);
+            say(&link, session(NONE, true, address), cx);
+            wait_a_minute(&page, &pictures, cx);
+        }
+        assert_eq!(pictures.all(), 3);
     }
 }

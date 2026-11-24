@@ -47,6 +47,11 @@ const KEEP_PAGES: usize = 200;
 /// wall of no more changes; a wall with its rows all read uses it no more.
 const KEEP_VIEW: Duration = Duration::from_secs(4 * 60);
 const PAGES_IN_FLIGHT: usize = 4;
+/// After a read fails, nothing more is read for this long, doubled with each
+/// failure in a row up to `RETRY_MOST`: a server that answers every read with
+/// an error is asked a few times a minute, not once a frame.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MOST: Duration = Duration::from_secs(30);
 /// Decoded covers kept, in bytes of pixels. GPUI's sprite atlas holds a
 /// second copy of each on the GPU. `RITORNEL_GPUI_COVER_MB` overrides it,
 /// for measuring.
@@ -242,6 +247,8 @@ impl TileRow {
 
 enum Page {
     Loading,
+    /// Could not be read: asked for again once the wait after it ends.
+    Failed,
     Ready {
         rows: Vec<Option<Arc<TileRow>>>,
         used: u64,
@@ -373,6 +380,13 @@ pub(crate) struct Wall {
     replacing: Option<gpui::Task<()>>,
     last_replace: Option<Instant>,
     replace_again: bool,
+    /// A replacement that failed, tried again when the wait after it ends.
+    replace_failed: bool,
+    /// The wait after a read failed, while it lasts: nothing is read
+    /// meanwhile. Its end asks again for what failed.
+    retrying: Option<gpui::Task<()>>,
+    /// Reads failed in a row, for how long the next wait is.
+    failures: u32,
     /// After a replacement, the row to keep where it was on screen.
     pending_anchor: Option<(usize, f32)>,
     /// Bumped with each open or replacement of the view, and whenever the
@@ -493,6 +507,9 @@ impl Wall {
             replacing: None,
             last_replace: None,
             replace_again: false,
+            replace_failed: false,
+            retrying: None,
+            failures: 0,
             pending_anchor: None,
             opening: 0,
             heard_revision: 0,
@@ -573,11 +590,12 @@ impl Wall {
     /// when the session began is opened at once.
     fn restated(&mut self, net: Arc<Net>, cx: &mut Context<Self>) {
         let opens = net.holds && !self.net.as_ref().is_some_and(|held| held.holds);
-        // The hub is back: a wall its absence kept from being read is read.
-        let back = self.failed && self.failed_for_hub && crate::away::away(&net).is_none();
+        // The hub is back: what its absence kept from being read is read.
+        let back = crate::away::away(&net).is_none()
+            && (self.hub_away() || (self.failed && self.failed_for_hub));
         if back {
             self.net = Some(net);
-            self.try_again(cx);
+            self.resume(cx);
             return;
         }
         if opens {
@@ -586,6 +604,73 @@ impl Wall {
             self.net = Some(net);
             cx.notify();
         }
+    }
+
+    /// The hub is back, once: a wall that could not be opened is opened, and
+    /// a view held through the hub, which went with it, is replaced, keeping
+    /// the row at the top where it is. What failed is asked for again.
+    fn resume(&mut self, cx: &mut Context<Self>) {
+        self.retrying = None;
+        self.failures = 0;
+        self.pages.retain(|_, page| !matches!(page, Page::Failed));
+        // Not opened, or still opening through the hub that went: opened
+        // again, and an answer to the open before is let go.
+        let holds = self.net.as_ref().is_some_and(|net| net.holds);
+        if self.failed || (self.view.is_none() && holds) {
+            self.try_again(cx);
+            return;
+        }
+        if self.view.is_some() {
+            // A replacement asked before the hub went is let go: its view,
+            // if it comes, went with the hub too.
+            self.opening += 1;
+            self.replacing = None;
+            self.replace_again = false;
+            self.replace_failed = false;
+            self.lost = true;
+            self.schedule_replace(cx);
+        }
+        cx.notify();
+    }
+
+    /// Whether the satellite's hub is away: nothing is read through it
+    /// until it is back, when the wall resumes.
+    fn hub_away(&self) -> bool {
+        self.net
+            .as_deref()
+            .is_some_and(|net| crate::away::away(net).is_some())
+    }
+
+    /// Whether reads wait: for the hub, or for the wait after a failure.
+    fn held_back(&self) -> bool {
+        self.hub_away() || self.retrying.is_some()
+    }
+
+    /// A read failed: nothing is read until a wait ends, longer after each
+    /// failure in a row. Then what failed is asked for again.
+    fn wait_to_retry(&mut self, cx: &mut Context<Self>) {
+        if self.retrying.is_some() {
+            return;
+        }
+        let wait = RETRY_FIRST
+            .saturating_mul(1 << self.failures.min(5))
+            .min(RETRY_MOST);
+        self.failures += 1;
+        self.retrying = Some(cx.spawn(async move |wall, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = wall.update(cx, |wall, cx| {
+                wall.retrying = None;
+                // Away, the hub's return asks again instead.
+                if wall.hub_away() {
+                    return;
+                }
+                wall.pages.retain(|_, page| !matches!(page, Page::Failed));
+                if std::mem::take(&mut wall.replace_failed) {
+                    wall.schedule_replace(cx);
+                }
+                cx.notify();
+            });
+        }));
     }
 
     /// The session ended: what was read is let go, and the covers already
@@ -612,7 +697,11 @@ impl Wall {
         self.selected = None;
         self.reveal_at = None;
         self.replace_again = false;
+        self.replace_failed = false;
         self.pending_anchor = None;
+        // A wait after failures is the old view's.
+        self.retrying = None;
+        self.failures = 0;
     }
 
     /// How the wall is laid out: under headings of time for a date, else
@@ -711,7 +800,7 @@ impl Wall {
                 .iter()
                 .position(|row| row.as_ref().is_some_and(|row| row.id == id))
                 .map(|at| page * PAGE + at),
-            Page::Loading => None,
+            Page::Loading | Page::Failed => None,
         })
     }
 
@@ -1207,6 +1296,9 @@ impl Wall {
         let (Some(view), Some(net)) = (self.view_id().map(str::to_owned), self.net.clone()) else {
             return;
         };
+        if self.held_back() {
+            return;
+        }
         let client = Arc::clone(&net.client);
         let asked_of = view.clone();
         let read = net.rt().spawn(async move {
@@ -1255,6 +1347,13 @@ impl Wall {
             self.replacing = None;
             return;
         };
+        // Away, the hub's return replaces the view; after a failure, the
+        // wait's end does.
+        if self.held_back() {
+            self.replacing = None;
+            self.replace_failed = true;
+            return;
+        }
         // Not laid out yet, empty or never drawn, there is no row to keep in
         // place: the view is opened afresh.
         let Some(layout) = self.layout.clone() else {
@@ -1393,9 +1492,13 @@ impl Wall {
                     if wall.heard_revision > wall.revision {
                         wall.replace_again = true;
                     }
+                    wall.retrying = None;
+                    wall.failures = 0;
                 } else {
-                    // Not opened or not read: asked again, a second on at the soonest.
-                    wall.replace_again = true;
+                    // Not opened or not read: asked again after a wait.
+                    wall.replace_again = false;
+                    wall.replace_failed = true;
+                    wall.wait_to_retry(cx);
                 }
                 if std::mem::take(&mut wall.replace_again) {
                     wall.schedule_replace(cx);
@@ -1412,6 +1515,9 @@ impl Wall {
         let (Some(view), Some(net)) = (self.view_id().map(str::to_owned), self.net.clone()) else {
             return;
         };
+        if self.hub_away() {
+            return;
+        }
         let asked_of = view.clone();
         let client = Arc::clone(&net.client);
         let read = net
@@ -1461,6 +1567,14 @@ impl Wall {
 
     fn open(&mut self, cx: &mut Context<Self>) {
         let Some(net) = self.net.clone() else { return };
+        // Away, the hub is not asked: the wall says why in its place, and
+        // is opened when the hub is back.
+        if self.hub_away() {
+            self.failed = true;
+            self.failed_for_hub = true;
+            cx.notify();
+            return;
+        }
         let client = Arc::clone(&net.client);
         let kind = match self.kind {
             WallKind::Artists => ListKind::Artists,
@@ -1518,6 +1632,8 @@ impl Wall {
                         wall.reveal_at = None;
                         wall.view = Some(held);
                         wall.lost = false;
+                        wall.retrying = None;
+                        wall.failures = 0;
                         wall.layout = None;
                         // The library changed while it was opening.
                         if wall.heard_revision > wall.revision {
@@ -1564,7 +1680,7 @@ impl Wall {
         let (Some(view), Some(net)) = (self.view_id().map(str::to_owned), self.net.clone()) else {
             return;
         };
-        if self.lost {
+        if self.lost || self.held_back() {
             return;
         }
         self.pages.insert(page, Page::Loading);
@@ -1594,18 +1710,23 @@ impl Wall {
                                 used: frame,
                             },
                         );
+                        wall.failures = 0;
                         wall.evict_pages();
                     }
                     // Unused for long, the view was let go by the server: one
                     // opened in its place keeps the row at the top where it is.
-                    answer => {
+                    answer if expired(&answer) => {
                         wall.pages.remove(&page);
-                        if expired(&answer) {
-                            wall.lost = true;
-                            if wall.replacing.is_none() {
-                                wall.schedule_replace(cx);
-                            }
+                        wall.lost = true;
+                        if wall.replacing.is_none() {
+                            wall.schedule_replace(cx);
                         }
+                    }
+                    // Any other failure, the hub's absence among them: the
+                    // page waits, and so does every other read.
+                    _ => {
+                        wall.pages.insert(page, Page::Failed);
+                        wall.wait_to_retry(cx);
                     }
                 }
                 cx.notify();
@@ -1624,7 +1745,7 @@ impl Wall {
             .iter()
             .filter_map(|(page, held)| match held {
                 Page::Ready { used, .. } => Some((*used, *page)),
-                Page::Loading => None,
+                Page::Loading | Page::Failed => None,
             })
             .collect();
         old.sort_unstable();
@@ -2943,5 +3064,310 @@ mod tests {
         assert_eq!(empty_words(Some(0)).0, "Your library is empty.");
         assert_eq!(empty_words(None).0, "Your library is empty.");
         assert_eq!(empty_words(Some(12)).0, "No albums yet.");
+    }
+
+    /// A server in memory with a list of `ROWS` artists for the wall. It
+    /// counts each call by method, and while `failing` is set it answers
+    /// each window with an error, as a satellite does whose hub has gone.
+    #[derive(Clone, Default)]
+    struct Fake {
+        calls: Arc<Mutex<HashMap<String, usize>>>,
+        /// Calls received and not yet answered.
+        unanswered: Arc<std::sync::atomic::AtomicUsize>,
+        failing: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    const ROWS: u64 = 1_000;
+    const PAGES: usize = ROWS as usize / PAGE;
+
+    fn artists(offset: u64, limit: u64) -> Vec<Row> {
+        (offset..(offset + limit).min(ROWS))
+            .map(|index| {
+                let mut id = [0; 16];
+                id[..8].copy_from_slice(&index.to_be_bytes());
+                Row::Artist(ritornel_contract::ArtistRow {
+                    artist_id: Id::from_bytes(id),
+                    name: Some(format!("Invented Artist {index:04}")),
+                    sort_name: None,
+                    album_count: 1,
+                    track_count: 1,
+                    art_id: None,
+                    portrait: false,
+                })
+            })
+            .collect()
+    }
+
+    impl Fake {
+        /// A client of it, on the app's network runtime.
+        fn client(&self) -> Arc<ritornel_client::Client> {
+            let (send, mut calls) = mpsc::channel::<String>(64);
+            let (answers, receive) = mpsc::channel(64);
+            let _runtime = crate::net::rt().enter();
+            let client = Arc::new(ritornel_client::Client::over_memory(send, receive));
+            let fake = self.clone();
+            crate::net::rt().spawn(async move {
+                let mut views = 0;
+                while let Some(text) = calls.recv().await {
+                    fake.unanswered.fetch_add(1, Ordering::SeqCst);
+                    let Ok(ritornel_contract::Frame::Request(request)) =
+                        ritornel_contract::Frame::decode(&text)
+                    else {
+                        continue;
+                    };
+                    *fake.lock().entry(request.method.clone()).or_default() += 1;
+                    let outcome = fake.answer(&request, &mut views);
+                    let frame = ritornel_contract::Frame::Response(ritornel_contract::Response {
+                        id: Some(request.id),
+                        outcome,
+                    });
+                    if answers.send(frame.encode()).await.is_err() {
+                        return;
+                    }
+                    fake.unanswered.fetch_sub(1, Ordering::SeqCst);
+                }
+            });
+            client
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        fn answer(
+            &self,
+            request: &ritornel_contract::Request,
+            views: &mut usize,
+        ) -> Result<Value, ritornel_contract::RpcError> {
+            let number = |name: &str| {
+                request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.pointer(name))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            };
+            let answer = match request.method.as_str() {
+                "list.open" => {
+                    *views += 1;
+                    let offset = number("/window/offset");
+                    serde_json::to_value(ritornel_contract::ListOpened {
+                        view: format!("view {views}"),
+                        total: ROWS,
+                        library_revision: 1,
+                        offset,
+                        rows: artists(offset, number("/window/limit")),
+                        anchor_index: None,
+                    })
+                }
+                "list.window" if self.failing.load(Ordering::SeqCst) => {
+                    return Err(ritornel_contract::RpcError::new(
+                        ritornel_contract::ErrorCode::Unavailable,
+                        "Studio Mac does not answer",
+                    )
+                    .with_detail("reason", "hub_unreachable"));
+                }
+                "list.window" => {
+                    let offset = number("/offset");
+                    serde_json::to_value(ritornel_contract::ListWindow {
+                        view: String::new(),
+                        offset,
+                        rows: artists(offset, number("/limit")),
+                    })
+                }
+                "list.sections" => Ok(json!({ "sections": [] })),
+                "list.close" => Ok(json!({ "closed": true })),
+                "list.locate" => Ok(json!({ "index": null })),
+                _ => {
+                    return Err(ritornel_contract::RpcError::new(
+                        ritornel_contract::ErrorCode::Unsupported,
+                        "not in this test",
+                    ));
+                }
+            };
+            answer.map_err(|error| {
+                ritornel_contract::RpcError::new(
+                    ritornel_contract::ErrorCode::Internal,
+                    error.to_string(),
+                )
+            })
+        }
+
+        fn asked(&self, method: &str) -> usize {
+            self.lock().get(method).copied().unwrap_or(0)
+        }
+    }
+
+    use gpui::AppContext as _;
+    use std::sync::atomic::Ordering;
+
+    /// A wall in a window, reading through `net`.
+    fn wall(
+        net: Net,
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<Wall>, &mut gpui::VisualTestContext) {
+        // The answers come on the app's own network runtime, as they do
+        // when it runs: from another thread. The clock stays the test's.
+        cx.executor().allow_parking();
+        let (wall, cx) = cx.add_window_view(|_, cx| {
+            let link = crate::link::unlinked(cx);
+            let player = cx.new(|cx| crate::player::Player::new(&link, cx));
+            Wall::new(link, player, 1., cx)
+        });
+        wall.update(cx, |wall, cx| wall.start(Arc::new(net), cx));
+        (wall, cx)
+    }
+
+    /// The most windows a test lets the wall ask for: a wall that asks
+    /// again and again is caught at this, not waited on for ever.
+    const RUNAWAY: usize = 60;
+
+    /// Runs the window until `done` holds of the wall and every call the
+    /// server has had is answered and taken in.
+    fn until(
+        wall: &gpui::Entity<Wall>,
+        fake: &Fake,
+        cx: &mut gpui::VisualTestContext,
+        done: impl Fn(&Wall) -> bool,
+    ) {
+        // A wall that stops asking for good is caught too.
+        let began = Instant::now();
+        loop {
+            assert!(
+                began.elapsed() < Duration::from_secs(60),
+                "the wall never settled"
+            );
+            cx.run_until_parked();
+            let (settled, held) = wall.read_with(cx, |wall, _| (done(wall), wall.pages_in_flight));
+            let quiet = held == 0 && fake.unanswered.load(Ordering::SeqCst) == 0;
+            assert!(
+                fake.asked("list.window") <= RUNAWAY,
+                "the wall keeps asking"
+            );
+            if settled && quiet {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Draws `frames` frames, as a window does while anything on it moves,
+    /// and takes in whatever the wall asked meanwhile.
+    fn draw(
+        wall: &gpui::Entity<Wall>,
+        fake: &Fake,
+        frames: usize,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        for _ in 0..frames {
+            cx.update(|window, _| window.refresh());
+            until(wall, fake, cx, |_| true);
+        }
+    }
+
+    fn read(wall: &Wall) -> usize {
+        wall.pages
+            .values()
+            .filter(|page| matches!(page, Page::Ready { .. }))
+            .count()
+    }
+
+    #[gpui::test]
+    fn a_wall_whose_windows_fail_asks_again_only_after_waits_that_grow(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Fake::default();
+        fake.failing.store(true, Ordering::SeqCst);
+        let (wall, cx) = wall(Net::satellite(fake.client(), true), cx);
+        until(&wall, &fake, cx, |wall| wall.failures > 0);
+        let first = fake.asked("list.window");
+        assert!((1..=PAGES_IN_FLIGHT).contains(&first), "{first}");
+        // Frame after frame, nothing more is asked while the wait lasts.
+        draw(&wall, &fake, 60, cx);
+        assert_eq!(fake.asked("list.window"), first);
+
+        // A minute: asked again after 1, 2, 4, 8 and 16 seconds, at most
+        // a few windows each time.
+        for _ in 0..60 {
+            cx.executor().advance_clock(Duration::from_secs(1));
+            draw(&wall, &fake, 1, cx);
+        }
+        let minute = fake.asked("list.window");
+        assert!(minute <= first + 5 * PAGES_IN_FLIGHT, "{minute}");
+        assert_eq!(wall.read_with(cx, |wall, _| wall.failures), 6);
+
+        // The server answers again: after the wait, every page is read.
+        fake.failing.store(false, Ordering::SeqCst);
+        cx.executor().advance_clock(RETRY_MOST);
+        until(&wall, &fake, cx, |wall| read(wall) == PAGES);
+        assert_eq!(fake.asked("list.open"), 1);
+    }
+
+    #[gpui::test]
+    fn while_the_hub_is_away_the_wall_reads_nothing_and_resumes_once_when_it_is_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fake = Fake::default();
+        let client = fake.client();
+        let (wall, cx) = wall(Net::satellite(Arc::clone(&client), true), cx);
+        // The hub goes as the wall opens.
+        wall.update(cx, |wall, cx| {
+            wall.restated(Arc::new(Net::satellite(Arc::clone(&client), false)), cx)
+        });
+        until(&wall, &fake, cx, |wall| wall.view.is_some());
+        draw(&wall, &fake, 60, cx);
+        cx.executor().advance_clock(Duration::from_secs(60));
+        draw(&wall, &fake, 1, cx);
+        assert_eq!(fake.asked("list.window"), 0);
+        assert_eq!(fake.asked("list.open"), 1);
+
+        // Back: the view, gone with the hub, is replaced once, and the
+        // rest of the wall is read.
+        let back = || Arc::new(Net::satellite(Arc::clone(&client), true));
+        wall.update(cx, |wall, cx| wall.restated(back(), cx));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        until(&wall, &fake, cx, |wall| {
+            read(wall) == PAGES && wall.replacing.is_none()
+        });
+        assert_eq!(fake.asked("list.open"), 2);
+        assert_eq!(fake.asked("list.window"), PAGES - 1);
+
+        // Told again that it answers, the wall asks nothing more.
+        wall.update(cx, |wall, cx| wall.restated(back(), cx));
+        cx.executor().advance_clock(Duration::from_secs(5));
+        draw(&wall, &fake, 10, cx);
+        assert_eq!(fake.asked("list.open"), 2);
+        assert_eq!(fake.asked("list.window"), PAGES - 1);
+    }
+
+    #[gpui::test]
+    fn another_wall_chosen_after_failures_is_read_at_once(cx: &mut gpui::TestAppContext) {
+        let fake = Fake::default();
+        fake.failing.store(true, Ordering::SeqCst);
+        let (wall, cx) = wall(Net::satellite(fake.client(), true), cx);
+        until(&wall, &fake, cx, |wall| wall.failures > 0);
+        // The server answers again; the wait is the old wall's, not the new one's.
+        fake.failing.store(false, Ordering::SeqCst);
+        wall.update(cx, |wall, cx| wall.choose(WallKind::Albums, None, cx));
+        until(&wall, &fake, cx, |wall| read(wall) == PAGES);
+        assert_eq!(fake.asked("list.open"), 2);
+    }
+
+    #[gpui::test]
+    fn a_wall_opened_while_the_hub_is_away_waits_for_it(cx: &mut gpui::TestAppContext) {
+        let fake = Fake::default();
+        let client = fake.client();
+        let (wall, cx) = wall(Net::satellite(Arc::clone(&client), false), cx);
+        draw(&wall, &fake, 10, cx);
+        let waiting = wall.read_with(cx, |wall, _| wall.failed && wall.failed_for_hub);
+        assert!(waiting);
+        assert_eq!(fake.asked("list.open"), 0);
+
+        let back = Arc::new(Net::satellite(Arc::clone(&client), true));
+        wall.update(cx, |wall, cx| wall.restated(back, cx));
+        until(&wall, &fake, cx, |wall| read(wall) == PAGES);
+        assert_eq!(fake.asked("list.open"), 1);
     }
 }

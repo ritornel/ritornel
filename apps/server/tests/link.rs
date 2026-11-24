@@ -1670,6 +1670,8 @@ async fn a_satellites_clients_hear_when_the_hub_goes_and_comes_back() {
 struct Relay {
     address: std::net::SocketAddr,
     holding: Arc<std::sync::atomic::AtomicBool>,
+    /// Everything the hub has sent through it, on every connection.
+    heard: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl Relay {
@@ -1679,6 +1681,8 @@ impl Relay {
         let address = listener.local_addr().unwrap();
         let holding = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let held = Arc::clone(&holding);
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hearing = Arc::clone(&heard);
         tokio::spawn(async move {
             while let Ok((satellite, _)) = listener.accept().await {
                 let Ok(hub) = tokio::net::TcpStream::connect(hub).await else {
@@ -1690,6 +1694,7 @@ impl Relay {
                     let _ = tokio::io::copy(&mut from_satellite, &mut to_hub).await;
                 });
                 let held = Arc::clone(&held);
+                let hearing = Arc::clone(&hearing);
                 tokio::spawn(async move {
                     let mut chunk = vec![0; 16 * 1024];
                     while let Ok(read @ 1..) = from_hub.read(&mut chunk).await {
@@ -1698,6 +1703,7 @@ impl Relay {
                             // long as the test says.
                             tokio::time::sleep(Duration::from_millis(20)).await;
                         }
+                        hearing.lock().unwrap().extend_from_slice(&chunk[..read]);
                         if to_satellite.write_all(&chunk[..read]).await.is_err() {
                             return;
                         }
@@ -1705,7 +1711,21 @@ impl Relay {
                 });
             }
         });
-        Self { address, holding }
+        Self {
+            address,
+            holding,
+            heard,
+        }
+    }
+
+    /// How many of the hub's library events have come through it.
+    fn library_events(&self) -> usize {
+        let heard = self.heard.lock().unwrap();
+        let topic = br#""topic":"library""#;
+        heard
+            .windows(topic.len())
+            .filter(|seen| seen == topic)
+            .count()
     }
 
     fn hold(&self, holding: bool) {
@@ -1814,6 +1834,140 @@ async fn a_satellite_stops_in_time_while_its_hub_does_not_answer_and_its_listens
         delivered(&scratch).await;
         assert_eq!(at_hub(&scratch, id).len(), 2);
         assert_eq!(staged(&scratch), 0);
+    })
+    .await;
+}
+
+/// Rates the first song at the hub, as any client of the hub may.
+async fn rate(hub_client: &Client, rating: u32) {
+    let Row::Song(song) = hub_client.list_open(&songs()).await.unwrap().rows[0].clone() else {
+        panic!("not a song");
+    };
+    hub_client
+        .call::<RatingsSet>(&RatingSetParams {
+            idempotency_key: key(),
+            recording_id: song.recording_id,
+            rating: Some(rating),
+        })
+        .await
+        .unwrap();
+}
+
+/// Waits for a `servers` event after which the satellite says its hub
+/// answers, or does not.
+async fn hub_answers(desk_client: &mut Client, answers: bool) {
+    loop {
+        if let Event::Servers(_) = desk_client.next_event().await.unwrap()
+            && desk_client.status().await.unwrap().hub.unwrap().answers == Some(answers)
+        {
+            return;
+        }
+    }
+}
+
+/// A client that only listens hears the hub's events again once the hub
+/// is back from a restart, on the same session and without a call to the
+/// hub in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellites_client_hears_the_hubs_events_again_after_the_hub_restarts() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, _desk, mut desk_client) = linked(&scratch).await;
+        desk_client
+            .subscribe(&[Topic::Library, Topic::Servers])
+            .await
+            .unwrap();
+        rate(&hub_client, 60).await;
+        loop {
+            if let Event::Library(_) = desk_client.next_event().await.unwrap() {
+                break;
+            }
+        }
+
+        let port = hub.endpoint().port();
+        drop(hub_client);
+        hub.stop().await.unwrap();
+        hub_answers(&mut desk_client, false).await;
+        let hub = start_on(&scratch, "hub", Listen::on_port(port)).await;
+        let hub_client = client(&scratch, "hub", &hub).await;
+        hub_answers(&mut desk_client, true).await;
+
+        rate(&hub_client, 80).await;
+        loop {
+            if let Event::Library(_) = desk_client.next_event().await.unwrap() {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
+/// A client that subscribes while the hub is away hears the hub's events
+/// once it is back, without a call to the hub in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellites_client_that_subscribes_while_the_hub_is_away_hears_it_when_back() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, _desk, mut desk_client) = linked(&scratch).await;
+        desk_client.subscribe(&[Topic::Servers]).await.unwrap();
+        let port = hub.endpoint().port();
+        drop(hub_client);
+        hub.stop().await.unwrap();
+        hub_answers(&mut desk_client, false).await;
+
+        desk_client.subscribe(&[Topic::Library]).await.unwrap();
+        let hub = start_on(&scratch, "hub", Listen::on_port(port)).await;
+        let hub_client = client(&scratch, "hub", &hub).await;
+        hub_answers(&mut desk_client, true).await;
+
+        rate(&hub_client, 80).await;
+        loop {
+            if let Event::Library(_) = desk_client.next_event().await.unwrap() {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
+/// A client that unsubscribes from the library's events is no longer sent
+/// them by the hub, not only no longer handed them by the satellite.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_satellites_client_that_unsubscribes_is_unsubscribed_at_the_hub() {
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, mut hub_client, _desk, desk_client) = two(&scratch).await;
+        scan(&scratch, &mut hub_client).await;
+        let relay = Relay::to(hub.endpoint()).await;
+        let link = hub_client
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![relay.address.to_string()],
+            })
+            .await
+            .unwrap()
+            .link;
+        join(&desk_client, &link).await.unwrap();
+        let mut desk_client = desk_client;
+        desk_client.subscribe(&[Topic::Library]).await.unwrap();
+        rate(&hub_client, 60).await;
+        loop {
+            if let Event::Library(_) = desk_client.next_event().await.unwrap() {
+                break;
+            }
+        }
+        let before = relay.library_events();
+        assert!(before >= 1);
+
+        desk_client.unsubscribe(&[Topic::Library]).await.unwrap();
+        rate(&hub_client, 80).await;
+        // The hub answers a session's calls on its connection after the
+        // events it queued for it before: once this is answered, an event
+        // the hub sent for the change has come through the relay.
+        desk_client
+            .call::<LibraryStats>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(relay.library_events(), before);
     })
     .await;
 }

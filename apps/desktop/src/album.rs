@@ -84,6 +84,12 @@ impl PictureRead {
         self.retries = Default::default();
     }
 
+    /// A read that failed is asked again at once, not after its wait. One
+    /// that was read, or that the server has none of, stays as it is.
+    fn retry_now(&mut self) {
+        self.retries = Default::default();
+    }
+
     fn ask(&mut self, art: Id, now: Instant) -> Option<u64> {
         if self.asked || self.retries.waits(art, now) {
             return None;
@@ -169,8 +175,9 @@ impl Album {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // When the library changes, what the page shows is read again, and
-        // through a new session when the server is found again.
+        // When the library changes, what the page shows is read again: through
+        // a new session when the server is found again, and when a
+        // satellite's hub is back.
         let followed = cx.subscribe(link, |page: &mut Self, _, event: &LinkEvent, cx| {
             let plays_only = match event {
                 LinkEvent::Connected(net) => {
@@ -178,6 +185,22 @@ impl Album {
                     page.revision = 0;
                     page.net = Arc::clone(net);
                     page.reset_picture_reads();
+                    page.more_covers.again();
+                    false
+                }
+                // The same session, its hub back: what could not be read
+                // while it was away is read again.
+                LinkEvent::Restated(net) => {
+                    let back = crate::away::back(&page.net, net);
+                    page.net = Arc::clone(net);
+                    if !back {
+                        return;
+                    }
+                    // Only those that failed: one read, or one the server
+                    // has none of, is not asked for again.
+                    page.large_read.retry_now();
+                    page.face_read.retry_now();
+                    page.blur_read.retry_now();
                     page.more_covers.again();
                     false
                 }
@@ -1378,6 +1401,22 @@ mod tests {
         Arc::new(RenderImage::new(vec![image::Frame::new(
             image::RgbaImage::new(1, 1),
         )]))
+    }
+
+    #[test]
+    fn the_hubs_return_asks_again_only_for_a_picture_that_failed() {
+        let art = Id::from_bytes([4; 16]);
+        let now = Instant::now();
+        let read = |result: Result<(), NoArt>| {
+            let mut picture = PictureRead::default();
+            assert!(picture.ask(art, now).is_some());
+            picture.finish(art, &result, now);
+            picture.retry_now();
+            picture.ask(art, now).is_some()
+        };
+        assert!(read(Err(NoArt::Failed)));
+        assert!(!read(Ok(())));
+        assert!(!read(Err(NoArt::Missing)));
     }
 
     #[test]

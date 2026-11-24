@@ -886,9 +886,14 @@ impl Core {
                 Ok(ritornel_contract::Subscriptions { topics })
             }),
             EventsUnsubscribe::NAME => run::<EventsUnsubscribe>(params, |params| {
-                Ok(ritornel_contract::Subscriptions {
-                    topics: session.unsubscribe(&params.topics),
-                })
+                let topics = session.unsubscribe(&params.topics);
+                // The hub's events it no longer follows are not sent to it.
+                if let Some(uplink) = self.uplink()
+                    && let Some(session) = self.shared(session)
+                {
+                    uplink.unsubscribe(&session, &params.topics);
+                }
+                Ok(ritornel_contract::Subscriptions { topics })
             }),
             // Each of these may give the hub a folder to watch.
             LibraryCreate::NAME => run::<LibraryCreate>(params, |params| {
