@@ -6,16 +6,16 @@
 //! One thread watches every music root and picture folder through the
 //! system: FSEvents on macOS, inotify on Linux. Once a folder's changes
 //! settle it queues the ordinary scan job for a music root, which reads only
-//! what changed and writes nothing when nothing did, or imports a picture
-//! folder again. A timer rescans as well, for folders the system says
-//! nothing about, such as a network share, and for what changed while the
-//! hub was not running. Only the hub watches: it is the library's one
-//! writer.
+//! what changed and writes nothing when nothing did, or has a picture folder
+//! imported again on a thread of its own. A timer rescans as well, for
+//! folders the system says nothing about, such as a network share, and for
+//! what changed while the hub was not running. Only the hub watches: it is
+//! the library's one writer.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -44,6 +44,11 @@ pub(crate) const RESCAN_AT_START_AFTER: Duration = Duration::from_secs(60 * 60);
 /// The longest the thread sleeps: how late the timer may be, and how often
 /// a folder that went offline is looked for.
 const IDLE: Duration = Duration::from_secs(60);
+
+/// How many signals wait for the thread at most, and how many it takes in
+/// before it acts on them. What finds the channel full is not kept: every
+/// folder is rescanned instead.
+pub(crate) const SIGNALS: usize = 4096;
 
 /// How this run watches.
 #[derive(Debug, Clone)]
@@ -86,12 +91,61 @@ impl WatchRun {
 pub(crate) enum Signal {
     /// Something changed at these paths.
     Changed(Vec<PathBuf>),
-    /// The system lost track of changes under this path, or anywhere.
-    Lost(Option<PathBuf>, String),
+    /// The system lost track of changes at or above these paths, or
+    /// anywhere if it names none.
+    Lost(Vec<PathBuf>, String),
     /// Look again: the folders, the role or the setting may have changed,
-    /// a scan may have ended, or the server is stopping.
+    /// a scan or an import may have ended, or the server is stopping.
     Wake,
 }
+
+/// Where signals are sent to the watching thread. A signal that finds the
+/// channel full is dropped and noted, so that no sender ever waits on the
+/// thread and what waits for it stays bounded.
+#[derive(Debug, Clone)]
+pub(crate) struct Signals {
+    sender: SyncSender<Signal>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Signals {
+    fn new() -> (Self, Receiver<Signal>) {
+        let (sender, receiver) = mpsc::sync_channel(SIGNALS);
+        let dropped = Arc::new(AtomicBool::new(false));
+        (Self { sender, dropped }, receiver)
+    }
+
+    fn send(&self, signal: Signal) {
+        // The thread has gone only if the server is stopping.
+        if let Err(TrySendError::Full(_)) = self.sender.try_send(signal) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Takes in what reached the thread: the first signal, waiting up to `wait`
+/// for it, then those already there, no more than [`SIGNALS`], so that a
+/// storm of changes never keeps the thread from acting on what it heard.
+/// Whether any signal was dropped since the last time comes with them.
+/// `None` once no one can send.
+fn receive(
+    receiver: &Receiver<Signal>,
+    dropped: &AtomicBool,
+    wait: Duration,
+) -> Option<(Vec<Signal>, bool)> {
+    let mut taken = match receiver.recv_timeout(wait) {
+        Ok(signal) => vec![signal],
+        Err(RecvTimeoutError::Timeout) => Vec::new(),
+        Err(RecvTimeoutError::Disconnected) => return None,
+    };
+    taken.extend(receiver.try_iter().take(SIGNALS - taken.len()));
+    Some((taken, dropped.swap(false, Ordering::SeqCst)))
+}
+
+/// What a folder is known by: its name, and whether it holds pictures. A
+/// picture folder may have a music root's name, as when they are one
+/// folder.
+pub(crate) type Key = (String, bool);
 
 /// A folder the hub watches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +158,10 @@ pub(crate) struct Folder {
 }
 
 impl Folder {
+    pub(crate) fn key(&self) -> Key {
+        (self.name.clone(), self.source.is_none())
+    }
+
     fn kind(&self) -> WatchedKind {
         match self.source {
             Some(_) => WatchedKind::Music,
@@ -124,14 +182,13 @@ pub(crate) trait Backend: Send {
 struct Native(notify::RecommendedWatcher);
 
 impl Native {
-    fn start(signals: Sender<Signal>) -> Result<Self, String> {
+    fn start(signals: Signals) -> Result<Self, String> {
         use notify::event::{AccessKind, AccessMode, EventKind};
         let handler = move |event: notify::Result<notify::Event>| {
             let signal = match event {
-                Ok(event) if event.need_rescan() => Signal::Lost(
-                    event.paths.first().cloned(),
-                    "events were dropped".to_owned(),
-                ),
+                Ok(event) if event.need_rescan() => {
+                    Signal::Lost(event.paths, "events were dropped".to_owned())
+                }
                 // Reads are not changes: the scan and the player open files
                 // all the time.
                 Ok(event)
@@ -141,10 +198,12 @@ impl Native {
                     return;
                 }
                 Ok(event) => Signal::Changed(event.paths),
-                Err(error) => Signal::Lost(error.paths.first().cloned(), error.to_string()),
+                Err(error) => {
+                    let why = error.to_string();
+                    Signal::Lost(error.paths, why)
+                }
             };
-            // The thread has gone only if the server is stopping.
-            let _ = signals.send(signal);
+            signals.send(signal);
         };
         notify::recommended_watcher(handler)
             .map(Self)
@@ -206,9 +265,11 @@ struct Watched {
     first_ms: Option<i64>,
     last_ms: Option<i64>,
     trigger: AutoTrigger,
-    /// A rescan is running that started before the changes: they wait for
-    /// it to end.
+    /// A rescan or an import is running that started before the changes:
+    /// they wait for it to end.
     busy: bool,
+    /// A picture folder's import was asked for and has not ended.
+    importing: bool,
     /// The last import of a picture folder, which is no job.
     imported: Option<AutoRun>,
     /// When the folder was first found. The timer leaves a new one alone a
@@ -254,6 +315,14 @@ impl Watched {
         (self.first_ms, self.last_ms, self.busy) = (None, None, false);
     }
 
+    /// Whether `path` is a folder this one is inside: one removed, moved or
+    /// mounted over takes this one with it.
+    fn below(&self, path: &Path) -> bool {
+        [&self.folder.path, &self.real]
+            .iter()
+            .any(|root| root.starts_with(path) && root.as_path() != path)
+    }
+
     /// Whether `path`, under this folder, is something a walk reads: a
     /// hidden name anywhere on the way is not.
     fn covers(&self, path: &Path) -> bool {
@@ -271,7 +340,9 @@ impl Watched {
 /// not yet taken in. It decides when; [`tick`] acts.
 pub(crate) struct Watch {
     backend: Box<dyn Backend>,
-    folders: BTreeMap<String, Watched>,
+    folders: BTreeMap<Key, Watched>,
+    /// Imports asked for and not yet handed to the thread that imports.
+    imports: Vec<(Folder, AutoTrigger)>,
     quiet_ms: i64,
     longest_ms: i64,
     /// Whether the hub's start has been looked at.
@@ -294,6 +365,7 @@ impl Watch {
         Self {
             backend,
             folders: BTreeMap::new(),
+            imports: Vec::new(),
             quiet_ms: ms(run.quiet),
             longest_ms: ms(run.longest),
             started: false,
@@ -312,33 +384,34 @@ impl Watch {
     /// Takes the folders as they now are: watches new ones, forgets gone
     /// ones, and notices one that went offline or came back.
     pub(crate) fn refresh(&mut self, found: Vec<Folder>, now_ms: i64) {
-        let names: Vec<&str> = found.iter().map(|folder| folder.name.as_str()).collect();
-        let gone: Vec<String> = self
+        let keys: Vec<Key> = found.iter().map(Folder::key).collect();
+        let gone: Vec<Key> = self
             .folders
             .keys()
-            .filter(|name| !names.contains(&name.as_str()))
+            .filter(|key| !keys.contains(key))
             .cloned()
             .collect();
-        for name in gone {
-            if let Some(watched) = self.folders.remove(&name)
+        for key in gone {
+            if let Some(watched) = self.folders.remove(&key)
                 && watched.state == WatchState::Watching
             {
                 self.backend.unwatch(&watched.folder.path);
             }
         }
         for folder in found {
+            let key = folder.key();
             let fresh = self
                 .folders
-                .get(&folder.name)
+                .get(&key)
                 .is_none_or(|watched| watched.folder != folder);
             if fresh {
-                if let Some(old) = self.folders.remove(&folder.name)
+                if let Some(old) = self.folders.remove(&key)
                     && old.state == WatchState::Watching
                 {
                     self.backend.unwatch(&old.folder.path);
                 }
                 self.folders.insert(
-                    folder.name.clone(),
+                    key.clone(),
                     Watched {
                         real: folder.path.clone(),
                         folder: folder.clone(),
@@ -348,6 +421,7 @@ impl Watch {
                         last_ms: None,
                         trigger: AutoTrigger::Change,
                         busy: false,
+                        importing: false,
                         imported: None,
                         seen_ms: now_ms,
                         id: None,
@@ -355,7 +429,7 @@ impl Watch {
                     },
                 );
             }
-            let Some(watched) = self.folders.get_mut(&folder.name) else {
+            let Some(watched) = self.folders.get_mut(&key) else {
                 continue;
             };
             let present = watched.folder.path.is_dir();
@@ -401,47 +475,81 @@ impl Watch {
         }
     }
 
-    /// Takes in what the system said.
-    pub(crate) fn signal(&mut self, signal: Signal, now_ms: i64) {
+    /// Takes in what the system said. It returns whether the folders
+    /// should be looked at again: the system lost track of one, or one may
+    /// have gone with a folder it is inside.
+    pub(crate) fn signal(&mut self, signal: Signal, now_ms: i64) -> bool {
         match signal {
             Signal::Changed(paths) => {
+                let mut look = false;
                 for path in paths {
                     if self.skip.iter().any(|skip| path.starts_with(skip)) {
                         continue;
                     }
                     // A picture folder may be inside a music root: both.
-                    for watched in self
-                        .folders
-                        .values_mut()
-                        .filter(|watched| watched.covers(&path))
-                    {
-                        watched.mark(now_ms, AutoTrigger::Change);
+                    for watched in self.folders.values_mut() {
+                        if watched.below(&path) {
+                            // Its watch may have gone with it.
+                            (watched.rearm, look) = (true, true);
+                            watched.mark(now_ms, AutoTrigger::Change);
+                        } else if watched.covers(&path) {
+                            watched.mark(now_ms, AutoTrigger::Change);
+                        }
                     }
                 }
+                look
             }
-            Signal::Lost(path, why) => {
+            Signal::Lost(paths, why) => {
                 warn!(
-                    path = ?path,
+                    paths = ?paths,
                     error = %why,
                     "the system lost track of changes: the folder is rescanned"
                 );
-                let under = |watched: &Watched| {
-                    path.as_deref().is_none_or(|path| {
-                        path.starts_with(&watched.folder.path) || path.starts_with(&watched.real)
-                    })
+                // A path at or under a folder, or above it.
+                let lost = |watched: &Watched| {
+                    paths.is_empty()
+                        || paths.iter().any(|path| {
+                            path.starts_with(&watched.folder.path)
+                                || path.starts_with(&watched.real)
+                                || watched.below(path)
+                        })
                 };
-                for watched in self.folders.values_mut().filter(|watched| under(watched)) {
+                for watched in self.folders.values_mut().filter(|watched| lost(watched)) {
                     watched.rearm = true;
                     watched.mark(now_ms, AutoTrigger::Lost);
                 }
+                true
             }
-            Signal::Wake => {}
+            Signal::Wake => true,
         }
+    }
+
+    /// Takes in that signals were dropped, the channel being full: what
+    /// they said is not known, so every folder is rescanned.
+    pub(crate) fn dropped(&mut self, now_ms: i64) {
+        warn!("too many changes came at once to hear each: every folder is rescanned");
+        for watched in self.folders.values_mut() {
+            watched.mark(now_ms, AutoTrigger::Lost);
+        }
+    }
+
+    /// Takes in that the import of the picture folder `key` ended.
+    pub(crate) fn imported(&mut self, key: &Key, run: AutoRun) {
+        if let Some(watched) = self.folders.get_mut(key) {
+            (watched.importing, watched.busy) = (false, false);
+            watched.imported = Some(run);
+        }
+    }
+
+    /// The imports asked for since this was last asked, for the thread that
+    /// imports.
+    pub(crate) fn take_imports(&mut self) -> Vec<(Folder, AutoTrigger)> {
+        std::mem::take(&mut self.imports)
     }
 
     /// The folders whose changes have settled: quiet for long enough, or
     /// changing for longer than a rescan waits.
-    pub(crate) fn settled(&self, now_ms: i64) -> Vec<String> {
+    pub(crate) fn settled(&self, now_ms: i64) -> Vec<Key> {
         self.folders
             .values()
             .filter(|watched| watched.state != WatchState::Offline)
@@ -451,7 +559,7 @@ impl Watch {
                 }
                 _ => false,
             })
-            .map(|watched| watched.folder.name.clone())
+            .map(|watched| watched.folder.key())
             .collect()
     }
 
@@ -515,19 +623,20 @@ pub(crate) enum Rescan {
     Failed(String),
 }
 
-/// One look by the thread: rescans what has settled, imports picture
-/// folders that changed, and rescans what the timer says is due. The first
-/// look is the hub's start.
+/// One look by the thread: rescans what has settled, asks for picture
+/// folders that changed to be imported, and rescans what the timer says is
+/// due. The first look is the hub's start.
 pub(crate) fn tick(core: &Core, watch: &mut Watch, now_ms: i64) {
     let start = !watch.started;
     watch.started = true;
-    for name in watch.settled(now_ms) {
-        let Some(watched) = watch.folders.get_mut(&name) else {
+    for key in watch.settled(now_ms) {
+        let Some(watched) = watch.folders.get_mut(&key) else {
             continue;
         };
         let (folder, trigger) = (watched.folder.clone(), watched.trigger);
+        let name = &folder.name;
         match folder.source {
-            Some(source) => match core.auto_scan(&folder.name, source, trigger, watched.last_ms) {
+            Some(source) => match core.auto_scan(name, source, trigger, watched.last_ms) {
                 Rescan::Busy => watched.busy = true,
                 Rescan::Failed(why) => {
                     // The timer tries again.
@@ -535,13 +644,16 @@ pub(crate) fn tick(core: &Core, watch: &mut Watch, now_ms: i64) {
                     watched.clear();
                 }
                 done => {
-                    log(&name, trigger, &done);
+                    log(name, trigger, &done);
                     watched.clear();
                 }
             },
+            // An import that started before the changes: they wait for it.
+            None if watched.importing => watched.busy = true,
             None => {
                 watched.clear();
-                watched.imported = Some(core.auto_import(&folder, trigger));
+                watched.importing = true;
+                watch.imports.push((folder, trigger));
             }
         }
     }
@@ -554,6 +666,7 @@ pub(crate) fn tick(core: &Core, watch: &mut Watch, now_ms: i64) {
     for watched in watch.folders.values_mut() {
         if watched.state == WatchState::Offline
             || watched.first_ms.is_some()
+            || watched.importing
             || !start && now_ms.saturating_sub(watched.seen_ms) < quiet_ms
         {
             continue;
@@ -572,7 +685,8 @@ pub(crate) fn tick(core: &Core, watch: &mut Watch, now_ms: i64) {
                     .as_ref()
                     .is_none_or(|last| now_ms.saturating_sub(last.started_at) >= ms(RESCAN_EVERY));
                 if due {
-                    watched.imported = Some(core.auto_import(&folder, trigger));
+                    watched.importing = true;
+                    watch.imports.push((folder, trigger));
                 }
             }
         }
@@ -597,14 +711,14 @@ fn log(root: &str, trigger: AutoTrigger, done: &Rescan) {
 #[derive(Debug)]
 pub(crate) struct Watching {
     run: WatchRun,
-    signals: Sender<Signal>,
+    signals: Signals,
     receiver: Mutex<Option<Receiver<Signal>>>,
     shown: Mutex<(Option<String>, Vec<Shown>)>,
 }
 
 impl Watching {
     pub(crate) fn new(run: WatchRun) -> Self {
-        let (signals, receiver) = mpsc::channel();
+        let (signals, receiver) = Signals::new();
         Self {
             run,
             signals,
@@ -619,7 +733,7 @@ impl Watching {
 
     /// Hands the thread a signal. A test hands in events this way.
     pub(crate) fn send(&self, signal: Signal) {
-        let _ = self.signals.send(signal);
+        self.signals.send(signal);
     }
 
     /// What the thread last found: why it is off, or each folder.
@@ -635,16 +749,17 @@ impl Watching {
     }
 }
 
-/// The thread that watches.
+/// The thread that watches, and the one that imports picture folders for
+/// it.
 #[derive(Debug)]
 pub(crate) struct Watcher {
     core: Arc<Core>,
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl Watcher {
-    /// Starts the thread, on a run that watches.
+    /// Starts the threads, on a run that watches.
     pub(crate) fn start(core: Arc<Core>) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let receiver = core.watching().and_then(|watching| {
@@ -655,24 +770,44 @@ impl Watcher {
                 .take()
                 .filter(|_| watching.run.on)
         });
-        let thread = match receiver {
-            Some(receiver) => {
-                let (core, stop) = (Arc::clone(&core), Arc::clone(&stop));
-                Some(
-                    std::thread::Builder::new()
-                        .name("ritornel-watch".to_owned())
-                        .spawn(move || watch(&core, &receiver, &stop))?,
-                )
-            }
-            None => None,
-        };
-        Ok(Self { core, stop, thread })
+        let mut threads = Vec::new();
+        if let Some(receiver) = receiver {
+            // An import can take a while: it runs on a thread of its own, so
+            // that the watcher goes on hearing changes and queuing scans.
+            let (asks, asked) = mpsc::channel::<(Folder, AutoTrigger)>();
+            let (done, imported) = mpsc::channel::<(Key, AutoRun)>();
+            let (core_, stop_) = (Arc::clone(&core), Arc::clone(&stop));
+            threads.push(
+                std::thread::Builder::new()
+                    .name("ritornel-pictures".to_owned())
+                    .spawn(move || import(&core_, &asked, &done, &stop_))?,
+            );
+            let lines = Lines {
+                signals: receiver,
+                asks,
+                imported,
+            };
+            let (core_, stop_) = (Arc::clone(&core), Arc::clone(&stop));
+            threads.push(
+                std::thread::Builder::new()
+                    .name("ritornel-watch".to_owned())
+                    .spawn(move || watch(&core_, &lines, &stop_))?,
+            );
+        }
+        Ok(Self {
+            core,
+            stop,
+            threads,
+        })
     }
 
-    /// Stops the thread and waits for it: it ends after what it is doing.
+    /// Stops the threads and waits for them: each ends after what it is
+    /// doing.
     pub(crate) fn stop(mut self) {
         self.signal();
-        if let Some(thread) = self.thread.take() {
+        // The watcher first: once it has gone, nothing more is asked of the
+        // importer.
+        for thread in self.threads.drain(..).rev() {
             let _ = thread.join();
         }
     }
@@ -689,7 +824,36 @@ impl Drop for Watcher {
     }
 }
 
-fn backend(run: &WatchRun, signals: Sender<Signal>) -> Box<dyn Backend> {
+/// Imports each picture folder the watcher asks for, and tells it when the
+/// import ends, until the watcher has gone.
+fn import(
+    core: &Core,
+    asked: &Receiver<(Folder, AutoTrigger)>,
+    done: &Sender<(Key, AutoRun)>,
+    stop: &AtomicBool,
+) {
+    for (folder, trigger) in asked {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let run = core.auto_import(&folder, trigger);
+        if done.send((folder.key(), run)).is_err() {
+            return;
+        }
+        core.wake_watch();
+    }
+}
+
+/// What the watching thread hears from and speaks to.
+struct Lines {
+    signals: Receiver<Signal>,
+    /// Imports for the importer.
+    asks: Sender<(Folder, AutoTrigger)>,
+    /// Imports that have ended.
+    imported: Receiver<(Key, AutoRun)>,
+}
+
+fn backend(run: &WatchRun, signals: Signals) -> Box<dyn Backend> {
     if run.injected {
         return Box::new(Silent);
     }
@@ -702,7 +866,7 @@ fn backend(run: &WatchRun, signals: Sender<Signal>) -> Box<dyn Backend> {
     }
 }
 
-fn watch(core: &Core, signals: &Receiver<Signal>, stop: &AtomicBool) {
+fn watch(core: &Core, lines: &Lines, stop: &AtomicBool) {
     let Some(watching) = core.watching() else {
         return;
     };
@@ -733,6 +897,9 @@ fn watch(core: &Core, signals: &Receiver<Signal>, stop: &AtomicBool) {
                     watch.skip(core.data_dir());
                     watch
                 });
+                for (key, run) in lines.imported.try_iter() {
+                    watch.imported(&key, run);
+                }
                 if look || now_ms.saturating_sub(looked_ms) >= ms(IDLE) {
                     if let Some(found) = core.watched_folders() {
                         watch.refresh(found, now_ms);
@@ -740,30 +907,36 @@ fn watch(core: &Core, signals: &Receiver<Signal>, stop: &AtomicBool) {
                     (look, looked_ms) = (false, now_ms);
                 }
                 tick(core, watch, now_ms);
+                for ask in watch.take_imports() {
+                    // The importer has gone only if the server is stopping.
+                    let _ = lines.asks.send(ask);
+                }
                 watching.show(None, watch.shown());
                 watch
                     .next_wait(core.now_ms())
                     .map_or(IDLE, |wait| wait.min(IDLE))
             }
         };
-        let mut take = |signal: Signal| {
-            // Lost events also ask for the folders to be watched afresh.
-            if matches!(signal, Signal::Wake | Signal::Lost(..)) {
-                look = true;
-            }
-            // Events that come while watching is off are dropped: the
-            // timer covers them when it is turned on again.
-            if let Some(watch) = state.as_mut() {
-                watch.signal(signal, core.now_ms());
-            }
+        let Some((signals, dropped)) = receive(&lines.signals, &watching.signals.dropped, wait)
+        else {
+            return;
         };
-        match signals.recv_timeout(wait) {
-            Ok(signal) => take(signal),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+        // Events that come while watching is off are dropped: the timer
+        // covers them when it is turned on again. Waking, or the system
+        // losing track, has the folders looked at again either way.
+        let now_ms = core.now_ms();
+        for signal in signals {
+            let again = match state.as_mut() {
+                Some(watch) => watch.signal(signal, now_ms),
+                None => matches!(signal, Signal::Wake | Signal::Lost(..)),
+            };
+            look |= again;
         }
-        while let Ok(signal) = signals.try_recv() {
-            take(signal);
+        if dropped {
+            look = true;
+            if let Some(watch) = state.as_mut() {
+                watch.dropped(now_ms);
+            }
         }
     }
 }

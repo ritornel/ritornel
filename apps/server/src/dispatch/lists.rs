@@ -6,12 +6,13 @@ use std::sync::{Arc, PoisonError, Weak};
 use std::time::Instant;
 
 use ritornel_contract::methods::{
-    CorrectionsLookup, HistoryRebuild, LibrarySetSettings, Method, RatingsSet, SourcesAdd,
+    ArtistsImportPictures, CorrectionsLookup, HistoryRebuild, LibrarySetSettings, Method,
+    RatingsSet, SourcesAdd,
 };
 use ritornel_contract::{
-    ErrorCode, Event, Id, LibraryChange, LibraryEvent, ListClosed, ListEvent, ListLocateParams,
-    ListLocated, ListOpenParams, ListOpened, ListSections, ListWindow, ListWindowParams,
-    MediaToken, Row, RpcError, ViewParams, Window,
+    ErrorCode, Event, Id, LibraryChange, LibraryEvent, ListClosed, ListEvent, ListKind,
+    ListLocateParams, ListLocated, ListOpenParams, ListOpened, ListSections, ListWindow,
+    ListWindowParams, MediaToken, Row, RpcError, ViewParams, Window,
 };
 use ritornel_engine::covers::{CoverError, Rendered};
 use ritornel_engine::{Committed, LibraryStore, ListError, View};
@@ -64,36 +65,46 @@ impl Fanout {
         if changed.is_empty() {
             return;
         }
-        // Plays and ratings show only on songs, and order no list.
+        // Plays and ratings show only on songs, portraits only on artists,
+        // and none of them orders a list.
         let plays_only = matches!(
             changed.as_slice(),
             [LibraryChange::Stats] | [LibraryChange::Ratings]
         );
+        let portraits = is_portraits(committed.method);
         for session in sessions {
             session.publish(Event::Library(LibraryEvent {
                 library_revision: revision,
                 changed: changed.clone(),
             }));
             for (view, held) in session.held_views() {
-                if plays_only && !held.shows_plays() {
+                if plays_only && !held.shows_plays() || portraits && held.kind != ListKind::Artists
+                {
                     continue;
                 }
                 session.publish(Event::List(ListEvent {
                     view,
                     library_revision: revision,
-                    reorder: !plays_only,
+                    reorder: !plays_only && !portraits,
                 }));
             }
         }
     }
 }
 
+/// Whether a write changed artists' portraits and nothing else: an import
+/// of a picture folder, asked for or on its own.
+fn is_portraits(method: &str) -> bool {
+    method == ArtistsImportPictures::NAME || method == super::watch::REFRESH_PICTURES
+}
+
 /// What kind of change a write made, by the method that made it: none, for
 /// a write that changes nothing shown, which sends no event. Adding a
 /// source adds a root and nothing in it. Taking in a listen and rebuilding
-/// history change plays and nothing else. Any other write does not yet
-/// say, so it is taken as every kind; a write of the resolver that moves a
-/// play with its file is among those.
+/// history change plays and nothing else, and importing portraits changes
+/// what artists show. Any other write does not yet say, so it is taken as
+/// every kind; a write of the resolver that moves a play with its file is
+/// among those.
 fn changes(method: &str) -> Vec<LibraryChange> {
     // Sidecars and the disc layouts read from them are evidence: nothing
     // shown reads them.
@@ -108,6 +119,8 @@ fn changes(method: &str) -> Vec<LibraryChange> {
         Vec::new()
     } else if method == SourcesAdd::NAME {
         vec![LibraryChange::Membership]
+    } else if is_portraits(method) {
+        vec![LibraryChange::Metadata]
     } else if method == ritornel_engine::INGEST_METHOD || method == HistoryRebuild::NAME {
         vec![LibraryChange::Stats]
     } else if method == RatingsSet::NAME {

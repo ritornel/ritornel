@@ -3,6 +3,7 @@
 //! the watcher queues are run here, one at a time, as the worker would.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -13,7 +14,7 @@ use ritornel_contract::{
 use ritornel_engine::{JobState, OsEntropy, ScanSettings, ServerStore, scan_summary};
 use serde_json::{Value, json};
 
-use super::{Backend, Folder, Signal, Watch, WatchRun, tick};
+use super::{Backend, Folder, SIGNALS, Signal, Signals, Watch, WatchRun, receive, tick};
 use crate::Bounds;
 use crate::data_dir::DataDir;
 use crate::dispatch::{Core, Stores};
@@ -198,20 +199,40 @@ impl Rig {
         ritornel_engine::Clock::now_ms(&*self.clock)
     }
 
-    /// The system says these paths changed, now.
-    fn changed(&mut self, paths: &[PathBuf]) {
+    /// The system says these paths changed, now. It returns whether the
+    /// folders are to be looked at again.
+    fn changed(&mut self, paths: &[PathBuf]) -> bool {
         let now = self.now();
-        self.watch.signal(Signal::Changed(paths.to_vec()), now);
+        self.watch.signal(Signal::Changed(paths.to_vec()), now)
     }
 
-    /// A look by the watching thread: the folders, then what is due.
+    /// A look by the watching thread: the folders, then what is due. The
+    /// imports it asks for are run, as the importer would, and taken in.
     fn look(&mut self) {
+        self.look_only();
+        self.import();
+    }
+
+    /// A look whose imports are only asked for: they are left running.
+    fn look_only(&mut self) {
         let now = self.now();
         self.watch
             .refresh(self.core.watched_folders().unwrap(), now);
         tick(&self.core, &mut self.watch, now);
         // What the thread shows the status.
         self.core.watching().unwrap().show(None, self.watch.shown());
+    }
+
+    /// Runs the imports asked for, as the importer would, and tells the
+    /// watcher they ended. It returns how many there were.
+    fn import(&mut self) -> usize {
+        let asked = self.watch.take_imports();
+        for (folder, trigger) in &asked {
+            let run = self.core.auto_import(folder, *trigger);
+            self.watch.imported(&folder.key(), run);
+        }
+        self.core.watching().unwrap().show(None, self.watch.shown());
+        asked.len()
     }
 
     fn jobs(&self) -> Vec<ritornel_engine::Job> {
@@ -587,7 +608,7 @@ fn a_disk_mounted_again_unseen_is_watched_afresh_and_rescanned() {
     rig.at(T0 + 30 * SECOND);
     let now = rig.now();
     rig.watch
-        .signal(Signal::Lost(Some(rig.music()), "overflow".to_owned()), now);
+        .signal(Signal::Lost(vec![rig.music()], "overflow".to_owned()), now);
     rig.look();
     assert_eq!(rig.fake.0.lock().unwrap().asked, 3);
     rig.at(T0 + 40 * SECOND);
@@ -624,6 +645,163 @@ fn a_change_in_a_folder_inside_another_is_a_change_to_both() {
         .map(|shown| shown.pending_since)
         .collect();
     assert_eq!(pending, [Some(T0 + 10 * SECOND), Some(T0 + 10 * SECOND)]);
+}
+
+#[test]
+fn a_picture_folder_with_a_music_roots_name_is_watched_beside_it() {
+    let mut rig = Rig::new();
+    // One folder, both the music root and a picture folder, by one name.
+    std::fs::write(
+        rig.music().join("index.json"),
+        r#"{"format": 1, "artists": []}"#,
+    )
+    .unwrap();
+    let mut import = rig.key();
+    import["name"] = json!("music");
+    import["path"] = json!(rig.music().to_str().unwrap());
+    rig.call("artists.importPictures", import);
+    let mut imports = 0;
+    for minute in 0..4 {
+        rig.at(T0 + minute * 60 * SECOND);
+        rig.look_only();
+        imports += rig.import();
+    }
+    // Each is watched once and kept: neither takes the other's place.
+    assert_eq!(rig.fake.0.lock().unwrap().asked, 2);
+    assert_eq!(
+        rig.fake.0.lock().unwrap().watched,
+        [rig.music(), rig.music()]
+    );
+    let folders = rig.status()["folders"].clone();
+    let shown: Vec<(&Value, &Value, &Value)> = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|folder| (&folder["name"], &folder["kind"], &folder["state"]))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (&json!("music"), &json!("music"), &json!("watching")),
+            (&json!("music"), &json!("pictures"), &json!("watching")),
+        ]
+    );
+    // The picture folder is imported once, by the timer, and the root is
+    // not scanned again.
+    assert_eq!(imports, 1);
+    assert_eq!(rig.jobs().len(), 1);
+
+    // A change in it is a change to both.
+    rig.at(T0 + 5 * 60 * SECOND);
+    rig.changed(&[rig.music().join("Tin Weather/03.flac")]);
+    rig.at(T0 + 6 * 60 * SECOND);
+    rig.look_only();
+    assert_eq!(rig.import(), 1);
+    assert_eq!(rig.jobs().len(), 2);
+}
+
+#[test]
+fn a_folder_above_a_root_lost_or_changed_among_other_paths_rescans_it() {
+    let mut rig = Rig::new();
+    let above = rig.scratch.path().to_owned();
+    let elsewhere = rig.scratch.path().join("elsewhere");
+
+    // The system lost track of an event that names another path first,
+    // and then a folder the root is inside.
+    rig.at(T0 + 10 * SECOND);
+    let now = rig.now();
+    let lost = Signal::Lost(vec![elsewhere.clone(), above.clone()], "dropped".to_owned());
+    assert!(rig.watch.signal(lost, now));
+    rig.look();
+    assert_eq!(rig.fake.0.lock().unwrap().asked, 2, "watched afresh");
+    rig.at(T0 + 20 * SECOND);
+    rig.look();
+    let jobs = rig.jobs();
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs[1].params_json.contains(r#""trigger":"lost""#));
+    rig.run_jobs();
+
+    // A folder the root is inside changed, as when it is moved: the root
+    // may have gone with it, and is looked at again and rescanned. A
+    // change inside the root asks for no look.
+    rig.at(T0 + 30 * SECOND);
+    assert!(!rig.changed(&[rig.music().join("Tin Weather/01.flac")]));
+    assert!(rig.changed(&[elsewhere, above]));
+    rig.look();
+    assert_eq!(rig.fake.0.lock().unwrap().asked, 3, "watched afresh");
+    rig.at(T0 + 40 * SECOND);
+    rig.look();
+    let jobs = rig.jobs();
+    assert_eq!(jobs.len(), 3);
+    assert!(jobs[2].params_json.contains(r#""trigger":"change""#));
+}
+
+#[test]
+fn a_storm_of_signals_is_taken_in_bounded_batches_and_what_overflows_rescans_everything() {
+    let (signals, receiver) = Signals::new();
+    for _ in 0..SIGNALS + 10 {
+        signals.send(Signal::Wake);
+    }
+    let (taken, dropped) = receive(&receiver, &signals.dropped, Duration::ZERO).unwrap();
+    assert_eq!(taken.len(), SIGNALS);
+    assert!(dropped);
+    // What was dropped is said once.
+    signals.send(Signal::Wake);
+    let (taken, dropped) = receive(&receiver, &signals.dropped, Duration::ZERO).unwrap();
+    assert_eq!((taken.len(), dropped), (1, false));
+    drop(signals);
+    assert!(receive(&receiver, &AtomicBool::new(false), Duration::ZERO).is_none());
+
+    // What the dropped signals said is not known: every folder is
+    // rescanned.
+    let mut rig = Rig::new();
+    rig.at(T0 + 10 * SECOND);
+    let now = rig.now();
+    rig.watch.dropped(now);
+    rig.at(T0 + 20 * SECOND);
+    rig.look();
+    let jobs = rig.jobs();
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs[1].params_json.contains(r#""trigger":"lost""#));
+}
+
+#[test]
+fn a_picture_import_runs_apart_and_changes_meanwhile_wait_for_it() {
+    let mut rig = Rig::new();
+    let pictures = rig.scratch.path().join("pictures");
+    std::fs::create_dir_all(&pictures).unwrap();
+    std::fs::write(
+        pictures.join("index.json"),
+        r#"{"format": 1, "artists": []}"#,
+    )
+    .unwrap();
+    let mut import = rig.key();
+    import["name"] = json!("pictures");
+    import["path"] = json!(pictures.to_str().unwrap());
+    rig.call("artists.importPictures", import);
+    rig.look();
+    let portrait = pictures.join(MOSS_ARCADE).join("portrait.png");
+
+    // The pictures change and settle: an import is asked for, and the
+    // look does not wait for it.
+    rig.at(T0 + 10 * SECOND);
+    rig.changed(std::slice::from_ref(&portrait));
+    rig.at(T0 + 20 * SECOND);
+    rig.look_only();
+    // While it runs, music changes are scanned, and picture changes wait.
+    rig.at(T0 + 21 * SECOND);
+    rig.put("Tin Weather/03.flac", "g2.flac");
+    rig.changed(&[rig.music().join("Tin Weather/03.flac"), portrait.clone()]);
+    rig.at(T0 + 30 * SECOND);
+    rig.look_only();
+    assert_eq!(rig.jobs().len(), 2, "the music root is rescanned");
+    assert_eq!(rig.status()["folders"][1]["pendingSince"], T0 + 21 * SECOND);
+    assert_eq!(rig.import(), 1, "one import, asked once");
+    // Once it ends, what waited is imported in turn.
+    rig.at(T0 + 31 * SECOND);
+    rig.look_only();
+    assert_eq!(rig.import(), 1);
+    assert_eq!(rig.status()["folders"][1].get("pendingSince"), None);
 }
 
 #[test]
@@ -726,6 +904,12 @@ fn a_picture_added_to_a_picture_folder_is_imported() {
     rig.call("artists.importPictures", import);
     rig.look();
     let folders = rig.status()["folders"].clone();
+    // A wall of artists and one of records are open, and the library's
+    // changes are followed.
+    let artists = rig.call("list.open", json!({ "kind": "artists" }))["view"].clone();
+    rig.call("list.open", json!({ "kind": "albums" }));
+    rig.call("events.subscribe", json!({ "topics": ["library"] }));
+    rig.session.drain();
     assert_eq!(folders[1]["name"], "pictures");
     assert_eq!(folders[1]["kind"], WatchedKind::Pictures.as_str());
     let revision = rig.stats()["libraryRevision"].clone();
@@ -764,6 +948,24 @@ fn a_picture_added_to_a_picture_folder_is_imported() {
         })
         .unwrap();
     assert!(portrait);
+    // Only what artists show changed: the artists' wall reads its rows
+    // again in place, and the records' wall is left be.
+    let events: Vec<Value> = rig
+        .session
+        .drain()
+        .into_iter()
+        .filter_map(|frame| match frame {
+            Frame::Notification(event) => event.params,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            json!({ "topic": "library", "libraryRevision": revision.as_u64().unwrap() + 1, "changed": ["metadata"] }),
+            json!({ "topic": "list", "libraryRevision": revision.as_u64().unwrap() + 1, "view": artists, "reorder": false }),
+        ]
+    );
     let shown = &rig.status()["folders"][1]["lastAuto"];
     assert_eq!(
         (&shown["trigger"], &shown["state"]),

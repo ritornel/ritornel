@@ -31,6 +31,10 @@ Rescans avoid unnecessary work and protect identity across moves, edits, and unm
 On the hub, `apps/server/src/watch.rs` watches all music roots and artist picture folders using `notify` (`=8.2.2`, FSEvents on macOS and inotify on Linux):
 
 - **Debounce:** After filesystem events arrive, the watcher waits `QUIET` (4 s) of silence—capped at `LONGEST` (60 s) under continuous writes—before queueing a standard scan job or picture re-import.
+- **Folders by name and kind:** Watched folders are keyed by name and kind (`Key`), so a picture folder may share its name and path with a music root without displacing its watch.
+- **Events above a root:** Every path of an event is matched. A change or lost-events notice for a folder that contains a root (one removed, moved, or mounted over) re-arms that root's watch, looks at the folders again, and rescans it.
+- **Bounded signals:** Signals reach the thread through a channel of `SIGNALS` (4096). One that finds it full is dropped and noted, and every folder is then rescanned with trigger `lost`; the thread takes in at most `SIGNALS` before acting on them, so a storm of events never starves rescans.
+- **Picture imports apart:** A picture folder's re-import runs on its own thread (`ritornel-pictures`), so the watcher goes on hearing changes and queueing scans meanwhile; changes to that folder during an import wait for it to end.
 - **Timer fallback:** Because OS watchers can miss changes on network shares or while the hub is offline, the watcher also triggers a scan on startup when a root's last scan is older than `RESCAN_AT_START_AFTER` (1 hour) and periodically every `RESCAN_EVERY` (6 hours).
 - Watching can be toggled per machine via `library.setWatching` and inspected in `server.status`.
 
