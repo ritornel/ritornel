@@ -435,8 +435,9 @@ methods! {
 
     /// `imports.apply`: starts a job that stores a staged run's streams
     /// that are new and records the run, in one library write. It is
-    /// refused when the run is gone, has no dry run, or the matcher or the
-    /// play rule changed since its dry run.
+    /// refused when the run is gone, or, applied for the first time, has no
+    /// dry run or one made before the matcher or the play rule changed. A
+    /// run applied already needs neither, and its job ends as done.
     ImportsApply: "imports.apply", Command, needs_full: true,
     ImportsRunParams => ImportsJobStarted;
 
