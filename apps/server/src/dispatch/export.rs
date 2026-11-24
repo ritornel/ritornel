@@ -56,10 +56,20 @@ impl Core {
                 .and_then(|exported| {
                     let files =
                         std::fs::read_dir(&staged.partial).map_err(|error| error.to_string())?;
+                    let mut open = false;
                     for file in files {
                         let path = file.map_err(|error| error.to_string())?.path();
-                        close_backup_file(&path)
-                            .map_err(|error| format!("cannot close {}: {error}", path.display()))?;
+                        if !close_backup_file(&path)
+                            .map_err(|error| format!("cannot close {}: {error}", path.display()))?
+                        {
+                            open = true;
+                        }
+                    }
+                    if open {
+                        warn!(
+                            path = %folder.display(),
+                            "the export folder keeps no permissions, so anyone who can open it can read this export"
+                        );
                     }
                     Ok(exported)
                 });

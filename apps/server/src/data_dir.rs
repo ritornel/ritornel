@@ -85,7 +85,23 @@ impl DataDir {
     fn ready(&self) -> Result<(), Error> {
         let credential = self.credential();
         let lastfm = self.root.join("lastfm.env");
-        close_data_dir_to_others(&self.root, &[credential.as_path(), lastfm.as_path()])?;
+        let hidden =
+            close_data_dir_to_others(&self.root, &[credential.as_path(), lastfm.as_path()])?;
+        if let Some(first) = hidden.first() {
+            // The folder is already closed, so leaving an exposed file here
+            // would let the next start mistake it for private. Remove the
+            // local credential (the server will revoke and issue a new one)
+            // and move `lastfm.env` aside so its credentials are not loaded.
+            if hidden.iter().any(|path| path == &credential) {
+                let _ = std::fs::remove_file(&credential);
+            }
+            if hidden.iter().any(|path| path == &lastfm) {
+                rename_exposed_aside(&lastfm);
+            }
+            return Err(io_error("close", first)(std::io::Error::other(
+                "closing the folder hid that this file was open to others",
+            )));
+        }
         create_private_dir(&self.logs())?;
         close_dir_to_others(&self.logs())?;
         close_database(&self.server_db())?;
@@ -163,6 +179,28 @@ impl DataDir {
             }
         }
         Ok(cache)
+    }
+}
+
+/// Moves an exposed file aside to `<name>.exposed` (or a numbered sibling if
+/// that name is taken) so the next start will not load it as private.
+fn rename_exposed_aside(path: &Path) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    for suffix in 0u32..100 {
+        let target_name = if suffix == 0 {
+            format!("{name}.exposed")
+        } else {
+            format!("{name}.exposed.{suffix}")
+        };
+        let target = path.with_file_name(target_name);
+        if target.exists() {
+            continue;
+        }
+        if std::fs::rename(path, &target).is_ok() {
+            return;
+        }
     }
 }
 
@@ -523,5 +561,26 @@ mod tests {
         let held = HeldDir::take(root).unwrap();
         assert!(!held.dir().server_json().exists());
         assert!(!held.dir().preparing_json().exists());
+    }
+
+    #[test]
+    fn rename_exposed_aside_moves_a_file_without_overwriting_an_older_copy() {
+        let scratch = Scratch::new();
+        let lastfm = scratch.path().join("lastfm.env");
+        std::fs::write(&lastfm, "first").unwrap();
+        rename_exposed_aside(&lastfm);
+        assert!(!lastfm.exists());
+        assert_eq!(
+            std::fs::read_to_string(scratch.path().join("lastfm.env.exposed")).unwrap(),
+            "first"
+        );
+
+        std::fs::write(&lastfm, "second").unwrap();
+        rename_exposed_aside(&lastfm);
+        assert!(!lastfm.exists());
+        assert_eq!(
+            std::fs::read_to_string(scratch.path().join("lastfm.env.exposed.1")).unwrap(),
+            "second"
+        );
     }
 }

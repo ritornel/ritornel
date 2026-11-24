@@ -2,7 +2,7 @@
 //! the whole file, free space from `statvfs`, and SIGINT and SIGTERM.
 
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use tokio::runtime::Runtime;
@@ -44,26 +44,31 @@ pub(crate) fn close_dir_to_others(_path: &Path) -> Result<(), Error> {
 }
 
 /// Same as [`close_dir_to_others`] on Unix.
-pub(crate) fn close_data_dir_to_others(_path: &Path, _keep_open: &[&Path]) -> Result<(), Error> {
-    Ok(())
+pub(crate) fn close_data_dir_to_others(
+    _path: &Path,
+    _keep_open: &[&Path],
+) -> Result<Vec<PathBuf>, Error> {
+    Ok(Vec::new())
 }
 
-/// Holds a staged private directory open while files are written into it.
-/// On Unix, nothing extra is held.
+/// Holds a staging folder (for a backup, export, or pre-migration rollback
+/// copy) open while files are written into it. On Unix, nothing extra is
+/// held.
 #[derive(Debug)]
-pub(crate) struct PrivateDir;
+pub(crate) struct StagingDir;
 
-impl PrivateDir {
+impl StagingDir {
     /// Releases the directory pin before renaming or removing the folder.
     pub(crate) fn release(self) {}
 }
 
-/// Creates the one folder at `path`, with mode `0700`, and fails if it is
+/// Creates a new staging folder at `path` for a backup, export, or
+/// pre-migration rollback copy, with mode `0700`, and fails if something is
 /// there already: two writers never share it. Its parent must be there.
-pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<PrivateDir> {
+pub(crate) fn create_staging_dir(path: &Path) -> std::io::Result<StagingDir> {
     use std::os::unix::fs::DirBuilderExt;
     DirBuilder::new().mode(0o700).create(path)?;
-    Ok(PrivateDir)
+    Ok(StagingDir)
 }
 
 /// Opens or creates the lock file at `path` with mode `0600` without
@@ -100,25 +105,25 @@ pub(crate) fn close_to_others(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(OWNER_ONLY))
 }
 
-/// Closes a file in a user-chosen backup or export folder to mode `0600`
-/// where the volume supports Unix modes, without failing on drives or shares
-/// (such as FAT, exFAT, or SMB) that refuse `chmod`.
-pub(crate) fn close_backup_file(path: &Path) -> std::io::Result<()> {
+/// Closes a file in a backup, export, or rollback folder to mode `0600`
+/// where the volume supports Unix modes. Returns `Ok(false)` on drives or
+/// shares (such as FAT, exFAT, or SMB) that refuse `chmod`.
+pub(crate) fn close_backup_file(path: &Path) -> std::io::Result<bool> {
     match close_to_others(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(error)
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
             ) =>
         {
-            Ok(())
+            Ok(false)
         }
         Err(error) => Err(error),
     }
 }
 
-/// Creates a new file in a user-chosen backup or export folder with mode
+/// Creates a new file in a backup, export, or rollback folder with mode
 /// `0600` where the volume supports it.
 pub(crate) fn create_backup_file(path: &Path) -> std::io::Result<File> {
     create_private_file(path)

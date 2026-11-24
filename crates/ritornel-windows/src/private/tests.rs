@@ -13,6 +13,7 @@ use std::process::Command;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
+use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
 use windows_sys::core::PWSTR;
 
 use super::*;
@@ -234,11 +235,12 @@ fn closing_a_folder_closes_existing_and_new_files_except_keep_open() {
     std::fs::write(&old_log, "x").unwrap();
     assert!(!private(&credential));
     assert!(!private(&config));
-    close_folder_preserving(&inner, &[credential.as_path()]).unwrap();
+    let hidden = close_folder_preserving(&inner, &[credential.as_path()]).unwrap();
+    assert!(hidden.is_empty());
     assert!(private(&inner));
     // Only the named keep_open file keeps its prior open access.
     assert!(!private(&credential));
-    // Other existing files and subfolders take the new owner-only list.
+    // Other existing files and subfolders that inherit their list take the new one.
     assert!(private(&config));
     assert!(private(&inner.join("logs")));
     assert!(private(&old_log));
@@ -257,16 +259,109 @@ fn a_failed_freeze_leaves_the_folder_unclosed() {
     std::fs::create_dir(&inner).unwrap();
     let credential = inner.join("credential");
     std::fs::write(&credential, "x").unwrap();
-    // Grant Everyone read, and replace implicit owner WRITE_DAC with
+    // Leave inheritance on (`AI`), and replace implicit owner WRITE_DAC with
     // OWNER RIGHTS allowing read and delete (for cleanup) but not WRITE_DAC.
-    let unfreezable = descriptor("O:MED:P(A;;FR;;;WD)(A;;0x00130089;;;OW)");
+    let unfreezable = descriptor("O:MED:AI(A;;0x00130089;;;OW)");
     let acl = unfreezable.dacl().unwrap().unwrap();
-    set_list(&open(&credential, true).unwrap(), acl.0.cast_mut()).unwrap();
+    let file = open(&credential, true).unwrap();
+    // SAFETY: `file` is open with WRITE_DAC and `acl` lives as long as `unfreezable`.
+    let set = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl.0.cast_mut(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(set, 0);
+    drop(file);
+    let before = Descriptor::of(
+        &open(&credential, false).unwrap(),
+        DACL_SECURITY_INFORMATION,
+    )
+    .unwrap();
+    assert!(!before.protected().unwrap());
+    assert!(!private(&credential));
 
     let refused = close_folder_preserving(&inner, &[credential.as_path()]).unwrap_err();
-    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    assert_eq!(
+        refused.source.kind(),
+        io::ErrorKind::PermissionDenied,
+        "{refused}"
+    );
+    assert_eq!(refused.path, credential);
     // The folder was not closed when freezing the open sensitive file failed.
     assert!(!private(&inner));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_protected_open_file_without_write_dac_is_left_alone() {
+    let dir = scratch("freeze-protected");
+    open_to_everyone(&dir);
+    let inner = dir.join("data");
+    std::fs::create_dir(&inner).unwrap();
+    let credential = inner.join("credential");
+    std::fs::write(&credential, "x").unwrap();
+    // Already protected (`P`) and open to Everyone, without owner WRITE_DAC:
+    // freeze checks READ_CONTROL first and never asks for WRITE_DAC.
+    let locked = descriptor("O:MED:P(A;;FR;;;WD)(A;;0x00130089;;;OW)");
+    let acl = locked.dacl().unwrap().unwrap();
+    set_list(&open(&credential, true).unwrap(), acl.0.cast_mut()).unwrap();
+
+    let hidden = close_folder_preserving(&inner, &[credential.as_path()]).unwrap();
+    assert!(hidden.is_empty());
+    assert!(private(&inner));
+    assert!(!private(&credential));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_null_dacl_file_stays_open_when_its_folder_is_closed() {
+    let dir = scratch("freeze-null-dacl");
+    open_to_everyone(&dir);
+    let inner = dir.join("data");
+    std::fs::create_dir(&inner).unwrap();
+    let credential = inner.join("credential");
+    std::fs::write(&credential, "x").unwrap();
+    let file = open(&credential, true).unwrap();
+    // SAFETY: `file` is open with WRITE_DAC; passing a null ACL sets a NULL
+    // DACL without setting SE_DACL_PROTECTED.
+    let set = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(set, 0);
+    drop(file);
+    let before = Descriptor::of(
+        &open(&credential, false).unwrap(),
+        DACL_SECURITY_INFORMATION,
+    )
+    .unwrap();
+    assert!(before.dacl().unwrap().is_none());
+    assert!(!before.protected().unwrap());
+    assert!(!private(&credential));
+
+    let hidden = close_folder_preserving(&inner, &[credential.as_path()]).unwrap();
+    assert!(hidden.is_empty());
+    assert!(private(&inner));
+    assert!(!private(&credential));
+    let after = Descriptor::of(
+        &open(&credential, false).unwrap(),
+        DACL_SECURITY_INFORMATION,
+    )
+    .unwrap();
+    assert!(after.protected().unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -354,9 +449,10 @@ fn close_folder_preserving_keeps_a_nested_open_file_open() {
     let nested = sub.join("secret");
     std::fs::write(&nested, "x").unwrap();
     assert!(!private(&nested));
-    close_folder_preserving(&inner, &[nested.as_path()]).unwrap();
+    let hidden = close_folder_preserving(&inner, &[nested.as_path()]).unwrap();
+    assert!(hidden.is_empty());
     assert!(private(&inner));
-    // The preserved file kept its open ACL even though its parent subfolder took the new one.
+    // The preserved file kept its open list even though its parent subfolder took the new one.
     assert!(!private(&nested));
     assert!(private(&sub));
     let _ = std::fs::remove_dir_all(&dir);
@@ -387,4 +483,19 @@ fn all_application_packages_with_change_rights_is_refused() {
     let inherited_ac = descriptor("O:MED:AI(A;OICIID;FA;;;ME)(A;OICIID;GA;;;AC)");
     assert!(!judge(&inherited_ac, true, &user).unwrap());
     assert!(lets_others(inherited_ac.dacl().unwrap().unwrap(), &user, CHANGE, false).unwrap());
+
+    let dir = scratch("app-packages");
+    let done = Command::new("icacls")
+        .arg(&dir)
+        .args(["/grant", "*S-1-15-2-1:(OI)(CI)(F)"])
+        .output()
+        .unwrap();
+    assert!(done.status.success(), "{done:?}");
+    let refused = check_folder_usable(&dir).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    assert!(
+        refused.to_string().contains("another user or app"),
+        "{refused}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

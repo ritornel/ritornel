@@ -8,7 +8,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use ritornel_contract::local;
@@ -86,57 +86,63 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Checks without changing anything that `path` is a folder on an
-/// ACL-capable volume, owned by a trusted owner, and whose access list
-/// no untrusted user may change.
+/// Checks without changing anything that `path` is a folder on a volume
+/// that keeps access lists, owned by a trusted owner, and whose access list
+/// nobody untrusted may change.
 pub(crate) fn check_dir_usable(path: &Path) -> Result<(), Error> {
     restricted::check_folder_usable(path).map_err(io_error("check", path))
 }
 
 /// Closes the folder at `path`, which is there, to everyone but the OS
-/// user, with what is made in it from now on, unless it is closed already.
-/// On Windows that is all that keeps a new file private: SQLite's logs
-/// beside a database, and a file made with [`create_owner_only`], take
-/// their list from the folder. The files directly in it keep the access
-/// they had, so the checks of the credential and of `lastfm.env` still see
-/// whether others could read them. A folder another user owns, or one
-/// whose list others may change, is refused.
+/// user, unless it is closed already. Files made in it, and existing files
+/// and subfolders that inherit their list, take the new one (on Windows
+/// SQLite's logs beside a database and files made with [`create_owner_only`]
+/// take their list from the folder). Use [`close_data_dir_to_others`] when
+/// an exposed file's open access must stay visible for its own check. A
+/// folder another user owns, or one whose list another user or app may
+/// change, is refused.
 pub(crate) fn close_dir_to_others(path: &Path) -> Result<(), Error> {
     restricted::close_folder(path).map_err(io_error("close", path))
 }
 
-/// Closes the data directory at `path`, guaranteeing that any file in
-/// `keep_open` that others could read before closing stays visibly open
-/// after (even if reached through a link into a subfolder).
-pub(crate) fn close_data_dir_to_others(path: &Path, keep_open: &[&Path]) -> Result<(), Error> {
-    restricted::close_folder_preserving(path, keep_open).map_err(io_error("close", path))
+/// Closes the data directory at `path`, keeping any file in `keep_open`
+/// that others could read beforehand visibly open after (even if reached
+/// through a link into a subfolder). Returns any paths from `keep_open`
+/// that were open beforehand yet appeared private after closing.
+pub(crate) fn close_data_dir_to_others(
+    path: &Path,
+    keep_open: &[&Path],
+) -> Result<Vec<PathBuf>, Error> {
+    restricted::close_folder_preserving(path, keep_open)
+        .map_err(|error| io_error("close", &error.path)(error.source))
 }
 
-/// Holds a staged private directory open without `FILE_SHARE_DELETE` so
-/// another user cannot delete or replace it while files are written inside.
+/// Holds a staging folder (for a backup, export, or pre-migration rollback
+/// copy) open without `FILE_SHARE_DELETE` so another user cannot delete or
+/// replace it while files are written inside.
 #[derive(Debug)]
-pub(crate) struct PrivateDir {
+pub(crate) struct StagingDir {
     handle: File,
 }
 
-impl PrivateDir {
+impl StagingDir {
     /// Releases the directory handle before renaming or removing the folder.
     pub(crate) fn release(self) {
         drop(self.handle);
     }
 }
 
-/// Creates a new staging folder at `path` in a user-chosen backup or export
-/// location, applying an owner-only access list where the volume supports
-/// it, and fails if something is there already. Its parent must be there.
-/// The returned guard pins the folder against removal or rename while files
-/// are written inside it.
-pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<PrivateDir> {
-    restricted::create_pinned_backup_dir(path).map(|handle| PrivateDir { handle })
+/// Creates a new staging folder at `path` for a backup, export, or
+/// pre-migration rollback copy, asking for an owner-only access list where
+/// the volume keeps one, and fails if something is there already. Its
+/// parent must be there. The returned guard pins the folder against removal
+/// or rename while files are written inside it.
+pub(crate) fn create_staging_dir(path: &Path) -> std::io::Result<StagingDir> {
+    restricted::create_pinned_backup_dir(path).map(|handle| StagingDir { handle })
 }
 
 /// Opens or creates the lock file at `path` without following a link or
-/// reparse point.
+/// junction.
 pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<File> {
     restricted::open_lock_file(path)
 }
@@ -160,10 +166,10 @@ pub(crate) fn close_to_others(path: &Path) -> std::io::Result<()> {
     restricted::restrict(path)
 }
 
-/// Closes a file in a user-chosen backup or export folder to this user
-/// alone where the volume supports persistent access lists, without failing
-/// on drives or network shares that keep no permissions.
-pub(crate) fn close_backup_file(path: &Path) -> std::io::Result<()> {
+/// Closes a file in a backup, export, or rollback folder to this user alone
+/// where the volume keeps access lists. Returns `Ok(false)` on drives or
+/// network shares that keep no permissions or refuse changes to the list.
+pub(crate) fn close_backup_file(path: &Path) -> std::io::Result<bool> {
     restricted::restrict_if_supported(path)
 }
 
@@ -179,8 +185,8 @@ pub(crate) fn create_private_file(path: &Path) -> std::io::Result<File> {
     restricted::create_restricted(path)
 }
 
-/// Creates a new file at `path` in a user-chosen backup or export folder,
-/// applying an owner-only access list where the volume supports it.
+/// Creates a new file at `path` in a backup, export, or rollback folder,
+/// asking for an owner-only access list where the volume keeps one.
 pub(crate) fn create_backup_file(path: &Path) -> std::io::Result<File> {
     restricted::create_backup_file(path)
 }
@@ -278,8 +284,8 @@ pub(crate) fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::
     Ok(Signals(window))
 }
 
-/// Gives a test scratch folder a protected owner-only ACL so it does not
-/// inherit permissive entries from `%TEMP%`.
+/// Gives a test scratch folder an owner-only access list that inherits
+/// nothing, so it does not inherit `%TEMP%`'s entries.
 #[cfg(test)]
 pub(crate) fn close_scratch(path: &Path) {
     restricted::restrict(path).unwrap();
@@ -333,11 +339,12 @@ mod tests {
         assert!(!path_is_private(&kept));
         assert!(!path_is_private(&other));
 
-        close_data_dir_to_others(&folder, &[kept.as_path()]).unwrap();
+        let hidden = close_data_dir_to_others(&folder, &[kept.as_path()]).unwrap();
+        assert!(hidden.is_empty());
         assert!(path_is_private(&folder));
         // Named sensitive files keep their open access for their own checks.
         assert!(!path_is_private(&kept));
-        // Other existing files and new files receive the new owner-only list.
+        // Other existing files that inherit their list, and new files, take the new one.
         assert!(path_is_private(&other));
         std::fs::write(folder.join("made-after"), "").unwrap();
         assert!(path_is_private(&folder.join("made-after")));

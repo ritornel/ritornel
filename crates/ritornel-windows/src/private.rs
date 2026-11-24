@@ -15,12 +15,13 @@
 //! system and the administrators count as the owner, as root does on Unix,
 //! since they can take any file whatever its list says.
 
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::marker::PhantomData;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(any(test, feature = "test-support"))]
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, LUID};
@@ -338,9 +339,32 @@ fn check_parent_supports_acls(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Checks that `folder` is a directory on an ACL-capable volume, owned by a
-/// trusted owner, and that no untrusted user may change its access list.
-/// Returns its security descriptor for further inspection.
+/// Why closing a folder failed, naming the folder or file that failed so
+/// callers report the right path.
+#[derive(Debug)]
+pub struct CloseError {
+    /// The folder being closed, or the file inside it whose list could not
+    /// be kept open.
+    pub path: PathBuf,
+    /// What the system said.
+    pub source: io::Error,
+}
+
+impl fmt::Display for CloseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for CloseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Checks that `folder` is a directory on a volume that keeps access lists,
+/// owned by a trusted owner, and that nobody untrusted may change who can
+/// open it. Returns its security descriptor for further inspection.
 fn usable_folder(folder: &File, user: &User) -> io::Result<Descriptor> {
     if !folder.metadata()?.is_dir() {
         return Err(io::Error::from(io::ErrorKind::NotADirectory));
@@ -361,21 +385,21 @@ fn usable_folder(folder: &File, user: &User) -> io::Result<Descriptor> {
     let Some(acl) = descriptor.dacl()? else {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "other users may change who can open it, so it cannot be closed to them",
+            "anyone may change who can open it, so it cannot be closed",
         ));
     };
     if lets_others(acl, user, CHANGE, false)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "other users may change who can open it, so it cannot be closed to them",
+            "another user or app may change who can open it, so it cannot be closed",
         ));
     }
     Ok(descriptor)
 }
 
 /// Whether `descriptor` is already a closed private folder: owned by a
-/// trusted owner, protected from inheritance, letting nobody untrusted in
-/// (directly or by inheritance), and passing this user's entry on to new
+/// trusted owner, inheriting nothing, letting nobody untrusted in (directly
+/// or through what it passes on), and passing this user's entry on to new
 /// files.
 fn folder_is_closed(descriptor: &Descriptor, user: &User) -> io::Result<bool> {
     if !judge(descriptor, true, user)? || !descriptor.protected()? {
@@ -389,16 +413,16 @@ fn folder_is_closed(descriptor: &Descriptor, user: &User) -> io::Result<bool> {
 
 /// Checks without changing anything that `path` is a folder on a volume
 /// that keeps access lists, owned by a trusted owner, and whose access list
-/// no untrusted user may change.
+/// nobody untrusted may change.
 pub fn check_folder_usable(path: &Path) -> io::Result<()> {
     let folder = open(path, false)?;
     let user = User::current()?;
     usable_folder(&folder, &user).map(|_| ())
 }
 
-/// Opens or creates the lock file at `path` without following a reparse
-/// point, refusing links, directories, and junctions before anything is
-/// locked or written.
+/// Opens or creates the lock file at `path` without following a link or
+/// junction, refusing anything that is not a regular file before anything
+/// is locked or written.
 pub fn open_lock_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -423,77 +447,124 @@ pub fn open_lock_file(path: &Path) -> io::Result<File> {
 /// Closes the folder at `path` to everyone except this user, unless it is
 /// already closed.
 ///
-/// The new owner-only access list is inherited by new files and propagates
-/// to existing files and subfolders that inherit from `path`. Returns an
-/// error if another user owns the folder or may change its access list.
+/// Files made in `path` take the new list, and existing files and subfolders
+/// that inherit their list take the new one. Returns an error if another
+/// user owns the folder or if another user or app may change its access
+/// list.
 pub fn close_folder(path: &Path) -> io::Result<()> {
     close_folder_preserving(path, &[])
+        .map(|_| ())
+        .map_err(|error| error.source)
 }
 
 /// Closes the folder at `path` to everyone except this user while keeping
 /// prior exposure visible for any file listed in `keep_open`.
 ///
 /// Before replacing the folder's access list, each existing file in
-/// `keep_open` that is not private is frozen so inheritance stops updating
-/// it. If freezing fails or leaves the file appearing private, this returns
-/// an error before changing the folder. Every other file and subfolder in
-/// `path` receives the new owner-only access list through inheritance.
-pub fn close_folder_preserving(path: &Path, keep_open: &[&Path]) -> io::Result<()> {
-    let folder = open(path, true)?;
-    let user = User::current()?;
-    let descriptor = usable_folder(&folder, &user)?;
-    if folder_is_closed(&descriptor, &user)? {
-        return Ok(());
+/// `keep_open` that is not private is frozen so it stops inheriting from
+/// `path`. If freezing fails or leaves the file appearing private, this
+/// returns an error carrying that file's path before changing the folder.
+/// Other files and subfolders that inherit their list take the new one.
+///
+/// Returns any paths from `keep_open` that were open beforehand yet
+/// appeared private after the folder was closed, so the caller can remove
+/// or move them aside instead of trusting them on the next start.
+pub fn close_folder_preserving(
+    path: &Path,
+    keep_open: &[&Path],
+) -> Result<Vec<PathBuf>, CloseError> {
+    let on_folder = |source| CloseError {
+        path: path.to_path_buf(),
+        source,
+    };
+    let folder = open(path, true).map_err(on_folder)?;
+    let user = User::current().map_err(on_folder)?;
+    let descriptor = usable_folder(&folder, &user).map_err(on_folder)?;
+    if folder_is_closed(&descriptor, &user).map_err(on_folder)? {
+        return Ok(Vec::new());
     }
     let mut was_open = Vec::new();
     for sensitive in keep_open {
+        let on_file = |source| CloseError {
+            path: sensitive.to_path_buf(),
+            source,
+        };
         match open(sensitive, false) {
             Ok(file) => {
-                if !is_private(&file)? {
+                if !is_private(&file).map_err(on_file)? {
                     drop(file);
-                    freeze(sensitive)?;
-                    if path_is_private(sensitive)? {
-                        return Err(io::Error::other(
-                            "freezing a sensitive file hid that it was open to others",
-                        ));
+                    freeze(sensitive, &user).map_err(on_file)?;
+                    if path_is_private(sensitive).map_err(on_file)? {
+                        return Err(on_file(io::Error::other(
+                            "freezing this file hid that it was open to others",
+                        )));
                     }
                     was_open.push(*sensitive);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(on_file(error)),
         }
     }
-    let mut list = OwnerOnly::new(true)?;
-    set_list(&folder, list.acl())?;
+    let mut list = OwnerOnly::new(true).map_err(on_folder)?;
+    set_list(&folder, list.acl()).map_err(on_folder)?;
     let closed = Descriptor::of(
         &folder,
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-    )?;
-    if !folder_is_closed(&closed, &user)? {
-        return Err(io::Error::other("it is still open to others once closed"));
+    )
+    .map_err(on_folder)?;
+    if !folder_is_closed(&closed, &user).map_err(on_folder)? {
+        return Err(on_folder(io::Error::other(
+            "it is still open to others once closed",
+        )));
     }
+    let mut hidden = Vec::new();
     for sensitive in was_open {
-        if path_is_private(sensitive)? {
-            return Err(io::Error::other(
-                "closing the folder hid that a sensitive file was open to others",
-            ));
+        let on_file = |source| CloseError {
+            path: sensitive.to_path_buf(),
+            source,
+        };
+        if path_is_private(sensitive).map_err(on_file)? {
+            hidden.push(sensitive.to_path_buf());
         }
     }
-    Ok(())
+    Ok(hidden)
 }
 
 /// Stops the file at `path` inheriting its list, keeping the entries it
-/// has now as its own.
-fn freeze(path: &Path) -> io::Result<()> {
-    let file = open(path, true)?;
-    let descriptor = Descriptor::of(&file, DACL_SECURITY_INFORMATION)?;
-    let Some(acl) = descriptor.dacl()? else {
-        return Ok(());
-    };
+/// has now (or its absent list, which lets everyone in) as its own.
+///
+/// Reads with `READ_CONTROL` first so a file whose list already inherits
+/// nothing, or one owned by another user (which already fails `is_private`),
+/// never asks for `WRITE_DAC`.
+fn freeze(path: &Path, user: &User) -> io::Result<()> {
+    let read = open(path, false)?;
+    let descriptor = Descriptor::of(
+        &read,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+    )?;
     if descriptor.protected()? {
         return Ok(());
     }
+    if descriptor
+        .owner()?
+        .is_none_or(|owner| !trusted_owner(owner, user))
+    {
+        return Ok(());
+    }
+    drop(read);
+
+    let file = open(path, true)?;
+    let descriptor = Descriptor::of(&file, DACL_SECURITY_INFORMATION)?;
+    if descriptor.protected()? {
+        return Ok(());
+    }
+    let Some(acl) = descriptor.dacl()? else {
+        // A null list lets everyone in; stop inheritance while keeping it
+        // null so closing the folder does not replace it with an owner-only
+        // list.
+        return set_list(&file, std::ptr::null_mut());
+    };
     // SAFETY: `acl` is valid while `descriptor` lives.
     let (size, count) = unsafe { (usize::from((*acl.0).AclSize), (*acl.0).AceCount) };
     let mut copy = vec![0u64; size.div_ceil(8)];
@@ -513,8 +584,8 @@ fn freeze(path: &Path) -> io::Result<()> {
     set_list(&file, copied)
 }
 
-/// Creates a new file at `path` with an owner-only protected descriptor in
-/// `CreateFileW`, without checking whether the volume persisted the ACL.
+/// Creates a new file at `path` asking `CreateFileW` for an owner-only list
+/// that inherits nothing, without checking whether the volume kept it.
 fn create_file_with_owner_only(path: &Path) -> io::Result<File> {
     let wide = crate::wide_absolute(path)?;
     owner_only(false, |attributes| {
@@ -541,8 +612,8 @@ fn create_file_with_owner_only(path: &Path) -> io::Result<File> {
     })
 }
 
-/// Creates a new directory at `path` with an owner-only protected
-/// descriptor in `CreateDirectoryW`.
+/// Creates a new directory at `path` asking `CreateDirectoryW` for an
+/// owner-only list that inherits nothing.
 fn create_dir_with_owner_only(path: &Path) -> io::Result<()> {
     let wide = crate::wide_absolute(path)?;
     owner_only(true, |attributes| {
@@ -576,23 +647,25 @@ pub fn create_restricted(path: &Path) -> io::Result<File> {
     }
 }
 
-/// Creates a new file at `path` in a user-chosen backup or export folder,
-/// applying an owner-only access list where the volume supports it without
-/// refusing drives or network shares that keep no permissions.
+/// Creates a new file at `path` in a backup, export, or rollback staging
+/// folder, asking for an owner-only access list where the volume keeps one
+/// without refusing drives or network shares that keep no permissions.
 pub fn create_backup_file(path: &Path) -> io::Result<File> {
     create_file_with_owner_only(path)
 }
 
-/// Closes a file at `path` in a user-chosen backup or export folder to this
-/// user alone when the volume supports persistent access lists. On volumes
-/// without persistent ACLs (such as FAT or exFAT) or shares that refuse
-/// ACL updates, this leaves the file as the volume keeps it.
-pub fn restrict_if_supported(path: &Path) -> io::Result<()> {
+/// Closes a file at `path` in a backup, export, or rollback folder to this
+/// user alone when the volume keeps access lists.
+///
+/// Returns `Ok(true)` when the owner-only list was set, and `Ok(false)` on
+/// drives that keep no permissions (such as FAT or exFAT) or shares that
+/// refuse changes to the list.
+pub fn restrict_if_supported(path: &Path) -> io::Result<bool> {
     let probe = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .open(path)?;
     if !supports_acls(&probe)? {
-        return Ok(());
+        return Ok(false);
     }
     drop(probe);
     let file = match open(path, true) {
@@ -603,21 +676,21 @@ pub fn restrict_if_supported(path: &Path) -> io::Result<()> {
                 io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
             ) =>
         {
-            return Ok(());
+            return Ok(false);
         }
         Err(error) => return Err(error),
     };
     let folder = file.metadata()?.is_dir();
     let mut list = OwnerOnly::new(folder)?;
     match set_list(&file, list.acl()) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(true),
         Err(error)
             if matches!(
                 error.kind(),
                 io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
             ) =>
         {
-            Ok(())
+            Ok(false)
         }
         Err(error) => Err(error),
     }
@@ -655,14 +728,14 @@ pub fn create_restricted_dir(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Creates a new staging folder at `path` in a user-chosen backup or export
-/// location, applying an owner-only access list where the volume supports
-/// it, and returns an open handle without `FILE_SHARE_DELETE` so the folder
+/// Creates a new staging folder at `path` for a backup, export, or rollback
+/// copy, asking for an owner-only access list where the volume keeps one,
+/// and returns an open handle without `FILE_SHARE_DELETE` so the folder
 /// cannot be removed or renamed while the handle is held.
 ///
-/// Unlike [`create_restricted_dir`], this does not refuse volumes without
-/// persistent ACLs (such as FAT or exFAT) or shares that assign a foreign
-/// owner SID.
+/// Unlike [`create_restricted_dir`], this does not refuse drives that keep
+/// no permissions (such as FAT or exFAT) or shares whose owner is a remote
+/// account.
 pub fn create_pinned_backup_dir(path: &Path) -> io::Result<File> {
     create_dir_with_owner_only(path)?;
     let checked = OpenOptions::new()

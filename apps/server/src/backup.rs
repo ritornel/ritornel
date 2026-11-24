@@ -39,8 +39,8 @@ use tracing::{info, warn};
 
 use crate::data_dir::DataDir;
 use crate::platform::{
-    PrivateDir, close_backup_file, close_dir_to_others, create_backup_file, create_new_private_dir,
-    create_private_dir, rename_dir, sync_dir,
+    StagingDir, close_backup_file, close_dir_to_others, create_backup_file, create_private_dir,
+    create_staging_dir, rename_dir, sync_dir,
 };
 
 /// The version of `backup.json`.
@@ -369,7 +369,7 @@ fn write(
 pub(crate) struct Staged {
     pub(crate) name: String,
     pub(crate) partial: PathBuf,
-    pin: PrivateDir,
+    pin: StagingDir,
 }
 
 impl Staged {
@@ -417,7 +417,7 @@ pub(crate) fn reserve_named(place: &Path, base: &str) -> Result<Staged, BackupEr
             continue;
         }
         let partial = place.join(format!(".{name}.partial"));
-        match create_new_private_dir(&partial) {
+        match create_staging_dir(&partial) {
             // Another writer may have finished a folder of this name since
             // it was looked for; then the next name is taken.
             Ok(pin) if place.join(&name).exists() => {
@@ -470,6 +470,7 @@ fn fill(
 ) -> Result<(), BackupError> {
     let mut files = Vec::new();
     let mut held = false;
+    let mut open = false;
     for (name, source) in [
         ("server.db", dir.server_db()),
         ("library.db", dir.library_db()),
@@ -499,10 +500,18 @@ fn fill(
             held = hold_sending(&copy, at_ms).map_err(|error| BackupError::Copy(name, error))?;
         }
         // SQLite makes a file anyone may read, and server.db holds this
-        // server's signing key. Close it where the backup volume supports
-        // file permissions.
-        close_backup_file(&copy).map_err(io("close", &copy))?;
+        // server's signing key. Close it where the backup folder keeps
+        // permissions.
+        if !close_backup_file(&copy).map_err(io("close", &copy))? {
+            open = true;
+        }
         files.push(name);
+    }
+    if open {
+        warn!(
+            path = %into.parent().unwrap_or(into).display(),
+            "the backup folder keeps no permissions, so anyone who can open it can read this backup"
+        );
     }
     let config = dir.config_toml();
     if present(&config)? {
