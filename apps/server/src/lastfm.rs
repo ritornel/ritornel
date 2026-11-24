@@ -223,8 +223,8 @@ mod enabled {
 
     use ritornel_contract::{ErrorCode, Id, RpcError, SyncSummary};
     use ritornel_engine::{
-        Due, Job, JobState, LibraryStore, Observations, Progress, ServerStore, ServiceKey,
-        ServiceSession, Settled,
+        Due, Job, JobCancel, JobState, JobStop, LibraryStore, Observations, Progress, ServerStore,
+        ServiceKey, ServiceSession, Settled,
     };
     use ritornel_lastfm::{
         DAILY_LIMIT, NotShown, Outcome, Playing, Sent, SessionKey, ToScrobble, Unsent,
@@ -627,7 +627,11 @@ mod enabled {
         /// Whether the sync reads everything again, which sets aside what
         /// an earlier one stored twice.
         full: bool,
-        stop: &'a std::sync::atomic::AtomicBool,
+        cancel: JobCancel,
+        /// Set when a guarded library write stopped before beginning its
+        /// transaction so `run_sync` distinguishes cancellation or shutdown
+        /// from a real database failure.
+        stopped: Option<JobStop>,
         batches: u64,
         summary: SyncSummary,
         saved: Instant,
@@ -638,20 +642,19 @@ mod enabled {
     }
 
     impl JobSink<'_> {
-        fn cancellation_requested(&self) -> bool {
-            self.job.cancel_requested || self.core.with_stores(|stores| {
-                matches!(stores.server().job(self.job.public_id), Ok(Some(job)) if job.cancel_requested)
-            }).unwrap_or(false)
-        }
-
         fn library<T>(
-            &self,
+            &mut self,
             work: impl FnOnce(&LibraryStore) -> Result<T, ritornel_engine::Error>,
         ) -> Result<T, SourceError> {
-            self.core
-                .with_library(|_, library| work(library))
-                .ok_or_else(|| sink_failed("the library is closed"))?
-                .map_err(sink_failed)
+            match self.core.with_library(|_, library| work(library)) {
+                Some(Ok(value)) => Ok(value),
+                Some(Err(ritornel_engine::Error::JobStopped(stop))) => {
+                    self.stopped = Some(stop);
+                    Err(sink_failed("stopped"))
+                }
+                Some(Err(error)) => Err(sink_failed(error)),
+                None => Err(sink_failed("the library is closed")),
+            }
         }
 
         fn save(&mut self, read: &Read) {
@@ -681,13 +684,16 @@ mod enabled {
         }
 
         fn commit(&mut self, batch: Batch) -> Result<Stored, SourceError> {
-            let (account, full) = (self.account, self.full);
+            let (account, full, cancel) = (self.account, self.full, self.cancel.clone());
             let outcome = self.library(|library| {
-                library.ingest(Observations::Imports {
-                    account,
-                    batch: &batch,
-                    full,
-                })
+                library.ingest_guarded(
+                    Observations::Imports {
+                        account,
+                        batch: &batch,
+                        full,
+                    },
+                    cancel,
+                )
             })?;
             let ritornel_engine::IngestOutcome::Imports(stored) = outcome else {
                 return Err(sink_failed("imports ingested as a listen"));
@@ -712,8 +718,9 @@ mod enabled {
         }
 
         fn loves(&mut self, loves: Vec<Love>) -> Result<LovesStored, SourceError> {
-            let account = self.account;
-            let stored = self.library(|library| library.replace_loves(account, &loves))?;
+            let (account, cancel) = (self.account, self.cancel.clone());
+            let stored =
+                self.library(|library| library.replace_loves_guarded(account, &loves, cancel))?;
             self.summary.loved = Some(stored.loved);
             Ok(stored)
         }
@@ -725,13 +732,17 @@ mod enabled {
         }
 
         fn stopping(&self) -> bool {
-            self.stop.load(std::sync::atomic::Ordering::SeqCst) || self.cancellation_requested()
+            self.cancel.stopped().is_some()
         }
     }
 
     /// Runs a claimed sync to its end, or until the server stops, which
     /// leaves it claimed for the next run to carry on from the cursor.
-    pub(crate) fn run_sync(core: &Core, job: Job, stop: &std::sync::atomic::AtomicBool) {
+    pub(crate) fn run_sync(
+        core: &Core,
+        job: Job,
+        shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let (row, job_id) = (job.id, job.public_id);
         info!(job_id = %job_id, kind = %job.kind, "a job is claimed");
         let finish = |state: JobState, failure: Option<String>, summary: Option<&SyncSummary>| {
@@ -752,12 +763,12 @@ mod enabled {
             match finished {
                 Some(Ok(job)) => {
                     match &job.error {
-                        Some(failure) if state == JobState::Failed => warn!(
+                        Some(failure) if job.state == JobState::Failed => warn!(
                             job_id = %job_id,
                             error = %failure,
                             "a Last.fm sync failed: the next import tries again"
                         ),
-                        _ => info!(job_id = %job_id, state = state.as_str(), "a job ended"),
+                        _ => info!(job_id = %job_id, state = job.state.as_str(), "a job ended"),
                     }
                     core.publish_job(&job);
                 }
@@ -767,6 +778,16 @@ mod enabled {
                 None => {}
             }
         };
+        let cancel = match crate::jobs::cancel_handle(core, row, shutdown) {
+            Some(Ok(cancel)) => cancel,
+            Some(Err(failed)) => return finish(JobState::Failed, Some(failed.to_string()), None),
+            None => return,
+        };
+        match cancel.stopped() {
+            Some(JobStop::Cancelled) => return finish(JobState::Cancelled, None, None),
+            Some(JobStop::Shutdown) => return,
+            None => {}
+        }
         let Some(lastfm) = core.lastfm() else {
             return finish(
                 JobState::Failed,
@@ -812,32 +833,50 @@ mod enabled {
             account: session.account,
             job: &job,
             full,
-            stop,
+            cancel: cancel.clone(),
+            stopped: None,
             batches: 0,
             summary: SyncSummary::default(),
             saved: Instant::now(),
         };
         let synced = client.source(&session.account_name).sync(&mut sink, full);
+        let stopped = sink.stopped;
         let mut summary = sink.summary;
         match synced {
             Ok(synced) if synced.stopped => {
-                if sink.cancellation_requested() {
+                if cancel.stopped() == Some(JobStop::Cancelled) {
                     finish(JobState::Cancelled, None, Some(&summary));
                 }
                 // Stopped with the server: the next run carries on.
             }
+            Err(_) if stopped == Some(JobStop::Cancelled) => {
+                finish(JobState::Cancelled, None, Some(&summary));
+            }
+            Err(_) if stopped == Some(JobStop::Shutdown) => {}
             Ok(synced) => {
                 summary.source_total = synced.source_total;
                 let account = session.account;
                 let after = core.with_library(|_, library| {
-                    let matched = library.match_library_for(account)?;
+                    let matched = library.match_library_for_guarded(account, cancel.clone())?;
                     Ok::<_, ritornel_engine::Error>((matched, library.imported_count(account)?))
                 });
                 match after {
+                    Some(Err(ritornel_engine::Error::JobStopped(JobStop::Cancelled))) => {
+                        finish(JobState::Cancelled, None, Some(&summary));
+                    }
+                    Some(Err(ritornel_engine::Error::JobStopped(JobStop::Shutdown))) => {}
                     Some(Ok((matched, stored))) => {
                         // What Last.fm has is known now: plays a restored
                         // library had waiting that it took are not sent.
-                        match core.with_library(|_, library| library.release_hold(account)) {
+                        match core.with_library(|_, library| {
+                            library.release_hold_guarded(account, cancel.clone())
+                        }) {
+                            Some(Err(ritornel_engine::Error::JobStopped(JobStop::Cancelled))) => {
+                                return finish(JobState::Cancelled, None, Some(&summary));
+                            }
+                            Some(Err(ritornel_engine::Error::JobStopped(JobStop::Shutdown))) => {
+                                return;
+                            }
                             Some(Ok(true)) => {
                                 info!("an import has run since the restore: scrobbling resumes");
                                 core.wake_scrobbler();
@@ -1197,14 +1236,18 @@ mod enabled {
                     store.claim_job(id(3)).unwrap().unwrap()
                 })
                 .unwrap();
-            let stop = std::sync::atomic::AtomicBool::new(false);
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel = core
+                .with_stores(|stores| stores.server().job_cancel(job.id, stop).unwrap())
+                .unwrap();
             let sink = JobSink {
                 core: &core,
                 lastfm: &lastfm,
                 account: id(2),
                 job: &job,
                 full: false,
-                stop: &stop,
+                cancel,
+                stopped: None,
                 batches: 0,
                 summary: Default::default(),
                 saved: Instant::now(),
@@ -1269,7 +1312,11 @@ mod enabled {
                 })
                 .unwrap();
             let public_id = job.public_id;
-            super::run_sync(&core, job, &std::sync::atomic::AtomicBool::new(false));
+            super::run_sync(
+                &core,
+                job,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
             let ended = core
                 .with_stores(|stores| stores.server().job(public_id).unwrap().unwrap())
                 .unwrap();
@@ -1283,6 +1330,86 @@ mod enabled {
                 ended.error
             );
             // Nothing of the other account's was read.
+            assert!(fake.seen().is_empty(), "{:?}", fake.seen());
+        }
+
+        #[test]
+        fn a_sync_cancelled_after_claim_ends_cancelled_without_reading_or_writing() {
+            use ritornel_engine::{Command, Fingerprint, JobState, NewJob, ServiceKey};
+            use ritornel_lastfm::fake::{API_KEY, API_SECRET, FakeLastfm, FakeScrobble};
+            let fake = FakeLastfm::start(
+                "someone",
+                vec![FakeScrobble::new(
+                    1_799_996_400,
+                    "Calla Brandt",
+                    "Glasshouse",
+                    "Low Tide",
+                )],
+            );
+            let (core, scratch) = crate::testing::core();
+            core.set_lastfm(Lastfm::new(
+                super::super::LastfmRun {
+                    credentials: Some(ritornel_lastfm::ApiCredentials::new(API_KEY, API_SECRET)),
+                    base_url: Some(fake.base_url()),
+                    ..Default::default()
+                },
+                scratch.path(),
+            ));
+            let id = |n| Id::from_bytes([n; 16]);
+            let job = core
+                .with_stores(|stores| {
+                    let store = stores.server();
+                    store
+                        .save_service_session(
+                            "lastfm",
+                            id(2),
+                            "someone",
+                            &ServiceKey::new("KEY_A"),
+                            false,
+                        )
+                        .unwrap();
+                    store
+                        .start_job(
+                            Command {
+                                id: id(1),
+                                fingerprint: Fingerprint::of("lastfm.sync", b"{}"),
+                            },
+                            "lastfm.sync",
+                            NewJob {
+                                kind: "lastfm.sync",
+                                dedupe_key: "someone".into(),
+                                target: id(2),
+                                params_json: "{}".into(),
+                                session: None,
+                            },
+                        )
+                        .unwrap();
+                    let claimed = store.claim_job(id(3)).unwrap().unwrap();
+                    let cancelling = store
+                        .cancel_job(
+                            Command {
+                                id: id(4),
+                                fingerprint: Fingerprint::of("jobs.cancel", b"{}"),
+                            },
+                            "jobs.cancel",
+                            claimed.public_id,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(cancelling.state, JobState::Cancelling);
+                    claimed
+                })
+                .unwrap();
+            let public_id = job.public_id;
+            super::run_sync(
+                &core,
+                job,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            let ended = core
+                .with_stores(|stores| stores.server().job(public_id).unwrap().unwrap())
+                .unwrap();
+            assert_eq!(ended.state, JobState::Cancelled);
             assert!(fake.seen().is_empty(), "{:?}", fake.seen());
         }
 

@@ -3,8 +3,9 @@
 //! in docs/internals/server.md and "Server identity and hub role" in
 //! docs/internals/linking.md.
 
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -159,6 +160,11 @@ pub struct ServerStore {
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
     migrated: Migrated,
+    /// Active jobs asked to stop during this run, updated after
+    /// `cancel_job` commits and before it returns so a library write
+    /// beginning its transaction sees the cancel at once without a second
+    /// database read.
+    pub(crate) cancels: Arc<Mutex<HashSet<i64>>>,
 }
 
 impl ServerStore {
@@ -200,6 +206,7 @@ impl ServerStore {
             clock,
             entropy,
             migrated,
+            cancels: Arc::default(),
         })
     }
 

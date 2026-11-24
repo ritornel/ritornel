@@ -1958,3 +1958,186 @@ fn no_play_a_stream_speaks_for_is_ever_scrobbled() {
     );
     assert_eq!(rig.library.plan_deliveries(rig.account, 0).unwrap(), 0);
 }
+
+/// Holds the library writer thread via a channel, spawns a guarded write so it
+/// queues behind the blocker, cancels the job while queued, releases the writer,
+/// and returns the guarded write's result.
+fn cancel_while_queued<T: Send + 'static>(
+    library: &LibraryStore,
+    server: &crate::ServerStore,
+    job: &crate::Job,
+    cancel_key: u8,
+    write: impl FnOnce() -> Result<T, Error> + Send,
+) -> Result<T, Error> {
+    struct Release(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let holder = scope.spawn(move || {
+            library
+                .writer
+                .call(move |_| {
+                    let _ = held_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        let release = Release(Some(release_tx));
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the writer blocker never started");
+        library.writer.notify_next_enqueue(queued_tx);
+        let writer = scope.spawn(write);
+        queued_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the guarded write never queued on the library writer");
+        let cancelled = server
+            .cancel_job(
+                crate::Command {
+                    id: Id::from_bytes([cancel_key; 16]),
+                    fingerprint: crate::Fingerprint::of("jobs.cancel", b"{}"),
+                },
+                "jobs.cancel",
+                job.public_id,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, crate::JobState::Cancelling);
+        drop(release);
+        holder.join().unwrap();
+        writer.join().unwrap()
+    })
+}
+
+#[test]
+fn cancellation_while_queued_on_the_library_writer_aborts_apply_undo_and_ingest() {
+    let rig = rig();
+    let server = crate::ServerStore::open_in_memory(
+        Arc::new(FixedClock::at(T0)),
+        Arc::new(CountingEntropy::default()),
+    )
+    .unwrap();
+    server.ensure_identity("desk").unwrap();
+    let claim = |kind: &'static str, key: u8| {
+        server
+            .start_job(
+                crate::Command {
+                    id: Id::from_bytes([key; 16]),
+                    fingerprint: crate::Fingerprint::of(kind, &[key]),
+                },
+                kind,
+                crate::NewJob {
+                    kind,
+                    dedupe_key: format!("k-{key}"),
+                    target: Id::from_bytes([key; 16]),
+                    params_json: "{}".to_owned(),
+                    session: None,
+                },
+            )
+            .unwrap();
+        let job = server
+            .claim_job(Id::from_bytes([0xb0; 16]))
+            .unwrap()
+            .unwrap();
+        let cancel = server
+            .job_cancel(job.id, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .unwrap();
+        (job, cancel)
+    };
+
+    // 1. Spotify apply cancelled while queued behind an active writer.
+    let (apply_job, apply_cancel) = claim("imports.apply", 11);
+    let rev_before = rig.library.meta().unwrap().revision;
+    let run_id = Id::from_bytes([0x41; 16]);
+    let outcome = cancel_while_queued(&rig.library, &server, &apply_job, 12, || {
+        rig.library.apply_streams_guarded(
+            WriteRequest {
+                method: crate::APPLY_METHOD,
+                command: None,
+                client: None,
+            },
+            run_id,
+            vec![stream(T0 - HOUR, 250_000, "Paper Kites")],
+            "ritornelctl 0.1.0".to_owned(),
+            None,
+            apply_cancel,
+        )
+    });
+    assert!(
+        matches!(outcome, Err(Error::JobStopped(crate::JobStop::Cancelled))),
+        "{outcome:?}"
+    );
+    assert_eq!(rig.library.meta().unwrap().revision, rev_before);
+    assert_eq!(rig.one("SELECT count(*) FROM history_observation"), "0");
+    assert!(rig.library.stored_run(run_id).unwrap().is_none());
+
+    // 2. Spotify undo cancelled while queued behind an active writer.
+    apply(&rig, 2, vec![stream(T0 - HOUR, 250_000, "Paper Kites")]);
+    let rev_after_apply = rig.library.meta().unwrap().revision;
+    let applied_run = Id::from_bytes([2; 16]);
+    let (undo_job, undo_cancel) = claim("imports.undo", 21);
+    let outcome = cancel_while_queued(&rig.library, &server, &undo_job, 22, || {
+        rig.library.undo_streams_guarded(
+            WriteRequest {
+                method: crate::UNDO_METHOD,
+                command: None,
+                client: None,
+            },
+            applied_run,
+            undo_cancel,
+        )
+    });
+    assert!(
+        matches!(outcome, Err(Error::JobStopped(crate::JobStop::Cancelled))),
+        "{outcome:?}"
+    );
+    assert_eq!(rig.library.meta().unwrap().revision, rev_after_apply);
+    assert!(
+        rig.library
+            .stored_run(applied_run)
+            .unwrap()
+            .unwrap()
+            .in_force
+    );
+
+    // 3. Last.fm batch ingest cancelled while queued behind an active writer.
+    let (sync_job, sync_cancel) = claim("lastfm.sync", 31);
+    let obs_before = rig.one("SELECT count(*) FROM history_observation");
+    let batch = Batch {
+        records: vec![record(T0 - 2 * HOUR, "Calla Brandt", "Low Tide", 1)],
+        span: Span {
+            from_ms: T0 - 3 * HOUR,
+            to_ms: T0,
+        },
+        cursor: r#"{"readBefore":1}"#.to_owned(),
+    };
+    let outcome = cancel_while_queued(&rig.library, &server, &sync_job, 32, || {
+        rig.library.ingest_guarded(
+            Observations::Imports {
+                account: rig.account,
+                batch: &batch,
+                full: false,
+            },
+            sync_cancel,
+        )
+    });
+    assert!(
+        matches!(outcome, Err(Error::JobStopped(crate::JobStop::Cancelled))),
+        "{outcome:?}"
+    );
+    assert_eq!(rig.library.meta().unwrap().revision, rev_after_apply);
+    assert_eq!(
+        rig.one("SELECT count(*) FROM history_observation"),
+        obs_before
+    );
+}

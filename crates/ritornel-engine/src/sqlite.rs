@@ -89,6 +89,8 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 pub(crate) struct Writer {
     jobs: Option<mpsc::Sender<Job>>,
     thread: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    on_enqueue: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 impl Writer {
@@ -107,7 +109,17 @@ impl Writer {
         Ok(Self {
             jobs: Some(jobs),
             thread: Some(thread),
+            #[cfg(test)]
+            on_enqueue: Mutex::default(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notify_next_enqueue(&self, tx: mpsc::Sender<()>) {
+        *self
+            .on_enqueue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(tx);
     }
 
     /// Runs `work` on the writer thread and waits for what it returns.
@@ -121,11 +133,21 @@ impl Writer {
             // The caller has gone only if its thread has died.
             let _ = reply.send(work(connection));
         });
+        #[cfg(test)]
+        let notify = self
+            .on_enqueue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         self.jobs
             .as_ref()
             .ok_or(Error::WriterStopped)?
             .send(job)
             .map_err(|_| Error::WriterStopped)?;
+        #[cfg(test)]
+        if let Some(tx) = notify {
+            let _ = tx.send(());
+        }
         answer.recv().map_err(|_| Error::WriterStopped)?
     }
 

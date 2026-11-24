@@ -515,6 +515,7 @@ impl LibraryStore {
 
     /// Records what a scan read, in one transaction, with `receipt` as the
     /// write's stored result.
+    #[cfg(test)]
     pub(crate) fn record(
         &self,
         request: WriteRequest,
@@ -522,7 +523,18 @@ impl LibraryStore {
         ops: Vec<RecordOp>,
         receipt: String,
     ) -> Result<Written, Error> {
-        self.write(request, move |write| {
+        self.record_with(request, source, ops, receipt, None)
+    }
+
+    pub(crate) fn record_with(
+        &self,
+        request: WriteRequest,
+        source: i64,
+        ops: Vec<RecordOp>,
+        receipt: String,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<Written, Error> {
+        self.write_guarded(request, cancel, move |write| {
             let recorder = Recorder::new(write)?;
             let retire = |item: &i64| {
                 write.connection().execute(
@@ -587,8 +599,9 @@ impl LibraryStore {
         request: WriteRequest,
         items: Vec<i64>,
         receipt: String,
+        cancel: Option<crate::JobCancel>,
     ) -> Result<Written, Error> {
-        self.write(request, move |write| {
+        self.write_guarded(request, cancel, move |write| {
             let mut update = write.connection().prepare(
                 "UPDATE source_item SET missing_since_ms = ?2, rev = ?3
                  WHERE id = ?1 AND missing_since_ms IS NULL",
@@ -617,8 +630,12 @@ impl LibraryStore {
 
     /// Rebuilds every item's claims from its stored payload, as a changed
     /// extractor asks.
-    pub(crate) fn rebuild_claims(&self, request: WriteRequest) -> Result<Written, Error> {
-        self.write(request, |write| {
+    pub(crate) fn rebuild_claims(
+        &self,
+        request: WriteRequest,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<Written, Error> {
+        self.write_guarded(request, cancel, |write| {
             let recorder = Recorder::new(write)?;
             mark_pending(write)?;
             write
