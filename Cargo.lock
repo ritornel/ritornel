@@ -2062,6 +2062,7 @@ dependencies = [
  "proptest",
  "ritornel-contract",
  "serde",
+ "serde_json",
  "sha1",
  "unicode-normalization",
 ]
@@ -2105,6 +2106,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ritornel-musicbrainz"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "ritornel-source",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "ritornel-server"
 version = "0.1.0"
 dependencies = [
@@ -2120,6 +2131,7 @@ dependencies = [
  "ritornel-contract",
  "ritornel-engine",
  "ritornel-lastfm",
+ "ritornel-musicbrainz",
  "ritornel-source",
  "ritornel-windows",
  "rusqlite",

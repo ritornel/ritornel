@@ -13,6 +13,7 @@
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
 --   0008_spotify_streams  e9ce8045bd8ecad934d57ecb7150f891907050e0591b711f9884c1231d1747e1
 --   0009_sidecars_and_disc_layouts  878233bcc6fed742092f02deba5765f167f1f9eb2bb1743c26a3235baea3e18a
+--   0010_lookup_replies  28ed4aad4966e46edc0008b800d61348b49c8e03ceaab864f22c3d90c5ede3a7
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -1184,3 +1185,53 @@ CREATE TABLE evidence_disc_item (
 ) STRICT;
 
 CREATE INDEX evidence_disc_item_item ON evidence_disc_item (source_item_id);
+
+CREATE TABLE lookup_response (
+  id                INTEGER PRIMARY KEY,
+  catalogue         TEXT NOT NULL,                  -- 'musicbrainz'
+  request_kind      TEXT NOT NULL,                  -- 'disc'
+  request_key       TEXT NOT NULL,                  -- the disc ID
+  includes          TEXT NOT NULL,                  -- what the request asked to be included
+  status            INTEGER NOT NULL CHECK (status IN (200, 404)),
+  body              TEXT NOT NULL,
+  body_hash         BLOB NOT NULL CHECK (length(body_hash) = 32),   -- BLAKE3 of body
+  received_at_ms    INTEGER NOT NULL,
+  rev               INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX lookup_response_request
+  ON lookup_response (catalogue, request_kind, request_key, includes, id);
+
+CREATE TRIGGER lookup_response_no_update
+BEFORE UPDATE ON lookup_response
+BEGIN
+  SELECT RAISE(ABORT, 'lookup_response is immutable');
+END;
+
+CREATE TRIGGER lookup_response_no_delete
+BEFORE DELETE ON lookup_response
+BEGIN
+  SELECT RAISE(ABORT, 'lookup_response is immutable');
+END;
+
+CREATE TRIGGER lookup_response_no_replace
+BEFORE INSERT ON lookup_response
+WHEN EXISTS (SELECT 1 FROM lookup_response WHERE id = NEW.id)
+BEGIN
+  SELECT RAISE(ABORT, 'lookup_response is immutable');
+END;
+
+CREATE TABLE evidence_claim (
+  id                    INTEGER PRIMARY KEY,
+  lookup_response_id    INTEGER NOT NULL REFERENCES lookup_response(id),
+  release_mbid          TEXT NOT NULL,                -- the release the fact is about
+  field                 TEXT NOT NULL,                -- such as 'mb_release_group', 'album_artist', 'disc_number'
+  value                 TEXT NOT NULL,
+  ordinal               INTEGER NOT NULL,             -- the position among a field's values, from 0
+  reader_version        INTEGER NOT NULL,
+  rev                   INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX evidence_claim_response ON evidence_claim (lookup_response_id);
+
+CREATE INDEX evidence_claim_release ON evidence_claim (release_mbid, field);

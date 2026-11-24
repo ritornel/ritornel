@@ -63,7 +63,7 @@ The server reads the file when it starts, so start it again: quit and reopen the
 | `crates/ritornel-client` | How a client finds a server and talks to it |
 | `crates/ritornel-domain` | Reading tags, deciding which files are one recording, and deriving plays, with no I/O |
 | `crates/ritornel-engine` | The databases, the scan and the audio pipeline |
-| `crates/ritornel-source`, `crates/ritornel-lastfm` | The plugin traits, and Last.fm as the first plugin |
+| `crates/ritornel-source`, `crates/ritornel-lastfm`, `crates/ritornel-musicbrainz` | The plugin traits, Last.fm, and MusicBrainz |
 | `contract/contract.ts` | The contract as TypeScript, generated from the Rust |
 | `schema/` | The databases' schemas, generated from the migrations |
 | `fixtures/` | Small synthetic audio files for the tests |

@@ -44,6 +44,12 @@ pub const TICKET_LIFE: Duration = Duration::from_secs(10);
 /// away hears so in seconds, not after its own wait runs out.
 pub const HUB_CALL_WAIT: Duration = Duration::from_secs(8);
 
+/// The longest a satellite waits for its hub to look an album's discs up
+/// (`corrections.lookup`): the hub asks MusicBrainz about each disc in
+/// turn, a second apart, each request with a timeout of its own, so a
+/// lookup can take far longer than any other call.
+pub(crate) const HUB_LOOKUP_WAIT: Duration = Duration::from_secs(600);
+
 /// The bounds one server runs with. [`Default`] is what a server uses. A
 /// test makes them small, so that it reaches one without opening a hundred
 /// connections or waiting ten seconds.

@@ -194,8 +194,8 @@ jobs:
 
   hub:
     # The headless hub, as it is built for a Linux machine with no desktop:
-    # the server without its default features, so no audio output, media
-    # session or Last.fm. pkg-config is pointed at nothing, so any crate
+    # the server without its default features but MusicBrainz, so no audio
+    # output, media session or Last.fm. pkg-config is pointed at nothing, so any crate
     # that would link a system library (ALSA among them) fails the build.
     # `mise run lint` lints it.
     name: Hub on Linux, linking no system library
@@ -212,8 +212,10 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           rust-cache: workspace
-      - run: cargo nextest run --locked --package ritornel-server --no-default-features
-      - run: cargo test --locked --package ritornel-server --no-default-features --doc
+      - run: cargo nextest run --locked --package ritornel-server --no-default-features --features musicbrainz
+      - run: cargo test --locked --package ritornel-server --no-default-features --features musicbrainz --doc
+      # And with no plugin at all.
+      - run: cargo clippy --locked --package ritornel-server --no-default-features --all-targets -- -D warnings
 
   player-arm64:
     # The headless player, as it is built for a small arm64 board: the

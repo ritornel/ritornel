@@ -1,0 +1,142 @@
+{
+ "id": "oAA1ZY.4QOAq6tpdobDdb4M9qyc-",
+ "sectors": 650,
+ "offset-count": 2,
+ "offsets": [
+  150,
+  350
+ ],
+ "releases": [
+  {
+   "id": "00000000-0000-4000-8000-0000000000c2",
+   "title": "Tin Weather (deluxe)",
+   "status": "Official",
+   "date": "2005-02-01",
+   "country": "XE",
+   "barcode": "0000000000024",
+   "artist-credit": [
+    {
+     "name": "Moss Arcade",
+     "joinphrase": "",
+     "artist": {
+      "id": "00000000-0000-4000-8000-0000000000a1",
+      "name": "Moss Arcade",
+      "sort-name": "Moss Arcade",
+      "disambiguation": "invented"
+     }
+    }
+   ],
+   "release-group": {
+    "id": "00000000-0000-4000-8000-0000000000b1",
+    "title": "Tin Weather",
+    "primary-type": "Album",
+    "secondary-types": [],
+    "first-release-date": "2004-05-11",
+    "artist-credit": [
+     {
+      "name": "Moss Arcade",
+      "joinphrase": "",
+      "artist": {
+       "id": "00000000-0000-4000-8000-0000000000a1",
+       "name": "Moss Arcade",
+       "sort-name": "Moss Arcade",
+       "disambiguation": "invented"
+      }
+     }
+    ]
+   },
+   "media": [
+    {
+     "position": 1,
+     "format": "CD",
+     "track-count": 3,
+     "discs": [
+      {
+       "id": "YuBQA_w4y7cbiR1haQP4UVic4Ko-",
+       "sectors": 435,
+       "offsets": [
+        150,
+        225,
+        345
+       ]
+      }
+     ],
+     "tracks": [
+      {
+       "position": 1,
+       "number": "1",
+       "title": "Track 1",
+       "length": 2000,
+       "recording": {
+        "id": "00000000-0000-4000-8000-000000000101",
+        "title": "Track 1",
+        "length": 2000
+       }
+      },
+      {
+       "position": 2,
+       "number": "2",
+       "title": "Track 2",
+       "length": 3000,
+       "recording": {
+        "id": "00000000-0000-4000-8000-000000000102",
+        "title": "Track 2",
+        "length": 3000
+       }
+      },
+      {
+       "position": 3,
+       "number": "3",
+       "title": "Track 3",
+       "length": 4000,
+       "recording": {
+        "id": "00000000-0000-4000-8000-000000000103",
+        "title": "Track 3",
+        "length": 4000
+       }
+      }
+     ]
+    },
+    {
+     "position": 2,
+     "format": "CD",
+     "track-count": 2,
+     "discs": [
+      {
+       "id": "oAA1ZY.4QOAq6tpdobDdb4M9qyc-",
+       "sectors": 650,
+       "offsets": [
+        150,
+        350
+       ]
+      }
+     ],
+     "tracks": [
+      {
+       "position": 1,
+       "number": "1",
+       "title": "Track 1",
+       "length": 2000,
+       "recording": {
+        "id": "00000000-0000-4000-8000-000000000201",
+        "title": "Track 1",
+        "length": 2000
+       }
+      },
+      {
+       "position": 2,
+       "number": "2",
+       "title": "Track 2",
+       "length": 3000,
+       "recording": {
+        "id": "00000000-0000-4000-8000-000000000202",
+        "title": "Track 2",
+        "length": 3000
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

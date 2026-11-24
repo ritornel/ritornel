@@ -8,11 +8,11 @@ use ritornel_contract::methods::{
     ArtistsImportPictures, JobsCancel, Method, ScanStart, SourcesAdd,
 };
 use ritornel_contract::{
-    DiscList, DiscsParams, DryRun, DryRunParams, ErrorCode, Event, ImportPicturesParams, Job,
-    JobCancelParams, JobCancelled, JobDetail, JobGetParams, JobItem, JobState, JobTarget,
-    JobsEvent, JobsList, LibraryStats, PictureFolder, PictureFolders, PicturesImported, Receipt,
-    ReceiptStatus, ReviewList, RpcError, ScanStartParams, ScanStarted, Source, SourceAdded,
-    SourceKind, SourcesAddParams, SourcesList,
+    DryRun, DryRunParams, ErrorCode, Event, ImportPicturesParams, Job, JobCancelParams,
+    JobCancelled, JobDetail, JobGetParams, JobItem, JobState, JobTarget, JobsEvent, JobsList,
+    LibraryStats, PictureFolder, PictureFolders, PicturesImported, Receipt, ReceiptStatus,
+    ReviewList, RpcError, ScanStartParams, ScanStarted, Source, SourceAdded, SourceKind,
+    SourcesAddParams, SourcesList,
 };
 use ritornel_engine::{
     Client, Command, LibraryStore, NewJob, ServerStore, SubjectKind, WriteRequest, is_policy,
@@ -633,15 +633,6 @@ impl Core {
         Self::library(stores, |library| {
             library.dry_run(params).map_err(in_library)
         })
-    }
-
-    /// `corrections.discs`: the disc layouts the sidecars give.
-    pub(super) fn corrections_discs(
-        &self,
-        stores: &Stores,
-        params: &DiscsParams,
-    ) -> Result<DiscList, RpcError> {
-        Self::library(stores, |library| library.discs(params).map_err(in_library))
     }
 
     /// `identity.review`: the bindings marked for review.

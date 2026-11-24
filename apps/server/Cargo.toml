@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["audio-output", "lastfm", "media-session"]
+default = ["audio-output", "lastfm", "media-session", "musicbrainz"]
 # The system's audio output, through the engine: CoreAudio on macOS,
 # WASAPI on Windows, and ALSA on Linux, where it needs ALSA's development
 # files to build. The
@@ -17,7 +17,12 @@ audio-output = ["ritornel-engine/audio-output"]
 # Last.fm: the import of a history, loved tracks, and scrobbling, through
 # `ritornel-lastfm`. A server built without it links no Last.fm code, and
 # CI builds it both ways. See docs/internals/plugins.md.
-lastfm = ["dep:ritornel-lastfm", "dep:ritornel-source"]
+lastfm = ["dep:ritornel-lastfm"]
+# MusicBrainz: asking it about the library's discs, through
+# `ritornel-musicbrainz`, once the library's switch allows it. The hub is
+# built with it and without the other default features, and still links no
+# system library. See "MusicBrainz lookups" in docs/internals/corrections.md.
+musicbrainz = ["dep:ritornel-musicbrainz"]
 # The system's media session: Now Playing and the media keys on macOS,
 # with `main` blocking in the platform run loop, MPRIS on the session bus
 # on Linux, and the system's media transport controls on Windows. The hub is built without it. See "OS integration" in
@@ -31,7 +36,8 @@ ritornel-client.workspace = true
 ritornel-contract.workspace = true
 ritornel-engine = { workspace = true, default-features = false }
 ritornel-lastfm = { workspace = true, optional = true }
-ritornel-source = { workspace = true, optional = true }
+ritornel-musicbrainz = { workspace = true, optional = true }
+ritornel-source.workspace = true
 # Sends a master to a satellite as it is read, as a stream of chunks. It
 # is already in the lock file, under the client.
 futures-util = { version = "0.3.34", default-features = false }
@@ -103,6 +109,8 @@ zbus = { version = "=6.3.0", default-features = false, features = ["tokio", "ser
 tokio = { version = "1.54.1", features = ["test-util"] }
 # The fake Last.fm the Last.fm tests run against.
 ritornel-lastfm = { workspace = true, features = ["fake"] }
+# The fake MusicBrainz the lookup tests run against.
+ritornel-musicbrainz = { workspace = true, features = ["fake"] }
 # The contract tests talk to a server through the client, as every program
 # does.
 ritornel-client.workspace = true

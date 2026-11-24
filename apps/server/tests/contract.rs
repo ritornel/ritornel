@@ -198,8 +198,11 @@ impl Running {
                 capability::MEDIA_ART,
                 capability::LINK,
             ]
+            .into_iter()
+            // A server built with MusicBrainz can ask it.
+            .chain(cfg!(feature = "musicbrainz").then_some(capability::CORRECTIONS_LOOKUP))
             .map(str::to_owned)
-            .to_vec(),
+            .collect(),
             limits: Limits {
                 max_message_bytes: 1 << 20,
                 max_views: 16,

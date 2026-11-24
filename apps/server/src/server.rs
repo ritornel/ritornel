@@ -212,6 +212,7 @@ impl Server {
 
         if let Some(library) = &library {
             history_rule(library, &steps)?;
+            corrections_rule(library)?;
             // A scrobble a dead run was sending may have arrived: it is
             // never sent again.
             let abandoned = library.abandon_sending()?;
@@ -251,6 +252,9 @@ impl Server {
         }
         core.follow_awake_at_start(run.keep_awake);
         core.set_lastfm(crate::lastfm::Lastfm::new(run.lastfm, dir.root()));
+        if let Some(catalogue) = crate::dispatch::catalogue(run.musicbrainz_url.as_deref()) {
+            core.set_catalogue(catalogue);
+        }
         core.set_watch(run.watch);
         core.set_backups(crate::backup::Backups::new(run.backup_dir));
         core.set_cache_bytes(run.cache_bytes);
@@ -476,6 +480,25 @@ fn history_rule(library: &ritornel_engine::LibraryStore, steps: &Steps) -> Resul
         })
         .map_err(Error::Library)
         .map(|done| info!(%done, "history is derived again under the play rule in force"))
+}
+
+/// Reads the kept MusicBrainz replies again if this build reads them
+/// otherwise, with no network ("Replies and facts" in
+/// docs/internals/corrections.md).
+fn corrections_rule(library: &ritornel_engine::LibraryStore) -> Result<(), Error> {
+    let request = ritornel_engine::WriteRequest {
+        method: ritornel_engine::FACTS_METHOD,
+        command: None,
+        client: None,
+    };
+    if library
+        .refresh_corrections(request)
+        .map_err(Error::Library)?
+        .is_some()
+    {
+        info!("MusicBrainz's replies are read again by the reader in force");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

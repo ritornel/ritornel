@@ -18,7 +18,7 @@ Ritornel was built on macOS first. Linux and Windows came early, while the code 
 | Touchpad scrolling that coasts | AppKit's momentum | On Wayland, GTK 4's coast in patched GPUI; not on X11 | Direct Manipulation's inertia | None |
 | Data directory | `~/Library/Application Support/Ritornel` | `$XDG_DATA_HOME/ritornel` | `%LOCALAPPDATA%\Ritornel` | As Linux |
 
-The headless hub is the server built for Linux with `--no-default-features`: no sound, no media session, no Last.fm, and no system library beyond libc.
+The headless hub is the server built for Linux with `--no-default-features --features musicbrainz`: no sound, no media session, no Last.fm, and no system library beyond libc. MusicBrainz is reached over rustls.
 
 The headless player is the server built for Linux with `--no-default-features --features audio-output`: sound through ALSA's `default` device, and no media session or Last.fm. It links `libasound` and libc. It is meant for a small board such as a Raspberry Pi, with `--name` saying what the speakers are called. `scripts/player-footprint.sh` reports its size and its memory at idle on the machine it runs on.
 

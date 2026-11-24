@@ -62,6 +62,9 @@ pub struct Run {
     pub playback: crate::playback::PlaybackRun,
     /// How this run reaches Last.fm.
     pub lastfm: crate::lastfm::LastfmRun,
+    /// A loopback address to send every MusicBrainz request to, for the
+    /// tests alone.
+    pub musicbrainz_url: Option<String>,
     /// Whether and how this run watches the hub's folders.
     pub watch: crate::watch::WatchRun,
     /// The folder backups are written to, outside the data directory.

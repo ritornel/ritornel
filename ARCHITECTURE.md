@@ -15,11 +15,11 @@ ritornelctl        ──┘                                                ├�
 
 Every client uses the same wire contract. The desktop app starts a bundled `ritornel-server` as a separate process (or connects to one already running) and has no in-process shortcut into the engine or database.
 
-The server can also be built without its default features (`--no-default-features`) as a headless Linux hub: no audio output, no media session, no Last.fm plugin, and no system library beyond libc. `library.db` and `server.db` already include a server identity, hub pointer/epoch, server registry, and delivery outbox so a library can be owned by one server while listens originate elsewhere.
+The server can also be built without its default features but MusicBrainz (`--no-default-features --features musicbrainz`) as a headless Linux hub: no audio output, no media session, no Last.fm plugin, and no system library beyond libc. `library.db` and `server.db` already include a server identity, hub pointer/epoch, server registry, and delivery outbox so a library can be owned by one server while listens originate elsewhere.
 
 ## Workspace and dependency direction
 
-The main Cargo workspace (`Cargo.toml`) holds seven library crates and two binaries. The desktop app (`apps/desktop`) is an excluded Cargo workspace of its own so the server and headless hub build without GPUI or any desktop library.
+The main Cargo workspace (`Cargo.toml`) holds eight library crates and two binaries. The desktop app (`apps/desktop`) is an excluded Cargo workspace of its own so the server and headless hub build without GPUI or any desktop library.
 
 | Path | Role |
 |---|---|
@@ -27,8 +27,9 @@ The main Cargo workspace (`Cargo.toml`) holds seven library crates and two binar
 | `crates/ritornel-domain` | Pure logic: tag extraction, normalization, recording resolution, catalog projection, history derivation, scrobble matching, and copy selection. No I/O, clock, or SQLite. |
 | `crates/ritornel-engine` | SQLite stores, migrations, library scanning, cover art, audio pipeline, backups, record health, and export. No networking. |
 | `crates/ritornel-client` | Shared Rust client: server discovery/launch and typed contract calls. |
-| `crates/ritornel-source` | Traits and wire-independent types for optional external-source plugins (`HistorySource`, `Sink`). |
+| `crates/ritornel-source` | Traits and wire-independent types for optional external-source plugins (`HistorySource`, `Sink`, `Catalogue`). |
 | `crates/ritornel-lastfm` | Last.fm plugin implementing `ritornel-source` behind the server's `lastfm` feature. |
+| `crates/ritornel-musicbrainz` | MusicBrainz plugin implementing `ritornel-source`'s `Catalogue` behind the server's `musicbrainz` feature. |
 | `crates/ritornel-windows` | Safe wrappers around the few Win32 calls the standard library cannot make (byte-range locks, owner-only ACLs, file identity, interrupt clock, hidden shutdown window, and, with its `media` feature, the system media transport controls). Empty on non-Windows. |
 | `apps/server` | `ritornel-server`: socket listener, auth/sessions, job runner, file watcher, media keys/Now Playing, and platform service integration. |
 | `apps/ritornelctl` | Command-line client over `ritornel-client`. |
@@ -41,13 +42,14 @@ ritornel-contract ◄── ritornel-domain ◄── ritornel-engine ◄── 
 ritornel-contract ◄── ritornel-client ◄── ritornelctl, ritornel-desktop-gpui
 ritornel-source   ◄── ritornel-engine
 ritornel-source   ◄── ritornel-lastfm ◄── ritornel-server (optional feature)
+ritornel-source   ◄── ritornel-musicbrainz ◄── ritornel-server (optional feature)
 ```
 
 Key boundary rules:
 
 - No client (`ritornel-client`, `ritornelctl`, `ritornel-desktop-gpui`) links `ritornel-engine` or `rusqlite`.
 - `ritornel-domain` does no I/O and never links `rusqlite`.
-- The core engine never depends on any plugin crate (`ritornel-lastfm`, `scrobl`), and among workspace crates a plugin depends only on `ritornel-source`.
+- The core engine never depends on any plugin crate (`ritornel-lastfm`, `ritornel-musicbrainz`, `scrobl`, `reqwest`), and among workspace crates a plugin depends only on `ritornel-source`.
 - Every crate in the main workspace forbids `unsafe_code` except `ritornel-windows`.
 - OS-specific code sits in a `platform` module per crate (one file per OS behind identical plain functions); no OS `cfg` appears outside it except in platform-specific tests. See [`docs/internals/platforms.md`](docs/internals/platforms.md).
 
@@ -87,10 +89,10 @@ Detailed guides for shipped subsystems live under `docs/internals/`:
 - [`docs/internals/platforms.md`](docs/internals/platforms.md) — macOS, Linux, Windows, and headless hub support, OS boundaries, and platform decisions.
 - [`docs/internals/contract.md`](docs/internals/contract.md) — wire schema, TypeScript generation, HTTP routes and tickets, JSON-RPC framing, list views, events, commands, and cover media.
 - [`docs/internals/schema.md`](docs/internals/schema.md) — two-database split, durable vs. rebuildable tables, immutability triggers, ratings, revision stamping, and migrations.
-- [`docs/internals/plugins.md`](docs/internals/plugins.md) — compiled-in plugin boundary (`ritornel-source`), `ritornel-lastfm`, and Cargo feature gating.
+- [`docs/internals/plugins.md`](docs/internals/plugins.md) — compiled-in plugin boundary (`ritornel-source`), `ritornel-lastfm`, `ritornel-musicbrainz`, and Cargo feature gating.
 - [`docs/internals/playback.md`](docs/internals/playback.md) — audio pipeline, gapless transitions, copy selection, persisted queue, frame-counted listen recording, and OS media sessions.
 - [`docs/internals/history.md`](docs/internals/history.md) — immutable observations, play derivation, monotonic timekeeping, indexed queries, Last.fm sync/scrobbling, and portable export.
-- [`docs/internals/corrections.md`](docs/internals/corrections.md) — sidecars kept with the audio, CD layouts and disc IDs read from them.
+- [`docs/internals/corrections.md`](docs/internals/corrections.md) — sidecars kept with the audio, CD layouts and disc IDs read from them, and MusicBrainz lookups behind the library's switch.
 - [`docs/internals/identity.md`](docs/internals/identity.md) — read-only scanning, audio-only hashing, folder watching, normalization, recording resolution, catalog projection, and scrobble matching.
 - [`docs/internals/linking.md`](docs/internals/linking.md) — server identity, hub write guard, local owner credentials, sessions, tickets, media tokens, and listener transport bounds.
 - [`docs/internals/desktop.md`](docs/internals/desktop.md) — GPUI desktop workspace, server discovery, frame and whole-page navigation, virtualized walls and cover loading, History/Lean back views, queue, Settings, and offscreen testing.

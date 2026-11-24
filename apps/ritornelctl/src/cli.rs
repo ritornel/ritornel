@@ -13,6 +13,8 @@
 //! ritornelctl identity re-resolve --dry-run [--detail] [<policy values>] [--data-dir <dir>] [--json]
 //! ritornelctl identity review [--data-dir <dir>] [--json]
 //! ritornelctl corrections discs [<folder>] [--data-dir <dir>] [--json]
+//! ritornelctl corrections musicbrainz <on | off> [--data-dir <dir>] [--json]
+//! ritornelctl corrections lookup <folder> [--root <name>] | --album <release> [--again] [--data-dir <dir>] [--json]
 //! ritornelctl play <folder | track>... [--album <release>] [--start <n>] [--follow]
 //! ritornelctl pause | resume | stop | next | previous | now | queue
 //! ritornelctl seek <position>
@@ -80,6 +82,9 @@ Usage:
                                   [--data-dir <dir>] [--json]
   ritornelctl identity review [--data-dir <dir>] [--json]
   ritornelctl corrections discs [<folder>] [--data-dir <dir>] [--json]
+  ritornelctl corrections musicbrainz <on | off> [--data-dir <dir>] [--json]
+  ritornelctl corrections lookup <folder> [--root <name>] | --album <release>
+                                 [--again] [--data-dir <dir>] [--json]
   ritornelctl play <folder | track>... [--album <release>] [--start <n>]
                    [--follow] [--data-dir <dir>] [--json]
   ritornelctl pause | resume | stop | next | previous [--data-dir <dir>] [--json]
@@ -170,6 +175,17 @@ Commands:
                    MusicBrainz disc ID and how it was found. With a
                    folder, under its root, show that folder's alone, with
                    the file at each track
+  corrections musicbrainz on | off
+                   Let `corrections lookup` ask MusicBrainz about this
+                   library's discs, or stop it. It is off until it is
+                   turned on, and even on, nothing is asked by itself:
+                   only the album or folder a lookup names. What is sent
+                   is disc IDs, never a path, a file or anything about you
+  corrections lookup <folder>
+                   Ask MusicBrainz about the discs of a folder, under its
+                   root, or of a release with --album, and keep each
+                   reply. A disc asked about before is not asked again
+                   unless --again says to
   play             Play the scanned tracks in a folder, album by album in
                    disc and track order, or tracks by their IDs, or a
                    release with --album. It replaces the queue. The server
@@ -286,6 +302,10 @@ Options:
   --cancel              jobs: ask the job to stop. It stops after the files
                         it is reading, and what it has recorded stays
   --detail              re-resolve: list every file that is not unchanged
+  --album <release>     corrections lookup: a release instead of a folder
+  --again               corrections lookup: ask about discs that have a reply
+  --root <name>         corrections lookup: the root the folder is in, when
+                        more than one root has it
 
 Policy values, for re-resolve --dry-run. A switch is on or off, and on
 when given alone:
@@ -787,6 +807,35 @@ enum LibraryCommand {
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum CorrectionsCommand {
     Discs(DiscsArgs),
+    Musicbrainz(SwitchArgs),
+    Lookup(LookupArgs),
+}
+
+/// What `corrections musicbrainz` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct SwitchArgs {
+    /// `on` or `off`.
+    pub(crate) state: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `corrections lookup` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct LookupArgs {
+    /// A folder, by its path under its root.
+    pub(crate) folder: Option<String>,
+    /// A release, by its ID.
+    #[arg(long)]
+    pub(crate) album: Option<String>,
+    /// Ask again about discs that have a reply.
+    #[arg(long)]
+    pub(crate) again: bool,
+    /// The root the folder is in, when more than one has it.
+    #[arg(long)]
+    pub(crate) root: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `corrections discs` takes.
@@ -989,6 +1038,12 @@ fn try_run(
         Command::Identity(IdentityCommand::Review(args)) => identity::review(&args, env, out),
         Command::Corrections(CorrectionsCommand::Discs(args)) => {
             corrections::discs(&args, env, out)
+        }
+        Command::Corrections(CorrectionsCommand::Musicbrainz(args)) => {
+            corrections::musicbrainz(&args, env, out)
+        }
+        Command::Corrections(CorrectionsCommand::Lookup(args)) => {
+            corrections::lookup(&args, env, out)
         }
         Command::Play(args) => playback::play(&args, env, out),
         Command::Pause(args) => playback::transport("pause", &args, env, out),

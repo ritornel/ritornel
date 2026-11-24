@@ -63,20 +63,34 @@ only ritornel-source
 only ritornel-lastfm ritornel-source
 forbid ritornel-lastfm rusqlite
 forbid ritornel-engine ritornel-lastfm scrobl
+only ritornel-musicbrainz ritornel-source
+forbid ritornel-musicbrainz rusqlite
+forbid ritornel-engine ritornel-musicbrainz reqwest
 
 # What Windows asks for that takes unsafe code stands beside the core: it
 # builds on no crate of the workspace, and the engine, the server and the
 # tests build on it.
 only ritornel-windows
 
-# A server built without its default features, as the hub is, has no
-# Last.fm code, no media session and no audio output in it, so on Linux it
-# builds with no ALSA or D-Bus library installed.
-without_defaults=$(cargo tree --manifest-path Cargo.toml --package ritornel-server --no-default-features \
-    --edges normal --target all --prefix none --format '{p}' | awk '{ print $1 }')
+# A server built without its default features but MusicBrainz, as the hub
+# is, has no Last.fm code, no media session and no audio output in it, so
+# on Linux it builds with no ALSA or D-Bus library installed.
+hub=$(cargo tree --manifest-path Cargo.toml --package ritornel-server --no-default-features \
+    --features musicbrainz --edges normal --target all --prefix none --format '{p}' | awk '{ print $1 }')
 for crate in ritornel-lastfm scrobl souvlaki zbus windows cpal alsa alsa-sys; do
-    if grep --quiet --line-regexp --fixed-strings "$crate" <<<"$without_defaults"; then
-        echo "error: ritornel-server without its default features is built with $crate" >&2
+    if grep --quiet --line-regexp --fixed-strings "$crate" <<<"$hub"; then
+        echo "error: ritornel-server, built as the hub is, is built with $crate" >&2
+        failed=1
+    fi
+done
+
+# Built without any feature, it has no plugin, and no reqwest, which only the
+# MusicBrainz plugin brings.
+bare=$(cargo tree --manifest-path Cargo.toml --package ritornel-server --no-default-features \
+    --edges normal --target all --prefix none --format '{p}' | awk '{ print $1 }')
+for crate in ritornel-lastfm ritornel-musicbrainz reqwest; do
+    if grep --quiet --line-regexp --fixed-strings "$crate" <<<"$bare"; then
+        echo "error: ritornel-server without any feature is built with $crate" >&2
         failed=1
     fi
 done

@@ -484,6 +484,16 @@ methods! {
     LibrarySetWatching: "library.setWatching", Command, needs_full: true,
     WatchingParams => WatchingSet;
 
+    /// `library.settings`: the library's settings, each with what gave it.
+    /// A satellite answers with its hub's.
+    LibrarySettingsCall: "library.settings", Query, needs_full: true,
+    NoParams => LibrarySettings;
+
+    /// `library.setSettings`: changes the library's settings, and keeps
+    /// them with it. A satellite's call is its hub's to answer.
+    LibrarySetSettings: "library.setSettings", Command, needs_full: true,
+    SetLibrarySettingsParams => LibrarySettingsSet;
+
     /// `server.backup`: copies this server's databases into a new folder in
     /// the place its backups go, and answers when the copy is whole. It
     /// fails with `invalid` when no place is named, and with `unavailable`
@@ -574,6 +584,15 @@ methods! {
     /// paths, so it needs a `full` session.
     CorrectionsDiscs: "corrections.discs", Query, needs_full: true,
     DiscsParams => DiscList;
+
+    /// `corrections.lookup`: asks MusicBrainz about the discs of one album,
+    /// a release or a folder, and keeps each reply. A disc with a reply is
+    /// not asked about again unless `again` says to. It is refused as
+    /// `unavailable` with the reason `lookups_off` until
+    /// `library.setSettings` allows it, and with `no_catalogue` on a
+    /// server built without MusicBrainz.
+    CorrectionsLookup: "corrections.lookup", Command, needs_full: true,
+    LookupParams => LookupDone;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -659,6 +678,8 @@ mod tests {
                 "artists.importPictures",
                 "artists.pictureFolders",
                 "library.setWatching",
+                "library.settings",
+                "library.setSettings",
                 "server.backup",
                 "history.export",
                 "record.dismiss",
@@ -671,7 +692,8 @@ mod tests {
                 "link.ping",
                 "server.settings",
                 "server.setSettings",
-                "corrections.discs"
+                "corrections.discs",
+                "corrections.lookup"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -718,6 +740,8 @@ mod tests {
                 "artists.importPictures",
                 "artists.pictureFolders",
                 "library.setWatching",
+                "library.settings",
+                "library.setSettings",
                 "server.backup",
                 "history.export",
                 "record.dismiss",
@@ -730,7 +754,8 @@ mod tests {
                 "link.ping",
                 "server.settings",
                 "server.setSettings",
-                "corrections.discs"
+                "corrections.discs",
+                "corrections.lookup"
             ]
         );
         // Everything but reading the library and controlling playback
