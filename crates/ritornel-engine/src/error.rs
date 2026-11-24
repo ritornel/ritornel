@@ -98,7 +98,8 @@ pub enum Error {
         /// The root's name.
         name: String,
     },
-    /// A root's folder is missing, is not a folder or is empty: the root is
+    /// A root's folder is missing, is not a folder, has no identity the
+    /// system will give or is empty: the root is
     /// offline, not empty, and nothing in it is marked missing. See "Data
     /// directory" in docs/internals/server.md.
     RootOffline {
@@ -215,7 +216,7 @@ impl fmt::Display for Error {
             }
             Self::RootOffline { path } => write!(
                 f,
-                "the root at {} is missing or holds no audio: it is taken to be offline, and nothing was changed",
+                "the root at {} is missing, holds no audio or cannot be told from another disk at its path: it is taken to be offline, and nothing was changed",
                 path.display()
             ),
             Self::Io(error) => write!(f, "reading a root: {error}"),

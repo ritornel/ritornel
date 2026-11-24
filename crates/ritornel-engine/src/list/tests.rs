@@ -131,6 +131,10 @@ fn albums_are_one_tile_a_record_in_each_order_with_sections() {
     );
     let labels: Vec<&str> = by_year.sections.iter().map(|s| s.label.as_str()).collect();
     assert_eq!(labels.first().copied(), Some(years[0].to_string().as_str()));
+    // A year typed finds where it starts; nothing typed finds nothing.
+    let locate = |typed: &str| library.store.list_locate_prefix(&by_year, typed).unwrap();
+    assert_eq!(locate(&years[0].to_string()), Some(0));
+    assert_eq!(locate("   "), None);
 
     // Some records have several versions, shown as one tile that counts
     // them, and some have no cover.

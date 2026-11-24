@@ -54,7 +54,7 @@ pub(crate) struct Walked {
     /// Which folder the root was when it was walked: its device and inode,
     /// or on Windows its volume's serial number and its file index. An
     /// unmounted disk leaves another folder at the same path.
-    pub(crate) root_id: Option<(u64, u64)>,
+    pub(crate) root_id: (u64, u64),
 }
 
 /// Which folder is at `path` now, if one is: its device and inode, or on
@@ -117,7 +117,19 @@ fn unreadable(walked: &mut Walked, rel: &str) {
         .push((rel.to_owned(), "the folder cannot be read"));
 }
 
-fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> Result<(), Error> {
+/// A folder's identity, as [`folder_id`] gives it.
+type FolderId = Option<(u64, u64)>;
+
+/// Lists the folder `dir`, at `rel` under the root: its audio files and
+/// images go into `walked`, and the folders in it are returned, to be
+/// listed in their turn.
+fn list(
+    dir: &Path,
+    rel: &str,
+    walked: &mut Walked,
+    stop: &AtomicBool,
+) -> Result<Vec<(PathBuf, String)>, Error> {
+    let mut folders = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // A folder inside the root that the server may not read, as a
@@ -126,24 +138,30 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
         // than what the folder held being taken for gone.
         // A folder removed since its parent was listed is gone, with all
         // that was in it, as it would be had the walk come a moment later.
-        Err(error) if !rel.is_empty() && error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) if !rel.is_empty() && error.kind() == ErrorKind::NotFound => return Ok(folders),
         Err(error) if !rel.is_empty() && error.kind() == ErrorKind::PermissionDenied => {
             unreadable(walked, rel);
-            return Ok(());
+            return Ok(folders);
         }
         Err(error) => return Err(Error::Io(error)),
     };
     for entry in entries {
         if stop.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let entry = entry.map_err(Error::Io)?;
         let name = entry.file_name();
+        let joined = |name: &str| {
+            if rel.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{rel}/{name}")
+            }
+        };
         let Some(name) = name.to_str() else {
-            walked.skipped.push((
-                format!("{rel}/{}", name.to_string_lossy()),
-                "its name is not UTF-8",
-            ));
+            walked
+                .skipped
+                .push((joined(&name.to_string_lossy()), "its name is not UTF-8"));
             continue;
         };
         // Hidden files, and the resource forks macOS leaves on other
@@ -151,11 +169,7 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
         if name.starts_with('.') {
             continue;
         }
-        let path = if rel.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{rel}/{name}")
-        };
+        let path = joined(name);
         // A folder that may be listed but not gone into, mode `r--`, says
         // no only here: it is passed over as one that cannot be listed.
         let denied =
@@ -165,12 +179,12 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
             Err(error) if denied(&error) => {
                 unreadable(walked, rel);
-                return Ok(());
+                return Ok(Vec::new());
             }
             Err(error) => return Err(Error::Io(error)),
         };
         if kind.is_dir() {
-            walk_into(&entry.path(), &path, walked, stop)?;
+            folders.push((entry.path(), path));
             continue;
         }
         // A link to a file is followed. A link to a folder is not: it
@@ -185,7 +199,7 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
             Err(error) if error.kind() == ErrorKind::NotFound => continue,
             Err(error) if denied(&error) => {
                 unreadable(walked, rel);
-                return Ok(());
+                return Ok(Vec::new());
             }
             Err(error) => return Err(Error::Io(error)),
         };
@@ -205,25 +219,75 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
             walked.sidecars.push(seen);
         }
     }
+    Ok(folders)
+}
+
+/// Lists the root and every folder under it, one at a time from a list of
+/// those still to go rather than by recursion, so that how deep a tree
+/// goes costs no stack. A folder that is one of the folders it is inside,
+/// as a bind mount can make, is passed over rather than gone round again.
+fn walk_tree(
+    root: &Path,
+    walked: &mut Walked,
+    stop: &AtomicBool,
+    id_of: &dyn Fn(&Path) -> FolderId,
+) -> Result<(), Error> {
+    // Each folder still to list, with how deep it is; and the identity of
+    // each folder on the way down to the one being listed.
+    let mut todo = vec![(root.to_owned(), String::new(), 0)];
+    let mut way: Vec<FolderId> = Vec::new();
+    while let Some((dir, rel, depth)) = todo.pop() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        // The list is taken deepest first, so the folders on the way to
+        // this one are the first `depth` of those last gone down.
+        way.truncate(depth);
+        let here = if depth == 0 {
+            Some(walked.root_id)
+        } else {
+            id_of(&dir)
+        };
+        if here.is_some() && way.contains(&here) {
+            walked.skipped.push((rel, "the folder is inside itself"));
+            continue;
+        }
+        way.push(here);
+        let folders = list(&dir, &rel, walked, stop)?;
+        todo.extend(folders.into_iter().map(|(dir, rel)| (dir, rel, depth + 1)));
+    }
     Ok(())
 }
 
-/// Walks a root. A root that is missing, is not a folder, or in which a
-/// whole walk finds no audio file at all is offline, not empty: this is
+/// Walks a root. A root that is missing, is not a folder, has no identity
+/// the system will give, or in which a whole walk finds no audio file at
+/// all is offline, not empty: this is
 /// what a share that failed to mount looks like, often with a `.DS_Store`
 /// at its mount point, and the scan must not mark its files missing.
 /// Emptiness is decided by what the walk counts, never by whether the
 /// folder has entries.
 pub(crate) fn walk(root: &Path, stop: &AtomicBool) -> Result<Walked, Error> {
+    walk_by(root, stop, &folder_id)
+}
+
+/// [`walk`], with what says which folder is at a path.
+fn walk_by(
+    root: &Path,
+    stop: &AtomicBool,
+    id_of: &dyn Fn(&Path) -> FolderId,
+) -> Result<Walked, Error> {
     let offline = || Error::RootOffline {
         path: root.to_owned(),
     };
     std::fs::read_dir(root).map_err(|_| offline())?;
+    // A root that cannot be told from another folder mounted at its path
+    // later is not walked: nothing could prove that what the scan then
+    // reads, or does not find, is of the folder it walked.
     let mut walked = Walked {
-        root_id: folder_id(root),
+        root_id: id_of(root).ok_or_else(offline)?,
         ..Walked::default()
     };
-    walk_into(root, "", &mut walked, stop)?;
+    walk_tree(root, &mut walked, stop, id_of)?;
     // A walk that was asked to stop has not looked everywhere.
     if walked.files.is_empty() && !stop.load(Ordering::Relaxed) {
         return Err(offline());
@@ -353,6 +417,92 @@ mod tests {
         let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
         assert_eq!(paths, ["a/01.flac"]);
         assert_eq!(walked.unreadable, ["listed"]);
+    }
+
+    #[test]
+    fn a_deep_tree_is_walked_on_a_small_stack() {
+        let scratch = Scratch::new();
+        let root = scratch.path().to_owned();
+        // Short names keep the deepest path inside every system's limit.
+        let deep = (0..300).fold(root.clone(), |path, _| path.join("d"));
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("01.flac"), b"12345").unwrap();
+        std::fs::write(root.join("top.flac"), b"12345").unwrap();
+        let walked = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || walk(&root, &AtomicBool::new(false)).unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+        let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], format!("{}01.flac", "d/".repeat(300)));
+        assert_eq!(paths[1], "top.flac");
+    }
+
+    #[test]
+    fn a_folder_that_is_one_it_is_inside_is_passed_over() {
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        for path in ["a/01.flac", "a/loop/02.flac", "b/loop/03.flac"] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"12345").unwrap();
+        }
+        // As a bind mount of the root inside it would: `a/loop` is the
+        // root again. `b/loop` is only another folder with the same name.
+        let looped = root.join("a/loop");
+        let id_of = |path: &Path| {
+            Some(if path == root || path == looped {
+                (1, 1)
+            } else {
+                (1, path.as_os_str().len() as u64)
+            })
+        };
+        let walked = walk_by(root, &AtomicBool::new(false), &id_of).unwrap();
+        let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
+        assert_eq!(paths, ["a/01.flac", "b/loop/03.flac"]);
+        assert_eq!(
+            walked.skipped,
+            [("a/loop".to_owned(), "the folder is inside itself")]
+        );
+    }
+
+    #[test]
+    fn a_root_with_no_identity_is_offline() {
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        std::fs::write(root.join("01.flac"), b"12345").unwrap();
+        // As a volume the system gives no identity for: what the scan
+        // later finds there could be of any disk mounted at the path.
+        let refused = walk_by(root, &AtomicBool::new(false), &|_| None);
+        assert!(
+            matches!(&refused, Err(Error::RootOffline { path }) if path == root),
+            "{refused:?}"
+        );
+        assert!(walk(root, &AtomicBool::new(false)).is_ok());
+    }
+
+    // Only Linux keeps a name that is not UTF-8 as it was given.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_that_is_not_utf8_is_named_by_its_path_under_the_root() {
+        use std::os::unix::ffi::OsStrExt;
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::write(root.join("a/01.flac"), b"12345").unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"\xff.flac");
+        std::fs::write(root.join(name), b"12345").unwrap();
+        std::fs::write(root.join("a").join(name), b"12345").unwrap();
+        let walked = walk(root, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            walked.skipped,
+            [
+                ("a/\u{fffd}.flac".to_owned(), "its name is not UTF-8"),
+                ("\u{fffd}.flac".to_owned(), "its name is not UTF-8"),
+            ]
+        );
     }
 
     #[test]

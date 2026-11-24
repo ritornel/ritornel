@@ -1723,6 +1723,60 @@ fn a_file_an_earlier_scan_recorded_as_unreadable_by_a_failed_read_is_read_again(
 }
 
 #[test]
+fn a_batch_with_nothing_to_write_still_counts_what_it_found_unchanged() {
+    use ritornel_domain::payload::ReadError;
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    let path = "Tin Weather/02.flac";
+    std::fs::write(rig.root().join(path), b"not audio at all").unwrap();
+    rig.scan();
+    // Its last read failed on I/O, and it reads as nothing again: the
+    // only file read, and nothing to write.
+    let metadata = std::fs::metadata(rig.root().join(path)).unwrap();
+    let mut payload = crate::media::read_file(
+        &rig.root(),
+        path,
+        metadata.len(),
+        crate::walk::mtime_ms(&metadata),
+        Vec::new(),
+    );
+    assert!(payload.audio.is_none());
+    payload.error = Some(ReadError {
+        kind: "io".to_owned(),
+        message: "Input/output error (os error 5)".to_owned(),
+    });
+    let item: i64 = rig
+        .one("SELECT id FROM source_item WHERE provider_key = 'Tin Weather/02.flac'")
+        .parse()
+        .unwrap();
+    let request = WriteRequest {
+        method: "scan.step",
+        command: None,
+        client: None,
+    };
+    rig.library
+        .record(
+            request,
+            rig.main.row,
+            vec![crate::scan_store::RecordOp::Update { item, payload }],
+            String::new(),
+        )
+        .unwrap();
+    // Each scan counts both files unchanged. The first resolves what was
+    // written by hand; the next writes nothing.
+    let mut revision = None;
+    for _ in 0..2 {
+        let summary = rig.scan();
+        assert_eq!(
+            (summary.files, summary.unchanged, summary.unreadable),
+            (2, 2, 0)
+        );
+        assert!(revision.is_none_or(|revision| revision == rig.revision()));
+        revision = Some(rig.revision());
+    }
+}
+
+#[test]
 fn a_file_that_reads_again_after_a_failed_read_keeps_its_item() {
     let mut rig = Rig::new();
     rig.put("Tin Weather/01.flac", "a.flac");

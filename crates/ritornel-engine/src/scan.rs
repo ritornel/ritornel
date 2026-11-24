@@ -380,8 +380,10 @@ impl ScanRun {
             self.phase,
             Phase::Read | Phase::Moves | Phase::Missing | Phase::Replaced | Phase::Sidecars
         );
-        let walked_id = self.walked.as_ref().and_then(|walked| walked.root_id);
-        if judged && folder_id(&self.root) != walked_id {
+        // Every walk has the root's identity: one the system would not give
+        // was refused, since two unknown identities prove nothing.
+        let walked_id = self.walked.as_ref().map(|walked| walked.root_id);
+        if judged && (walked_id.is_none() || folder_id(&self.root) != walked_id) {
             return Err(Error::RootOffline {
                 path: self.root.clone(),
             });
@@ -698,15 +700,17 @@ impl ScanRun {
         if self.cursor >= self.queue.len() {
             self.phase = Phase::Moves;
         }
-        self.summary.bytes_read = counted.bytes_read;
-        if !ops.is_empty() {
-            let request = self.next_step();
-            let receipt = self.step_result(counted)?;
-            library.record(request, self.source.row, ops, receipt)?;
+        // A batch with nothing to write still counts the files it found
+        // unchanged.
+        if ops.is_empty() {
             self.summary = counted;
-            self.committed()?;
+            return Ok(());
         }
-        Ok(())
+        let request = self.next_step();
+        let receipt = self.step_result(counted)?;
+        library.record(request, self.source.row, ops, receipt)?;
+        self.summary = counted;
+        self.committed()
     }
 
     /// Records a file at a path the library has no live item at. If its
