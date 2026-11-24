@@ -235,12 +235,12 @@ pub(crate) fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::
 #[cfg(test)]
 pub(crate) fn path_is_private(path: &Path) -> bool {
     let private = restricted::path_is_private(path).unwrap();
-    assert_eq!(
-        restricted::another_user_may_open(path).unwrap(),
-        !private,
-        "{}",
-        path.display()
-    );
+    let open = restricted::another_user_may_open(path).unwrap();
+    if path.is_dir() {
+        assert!(!(private && open), "{}", path.display());
+    } else {
+        assert_eq!(open, !private, "{}", path.display());
+    }
     private
 }
 

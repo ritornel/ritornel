@@ -60,7 +60,10 @@ fn descriptor(sddl: &str) -> Descriptor {
     let user = User::current().unwrap();
     let mut text: PWSTR = std::ptr::null_mut();
     // SAFETY: the SID is valid; the string is allocated by the call.
-    assert_ne!(unsafe { ConvertSidToStringSidW(user.sid(), &mut text) }, 0);
+    assert_ne!(
+        unsafe { ConvertSidToStringSidW(user.sid().0, &mut text) },
+        0
+    );
     let _text = Local(text.cast());
     // SAFETY: the call wrote a string ending in a NUL.
     let len = unsafe { (0..).take_while(|&i| *text.add(i) != 0).count() };
@@ -262,7 +265,7 @@ fn a_folder_that_passes_nothing_on_is_closed_again() {
     assert!(private(&inner.join("made-after")));
     let descriptor =
         Descriptor::of(&open(&inner, false).unwrap(), DACL_SECURITY_INFORMATION).unwrap();
-    let (_, acl) = descriptor.owner_and_list().unwrap();
+    let acl = descriptor.dacl().unwrap().unwrap();
     assert!(passes_on(acl, &User::current().unwrap()).unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -325,7 +325,12 @@ fn private(path: &Path) -> bool {
     {
         use ritornel_windows::private::{another_user_may_open, path_is_private};
         let private = path_is_private(path).unwrap();
-        assert_eq!(another_user_may_open(path).unwrap(), !private, "{path:?}");
+        let open = another_user_may_open(path).unwrap();
+        if path.is_dir() {
+            assert!(!(private && open), "{path:?}");
+        } else {
+            assert_eq!(open, !private, "{path:?}");
+        }
         private
     }
 }

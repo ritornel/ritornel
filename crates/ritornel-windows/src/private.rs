@@ -17,6 +17,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::marker::PhantomData;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
@@ -92,6 +93,16 @@ fn open(path: &Path, change: bool) -> io::Result<File> {
         .open(path)
 }
 
+/// A SID borrowed from its owner, such as a [`User`] or a [`Descriptor`].
+/// Tying the pointer to that lifetime stops it outliving the buffer it
+/// points into.
+#[derive(Clone, Copy)]
+struct Sid<'a>(PSID, PhantomData<&'a ()>);
+
+/// An access list borrowed from a [`Descriptor`].
+#[derive(Clone, Copy)]
+struct Acl<'a>(*const ACL, PhantomData<&'a Descriptor>);
+
 /// The user this process runs as: a `TOKEN_USER` and the SID it points
 /// into, in one buffer aligned for both.
 struct User(Vec<u64>);
@@ -141,9 +152,12 @@ impl User {
 
     /// The user's SID. It points into the buffer, so it lives as long as
     /// `self`.
-    fn sid(&self) -> PSID {
+    fn sid(&self) -> Sid<'_> {
         // SAFETY: the buffer was filled with a TOKEN_USER by the system.
-        unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+        Sid(
+            unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid },
+            PhantomData,
+        )
     }
 }
 
@@ -157,7 +171,7 @@ impl OwnerOnly {
         let user = User::current()?;
         let sid = user.sid();
         // SAFETY: `sid` is a valid SID for as long as `user` lives.
-        let sid_len = unsafe { GetLengthSid(sid) } as usize;
+        let sid_len = unsafe { GetLengthSid(sid.0) } as usize;
         // An ACL header and one entry, whose SID replaces its last field.
         let len = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>()
             - std::mem::size_of::<u32>()
@@ -176,7 +190,8 @@ impl OwnerOnly {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: the ACL was made with room for exactly this entry.
-        if unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, inherit, FILE_ALL_ACCESS, sid) } == 0 {
+        if unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, inherit, FILE_ALL_ACCESS, sid.0) } == 0
+        {
             return Err(io::Error::last_os_error());
         }
         Ok(Self(buffer))
@@ -258,11 +273,16 @@ fn owned_by_another() -> io::Error {
 pub fn restrict(path: &Path) -> io::Result<()> {
     let file = open(path, true)?;
     let folder = file.metadata()?.is_dir();
-    let (owner, _) = Descriptor::of(&file, OWNER_SECURITY_INFORMATION)?.owner_and_list()?;
-    if owner.is_null() || !trusted_owner(owner, &User::current()?) {
+    let user = User::current()?;
+    let descriptor = Descriptor::of(&file, OWNER_SECURITY_INFORMATION)?;
+    let Some(owner) = descriptor.owner()? else {
+        return Err(owned_by_another());
+    };
+    if !trusted_owner(owner, &user) {
         return Err(owned_by_another());
     }
-    set_list(&file, OwnerOnly::new(folder)?.acl())
+    let mut list = OwnerOnly::new(folder)?;
+    set_list(&file, list.acl())
 }
 
 /// Makes the folder at `path` one only this user can open, with what is
@@ -285,11 +305,19 @@ pub fn close_folder(path: &Path) -> io::Result<()> {
         &folder,
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
     )?;
-    let (owner, acl) = descriptor.owner_and_list()?;
-    if owner.is_null() || !trusted_owner(owner, &user) {
+    let Some(owner) = descriptor.owner()? else {
+        return Err(owned_by_another());
+    };
+    if !trusted_owner(owner, &user) {
         return Err(owned_by_another());
     }
-    if acl.is_null() || lets_others(acl, &user, CHANGE, false)? {
+    let Some(acl) = descriptor.dacl()? else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "other users may change who can open it, so it cannot be closed to them",
+        ));
+    };
+    if lets_others(acl, &user, CHANGE, false)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "other users may change who can open it, so it cannot be closed to them",
@@ -309,12 +337,18 @@ pub fn close_folder(path: &Path) -> io::Result<()> {
             let _ = freeze(&entry.path());
         }
     }
-    set_list(&folder, OwnerOnly::new(true)?.acl())?;
+    let mut list = OwnerOnly::new(true)?;
+    set_list(&folder, list.acl())?;
     let closed = Descriptor::of(
         &folder,
         OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
     )?;
-    if judge(&closed, true, &user)? {
+    let passes = closed
+        .dacl()?
+        .map(|acl| passes_on(acl, &user))
+        .transpose()?
+        .unwrap_or(false);
+    if judge(&closed, true, &user)? && closed.protected()? && passes {
         Ok(())
     } else {
         Err(io::Error::other("it is still open to others once closed"))
@@ -326,15 +360,17 @@ pub fn close_folder(path: &Path) -> io::Result<()> {
 fn freeze(path: &Path) -> io::Result<()> {
     let file = open(path, true)?;
     let descriptor = Descriptor::of(&file, DACL_SECURITY_INFORMATION)?;
-    let (_, acl) = descriptor.owner_and_list()?;
-    if acl.is_null() || descriptor.protected()? {
+    let Some(acl) = descriptor.dacl()? else {
+        return Ok(());
+    };
+    if descriptor.protected()? {
         return Ok(());
     }
     // SAFETY: `acl` is valid while `descriptor` lives.
-    let (size, count) = unsafe { (usize::from((*acl).AclSize), (*acl).AceCount) };
+    let (size, count) = unsafe { (usize::from((*acl.0).AclSize), (*acl.0).AceCount) };
     let mut copy = vec![0u64; size.div_ceil(8)];
     // SAFETY: the list is `size` bytes long, and the copy holds as many.
-    unsafe { std::ptr::copy_nonoverlapping(acl.cast::<u8>(), copy.as_mut_ptr().cast(), size) };
+    unsafe { std::ptr::copy_nonoverlapping(acl.0.cast::<u8>(), copy.as_mut_ptr().cast(), size) };
     let copied = copy.as_mut_ptr().cast::<ACL>();
     for index in 0..u32::from(count) {
         let mut entry: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -473,9 +509,8 @@ impl Descriptor {
         Ok(Self(descriptor))
     }
 
-    /// Its owner and its access list, each null if it has none. Both point
-    /// into the descriptor.
-    fn owner_and_list(&self) -> io::Result<(PSID, *const ACL)> {
+    /// Its owner, or `None` if it has none. It points into the descriptor.
+    fn owner(&self) -> io::Result<Option<Sid<'_>>> {
         let mut owner: PSID = std::ptr::null_mut();
         let mut defaulted = 0;
         // SAFETY: the descriptor is valid while `self` lives, and the rest
@@ -483,16 +518,20 @@ impl Descriptor {
         if unsafe { GetSecurityDescriptorOwner(self.0, &mut owner, &mut defaulted) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let (mut present, mut acl) = (0, std::ptr::null_mut());
-        // SAFETY: as above.
+        Ok((!owner.is_null()).then_some(Sid(owner, PhantomData)))
+    }
+
+    /// Its access list, or `None` if it has none. It points into the
+    /// descriptor.
+    fn dacl(&self) -> io::Result<Option<Acl<'_>>> {
+        let (mut present, mut acl, mut defaulted) = (0, std::ptr::null_mut(), 0);
+        // SAFETY: the descriptor is valid while `self` lives, and the rest
+        // are written by the call.
         if unsafe { GetSecurityDescriptorDacl(self.0, &mut present, &mut acl, &mut defaulted) } == 0
         {
             return Err(io::Error::last_os_error());
         }
-        if present == 0 {
-            acl = std::ptr::null_mut();
-        }
-        Ok((owner, acl))
+        Ok((present != 0 && !acl.is_null()).then_some(Acl(acl, PhantomData)))
     }
 
     /// Whether its access list inherits nothing.
@@ -527,11 +566,13 @@ pub fn is_private(file: &File) -> io::Result<bool> {
 
 /// [`is_private`] on a descriptor.
 fn judge(descriptor: &Descriptor, folder: bool, user: &User) -> io::Result<bool> {
-    let (owner, acl) = descriptor.owner_and_list()?;
     // The owner may always read and change the list, so one who is not
     // trusted can let themselves in whatever it says. No list at all lets
     // everyone in.
-    if owner.is_null() || !trusted_owner(owner, user) || acl.is_null() {
+    let (Some(owner), Some(acl)) = (descriptor.owner()?, descriptor.dacl()?) else {
+        return Ok(false);
+    };
+    if !trusted_owner(owner, user) {
         return Ok(false);
     }
     Ok(!lets_others(acl, user, !HARMLESS, folder)?)
@@ -541,14 +582,14 @@ fn judge(descriptor: &Descriptor, folder: bool, user: &User) -> io::Result<bool>
 /// and its SID, or `None` for an entry of a kind this does not weigh, which
 /// is taken to let anyone do anything. Entries of the kinds that let
 /// nobody in are left out.
-fn entries(acl: *const ACL) -> io::Result<Vec<Option<(u32, u32, PSID)>>> {
-    // SAFETY: the caller's `acl` is valid while this runs.
-    let count = unsafe { (*acl).AceCount };
+fn entries<'a>(acl: Acl<'a>) -> io::Result<Vec<Option<(u32, u32, Sid<'a>)>>> {
+    // SAFETY: `acl` is borrowed from a live `Descriptor`.
+    let count = unsafe { (*acl.0).AceCount };
     let mut found = Vec::new();
     for index in 0..u32::from(count) {
         let mut entry: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: the index is below the list's count.
-        if unsafe { GetAce(acl, index, &mut entry) } == 0 {
+        if unsafe { GetAce(acl.0, index, &mut entry) } == 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: every entry starts with its header.
@@ -564,7 +605,11 @@ fn entries(acl: *const ACL) -> io::Result<Vec<Option<(u32, u32, PSID)>>> {
                         std::ptr::addr_of_mut!((*allowed).SidStart).cast(),
                     )
                 };
-                found.push(Some((u32::from(header.AceFlags), mask, sid)));
+                found.push(Some((
+                    u32::from(header.AceFlags),
+                    mask,
+                    Sid(sid, PhantomData),
+                )));
             }
             ACCESS_ALLOWED_COMPOUND_ACE_TYPE
             | ACCESS_ALLOWED_OBJECT_ACE_TYPE
@@ -583,7 +628,7 @@ fn entries(acl: *const ACL) -> io::Result<Vec<Option<(u32, u32, PSID)>>> {
 /// Whether an entry of `acl` lets anyone untrusted do any of `mask` with
 /// what the list is on, or, with `passed_on`, with what is made in it: an
 /// entry only passed on applies to nothing but what a folder holds.
-fn lets_others(acl: *const ACL, user: &User, mask: u32, passed_on: bool) -> io::Result<bool> {
+fn lets_others(acl: Acl<'_>, user: &User, mask: u32, passed_on: bool) -> io::Result<bool> {
     Ok(entries(acl)?.into_iter().any(|entry| match entry {
         Some((flags, allowed, sid)) => {
             (passed_on || flags & INHERIT_ONLY_ACE == 0)
@@ -596,21 +641,21 @@ fn lets_others(acl: *const ACL, user: &User, mask: u32, passed_on: bool) -> io::
 
 /// Whether `acl` passes this user's entry on to the files made in it, so
 /// that they never fall back on the process's default list.
-fn passes_on(acl: *const ACL, user: &User) -> io::Result<bool> {
+fn passes_on(acl: Acl<'_>, user: &User) -> io::Result<bool> {
     Ok(entries(acl)?.into_iter().flatten().any(|(flags, _, sid)| {
         // SAFETY: both SIDs are valid for the call.
-        flags & OBJECT_INHERIT_ACE != 0 && unsafe { EqualSid(sid, user.sid()) } != 0
+        flags & OBJECT_INHERIT_ACE != 0 && unsafe { EqualSid(sid.0, user.sid().0) } != 0
     }))
 }
 
 /// Whether `sid` may own a private file: this user, or those who can take
 /// any file anyway.
-fn trusted_owner(sid: PSID, user: &User) -> bool {
+fn trusted_owner(sid: Sid<'_>, user: &User) -> bool {
     // SAFETY: both SIDs are valid for the call.
     unsafe {
-        EqualSid(sid, user.sid()) != 0
-            || IsWellKnownSid(sid, WinLocalSystemSid) != 0
-            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+        EqualSid(sid.0, user.sid().0) != 0
+            || IsWellKnownSid(sid.0, WinLocalSystemSid) != 0
+            || IsWellKnownSid(sid.0, WinBuiltinAdministratorsSid) != 0
     }
 }
 
@@ -618,12 +663,12 @@ fn trusted_owner(sid: PSID, user: &User) -> bool {
 /// rights stand for the owner, checked before, and the creator owner, in an
 /// entry a folder passes on, for whoever makes something in it, who must
 /// already be let in to make it.
-fn trusted(sid: PSID, user: &User) -> bool {
+fn trusted(sid: Sid<'_>, user: &User) -> bool {
     trusted_owner(sid, user)
         // SAFETY: the SID is valid for the call.
         || unsafe {
-            IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0
-                || IsWellKnownSid(sid, WinCreatorOwnerSid) != 0
+            IsWellKnownSid(sid.0, WinCreatorOwnerRightsSid) != 0
+                || IsWellKnownSid(sid.0, WinCreatorOwnerSid) != 0
         }
 }
 

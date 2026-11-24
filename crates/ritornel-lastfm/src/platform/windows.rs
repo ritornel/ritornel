@@ -20,6 +20,9 @@ pub(crate) fn private(file: &File) -> std::io::Result<bool> {
 /// [`HOW_TO_CLOSE`] says: made again, in a folder only this user may open.
 #[cfg(test)]
 pub(crate) fn close_to_others(path: &Path) {
+    if let Some(parent) = path.parent() {
+        ritornel_windows::private::restrict(parent).unwrap();
+    }
     let text = std::fs::read(path).unwrap();
     std::fs::remove_file(path).unwrap();
     std::fs::write(path, text).unwrap();
