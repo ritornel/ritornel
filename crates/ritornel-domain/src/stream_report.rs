@@ -453,12 +453,18 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         &lengths,
         input.set_aside,
     );
-    let in_force = match_streams(
-        input.in_force,
-        input.scrobbles,
-        Tiers::ALL,
-        &pins(input.in_force),
-    );
+    // With no stream in force, as before a first archive, nothing is
+    // matched now.
+    let in_force = if input.in_force.is_empty() {
+        Matched::default()
+    } else {
+        match_streams(
+            input.in_force,
+            input.scrobbles,
+            Tiers::ALL,
+            &pins(input.in_force),
+        )
+    };
     let lengths_now = lengths_of(input.in_force, &in_force.events);
     let mut now = added(
         input.in_force,

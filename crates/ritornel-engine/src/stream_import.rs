@@ -617,6 +617,7 @@ impl LibraryStore {
             drop(read);
             let before = in_force(write.connection())?;
             let stored = apply_in(write, run, &streams, &reader, session)?;
+            drop(streams);
             // The tracks the run brought, and those whose newest stream in
             // force it changed, are judged against the library; and since a
             // stream in force can move its track's length, and so any play
