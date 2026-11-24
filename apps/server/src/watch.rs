@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -256,6 +256,11 @@ fn ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
+/// What an asked picture import is known by: which watching epoch asked for
+/// it, and its number within that epoch. Both together survive watching being
+/// turned off and back on, so a stale ask or answer never matches a newer one.
+pub(crate) type ImportId = (u64, u64);
+
 /// A folder as the thread keeps it.
 #[derive(Debug)]
 struct Watched {
@@ -273,7 +278,7 @@ struct Watched {
     /// they wait for it to end.
     busy: bool,
     /// The picture folder's import asked for and not yet ended.
-    importing: Option<u64>,
+    importing: Option<ImportId>,
     /// The last import of a picture folder, which is no job.
     imported: Option<AutoRun>,
     /// When the folder was first found. The timer leaves a new one alone a
@@ -315,15 +320,19 @@ impl Registry {
     }
 
     /// Lets go of `path` for one folder: the system's watch goes with the
-    /// last.
-    fn unwatch(&mut self, path: &Path) {
+    /// last, in which case this returns `true`.
+    fn unwatch(&mut self, path: &Path) -> bool {
         match self.held.get_mut(path) {
-            Some(held) if *held > 1 => *held -= 1,
+            Some(held) if *held > 1 => {
+                *held -= 1;
+                false
+            }
             Some(_) => {
                 self.held.remove(path);
                 self.backend.unwatch(path);
+                true
             }
-            None => {}
+            None => false,
         }
     }
 }
@@ -366,6 +375,13 @@ impl Watched {
         path == self.folder.path || path == self.real
     }
 
+    /// Whether `path` is strictly inside this folder.
+    fn is_ancestor_of(&self, path: &Path) -> bool {
+        [&self.folder.path, &self.real]
+            .iter()
+            .any(|root| path.starts_with(root) && path != root.as_path())
+    }
+
     /// Whether `path` is a folder this one is inside: one removed, moved or
     /// mounted over takes this one with it.
     fn below(&self, path: &Path) -> bool {
@@ -394,7 +410,8 @@ pub(crate) struct Watch {
     registry: Registry,
     folders: BTreeMap<Key, Watched>,
     /// Imports asked for and not yet handed to the thread that imports.
-    imports: Vec<(u64, Folder, AutoTrigger)>,
+    imports: Vec<(ImportId, Folder, AutoTrigger)>,
+    epoch: u64,
     next_import: u64,
     quiet_ms: i64,
     longest_ms: i64,
@@ -414,7 +431,12 @@ impl std::fmt::Debug for Watch {
 }
 
 impl Watch {
+    #[cfg(test)]
     pub(crate) fn new(backend: Box<dyn Backend>, run: &WatchRun) -> Self {
+        Self::in_epoch(backend, run, 0)
+    }
+
+    fn in_epoch(backend: Box<dyn Backend>, run: &WatchRun, epoch: u64) -> Self {
         Self {
             registry: Registry {
                 backend,
@@ -422,6 +444,7 @@ impl Watch {
             },
             folders: BTreeMap::new(),
             imports: Vec::new(),
+            epoch,
             next_import: 0,
             quiet_ms: ms(run.quiet),
             longest_ms: ms(run.longest),
@@ -438,6 +461,30 @@ impl Watch {
         }
     }
 
+    /// Rearms a watched folder in place, propagating a failed replacement to
+    /// any sibling folder sharing the same path.
+    fn rearm_folder(&mut self, key: &Key) {
+        let Some(watched) = self.folders.get_mut(key) else {
+            return;
+        };
+        if watched.state == WatchState::Watching {
+            self.registry.unwatch(&watched.folder.path);
+        }
+        arm(&mut self.registry, watched, true);
+        if watched.state == WatchState::Polling
+            && !self.registry.held.contains_key(&watched.folder.path)
+        {
+            let (path, detail) = (watched.folder.path.clone(), watched.detail.clone());
+            // Replacing a shared path's system watch failed, so any sibling
+            // folder at that path has no watch left either.
+            for sibling in self.folders.values_mut() {
+                if sibling.folder.path == path && sibling.state == WatchState::Watching {
+                    (sibling.state, sibling.detail) = (WatchState::Polling, detail.clone());
+                }
+            }
+        }
+    }
+
     /// Takes the folders as they now are: watches new ones, forgets gone
     /// ones, and notices one that went offline or came back.
     pub(crate) fn refresh(&mut self, found: Vec<Folder>, now_ms: i64) {
@@ -448,13 +495,30 @@ impl Watch {
             .filter(|key| !keys.contains(key))
             .cloned()
             .collect();
+        let mut unwatched_early = Vec::new();
         for key in gone {
             if let Some(watched) = self.folders.remove(&key)
                 && watched.state == WatchState::Watching
+                && self.registry.unwatch(&watched.folder.path)
             {
-                self.registry.unwatch(&watched.folder.path);
+                unwatched_early.push(watched.folder.path);
+                unwatched_early.push(watched.real);
             }
         }
+        // Unwatching a child path on inotify can remove its descriptors from
+        // a recursive parent watch too, so any watched ancestor is rearmed.
+        if !unwatched_early.is_empty() {
+            for watched in self.folders.values_mut() {
+                if watched.state == WatchState::Watching
+                    && unwatched_early
+                        .iter()
+                        .any(|child| watched.is_ancestor_of(child))
+                {
+                    watched.rearm = true;
+                }
+            }
+        }
+        let mut unwatched_late = Vec::new();
         for folder in found {
             let key = folder.key();
             let fresh = self
@@ -464,8 +528,10 @@ impl Watch {
             if fresh {
                 if let Some(old) = self.folders.remove(&key)
                     && old.state == WatchState::Watching
+                    && self.registry.unwatch(&old.folder.path)
                 {
-                    self.registry.unwatch(&old.folder.path);
+                    unwatched_late.push(old.folder.path);
+                    unwatched_late.push(old.real);
                 }
                 self.folders.insert(
                     key.clone(),
@@ -501,8 +567,11 @@ impl Watch {
                     }
                 }
                 (WatchState::Watching | WatchState::Polling, false) => {
-                    if watched.state == WatchState::Watching {
-                        self.registry.unwatch(&watched.folder.path);
+                    if watched.state == WatchState::Watching
+                        && self.registry.unwatch(&watched.folder.path)
+                    {
+                        unwatched_late.push(watched.folder.path.clone());
+                        unwatched_late.push(watched.real.clone());
                     }
                     info!(
                         root = %watched.folder.name,
@@ -513,39 +582,42 @@ impl Watch {
                 }
                 (WatchState::Watching | WatchState::Polling, true) => {
                     let other = folder_id(&watched.folder.path) != watched.id;
-                    let mut dropped_watch = None;
-                    if other || watched.rearm {
-                        if watched.state == WatchState::Watching {
-                            self.registry.unwatch(&watched.folder.path);
-                        }
-                        arm(&mut self.registry, watched, true);
-                        if watched.state == WatchState::Polling
+                    let needs_rearm = other || watched.rearm;
+                    if needs_rearm {
+                        self.rearm_folder(&key);
+                        if let Some(watched) = self.folders.get(&key)
+                            && watched.state == WatchState::Polling
                             && !self.registry.held.contains_key(&watched.folder.path)
                         {
-                            dropped_watch =
-                                Some((watched.folder.path.clone(), watched.detail.clone()));
+                            unwatched_late.push(watched.folder.path.clone());
+                            unwatched_late.push(watched.real.clone());
                         }
                     }
-                    if other {
+                    if other && let Some(watched) = self.folders.get_mut(&key) {
                         info!(
                             root = %watched.folder.name,
                             "a folder is another folder now, as a disk mounted again is: it is watched afresh"
                         );
                         watched.mark(now_ms, AutoTrigger::Returned);
                     }
-                    // Replacing a shared path's system watch failed, so any
-                    // sibling folder at that path has no watch left either.
-                    if let Some((path, detail)) = dropped_watch {
-                        for sibling in self.folders.values_mut() {
-                            if sibling.folder.path == path && sibling.state == WatchState::Watching
-                            {
-                                (sibling.state, sibling.detail) =
-                                    (WatchState::Polling, detail.clone());
-                            }
-                        }
-                    }
                 }
                 (WatchState::Offline, false) => {}
+            }
+        }
+        if !unwatched_late.is_empty() {
+            let ancestors: Vec<Key> = self
+                .folders
+                .iter()
+                .filter(|(_, watched)| {
+                    watched.state == WatchState::Watching
+                        && unwatched_late
+                            .iter()
+                            .any(|child| watched.is_ancestor_of(child))
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in ancestors {
+                self.rearm_folder(&key);
             }
         }
     }
@@ -570,10 +642,12 @@ impl Watch {
                                 watched.rearm = true;
                                 watched.mark(now_ms, AutoTrigger::Change);
                             }
-                        } else if watched.state != WatchState::Offline && watched.covers(&path) {
-                            if watched.is_root(&path) {
-                                look = true;
+                        } else if watched.is_root(&path) {
+                            look = true;
+                            if watched.state != WatchState::Offline {
+                                watched.mark(now_ms, AutoTrigger::Change);
                             }
+                        } else if watched.state != WatchState::Offline && watched.covers(&path) {
                             watched.mark(now_ms, AutoTrigger::Change);
                         }
                     }
@@ -612,7 +686,7 @@ impl Watch {
     /// Takes in that the import `id` of the picture folder `key` ended, or
     /// was not run. A stale answer from an earlier instance of the folder is
     /// ignored.
-    pub(crate) fn imported(&mut self, key: &Key, id: u64, run: Option<AutoRun>) {
+    pub(crate) fn imported(&mut self, key: &Key, id: ImportId, run: Option<AutoRun>) {
         if let Some(watched) = self.folders.get_mut(key)
             && watched.importing == Some(id)
         {
@@ -625,7 +699,7 @@ impl Watch {
     /// answer cannot clear a newer one.
     fn ask_import(&mut self, key: &Key, folder: Folder, trigger: AutoTrigger) {
         self.next_import += 1;
-        let id = self.next_import;
+        let id = (self.epoch, self.next_import);
         if let Some(watched) = self.folders.get_mut(key) {
             watched.importing = Some(id);
         }
@@ -634,7 +708,7 @@ impl Watch {
 
     /// The imports asked for since this was last asked, for the thread that
     /// imports.
-    pub(crate) fn take_imports(&mut self) -> Vec<(u64, Folder, AutoTrigger)> {
+    pub(crate) fn take_imports(&mut self) -> Vec<(ImportId, Folder, AutoTrigger)> {
         std::mem::take(&mut self.imports)
     }
 
@@ -868,18 +942,20 @@ impl Watcher {
         if let Some(receiver) = receiver {
             // An import can take a while: it runs on a thread of its own, so
             // that the watcher goes on hearing changes and queuing scans.
-            let (asks, asked) = mpsc::channel::<(u64, Folder, AutoTrigger)>();
-            let (done, imported) = mpsc::channel::<(Key, u64, Option<AutoRun>)>();
-            let (core_, stop_) = (Arc::clone(&core), Arc::clone(&stop));
+            let epoch = Arc::new(AtomicU64::new(0));
+            let (asks, asked) = mpsc::channel::<(ImportId, Folder, AutoTrigger)>();
+            let (done, imported) = mpsc::channel::<(Key, ImportId, Option<AutoRun>)>();
+            let (core_, stop_, epoch_) = (Arc::clone(&core), Arc::clone(&stop), Arc::clone(&epoch));
             threads.push(
                 std::thread::Builder::new()
                     .name("ritornel-pictures".to_owned())
-                    .spawn(move || import(&core_, &asked, &done, &stop_))?,
+                    .spawn(move || import(&core_, &asked, &done, &epoch_, &stop_))?,
             );
             let lines = Lines {
                 signals: receiver,
                 asks,
                 imported,
+                epoch,
             };
             let (core_, stop_) = (Arc::clone(&core), Arc::clone(&stop));
             threads.push(
@@ -922,8 +998,9 @@ impl Drop for Watcher {
 /// import ends, until the watcher has gone.
 fn import(
     core: &Core,
-    asked: &Receiver<(u64, Folder, AutoTrigger)>,
-    done: &Sender<(Key, u64, Option<AutoRun>)>,
+    asked: &Receiver<(ImportId, Folder, AutoTrigger)>,
+    done: &Sender<(Key, ImportId, Option<AutoRun>)>,
+    epoch: &AtomicU64,
     stop: &AtomicBool,
 ) {
     for (id, folder, trigger) in asked {
@@ -932,9 +1009,7 @@ fn import(
         }
         // Asked for before watching was turned off: the timer imports it
         // when it is turned on again. The watcher is told all the same.
-        let run = core
-            .watch_off()
-            .is_none()
+        let run = (epoch.load(Ordering::SeqCst) == id.0 && core.watch_off().is_none())
             .then(|| core.auto_import(&folder, trigger));
         if done.send((folder.key(), id, run)).is_err() {
             return;
@@ -947,9 +1022,13 @@ fn import(
 struct Lines {
     signals: Receiver<Signal>,
     /// Imports for the importer.
-    asks: Sender<(u64, Folder, AutoTrigger)>,
+    asks: Sender<(ImportId, Folder, AutoTrigger)>,
     /// Imports that have ended, or were not run.
-    imported: Receiver<(Key, u64, Option<AutoRun>)>,
+    imported: Receiver<(Key, ImportId, Option<AutoRun>)>,
+    /// Which watching session is current: bumped whenever watching stops or
+    /// starts, so queued imports and completions from an earlier session are
+    /// ignored.
+    epoch: Arc<AtomicU64>,
 }
 
 fn backend(run: &WatchRun, signals: Signals) -> Box<dyn Backend> {
@@ -981,6 +1060,7 @@ fn watch(core: &Core, lines: &Lines, stop: &AtomicBool) {
         let wait = match core.watch_off() {
             Some(why) => {
                 if state.take().is_some() {
+                    lines.epoch.fetch_add(1, Ordering::SeqCst);
                     info!(why = %why, "stopped watching the library's folders");
                 }
                 watching.show(Some(why), Vec::new());
@@ -990,9 +1070,11 @@ fn watch(core: &Core, lines: &Lines, stop: &AtomicBool) {
                 let watch = state.get_or_insert_with(|| {
                     info!("watching the library's folders");
                     look = true;
-                    let mut watch = Watch::new(
+                    let epoch = lines.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut watch = Watch::in_epoch(
                         backend(&watching.run, watching.signals.clone()),
                         &watching.run,
+                        epoch,
                     );
                     watch.skip(core.data_dir());
                     watch

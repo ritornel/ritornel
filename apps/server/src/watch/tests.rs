@@ -1062,6 +1062,89 @@ fn folders_are_watched_as_they_come_and_forgotten_as_they_go() {
     assert_eq!(rig.watch.shown()[0].state, WatchState::Watching);
 }
 
+#[test]
+fn unwatching_a_nested_folder_rearms_its_parent_watch() {
+    let mut rig = Rig::new();
+    let nested = rig.music().join("portraits");
+    std::fs::create_dir_all(&nested).unwrap();
+    let music = Folder {
+        name: "music".to_owned(),
+        path: rig.music(),
+        source: Some(rig.source),
+    };
+    let portraits = Folder {
+        name: "portraits".to_owned(),
+        path: nested.clone(),
+        source: None,
+    };
+    rig.watch.refresh(vec![music.clone(), portraits], rig.now());
+    let asked_before = rig.fake.0.lock().unwrap().asked;
+    assert_eq!(rig.fake.0.lock().unwrap().watched, [rig.music(), nested]);
+
+    // Removing the nested folder drops its watch and rearms the parent so
+    // inotify keeps hearing changes in the nested directory.
+    rig.watch.refresh(vec![music], rig.now());
+    assert_eq!(rig.fake.0.lock().unwrap().watched, [rig.music()]);
+    assert_eq!(rig.fake.0.lock().unwrap().asked, asked_before + 1);
+    assert_eq!(rig.watch.shown()[0].state, WatchState::Watching);
+}
+
+#[test]
+fn an_exact_path_event_wakes_refresh_for_an_offline_root() {
+    let mut rig = Rig::new();
+    let away = rig.scratch.path().join("away");
+    std::fs::rename(rig.music(), &away).unwrap();
+    rig.look();
+    assert_eq!(rig.watch.shown()[0].state, WatchState::Offline);
+
+    // A parent watch reporting the offline root's own path asks for a look
+    // without marking the offline folder pending.
+    rig.at(T0 + 10 * SECOND);
+    assert!(rig.changed(&[rig.music()]));
+    assert_eq!(rig.watch.shown()[0].pending_since, None);
+
+    // Once the directory is back, that look arms it immediately.
+    std::fs::rename(&away, rig.music()).unwrap();
+    rig.look();
+    assert_eq!(rig.watch.shown()[0].state, WatchState::Watching);
+    assert_eq!(rig.watch.shown()[0].pending_since, Some(T0 + 10 * SECOND));
+}
+
+#[test]
+fn a_stale_import_completion_from_an_earlier_epoch_is_ignored() {
+    let rig = Rig::new();
+    let pictures = rig.scratch.path().join("pictures");
+    std::fs::create_dir_all(&pictures).unwrap();
+    let folder = Folder {
+        name: "pictures".to_owned(),
+        path: pictures.clone(),
+        source: None,
+    };
+    let run = WatchRun {
+        quiet: Duration::from_secs(4),
+        longest: Duration::from_secs(60),
+        ..WatchRun::on()
+    };
+    let fake = Shared::default();
+    let mut watch = Watch::in_epoch(Box::new(fake), &run, 2);
+    watch.refresh(vec![folder.clone()], T0);
+    tick(&rig.core, &mut watch, T0);
+    let asked = watch.take_imports();
+    assert_eq!(asked.len(), 1);
+    let current_id = asked[0].0;
+    assert_eq!(current_id, (2, 1));
+
+    // A completion from an earlier watching epoch with the same sequence
+    // number must not clear the current epoch's in-flight import.
+    let stale_run = crate::watch::imported(AutoTrigger::Start, T0, T0, true);
+    watch.imported(&folder.key(), (1, 1), Some(stale_run));
+    assert_eq!(watch.shown()[0].imported, None);
+
+    let real_run = crate::watch::imported(AutoTrigger::Start, T0, T0 + 1, true);
+    watch.imported(&folder.key(), current_id, Some(real_run.clone()));
+    assert_eq!(watch.shown()[0].imported, Some(real_run));
+}
+
 /// A running hub whose watcher's events the test hands in: a rescan while a
 /// track plays on the null output leaves it be, and the hub's own threads
 /// import a picture folder.
