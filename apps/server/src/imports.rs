@@ -405,6 +405,12 @@ pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &Atomic
     let Ok(params) = serde_json::from_str::<RunJobParams>(&job.params_json) else {
         return failed("the job's params are not a run".to_owned());
     };
+    // A run applied keeps the report it was applied with: one applied
+    // before this job began is not read at all, and one applied while it
+    // ran keeps nothing of it.
+    if let Some(Ok(Some(_))) = core.with_library(|_, library| library.stored_run(params.run_id)) {
+        return failed("the run is applied".to_owned());
+    }
     let (streams, begun_at) = match core.staging().streams(params.run_id, core.now_ms()) {
         Ok(Some(found)) => found,
         Ok(None) => {
@@ -412,7 +418,6 @@ pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &Atomic
         }
         Err(error) => return failed(error.to_string()),
     };
-    // A run applied meanwhile keeps the report it was applied with.
     let report = core.with_library(|_, library| {
         let report = library.stream_dry_run(streams)?;
         Ok::<_, ritornel_engine::Error>(
