@@ -6,16 +6,8 @@
 //! Nothing here sleeps: a test waits for an answer or an event, and is cut
 //! off with a message if it has not finished in [`WAIT`].
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use ritornel_client::Client;
 use ritornel_client::contract::methods::{
@@ -34,25 +26,10 @@ use ritornel_client::contract::{
 use ritornel_engine::{OsEntropy, SystemClock};
 use ritornel_server::{Bounds, HeldDir, Listen, Output, PlaybackRun, Run, Server};
 
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{Scratch, WAIT, album, key};
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-playback-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+fn scratch() -> Scratch {
+    Scratch::new("ritornel-playback-")
 }
 
 /// Starts a server with a player on the null output, a hundred times real
@@ -100,26 +77,6 @@ async fn server_at(scratch: &Scratch, speed: u32) -> (Server, Client) {
     (server, client)
 }
 
-fn key() -> Id {
-    ritornel_client::idempotency_key().unwrap()
-}
-
-/// An album of three tracks, from the audio fixtures, half a second each.
-fn album(scratch: &Scratch) -> PathBuf {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio");
-    let folder = scratch.0.join("music");
-    for (to, fixture) in [
-        ("Tin Weather/01.flac", "a.flac"),
-        ("Tin Weather/02.flac", "b.flac"),
-        ("Tin Weather/03.mp3", "a.mp3"),
-    ] {
-        let to = folder.join(to);
-        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-        std::fs::copy(fixtures.join(fixture), to).unwrap();
-    }
-    folder.canonicalize().unwrap()
-}
-
 /// Creates the library and scans the folder into it, and waits for the
 /// scan to end.
 async fn scanned(client: &mut Client, folder: &Path) {
@@ -153,7 +110,7 @@ async fn scan_music(client: &mut Client, folder: &Path) {
 #[tokio::test]
 async fn a_picture_folder_does_not_hide_tracks_in_a_music_folder() {
     for pictures_first in [true, false] {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let (_server, mut client) = server_at(&scratch, 4).await;
         let music = album(&scratch);
         let parent = music.parent().unwrap();
@@ -214,7 +171,7 @@ async fn a_picture_folder_does_not_hide_tracks_in_a_music_folder() {
 #[tokio::test]
 async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
     tokio::time::timeout(WAIT, async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         // Four times real time: the album is over in well under a second.
         let (server, mut client) = server_at(&scratch, 4).await;
         let folder = album(&scratch);
@@ -401,7 +358,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
 async fn a_file_replaced_after_the_scan_is_not_played_under_the_identity_the_scan_gave_the_old_one()
 {
     tokio::time::timeout(WAIT, async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let (server, mut client) = server(&scratch).await;
         let folder = album(&scratch);
         scanned(&mut client, &folder).await;
@@ -487,7 +444,7 @@ async fn a_file_replaced_after_the_scan_is_not_played_under_the_identity_the_sca
 #[tokio::test]
 async fn the_volume_is_set_absolutely_kept_across_a_restart_and_refused_out_of_range() {
     tokio::time::timeout(WAIT, async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let (first, client) = server(&scratch).await;
         assert_eq!(
             client.call::<PlaybackGet>(&NoParams {}).await.unwrap().volume,
@@ -556,7 +513,7 @@ fn refusal<T: std::fmt::Debug>(
 #[tokio::test]
 async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
     tokio::time::timeout(WAIT, async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let (server, mut client) = server(&scratch).await;
         let folder = album(&scratch);
         scanned(&mut client, &folder).await;
@@ -789,7 +746,7 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
 #[tokio::test]
 async fn a_command_from_a_view_sent_again_after_the_view_ended_is_answered_from_its_receipt() {
     tokio::time::timeout(WAIT, async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let (server, mut client) = server(&scratch).await;
         let folder = album(&scratch);
         scanned(&mut client, &folder).await;

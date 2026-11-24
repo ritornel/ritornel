@@ -9,51 +9,18 @@
 //! Every server here listens on a port the system picks, so no test needs
 //! the default port.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
-use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::sync::mpsc::Receiver;
 
 use ritornel_engine::{OsEntropy, ServerStore, SessionToken, SystemClock};
 use serde_json::Value;
 
-/// How long a test waits for a server to do what it should before it kills
-/// the server and fails. It is a bound, not a wait: a server that works
-/// never comes near it.
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{Scratch, WAIT, lines, rest, signal};
 
-/// A directory that is removed when the test ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-server-process-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-
-    /// The data directory. The server creates it.
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+fn scratch() -> Scratch {
+    Scratch::new("ritornel-server-process-")
 }
 
 /// `ritornel-server serve` on `data_dir`, on a port the system picks, with
@@ -79,38 +46,6 @@ fn serve(data_dir: &Path, extra: &[&str]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
-}
-
-/// Reads a pipe on a thread of its own and hands over each line, so that
-/// whoever wants them can stop waiting. The channel closes at the pipe's
-/// end, which comes when the process ends.
-fn lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
-    let (send, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            // The test has gone only if it has failed already.
-            if send.send(line.unwrap()).is_err() {
-                break;
-            }
-        }
-    });
-    lines
-}
-
-/// The rest of what a pipe carries, up to its end. `None` if the end did
-/// not come within [`WAIT`].
-fn rest(lines: &Receiver<String>) -> Option<String> {
-    let mut text = String::new();
-    loop {
-        match lines.recv_timeout(WAIT) {
-            Ok(line) => {
-                text.push_str(&line);
-                text.push('\n');
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(text),
-            Err(mpsc::RecvTimeoutError::Timeout) => return None,
-        }
-    }
 }
 
 /// Runs a command that should end by itself, and returns how it ended and
@@ -193,29 +128,8 @@ impl Server {
     }
 
     /// Sends the server a signal, by name: `TERM`, `INT`.
-    #[cfg(unix)]
     fn signal(&self, name: &str) {
-        let sent = Command::new("kill")
-            .arg(format!("-{name}"))
-            .arg(self.pid.to_string())
-            .status()
-            .unwrap();
-        assert!(sent.success());
-    }
-
-    /// Asks the server to stop as Windows does in place of `TERM`:
-    /// `taskkill /PID` without `/F` asks its hidden window to close. A
-    /// process with no console of its own has no Ctrl+C to be sent, so
-    /// `INT` is not one of them.
-    #[cfg(windows)]
-    fn signal(&self, name: &str) {
-        assert_eq!(name, "TERM", "only TERM has a Windows equivalent here");
-        let sent = Command::new("taskkill")
-            .arg("/PID")
-            .arg(self.pid.to_string())
-            .output()
-            .unwrap();
-        assert!(sent.status.success(), "{sent:?}");
+        signal(self.pid, name);
     }
 
     /// Closes the server's standard input.
@@ -355,7 +269,7 @@ fn assert_clean_stop(stopped: &Stopped, data_dir: &Path) {
 
 #[test]
 fn a_second_server_on_the_same_directory_is_refused_and_the_first_stops_cleanly() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let first = Server::start(&data_dir, &[]);
     let named = server_json(&data_dir);
@@ -399,7 +313,7 @@ fn a_second_server_on_the_same_directory_is_refused_and_the_first_stops_cleanly(
 
 #[test]
 fn a_restart_keeps_the_identity_and_the_credential() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
 
     let first = Server::start(&data_dir, &[]);
@@ -433,7 +347,7 @@ fn a_restart_keeps_the_identity_and_the_credential() {
 
 #[test]
 fn a_name_given_in_the_settings_wins_over_the_stored_one_and_is_kept_after() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     Server::start(&data_dir, &[]).stop(&data_dir);
     Server::start(&data_dir, &["--name", "Workbench Speakers"]).stop(&data_dir);
@@ -460,7 +374,7 @@ fn a_name_given_in_the_settings_wins_over_the_stored_one_and_is_kept_after() {
 
 #[test]
 fn a_lost_credential_file_is_replaced_at_the_next_start() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let first = Server::start(&data_dir, &[]);
     let server_id = first.server_id.clone();
@@ -490,7 +404,7 @@ fn a_lost_credential_file_is_replaced_at_the_next_start() {
 
 #[test]
 fn an_owned_server_stops_when_its_standard_input_closes() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let mut server = Server::start(&data_dir, &["--owned"]);
     assert!(data_dir.join("server.json").exists());
@@ -507,7 +421,7 @@ fn an_owned_server_stops_when_its_standard_input_closes() {
 
 #[test]
 fn an_owned_server_still_stops_on_a_signal() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     // Its standard input stays open, with a thread of the server waiting on
     // it, for as long as this test holds the other end.
@@ -517,7 +431,7 @@ fn an_owned_server_still_stops_on_a_signal() {
 
 #[test]
 fn a_server_nobody_owns_outlives_its_standard_input() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let mut server = Server::start(&data_dir, &[]);
     server.close_stdin();
@@ -535,7 +449,7 @@ fn a_server_nobody_owns_outlives_its_standard_input() {
 
 #[test]
 fn every_log_line_is_json_with_the_runs_boot_id_and_no_secret() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     for _ in 0..2 {
         Server::start(&data_dir, &[]).stop(&data_dir);
@@ -605,7 +519,7 @@ fn every_log_line_is_json_with_the_runs_boot_id_and_no_secret() {
 
 #[test]
 fn a_setting_comes_from_its_flag_then_the_environment_then_the_file() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::write(data_dir.join("config.toml"), "log_level = \"error\"\n").unwrap();
@@ -639,7 +553,7 @@ fn a_setting_comes_from_its_flag_then_the_environment_then_the_file() {
 
 #[test]
 fn the_data_directory_can_come_from_the_environment() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let mut command = Command::new(env!("CARGO_BIN_EXE_ritornel-server"));
     command
@@ -659,7 +573,7 @@ fn the_data_directory_can_come_from_the_environment() {
 
 #[test]
 fn a_start_that_fails_exits_with_1_and_leaves_the_directory_free() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     Server::start(&data_dir, &[]).stop(&data_dir);
 
@@ -706,7 +620,7 @@ fn a_start_that_fails_exits_with_1_and_leaves_the_directory_free() {
 
 #[test]
 fn a_database_that_cannot_be_opened_stops_the_start_and_the_log_says_why() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     Server::start(&data_dir, &[]).stop(&data_dir);
     let before = log_lines(&data_dir).len();
