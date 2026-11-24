@@ -341,12 +341,14 @@ pub struct RecordPlayed {
 /// The result of `history.artist` and `history.album`: what a page says of
 /// the listener's history with an artist or an album.
 ///
-/// It counts the plays that count and are not excluded, of songs the
-/// library has bound them to: an artist's are the plays of their songs, by
-/// each song's credit; an album's are those heard from one of its
-/// versions. A play bound to no song reaches no page ("Queries" in
-/// docs/internals/history.md), so this is read again whenever plays change:
-/// a binding made later moves them here.
+/// It counts the plays that count and are not excluded. Of the library's
+/// artist or album, they are of songs the library has bound them to: an
+/// artist's are the plays of their songs, by the credit of the appearance
+/// each was heard from or else its recording's; an album's are those heard
+/// from one of its versions. Of a name heard that is none of the
+/// library's, they are the plays heard under it ("Queries" in
+/// docs/internals/history.md). It is read again whenever plays change: a
+/// binding made later moves them here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -387,9 +389,10 @@ pub struct HistoryOf {
 
 /// The params of `history.artist`: the library's artist, by its ID, or
 /// an artist heard, by their name's key as `history.artists` gives it. A
-/// key that is the name of exactly one of the library's artists with a
-/// record answers with that artist, so a key kept from before their record
-/// was bought still arrives.
+/// key that names exactly one of the library's artists a name can be (one
+/// with a record, one a bound song's credit names, or one credited on a
+/// record heard from) answers with that artist, so a key kept from before
+/// their record was bought still arrives.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

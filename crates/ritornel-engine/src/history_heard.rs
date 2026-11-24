@@ -358,23 +358,24 @@ impl<'c> Linker<'c> {
         Ok(credit)
     }
 
-    /// The row of a row-making `select` and `insert` by one value, found
-    /// or made, and whether it was made.
-    fn row<P: rusqlite::Params + Clone>(
+    /// The row `select` finds `by` these, or else the one `insert` makes of
+    /// `values`, and whether it was made.
+    fn row(
         &self,
         select: &str,
+        by: impl rusqlite::Params,
         insert: &str,
-        params: P,
+        values: impl rusqlite::Params,
     ) -> Result<(i64, bool), Error> {
         let found: Option<i64> = self
             .connection
             .prepare_cached(select)?
-            .query_row(params.clone(), |row| row.get(0))
+            .query_row(by, |row| row.get(0))
             .optional()?;
         match found {
             Some(id) => Ok((id, false)),
             None => {
-                self.connection.prepare_cached(insert)?.execute(params)?;
+                self.connection.prepare_cached(insert)?.execute(values)?;
                 Ok((self.connection.last_insert_rowid(), true))
             }
         }
@@ -385,7 +386,8 @@ impl<'c> Linker<'c> {
             Some(id) => *id,
             None => {
                 let (id, made) = self.row(
-                    "SELECT id FROM heard_artist WHERE artist_id = ?1 AND ?2 = ?2",
+                    "SELECT id FROM heard_artist WHERE artist_id = ?1",
+                    [artist],
                     "INSERT INTO heard_artist (artist_id, rev) VALUES (?1, ?2)",
                     (artist, self.rev),
                 )?;
@@ -403,7 +405,8 @@ impl<'c> Linker<'c> {
             Some(id) => *id,
             None => {
                 let (id, _) = self.row(
-                    "SELECT id FROM heard_artist WHERE name_key = ?1 AND ?2 = ?2 AND ?3 = ?3",
+                    "SELECT id FROM heard_artist WHERE name_key = ?1",
+                    [key],
                     "INSERT INTO heard_artist (name_key, name, rev) VALUES (?1, ?2, ?3)",
                     (key, spelling, self.rev),
                 )?;
@@ -420,7 +423,8 @@ impl<'c> Linker<'c> {
             Some(id) => *id,
             None => {
                 let (id, made) = self.row(
-                    "SELECT id FROM heard_album WHERE release_group_id = ?1 AND ?2 = ?2",
+                    "SELECT id FROM heard_album WHERE release_group_id = ?1",
+                    [group],
                     "INSERT INTO heard_album (release_group_id, rev) VALUES (?1, ?2)",
                     (group, self.rev),
                 )?;
@@ -438,8 +442,8 @@ impl<'c> Linker<'c> {
             Some(id) => *id,
             None => {
                 let (id, _) = self.row(
-                    "SELECT id FROM heard_album
-                     WHERE heard_artist_id = ?1 AND name_key = ?2 AND ?3 = ?3 AND ?4 = ?4",
+                    "SELECT id FROM heard_album WHERE heard_artist_id = ?1 AND name_key = ?2",
+                    (artist, key),
                     "INSERT INTO heard_album (heard_artist_id, name_key, name, rev)
                      VALUES (?1, ?2, ?3, ?4)",
                     (artist, key, spelling, self.rev),
