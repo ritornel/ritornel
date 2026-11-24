@@ -358,7 +358,7 @@ impl Player {
                 if !player
                     .net
                     .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, &net))
+                    .is_some_and(|current| current.same_session(&net))
                 {
                     return;
                 }
@@ -757,7 +757,7 @@ impl Player {
                     || player
                         .net
                         .as_ref()
-                        .is_none_or(|current| !Arc::ptr_eq(current, &net))
+                        .is_none_or(|current| !current.same_session(&net))
                 {
                     return;
                 }
@@ -835,7 +835,7 @@ impl Player {
                     if session
                         .as_ref()
                         .zip(player.net.as_ref())
-                        .is_some_and(|(from, current)| Arc::ptr_eq(from, current))
+                        .is_some_and(|(from, current)| from.same_session(current))
                         && let Some(revision) = set.receipt.revision
                     {
                         player.rated.confirm(recording, set.rating, revision);
