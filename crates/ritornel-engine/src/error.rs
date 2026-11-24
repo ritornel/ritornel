@@ -99,9 +99,9 @@ pub enum Error {
         name: String,
     },
     /// A root's folder is missing, is not a folder, has no identity the
-    /// system will give or is empty: the root is
-    /// offline, not empty, and nothing in it is marked missing. See "Data
-    /// directory" in docs/internals/server.md.
+    /// system will give, or is empty: the root is offline, not empty, and
+    /// nothing in it is marked missing. See "Data directory" in
+    /// docs/internals/server.md.
     RootOffline {
         /// Where the root should be.
         path: std::path::PathBuf,

@@ -1637,60 +1637,75 @@ fn another_disk_mounted_at_the_root_after_the_walk_is_not_judged_against_it() {
 
 #[test]
 fn a_root_swapped_between_prepare_and_commit_writes_nothing() {
-    let mut rig = Rig::new();
-    rig.put("Tin Weather/01.flac", "a.flac");
-    rig.put("Tin Weather/02.flac", "b.flac");
-    rig.scan();
-    let (root, away) = (rig.root(), rig.scratch.path().join("unmounted"));
     let stop = std::sync::atomic::AtomicBool::new(false);
-
-    // 1. Missing phase: prepare succeeds, then the root is swapped before commit.
-    std::fs::remove_file(root.join("Tin Weather/02.flac")).unwrap();
-    let (revision, before) = (rig.revision(), rig.dump());
-    let (mut run, row) = walked(&mut rig);
-    // Moves phase (no moves to commit), then prepare for Missing phase.
-    assert!(run.prepare(&stop, &mut |_| {}).unwrap());
-    assert_eq!(run.commit(&rig.library).unwrap(), None);
-    assert!(run.prepare(&stop, &mut |_| {}).unwrap());
-    std::fs::rename(&root, &away).unwrap();
-    std::fs::create_dir(&root).unwrap();
-    let refused = run.commit(&rig.library);
-    assert!(
-        matches!(&refused, Err(Error::RootOffline { path }) if *path == root),
-        "{refused:?}"
-    );
-    rig.server
-        .finish_job(row, JobState::Failed, Some("offline".to_owned()))
-        .unwrap();
-    assert_eq!((rig.revision(), rig.dump()), (revision, before));
-    std::fs::remove_dir(&root).unwrap();
-    std::fs::rename(&away, &root).unwrap();
-
-    // 2. Replaced phase: prepare succeeds, then the root is swapped before commit.
-    rig.put("Tin Weather/02.flac", "b.flac");
-    rig.scan();
-    rig.put("Tin Weather/01.flac", "b.flac");
-    let (revision, before) = (rig.revision(), rig.dump());
-    let (mut run, row) = walked(&mut rig);
-    // Read, Moves, Missing, then prepare for Replaced.
-    for _ in 0..3 {
-        assert!(run.prepare(&stop, &mut |_| {}).unwrap());
-        assert_eq!(run.commit(&rig.library).unwrap(), None);
+    for phase in ["record", "moves", "missing", "replaced", "sidecars"] {
+        let mut rig = Rig::new();
+        rig.put("Tin Weather/01.flac", "a.flac");
+        rig.put("Tin Weather/02.flac", "b.flac");
+        rig.scan();
+        let (root, away) = (rig.root(), rig.scratch.path().join("unmounted"));
+        let steps_before = match phase {
+            "record" => {
+                rig.put("Tin Weather/03.mp3", "a.mp3");
+                0
+            }
+            "moves" => {
+                // Swap both paths: Read holds both in `replaced` with no
+                // write, and Moves is the first step that writes.
+                rig.put("Tin Weather/01.flac", "b.flac");
+                rig.put("Tin Weather/02.flac", "a.flac");
+                1
+            }
+            "missing" => {
+                std::fs::remove_file(root.join("Tin Weather/02.flac")).unwrap();
+                1
+            }
+            "replaced" => {
+                rig.put("Tin Weather/01.flac", "b.flac");
+                3
+            }
+            "sidecars" => {
+                std::fs::write(
+                    root.join("Tin Weather/disc.cue"),
+                    "FILE \"01.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                )
+                .unwrap();
+                3
+            }
+            _ => unreachable!(),
+        };
+        let (revision, before) = (rig.revision(), rig.dump());
+        let (mut run, row) = walked(&mut rig);
+        for _ in 0..steps_before {
+            assert!(run.prepare(&stop, &mut |_| {}).unwrap(), "{phase}");
+            assert_eq!(run.commit(&rig.library).unwrap(), None, "{phase}");
+        }
+        assert_eq!(
+            (rig.revision(), rig.dump()),
+            (revision, before.clone()),
+            "{phase}: no earlier step wrote"
+        );
+        // Prepare succeeds for the writing phase, then the root is swapped
+        // before commit runs.
+        assert!(run.prepare(&stop, &mut |_| {}).unwrap(), "{phase}");
+        std::fs::rename(&root, &away).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let refused = run.commit(&rig.library);
+        assert!(
+            matches!(&refused, Err(Error::RootOffline { path }) if *path == root),
+            "{phase}: {refused:?}"
+        );
+        rig.server
+            .finish_job(row, JobState::Failed, Some("offline".to_owned()))
+            .unwrap();
+        assert_eq!(
+            (rig.revision(), rig.dump()),
+            (revision, before),
+            "{phase}: nothing written after swap"
+        );
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::rename(&away, &root).unwrap();
     }
-    assert!(run.prepare(&stop, &mut |_| {}).unwrap());
-    std::fs::rename(&root, &away).unwrap();
-    std::fs::create_dir(&root).unwrap();
-    let refused = run.commit(&rig.library);
-    assert!(
-        matches!(&refused, Err(Error::RootOffline { path }) if *path == root),
-        "{refused:?}"
-    );
-    rig.server
-        .finish_job(row, JobState::Failed, Some("offline".to_owned()))
-        .unwrap();
-    assert_eq!((rig.revision(), rig.dump()), (revision, before));
-    std::fs::remove_dir(&root).unwrap();
-    std::fs::rename(&away, &root).unwrap();
 }
 
 #[test]

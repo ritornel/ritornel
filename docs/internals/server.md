@@ -70,7 +70,7 @@ A sleeping hub is one its satellites cannot reach, but a satellite or a player s
   imports/       runs of streams staged for a dry run, owner-only, removed at every start
 ```
 
-The data directory must sit on a local filesystem because SQLite WAL shared memory and OS file locks are unreliable on network shares. Master music folders may live on local disks or network mounts; a missing or empty root is treated as offline rather than empty so scans skip it without dropping locations.
+The data directory must sit on a local filesystem because SQLite WAL shared memory and OS file locks are unreliable on network shares. Master music folders may live on local disks or network mounts; a root that is missing, empty, has no filesystem identity, or whose identity changes during a walk or before a write is treated as offline rather than empty so scans skip it without dropping locations.
 
 `DataDir::prepare` creates private directories (`0700` on Unix, owner-only ACL on Windows) and tightens permissions on `server.db` and `library.db` at startup (protecting restored databases that may arrive world-readable).
 

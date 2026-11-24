@@ -32,6 +32,10 @@ pub(crate) struct Seen {
     pub(crate) mtime_ms: i64,
 }
 
+/// A folder's identity: its device and inode on Unix, or its volume's serial
+/// number and file index on Windows.
+pub type FolderId = (u64, u64);
+
 /// What a walk found.
 #[derive(Debug, Default)]
 pub(crate) struct Walked {
@@ -61,7 +65,7 @@ pub(crate) struct Walked {
 /// Which folder is at `path` now, if one is: its device and inode, or on
 /// Windows its volume's serial number and its file index. A disk mounted
 /// again is another folder at the same path.
-pub fn folder_id(path: &Path) -> Option<(u64, u64)> {
+pub fn folder_id(path: &Path) -> Option<FolderId> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_dir() {
         return None;
@@ -117,9 +121,6 @@ fn unreadable(walked: &mut Walked, rel: &str) {
         .skipped
         .push((rel.to_owned(), "the folder cannot be read"));
 }
-
-/// A folder's identity, as [`folder_id`] gives it.
-type FolderId = (u64, u64);
 
 /// Lists the folder `dir`, at `rel` under the root: its audio files and
 /// images go into `walked`, and the folders in it are returned, to be
@@ -236,17 +237,18 @@ fn walk_tree(
     // Each folder still to list, with how deep it is; and the identity of
     // each folder on the way down to the one being listed.
     let mut todo = vec![(root.to_owned(), String::new(), 0)];
-    let mut way: Vec<Option<FolderId>> = Vec::new();
+    let mut ancestors: Vec<Option<FolderId>> = Vec::new();
     while let Some((dir, rel, depth)) = todo.pop() {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
         // The list is taken deepest first, so the folders on the way to
         // this one are the first `depth` of those last gone down.
-        way.truncate(depth);
+        ancestors.truncate(depth);
         if depth > 0 {
-            // A folder on the work list may have been replaced by a link
-            // since its parent was listed: never follow a link to a folder.
+            // Re-check the folder's own entry before going into it: a folder
+            // that is already a link when the walk reaches it is not
+            // followed.
             match std::fs::symlink_metadata(&dir) {
                 Ok(metadata) if metadata.file_type().is_dir() => {}
                 Ok(_) => continue,
@@ -258,19 +260,23 @@ fn walk_tree(
                 Err(error) => return Err(Error::Io(error)),
             }
         }
+        // A zero file index is what some network or virtual filesystems
+        // return for every folder, so it proves no cycle. Both device and
+        // index must match an ancestor (`FolderId` is `(device, index)`).
         let here = if depth == 0 {
             Some(walked.root_id)
         } else {
             id_of(&dir)
-        };
+        }
+        .filter(|&(_, index)| index != 0);
         // Not gone into, and what was known in it is kept, as in a folder
         // that cannot be read: its files may well still be there.
-        if here.is_some() && way.contains(&here) {
+        if here.is_some() && ancestors.contains(&here) {
             walked.unreadable.push(rel.clone());
             walked.skipped.push((rel, "the folder is inside itself"));
             continue;
         }
-        way.push(here);
+        ancestors.push(here);
         let folders = list(&dir, &rel, walked, stop)?;
         todo.extend(folders.into_iter().map(|(dir, rel)| (dir, rel, depth + 1)));
     }
@@ -279,11 +285,10 @@ fn walk_tree(
 
 /// Walks a root. A root that is missing, is not a folder, has no identity
 /// the system will give, or in which a whole walk finds no audio file at
-/// all is offline, not empty: this is
-/// what a share that failed to mount looks like, often with a `.DS_Store`
-/// at its mount point, and the scan must not mark its files missing.
-/// Emptiness is decided by what the walk counts, never by whether the
-/// folder has entries.
+/// all is offline, not empty: this is what a share that failed to mount
+/// looks like, often with a `.DS_Store` at its mount point, and the scan
+/// must not mark its files missing. Emptiness is decided by what the walk
+/// counts, never by whether the folder has entries.
 pub(crate) fn walk(root: &Path, stop: &AtomicBool) -> Result<Walked, Error> {
     walk_by(root, stop, &folder_id)
 }
@@ -513,6 +518,27 @@ mod tests {
         );
         // What a scan knew in them is not taken for gone.
         assert_eq!(walked.unreadable, ["a/loop", "b/c/up"]);
+    }
+
+    #[test]
+    fn a_zero_file_index_is_not_taken_for_a_cycle() {
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        for path in ["a/01.flac", "a/b/02.flac", "c/03.flac"] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"12345").unwrap();
+        }
+        // As an SMB redirector, FUSE or overlayfs returning a zero file
+        // index for every folder: subfolders must still be walked, and
+        // nothing is skipped as inside itself.
+        for id in [(1, 0), (0, 0)] {
+            let walked = walk_by(root, &AtomicBool::new(false), &|_| Some(id)).unwrap();
+            let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
+            assert_eq!(paths, ["a/01.flac", "a/b/02.flac", "c/03.flac"]);
+            assert!(walked.skipped.is_empty(), "{:?}", walked.skipped);
+            assert!(walked.unreadable.is_empty(), "{:?}", walked.unreadable);
+        }
     }
 
     #[test]

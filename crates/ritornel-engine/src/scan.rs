@@ -371,11 +371,13 @@ impl ScanRun {
             Phase::Sidecars => self.read_sidecars(stop),
             _ => {}
         }
-        // What a batch read, and which files the walk found gone or other
+        // Early exit before taking the library lock or judging replacements:
+        // what a batch read, and which files the walk found gone or other
         // audio at, are of the folder that was walked. A root that is no
         // longer that folder, as when its disk went away or another was
         // mounted at its path, ends the scan: nothing more is recorded, and
-        // nothing is taken for gone or replaced.
+        // nothing is taken for gone or replaced. `commit` verifies again
+        // immediately before every write derived from the root.
         let judged = matches!(
             self.phase,
             Phase::Read | Phase::Moves | Phase::Missing | Phase::Replaced | Phase::Sidecars
