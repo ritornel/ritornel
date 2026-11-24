@@ -31,9 +31,11 @@ pub struct DryRunInput<'a> {
     /// The listener's streams in force now, with their keys, which applying
     /// keeps in force beside the run's.
     pub in_force: &'a [Stream],
-    /// Other listeners' streams in force, which a track's length is taken
-    /// from too, as derivation takes it from every stream in force.
-    pub others: &'a [Stream],
+    /// Every other listener's streams in force and the scrobbles offered
+    /// to them: a track's length is taken from their streams too, as
+    /// derivation takes it from every stream in force, so a run can move
+    /// their plays.
+    pub others: &'a [Listened],
     /// The scrobbles that may be offered to a stream.
     pub scrobbles: &'a [Scrobble],
     /// Scrobbles set aside, which are offered to none.
@@ -60,6 +62,15 @@ pub struct DryRunInput<'a> {
     pub set_aside: &'a HashSet<Vec<u8>>,
     /// When the report is made.
     pub made_at: i64,
+}
+
+/// One listener's streams in force and the scrobbles offered to them.
+#[derive(Debug, Clone, Default)]
+pub struct Listened {
+    /// Their streams, with their keys.
+    pub streams: Vec<Stream>,
+    /// Their scrobbles that may be offered to a stream.
+    pub scrobbles: Vec<Scrobble>,
 }
 
 /// The row of `year`, made when it is the first of it.
@@ -299,7 +310,13 @@ fn added(
 /// run's and those in force now, as applying derives every play from them.
 pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
     let run = input.streams;
-    let held: HashSet<&[u8]> = input.in_force.iter().map(|s| s.key.as_slice()).collect();
+    // A stream in force for any listener stays theirs.
+    let held: HashSet<&[u8]> = input
+        .in_force
+        .iter()
+        .chain(input.others.iter().flat_map(|other| &other.streams))
+        .map(|s| s.key.as_slice())
+        .collect();
     // A stream stored already keeps its record as it was stored.
     let union: Vec<Stream> = input
         .in_force
@@ -344,7 +361,11 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         if input.others.is_empty() {
             return lengths(streams, events);
         }
-        let every: Vec<Stream> = streams.iter().chain(input.others).cloned().collect();
+        let every: Vec<Stream> = streams
+            .iter()
+            .chain(input.others.iter().flat_map(|other| &other.streams))
+            .cloned()
+            .collect();
         lengths(&every, &crate::streams::events(&every))
     };
     let lengths = lengths_of(input.streams, &matched.events);
@@ -425,29 +446,51 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
     }
     // The plays now hold what the streams in force add; once applied they
     // hold what every stream in force adds instead.
-    let after = added(
+    let mut after = added(
         input.streams,
         input.scrobbles,
         &matched,
         &lengths,
         input.set_aside,
     );
-    let now = {
+    let in_force = match_streams(
+        input.in_force,
+        input.scrobbles,
+        Tiers::ALL,
+        &pins(input.in_force),
+    );
+    let lengths_now = lengths_of(input.in_force, &in_force.events);
+    let mut now = added(
+        input.in_force,
+        input.scrobbles,
+        &in_force,
+        &lengths_now,
+        input.set_aside,
+    );
+    // Another listener's plays move only by a track's length, which the
+    // run's streams can change.
+    for other in input.others {
         let matched = match_streams(
-            input.in_force,
-            input.scrobbles,
+            &other.streams,
+            &other.scrobbles,
             Tiers::ALL,
-            &pins(input.in_force),
+            &pins(&other.streams),
         );
-        let lengths_now = lengths_of(input.in_force, &matched.events);
-        added(
-            input.in_force,
-            input.scrobbles,
-            &matched,
-            &lengths_now,
-            input.set_aside,
-        )
-    };
+        for (into, lengths) in [(&mut after, &lengths), (&mut now, &lengths_now)] {
+            let theirs = added(
+                &other.streams,
+                &other.scrobbles,
+                &matched,
+                lengths,
+                input.set_aside,
+            );
+            for (year, (plays, counted)) in theirs {
+                let row = into.entry(year).or_default();
+                row.0 += plays;
+                row.1 += counted;
+            }
+        }
+    }
     for row in years.values_mut() {
         let (after, now) = (
             after.get(&row.year).copied().unwrap_or_default(),
@@ -974,7 +1017,7 @@ mod tests {
         // This run's stream of it played a minute and a half and stopped.
         let streams = fresh(vec![record(221, 90, "Low Tide", "endplay")]);
         let plays = BTreeMap::new();
-        let alone = |others: &[Stream]| {
+        let alone = |others: &[Listened]| {
             let year = dry_run(&DryRunInput {
                 others,
                 ..input(&streams, &[], &plays)
@@ -984,7 +1027,39 @@ mod tests {
         };
         assert_eq!(alone(&[]), (0, 1));
         // Over half its length: it counts, as derivation counts it.
-        assert_eq!(alone(&theirs), (1, 0));
+        let others = [Listened {
+            streams: theirs,
+            scrobbles: Vec::new(),
+        }];
+        assert_eq!(alone(&others), (1, 0));
+    }
+
+    #[test]
+    fn a_run_moves_another_listeners_plays_by_a_tracks_length_and_leaves_theirs_theirs() {
+        // Another listener's stream of Low Tide played a minute and a half
+        // and stopped: with no length for it, it does not count.
+        let theirs = fresh(vec![record(221, 90, "Low Tide", "endplay")]);
+        let others = [Listened {
+            streams: theirs.clone(),
+            scrobbles: Vec::new(),
+        }];
+        let plays = BTreeMap::from([(2019, (1, 0))]);
+        // This run plays it to its end, in 2:40, which gives it a length:
+        // their stream counts too once it is applied.
+        let streams = fresh(vec![record(5000, 160, "Low Tide", "trackdone")]);
+        let year = dry_run(&DryRunInput {
+            others: &others,
+            ..input(&streams, &[], &plays)
+        })
+        .years[0];
+        assert_eq!((year.plays_after, year.counted_after), (2, 2));
+        // A run that holds their stream adds nothing: it stays theirs.
+        let year = dry_run(&DryRunInput {
+            others: &others,
+            ..input(&theirs, &[], &plays)
+        })
+        .years[0];
+        assert_eq!((year.plays_after, year.counted_after), (1, 0));
     }
 
     #[test]

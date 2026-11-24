@@ -6,8 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ritornel_contract::{DeviceKind, ImportReport, Platform, PlayedVia, SpotifyStream};
-use ritornel_domain::history::Correction;
-use ritornel_domain::stream_report::{DryRunInput, dry_run, keyed};
+use ritornel_domain::history::{Correction, StreamImport};
+use ritornel_domain::stream_report::{DryRunInput, Listened, dry_run, keyed};
 use ritornel_domain::streams::{Scrobble, Stream, kept, repeat_order};
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -29,7 +29,7 @@ struct Read {
     observations: HashMap<Vec<u8>, i64>,
     corrections: Vec<Correction>,
     in_force: Vec<Stream>,
-    others: Vec<Stream>,
+    others: Vec<Listened>,
     set_aside: HashSet<Vec<u8>>,
 }
 
@@ -106,7 +106,7 @@ fn in_force(connection: &Connection) -> Result<i64, Error> {
 /// derivation finds it, so that a second copy of an echo, which stands as a
 /// play of its own, is an echo too; and it is set aside when it is one of
 /// `set_aside`, those a correction that stands excludes.
-fn scrobbles(
+fn offered(
     connection: &Connection,
     set_aside: &BTreeSet<i64>,
     listener: i64,
@@ -194,17 +194,21 @@ fn read(connection: &Connection) -> Result<Read, Error> {
     // never by what a play of a record shows, which another record can
     // decide.
     let set_aside_ids = ritornel_domain::history::excluded(&corrections);
-    let (scrobbles, excluded, echoes) = scrobbles(connection, &set_aside_ids, listener)?;
+    let (scrobbles, excluded, echoes) = offered(connection, &set_aside_ids, listener)?;
     let (stored, observations) = stored_streams(connection)?;
     let set_aside = observations
         .iter()
         .filter(|(_, observation)| set_aside_ids.contains(observation))
         .map(|(key, _)| key.clone())
         .collect();
-    let (in_force, others): (Vec<_>, Vec<_>) = crate::history_streams::streams(connection, None)?
+    let (in_force, theirs): (Vec<_>, Vec<_>) = crate::history_streams::streams(connection, None)?
         .into_iter()
         .partition(|stream| stream.listener == listener);
-    let keyed = |streams: Vec<ritornel_domain::history::StreamImport>| -> Vec<Stream> {
+    let mut by_listener: BTreeMap<i64, Vec<StreamImport>> = BTreeMap::new();
+    for stream in theirs {
+        by_listener.entry(stream.listener).or_default().push(stream);
+    }
+    let as_streams = |streams: Vec<StreamImport>| -> Vec<Stream> {
         streams
             .into_iter()
             .map(|stream| Stream {
@@ -213,6 +217,16 @@ fn read(connection: &Connection) -> Result<Read, Error> {
             })
             .collect()
     };
+    // Every other listener's, matched with their own scrobbles.
+    let others = by_listener
+        .into_iter()
+        .map(|(other, streams)| {
+            Ok(Listened {
+                streams: as_streams(streams),
+                scrobbles: offered(connection, &set_aside_ids, other)?.0,
+            })
+        })
+        .collect::<Result<_, Error>>()?;
     Ok(Read {
         scrobbles,
         excluded,
@@ -223,8 +237,8 @@ fn read(connection: &Connection) -> Result<Read, Error> {
         stored,
         observations,
         corrections,
-        in_force: keyed(in_force),
-        others: keyed(others),
+        in_force: as_streams(in_force),
+        others,
         set_aside,
     })
 }
