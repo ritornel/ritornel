@@ -489,6 +489,12 @@ pub(crate) fn drop_unshared(
     }
 }
 
+/// How many pictures wait for their last borrower to let go before they
+/// leave the sprite atlas, for the script's `held` step.
+pub(crate) fn waiting_drops() -> usize {
+    PENDING_DROPS.with(|pending| pending.borrow().images.len())
+}
+
 /// Drops any queued view images whose external borrowers have released them.
 pub(crate) fn flush_dropped(window: &mut gpui::Window, cx: &mut App) {
     let ready = PENDING_DROPS.with(|pending| {

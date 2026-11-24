@@ -69,6 +69,16 @@ pub(crate) fn carried(cx: &App) -> Option<&Carried> {
     cx.try_global::<Carrying>().map(|carrying| &carrying.0)
 }
 
+/// Whether what was carried last still holds a picture, for the script's
+/// `held` step.
+pub(crate) fn holds_picture(cx: &App) -> bool {
+    cx.try_global::<Carrying>()
+        .is_some_and(|carrying| match &carrying.0 {
+            Carried::Songs { art, .. } | Carried::Record { art, .. } => art.is_some(),
+            Carried::Entries { .. } => false,
+        })
+}
+
 /// A record on a page, carried to Up next: its songs are read when it lands.
 pub(crate) fn record<E: gpui::StatefulInteractiveElement>(
     element: E,

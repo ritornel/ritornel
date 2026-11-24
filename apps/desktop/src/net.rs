@@ -26,6 +26,14 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+/// Covers asked of the server, for the script's `count` step.
+static ART_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many covers have been asked of the server so far.
+pub(crate) fn art_reads() -> u64 {
+    ART_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The runtime calls, events and covers run on, for as long as the app does.
 pub(crate) fn rt() -> &'static Handle {
     static RUNTIME: OnceLock<Option<Runtime>> = OnceLock::new();
@@ -241,6 +249,7 @@ impl ArtHttp {
             NoArt::Failed
         }
         let _permit = self.in_flight.acquire().await.map_err(failed)?;
+        ART_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let idle = self.idle.lock().ok().and_then(|mut idle| idle.pop());
         let mut sender = match idle {
             Some(sender) if !sender.is_closed() => sender,

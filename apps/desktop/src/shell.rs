@@ -1470,6 +1470,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::script::frame();
         let now = Instant::now();
         let size_now = window.viewport_size();
         let (width, height) = (f32::from(size_now.width), f32::from(size_now.height));
