@@ -42,9 +42,10 @@ use fallback as system;
 
 pub(crate) use system::{
     CHROME, FEEL, FITTING_SHOWS, KEYS, SERVER_APART, SHOW_FOLDER, bring_forward_quietly,
-    choose_folder, dismiss_menu, fit_window, footprint, give_back, hold_appearance,
-    keep_out_of_the_dock, key_text, locale, memory_line, pop_up_menu, screenshot, scroll_details,
-    settings_dir, start, start_server, started_here, stop_server, swiped_back,
+    choose_folder, dismiss_menu, fit_window, footprint, forget_main_window, give_back,
+    hold_appearance, keep_out_of_the_dock, key_text, locale, main_window, memory_line, pop_up_menu,
+    screenshot, scroll_details, settings_dir, start, start_server, started_here, stop_server,
+    swiped_back,
 };
 
 /// One line of the system's context menu. Its actions are numbered in
@@ -231,6 +232,12 @@ mod fallback {
     pub(crate) fn swiped_back() -> bool {
         false
     }
+
+    /// Registers the main window for platform scroll/swipe tracking.
+    pub(crate) fn main_window(_window: &gpui::Window) {}
+
+    /// Clears main-window scroll/swipe state when the window closes.
+    pub(crate) fn forget_main_window() {}
 
     /// Whether the system asks for motion to be reduced.
     pub(crate) fn reduce_motion() -> bool {

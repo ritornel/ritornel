@@ -242,8 +242,18 @@ pub(crate) fn card(id: impl Into<ElementId>, card: Card, window: &Window) -> Sta
 /// A title broken already, by its text, and the bits of its width, size and weight.
 type Broken = HashMap<(String, u32, u32, u32), Option<String>>;
 
+/// Cap on cached wrapped titles so long browsing sessions stay bounded.
+const MAX_BROKEN: usize = 2048;
+
 thread_local! {
     static BROKEN: RefCell<Broken> = RefCell::new(HashMap::new());
+}
+
+fn cache_broken(cache: &mut Broken, key: (String, u32, u32, u32), value: Option<String>) {
+    if cache.len() >= MAX_BROKEN && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, value);
 }
 
 /// Where a title of two lines breaks, as WebKit's `text-wrap: pretty`
@@ -291,7 +301,7 @@ fn balanced(title: &str, width: f32, size: f32, weight: f32, window: &Window) ->
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, broken)| broken)
     };
-    BROKEN.with(|cache| cache.borrow_mut().insert(key, broken.clone()));
+    BROKEN.with(|cache| cache_broken(&mut cache.borrow_mut(), key, broken.clone()));
     broken
 }
 
@@ -363,4 +373,18 @@ pub(crate) fn years(
                     .child(last),
             ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_title_cache_stays_bounded() {
+        let mut cache = Broken::new();
+        for i in 0..(MAX_BROKEN + 25) {
+            cache_broken(&mut cache, (format!("title-{i}"), 0, 0, 0), None);
+        }
+        assert!(cache.len() <= MAX_BROKEN);
+    }
 }

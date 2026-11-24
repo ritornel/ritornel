@@ -124,13 +124,45 @@ impl FetchBag {
         self.0.retain(|existing| !existing.is_finished());
         self.0.push(handle);
     }
+
+    pub(crate) fn clear(&mut self) {
+        for handle in self.0.drain(..) {
+            handle.abort();
+        }
+    }
 }
 
 impl Drop for FetchBag {
     fn drop(&mut self) {
-        for handle in self.0.drain(..) {
-            handle.abort();
-        }
+        self.clear();
+    }
+}
+
+/// A Tokio task handle that aborts its task when dropped, so replacing or
+/// cancelling a GPUI future does not leave background HTTP or decode work
+/// running detached.
+pub(crate) struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> AbortOnDrop<T> {
+    pub(crate) fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(handle)
+    }
+}
+
+impl<T> Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -770,12 +802,12 @@ impl Cache {
             } => {
                 self.colors.insert(art, color);
                 if expected_px > 0 && px != expected_px {
-                    cx.drop_image(image, None);
+                    drop_unshared(image, None, cx);
                     return;
                 }
                 if let Some(old) = self.ready.remove(&art) {
                     self.bytes -= old.bytes;
-                    cx.drop_image(old.image, None);
+                    drop_unshared(old.image, None, cx);
                 }
                 self.bytes += bytes;
                 self.ready.insert(
@@ -844,9 +876,22 @@ impl Cache {
             if let Some(gone) = self.ready.remove(&art) {
                 self.bytes -= gone.bytes;
                 self.evicted += 1;
-                cx.drop_image(gone.image, window.as_deref_mut());
+                drop_unshared(gone.image, window.as_deref_mut(), cx);
             }
         }
+    }
+
+    /// Drops every decoded cover held by the wall, deferring any still
+    /// borrowed by a transition, drag chip, or page until its borrower drops it.
+    pub(crate) fn drain(&mut self, mut window: Option<&mut gpui::Window>, cx: &mut App) {
+        if self.ready.is_empty() {
+            return;
+        }
+        self.bytes = 0;
+        for (_, gone) in self.ready.drain() {
+            drop_unshared(gone.image, window.as_deref_mut(), cx);
+        }
+        crate::platform::give_back();
     }
 }
 
@@ -1312,6 +1357,98 @@ mod tests {
             assert!(joined.is_err());
             Ok(())
         })
+    }
+
+    #[test]
+    fn abort_on_drop_cancels_underlying_task() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let (done, mut rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                let _guard = done;
+                // sleep: held open until AbortOnDrop cancels it.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+            let guard = AbortOnDrop::new(handle);
+            drop(guard);
+            // Dropping the cancelled task drops `done`, closing `rx`.
+            let res = tokio::time::timeout(Duration::from_secs(60), &mut rx).await?;
+            assert!(res.is_err());
+            Ok(())
+        })
+    }
+
+    #[gpui::test]
+    fn cache_eviction_and_drain_defer_shared_images(cx: &mut gpui::TestAppContext) {
+        let img1 = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]));
+        let img2 = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]));
+        let borrower = Arc::clone(&img1);
+        let art1 = Id::from_bytes([11; 16]);
+        let art2 = Id::from_bytes([12; 16]);
+        let mut cache = Cache::new(100);
+        cx.update(|cx| {
+            cache.land(
+                Arrived::Ready {
+                    art: art1,
+                    px: 64,
+                    image: Arc::clone(&img1),
+                    color: gpui::rgba(0x112233ff),
+                    bytes: 80,
+                },
+                64,
+                |_| false,
+                1,
+                cx,
+            );
+            // Replace art1 while `borrower` still holds `img1`: it must wait in
+            // PENDING_DROPS rather than dropping from the atlas while borrowed.
+            cache.land(
+                Arrived::Ready {
+                    art: art1,
+                    px: 128,
+                    image: Arc::clone(&img2),
+                    color: gpui::rgba(0x112233ff),
+                    bytes: 80,
+                },
+                128,
+                |_| false,
+                5,
+                cx,
+            );
+            assert!(waiting_drops() >= 1);
+            // Evict via drain while `img2` is still held by `img2` local var.
+            cache.land(
+                Arrived::Ready {
+                    art: art2,
+                    px: 64,
+                    image: Arc::new(RenderImage::new(vec![image::Frame::new(
+                        image::RgbaImage::new(1, 1),
+                    )])),
+                    color: gpui::rgba(0x112233ff),
+                    bytes: 10,
+                },
+                64,
+                |_| false,
+                10,
+                cx,
+            );
+            cache.drain(None, cx);
+            assert_eq!(cache.len(), 0);
+            assert_eq!(cache.bytes(), 0);
+        });
+        drop(borrower);
+        drop(img1);
+        drop(img2);
+        // Drain pending drops from our test thread-local so other tests start clean.
+        PENDING_DROPS.with(|p| {
+            let _ = p.borrow_mut().take_unshared();
+        });
     }
 }
 

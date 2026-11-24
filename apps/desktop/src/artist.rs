@@ -60,6 +60,8 @@ const WINDOW: u64 = 500;
 const STAYS_AT: f32 = 76.;
 /// Between the parts of the page.
 const PART_GAP: f32 = 44.;
+/// Byte budget for shelf covers kept on one artist page.
+const MAX_COVER_BYTES: usize = 16 * 1024 * 1024;
 
 /// What the page asks of the window.
 pub(crate) enum ArtistEvent {
@@ -212,10 +214,18 @@ pub(crate) struct Artist {
     shelves: Vec<(Shelf, Vec<AlbumTile>)>,
     tracks: Entity<Tracks>,
     history: Option<HistoryOf>,
-    covers: HashMap<(Id, u32), Arc<RenderImage>>,
+    covers: HashMap<(Id, u32), (Arc<RenderImage>, usize, u64)>,
+    cover_bytes: usize,
+    covers_scale: f32,
+    frame: u64,
     asked: HashSet<(Id, u32)>,
     retries: crate::covers::Retries,
     fetches: crate::covers::FetchBag,
+    /// Generation bumped whenever in-flight fetches are aborted so late
+    /// cancellation callbacks cannot mark cancelled work as failed.
+    fetch_gen: u64,
+    /// Which of the artist's header pictures have an active read in flight.
+    in_flight_pictures: Unread,
     revision: u64,
     /// Whether it is behind another page, kept for Back, and what changed
     /// meanwhile.
@@ -272,8 +282,11 @@ pub(crate) struct Artist {
     pictures_in_flight: usize,
     pub top: f32,
     elastic: crate::elastic::Elastic,
-    /// How tall the page was when last drawn, and the column of history
-    /// and what it stands beside.
+    /// How tall the page was when last drawn, its top marker in window
+    /// coordinates (for scroll-invariant card bounds), the width those bounds
+    /// were measured at, and the column of history and what it stands beside.
+    head: Rc<Cell<f32>>,
+    measured_area: f32,
     height: Rc<Cell<f32>>,
     column: Rc<Cell<f32>>,
     beside_height: Rc<Cell<f32>>,
@@ -358,9 +371,14 @@ impl Artist {
             tracks: cx.new(|cx| Tracks::new(player, false, cx)),
             history: None,
             covers: HashMap::new(),
+            cover_bytes: 0,
+            covers_scale: 0.,
+            frame: 0,
             asked: HashSet::new(),
             retries: crate::covers::Retries::default(),
             fetches: crate::covers::FetchBag::default(),
+            fetch_gen: 0,
+            in_flight_pictures: Unread::default(),
             revision: 0,
             freshness: crate::stage::Freshness::default(),
             whole_wanted: false,
@@ -389,6 +407,8 @@ impl Artist {
             pictures_in_flight: 0,
             top: 0.,
             elastic: crate::elastic::Elastic::default(),
+            head: Rc::new(Cell::new(f32::NAN)),
+            measured_area: 0.,
             height: Rc::new(Cell::new(0.)),
             column: Rc::new(Cell::new(0.)),
             beside_height: Rc::new(Cell::new(0.)),
@@ -411,7 +431,8 @@ impl Artist {
             released = true;
             crate::covers::drop_unshared(image, None, cx);
         };
-        for (_, image) in self.covers.drain() {
+        self.cover_bytes = 0;
+        for (_, (image, _, _)) in self.covers.drain() {
             drop_one(image);
         }
         if let Some(image) = self.face.take() {
@@ -431,9 +452,36 @@ impl Artist {
         }
     }
 
+    /// Releases cached pictures when this page sits deep in back history,
+    /// resetting picture state so they reload if the user navigates back.
+    pub(crate) fn trim_behind(&mut self, cx: &mut Context<Self>) {
+        self.fetch_gen = self.fetch_gen.wrapping_add(1);
+        self.fetches.clear();
+        self.in_flight_pictures = Unread::default();
+        self.release_images(cx);
+        self.asked.clear();
+        self.portrait = None;
+        self.melting = false;
+        self.pictured_for = None;
+        self.pictured_scale = 0.;
+        self.stale_face = true;
+        self.stale_blurs = true;
+        self.picture_failed = false;
+    }
+
     /// The page shown again, or put behind another: what changed while it
     /// was behind is read.
     pub(crate) fn seen(&mut self, seen: bool, cx: &mut Context<Self>) {
+        if !seen {
+            self.fetch_gen = self.fetch_gen.wrapping_add(1);
+            self.fetches.clear();
+            self.asked.retain(|key| self.covers.contains_key(key));
+            self.melting = false;
+            let cancelled = std::mem::take(&mut self.in_flight_pictures);
+            self.read_unread.face |= cancelled.face;
+            self.read_unread.portrait |= cancelled.portrait;
+            self.read_unread.blurs |= cancelled.blurs;
+        }
         if let Some(plays_only) = self.freshness.shown(seen) {
             self.read(plays_only, cx);
         }
@@ -538,6 +586,7 @@ impl Artist {
         }
         if let Some(shelves) = read.shelves {
             self.shelves = shelves;
+            self.measured_area = 0.;
         }
         let context = PlayContext {
             kind: ContextKind::Artist,
@@ -558,25 +607,89 @@ impl Artist {
         image
     }
 
+    fn store_cover(
+        &mut self,
+        art: Id,
+        px: u32,
+        image: Arc<RenderImage>,
+        bytes: usize,
+        cx: &mut gpui::App,
+    ) {
+        // Evict any stale-DPI variant of the same cover once a new-scale size lands,
+        // keeping valid sibling slot sizes (30/140/220 pt) at the current display scale.
+        let scale = self.covers_scale;
+        let current_slot = |size: u32| {
+            scale > 0.
+                && [30., 140., 220.]
+                    .into_iter()
+                    .any(|pt| (pt * scale).ceil() as u32 == size)
+        };
+        let stale: Vec<(Id, u32)> = self
+            .covers
+            .keys()
+            .copied()
+            .filter(|&(id, size)| id == art && size != px && !current_slot(size))
+            .collect();
+        for key in stale {
+            if let Some((old, old_bytes, _)) = self.covers.remove(&key) {
+                self.cover_bytes = self.cover_bytes.saturating_sub(old_bytes);
+                self.asked.remove(&key);
+                crate::covers::drop_unshared(old, None, cx);
+            }
+        }
+        if let Some((old, old_bytes, _)) = self.covers.insert((art, px), (image, bytes, self.frame))
+        {
+            self.cover_bytes = self.cover_bytes.saturating_sub(old_bytes);
+            crate::covers::drop_unshared(old, None, cx);
+        }
+        self.cover_bytes += bytes;
+        if self.cover_bytes <= MAX_COVER_BYTES {
+            return;
+        }
+        let mut old: Vec<(u64, (Id, u32))> = self
+            .covers
+            .iter()
+            .filter(|(_, (_, _, used))| used.saturating_add(1) < self.frame)
+            .map(|(key, (_, _, used))| (*used, *key))
+            .collect();
+        old.sort_unstable_by_key(|(used, _)| *used);
+        for (_, key) in old {
+            if self.cover_bytes <= MAX_COVER_BYTES {
+                break;
+            }
+            if let Some((gone, gone_bytes, _)) = self.covers.remove(&key) {
+                self.cover_bytes = self.cover_bytes.saturating_sub(gone_bytes);
+                self.asked.remove(&key);
+                crate::covers::drop_unshared(gone, None, cx);
+            }
+        }
+    }
+
     fn cover_at(&mut self, art: Id, px: u32, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
-        if let Some(image) = self.covers.get(&(art, px)) {
+        if let Some((image, _, used)) = self.covers.get_mut(&(art, px)) {
+            *used = self.frame;
             return Some(Arc::clone(image));
         }
         if !self.retries.waits(art, Instant::now()) && self.asked.insert((art, px)) {
-            self.fetch(art, px, cx, move |page, image, cx| match image {
-                Ok(image) => {
-                    page.retries.read(art);
-                    page.covers.insert((art, px), image);
-                }
-                // Not there: it is not asked for again.
-                Err(NoArt::Missing) => {}
-                Err(NoArt::Failed) => {
-                    page.asked.remove(&(art, px));
-                    // Shown at two sizes, it fails twice: the wait grows once.
-                    let now = Instant::now();
-                    if !page.retries.waits(art, now) {
-                        let wait = page.retries.failed(art, now);
-                        crate::covers::notify_after(wait, cx);
+            self.fetch_sized(art, px, cx, move |page, image, cx| {
+                let Some(image) = image else {
+                    return;
+                };
+                match image {
+                    Ok((image, bytes)) => {
+                        page.retries.read(art);
+                        page.store_cover(art, px, image, bytes, cx);
+                    }
+                    // Not there: it is not asked for again.
+                    Err(NoArt::Missing) => {}
+                    Err(NoArt::Failed) => {
+                        page.asked.remove(&(art, px));
+                        // Shown at two sizes, it fails twice: the wait grows once.
+                        let now = Instant::now();
+                        if !page.retries.waits(art, now) {
+                            let wait = page.retries.failed(art, now);
+                            crate::covers::notify_after(wait, cx);
+                        }
                     }
                 }
             });
@@ -586,16 +699,21 @@ impl Artist {
             .iter()
             .filter(|((at, _), _)| *at == art)
             .max_by_key(|((_, size), _)| *size)
-            .map(|(_, image)| Arc::clone(image))
+            .map(|(_, (image, _, _))| Arc::clone(image))
     }
 
-    fn fetch(
+    fn fetch_sized(
         &mut self,
         art: Id,
         px: u32,
         cx: &mut Context<Self>,
-        took: impl FnOnce(&mut Self, Result<Arc<RenderImage>, NoArt>, &mut Context<Self>) + 'static,
+        took: impl FnOnce(
+            &mut Self,
+            Option<Result<(Arc<RenderImage>, usize), NoArt>>,
+            &mut Context<Self>,
+        ) + 'static,
     ) {
+        let generation = self.fetch_gen;
         let http = Arc::clone(&self.net.art);
         let sizes = self.net.art_sizes.clone();
         let read = self
@@ -604,14 +722,34 @@ impl Artist {
             .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
         self.fetches.push(read.abort_handle());
         cx.spawn(async move |this, cx| {
-            let image = read.await.unwrap_or(Err(NoArt::Failed));
+            let image = read.await.ok();
             this.update(cx, |page, cx| {
-                took(page, image.map(|(image, _, _)| Arc::new(image)), cx);
-                cx.notify();
+                let result = if page.fetch_gen == generation {
+                    image.map(|res| res.map(|(image, _, bytes)| (Arc::new(image), bytes)))
+                } else {
+                    None
+                };
+                took(page, result, cx);
+                if page.fetch_gen == generation {
+                    cx.notify();
+                }
             })
             .ok();
         })
         .detach();
+    }
+
+    fn fetch(
+        &mut self,
+        art: Id,
+        px: u32,
+        cx: &mut Context<Self>,
+        took: impl FnOnce(&mut Self, Option<Result<Arc<RenderImage>, NoArt>>, &mut Context<Self>)
+        + 'static,
+    ) {
+        self.fetch_sized(art, px, cx, move |page, result, cx| {
+            took(page, result.map(|res| res.map(|(image, _)| image)), cx);
+        });
     }
 
     /// Makes the portrait for its box, `size` device pixels, off the UI
@@ -626,6 +764,7 @@ impl Artist {
             return;
         }
         self.melting = true;
+        let generation = self.fetch_gen;
         let source = Arc::clone(source);
         let from = Arc::clone(&source);
         let made = self.net.rt().spawn(crate::covers::decode(move || {
@@ -635,6 +774,9 @@ impl Artist {
         cx.spawn(async move |this, cx| {
             let made = made.await.ok().flatten();
             this.update(cx, |page, cx| {
+                if page.fetch_gen != generation {
+                    return;
+                }
                 page.melting = false;
                 let current = page
                     .portrait
@@ -711,6 +853,7 @@ impl Artist {
         self.pictured_scale = scale;
         self.unread = Unread::default();
         self.read_unread = Unread::default();
+        self.in_flight_pictures = Unread::default();
         self.stale_face = true;
         self.stale_blurs = true;
         // A portrait of another picture, or of none, is not kept meanwhile.
@@ -745,7 +888,9 @@ impl Artist {
     fn read_blurs(&mut self, art: Id, window: &Window, cx: &mut Context<Self>) {
         self.blur_read += 1;
         let blur_read = self.blur_read;
+        let generation = self.fetch_gen;
         let since = self.returns;
+        self.in_flight_pictures.blurs = true;
         #[cfg(test)]
         {
             self.pictures_in_flight += 1;
@@ -766,16 +911,20 @@ impl Artist {
         });
         self.fetches.push(blurs.abort_handle());
         cx.spawn(async move |this, cx| {
-            let blurs = blurs.await.unwrap_or(Err(NoArt::Failed));
+            let blurs = blurs.await.ok();
             this.update(cx, |page, cx| {
                 #[cfg(test)]
                 {
                     page.pictures_in_flight -= 1;
                 }
-                // Too late: the page has asked for its pictures again since.
-                if page.blur_read != blur_read {
+                let Some(blurs) = blurs else {
+                    return;
+                };
+                // Too late: the page left or asked for its pictures again since.
+                if page.fetch_gen != generation || page.blur_read != blur_read {
                     return;
                 }
+                page.in_flight_pictures.blurs = false;
                 page.came_back(Picture::Blurs, blurs == Err(NoArt::Failed), since);
                 match blurs {
                     Ok((banner, wash)) => {
@@ -850,6 +999,7 @@ impl Artist {
         self.face_read += 1;
         let read = self.face_read;
         let since = self.returns;
+        self.in_flight_pictures.face = true;
         #[cfg(test)]
         {
             self.pictures_in_flight += 1;
@@ -863,11 +1013,15 @@ impl Artist {
                 {
                     page.pictures_in_flight -= 1;
                 }
+                let Some(image) = image else {
+                    return;
+                };
                 // Asked for before the last: for a display the window has
                 // left since, or another picture.
                 if page.face_read != read {
                     return;
                 }
+                page.in_flight_pictures.face = false;
                 page.came_back(Picture::Face, matches!(image, Err(NoArt::Failed)), since);
                 let Ok(image) = image else {
                     if page.stale_face {
@@ -889,7 +1043,9 @@ impl Artist {
     fn read_portrait(&mut self, art: Id, scale: f32, cx: &mut Context<Self>) {
         self.portrait_read += 1;
         let asked = self.portrait_read;
+        let generation = self.fetch_gen;
         let since = self.returns;
+        self.in_flight_pictures.portrait = true;
         #[cfg(test)]
         {
             self.pictures_in_flight += 1;
@@ -911,19 +1067,24 @@ impl Artist {
         });
         self.fetches.push(read.abort_handle());
         cx.spawn(async move |this, cx| {
-            let source = read.await.unwrap_or(Err(NoArt::Failed));
+            let source = read.await.ok();
             this.update(cx, |page, cx| {
                 #[cfg(test)]
                 {
                     page.pictures_in_flight -= 1;
                 }
-                // Too late: the page shows another picture now, or a later
+                let Some(source) = source else {
+                    return;
+                };
+                // Too late: the page left, shows another picture now, or a later
                 // read was asked for, for another display.
-                if page.pictured_for.map(|(at, _)| at) != Some(Some(art))
+                if page.fetch_gen != generation
+                    || page.pictured_for.map(|(at, _)| at) != Some(Some(art))
                     || page.portrait_read != asked
                 {
                     return;
                 }
+                page.in_flight_pictures.portrait = false;
                 let again = page.portrait.is_some();
                 match source {
                     Ok(source) => {
@@ -1045,7 +1206,7 @@ impl Artist {
         let image = tile
             .art_id
             .and_then(|art| self.covers.iter().find(|((id, _), _)| *id == art))
-            .map(|(_, image)| Arc::clone(image));
+            .map(|(_, (image, _, _))| Arc::clone(image));
         let lift = record::Lift::of(&self.landings, row.id, image);
         cx.emit(ArtistEvent::Open(row, lift));
     }
@@ -1075,6 +1236,7 @@ impl Artist {
         side: f32,
         words: Words,
         appears: bool,
+        fetch: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1104,14 +1266,20 @@ impl Artist {
         };
         let picture = match tile.art_id {
             // The first shelf's covers are read at 220 points, the rest at 140.
-            Some(art) => {
+            // Cards far outside the viewport keep no image reference so their
+            // covers age out and stay inside the page's cover byte budget.
+            Some(art) if fetch => {
                 let read_at = if side > CARD { 220. } else { 140. };
-                self.want(art, (read_at * scale).ceil() as u32, cx)
+                let px = (read_at * scale).ceil() as u32;
+                self.want(art, px, cx)
             }
-            None => Some(theme::soft_cached(
-                &format!("{title}{}", credit.unwrap_or_default()),
-                (side * scale).ceil() as u32,
-            )),
+            Some(_) => None,
+            None => fetch.then(|| {
+                theme::soft_cached(
+                    &format!("{title}{}", credit.unwrap_or_default()),
+                    (side * scale).ceil() as u32,
+                )
+            }),
         };
         let row = Arc::new(TileRow::of_album(tile.clone()));
         let landings = Rc::clone(&self.landings);
@@ -1142,7 +1310,13 @@ impl Artist {
 
     /// Their records, each kind taking only the room it needs, as many
     /// side by side as fit across `area` points.
-    fn records(&mut self, area: f32, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+    fn records(
+        &mut self,
+        area: f32,
+        viewport: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let shelves = self.shelves.clone();
         let mut lines: Vec<Vec<(usize, f32)>> = Vec::new();
         let mut used = 0f32;
@@ -1165,9 +1339,17 @@ impl Artist {
                 }
             }
         }
+        let view_min = self.top - viewport;
+        let view_max = self.top + 2. * viewport;
+        let head = self.head.get();
+        let use_measured = head.is_finite() && (self.measured_area - area).abs() <= 1.;
+        let mut y_min = banner::HEIGHT + banner::BELOW;
+        let mut y_max = banner::HEIGHT + banner::BELOW;
         let mut out = div().flex().flex_col().gap(px(PART_GAP));
         for line in lines {
             let mut row = div().flex().items_start().gap(px(SHELF_GAP));
+            let mut line_min = 0f32;
+            let mut line_max = 0f32;
             for (at, wide) in line {
                 let Some((shelf, records)) = shelves.get(at) else {
                     continue;
@@ -1194,20 +1376,40 @@ impl Artist {
                         weight: 600.,
                     }
                 };
+                let row_gap = if first { 26. } else { 22. };
+                let min_step = track + 26. + row_gap;
+                let max_step = track + 76. + row_gap;
+                let heading_h = 40.;
+                let shelf_rows = records.len().div_ceil(columns);
+                line_min = line_min.max(heading_h + shelf_rows as f32 * min_step);
+                line_max = line_max.max(heading_h + shelf_rows as f32 * max_step);
                 let mut cards = div()
                     .w(px(wide))
                     .flex()
                     .flex_wrap()
                     .gap_x(px(gap))
-                    .gap_y(px(if first { 26. } else { 22. }));
+                    .gap_y(px(row_gap));
                 let appears = *shelf == Shelf::AppearsOn;
                 for (index, tile) in records.iter().enumerate() {
+                    let near = if use_measured
+                        && let Some(bounds) = self.landings.bounds(tile.album.id())
+                    {
+                        let card_top = f32::from(bounds.origin.y) - head;
+                        let card_bottom = card_top + f32::from(bounds.size.height);
+                        card_bottom >= view_min && card_top <= view_max
+                    } else {
+                        let row_index = (index / columns) as f32;
+                        let row_top_min = y_min + heading_h + row_index * min_step;
+                        let row_bottom_max = y_max + heading_h + (row_index + 1.) * max_step;
+                        row_bottom_max >= view_min && row_top_min <= view_max
+                    };
                     cards = cards.child(self.card(
                         (shelf_id(*shelf), index),
                         tile,
                         track,
                         words,
                         appears,
+                        near,
                         window,
                         cx,
                     ));
@@ -1225,8 +1427,11 @@ impl Artist {
                         .child(cards),
                 );
             }
+            y_min += line_min + PART_GAP;
+            y_max += line_max + PART_GAP;
             out = out.child(row);
         }
+        self.measured_area = area;
         out
     }
 
@@ -1387,6 +1592,8 @@ fn gutter(width: f32) -> f32 {
 
 impl Render for Artist {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.frame += 1;
+        self.covers_scale = window.scale_factor();
         crate::waits::frame("artist");
         self.pictures(window, cx);
         self.menued = crate::menu::marked(window, cx);
@@ -1439,7 +1646,7 @@ impl Render for Artist {
             } else {
                 content
             };
-            let records = self.records(area, window, cx);
+            let records = self.records(area, viewport, window, cx);
             let songs = if self.tracks.read(cx).is_empty() {
                 None
             } else {
@@ -1526,8 +1733,8 @@ impl Render for Artist {
 
         // The page measures itself: from a mark at its head to one at its foot.
         let height = Rc::clone(&self.height);
-        let head = Rc::new(Cell::new(0f32));
-        let start = Rc::clone(&head);
+        let head = Rc::clone(&self.head);
+        let start = Rc::clone(&self.head);
         let page_area = div()
             .absolute()
             .left_0()
@@ -2006,5 +2213,65 @@ mod tests {
             wait_a_minute(&page, &pictures, cx);
         }
         assert_eq!(pictures.all(), 3);
+    }
+
+    #[gpui::test]
+    fn leaving_during_initial_read_resumes_pictures_on_return(cx: &mut gpui::TestAppContext) {
+        let (pictures, address) = Pictures::start();
+        pictures.hold(&[FACE, PORTRAIT, BLURS]);
+        let (page, _link, cx) = open(session(PICTURE, true, address), cx);
+        until(&page, cx, "asked for its pictures", |page| {
+            pictures.all() == 3 && page.pictures_in_flight == 3
+        });
+
+        // Navigate away while all three header picture reads are still in flight.
+        page.update(cx, |page, cx| page.seen(false, cx));
+        until(&page, cx, "cancelled reads settled", |page| {
+            page.pictures_in_flight == 0
+        });
+        assert_eq!(page.read_with(cx, |page, _| page.unread), Unread::default());
+        assert!(!page.read_with(cx, |page, _| page.picture_failed));
+
+        // Return to the same artist at the same scale: all three reads resume.
+        pictures.hold(&[]);
+        page.update(cx, |page, cx| {
+            page.seen(true, cx);
+            cx.notify();
+        });
+        until(&page, cx, "pictures loaded after returning", |page| {
+            face_read(page) && page.portrait.is_some() && !page.stale_blurs
+        });
+        settle(&page, &pictures, cx);
+        assert_eq!(pictures.asked(PICTURE, FACE), 2);
+        assert_eq!(pictures.asked(PICTURE, PORTRAIT), 2);
+        assert_eq!(pictures.asked(PICTURE, BLURS), 2);
+    }
+
+    #[gpui::test]
+    fn shelf_cover_cache_evicts_scrolled_past_covers_to_stay_within_budget(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_pictures, address) = Pictures::start();
+        let (page, _link, cx) = open(session(NONE, true, address), cx);
+        let chunk = MAX_COVER_BYTES / 3;
+        let make = || {
+            Arc::new(RenderImage::new(vec![image::Frame::new(
+                image::RgbaImage::new(1, 1),
+            )]))
+        };
+        page.update(cx, |page, cx| {
+            page.covers_scale = 2.;
+            for i in 1u8..=6 {
+                page.frame += 2;
+                page.store_cover(Id::from_bytes([i; 16]), 280, make(), chunk, cx);
+            }
+            assert!(
+                page.cover_bytes <= MAX_COVER_BYTES,
+                "expected cover_bytes ({}) <= MAX_COVER_BYTES ({})",
+                page.cover_bytes,
+                MAX_COVER_BYTES
+            );
+            assert!(page.covers.len() <= 3);
+        });
     }
 }

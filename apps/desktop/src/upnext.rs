@@ -113,6 +113,8 @@ pub(crate) struct UpNextCard {
     pictures: HashMap<Id, Arc<RenderImage>>,
     /// Covers currently being fetched.
     in_flight: HashSet<Id>,
+    /// In-flight cover fetch tasks, aborted when the card is dropped.
+    fetches: crate::covers::FetchBag,
     /// Art IDs currently displayed (now playing + queue entries).
     current_arts: HashSet<Id>,
     /// The entries of the last read, and its revision: entries that arrive
@@ -150,6 +152,7 @@ impl UpNextCard {
             player,
             pictures: HashMap::new(),
             in_flight: HashSet::new(),
+            fetches: crate::covers::FetchBag::default(),
             current_arts: HashSet::new(),
             seen: HashSet::new(),
             last_revision: None,
@@ -245,6 +248,7 @@ impl UpNextCard {
             let read = net
                 .rt()
                 .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
+            self.fetches.push(read.abort_handle());
             cx.spawn(async move |this, cx| {
                 let result = read.await.ok().and_then(Result::ok);
                 this.update(cx, |card, cx| {

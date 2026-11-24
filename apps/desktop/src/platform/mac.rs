@@ -203,6 +203,9 @@ pub(crate) fn give_back() {
 }
 
 thread_local! {
+    /// Window number of the main window, so scroll/swipe events on Settings
+    /// or modal sheets do not bleed into the main window's gesture state.
+    static MAIN_WINDOW: std::cell::Cell<Option<isize>> = const { std::cell::Cell::new(None) };
     /// What AppKit said of the scroll it last delivered. GPUI's event
     /// leaves out its gesture and momentum phases as they are (GPUI folds a
     /// touch that lifts without scrolling into a move, and momentum into
@@ -215,6 +218,26 @@ thread_local! {
     /// asks to go back.
     static SWIPE: std::cell::RefCell<crate::swipe::Gesture> = std::cell::RefCell::default();
     static SWIPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn reset_scroll_state() {
+    LAST_SCROLL.with(|last| last.set(None));
+    SWIPE.with(|swipe| *swipe.borrow_mut() = crate::swipe::Gesture::default());
+    SWIPED.with(|swiped| swiped.set(false));
+}
+
+/// Registers the main window's AppKit window number and clears any prior
+/// window's scroll/swipe state.
+pub(crate) fn main_window(window: &gpui::Window) {
+    let number = ns_window(window).map(|ns| ns.windowNumber());
+    MAIN_WINDOW.with(|main| main.set(number));
+    reset_scroll_state();
+}
+
+/// Clears main-window scroll/swipe state when the main window closes.
+pub(crate) fn forget_main_window() {
+    MAIN_WINDOW.with(|main| main.set(None));
+    reset_scroll_state();
 }
 
 /// Whether the scroll being handled asks to go back. The monitor sees every
@@ -246,6 +269,11 @@ fn watch_scrolls() {
     let block = block2::RcBlock::new(|event: std::ptr::NonNull<NSEvent>| -> *mut NSEvent {
         // SAFETY: AppKit hands the monitor a live event, on the main thread.
         let ns = unsafe { event.as_ref() };
+        if let Some(main) = MAIN_WINDOW.with(std::cell::Cell::get)
+            && ns.windowNumber() != main
+        {
+            return event.as_ptr();
+        }
         let object: &AnyObject = ns;
         // SAFETY: `respondsToSelector:` is NSObject's; the private getter is
         // only called when the event answers to it, and returns a CGFloat.

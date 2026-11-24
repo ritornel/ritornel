@@ -533,6 +533,10 @@ impl Wall {
         if let Some(net) = now {
             wall.start(net, cx);
         }
+        cx.on_release(|wall, cx| {
+            wall.covers.drain(None, cx);
+        })
+        .detach();
         wall
     }
 

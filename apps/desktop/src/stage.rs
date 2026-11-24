@@ -73,6 +73,11 @@ impl<P: Place> History<P> {
         self.behind.last()
     }
 
+    /// Pages behind the current one, oldest first.
+    pub(crate) fn behind(&self) -> &[P] {
+        &self.behind
+    }
+
     /// Opens `place`, keeping this page to come back to. The page already
     /// open opens nothing: `false`.
     pub(crate) fn go(&mut self, place: P) -> bool {
