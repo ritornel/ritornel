@@ -66,6 +66,10 @@ impl Pictures {
         self.in_flight.remove(&art);
     }
 
+    fn clear_in_flight(&mut self) {
+        self.in_flight.clear();
+    }
+
     fn insert(
         &mut self,
         art: Id,
@@ -199,6 +203,11 @@ pub(crate) struct SearchBox {
     /// When the dropdown came down, for it to rise into place.
     dropped: Option<Instant>,
     pictures: Pictures,
+    /// In-flight thumbnail fetches, aborted when cleared or dropped.
+    fetches: crate::covers::FetchBag,
+    /// Generation bumped whenever thumbnail fetches are cleared so late
+    /// cancellation callbacks cannot erase a reopened search's bookkeeping.
+    fetch_gen: u64,
     /// Where each row's picture is, for a record's cover to travel from.
     arts: Rc<std::cell::RefCell<HashMap<Id, Bounds<Pixels>>>>,
     /// Where the dropdown is, so a press in it does not close it.
@@ -247,6 +256,8 @@ impl SearchBox {
             asking: None,
             dropped: None,
             pictures: Pictures::default(),
+            fetches: crate::covers::FetchBag::default(),
+            fetch_gen: 0,
             arts: Rc::default(),
             drop_bounds: Rc::default(),
             hovered_song: None,
@@ -272,6 +283,9 @@ impl SearchBox {
         self.hovered_song = None;
         if text.trim().is_empty() {
             self.asking = None;
+            self.fetch_gen = self.fetch_gen.wrapping_add(1);
+            self.fetches.clear();
+            self.pictures.clear_in_flight();
             self.view = View {
                 settled: true,
                 ..View::default()
@@ -368,31 +382,40 @@ impl SearchBox {
                 continue;
             }
             let px = 72;
+            let generation = self.fetch_gen;
             let http = Arc::clone(&net.art);
             let sizes = net.art_sizes.clone();
             let read = net
                 .rt()
                 .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
+            self.fetches.push(read.abort_handle());
             cx.spawn(async move |this, cx| {
-                let result = read.await.ok().and_then(Result::ok);
-                this.update(cx, |search, cx| match result {
-                    Some((image, _, _)) => {
-                        let keep: HashSet<Id> = search
-                            .view
-                            .hits
-                            .iter()
-                            .filter_map(|hit| match hit {
-                                Hit::Artist(row) => row.art_id,
-                                Hit::Album(tile) => tile.art_id,
-                                Hit::Song(song) => song.art_id,
-                            })
-                            .collect();
-                        for old in search.pictures.insert(art, Arc::new(image), &keep) {
-                            crate::covers::drop_unshared(old, None, cx);
-                        }
-                        cx.notify();
+                let Ok(result) = read.await else {
+                    return;
+                };
+                this.update(cx, |search, cx| {
+                    if search.fetch_gen != generation {
+                        return;
                     }
-                    None => search.pictures.finish_failed(art),
+                    match result {
+                        Ok((image, _, _)) => {
+                            let keep: HashSet<Id> = search
+                                .view
+                                .hits
+                                .iter()
+                                .filter_map(|hit| match hit {
+                                    Hit::Artist(row) => row.art_id,
+                                    Hit::Album(tile) => tile.art_id,
+                                    Hit::Song(song) => song.art_id,
+                                })
+                                .collect();
+                            for old in search.pictures.insert(art, Arc::new(image), &keep) {
+                                crate::covers::drop_unshared(old, None, cx);
+                            }
+                            cx.notify();
+                        }
+                        Err(_) => search.pictures.finish_failed(art),
+                    }
                 })
                 .ok();
             })
@@ -479,6 +502,9 @@ impl SearchBox {
         self.asked += 1;
         self.hovered_song = None;
         self.asking = None;
+        self.fetch_gen = self.fetch_gen.wrapping_add(1);
+        self.fetches.clear();
+        self.pictures.clear_in_flight();
         self.view = View {
             settled: true,
             ..View::default()

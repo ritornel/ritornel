@@ -69,6 +69,21 @@ pub(crate) fn carried(cx: &App) -> Option<&Carried> {
     cx.try_global::<Carrying>().map(|carrying| &carrying.0)
 }
 
+/// Drops the retained drag payload once GPUI no longer has an active drag, so
+/// its cover reference is released and can leave the sprite atlas.
+pub(crate) fn settle(cx: &mut App) {
+    if !cx.has_active_drag() && cx.has_global::<Carrying>() {
+        cx.remove_global::<Carrying>();
+    }
+}
+
+/// Drops any retained drag payload unconditionally, as when the main window closes.
+pub(crate) fn clear(cx: &mut App) {
+    if cx.has_global::<Carrying>() {
+        cx.remove_global::<Carrying>();
+    }
+}
+
 /// Whether what was carried last still holds a picture, for the script's
 /// `held` step.
 pub(crate) fn holds_picture(cx: &App) -> bool {
@@ -119,6 +134,7 @@ pub(crate) fn drop(carried: &Carried, place: QueuePlace, player: &Entity<Player>
         "carry: dropped “{}” at {place:?}",
         carried.name()
     ));
+    clear(cx);
     let carried = carried.clone();
     player.update(cx, |player, cx| match carried {
         Carried::Entries { ids, .. } => {
@@ -231,5 +247,35 @@ impl Render for Chip {
                     .child(format!("{count} songs"))
             }));
         div().relative().child(chip)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::RenderImage;
+    use ritornel_contract::Id;
+
+    use super::{Carried, Carrying, holds_picture, settle};
+
+    #[gpui::test]
+    fn settle_releases_carried_picture_once_drag_ends(cx: &mut gpui::TestAppContext) {
+        let art = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]));
+        cx.update(|cx| {
+            cx.set_global(Carrying(Carried::Songs {
+                ids: vec![Id::from_bytes([1; 16])],
+                name: "Test".to_owned(),
+                context: None,
+                art: Some(Arc::clone(&art)),
+            }));
+            assert!(holds_picture(cx));
+            assert_eq!(Arc::strong_count(&art), 2);
+            settle(cx);
+            assert!(!holds_picture(cx));
+            assert_eq!(Arc::strong_count(&art), 1);
+        });
     }
 }

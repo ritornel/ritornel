@@ -328,6 +328,15 @@ impl Shell {
         // The menus' items open pages through the shell.
         let here = cx.entity().downgrade();
         cx.set_global(crate::menu::Here(here));
+        crate::platform::main_window(window);
+        cx.on_release(|shell, cx| {
+            shell.tints.clear();
+            shell.carry = None;
+            frost::clear(cx);
+            crate::carry::clear(cx);
+            crate::platform::forget_main_window();
+        })
+        .detach();
         let mut arrival = Arrival::new(false, false, true);
         arrival.ready = Some(arrival.started);
         Self {
@@ -480,6 +489,19 @@ impl Shell {
         let now = self.shown();
         left.seen(false, cx);
         now.seen(true, cx);
+        // Keep the nearest pages in back history warm for instant Back; drop
+        // cached pictures on deeper pages so deep navigation chains do not pin VRAM.
+        const BEHIND_KEEP: usize = 2;
+        let behind = self.pages.behind();
+        let trim_count = behind.len().saturating_sub(BEHIND_KEEP);
+        let deep: Vec<Shown> = behind.iter().take(trim_count).map(Shown::of).collect();
+        for page in deep {
+            match page {
+                Shown::Album(album) => album.update(cx, |album, cx| album.trim_behind(cx)),
+                Shown::Artist(artist) => artist.update(cx, |artist, cx| artist.trim_behind(cx)),
+                _ => {}
+            }
+        }
         let hold = left.bannered() && now.bannered() && left_top < 8. && now.top(cx) < 8. && !still;
         let entrance = matches!(now, Shown::Artist(_)) && !hold;
         if let Some((gone, _)) = self.leaving.take() {
@@ -1471,6 +1493,8 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::script::frame();
+        crate::carry::settle(cx);
+        crate::covers::flush_dropped(window, cx);
         let now = Instant::now();
         let size_now = window.viewport_size();
         let (width, height) = (f32::from(size_now.width), f32::from(size_now.height));

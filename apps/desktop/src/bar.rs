@@ -175,9 +175,10 @@ impl PlayerBar {
         let px = (50. * window.scale_factor()).ceil() as u32;
         let sizes = net.art_sizes.clone();
         let http = Arc::clone(&net.art);
-        let read = net
-            .rt()
-            .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
+        let read = crate::covers::AbortOnDrop::new(
+            net.rt()
+                .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await }),
+        );
         let task = cx.spawn(async move |this, cx| {
             let image = read.await.unwrap_or(Err(NoArt::Failed));
             this.update(cx, |bar, cx| {

@@ -281,6 +281,20 @@ impl Album {
         crate::platform::give_back();
     }
 
+    /// Releases cached pictures when this page sits deep in back history,
+    /// resetting picture read state so they reload if the user navigates back.
+    pub(crate) fn trim_behind(&mut self, cx: &mut Context<Self>) {
+        self.fetches.clear();
+        self.tracks.update(cx, |tracks, _| {
+            tracks.art = None;
+        });
+        self.release_images(cx);
+        self.small = None;
+        self.pictured_scale = 0.;
+        self.reset_picture_reads();
+        self.more_covers.clear();
+    }
+
     fn release_cover(&mut self, cx: &mut gpui::App) {
         let images = [
             self.large.take().map(|pair| pair.0),
@@ -1395,6 +1409,12 @@ impl MoreCovers {
 
     fn drain(&mut self) -> impl Iterator<Item = Arc<RenderImage>> + '_ {
         self.covers.drain().map(|(_, image)| image)
+    }
+
+    fn clear(&mut self) {
+        self.asked.clear();
+        self.retries = crate::covers::Retries::default();
+        self.px = 0;
     }
 }
 

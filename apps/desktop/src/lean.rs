@@ -896,11 +896,11 @@ impl LeanBack {
         let read = art.zip(self.net.clone()).map(|(art, net)| {
             let sizes = net.art_sizes.clone();
             let http = Arc::clone(&net.art);
-            net.rt().spawn(async move {
+            crate::covers::AbortOnDrop::new(net.rt().spawn(async move {
                 crate::covers::fetch_square(&http, &sizes, art, px)
                     .await
                     .map(|(image, _, _)| image)
-            })
+            }))
         });
         async move {
             match read {
@@ -927,21 +927,23 @@ impl LeanBack {
         let read = match (art, net) {
             (Some(art), Some(net)) => {
                 let http = Arc::clone(&net.art);
-                Some(net.rt().spawn(async move {
-                    let bytes = http.get(art, crate::blur::SIDE).await.ok()?;
-                    crate::covers::decode(move || {
-                        crate::blur::jpeg_toned(&bytes, radius, saturation, brightness)
-                    })
-                    .await
-                }))
+                Some(crate::covers::AbortOnDrop::new(net.rt().spawn(
+                    async move {
+                        let bytes = http.get(art, crate::blur::SIDE).await.ok()?;
+                        crate::covers::decode(move || {
+                            crate::blur::jpeg_toned(&bytes, radius, saturation, brightness)
+                        })
+                        .await
+                    },
+                )))
             }
             (None, Some(net)) => soft.map(|soft| {
-                net.rt().spawn(async move {
+                crate::covers::AbortOnDrop::new(net.rt().spawn(async move {
                     crate::covers::decode(move || {
                         Some(crate::blur::toned(&soft, radius, saturation, brightness))
                     })
                     .await
-                })
+                }))
             }),
             _ => None,
         };

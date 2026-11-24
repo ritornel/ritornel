@@ -315,6 +315,19 @@ pub(crate) fn forget(window: &mut Window) {
     }
 }
 
+/// Drops all thread-local frost state when the main window closes so cached
+/// textures and borrowed piece pictures do not survive across windows.
+pub(crate) fn clear(cx: &mut App) {
+    WANTED.set(false);
+    PIECES.with_borrow_mut(Vec::clear);
+    FADES.with_borrow_mut(Vec::clear);
+    SMALL.with_borrow_mut(HashMap::clear);
+    COST.take();
+    if let Some(old) = LAST.take() {
+        crate::covers::drop_unshared(old.image, None, cx);
+    }
+}
+
 /// How many cells across and down the picture has: about 10 points each,
 /// a quarter of the blur's deviation, plenty for something so soft.
 fn cells(bounds: Bounds<Pixels>) -> (usize, usize) {

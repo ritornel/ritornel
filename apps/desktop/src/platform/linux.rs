@@ -21,9 +21,9 @@ use ritornel_client::launch::Program;
 
 pub(crate) use super::fallback::{
     CHROME, FEEL, FITTING_SHOWS, KEYS, SHOW_FOLDER, bring_forward_quietly, choose_folder,
-    dismiss_menu, fit_window, footprint, give_back, hold_appearance, keep_out_of_the_dock,
-    key_text, locale, memory_line, pop_up_menu, reduce_motion, screenshot, scroll_details,
-    settings_dir, start, swiped_back,
+    dismiss_menu, fit_window, footprint, forget_main_window, give_back, hold_appearance,
+    keep_out_of_the_dock, key_text, locale, main_window, memory_line, pop_up_menu, reduce_motion,
+    screenshot, scroll_details, settings_dir, start, swiped_back,
 };
 
 /// The server outlives the app.
