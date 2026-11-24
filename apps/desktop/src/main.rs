@@ -116,7 +116,8 @@ fn args() -> Result<Args, String> {
 /// A line on standard error for a developer, when `RITORNEL_GPUI_DEBUG` is set.
 #[allow(clippy::print_stderr)]
 pub(crate) fn debug(line: std::fmt::Arguments<'_>) {
-    if std::env::var_os("RITORNEL_GPUI_DEBUG").is_some() {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("RITORNEL_GPUI_DEBUG").is_some()) {
         eprintln!("{line}");
     }
 }

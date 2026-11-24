@@ -1494,6 +1494,7 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::script::frame();
         crate::carry::settle(cx);
+        theme::flush_soft(window, cx);
         crate::covers::flush_dropped(window, cx);
         let now = Instant::now();
         let size_now = window.viewport_size();

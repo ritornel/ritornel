@@ -369,8 +369,10 @@ struct Set {
 /// One picture of the record playing, as the cover and as the ground behind everything.
 struct Picture {
     key: String,
-    /// The soft colour of its name, under the cover.
-    fill: Arc<RenderImage>,
+    /// Instant gradient fallback derived from its name while the picture loads.
+    soft: (Hsla, Hsla),
+    /// Soft glow artwork generated off-thread only when the record has no cover.
+    fill: Option<Arc<RenderImage>>,
     /// The cover, large, once it is read.
     large: Option<Arc<RenderImage>>,
     /// The cover blurred, and whether for the dark palette.
@@ -426,8 +428,10 @@ pub(crate) struct LeanBack {
     player: Entity<Player>,
     net: Option<Arc<Net>>,
     stage: Stage,
-    /// When it opened, for the drift.
-    opened: Instant,
+    /// Accumulated playback drift time, and when the current drift span
+    /// started, so pausing freezes the drift without jumping on resume.
+    drift_elapsed: Duration,
+    drift_since: Option<Instant>,
     pictures: Vec<Picture>,
     /// The picture being read, what reads it, and what shows it if it is late.
     reading: Option<(String, Task<()>, Task<()>)>,
@@ -513,7 +517,8 @@ impl LeanBack {
             player,
             net,
             stage,
-            opened: now,
+            drift_elapsed: Duration::ZERO,
+            drift_since: None,
             pictures: Vec::new(),
             reading: None,
             retoning: None,
@@ -553,11 +558,15 @@ impl LeanBack {
         lean
     }
 
-    /// Drops the large covers and blurred grounds this view owns from the
-    /// sprite atlas. `fill` belongs to `theme::soft_cached` and is left alone.
+    /// Drops the large covers, soft placeholders, and blurred grounds this view
+    /// owns from the sprite atlas.
     fn release_images(&mut self, cx: &mut gpui::App) {
         let mut released = false;
         for picture in self.pictures.drain(..) {
+            if let Some(fill) = picture.fill {
+                released = true;
+                crate::covers::drop_unshared(fill, None, cx);
+            }
             if let Some(large) = picture.large {
                 released = true;
                 crate::covers::drop_unshared(large, None, cx);
@@ -810,10 +819,13 @@ impl LeanBack {
         if self.reading.as_ref().is_some_and(|(at, _, _)| *at == key) {
             return;
         }
-        let fill = theme::soft_cached(&name, (COVER * window.scale_factor()).ceil() as u32);
+        let soft = theme::soft(&name);
         let first = self.pictures.is_empty() || crate::platform::reduce_motion();
         if first {
             for old in self.pictures.drain(..) {
+                if let Some(fill) = old.fill {
+                    crate::covers::drop_unshared(fill, Some(window), cx);
+                }
                 if let Some(large) = old.large {
                     crate::covers::drop_unshared(large, Some(window), cx);
                 }
@@ -823,20 +835,20 @@ impl LeanBack {
             }
             self.pictures.push(Picture {
                 key: key.clone(),
-                fill: Arc::clone(&fill),
+                soft,
+                fill: None,
                 large: None,
                 ground: None,
                 since: None,
             });
         }
-        let large = self.read_large(track.art_id, window);
+        let large = self.read_large(track.art_id, &name, window);
         let ground = self.read_ground(track.art_id, &name, radius, saturation, brightness);
-        let read_fill = Arc::clone(&fill);
         let read_key = key.clone();
         let read = cx.spawn(async move |this, cx| {
-            let (large, ground) = (large.await, ground.await);
+            let ((large, fill), ground) = (large.await, ground.await);
             this.update(cx, |lean, cx| {
-                lean.took_picture(&read_key, &read_fill, large, ground, dark, cx);
+                lean.took_picture(&read_key, soft, fill, large, ground, dark, cx);
                 cx.notify();
             })
             .ok();
@@ -846,7 +858,7 @@ impl LeanBack {
         let late = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(WAIT_PICTURE).await;
             this.update(cx, |lean, cx| {
-                lean.took_picture(&late_key, &fill, None, None, dark, cx);
+                lean.took_picture(&late_key, soft, None, None, None, dark, cx);
                 cx.notify();
             })
             .ok();
@@ -856,16 +868,23 @@ impl LeanBack {
 
     /// Takes a record's pictures in: into its place if it is shown, or as a
     /// new picture over the last.
+    #[allow(clippy::too_many_arguments)]
     fn took_picture(
         &mut self,
         key: &str,
-        fill: &Arc<RenderImage>,
+        soft: (Hsla, Hsla),
+        fill: Option<RenderImage>,
         large: Option<RenderImage>,
         ground: Option<RenderImage>,
         dark: bool,
         cx: &mut gpui::App,
     ) {
         if let Some(shown) = self.pictures.iter_mut().find(|each| each.key == key) {
+            if let Some(fill) = fill
+                && let Some(old) = shown.fill.replace(Arc::new(fill))
+            {
+                crate::covers::drop_unshared(old, None, cx);
+            }
             if let Some(large) = large
                 && let Some(old) = shown.large.replace(Arc::new(large))
             {
@@ -880,7 +899,8 @@ impl LeanBack {
         }
         self.pictures.push(Picture {
             key: key.to_owned(),
-            fill: Arc::clone(fill),
+            soft,
+            fill: fill.map(Arc::new),
             large: large.map(Arc::new),
             ground: ground.map(|ground| (Arc::new(ground), dark)),
             since: Some(Instant::now()),
@@ -890,22 +910,30 @@ impl LeanBack {
     fn read_large(
         &self,
         art: Option<Id>,
+        name: &str,
         window: &Window,
-    ) -> impl std::future::Future<Output = Option<RenderImage>> + 'static {
+    ) -> impl std::future::Future<Output = (Option<RenderImage>, Option<RenderImage>)> + 'static
+    {
         let px = (COVER * window.scale_factor()).ceil() as u32;
-        let read = art.zip(self.net.clone()).map(|(art, net)| {
+        let name = name.to_owned();
+        let read = self.net.clone().map(|net| {
             let sizes = net.art_sizes.clone();
             let http = Arc::clone(&net.art);
             crate::covers::AbortOnDrop::new(net.rt().spawn(async move {
-                crate::covers::fetch_square(&http, &sizes, art, px)
-                    .await
-                    .map(|(image, _, _)| image)
+                if let Some(art) = art
+                    && let Ok((image, _, _)) =
+                        crate::covers::fetch_square(&http, &sizes, art, px).await
+                {
+                    return (Some(image), None);
+                }
+                let fill = crate::covers::decode(move || Some(theme::soft_image(&name, px))).await;
+                (None, fill)
             }))
         });
         async move {
             match read {
-                Some(read) => read.await.ok().and_then(Result::ok),
-                None => None,
+                Some(read) => read.await.unwrap_or((None, None)),
+                None => (None, None),
             }
         }
     }
@@ -1120,7 +1148,8 @@ impl LeanBack {
 
 /// A cover drawn as a face: its soft colour, and the picture over it.
 fn face(
-    fill: &Arc<RenderImage>,
+    soft: (Hsla, Hsla),
+    fill: Option<&Arc<RenderImage>>,
     large: Option<&Arc<RenderImage>>,
     bounds: Bounds<Pixels>,
     radius: f32,
@@ -1132,16 +1161,24 @@ fn face(
         .left(bounds.origin.x)
         .top(bounds.origin.y)
         .size(px(side))
+        .rounded(px(radius))
+        .bg(linear_gradient(
+            180.,
+            linear_color_stop(soft.0, 0.),
+            linear_color_stop(soft.1, 1.),
+        ))
         .opacity(opacity)
-        .child(
-            img(Arc::clone(fill))
-                .absolute()
-                .top_0()
-                .left_0()
-                .size(px(side))
-                .rounded(px(radius))
-                .object_fit(ObjectFit::Cover),
-        )
+        .when_some(fill, |face, fill| {
+            face.child(
+                img(Arc::clone(fill))
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size(px(side))
+                    .rounded(px(radius))
+                    .object_fit(ObjectFit::Cover),
+            )
+        })
         .when_some(large, |face, large| {
             face.child(
                 img(Arc::clone(large))
@@ -1194,7 +1231,8 @@ fn flight(
     t: f32,
     radius: (f32, f32),
     shadows: (Shadow, Shadow),
-    fill: &Arc<RenderImage>,
+    soft: (Hsla, Hsla),
+    fill: Option<&Arc<RenderImage>>,
     large: Option<&Arc<RenderImage>>,
 ) -> AnyElement {
     let p = fly_curve(t);
@@ -1233,8 +1271,8 @@ fn flight(
         .size_full()
         .child(shadow(shadows.0, 1. - p, scale, old_round))
         .child(shadow(shadows.1, p, scale / landing, new_round))
-        .child(face(fill, large, bounds, old_round, old))
-        .child(face(fill, large, bounds, new_round, new))
+        .child(face(soft, fill, large, bounds, old_round, old))
+        .child(face(soft, fill, large, bounds, new_round, new))
         .into_any_element()
 }
 
@@ -1368,7 +1406,8 @@ impl Render for LeanBack {
                             t,
                             (8., 16.),
                             (ring_shadow, cover_shadow),
-                            &top.fill,
+                            top.soft,
+                            top.fill.as_ref(),
                             top.large.as_ref(),
                         )
                     });
@@ -1391,7 +1430,8 @@ impl Render for LeanBack {
                         t,
                         (16., 8.),
                         (cover_shadow, ring_shadow),
-                        &top.fill,
+                        top.soft,
+                        top.fill.as_ref(),
                         top.large.as_ref(),
                     )
                 });
@@ -1412,11 +1452,19 @@ impl Render for LeanBack {
         // `scale(1.05) translate(-1.5%, -1%)` to `scale(1.22) translate(2%, 1.5%)`.
         let (drift_w, drift_h) = (width + 180., height + 180.);
         let side = drift_w.max(drift_h);
+        let drifting = !still && playing;
+        if drifting {
+            if let Some(since) = self.drift_since {
+                self.drift_elapsed += now.saturating_duration_since(since);
+            }
+            self.drift_since = Some(now);
+        } else {
+            self.drift_since = None;
+        }
         let (scale, shift) = if still {
             (1., (0., 0.))
         } else {
-            let cycles =
-                now.saturating_duration_since(self.opened).as_secs_f32() * 1000. / DRIFT_MS;
+            let cycles = self.drift_elapsed.as_secs_f32() * 1000. / DRIFT_MS;
             let local = cycles.fract();
             let along = if (cycles as u64).is_multiple_of(2) {
                 local
@@ -1463,6 +1511,9 @@ impl Render for LeanBack {
         {
             let keep = self.pictures.len() - 1;
             for old in self.pictures.drain(..keep) {
+                if let Some(fill) = old.fill {
+                    crate::covers::drop_unshared(fill, Some(window), cx);
+                }
                 if let Some(large) = old.large {
                     crate::covers::drop_unshared(large, Some(window), cx);
                 }
@@ -1555,7 +1606,14 @@ impl Render for LeanBack {
                     }
                     _ => 1.,
                 };
-                faces.push(face(&picture.fill, picture.large.as_ref(), local, 16., up));
+                faces.push(face(
+                    picture.soft,
+                    picture.fill.as_ref(),
+                    picture.large.as_ref(),
+                    local,
+                    16.,
+                    up,
+                ));
             }
             layers.push(
                 div()
@@ -1843,21 +1901,25 @@ impl Render for LeanBack {
 
         // The drift moves under a fifth of a point at thirty frames a
         // second, so while nothing else moves it is drawn that often rather
-        // than at the display's rate.
+        // than at the display's rate, and paused when playback is paused.
         if animating {
             self.drift_tick = None;
             window.request_animation_frame();
-        } else if !still && self.drift_tick.is_none() {
-            self.drift_tick = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(33))
-                    .await;
-                this.update(cx, |lean, cx| {
-                    lean.drift_tick = None;
-                    cx.notify();
-                })
-                .ok();
-            }));
+        } else if !still && playing {
+            if self.drift_tick.is_none() {
+                self.drift_tick = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(33))
+                        .await;
+                    this.update(cx, |lean, cx| {
+                        lean.drift_tick = None;
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
+        } else {
+            self.drift_tick = None;
         }
 
         div()

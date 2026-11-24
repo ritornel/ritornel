@@ -148,11 +148,13 @@ struct Ratings {
     pending: HashMap<Id, (Id, Option<u32>)>,
     confirmed: HashMap<Id, (u64, Option<u32>)>,
     revision: u64,
+    version: u64,
 }
 
 impl Ratings {
     fn start(&mut self, recording: Id, key: Id, rating: Option<u32>) {
         self.pending.insert(recording, (key, rating));
+        self.version += 1;
     }
 
     fn own(&self, recording: Id, saved: Option<u32>, row_revision: Option<u64>) -> Option<u32> {
@@ -175,6 +177,7 @@ impl Ratings {
             .is_some_and(|(pending, _)| *pending == key)
         {
             self.pending.remove(&recording);
+            self.version += 1;
             true
         } else {
             false
@@ -190,6 +193,7 @@ impl Ratings {
             .is_none_or(|(kept, _)| revision > *kept)
         {
             self.confirmed.insert(recording, (revision, rating));
+            self.version += 1;
         }
     }
 }
@@ -225,6 +229,9 @@ pub(crate) struct Player {
     hub_away_said: Option<i64>,
     /// What plays next, while the card is open.
     pub up_next: Option<UpNext>,
+    /// Monotonic counter bumped whenever `up_next` changes (server read or
+    /// optimistic reorder/removal) so observers see queue edits immediately.
+    up_next_version: u64,
     /// Whether Up next's card is open.
     pub open: bool,
     /// The last read of Up next asked for: an older one that answers late is dropped.
@@ -297,6 +304,7 @@ impl Player {
             hub_away_said: None,
             toast_ends: None,
             up_next: None,
+            up_next_version: 0,
             open: false,
             reading: 0,
             _link: followed,
@@ -685,6 +693,11 @@ impl Player {
         })
     }
 
+    /// Monotonic version of `up_next` (server updates and optimistic edits).
+    pub(crate) fn up_next_version(&self) -> u64 {
+        self.up_next_version
+    }
+
     /// Takes an entry out of Up next, and out of the card at once.
     pub(crate) fn remove(&mut self, entry: Id, cx: &mut Context<Self>) {
         let Some(key) = self.key(cx) else { return };
@@ -692,6 +705,7 @@ impl Player {
         if let Some(up_next) = &mut self.up_next {
             up_next.total = up_next.total.saturating_sub(1);
             up_next.entries.retain(|kept| kept.entry_id != entry);
+            self.up_next_version = self.up_next_version.wrapping_add(1);
             cx.notify();
         }
         self.send::<QueueRemove>(
@@ -720,6 +734,7 @@ impl Player {
         if let Some(up_next) = &mut self.up_next {
             let complete = up_next.entries.len() as u64 >= up_next.total;
             up_next.entries = moved(&up_next.entries, &entries, place, complete);
+            self.up_next_version = self.up_next_version.wrapping_add(1);
             cx.notify();
         }
         self.send::<QueueMove>(
@@ -773,6 +788,7 @@ impl Player {
                     total: window.total,
                     entries: window.entries,
                 });
+                player.up_next_version = player.up_next_version.wrapping_add(1);
                 cx.notify();
             })
             .ok();
@@ -797,6 +813,11 @@ impl Player {
         row_revision: Option<u64>,
     ) -> Option<u32> {
         self.rated.own(recording, said, row_revision)
+    }
+
+    /// Monotonic counter bumped on optimistic or confirmed rating changes.
+    pub(crate) fn ratings_version(&self) -> u64 {
+        self.rated.version
     }
 
     /// A click on star `star` of `recording`, whose stars the server last

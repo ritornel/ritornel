@@ -63,8 +63,25 @@ pub(crate) fn key_text(keystroke: &gpui::KeybindingKeystroke) -> String {
 pub(crate) const FEEL: Feel = Feel { rubber_band: true };
 
 /// Whether System Settings › Accessibility › Display › Reduce motion is on.
+/// Cached briefly on the main thread so per-frame render checks do not make
+/// repeated AppKit calls while still picking up live setting changes.
 pub(crate) fn reduce_motion() -> bool {
-    objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+    thread_local! {
+        static CACHED: std::cell::Cell<Option<(std::time::Instant, bool)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    let now = std::time::Instant::now();
+    CACHED.with(|cached| {
+        if let Some((at, value)) = cached.get()
+            && now.duration_since(at) < std::time::Duration::from_secs(2)
+        {
+            return value;
+        }
+        let value =
+            objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        cached.set(Some((now, value)));
+        value
+    })
 }
 
 pub(crate) fn start() {

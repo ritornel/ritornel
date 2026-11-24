@@ -138,8 +138,12 @@ fn hsl(h: f32, s: f32, l: f32) -> [f32; 3] {
 /// Most soft-colour pictures kept while scrolling (never evicting entries
 /// drawn in the current or previous frame).
 const SOFT_CAPACITY: usize = 64;
+/// Byte budget for soft-colour pictures kept while scrolling.
+const SOFT_BUDGET: usize = 16 * 1024 * 1024;
 /// Soft-colour pictures kept at rest beyond what is still on screen.
 const SOFT_REST_KEEP: usize = 16;
+/// Byte budget for soft-colour pictures kept at rest.
+const SOFT_REST_BUDGET: usize = 4 * 1024 * 1024;
 /// Number of frame ticks an entry is protected after its last use, so calling
 /// `flush_soft` from both the wall and the player bar in the same frame still
 /// shields every visible tile across repaints.
@@ -149,7 +153,9 @@ const SOFT_FRAME_GUARD: u64 = 3;
 /// evicted pictures waiting to be dropped from the sprite atlas.
 #[derive(Default)]
 struct SoftCache {
-    entries: std::collections::HashMap<(String, u32), (std::sync::Arc<gpui::RenderImage>, u64)>,
+    entries:
+        std::collections::HashMap<(String, u32), (std::sync::Arc<gpui::RenderImage>, usize, u64)>,
+    bytes: usize,
     frame: u64,
     evicted: Vec<std::sync::Arc<gpui::RenderImage>>,
 }
@@ -161,34 +167,42 @@ impl SoftCache {
 
     fn get_or_insert(&mut self, name: &str, side: u32) -> std::sync::Arc<gpui::RenderImage> {
         let key = (name.to_owned(), side);
-        if let Some((image, used)) = self.entries.get_mut(&key) {
+        if let Some((image, _, used)) = self.entries.get_mut(&key) {
             *used = self.frame;
             return std::sync::Arc::clone(image);
         }
         let image = std::sync::Arc::new(soft_image(name, side));
+        let bytes = (side as usize)
+            .saturating_mul(side as usize)
+            .saturating_mul(4);
+        self.bytes += bytes;
         self.entries
-            .insert(key, (std::sync::Arc::clone(&image), self.frame));
-        self.shrink(SOFT_CAPACITY);
+            .insert(key, (std::sync::Arc::clone(&image), bytes, self.frame));
+        self.shrink(SOFT_CAPACITY, SOFT_BUDGET);
         image
     }
 
     /// Evicts the oldest entries that have not been drawn in recent frames
-    /// until at most `keep` entries remain (or only recently drawn entries are left).
-    fn shrink(&mut self, keep: usize) -> usize {
-        if self.entries.len() <= keep {
+    /// until at most `keep` entries and `keep_bytes` remain (or only recently
+    /// drawn entries are left).
+    fn shrink(&mut self, keep: usize, keep_bytes: usize) -> usize {
+        if self.entries.len() <= keep && self.bytes <= keep_bytes {
             return 0;
         }
         let mut order: Vec<(u64, (String, u32))> = self
             .entries
             .iter()
-            .filter(|(_, (_, used))| used.saturating_add(SOFT_FRAME_GUARD) < self.frame)
-            .map(|(key, (_, used))| (*used, key.clone()))
+            .filter(|(_, (_, _, used))| used.saturating_add(SOFT_FRAME_GUARD) < self.frame)
+            .map(|(key, (_, _, used))| (*used, key.clone()))
             .collect();
         order.sort_unstable_by_key(|(used, _)| *used);
-        let remove = self.entries.len() - keep;
         let mut removed = 0;
-        for (_, key) in order.into_iter().take(remove) {
-            if let Some((image, _)) = self.entries.remove(&key) {
+        for (_, key) in order {
+            if self.entries.len() <= keep && self.bytes <= keep_bytes {
+                break;
+            }
+            if let Some((image, bytes, _)) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(bytes);
                 self.evicted.push(image);
                 removed += 1;
             }
@@ -234,7 +248,7 @@ pub(crate) fn soft_holds(image: &std::sync::Arc<gpui::RenderImage>) -> bool {
         cache
             .entries
             .values()
-            .any(|(held, _)| std::sync::Arc::ptr_eq(held, image))
+            .any(|(held, _, _)| std::sync::Arc::ptr_eq(held, image))
             || cache
                 .evicted
                 .iter()
@@ -263,7 +277,7 @@ pub(crate) fn flush_soft(window: &mut gpui::Window, cx: &mut gpui::App) {
 pub(crate) fn trim_soft(window: &mut gpui::Window, cx: &mut gpui::App) {
     let (removed, gone) = SOFT.with(|soft| {
         let mut cache = soft.borrow_mut();
-        let removed = cache.shrink(SOFT_REST_KEEP);
+        let removed = cache.shrink(SOFT_REST_KEEP, SOFT_REST_BUDGET);
         let gone = cache.take_unshared_evicted();
         (removed, gone)
     });
@@ -301,26 +315,31 @@ pub(crate) fn soft_pixels(name: &str, side: u32) -> image::RgbaImage {
     let x = (25 + (signed >> 3) % 40) as f32 / 100.;
     let y = (25 + (signed >> 6) % 40) as f32 / 100.;
     let ground = hsl(h1, 0.12, 0.19);
-    // Each glow: its centre, its colour, and where it has gone, as a share
-    // of the distance from the centre to the farthest corner.
+    // Each glow: its centre, its colour, and its radius (`far * stop`),
+    // computed once before the pixel loop.
+    let radius = |(cx, cy): (f32, f32), stop: f32| {
+        let far = [(0f32, 0f32), (1., 0.), (0., 1.), (1., 1.)]
+            .iter()
+            .map(|(fx, fy)| ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt())
+            .fold(0f32, f32::max);
+        far * stop
+    };
     let glows = [
-        ((1. - x, 1. - y), hsl(h2, 0.30, 0.40), 0.62),
-        ((x, y), hsl(h1, 0.34, 0.52), 0.58),
+        (
+            (1. - x, 1. - y),
+            hsl(h2, 0.30, 0.40),
+            radius((1. - x, 1. - y), 0.62),
+        ),
+        ((x, y), hsl(h1, 0.34, 0.52), radius((x, y), 0.58)),
     ];
+    let inv_side = 1. / side.max(1) as f32;
     let mut pixels = image::RgbaImage::new(side, side);
     for (px, py, out) in pixels.enumerate_pixels_mut() {
-        let (u, v) = (
-            (px as f32 + 0.5) / side as f32,
-            (py as f32 + 0.5) / side as f32,
-        );
+        let (u, v) = ((px as f32 + 0.5) * inv_side, (py as f32 + 0.5) * inv_side);
         let mut color = ground;
         // The second layer is painted first: CSS's first layer is on top.
-        for ((cx, cy), glow, stop) in glows {
-            let far = [(0f32, 0f32), (1., 0.), (0., 1.), (1., 1.)]
-                .iter()
-                .map(|(fx, fy)| ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt())
-                .fold(0f32, f32::max);
-            let t = (((u - cx).powi(2) + (v - cy).powi(2)).sqrt() / (far * stop)).min(1.);
+        for ((cx, cy), glow, reach) in glows {
+            let t = (((u - cx).powi(2) + (v - cy).powi(2)).sqrt() / reach).min(1.);
             let alpha = 0.9 * (1. - t);
             for (channel, glowing) in color.iter_mut().zip(glow) {
                 *channel = *channel * (1. - alpha) + glowing * alpha;
@@ -391,11 +410,28 @@ mod tests {
         SOFT.with(|soft| {
             let mut cache = soft.borrow_mut();
             let key = ("known-kept".to_owned(), 8);
-            if let Some((image, _)) = cache.entries.remove(&key) {
+            if let Some((image, bytes, _)) = cache.entries.remove(&key) {
+                cache.bytes = cache.bytes.saturating_sub(bytes);
                 cache.evicted.push(image);
             }
         });
         assert!(soft_holds(&kept));
+    }
+
+    #[test]
+    fn soft_cache_evicts_by_byte_budget() {
+        let mut cache = SoftCache::default();
+        // 512x512 RGBA = 1 MiB each; inserting 20 across aged frames must trim
+        // down to SOFT_BUDGET (16 MiB) even though count < SOFT_CAPACITY (64).
+        for i in 0..20 {
+            let _ = cache.get_or_insert(&format!("big-{i}"), 512);
+            for _ in 0..=SOFT_FRAME_GUARD {
+                cache.advance_frame();
+            }
+        }
+        assert!(cache.bytes <= SOFT_BUDGET);
+        assert!(cache.entries.len() <= 16);
+        assert!(!cache.evicted.is_empty());
     }
 
     #[test]
@@ -415,7 +451,7 @@ mod tests {
         // wall looks up its tiles must not evict or regenerate any of them.
         for _ in 0..3 {
             cache.advance_frame(); // wall flush
-            let _ = cache.shrink(SOFT_REST_KEEP);
+            let _ = cache.shrink(SOFT_REST_KEEP, SOFT_REST_BUDGET);
             for (i, expected_id) in ids.iter().enumerate().take(30) {
                 let got = cache.get_or_insert(&format!("visible-{i}"), 8);
                 assert_eq!(got.id, *expected_id);
@@ -434,7 +470,7 @@ mod tests {
             assert_eq!(got.id, *expected_id);
         }
         cache.advance_frame();
-        let _ = cache.shrink(SOFT_REST_KEEP);
+        let _ = cache.shrink(SOFT_REST_KEEP, SOFT_REST_BUDGET);
         assert_eq!(cache.entries.len(), 30);
         assert_eq!(cache.take_unshared_evicted().len(), wide_count - 30);
     }
@@ -451,7 +487,7 @@ mod tests {
         for _ in 0..=SOFT_FRAME_GUARD {
             cache.advance_frame();
         }
-        let removed = cache.shrink(SOFT_REST_KEEP);
+        let removed = cache.shrink(SOFT_REST_KEEP, SOFT_REST_BUDGET);
         assert_eq!(removed, 32 - SOFT_REST_KEEP);
         assert_eq!(cache.entries.len(), SOFT_REST_KEEP);
         assert!(cache.entries.contains_key(&("item-0".to_owned(), 8)));

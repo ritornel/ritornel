@@ -388,7 +388,9 @@ mod fallback {
 /// change. `RITORNEL_GPUI_REDUCE_MOTION` asks for it too, for checking
 /// without changing the system's setting (developer-only).
 pub(crate) fn reduce_motion() -> bool {
-    std::env::var_os("RITORNEL_GPUI_REDUCE_MOTION").is_some() || system::reduce_motion()
+    static ENV_REDUCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV_REDUCE.get_or_init(|| std::env::var_os("RITORNEL_GPUI_REDUCE_MOTION").is_some())
+        || system::reduce_motion()
 }
 
 /// The program of the server that goes beside the app's.

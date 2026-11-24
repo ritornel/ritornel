@@ -29,7 +29,8 @@ use ritornel_contract::{Id, QueueEntry, QueuePlace, Repeat, TrackSummary};
 
 use crate::carry::{self, Carried};
 use crate::icons::icon;
-use crate::link::Link;
+use crate::link::{Link, LinkEvent};
+use crate::net::NoArt;
 use crate::player::{Player, stars_of};
 use crate::theme;
 use crate::words::{clock, length, plural};
@@ -57,6 +58,61 @@ const RADIUS: f32 = 16.;
 const ARRIVED_MS: f32 = 1400.;
 /// Covers kept beyond what the queue currently shows before pruning.
 const MAX_PICTURES: usize = 64;
+
+/// The player state `UpNextCard` displays, so 250 ms progress ticks that do
+/// not change any visible field do not trigger full card rebuilds or art checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CardSnapshot {
+    entry_id: Option<Id>,
+    art_id: Option<Id>,
+    playing: bool,
+    repeat: Repeat,
+    shuffle: bool,
+    queue_revision: Option<u64>,
+    up_next_version: u64,
+    ratings_revision: Option<u64>,
+    ratings_version: u64,
+    entries_len: usize,
+    total: u64,
+    left_minutes: u64,
+}
+
+impl CardSnapshot {
+    fn of(player: &Player) -> Self {
+        let state = player.state.as_ref();
+        let entry_id = state.and_then(|s| s.entry_id);
+        let art_id = state
+            .filter(|s| s.entry_id.is_some())
+            .and_then(|s| s.track.as_ref())
+            .and_then(|t| t.art_id);
+        let up_next = player.up_next.as_ref();
+        let ahead: u64 = up_next.map_or(0, |q| {
+            q.entries
+                .iter()
+                .map(|entry| entry.track.duration_ms.unwrap_or(0))
+                .sum()
+        });
+        let here = state
+            .and_then(|s| s.duration_ms)
+            .unwrap_or(0)
+            .saturating_sub(player.position());
+        let left_minutes = (ahead + here + 30_000) / 60_000;
+        Self {
+            entry_id,
+            art_id,
+            playing: player.playing(),
+            repeat: state.map_or(Repeat::Off, |s| s.repeat),
+            shuffle: state.is_some_and(|s| s.shuffle),
+            queue_revision: up_next.map(|q| q.revision),
+            up_next_version: player.up_next_version(),
+            ratings_revision: up_next.map(|q| q.ratings_revision),
+            ratings_version: player.ratings_version(),
+            entries_len: up_next.map_or(0, |q| q.entries.len()),
+            total: up_next.map_or(0, |q| q.total),
+            left_minutes,
+        }
+    }
+}
 
 /// The room the page gives Up next's card, as the shell last set it: the
 /// rail when the card moves the page over, or nothing.
@@ -111,12 +167,18 @@ pub(crate) struct UpNextCard {
     player: Entity<Player>,
     /// Covers read, by their art.
     pictures: HashMap<Id, Arc<RenderImage>>,
+    /// Covers the server reported missing (404): never re-requested in this session.
+    missing: HashSet<Id>,
+    /// Covers whose fetch failed transiently, with exponential backoff.
+    retries: crate::covers::Retries,
     /// Covers currently being fetched.
     in_flight: HashSet<Id>,
     /// In-flight cover fetch tasks, aborted when the card is dropped.
     fetches: crate::covers::FetchBag,
     /// Art IDs currently displayed (now playing + queue entries).
     current_arts: HashSet<Id>,
+    /// Last displayed player snapshot, to skip redundant progress-only updates.
+    snapshot: Option<CardSnapshot>,
     /// The entries of the last read, and its revision: entries that arrive
     /// in a later one show arriving for a moment.
     seen: HashSet<Id>,
@@ -138,12 +200,35 @@ pub(crate) struct UpNextCard {
     pub over: bool,
     /// Over a colour the page borrows: a thinner fill.
     pub washed: bool,
+    _link: Subscription,
     _player: Subscription,
 }
 
 impl UpNextCard {
     pub(crate) fn new(link: Entity<Link>, player: Entity<Player>, cx: &mut Context<Self>) -> Self {
+        let session = cx.subscribe(
+            &link,
+            |card: &mut Self, _, event: &LinkEvent, cx| match event {
+                LinkEvent::Connected(_) => {
+                    card.missing.clear();
+                    card.retries = crate::covers::Retries::default();
+                    card.read(cx);
+                    cx.notify();
+                }
+                LinkEvent::Restated(_) => {
+                    card.retries = crate::covers::Retries::default();
+                    card.read(cx);
+                    cx.notify();
+                }
+                _ => {}
+            },
+        );
         let followed = cx.observe(&player, |card, _, cx| {
+            let snap = CardSnapshot::of(card.player.read(cx));
+            if card.snapshot.as_ref() == Some(&snap) {
+                return;
+            }
+            card.snapshot = Some(snap);
             card.read(cx);
             cx.notify();
         });
@@ -151,9 +236,12 @@ impl UpNextCard {
             link,
             player,
             pictures: HashMap::new(),
+            missing: HashSet::new(),
+            retries: crate::covers::Retries::default(),
             in_flight: HashSet::new(),
             fetches: crate::covers::FetchBag::default(),
             current_arts: HashSet::new(),
+            snapshot: None,
             seen: HashSet::new(),
             last_revision: None,
             fresh: HashSet::new(),
@@ -165,6 +253,7 @@ impl UpNextCard {
             hovered: None,
             over: false,
             washed: false,
+            _link: session,
             _player: followed,
         };
         cx.on_release(|card, cx| {
@@ -173,6 +262,7 @@ impl UpNextCard {
             }
         })
         .detach();
+        card.snapshot = Some(CardSnapshot::of(card.player.read(cx)));
         card.read(cx);
         card
     }
@@ -214,6 +304,9 @@ impl UpNextCard {
         for old in self.prune_pictures() {
             crate::covers::drop_unshared(old, None, cx);
         }
+        // Reconcile queued covers independently of whether the queue revision
+        // changed so retry timers and reconnects recover transiently failed art.
+        self.want(arts, cx);
         if self.last_revision == Some(read.revision)
             && read.entries.len() == self.seen.len()
             && read
@@ -230,7 +323,6 @@ impl UpNextCard {
         }
         self.seen = ids;
         self.last_revision = Some(read.revision);
-        self.want(arts, cx);
     }
 
     /// Reads the covers not yet read, at the pixels the song on is drawn at.
@@ -238,8 +330,13 @@ impl UpNextCard {
         let Some(net) = self.link.read(cx).net() else {
             return;
         };
+        let now = Instant::now();
         for art in arts {
-            if self.pictures.contains_key(&art) || !self.in_flight.insert(art) {
+            if self.pictures.contains_key(&art)
+                || self.missing.contains(&art)
+                || self.retries.waits(art, now)
+                || !self.in_flight.insert(art)
+            {
                 continue;
             }
             let px = 88;
@@ -250,16 +347,38 @@ impl UpNextCard {
                 .spawn(async move { crate::covers::fetch_square(&http, &sizes, art, px).await });
             self.fetches.push(read.abort_handle());
             cx.spawn(async move |this, cx| {
-                let result = read.await.ok().and_then(Result::ok);
+                let Ok(result) = read.await else {
+                    return;
+                };
                 this.update(cx, |card, cx| {
                     card.in_flight.remove(&art);
-                    if let Some((image, _, _)) = result {
-                        let image = Arc::new(image);
-                        for old in take_picture(&mut card.pictures, &card.current_arts, art, image)
-                        {
-                            crate::covers::drop_unshared(old, None, cx);
+                    match result {
+                        Ok((image, _, _)) => {
+                            card.retries.read(art);
+                            let image = Arc::new(image);
+                            for old in
+                                take_picture(&mut card.pictures, &card.current_arts, art, image)
+                            {
+                                crate::covers::drop_unshared(old, None, cx);
+                            }
+                            cx.notify();
                         }
-                        cx.notify();
+                        Err(NoArt::Missing) => {
+                            card.retries.read(art);
+                            card.missing.insert(art);
+                        }
+                        Err(NoArt::Failed) => {
+                            let wait = card.retries.failed(art, Instant::now());
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(wait).await;
+                                this.update(cx, |card, cx| {
+                                    card.read(cx);
+                                    cx.notify();
+                                })
+                                .ok();
+                            })
+                            .detach();
+                        }
                     }
                 })
                 .ok();
@@ -1085,6 +1204,10 @@ fn take_picture(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use gpui::AppContext;
+
     use super::*;
 
     fn entry(id: u8) -> QueueEntry {
@@ -1157,5 +1280,131 @@ mod tests {
             assert!(take_picture(&mut pictures, &large_keep, id, make()).is_empty() || id == kept);
         }
         assert_eq!(pictures.len(), MAX_PICTURES + 20);
+    }
+
+    #[gpui::test]
+    fn snapshot_changes_on_optimistic_queue_move(cx: &mut gpui::TestAppContext) {
+        let link = cx.update(crate::link::unlinked);
+        let player = cx.new(|cx| Player::new(&link, cx));
+        let mut e1 = entry(1);
+        let mut e2 = entry(2);
+        e1.track.duration_ms = Some(180_000);
+        e2.track.duration_ms = Some(180_000);
+        let e2_id = e2.entry_id;
+        let before = player.update(cx, |player, _| {
+            player.up_next = Some(crate::player::UpNext {
+                revision: 4,
+                ratings_revision: 1,
+                total: 2,
+                entries: vec![e1, e2],
+            });
+            CardSnapshot::of(player)
+        });
+        let after = player.update(cx, |player, cx| {
+            player.move_entries(vec![e2_id], QueuePlace::Next, cx);
+            CardSnapshot::of(player)
+        });
+        assert_ne!(before, after);
+    }
+
+    #[gpui::test]
+    fn read_retries_queued_art_when_queue_revision_is_unchanged(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        cx.executor().allow_parking();
+        let rt = crate::net::rt();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let address = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+            let addr = listener.local_addr().ok()?;
+            tokio::spawn(async move {
+                let mut body = Vec::new();
+                let img = image::RgbImage::from_pixel(32, 32, image::Rgb([40, 80, 120]));
+                let _ = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut body, 90)
+                    .encode_image(&img);
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let reqs = Arc::clone(&server_requests);
+                    let body = body.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 1024];
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        let attempt = reqs.fetch_add(1, Ordering::SeqCst);
+                        let reply = if attempt == 0 {
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+                                .to_owned()
+                        } else {
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                        };
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                        if attempt > 0 {
+                            let _ = stream.write_all(&body).await;
+                        }
+                    });
+                }
+            });
+            Some(addr)
+        });
+        assert!(address.is_some(), "art test server failed to bind");
+        let Some(address) = address else { return };
+
+        let art = Id::from_bytes([77; 16]);
+        let mut queued = entry(1);
+        queued.track.art_id = Some(art);
+
+        let (send, _calls) = tokio::sync::mpsc::channel::<String>(16);
+        let (_answer, receive) = tokio::sync::mpsc::channel(16);
+        let _guard = rt.enter();
+        let client = Arc::new(ritornel_client::Client::over_memory(send, receive));
+        let net = Arc::new(crate::net::Net::satellite(client, true).with_art(address, vec![88]));
+        let link = cx.update(crate::link::unlinked);
+        link.update(cx, |link, cx| {
+            link.state = crate::link::State::Connected(Arc::clone(&net));
+            cx.notify();
+        });
+        let player = cx.new(|cx| Player::new(&link, cx));
+        player.update(cx, |player, _| {
+            player.up_next = Some(crate::player::UpNext {
+                revision: 9,
+                ratings_revision: 1,
+                total: 1,
+                entries: vec![queued],
+            });
+        });
+        let card = cx.new(|cx| UpNextCard::new(link.clone(), player.clone(), cx));
+        // Wait for the initial 503 failure to finish.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while card.read_with(cx, |card, _| {
+            requests.load(Ordering::SeqCst) < 1 || !card.in_flight.is_empty()
+        }) {
+            assert!(Instant::now() < deadline, "initial fetch did not finish");
+            cx.run_until_parked();
+            // sleep: yield to Tokio background server for the 503 response.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!card.read_with(cx, |card, _| card.pictures.contains_key(&art)));
+
+        // Simulate retry timer firing with an unchanged queue revision/entries.
+        card.update(cx, |card, cx| {
+            card.retries = crate::covers::Retries::default();
+            card.read(cx);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !card.read_with(cx, |card, _| card.pictures.contains_key(&art)) {
+            assert!(
+                Instant::now() < deadline,
+                "queued cover was not retried on unchanged queue"
+            );
+            cx.run_until_parked();
+            // sleep: yield to Tokio background server for the 200 retry response.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 }
