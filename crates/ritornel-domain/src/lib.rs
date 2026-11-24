@@ -16,6 +16,8 @@
 //!   the library, or leaves it unbound.
 //! - [`selection`] orders the copies of a track for the player
 //!   (docs/internals/playback.md).
+//! - [`streams`] tells which of Spotify's streams and Last.fm's scrobbles
+//!   are one listen, and whether a stream with no scrobble counts.
 //!
 //! See docs/internals/identity.md.
 
@@ -31,10 +33,6 @@
     )
 )]
 
-// Nothing here uses the contract yet. The import keeps the dependency in
-// place, and Cargo's unused-dependency lint quiet, until something does.
-use ritornel_contract as _;
-
 pub mod catalog;
 mod discs;
 pub mod extract;
@@ -47,6 +45,8 @@ pub mod payload;
 pub mod resolve;
 pub mod scrobble;
 pub mod selection;
+pub mod stream_report;
+pub mod streams;
 #[cfg(test)]
 mod tests;
 

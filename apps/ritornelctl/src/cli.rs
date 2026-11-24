@@ -34,6 +34,7 @@
 //! ritornelctl settings
 //! ritornelctl settings awake <while-active [<minutes>] | always | never>
 //! ritornelctl spotify read <archive>
+//! ritornelctl spotify import <archive> [--samples]
 //! ```
 //!
 //! Every command takes `--json`, and every command that talks to a server
@@ -100,6 +101,7 @@ Usage:
   ritornelctl settings awake <while-active [<minutes>] | always | never>
                              [--data-dir <dir>] [--json]
   ritornelctl spotify read <archive> [--json]
+  ritornelctl spotify import <archive> [--samples] [--data-dir <dir>] [--json]
 
 Commands:
   status           Show the running server's ID, name and role, the versions
@@ -240,6 +242,13 @@ Commands:
                    one word. It never keeps the IP address, user agent,
                    account name, country or the device. It needs no server,
                    and stores and sends nothing
+  spotify import <archive>
+                   Read the history as `spotify read` does, send what it
+                   keeps to the library's hub, and show what importing it
+                   would do, worked out without writing anything: which
+                   streams are the same listens as Last.fm's scrobbles,
+                   how many of the rest count, and the plays by year
+                   before and after. The hub keeps what was sent for a day
 
 Options:
   --name <name>         scan, artists pictures: the name the folder is
@@ -292,6 +301,8 @@ when given alone:
   --no-wait             lastfm sync: start it and return at once
   --limit <n>           lastfm report: how many doubtful tracks. The
                         default is 50
+  --samples             spotify import: show a sample of what each rule not
+                        yet in force would join, for judging it
   --data-dir <dir>      The data directory of the server to talk to
   --json                Print the answer as JSON, in the shape the server
                         sends it in
@@ -438,6 +449,19 @@ enum Command {
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 pub(crate) enum SpotifyCommand {
     Read(SpotifyReadArgs),
+    Import(SpotifyImportArgs),
+}
+
+/// What `spotify import` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct SpotifyImportArgs {
+    /// The zip file Spotify sent, or the folder it was unpacked to.
+    pub(crate) archive: PathBuf,
+    /// Show a sample of what each rule not yet in force would join.
+    #[arg(long)]
+    pub(crate) samples: bool,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `spotify read` takes. It talks to no server.
@@ -902,6 +926,7 @@ fn try_run(
         Command::Link(command) => link::link(&command, env, out),
         Command::Settings(args) => settings::settings(&args, env, out),
         Command::Spotify(SpotifyCommand::Read(args)) => spotify::read_command(&args, out),
+        Command::Spotify(SpotifyCommand::Import(args)) => spotify::import(&args, env, out),
     }
 }
 

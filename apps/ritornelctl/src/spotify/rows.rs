@@ -245,7 +245,11 @@ impl Raw {
             return Row::NotMusic(NotMusic::Audiobook);
         }
         match self.stream() {
-            Ok(stream) => stream,
+            Ok(Row::Music(stream)) => match stream.plausible() {
+                Ok(()) => Row::Music(stream),
+                Err(field) => Row::Wrong(field),
+            },
+            Ok(row) => row,
             Err(field) => Row::Wrong(field),
         }
     }
@@ -569,6 +573,8 @@ mod tests {
             ("shuffle", json!("MARKED")),
             ("offline_timestamp", json!(1.5)),
             ("shuffle", json!([true])),
+            ("ts", json!("2150-01-01T00:00:00Z")),
+            ("ms_played", json!(90_000_000)),
             ("reason_end", json!(7)),
         ] {
             let mut wrong = row();

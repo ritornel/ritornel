@@ -482,7 +482,7 @@ pub(crate) fn corrections(connection: &Connection) -> Result<Vec<Correction>, Er
 }
 
 /// Every listener's zone periods.
-fn zone_periods(connection: &Connection) -> Result<Vec<ZonePeriod>, Error> {
+pub(crate) fn zone_periods(connection: &Connection) -> Result<Vec<ZonePeriod>, Error> {
     let mut statement = connection.prepare_cached(
         "SELECT listener_id, zone_name, valid_from_ms, valid_to_ms FROM listener_zone_period",
     )?;
@@ -505,7 +505,7 @@ const MAY_HAVE_ARRIVED: &str = "('sending', 'accepted', 'unknown')";
 /// listen to the import's own endpoint, which may have arrived, sent with
 /// the import's time to the second and naming the same track, as sent or as
 /// the service took it. Of several, the earliest listen.
-fn echo_of(
+pub(crate) fn echo_of(
     connection: &Connection,
     endpoint: i64,
     played_at_ms: i64,

@@ -312,6 +312,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
         })
         .collect();
     let logs_dir = data_dir.join("logs");
+    let contract = ritornel_client::contract::CONTRACT_VERSION.to_string();
     assert_eq!(facts.len(), 13, "{}", printed.stdout);
     assert_eq!(
         facts[..7],
@@ -320,7 +321,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             ("Name", "Invented Desk"),
             ("Role", "unassigned"),
             ("Server version", env!("CARGO_PKG_VERSION")),
-            ("Contract version", "2"),
+            ("Contract version", contract.as_str()),
             ("SQLite version", "3.54.1"),
             ("Server schema", "2"),
         ]
@@ -356,7 +357,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             "role": "unassigned",
             "versions": {
                 "server": env!("CARGO_PKG_VERSION"),
-                "contract": 2,
+                "contract": ritornel_client::contract::CONTRACT_VERSION,
                 "sqlite": "3.54.1",
                 "serverSchema": 2,
             },

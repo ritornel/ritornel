@@ -422,6 +422,21 @@ methods! {
     LastfmReportCall: "lastfm.report", Query, needs_full: true,
     LastfmReportParams => LastfmReport;
 
+    /// `imports.stage`: keeps one piece of a run of streams read from an
+    /// archive on the hub, for a dry run. The library is not written.
+    ImportsStage: "imports.stage", Command, needs_full: true,
+    ImportsStageParams => ImportsStaged;
+
+    /// `imports.dryRun`: starts a job that works out, read-only, what
+    /// applying a staged run would do. A dry run of the run that is running
+    /// already is returned.
+    ImportsDryRun: "imports.dryRun", Command, needs_full: true,
+    ImportsDryRunParams => ImportsDryRunStarted;
+
+    /// `imports.get`: a staged run, with its last dry run's report.
+    ImportsGet: "imports.get", Query, needs_full: true,
+    ImportsGetParams => ImportRun;
+
     /// `artists.importPictures`: adds a picture folder on this server as a
     /// named root, if it is not one, and takes each artist's portrait from
     /// it, dropping those it no longer chooses. The server only ever reads
@@ -599,6 +614,9 @@ mod tests {
                 "lastfm.sync",
                 "lastfm.setScrobbling",
                 "lastfm.report",
+                "imports.stage",
+                "imports.dryRun",
+                "imports.get",
                 "artists.importPictures",
                 "artists.pictureFolders",
                 "library.setWatching",
@@ -651,6 +669,9 @@ mod tests {
                 "lastfm.sync",
                 "lastfm.setScrobbling",
                 "lastfm.report",
+                "imports.stage",
+                "imports.dryRun",
+                "imports.get",
                 "artists.importPictures",
                 "artists.pictureFolders",
                 "library.setWatching",

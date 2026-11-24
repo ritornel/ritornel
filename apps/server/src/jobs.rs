@@ -216,6 +216,9 @@ fn run(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &At
     if job.kind == crate::lastfm::SYNC_JOB {
         return sync(core, job, stop);
     }
+    if job.kind == crate::imports::DRY_RUN_JOB {
+        return crate::imports::run_dry_run(core, job, stop);
+    }
     scan(core, job, settings, stop);
 }
 

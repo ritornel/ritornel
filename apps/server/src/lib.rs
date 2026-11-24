@@ -35,6 +35,7 @@ mod data_dir;
 mod dispatch;
 mod error;
 mod hub_catalog;
+mod imports;
 mod invent;
 mod jobs;
 mod lastfm;

@@ -1125,6 +1125,48 @@ fn a_counted_listen_is_recorded_before_it_is_sent_once_and_its_echo_joins_its_pl
     let incremental = at.library.derived_history().unwrap();
     at.rebuild(PlayRule::V1, false);
     assert_eq!(at.library.derived_history().unwrap(), incremental);
+
+    // A Spotify stream at the same moment is never joined to the echo of a
+    // listen of this library's own: the two are two players. The other
+    // scrobble is offered, and joins its stream.
+    let streams = vec![
+        crate::import_store::tests::stream(start, 144_000, "Paper Kites"),
+        crate::import_store::tests::stream(start + 1000, 144_000, "Lanternfish"),
+    ];
+    let report = at.library.stream_dry_run(streams.clone()).unwrap();
+    assert_eq!((report.scrobbles, report.scrobbles_echoes), (1, 1));
+    assert_eq!(report.tiers[0].joined, 1);
+
+    // A second copy of the echo, as a read that shifted could store, stands
+    // as a play of its own, and is still never offered to a stream.
+    let again = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: b"again".to_vec(),
+            played_at_ms: start,
+            track: ritornel_source::TrackText {
+                artist: "moss arcade".to_owned(),
+                album: Some("Tin Weather".to_owned()),
+                title: "Paper Kites".to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: start,
+            to_ms: start + 1000,
+        },
+        cursor: "{}".to_owned(),
+    };
+    at.library
+        .ingest(Observations::Imports {
+            account,
+            batch: &again,
+            full: false,
+        })
+        .unwrap();
+    let report = at.library.stream_dry_run(streams).unwrap();
+    assert_eq!((report.scrobbles, report.scrobbles_echoes), (1, 2));
+    assert_eq!(report.tiers[0].joined, 1);
 }
 
 #[test]

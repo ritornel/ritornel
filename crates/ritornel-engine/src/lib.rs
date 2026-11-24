@@ -76,6 +76,7 @@ mod server_store;
 mod service_session;
 mod sqlite;
 mod stats;
+mod stream_import;
 #[cfg(test)]
 mod testing;
 mod timekeeping;

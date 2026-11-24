@@ -15,16 +15,16 @@ use ritornel_contract::methods::{
     self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, EventsSubscribe,
     EventsUnsubscribe, HistoryAlbum, HistoryArtist, HistoryExport, HistoryOnThisDay,
     HistoryRebuild, HistoryRecent, HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones,
-    IdentityDryRun, IdentityReview, JobsCancel, JobsGet, JobsList, LastfmReportCall,
-    LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
-    LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkCopiesCall,
-    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall, ListClose,
-    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
-    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
-    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
-    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerSetSettings,
-    ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks,
-    TracksGet,
+    IdentityDryRun, IdentityReview, ImportsDryRun, ImportsGet, ImportsStage, JobsCancel, JobsGet,
+    JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart,
+    LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching,
+    LibraryStats, LinkCopiesCall, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall,
+    LinkTracksCall, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
+    MediaTokenCall, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume,
+    PlaybackSeek, PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove,
+    QueueRemove, QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello,
+    ServerSetSettings, ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList,
+    SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -53,6 +53,7 @@ mod calls;
 mod churn;
 mod export;
 mod history;
+mod imports;
 mod lastfm;
 mod link;
 mod lists;
@@ -176,6 +177,8 @@ pub(crate) struct Core {
     audio_pace: std::sync::OnceLock<std::time::Duration>,
     /// Last.fm, once the server has started.
     lastfm: std::sync::OnceLock<crate::lastfm::Lastfm>,
+    /// The runs of streams staged for a dry run.
+    staging: crate::imports::Staging,
     /// Watching the hub's folders, once the server has started.
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// Where backups go, once the server has started.
@@ -270,6 +273,7 @@ impl Core {
             ))),
             _ => None,
         };
+        let staging = crate::imports::Staging::start(dir.imports())?;
         let cache = dir.cache()?;
         let covers = ritornel_engine::covers::Covers::new(&cache).map_err(|error| Error::Io {
             doing: "prepare",
@@ -313,6 +317,7 @@ impl Core {
             sounding: std::sync::atomic::AtomicBool::new(false),
             audio_pace: std::sync::OnceLock::new(),
             lastfm: std::sync::OnceLock::new(),
+            staging,
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
             cache_bytes: std::sync::OnceLock::new(),
@@ -1070,6 +1075,13 @@ impl Core {
             LastfmSetScrobbling::NAME => run::<LastfmSetScrobbling>(params, |params| {
                 self.lastfm_set_scrobbling(stores, &params)
             }),
+            ImportsStage::NAME => {
+                run::<ImportsStage>(params, |params| self.imports_stage(stores, &params))
+            }
+            ImportsDryRun::NAME => {
+                run::<ImportsDryRun>(params, |params| self.imports_dry_run(stores, &params))
+            }
+            ImportsGet::NAME => run::<ImportsGet>(params, |params| self.imports_get(&params)),
             LastfmReportCall::NAME => {
                 run::<LastfmReportCall>(params, |params| self.lastfm_report(stores, &params))
             }
@@ -1363,9 +1375,16 @@ fn run<M: Method>(
         }
     };
     let params = serde_json::from_value(params).map_err(|error| {
+        // A staged stream's values are a listener's history, and serde's
+        // message can quote one: that call is told only that one is wrong.
+        let why = if M::NAME == ImportsStage::NAME {
+            "a field is unknown or holds a value of another kind".to_owned()
+        } else {
+            error.to_string()
+        };
         RpcError::new(
             ErrorCode::Invalid,
-            format!("the params of {} are wrong: {error}", M::NAME),
+            format!("the params of {} are wrong: {why}", M::NAME),
         )
     })?;
     serde_json::to_value(handler(params)?).map_err(|error| {
@@ -2573,5 +2592,25 @@ mod tests {
             .collect();
         got.sort_unstable();
         assert_eq!(got, [("create", true), ("status", true)]);
+    }
+
+    #[test]
+    fn a_staged_stream_of_the_wrong_kind_is_refused_without_its_value() {
+        let params = json!({
+            "idempotencyKey": Id::from_bytes([1; 16]),
+            "runId": Id::from_bytes([2; 16]),
+            "piece": 0,
+            "pieces": 1,
+            "streams": [{
+                "endedAt": 1, "msPlayed": 1, "trackUri": "spotify:track:1",
+                "title": "Low Tide", "artist": "Calla Brandt", "shuffle": "MARKED_VALUE",
+            }],
+        });
+        let refused = run::<ImportsStage>(Some(params.clone()), |_| unreachable!()).unwrap_err();
+        assert!(!refused.message.contains("MARKED"), "{}", refused.message);
+        let mut unknown = params;
+        unknown["archivePath"] = json!("MARKED_PATH");
+        let refused = run::<ImportsStage>(Some(unknown), |_| unreachable!()).unwrap_err();
+        assert!(!refused.message.contains("MARKED"), "{}", refused.message);
     }
 }

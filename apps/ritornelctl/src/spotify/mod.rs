@@ -3,13 +3,16 @@
 //!
 //! `spotify read <archive>` reads the zip file Spotify sent, or the folder
 //! it was unpacked to, keeps each row's kept fields, and says what it read.
-//! It stores nothing and sends nothing.
+//! It stores nothing and sends nothing. `spotify import <archive>` reads it
+//! the same way and sends what it keeps to the hub for a dry run.
 
 mod archive;
+mod import;
 mod rows;
 
 pub(crate) use self::archive::Error as ArchiveError;
 use self::archive::shown;
+pub(crate) use self::import::import;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -210,6 +213,13 @@ fn to_json(tally: &Tally) -> serde_json::Value {
 }
 
 fn render(tally: &Tally) -> String {
+    let mut text = render_tally(tally);
+    text.push_str("Nothing was stored or sent.\n");
+    text
+}
+
+/// What was read, as a person reads it.
+fn render_tally(tally: &Tally) -> String {
     let not_music: u64 = tally.not_music.iter().sum();
     let mut lines = vec![
         ("Files", tally.files.to_string()),
@@ -278,7 +288,6 @@ fn render(tally: &Tally) -> String {
             tally.wrong - tally.wrong_named.len() as u64
         ));
     }
-    text.push_str("Nothing was stored or sent.\n");
     text
 }
 

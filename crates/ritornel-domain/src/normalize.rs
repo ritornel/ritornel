@@ -29,7 +29,7 @@ fn parts_words(c: char) -> bool {
 
 /// Whether a mark is a symbol, as Unicode's maths, currency and other
 /// symbols are, rather than punctuation: `+`, `=`, `÷`, `$`, `★`.
-fn is_symbol(c: char) -> bool {
+pub(crate) fn is_symbol(c: char) -> bool {
     !c.is_alphanumeric()
         && matches!(c,
             '+' | '<' | '=' | '>' | '$'

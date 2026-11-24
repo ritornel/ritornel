@@ -75,6 +75,8 @@ pub struct Server {
     /// What lets a hub's machine sleep again once no linked server is
     /// active.
     awake: Task,
+    /// Removes the staged imports that have expired.
+    sweep: Task,
     transports: Transports,
     listening: Listening,
     bounds: Bounds,
@@ -277,6 +279,7 @@ impl Server {
         let watcher = crate::watch::Watcher::start(Arc::clone(&core)).map_err(Error::Runtime)?;
         let hub = Task(tokio::spawn(crate::uplink::follow(Arc::clone(&core))));
         let awake = Task(tokio::spawn(crate::awake::check(Arc::clone(&core))));
+        let sweep = Task(tokio::spawn(crate::imports::sweep(Arc::clone(&core))));
 
         // The server answers, so a client may be told where it is.
         let server_json = ServerJson::publish(
@@ -293,6 +296,7 @@ impl Server {
             watcher,
             hub,
             awake,
+            sweep,
             core,
             listening,
             bounds,
@@ -401,6 +405,7 @@ impl Server {
         self.core.stop_hub_within(self.bounds.stop_grace);
         drop(self.hub);
         drop(self.awake);
+        drop(self.sweep);
         self.core.close_sessions();
         self.listening.stop().await;
         self.core.end_transports(self.bounds.stop_grace).await;
