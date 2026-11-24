@@ -21,163 +21,218 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   NEXTEST_PROFILE: ci
 
-# The jobs together run what `mise run check` runs, each part where it can
-# fail: what is the same on every system once, and what differs by system on
-# each. The setup they share is .github/actions/setup.
+# Every PR runs a fast `checks` job and one job per system (`linux`, `macos`,
+# `windows`), unless every file changed since merge-base(origin/main, HEAD) is
+# documentation or a licence file. Release desktop builds, the arm64 player,
+# and cache pruning run after merge on `push: main`.
 jobs:
-  changes:
-    # Which jobs a pull request's changes can affect, by scripts/ci-changes.sh:
-    # one that touches only the desktop app skips the main workspace's jobs,
-    # and one that touches only what the desktop app does not build skips
-    # the desktop jobs. A push to main runs every job, so its caches are all
-    # saved.
-    #
-    # And on which systems, by the tier. A pull request whose branch is the
-    # base of another open one from this repository, a layer under the top
-    # of a stack, has the Linux tier: the jobs on Linux x64 alone. Every
-    # other run has the full tier, every system: a pull request on its own,
-    # the top of a stack, which holds every layer under it and is where the
-    # stack lands, and a push to main. When the pull requests cannot be
-    # listed, the tier is full.
-    name: Jobs the change needs
-    runs-on: ubuntu-slim
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      workspace: ${{ steps.paths.outputs.workspace }}
-      desktop: ${{ steps.paths.outputs.desktop }}
-      tier: ${{ steps.tier.outputs.tier }}
-      systems: ${{ steps.tier.outputs.systems }}
-    steps:
-      # What started the run, so a run started twice for one commit can be
-      # told apart from the other.
-      - env:
-          ACTION: ${{ github.event.action }}
-          BEFORE: ${{ github.event.before }}
-          AFTER: ${{ github.event.after }}
-        run: echo "event=$GITHUB_EVENT_NAME action=$ACTION before=$BEFORE after=$AFTER"
-      # A pull request's run checks out its merge into the base branch, whose
-      # first parent is the base: the two differ by what the pull request
-      # changes. Without renames, a moved file is listed at both its paths.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-      - id: paths
-        env:
-          EVENT: ${{ github.event_name }}
-        run: |
-          if [[ $EVENT == pull_request ]]; then
-            git diff --name-only --no-renames HEAD^1 HEAD | scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
-          else
-            printf 'workspace=true\ndesktop=true\n' | tee -a "$GITHUB_OUTPUT"
-          fi
-      - id: tier
-        env:
-          EVENT: ${{ github.event_name }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_REF: ${{ github.head_ref }}
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          tier=full
-          if [[ $EVENT != pull_request ]]; then
-            why="a push to $GITHUB_REF_NAME"
-          elif [[ $HEAD_REPO != "$GH_REPO" ]]; then
-            why="a pull request from a fork"
-          # A pull request from a fork does not land through the one it is based on.
-          elif ! above=$(gh api --method GET "repos/$GH_REPO/pulls" -f state=open -f base="$HEAD_REF" -F per_page=100 \
-            --jq 'map(select(.head.repo.full_name == .base.repo.full_name) | "#\(.number)") | join(", ")'); then
-            why="the open pull requests could not be listed"
-          elif [[ -n $above ]]; then
-            tier=linux
-            why="$HEAD_REF is the base of $above"
-          else
-            why="no open pull request is based on $HEAD_REF"
-          fi
-          if [[ $tier == linux ]]; then
-            systems='["Linux"]'
-          else
-            systems='["Linux","macOS","Windows"]'
-          fi
-          printf 'tier=%s\nsystems=%s\n' "$tier" "$systems" | tee -a "$GITHUB_OUTPUT"
-          echo "The $tier tier: $why." | tee -a "$GITHUB_STEP_SUMMARY"
-
   checks:
     name: Formatting, dependencies, test sleeps, docs and licences
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    timeout-minutes: 15
+    outputs:
+      docs_only: ${{ steps.docs_only.outputs.docs_only }}
     steps:
-      # The whole history, so the contract check finds where a pull
-      # request, stacked on another or not, leaves main.
+      # Full history, so both the cumulative docs-only check and the contract
+      # check find where a pull request (stacked or standalone) leaves main.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      # rustdoc runs the build scripts, and cpal's asks for ALSA.
       - uses: ./.github/actions/setup
         with:
-          packages: libasound2-dev
           disable-tools: conda:ffmpeg,aqua:nextest-rs/nextest/cargo-nextest
-          rust-cache: workspace
+          rust-cache: none
+      # Skip the three OS jobs only for a PR whose cumulative changes since
+      # origin/main are strictly documentation or licence files. A push to main
+      # always runs every job so its caches stay warm. Uses NUL-delimited raw
+      # paths and fails closed on empty diffs or git errors.
+      - id: docs_only
+        run: |
+          set -euo pipefail
+          if [[ $GITHUB_EVENT_NAME == pull_request ]]; then
+            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          fi
+          python3 - <<'PY'
+          import os, re, subprocess
+
+          event = os.environ.get("GITHUB_EVENT_NAME", "")
+          docs_only = False
+          base = ""
+          if event == "pull_request":
+              base = subprocess.check_output(
+                  ["git", "merge-base", "origin/main", "HEAD"], text=True
+              ).strip()
+              raw = subprocess.check_output(
+                  ["git", "diff", "-z", "--name-only", "--no-renames", base, "HEAD"]
+              )
+              paths = [p.decode("utf-8", errors="surrogateescape") for p in raw.split(b"\0") if p]
+              doc_re = re.compile(r"^(?:docs/.*|[^/]*\.md|LICENSE|LICENSES/.*)\Z", re.DOTALL)
+              docs_only = bool(paths) and all(
+                  ("\n" not in p and "\r" not in p) and doc_re.match(p) is not None
+                  for p in paths
+              )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"docs_only={'true' if docs_only else 'false'}\n")
+          if docs_only:
+              msg = f"Docs-only change since {base}: skipping platform builds.\n"
+              print(msg, end="")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as out:
+                      out.write(msg)
+          PY
       - run: mise run fmt
       - run: mise run deps
       - run: mise run sleeps
-      # A pull request's contract version is checked against main's, where
-      # the pull request leaves it.
+      # A pull request's contract version is checked against main's, where the
+      # pull request leaves it. origin/main was fetched in the step above.
       - if: github.event_name == 'pull_request'
-        run: |
-          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          mise run contract-version
-      - run: mise run docs
+        run: mise run contract-version
+      - run: scripts/check-docs.sh
       - run: mise run licenses
 
-  workspace:
-    # Clippy, rustdoc's links and the tests of the main workspace, on each
-    # system its code differs for. On Linux the server's audio output links ALSA, so that
-    # job installs ALSA's development files; the hub job proves the hub
-    # needs none.
-    name: Workspace on ${{ matrix.name }}
-    needs: changes
-    if: needs.changes.outputs.workspace == 'true'
-    strategy:
-      fail-fast: false
-      # The systems are the tier's, so a runner is named for each here
-      # rather than in an include, which would add back a system the tier
-      # leaves out.
-      matrix:
-        name: ${{ fromJSON(needs.changes.outputs.systems) }}
-    runs-on: ${{ fromJSON('{"Linux":"ubuntu-26.04","macOS":"macos-latest","Windows":"windows-latest"}')[matrix.name] }}
-    timeout-minutes: 45
+  linux:
+    name: Linux
+    needs: checks
+    if: needs.checks.outputs.docs_only != 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup
         with:
-          packages: ${{ matrix.name == 'Linux' && 'libasound2-dev' || '' }}
-      - run: mise run lint
-      # The checks job runs it on Linux, with the rest of `mise run docs`.
-      - if: runner.os != 'Linux'
+          packages: pkg-config libasound2-dev libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+          workspaces: |
+            .
+            apps/desktop
+          shared-key: platform-debug
+      - name: Workspace lint
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Server feature-variant lint
+        run: |
+          cargo clippy --locked --package ritornel-server --no-default-features --features musicbrainz --all-targets -- -D warnings
+          cargo clippy --locked --package ritornel-server --no-default-features --all-targets -- -D warnings
+          cargo clippy --locked --package ritornel-server --no-default-features --features audio-output --all-targets -- -D warnings
+      - name: Workspace rustdoc
         run: mise run rustdoc
-      - run: mise run test
+      # Build test binaries first, then run them, so compile and test timings
+      # appear as separate steps (cargo-nextest has no --no-build flag; the
+      # second call reuses the fresh build without recompiling).
+      - name: Build workspace tests
+        run: cargo nextest run --locked --workspace --all-features --no-run
+      - name: Run workspace tests
+        run: cargo nextest run --locked --workspace --all-features
+      - name: Workspace doc tests
+        run: cargo test --locked --workspace --all-features --doc
+      # The headless hub, as built for a Linux machine with no desktop:
+      # PKG_CONFIG_LIBDIR=/nonexistent blocks pkg-config discovery of system
+      # libraries (ALSA and desktop libraries among them) so any crate that
+      # probes for them through pkg-config fails the build.
+      - name: Hub without pkg-config system libraries
+        env:
+          PKG_CONFIG_LIBDIR: /nonexistent
+          PKG_CONFIG_PATH: ''
+        run: |
+          cargo nextest run --locked --package ritornel-server --no-default-features --features musicbrainz
+          cargo test --locked --package ritornel-server --no-default-features --features musicbrainz --doc
+      - name: Desktop debug check
+        run: mise run desktop:check
 
-  desktop:
-    # The desktop app, a workspace of its own, checked, linted and tested on
-    # each system. On Linux GPUI's Wayland and X11
-    # backends link fontconfig, xcb and xkbcommon; scripts/desktop.sh skips
-    # without them, and fails instead in CI, so the job cannot pass by
-    # skipping. On Windows the task runs scripts/desktop.ps1.
-    name: Desktop app on ${{ matrix.name }}
-    needs: changes
-    if: needs.changes.outputs.desktop == 'true'
+  macos:
+    name: macOS
+    needs: checks
+    if: needs.checks.outputs.docs_only != 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          workspaces: |
+            .
+            apps/desktop
+          shared-key: platform-debug
+      - name: Workspace lint
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Workspace rustdoc
+        run: mise run rustdoc
+      - name: Build workspace tests
+        run: cargo nextest run --locked --workspace --all-features --no-run
+      - name: Run workspace tests
+        run: cargo nextest run --locked --workspace --all-features
+      - name: Desktop debug check
+        run: mise run desktop:check
+
+  windows:
+    name: Windows
+    needs: checks
+    if: needs.checks.outputs.docs_only != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          workspaces: |
+            .
+            apps/desktop
+          shared-key: platform-debug
+      - name: Workspace lint
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Workspace rustdoc
+        run: mise run rustdoc
+      - name: Build workspace tests
+        run: cargo nextest run --locked --workspace --all-features --no-run
+      - name: Run workspace tests
+        run: cargo nextest run --locked --workspace --all-features
+      - name: Desktop debug check
+        run: mise run desktop:check
+
+  passed:
+    # The single check for branch protection to require: passes only when
+    # `checks` succeeded and either all three OS jobs individually succeeded or
+    # the PR was strictly docs-only. Skipped on cancelled runs so a superseded
+    # push does not mark a commit failed.
+    name: CI passed
+    if: ${{ !cancelled() }}
+    needs: [checks, linux, macos, windows]
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      - if: >-
+          needs.checks.result != 'success' ||
+          (
+            !(github.event_name == 'pull_request' && needs.checks.outputs.docs_only == 'true') &&
+            (needs.linux.result != 'success' || needs.macos.result != 'success' || needs.windows.result != 'success')
+          ) ||
+          contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+
+  desktop-release:
+    # Post-merge release build of the desktop app (thin LTO, single CGU) on
+    # each system, using its own cache key so PRs never download release
+    # artifacts.
+    name: Desktop release on ${{ matrix.name }}
+    if: github.ref == 'refs/heads/main'
     strategy:
       fail-fast: false
       matrix:
-        name: ${{ fromJSON(needs.changes.outputs.systems) }}
-    runs-on: ${{ fromJSON('{"Linux":"ubuntu-26.04","macOS":"macos-latest","Windows":"windows-latest"}')[matrix.name] }}
+        include:
+          - name: Linux
+            runner: ubuntu-26.04
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -188,44 +243,15 @@ jobs:
           packages: >-
             ${{ matrix.name == 'Linux' && 'pkg-config libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev' || '' }}
           workspaces: apps/desktop
+          shared-key: desktop-release
           disable-tools: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny,aqua:nextest-rs/nextest/cargo-nextest
-      - run: mise run desktop:check
-
-  hub:
-    # The headless hub, as it is built for a Linux machine with no desktop:
-    # the server without its default features but MusicBrainz, so no audio
-    # output, media session or Last.fm. pkg-config is pointed at nothing, so any crate
-    # that would link a system library (ALSA among them) fails the build.
-    # `mise run lint` lints it.
-    name: Hub on Linux, linking no system library
-    needs: changes
-    if: needs.changes.outputs.workspace == 'true'
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    env:
-      PKG_CONFIG_LIBDIR: /nonexistent
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup
-        with:
-          rust-cache: workspace
-      - run: cargo nextest run --locked --package ritornel-server --no-default-features --features musicbrainz
-      - run: cargo test --locked --package ritornel-server --no-default-features --features musicbrainz --doc
-      # And with no plugin at all.
-      - run: cargo clippy --locked --package ritornel-server --no-default-features --all-targets -- -D warnings
+      - run: mise run desktop:release
 
   player-arm64:
-    # The headless player, as it is built for a small arm64 board: the
-    # server with its audio output alone, which links ALSA, and no media
-    # session or Last.fm. GitHub's arm64 runner builds it natively, which is
-    # simpler than cross-linking ALSA, and runs the engine's and the
-    # server's tests on arm64. The last step prints the release build's
-    # size and the server's memory at idle. The full tier alone runs it.
+    # Post-merge native arm64 build, tests, release build, and footprint check
+    # for the headless player (audio-output alone, linking ALSA).
     name: Player on arm64 Linux
-    needs: changes
-    if: needs.changes.outputs.workspace == 'true' && needs.changes.outputs.tier == 'full'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -243,30 +269,6 @@ jobs:
       - run: cargo build --locked --release --package ritornelctl
       - run: scripts/player-footprint.sh target/release
 
-  passed:
-    # The one check for branch protection to require: it passes only when
-    # every job above passed, or was skipped because the changes job said
-    # it was not needed, for the change or the tier. A job added above goes
-    # in this list and, if it is one the changes job can skip, in the
-    # condition below.
-    name: CI passed
-    # Not in a run a newer one cancelled: its jobs say cancelled, and
-    # failing here as well would mark the commit failed, though the newer
-    # run tests the same commit. On a stacked PR one push to the stack is
-    # two events, one for the PR's base and one for its head.
-    if: ${{ !cancelled() }}
-    needs: [changes, checks, workspace, desktop, hub, player-arm64]
-    runs-on: ubuntu-slim
-    timeout-minutes: 5
-    steps:
-      - if: >-
-          needs.changes.result != 'success' || needs.checks.result != 'success' ||
-          (needs.changes.outputs.workspace != 'false' && (needs.workspace.result != 'success' || needs.hub.result != 'success')) ||
-          (needs.changes.outputs.workspace != 'false' && needs.changes.outputs.tier != 'linux' && needs.player-arm64.result != 'success') ||
-          (needs.changes.outputs.desktop != 'false' && needs.desktop.result != 'success') ||
-          contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
-        run: exit 1
-
   prune-caches:
     # On main, once every job has saved its cache: deletes each cache on main
     # that a newer one of the same kind replaced, such as the whole set saved
@@ -275,7 +277,7 @@ jobs:
     # left to the quota they would evict newer caches instead.
     name: Prune replaced caches
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
-    needs: [checks, workspace, desktop, hub, player-arm64]
+    needs: [checks, linux, macos, windows, desktop-release, player-arm64]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
