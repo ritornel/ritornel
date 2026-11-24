@@ -22,7 +22,8 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LUID, LocalFree,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LUID,
+    LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
     AUTHZ_ACCESS_REPLY, AUTHZ_ACCESS_REQUEST, AUTHZ_RM_FLAG_NO_AUDIT, AUTHZ_SKIP_TOKEN_GROUPS,
@@ -538,8 +539,8 @@ fn judge(descriptor: &Descriptor, folder: bool, user: &User) -> io::Result<bool>
 
 /// Each plain entry of `acl` that lets someone in: its flags, its access
 /// and its SID, or `None` for an entry of a kind this does not weigh, which
-/// is taken to let anyone do anything. Entries that deny, audit or label
-/// let nobody in, and are left out.
+/// is taken to let anyone do anything. Entries of the kinds that let
+/// nobody in are left out.
 fn entries(acl: *const ACL) -> io::Result<Vec<Option<(u32, u32, PSID)>>> {
     // SAFETY: the caller's `acl` is valid while this runs.
     let count = unsafe { (*acl).AceCount };
@@ -569,7 +570,11 @@ fn entries(acl: *const ACL) -> io::Result<Vec<Option<(u32, u32, PSID)>>> {
             | ACCESS_ALLOWED_OBJECT_ACE_TYPE
             | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
             | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => found.push(None),
-            _ => {}
+            // Entries that deny, audit, raise an alarm, label, or carry
+            // an attribute, a policy or a filter.
+            1..=3 | 6..=8 | 10 | 12..=21 => {}
+            // A kind newer than these is taken to let anyone in.
+            _ => found.push(None),
         }
     }
     Ok(found)
@@ -628,11 +633,12 @@ pub fn path_is_private(path: &Path) -> io::Result<bool> {
 }
 
 /// Whether Windows itself would let another user do more with what is at
-/// `path` than see that it is there: a user invented for the question, who
-/// is neither this one nor its owner, in the groups every signed-in user is
-/// in. It asks the system's own access check of the descriptor the file
-/// has, rather than reading the list as [`is_private`] does, so tests can
-/// hold the two to each other.
+/// `path` than see that it is there: a user invented for the question, in
+/// the groups every signed-in user is in. It asks the system's own access
+/// check of the descriptor the file or folder has, rather than reading the
+/// list as [`is_private`] does, so tests can hold the two to each other. It
+/// weighs access to the file or folder itself, not what a folder passes on
+/// to what is made in it.
 pub fn another_user_may_open(path: &Path) -> io::Result<bool> {
     let descriptor = Descriptor::of(
         &open(path, false)?,
@@ -791,6 +797,10 @@ fn granted_to_another(descriptor: &Descriptor) -> io::Result<u32> {
     };
     if checked == 0 {
         return Err(io::Error::last_os_error());
+    }
+    // Denied is an answer; any other error is not one.
+    if error != 0 && error != ERROR_ACCESS_DENIED {
+        return Err(io::Error::from_raw_os_error(error as i32));
     }
     Ok(granted)
 }

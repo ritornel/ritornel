@@ -377,6 +377,16 @@ mod tests {
     }
 
     #[test]
+    fn a_data_directory_that_is_a_file_is_refused() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("data");
+        std::fs::write(&root, "").unwrap();
+        let refused = HeldDir::take(root.clone());
+        assert!(matches!(refused, Err(Error::Io { .. })), "{refused:?}");
+        assert_eq!(std::fs::read(&root).unwrap(), b"");
+    }
+
+    #[test]
     fn a_server_with_no_library_is_not_given_a_library_file() {
         let scratch = Scratch::new();
         let held = HeldDir::take(scratch.path().join("data")).unwrap();
