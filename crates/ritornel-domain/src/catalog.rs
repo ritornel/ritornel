@@ -18,7 +18,9 @@ use std::hash::Hash;
 ///    Artist's, not Various Artists', and is formed and grouped as before.
 /// 4: a track appearance several files share shows what they claim in
 ///    first-seen order, whichever of them held it before.
-pub const CATALOG_VERSION: i64 = 4;
+/// 5: the tag values answers put on files are read above the files' own,
+///    and a join they give passes the guard on releases that carry input.
+pub const CATALOG_VERSION: i64 = 5;
 
 use crate::extract::{Facts, parse_date};
 use crate::library::{
@@ -312,6 +314,36 @@ fn keep_rows(
     kept
 }
 
+/// Each row any of `sets` holds, to the least row joined with it through
+/// them, by one set or a chain of them.
+fn joined<'a>(sets: impl Iterator<Item = &'a Vec<i64>>) -> HashMap<i64, i64> {
+    fn root(parent: &HashMap<i64, i64>, mut row: i64) -> i64 {
+        while let Some(&up) = parent.get(&row) {
+            if up == row {
+                break;
+            }
+            row = up;
+        }
+        row
+    }
+    let mut parent: HashMap<i64, i64> = HashMap::new();
+    for set in sets {
+        for row in set {
+            parent.entry(*row).or_insert(*row);
+        }
+        for pair in set.windows(2) {
+            if let [a, b] = pair {
+                let (a, b) = (root(&parent, *a), root(&parent, *b));
+                parent.insert(a.max(b), a.min(b));
+            }
+        }
+    }
+    parent
+        .keys()
+        .map(|row| (*row, root(&parent, *row)))
+        .collect()
+}
+
 fn find(parents: &mut [usize], mut node: usize) -> usize {
     while let Some(parent) = parents.get(node).copied()
         && parent != node
@@ -526,8 +558,14 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             r: Ref::New(0),
         })
         .collect();
+    // An item votes for the rows it is on, or for those it is to be kept
+    // on (an undo's).
     let release_of = |item: &Item| -> Option<i64> {
-        let appearance = item.current?.appearance?;
+        // A file pinned by hand stays where it is.
+        let prior = item
+            .prior
+            .filter(|_| !item.current.is_some_and(|current| current.by_user));
+        let appearance = prior.or_else(|| item.current.and_then(|current| current.appearance))?;
         let release = library.appearances.get(&appearance)?.1?;
         Some(
             library
@@ -539,11 +577,14 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
     // A merge of releases is the owner's and lasts: files on a release that
     // a merge was made into stay one release, whatever their tags say. The
     // formations that hold files on such a release are joined before rows
-    // are given out.
+    // are given out. A release an answer led on to where its files went is
+    // the answer's, and no merge.
     let merged: HashSet<i64> = library
         .releases
         .iter()
-        .filter(|(row, release)| **row != release.canonical)
+        .filter(|(row, release)| {
+            **row != release.canonical && !library.answer_redirects.contains(*row)
+        })
         .map(|(_, release)| release.canonical)
         .collect();
     if !merged.is_empty() {
@@ -603,7 +644,10 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
     }
     // Automatic release formation never silently collapses two distinct
     // canonical releases that BOTH carry owner input (edits, merges, a chosen
-    // group, or membership in an owner-edited group).
+    // group, or membership in an owner-edited group). Releases a standing
+    // answer put together count as one: a person said yes to that join.
+    let joined_releases = joined(library.answer_joins.iter().map(|join| &join.releases));
+    let owner_of = |rel: i64| joined_releases.get(&rel).copied().unwrap_or(rel);
     let mut split_forming: Vec<Forming> = Vec::with_capacity(forming.len());
     for release in forming {
         let mut distinct_owners: BTreeSet<i64> = BTreeSet::new();
@@ -613,7 +657,7 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 .and_then(|active| release_of(active.item))
                 && owner_releases.contains(&rel)
             {
-                distinct_owners.insert(rel);
+                distinct_owners.insert(owner_of(rel));
             }
         }
         if distinct_owners.len() <= 1 {
@@ -626,7 +670,8 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             let bucket = actives
                 .get(member)
                 .and_then(|active| release_of(active.item))
-                .filter(|rel| distinct_owners.contains(rel))
+                .map(owner_of)
+                .filter(|owner| distinct_owners.contains(owner))
                 .unwrap_or(first_owner);
             buckets.entry(bucket).or_default().push(member);
         }
@@ -726,25 +771,40 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 .release
                 .and_then(|at| forming.get(at))
                 .map(|release| release.r);
+            // The appearance it is to be kept on: an undo's, if it fits and
+            // does not lead on to another, else its current one if that fits.
+            let fits = |row: &i64| {
+                library
+                    .appearances
+                    .get(row)
+                    .is_some_and(|(recording, release)| {
+                        let release = release
+                            .map(|row| {
+                                library
+                                    .releases
+                                    .get(&row)
+                                    .map_or(row, |release| release.canonical)
+                            })
+                            .map(Ref::Row);
+                        Ref::Row(*recording) == active.assign && release == wanted_release
+                    })
+            };
+            let led_on = |row: &i64| {
+                library
+                    .appearance_canonical
+                    .get(row)
+                    .is_some_and(|canonical| canonical != row)
+            };
             let held = active
                 .item
-                .current
-                .and_then(|current| current.appearance)
-                .filter(|row| {
-                    library
-                        .appearances
-                        .get(row)
-                        .is_some_and(|(recording, release)| {
-                            let release = release
-                                .map(|row| {
-                                    library
-                                        .releases
-                                        .get(&row)
-                                        .map_or(row, |release| release.canonical)
-                                })
-                                .map(Ref::Row);
-                            Ref::Row(*recording) == active.assign && release == wanted_release
-                        })
+                .prior
+                .filter(|row| !led_on(row) && fits(row))
+                .or_else(|| {
+                    active
+                        .item
+                        .current
+                        .and_then(|current| current.appearance)
+                        .filter(&fits)
                 });
             // A pinned file keeps its appearance, whatever its tags say.
             let held = if active.pinned {
@@ -1382,14 +1442,40 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         Ref::New(_) => None,
     };
     let mut parents: Vec<usize> = (0..releases.len()).collect();
+    // A release is protected by the group it is in, or by the one an undo
+    // gives it back to. Groups a standing answer put together are one
+    // owner's.
+    // The groups of all the standing yeses to one album count as one too.
+    let mut by_album: BTreeMap<&str, Vec<i64>> = BTreeMap::new();
+    for join in &library.answer_joins {
+        by_album
+            .entry(join.album.as_str())
+            .or_default()
+            .extend(&join.groups);
+    }
+    let joined_groups = joined(
+        library
+            .answer_joins
+            .iter()
+            .map(|join| &join.groups)
+            .chain(by_album.values()),
+    );
+    let group_owner = |group: i64| joined_groups.get(&group).copied().unwrap_or(group);
     let mut comp_owner_group: Vec<Option<i64>> = releases
         .iter()
         .map(|release| match release.r {
             Ref::Row(row) => library
                 .releases
                 .get(&row)
-                .map(|existing| existing.group)
-                .filter(|group| owner_groups.contains(group)),
+                .map(|existing| {
+                    library
+                        .prior_groups
+                        .get(&row)
+                        .copied()
+                        .unwrap_or(existing.group)
+                })
+                .filter(|group| owner_groups.contains(group))
+                .map(group_owner),
             Ref::New(_) => None,
         })
         .collect();
@@ -1424,8 +1510,8 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         }
         families.entry(&formed.family).or_default().push(index);
     }
-    // First unite releases sharing an MBID that already belong to the same
-    // owner-edited group, then unite remaining pairs in deterministic order.
+    // Then unite releases sharing an MBID that already belong to the same
+    // owner-edited group, then the remaining pairs in deterministic order.
     for members in by_mbid.values() {
         for (at, a) in members.iter().enumerate() {
             for b in members.iter().skip(at + 1) {
@@ -1507,7 +1593,12 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 if let Some(Ref::Row(rel_row)) = releases.get(*index).map(|release| release.r)
                     && let Some(existing) = library.releases.get(&rel_row)
                 {
-                    let group = existing.group;
+                    // The group it was in before an undone answer, if any.
+                    let group = library
+                        .prior_groups
+                        .get(&rel_row)
+                        .copied()
+                        .unwrap_or(existing.group);
                     if library.groups.get(&group).and_then(|g| g.preferred_release) == Some(rel_row)
                     {
                         preferred_group_hits.insert((group, comp_idx));

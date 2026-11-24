@@ -612,6 +612,30 @@ methods! {
     /// change, as one: the albums now and after. It writes nothing.
     CorrectionsPreview: "corrections.preview", Query, needs_full: true,
     PreviewParams => PreviewShown;
+
+    /// `corrections.confirm`: yes to proposals, each with its candidate and
+    /// the fingerprint it was shown, in one write: the values each puts on
+    /// its files, and the catalog worked out again with them. A proposal
+    /// that has changed since is refused as `conflict` with the reason
+    /// `plan_stale`, and nothing is written.
+    CorrectionsConfirm: "corrections.confirm", Command, needs_full: true,
+    ConfirmParams => Answered;
+
+    /// `corrections.undo`: undoes answers, in one write. Each undo is an
+    /// answer of its own; the values the undone answer put are withdrawn,
+    /// and the files go back to the rows they were on.
+    CorrectionsUndo: "corrections.undo", Command, needs_full: true,
+    UndoParams => Answered;
+
+    /// `corrections.answers`: the ledger of answers, newest first, a page
+    /// at a time.
+    CorrectionsAnswers: "corrections.answers", Query, needs_full: true,
+    AnswersParams => AnswerList;
+
+    /// `corrections.answer`: one answer, with what it rested on and said
+    /// as it was kept when it was given.
+    CorrectionsAnswer: "corrections.answer", Query, needs_full: true,
+    AnswerParams => AnswerGot;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -716,7 +740,11 @@ mod tests {
                 "corrections.summary",
                 "corrections.list",
                 "corrections.get",
-                "corrections.preview"
+                "corrections.preview",
+                "corrections.confirm",
+                "corrections.undo",
+                "corrections.answers",
+                "corrections.answer"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -782,7 +810,11 @@ mod tests {
                 "corrections.summary",
                 "corrections.list",
                 "corrections.get",
-                "corrections.preview"
+                "corrections.preview",
+                "corrections.confirm",
+                "corrections.undo",
+                "corrections.answers",
+                "corrections.answer"
             ]
         );
         // Everything but reading the library and controlling playback

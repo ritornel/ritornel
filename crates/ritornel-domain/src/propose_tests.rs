@@ -27,6 +27,8 @@ fn file(id: i64, folder: &str, album: &str, track: i64, title: &str) -> Item {
         },
         held: Vec::new(),
         current: None,
+        prior: None,
+        prior_recording: None,
     }
 }
 
@@ -197,7 +199,7 @@ fn the_preview_of_the_group_is_one_album_of_two_discs() {
         .iter()
         .flat_map(|proposal| proposal.candidates[0].values.clone())
         .collect();
-    let shown = preview(&library, &values, &crate::Policy::current());
+    let shown = preview(&library, &values, &[], &crate::Policy::current());
     let shape = |title: &str, discs, songs| AlbumShape {
         title: Some(title.to_owned()),
         artist: Some("Moss Arcade".to_owned()),
@@ -228,6 +230,7 @@ fn the_preview_of_the_group_is_one_album_of_two_discs() {
     let alone = preview(
         &library,
         &proposals[1].candidates[0].values,
+        &[],
         &crate::Policy::current(),
     );
     assert_eq!(alone.after.len(), 1);
@@ -586,7 +589,7 @@ fn the_preview_counts_the_songs_two_editions_would_hold_as_one() {
             origin: Origin::Catalogue,
         })
         .collect();
-    let shown = preview(&library, &values, &crate::Policy::current());
+    let shown = preview(&library, &values, &[], &crate::Policy::current());
     assert_eq!((shown.songs_joined, shown.songs_parted), (3, 0));
     // And the other way round: the values gone, they are parted again.
     let mut joined = library.clone();
@@ -601,7 +604,7 @@ fn the_preview_counts_the_songs_two_editions_would_hold_as_one() {
             origin: Origin::Catalogue,
         })
         .collect();
-    let parted = preview(&joined, &undone, &crate::Policy::current());
+    let parted = preview(&joined, &undone, &[], &crate::Policy::current());
     assert_eq!((parted.songs_joined, parted.songs_parted), (0, 3));
 }
 
@@ -680,7 +683,7 @@ fn answering_the_second_disc_alone_keeps_the_release_the_disc_rules_joined() {
     );
     assert_eq!(proposals.len(), 1, "only the second disc is proposed for");
     let values = &proposals[0].candidates[0].values;
-    let shown = preview(&library, values, &crate::Policy::current());
+    let shown = preview(&library, values, &[], &crate::Policy::current());
     let shape = |albums: &[AlbumShape]| -> Vec<(u32, u32, u32)> {
         albums
             .iter()

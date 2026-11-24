@@ -32,6 +32,9 @@
     )
 )]
 
+mod answer_store;
+#[cfg(test)]
+mod answer_tests;
 mod artist_pictures;
 pub mod backup;
 mod clock;

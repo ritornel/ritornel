@@ -15,6 +15,7 @@
 --   0009_sidecars_and_disc_layouts  878233bcc6fed742092f02deba5765f167f1f9eb2bb1743c26a3235baea3e18a
 --   0010_lookup_replies  28ed4aad4966e46edc0008b800d61348b49c8e03ceaab864f22c3d90c5ede3a7
 --   0011_album_proposals  1a1ea91e5554dd76b0cef6be8665945177ff99b3d8853c2df2fa5effd92b70c2
+--   0012_answers  872f809b8df1581f7dd802a0cd7086433449042f8c257a44c0775ac20bc30905
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -1288,3 +1289,213 @@ CREATE TABLE proposal_evidence (
   rev                   INTEGER NOT NULL,
   UNIQUE (proposal_id, role, disc_id, lookup_response_id)
 ) STRICT;
+
+CREATE TABLE answer (
+  id                      INTEGER PRIMARY KEY,
+  public_id               BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
+  verb                    TEXT NOT NULL CHECK (length(verb) > 0),               -- 'confirm' or 'undo'
+  kind                    TEXT CHECK (length(kind) > 0),                        -- what a confirm was about: 'album'; NULL for an undo
+  proposal_public_id      BLOB CHECK (proposal_public_id IS NULL OR length(proposal_public_id) = 16),
+  proposal_fingerprint    TEXT,                                                 -- the proposal as it was shown
+  candidate               TEXT,                                                 -- the release group a confirm said yes to
+  undoes_answer_id        INTEGER REFERENCES answer(id),
+  actor_kind              TEXT NOT NULL CHECK (actor_kind IN ('person', 'agent', 'rule')),
+  actor_session_pid       BLOB CHECK (actor_session_pid IS NULL OR length(actor_session_pid) = 16),
+  answered_at_ms          INTEGER NOT NULL,
+  layout_version          INTEGER NOT NULL,
+  reader_version          INTEGER NOT NULL,
+  proposer_version        INTEGER NOT NULL,
+  evidence_json           TEXT NOT NULL,                                        -- what it rested on, by value
+  before_json             TEXT NOT NULL,                                        -- each file's assignment before it
+  rev                     INTEGER NOT NULL,
+  CHECK (verb <> 'confirm' OR (kind IS NOT NULL AND proposal_public_id IS NOT NULL
+                                AND proposal_fingerprint IS NOT NULL AND candidate IS NOT NULL
+                                AND undoes_answer_id IS NULL)),
+  CHECK ((verb = 'undo') = (undoes_answer_id IS NOT NULL)),
+  CHECK (verb <> 'undo' OR (kind IS NULL AND proposal_public_id IS NULL
+                             AND proposal_fingerprint IS NULL AND candidate IS NULL))
+) STRICT;
+
+CREATE UNIQUE INDEX answer_undone ON answer (undoes_answer_id) WHERE undoes_answer_id IS NOT NULL;
+
+CREATE TRIGGER answer_no_update
+BEFORE UPDATE ON answer
+BEGIN
+  SELECT RAISE(ABORT, 'answer is immutable');
+END;
+
+CREATE TRIGGER answer_no_delete
+BEFORE DELETE ON answer
+BEGIN
+  SELECT RAISE(ABORT, 'answer is immutable');
+END;
+
+CREATE TRIGGER answer_undoes_an_answer
+BEFORE INSERT ON answer
+WHEN NEW.undoes_answer_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM answer WHERE id = NEW.undoes_answer_id AND verb <> 'undo')
+BEGIN
+  SELECT RAISE(ABORT, 'an undo names an answer that is not an undo');
+END;
+
+CREATE TRIGGER answer_no_replace
+BEFORE INSERT ON answer
+WHEN EXISTS (SELECT 1 FROM answer
+             WHERE id = NEW.id OR public_id = NEW.public_id OR undoes_answer_id = NEW.undoes_answer_id)
+BEGIN
+  SELECT RAISE(ABORT, 'answer is immutable');
+END;
+
+CREATE TABLE answer_value (
+  id                        INTEGER PRIMARY KEY,
+  answer_id                 INTEGER NOT NULL REFERENCES answer(id),
+  source_item_id            INTEGER NOT NULL REFERENCES source_item(id),
+  field                     TEXT NOT NULL CHECK (length(field) > 0),            -- a field values::FIELDS names
+  ordinal                   INTEGER NOT NULL CHECK (ordinal >= 0),
+  value                     TEXT,                                               -- NULL clears the field
+  origin                    TEXT NOT NULL CHECK (length(origin) > 0),           -- 'catalogue', MusicBrainz's reply, or 'library', another of the library's files
+  withdrawn_by_answer_id    INTEGER REFERENCES answer(id),
+  rev                       INTEGER NOT NULL,
+  UNIQUE (answer_id, source_item_id, field, ordinal)
+) STRICT;
+
+CREATE INDEX answer_value_item ON answer_value (source_item_id, field);
+
+CREATE TRIGGER answer_value_withdrawn_once
+BEFORE UPDATE ON answer_value
+WHEN OLD.withdrawn_by_answer_id IS NOT NULL
+  OR NEW.withdrawn_by_answer_id IS NULL
+  OR NOT EXISTS (SELECT 1 FROM answer u
+                 WHERE u.id = NEW.withdrawn_by_answer_id AND u.undoes_answer_id = OLD.answer_id)
+  OR NEW.id IS NOT OLD.id
+  OR NEW.answer_id IS NOT OLD.answer_id
+  OR NEW.source_item_id IS NOT OLD.source_item_id
+  OR NEW.field IS NOT OLD.field
+  OR NEW.ordinal IS NOT OLD.ordinal
+  OR NEW.value IS NOT OLD.value
+  OR NEW.origin IS NOT OLD.origin
+BEGIN
+  SELECT RAISE(ABORT, 'answer_value changes only by being withdrawn, once');
+END;
+
+CREATE TRIGGER answer_value_written_in_force
+BEFORE INSERT ON answer_value
+WHEN NEW.withdrawn_by_answer_id IS NOT NULL
+  OR NOT EXISTS (SELECT 1 FROM answer a
+                 WHERE a.id = NEW.answer_id AND a.verb = 'confirm'
+                   AND NOT EXISTS (SELECT 1 FROM answer u WHERE u.undoes_answer_id = a.id))
+BEGIN
+  SELECT RAISE(ABORT, 'answer_value is written in force, by an answer standing');
+END;
+
+CREATE TRIGGER answer_value_no_delete
+BEFORE DELETE ON answer_value
+BEGIN
+  SELECT RAISE(ABORT, 'answer_value is never removed');
+END;
+
+CREATE TRIGGER answer_value_no_replace
+BEFORE INSERT ON answer_value
+WHEN EXISTS (SELECT 1 FROM answer_value
+             WHERE id = NEW.id
+                OR (answer_id = NEW.answer_id AND source_item_id = NEW.source_item_id
+                    AND field = NEW.field AND ordinal = NEW.ordinal))
+BEGIN
+  SELECT RAISE(ABORT, 'answer_value is never removed');
+END;
+
+CREATE TABLE answer_redirect (
+  id           INTEGER PRIMARY KEY,
+  answer_id    INTEGER NOT NULL REFERENCES answer(id),
+  entity       TEXT NOT NULL CHECK (length(entity) > 0),   -- 'recording', 'track_appearance' or 'release'
+  row_id       INTEGER NOT NULL,
+  to_id        INTEGER NOT NULL,
+  rev          INTEGER NOT NULL,
+  UNIQUE (answer_id, entity, row_id)
+) STRICT;
+
+CREATE INDEX answer_redirect_row ON answer_redirect (entity, row_id);
+
+CREATE TRIGGER answer_redirect_no_update
+BEFORE UPDATE ON answer_redirect
+BEGIN
+  SELECT RAISE(ABORT, 'answer_redirect is immutable');
+END;
+
+CREATE TRIGGER answer_redirect_no_delete
+BEFORE DELETE ON answer_redirect
+BEGIN
+  SELECT RAISE(ABORT, 'answer_redirect is immutable');
+END;
+
+CREATE TRIGGER answer_redirect_no_replace
+BEFORE INSERT ON answer_redirect
+WHEN EXISTS (SELECT 1 FROM answer_redirect
+             WHERE id = NEW.id
+                OR (answer_id = NEW.answer_id AND entity = NEW.entity AND row_id = NEW.row_id))
+BEGIN
+  SELECT RAISE(ABORT, 'answer_redirect is immutable');
+END;
+
+CREATE TABLE answer_join (
+  id           INTEGER PRIMARY KEY,
+  answer_id    INTEGER NOT NULL REFERENCES answer(id),
+  entity       TEXT NOT NULL CHECK (length(entity) > 0),   -- 'release' or 'release_group'
+  row_id       INTEGER NOT NULL,
+  album_mbid   TEXT NOT NULL,                     -- the album the yes said its files are, by its release group
+  rev          INTEGER NOT NULL,
+  UNIQUE (answer_id, entity, row_id)
+) STRICT;
+
+CREATE TRIGGER answer_join_no_update
+BEFORE UPDATE ON answer_join
+BEGIN
+  SELECT RAISE(ABORT, 'answer_join is immutable');
+END;
+
+CREATE TRIGGER answer_join_no_delete
+BEFORE DELETE ON answer_join
+BEGIN
+  SELECT RAISE(ABORT, 'answer_join is immutable');
+END;
+
+CREATE TRIGGER answer_join_no_replace
+BEFORE INSERT ON answer_join
+WHEN EXISTS (SELECT 1 FROM answer_join
+             WHERE id = NEW.id
+                OR (answer_id = NEW.answer_id AND entity = NEW.entity AND row_id = NEW.row_id))
+BEGIN
+  SELECT RAISE(ABORT, 'answer_join is immutable');
+END;
+
+CREATE TABLE answer_dependency (
+  id                      INTEGER PRIMARY KEY,
+  answer_id               INTEGER NOT NULL REFERENCES answer(id),
+  depends_on_answer_id    INTEGER NOT NULL REFERENCES answer(id),
+  rev                     INTEGER NOT NULL,
+  CHECK (answer_id <> depends_on_answer_id),
+  UNIQUE (answer_id, depends_on_answer_id)
+) STRICT;
+
+CREATE INDEX answer_dependency_on ON answer_dependency (depends_on_answer_id);
+
+CREATE TRIGGER answer_dependency_no_update
+BEFORE UPDATE ON answer_dependency
+BEGIN
+  SELECT RAISE(ABORT, 'answer_dependency is immutable');
+END;
+
+CREATE TRIGGER answer_dependency_no_delete
+BEFORE DELETE ON answer_dependency
+BEGIN
+  SELECT RAISE(ABORT, 'answer_dependency is immutable');
+END;
+
+CREATE TRIGGER answer_dependency_no_replace
+BEFORE INSERT ON answer_dependency
+WHEN EXISTS (SELECT 1 FROM answer_dependency
+             WHERE id = NEW.id
+                OR (answer_id = NEW.answer_id AND depends_on_answer_id = NEW.depends_on_answer_id))
+BEGIN
+  SELECT RAISE(ABORT, 'answer_dependency is immutable');
+END;

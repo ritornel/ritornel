@@ -68,10 +68,12 @@ mod typescript;
 
 pub use command::{LibraryCreateParams, LibraryCreated, Receipt, ReceiptStatus};
 pub use corrections::{
-    AlbumShape, CatalogueAlbum, Choice, CorrectionsSummary, Disc, DiscFile, DiscList, DiscLookup,
-    DiscsParams, FileValue, LayoutMethod, LookupDone, LookupOutcome, LookupParams, PreviewParams,
-    PreviewShown, Proposal, ProposalCandidate, ProposalChange, ProposalEvidence, ProposalGetParams,
-    ProposalGot, ProposalList,
+    AlbumShape, Answer, AnswerEvidence, AnswerGot, AnswerList, AnswerParams, AnswerVerb,
+    AnswerWritten, Answered, AnsweredCandidate, AnsweredLayout, AnsweredReply, AnswersParams,
+    CatalogueAlbum, Choice, ConfirmParams, Confirmation, CorrectionsSummary, Disc, DiscFile,
+    DiscList, DiscLookup, DiscsParams, FileValue, LayoutMethod, LookupDone, LookupOutcome,
+    LookupParams, PreviewParams, PreviewShown, Proposal, ProposalCandidate, ProposalChange,
+    ProposalEvidence, ProposalGetParams, ProposalGot, ProposalList, UndoParams,
 };
 pub use device::{DeviceKind, Platform, PlayedVia};
 pub use error::{ErrorCode, ErrorData, RpcError};

@@ -4,12 +4,15 @@
 
 use std::sync::{Arc, PoisonError};
 
-use ritornel_contract::methods::{CorrectionsLookup, LibrarySetSettings, Method};
+use ritornel_contract::methods::{
+    CorrectionsConfirm, CorrectionsLookup, CorrectionsUndo, LibrarySetSettings, Method,
+};
 use ritornel_contract::{
-    CorrectionsSummary, DiscList, DiscLookup, DiscsParams, ErrorCode, LibrarySettings,
+    AnswerGot, AnswerList, AnswerParams, AnswerWritten, Answered, AnswersParams, ConfirmParams,
+    CorrectionsSummary, DiscList, DiscLookup, DiscsParams, ErrorCode, Id, LibrarySettings,
     LibrarySettingsSet, LookupDone, LookupOutcome, LookupParams, PreviewParams, PreviewShown,
     ProposalGetParams, ProposalGot, ProposalList, Receipt, ReceiptStatus, RpcError, SetBy,
-    SetLibrarySettingsParams, Setting,
+    SetLibrarySettingsParams, Setting, UndoParams,
 };
 use ritornel_engine::{Asked, Command, KeptReply, WriteRequest, reads_as_disc_reply};
 use ritornel_source::Catalogue;
@@ -48,6 +51,51 @@ pub(crate) fn catalogue(test_url: Option<&str>) -> Option<Arc<dyn Catalogue>> {
 #[cfg(not(feature = "musicbrainz"))]
 pub(crate) fn catalogue(_: Option<&str>) -> Option<Arc<dyn Catalogue>> {
     None
+}
+
+/// An answer's result, as it is stored and answered with.
+fn answered(
+    key: Id,
+    rev: i64,
+    answers: impl Iterator<Item = AnswerWritten>,
+    moved: bool,
+) -> String {
+    let done = Answered {
+        receipt: Receipt {
+            command_id: key,
+            status: ReceiptStatus::Done,
+            revision: Some(revision(rev)),
+        },
+        answers: answers.collect(),
+        moved,
+    };
+    serde_json::to_string(&done).unwrap_or_default()
+}
+
+/// An answer refused: a proposal changed since it was shown is a conflict.
+fn answer_refused(error: ritornel_engine::Error) -> RpcError {
+    match error {
+        ritornel_engine::Error::PlanStale => RpcError::new(
+            ErrorCode::Conflict,
+            "the proposal has changed since it was shown: read it again",
+        )
+        .with_detail("reason", "plan_stale"),
+        other => refused(other),
+    }
+}
+
+/// A yes, an undo or a keep-apart works the catalog out again, so it waits
+/// for a scan that is running: one between two of its batches has read
+/// files it has not yet judged as moved, missing or replaced.
+fn no_scan_running(stores: &Stores) -> Result<(), RpcError> {
+    if stores.server.running("scan").map_err(refused)? {
+        return Err(RpcError::new(
+            ErrorCode::Unavailable,
+            "a scan is running: answer once it has finished",
+        )
+        .with_detail("reason", "scan_running"));
+    }
+    Ok(())
 }
 
 fn stored<T: serde::de::DeserializeOwned>(method: &str, json: &str) -> Result<T, RpcError> {
@@ -116,14 +164,123 @@ impl Core {
         stores: &Stores,
         params: &PreviewParams,
     ) -> Result<PreviewShown, RpcError> {
-        if params.choices.is_empty() {
-            return Err(RpcError::new(
+        match (params.choices.is_empty(), params.undo.is_empty()) {
+            (true, true) => Err(RpcError::new(
                 ErrorCode::Invalid,
-                "name at least one proposal",
-            ));
+                "name at least one proposal, or answers to undo",
+            )),
+            (false, false) => Err(RpcError::new(
+                ErrorCode::Invalid,
+                "preview choices or an undo, not both",
+            )),
+            (false, true) => Self::library(stores, |library| {
+                library.preview(&params.choices).map_err(refused)
+            }),
+            (true, false) => Self::library(stores, |library| {
+                library.preview_undo(&params.undo).map_err(refused)
+            }),
         }
+    }
+
+    /// `corrections.confirm`: yes to proposals, in one write.
+    pub(super) fn corrections_confirm(
+        &self,
+        stores: &Stores,
+        params: &ConfirmParams,
+    ) -> Result<Answered, RpcError> {
+        // No scan is claimed from this check to the end of the write.
+        let _answering = self
+            .answering
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        no_scan_running(stores)?;
+        let key = params.idempotency_key;
+        let request = WriteRequest {
+            method: CorrectionsConfirm::NAME,
+            command: Some(Command {
+                id: key,
+                fingerprint: fingerprint::<CorrectionsConfirm>(params)?,
+            }),
+            client: self.client(),
+        };
+        let confirmations = params.answers.clone();
+        let written = Self::library(stores, |library| {
+            library
+                .confirm(request, confirmations, move |rev, answers, moved| {
+                    answered(
+                        key,
+                        rev,
+                        answers.into_iter().map(|(answer, proposal)| AnswerWritten {
+                            answer_id: answer,
+                            proposal_id: Some(proposal),
+                            undoes: None,
+                        }),
+                        moved,
+                    )
+                })
+                .map_err(answer_refused)
+        })?;
+        stored(CorrectionsConfirm::NAME, &written.result_json)
+    }
+
+    /// `corrections.undo`: undoes answers, in one write.
+    pub(super) fn corrections_undo(
+        &self,
+        stores: &Stores,
+        params: &UndoParams,
+    ) -> Result<Answered, RpcError> {
+        // No scan is claimed from this check to the end of the write.
+        let _answering = self
+            .answering
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        no_scan_running(stores)?;
+        let key = params.idempotency_key;
+        let request = WriteRequest {
+            method: CorrectionsUndo::NAME,
+            command: Some(Command {
+                id: key,
+                fingerprint: fingerprint::<CorrectionsUndo>(params)?,
+            }),
+            client: self.client(),
+        };
+        let answers = params.answers.clone();
+        let written = Self::library(stores, |library| {
+            library
+                .undo(request, answers, move |rev, undone, moved| {
+                    answered(
+                        key,
+                        rev,
+                        undone.into_iter().map(|(answer, undoes)| AnswerWritten {
+                            answer_id: answer,
+                            proposal_id: None,
+                            undoes: Some(undoes),
+                        }),
+                        moved,
+                    )
+                })
+                .map_err(answer_refused)
+        })?;
+        stored(CorrectionsUndo::NAME, &written.result_json)
+    }
+
+    /// `corrections.answers`: the ledger.
+    pub(super) fn corrections_answers(
+        &self,
+        stores: &Stores,
+        params: AnswersParams,
+    ) -> Result<AnswerList, RpcError> {
+        Self::library(stores, |library| library.answers(params).map_err(refused))
+    }
+
+    /// `corrections.answer`: one answer, and what it rested on.
+    pub(super) fn corrections_answer(
+        &self,
+        stores: &Stores,
+        params: &AnswerParams,
+    ) -> Result<AnswerGot, RpcError> {
         Self::library(stores, |library| {
-            library.preview(&params.choices).map_err(refused)
+            library.answer(params.answer_id).map_err(refused)
         })
     }
 
@@ -523,7 +680,11 @@ mod tests {
                 .claim_job(ritornel_contract::Id::from_bytes([0xb0; 16]))
                 .unwrap()
                 .unwrap();
+            let row = job.id;
             run_scan(job, server, library, ScanSettings::default()).unwrap();
+            server
+                .finish_job(row, ritornel_engine::JobState::Succeeded, None)
+                .unwrap();
         })
         .unwrap();
         (core, scratch, session)
@@ -856,5 +1017,113 @@ mod tests {
             json!({ "proposalId": key(0x55) }),
         );
         assert_eq!(unknown.unwrap_err().0, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn a_yes_is_kept_refused_when_stale_listed_and_undone() {
+        let catalogue = Arc::new(Recorded::default());
+        catalogue
+            .replies
+            .lock()
+            .unwrap()
+            .insert(DISC.to_owned(), (200, REPLY.to_owned()));
+        let (core, _scratch, session) = hub(Some(catalogue));
+        switch(&core, &session, 2, true);
+        lookup(&core, &session, 3, false).unwrap();
+        let list = call(&core, &session, "corrections.list", json!({})).unwrap();
+        let proposal = list["proposals"][0].clone();
+        let answer = |fingerprint: &serde_json::Value, byte: u8| {
+            call(
+                &core,
+                &session,
+                "corrections.confirm",
+                json!({ "idempotencyKey": key(byte), "answers": [{
+                    "proposalId": proposal["proposalId"],
+                    "releaseGroup": proposal["candidates"][0]["releaseGroup"],
+                    "fingerprint": fingerprint,
+                }] }),
+            )
+        };
+        let stale = answer(&json!("an older one"), 4).unwrap_err();
+        assert_eq!(
+            (stale.0, stale.1["reason"].clone()),
+            (ErrorCode::Conflict, json!("plan_stale"))
+        );
+        let done = answer(&proposal["fingerprint"], 5).unwrap();
+        assert_eq!(done["status"], "done");
+        assert_eq!(done["moved"], true);
+        let id = done["answers"][0]["answerId"].clone();
+        let ledger = call(&core, &session, "corrections.answers", json!({})).unwrap();
+        assert_eq!(ledger["answers"][0]["answerId"], id);
+        assert_eq!(ledger["answers"][0]["title"], "Tin Weather");
+        let undone = call(
+            &core,
+            &session,
+            "corrections.undo",
+            json!({ "idempotencyKey": key(6), "answers": [id] }),
+        )
+        .unwrap();
+        assert_eq!(undone["answers"][0]["undoes"], id);
+        let list = call(&core, &session, "corrections.list", json!({})).unwrap();
+        assert_eq!(list["proposals"][0]["proposalId"], proposal["proposalId"]);
+    }
+
+    #[test]
+    fn a_yes_waits_for_a_scan_that_is_running() {
+        let catalogue = Arc::new(Recorded::default());
+        catalogue
+            .replies
+            .lock()
+            .unwrap()
+            .insert(DISC.to_owned(), (200, REPLY.to_owned()));
+        let (core, _scratch, session) = hub(Some(catalogue));
+        switch(&core, &session, 2, true);
+        lookup(&core, &session, 3, false).unwrap();
+        let list = call(&core, &session, "corrections.list", json!({})).unwrap();
+        let proposal = list["proposals"][0].clone();
+        let answer = |byte: u8| {
+            call(
+                &core,
+                &session,
+                "corrections.confirm",
+                json!({ "idempotencyKey": key(byte), "answers": [{
+                    "proposalId": proposal["proposalId"],
+                    "releaseGroup": proposal["candidates"][0]["releaseGroup"],
+                    "fingerprint": proposal["fingerprint"],
+                }] }),
+            )
+        };
+        let with_server = |work: &dyn Fn(&ritornel_engine::ServerStore)| {
+            let stores = core.stores.read().unwrap();
+            work(&stores.as_ref().unwrap().server);
+        };
+        let id = |byte: u8| ritornel_contract::Id::from_bytes([byte; 16]);
+        with_server(&|server| {
+            let job = ritornel_engine::NewJob {
+                kind: "scan",
+                dedupe_key: "main".to_owned(),
+                target: id(0x51),
+                params_json: "{}".to_owned(),
+                session: None,
+            };
+            let command = ritornel_engine::Command {
+                id: id(0x52),
+                fingerprint: ritornel_engine::Fingerprint::of("scan.start", &[1]),
+            };
+            server.start_job(command, "scan.start", job).unwrap();
+            server.claim_job(id(0x53)).unwrap().unwrap();
+        });
+        let refused = answer(4).unwrap_err();
+        assert_eq!(
+            (refused.0, refused.1["reason"].clone()),
+            (ErrorCode::Unavailable, json!("scan_running"))
+        );
+        with_server(&|server| {
+            let running = server.active_job("scan", "main").unwrap().unwrap();
+            server
+                .finish_job(running.id, ritornel_engine::JobState::Succeeded, None)
+                .unwrap();
+        });
+        assert_eq!(answer(5).unwrap()["status"], "done");
     }
 }

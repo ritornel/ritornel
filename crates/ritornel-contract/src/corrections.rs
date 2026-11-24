@@ -375,7 +375,13 @@ pub struct PreviewParams {
     /// The proposals, each once with its candidate, previewed together as
     /// one. Choices whose values disagree for one field of one file are
     /// refused.
+    #[serde(default)]
     pub choices: Vec<Choice>,
+    /// Or answers, to preview their undo: what it would give back, and
+    /// which answers resting on them it would undo too. Not with
+    /// `choices`.
+    #[serde(default)]
+    pub undo: Vec<Id>,
 }
 
 /// One album as a preview shows it.
@@ -420,6 +426,9 @@ pub struct PreviewShown {
     pub now: Vec<AlbumShape>,
     /// The albums after.
     pub after: Vec<AlbumShape>,
+    /// For an undo: every answer it would undo, those asked for and those
+    /// resting on them, oldest first. Empty for choices.
+    pub undoes: Vec<Id>,
     /// How many songs would be joined into another: copies of one song,
     /// such as two editions' of it, that are two songs now and would be one.
     pub songs_joined: u32,
@@ -428,4 +437,250 @@ pub struct PreviewShown {
     pub songs_parted: u32,
     /// The values the choices would put on the files.
     pub values: Vec<FileValue>,
+}
+
+/// A yes to one proposal's candidate, naming the proposal as it was shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct Confirmation {
+    /// The proposal.
+    pub proposal_id: Id,
+    /// The candidate, by its release group ID.
+    pub release_group: String,
+    /// The proposal's fingerprint as it was shown. A proposal that has
+    /// changed since is refused, and nothing is written.
+    pub fingerprint: String,
+}
+
+/// The params of `corrections.confirm`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// Each yes, all kept in one write or none.
+    pub answers: Vec<Confirmation>,
+}
+
+/// One answer a command wrote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerWritten {
+    /// The answer's ID.
+    pub answer_id: Id,
+    /// The proposal a yes answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub proposal_id: Option<Id>,
+    /// The answer an undo undid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub undoes: Option<Id>,
+}
+
+/// The result of `corrections.confirm` and `corrections.undo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct Answered {
+    /// The receipt. Every answer is at its revision.
+    #[serde(flatten)]
+    pub receipt: Receipt,
+    /// Each answer written.
+    pub answers: Vec<AnswerWritten>,
+    /// Whether anything shown changed: an album, a song or an artist.
+    pub moved: bool,
+}
+
+/// The params of `corrections.undo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct UndoParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// The answers to undo, all in one write or none.
+    pub answers: Vec<Id>,
+}
+
+/// What an answer said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerVerb {
+    /// Yes to a proposal's candidate.
+    Confirm,
+    /// The undo of an earlier answer.
+    Undo,
+}
+
+/// One answer in the ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct Answer {
+    /// Its ID.
+    pub answer_id: Id,
+    /// What it said.
+    pub verb: AnswerVerb,
+    /// For a yes: the proposal it answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub proposal_id: Option<Id>,
+    /// For a yes: the album it said yes to, by its release group ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release_group: Option<String>,
+    /// For a yes: the album's title, as it was shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub title: Option<String>,
+    /// For an undo: the answer it undid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub undoes: Option<Id>,
+    /// For a yes that was undone: the undo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub undone_by: Option<Id>,
+    /// How many files it put values on.
+    pub files: u32,
+    /// When it was given, as Unix milliseconds.
+    pub answered_at_ms: u64,
+}
+
+/// The params of `corrections.answers`: one page of the ledger.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AnswersParams {
+    /// The answers older than this one; from the newest when left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub before: Option<Id>,
+    /// How many at most: 50 when left out, and never more than 500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub limit: Option<u32>,
+}
+
+/// The result of `corrections.answers`: one page of the ledger, newest
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerList {
+    /// The library revision it read.
+    pub library_revision: u64,
+    /// Each answer, newest first.
+    pub answers: Vec<Answer>,
+    /// The `before` that reads the next page, while there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub next: Option<Id>,
+}
+
+/// The params of `corrections.answer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerParams {
+    /// The answer.
+    pub answer_id: Id,
+}
+
+/// An album a yes was given among, as it was shown: all of it for the one
+/// said yes to, its ID and title for the others.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AnsweredCandidate {
+    /// Its release group ID.
+    pub release_group: String,
+    /// Its title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub title: Option<String>,
+    /// Who it is credited to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub artist: Option<String>,
+    /// Its kind: `album`, `single`, `ep`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub primary_type: Option<String>,
+    /// When it first came out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub first_date: Option<String>,
+    /// How many of the replies' releases were of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub releases: Option<u32>,
+}
+
+/// A disc a yes rested on: its disc ID, and when the reply it was read
+/// from came.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AnsweredReply {
+    /// The disc ID.
+    pub disc_id: String,
+    /// When MusicBrainz replied, as Unix milliseconds.
+    pub replied_at_ms: u64,
+}
+
+/// A layout of a disc a yes rested on, as it was then.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AnsweredLayout {
+    /// The disc ID it gives.
+    pub disc_id: String,
+    /// The folder it is of, by its path under its root.
+    pub folder: String,
+    /// Each way it was found, in the order found.
+    pub methods: Vec<LayoutMethod>,
+    /// Whether it may not be the disc's.
+    pub provisional: bool,
+}
+
+/// What an answer rested on and said, kept by value when it was given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerEvidence {
+    /// For a yes: the album said yes to, as it was shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub candidate: Option<AnsweredCandidate>,
+    /// For a yes: the albums it was chosen among, in the order shown.
+    pub candidates: Vec<AnsweredCandidate>,
+    /// For a yes: each disc it rested on, with its reply.
+    pub replies: Vec<AnsweredReply>,
+    /// For a yes: each layout of those discs.
+    pub layouts: Vec<AnsweredLayout>,
+    /// For a yes: the values it put on the files, each with the file as it
+    /// is named now.
+    pub values: Vec<FileValue>,
+    /// For an undo of an answer that rested on others: the answers it was
+    /// undone with.
+    pub rests_on: Vec<Id>,
+}
+
+/// The result of `corrections.answer`: one answer, and what it rested on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerGot {
+    /// The library revision it read.
+    pub library_revision: u64,
+    /// The answer.
+    pub answer: Answer,
+    /// What it rested on and said.
+    pub evidence: AnswerEvidence,
 }
