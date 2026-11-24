@@ -42,16 +42,16 @@ use windows_sys::Win32::Security::{
     PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
     SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SetSecurityDescriptorControl,
     SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE,
-    WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinBuiltinUsersSid,
-    WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinInteractiveSid, WinLocalSystemSid,
-    WinWorldSid,
+    WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinBuiltinAnyPackageSid,
+    WinBuiltinUsersSid, WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinInteractiveSid,
+    WinLocalSystemSid, WinWorldSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GetVolumeInformationByHandleW, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
-    WRITE_OWNER,
+    FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetVolumeInformationByHandleW, READ_CONTROL, SYNCHRONIZE,
+    WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -355,7 +355,7 @@ pub fn check_folder_usable(path: &Path) -> io::Result<()> {
             "other users may change who can open it, so it cannot be closed to them",
         ));
     };
-    if lets_others(acl, &user, CHANGE, false)? {
+    if lets_others_change(acl, &user)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "other users may change who can open it, so it cannot be closed to them",
@@ -428,7 +428,7 @@ pub fn close_folder_preserving(path: &Path, keep_open: &[&Path]) -> io::Result<(
             "other users may change who can open it, so it cannot be closed to them",
         ));
     };
-    if lets_others(acl, &user, CHANGE, false)? {
+    if lets_others_change(acl, &user)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "other users may change who can open it, so it cannot be closed to them",
@@ -581,7 +581,10 @@ pub fn create_pinned_restricted_dir(path: &Path) -> io::Result<File> {
         Ok(())
     })?;
     let checked = OpenOptions::new()
-        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        // FILE_LIST_DIRECTORY makes NTFS enforce the share mode below;
+        // metadata-only handles (READ_CONTROL | FILE_READ_ATTRIBUTES alone)
+        // bypass sharing checks and would not block rename or delete.
+        .access_mode(FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES)
         // Without FILE_SHARE_DELETE, the folder cannot be removed or renamed
         // while this handle lives, even if its parent grants delete-child.
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
@@ -795,6 +798,28 @@ fn lets_others(acl: Acl<'_>, user: &User, mask: u32, passed_on: bool) -> io::Res
         }
         None => true,
     }))
+}
+
+/// Whether an entry of `acl` lets another user change who may open a
+/// folder. An inherited entry for `ALL APPLICATION PACKAGES` (which
+/// Windows puts on `%TEMP%` by default) is allowed to be stripped when
+/// closing the folder, though [`judge`] never treats it as private.
+fn lets_others_change(acl: Acl<'_>, user: &User) -> io::Result<bool> {
+    Ok(entries(acl)?.into_iter().any(|entry| match entry {
+        Some((flags, allowed, sid)) => {
+            flags & INHERIT_ONLY_ACE == 0
+                && allowed & CHANGE != 0
+                && !trusted(sid, user)
+                && !(flags & INHERITED_ACE != 0 && is_all_app_packages(sid))
+        }
+        None => true,
+    }))
+}
+
+/// Whether `sid` is `ALL APPLICATION PACKAGES` (`S-1-15-2-1`).
+fn is_all_app_packages(sid: Sid<'_>) -> bool {
+    // SAFETY: the SID is valid for the call.
+    unsafe { IsWellKnownSid(sid.0, WinBuiltinAnyPackageSid) != 0 }
 }
 
 /// Whether `acl` passes this user's entry on to the files made in it, so

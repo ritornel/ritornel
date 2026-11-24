@@ -40,20 +40,16 @@ fn open_to_everyone(path: &Path) {
         .output()
         .unwrap();
     assert!(done.status.success(), "{done:?}");
+    assert!(another_user_may_open(path).unwrap(), "{}", path.display());
 }
 
-/// Whether `path` is private, asserting that the system's access check for
-/// another user agrees: on a file both ways, and on a folder, whose list
-/// may let others into only what is made in it, that one private lets
-/// nobody in.
+/// Whether `path` is private, asserting that Windows AuthZ for the
+/// synthetic signed-in user never lets them open what [`path_is_private`]
+/// calls private.
 fn private(path: &Path) -> bool {
     let private = path_is_private(path).unwrap();
     let open = another_user_may_open(path).unwrap();
-    if path.is_dir() {
-        assert!(!(private && open), "{}", path.display());
-    } else {
-        assert_eq!(open, !private, "{}", path.display());
-    }
+    assert!(!(private && open), "{}", path.display());
     private
 }
 
@@ -62,10 +58,8 @@ fn descriptor(sddl: &str) -> Descriptor {
     let user = User::current().unwrap();
     let mut text: PWSTR = std::ptr::null_mut();
     // SAFETY: the SID is valid; the string is allocated by the call.
-    assert_ne!(
-        unsafe { ConvertSidToStringSidW(user.sid().0, &mut text) },
-        0
-    );
+    let converted = unsafe { ConvertSidToStringSidW(user.sid().0, &mut text) };
+    assert_ne!(converted, 0);
     let _text = Local(text.cast());
     // SAFETY: the call wrote a string ending in a NUL.
     let len = unsafe { (0..).take_while(|&i| *text.add(i) != 0).count() };
@@ -341,4 +335,19 @@ fn open_lock_file_refuses_a_directory_junction() {
     assert!(open_lock_file(&link).is_err());
     let _ = std::fs::remove_dir(&link);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn inherited_all_application_packages_is_not_private_but_may_be_stripped() {
+    let user = User::current().unwrap();
+    let inherited_ac = descriptor("O:MED:AI(A;OICIID;FA;;;ME)(A;OICIID;GA;;;AC)");
+    assert!(!judge(&inherited_ac, true, &user).unwrap());
+    assert!(!lets_others_change(inherited_ac.dacl().unwrap().unwrap(), &user).unwrap());
+
+    let explicit_ac = descriptor("O:MED:P(A;OICI;FA;;;ME)(A;OICI;GA;;;AC)");
+    assert!(!judge(&explicit_ac, true, &user).unwrap());
+    assert!(lets_others_change(explicit_ac.dacl().unwrap().unwrap(), &user).unwrap());
+
+    let inherited_wd = descriptor("O:MED:AI(A;OICIID;FA;;;ME)(A;OICIID;GA;;;WD)");
+    assert!(lets_others_change(inherited_wd.dacl().unwrap().unwrap(), &user).unwrap());
 }

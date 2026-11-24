@@ -265,17 +265,13 @@ pub(crate) fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::
 }
 
 /// Whether only the owner can open a file or directory: an access list that
-/// names the owner alone. The system's own access check for another user
-/// must agree.
+/// names the owner alone. Windows AuthZ for the synthetic signed-in user
+/// must never allow opening what this calls private.
 #[cfg(test)]
 pub(crate) fn path_is_private(path: &Path) -> bool {
     let private = restricted::path_is_private(path).unwrap();
     let open = restricted::another_user_may_open(path).unwrap();
-    if path.is_dir() {
-        assert!(!(private && open), "{}", path.display());
-    } else {
-        assert_eq!(open, !private, "{}", path.display());
-    }
+    assert!(!(private && open), "{}", path.display());
     private
 }
 
