@@ -207,10 +207,8 @@ impl Server {
         Self { child, stdout }
     }
 
-    /// Waits for the server to end by itself, and returns its exit code:
-    /// `None` when a signal ended it.
-    /// Waits for the server to end, and says how it did: its exit status
-    /// names the signal when one ended it.
+    /// Waits for the server to end by itself, and says how it did: its
+    /// exit status names the signal when one ended it, as an abort does.
     fn ended(mut self) -> ExitStatus {
         assert!(
             rest(&self.stdout).is_some(),
