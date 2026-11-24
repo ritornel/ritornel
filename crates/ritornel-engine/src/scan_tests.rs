@@ -114,7 +114,7 @@ impl Rig {
             .unwrap()
     }
 
-    fn root(&self) -> PathBuf {
+    pub(crate) fn root(&self) -> PathBuf {
         self.scratch.path().join("main")
     }
 
@@ -132,7 +132,7 @@ impl Rig {
         self.stamp(to);
     }
 
-    fn stamp(&mut self, path: &Path) {
+    pub(crate) fn stamp(&mut self, path: &Path) {
         self.commands += 1;
         let time = UNIX_EPOCH + Duration::from_secs(1_700_000_000 + 60 * u64::from(self.commands));
         std::fs::File::options()

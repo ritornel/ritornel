@@ -12,6 +12,7 @@
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
 --   0008_spotify_streams  e9ce8045bd8ecad934d57ecb7150f891907050e0591b711f9884c1231d1747e1
+--   0009_sidecars_and_disc_layouts  878233bcc6fed742092f02deba5765f167f1f9eb2bb1743c26a3235baea3e18a
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -1112,3 +1113,74 @@ CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted
 CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date, event_at_utc_ms);
 
 CREATE INDEX track_appearance_display_artist_credit ON track_appearance (display_artist_credit_id);
+
+CREATE TABLE sidecar (
+  id                    INTEGER PRIMARY KEY,
+  source_instance_id    INTEGER NOT NULL REFERENCES source_instance(id),
+  rel_path              TEXT NOT NULL,                  -- relative to the root, with '/' between its parts
+  current_revision_id   INTEGER,                        -- one of this sidecar's own revisions
+  size_bytes            INTEGER NOT NULL,
+  mtime_ms              INTEGER NOT NULL,               -- unchanged size and time let a rescan skip the file
+  missing_since_ms      INTEGER,
+  first_seen_at_ms      INTEGER NOT NULL,
+  rev                   INTEGER NOT NULL,
+  UNIQUE (source_instance_id, rel_path),
+  FOREIGN KEY (id, current_revision_id) REFERENCES sidecar_revision (sidecar_id, id)
+) STRICT;
+
+CREATE TABLE sidecar_revision (
+  id                INTEGER PRIMARY KEY,
+  sidecar_id        INTEGER NOT NULL REFERENCES sidecar(id),
+  content_hash      BLOB NOT NULL CHECK (length(content_hash) = 32),   -- BLAKE3 of content
+  content           BLOB NOT NULL,                                     -- the file's bytes, which may be UTF-16 or Windows-1252
+  observed_at_ms    INTEGER NOT NULL,
+  rev               INTEGER NOT NULL,
+  UNIQUE (sidecar_id, content_hash),
+  UNIQUE (sidecar_id, id)
+) STRICT;
+
+CREATE TRIGGER sidecar_revision_no_update
+BEFORE UPDATE ON sidecar_revision
+BEGIN
+  SELECT RAISE(ABORT, 'sidecar_revision is immutable');
+END;
+
+CREATE TRIGGER sidecar_revision_no_delete
+BEFORE DELETE ON sidecar_revision
+BEGIN
+  SELECT RAISE(ABORT, 'sidecar_revision is immutable');
+END;
+
+CREATE TRIGGER sidecar_revision_no_replace
+BEFORE INSERT ON sidecar_revision
+WHEN EXISTS (SELECT 1 FROM sidecar_revision
+             WHERE id = NEW.id OR (sidecar_id = NEW.sidecar_id AND content_hash = NEW.content_hash))
+BEGIN
+  SELECT RAISE(ABORT, 'sidecar_revision is immutable');
+END;
+
+CREATE TABLE evidence_disc (
+  id                    INTEGER PRIMARY KEY,
+  source_instance_id    INTEGER NOT NULL REFERENCES source_instance(id),
+  folder                TEXT NOT NULL,                  -- relative to the root; '' is the root
+  disc_id               TEXT NOT NULL CHECK (length(disc_id) = 28),
+  track_offsets_json    TEXT NOT NULL,                  -- the sector each track starts at, from the first track's, without the lead-in
+  lead_out              INTEGER NOT NULL,               -- the sector after the last track's audio
+  found_json            TEXT NOT NULL,                  -- each way it was found, in order: [{"method":"log","sidecarRevisionId":12}]
+  provisional           INTEGER NOT NULL CHECK (provisional IN (0, 1)),   -- a CUE sheet that disagrees with the CDDB ID it prints
+  whole_file            INTEGER NOT NULL CHECK (whole_file IN (0, 1)),    -- one file holds the whole disc
+  layout_version        INTEGER NOT NULL,
+  rev                   INTEGER NOT NULL,
+  UNIQUE (source_instance_id, folder, disc_id)
+) STRICT;
+
+CREATE TABLE evidence_disc_item (
+  id                    INTEGER PRIMARY KEY,
+  evidence_disc_id      INTEGER NOT NULL REFERENCES evidence_disc(id),
+  position              INTEGER NOT NULL CHECK (position >= 0),
+  source_item_id        INTEGER NOT NULL REFERENCES source_item(id),
+  rev                   INTEGER NOT NULL,
+  UNIQUE (evidence_disc_id, position)
+) STRICT;
+
+CREATE INDEX evidence_disc_item_item ON evidence_disc_item (source_item_id);

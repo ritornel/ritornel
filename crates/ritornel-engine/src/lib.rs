@@ -39,6 +39,9 @@ pub mod covers;
 mod delivery_store;
 mod entropy;
 mod error;
+mod evidence_store;
+#[cfg(test)]
+mod evidence_tests;
 mod export;
 mod history_facts;
 mod history_heard;
@@ -99,6 +102,7 @@ pub use delivery_store::{
 };
 pub use entropy::{Entropy, OsEntropy};
 pub use error::Error;
+pub use evidence_store::{LAYOUTS_METHOD, SIDECARS_METHOD};
 pub use export::{EXPORT_FORMAT, EXPORT_VERSION, Exported};
 pub use history_pages::Today;
 pub use history_store::{

@@ -110,8 +110,11 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
+      # The whole history, so the contract check finds where a pull
+      # request, stacked on another or not, leaves main.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       # rustdoc runs the build scripts, and cpal's asks for ALSA.
       - uses: ./.github/actions/setup
@@ -122,6 +125,12 @@ jobs:
       - run: mise run fmt
       - run: mise run deps
       - run: mise run sleeps
+      # A pull request's contract version is checked against main's, where
+      # the pull request leaves it.
+      - if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          mise run contract-version
       - run: mise run docs
       - run: mise run licenses
 

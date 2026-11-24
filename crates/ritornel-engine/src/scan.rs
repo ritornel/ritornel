@@ -17,27 +17,40 @@
 //! before a crash, and whose number was never saved, is found by its
 //! command ID and counted as done, and its counters are read from what it
 //! stored as its result ([`StepResult`]). Once the resolver's step has
-//! committed, the scan is finished.
+//! committed, nothing is walked again, and once the disc layouts' step has,
+//! the scan is finished.
 //!
 //! The resolver runs once, at the end, over the whole library, and only if
 //! the scan changed something. So a rescan that finds nothing changed
 //! writes nothing at all, and takes no library revision.
+//!
+//! The sidecars found with the audio, such as rip logs and CUE sheets, are
+//! read after the audio and before the resolver, and recorded in steps of
+//! their own, which do not make the resolver run. The disc layouts are
+//! derived from them last, when a write since the last derivation said they
+//! were due (docs/internals/corrections.md, "Disc layouts").
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use ritornel_contract::ScanSummary;
+use ritornel_domain::layout;
 use ritornel_domain::payload::{FolderImage, Payload};
 use ritornel_domain::{Facts, Policy, Replacement, extract, judge_replacements};
 use serde::{Deserialize, Serialize};
 
+use crate::evidence_store::{KnownSidecar, LAYOUTS_METHOD, SIDECARS_METHOD, SidecarOp};
 use crate::jobs::{Job, Progress, step_command};
 use crate::media::{UNAVAILABLE, read_file, read_folder_image};
 use crate::scan_store::{Known, RecordOp, Source};
 use crate::walk::{Seen, Walked, folder_id, folder_of, under, walk};
 use crate::{Command, Error, Fingerprint, LibraryStore, Resolved, ServerStore, WriteRequest};
+
+/// The most sidecar bytes one step reads and records.
+const SIDECAR_BATCH_BYTES: usize = 8 << 20;
 
 /// How a scan runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +93,9 @@ struct Checkpoint {
 #[derive(Debug, Serialize, Deserialize)]
 struct StepResult {
     checkpoint: Checkpoint,
+    /// Whether the step is the scan's last: the disc layouts'.
+    #[serde(default)]
+    last: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,11 +105,13 @@ enum Phase {
     Moves,
     Missing,
     Replaced,
+    Sidecars,
     Resolve,
     /// The tracks other services named are judged against what the scan
     /// made: after a resolve that wrote anything, and after a scan taken up
     /// again whose resolve had committed.
     Match,
+    Layouts,
     Done,
 }
 
@@ -124,6 +142,12 @@ pub struct ScanRun {
     /// Files whose audio changed at a known path, held until every file is
     /// read: each is then a move, or is judged by the resolver.
     replaced: Vec<(i64, Payload)>,
+    /// The sidecars the library has for this source, by path.
+    known_sidecars: HashMap<String, KnownSidecar>,
+    /// The sidecar files to read: new, or changed since they were read.
+    sidecar_queue: Vec<Seen>,
+    /// What to record of the sidecars.
+    sidecar_ops: Vec<SidecarOp>,
     failed: Vec<(String, &'static str, String)>,
     label: Option<String>,
 }
@@ -218,20 +242,30 @@ impl ScanRun {
             dirty = true;
             if let Ok(stored) = serde_json::from_str::<StepResult>(&result) {
                 summary = stored.checkpoint.summary;
+                dirty = stored.checkpoint.dirty;
             } else if let Ok(resolved) = serde_json::from_str::<Resolved>(&result) {
                 summary.assignments += resolved.assignments;
                 summary.recordings += resolved.recordings;
                 summary.releases += resolved.releases;
             }
         }
-        // The resolver's step is the scan's last. Once it has committed, the
-        // scan is finished, saved or not, and nothing is walked again: a
-        // root that is offline now does not fail a scan that was done.
-        let finished = step > 0
-            && library
-                .command_result(step_command(job.public_id, step))?
-                .is_some_and(|result| serde_json::from_str::<Resolved>(&result).is_ok());
-        if finished {
+        // Everything that needs the root is done before the resolver's step,
+        // and the layouts' is the scan's last. Once the resolver's has
+        // committed, nothing is walked again: a root that is offline now
+        // does not fail a scan that was done. Once the layouts' has, the
+        // scan is finished.
+        let last = match step {
+            0 => None,
+            _ => library.command_result(step_command(job.public_id, step))?,
+        };
+        let resolved = last
+            .as_deref()
+            .is_some_and(|result| serde_json::from_str::<Resolved>(result).is_ok());
+        let finished = last
+            .as_deref()
+            .and_then(|result| serde_json::from_str::<StepResult>(result).ok())
+            .is_some_and(|stored| stored.last);
+        if resolved || finished {
             dirty = false;
         }
         Ok(Self {
@@ -241,8 +275,14 @@ impl ScanRun {
             settings,
             // A scan whose resolve committed may have stopped before it
             // judged the tracks; judging them again changes nothing if it
-            // did not.
-            phase: if finished { Phase::Match } else { Phase::Walk },
+            // did not. One whose layouts' step committed is finished.
+            phase: if finished {
+                Phase::Done
+            } else if resolved {
+                Phase::Match
+            } else {
+                Phase::Walk
+            },
             step,
             summary,
             dirty,
@@ -255,6 +295,9 @@ impl ScanRun {
             batch: Vec::new(),
             images: HashMap::new(),
             replaced: Vec::new(),
+            known_sidecars: HashMap::new(),
+            sidecar_queue: Vec::new(),
+            sidecar_ops: Vec::new(),
             failed: Vec::new(),
             label: None,
         })
@@ -325,6 +368,7 @@ impl ScanRun {
                 };
                 self.batch = batch;
             }
+            Phase::Sidecars => self.read_sidecars(stop),
             _ => {}
         }
         // What a batch read, and which files the walk found gone or other
@@ -334,7 +378,7 @@ impl ScanRun {
         // nothing is taken for gone or replaced.
         let judged = matches!(
             self.phase,
-            Phase::Read | Phase::Moves | Phase::Missing | Phase::Replaced
+            Phase::Read | Phase::Moves | Phase::Missing | Phase::Replaced | Phase::Sidecars
         );
         let walked_id = self.walked.as_ref().and_then(|walked| walked.root_id);
         if judged && folder_id(&self.root) != walked_id {
@@ -347,12 +391,17 @@ impl ScanRun {
 
     /// The request of the job's next library write: its next step.
     fn next_step(&mut self) -> WriteRequest {
+        self.next_step_as("scan.step")
+    }
+
+    /// The request of the job's next library write, as `method`.
+    fn next_step_as(&mut self, method: &'static str) -> WriteRequest {
         self.step += 1;
         WriteRequest {
-            method: "scan.step",
+            method,
             command: Some(Command {
                 id: step_command(self.job.public_id, self.step),
-                fingerprint: Fingerprint::of("scan.step", &self.step.to_be_bytes()),
+                fingerprint: Fingerprint::of(method, &self.step.to_be_bytes()),
             }),
             client: None,
         }
@@ -361,17 +410,18 @@ impl ScanRun {
     /// What a step of the scan's own stores as its result: the checkpoint
     /// once it has committed, with `summary` as its counters.
     fn step_result(&self, summary: ScanSummary) -> Result<String, Error> {
-        Ok(serde_json::to_string(&StepResult {
-            checkpoint: Checkpoint {
-                summary,
-                dirty: true,
-            },
-        })?)
+        stored(summary, true, false)
     }
 
-    /// What follows every library commit of the job: the fail point.
+    /// What follows every library commit of the job that the resolver
+    /// must see.
     fn committed(&mut self) -> Result<(), Error> {
         self.dirty = true;
+        self.fail_point()
+    }
+
+    /// The fail point, after any library commit of the job.
+    fn fail_point(&self) -> Result<(), Error> {
         if self.settings.fail_after_step == Some(self.step) {
             return Err(Error::FailPoint);
         }
@@ -410,6 +460,18 @@ impl ScanRun {
                 }
             }
             Phase::Replaced => self.judge_replaced(library)?,
+            Phase::Sidecars => {
+                if self.sidecar_queue.is_empty() {
+                    self.phase = Phase::Resolve;
+                }
+                let ops = std::mem::take(&mut self.sidecar_ops);
+                if !ops.is_empty() {
+                    let request = self.next_step_as(SIDECARS_METHOD);
+                    let receipt = stored(self.summary, self.dirty, false)?;
+                    library.record_sidecars(request, self.source.row, ops, receipt)?;
+                    self.fail_point()?;
+                }
+            }
             Phase::Resolve => {
                 if self.dirty || library.needs_resolving()? {
                     self.label = Some("resolving".to_owned());
@@ -433,23 +495,33 @@ impl ScanRun {
                         // Nothing was written, so the step was not taken.
                         None => {
                             self.step -= 1;
-                            self.phase = Phase::Done;
+                            self.phase = Phase::Layouts;
                         }
                     }
                     self.dirty = false;
                 } else {
-                    self.phase = Phase::Done;
+                    self.phase = Phase::Layouts;
                 }
                 self.label = None;
-                if self.phase == Phase::Done {
-                    return Ok(Some(self.summary));
-                }
             }
             Phase::Match => {
                 // A write of its own, which writes nothing when no binding
                 // moves, and so is safe to repeat.
                 library.match_library()?;
+                self.phase = Phase::Layouts;
+            }
+            Phase::Layouts => {
+                // Due whenever a write since the last derivation said so,
+                // in this job or one that stopped before it got here.
+                if library.layouts_are_stale()? {
+                    self.label = Some("reading disc layouts".to_owned());
+                    let request = self.next_step_as(LAYOUTS_METHOD);
+                    let receipt = stored(self.summary, self.dirty, true)?;
+                    library.derive_layouts(request, receipt)?;
+                    self.fail_point()?;
+                }
                 self.phase = Phase::Done;
+                self.label = None;
                 return Ok(Some(self.summary));
             }
             Phase::Done => return Ok(Some(self.summary)),
@@ -526,6 +598,10 @@ impl ScanRun {
             self.failed
                 .push((path.clone(), "skipped", format!("{{\"reason\":\"{why}\"}}")));
         }
+        self.sort_sidecars(library)?;
+        let Some(walked) = &self.walked else {
+            return Err(Error::Corrupt("a scan with no walk"));
+        };
         self.summary.files = walked.files.len() as u64;
         self.summary.unchanged = unchanged;
         self.phase = if self.queue.is_empty() {
@@ -730,7 +806,8 @@ impl ScanRun {
     /// the recording the item has, the item is kept, and if not, the item
     /// is retired and a new one takes the path.
     fn judge_replaced(&mut self, library: &LibraryStore) -> Result<(), Error> {
-        self.phase = Phase::Resolve;
+        self.phase = Phase::Sidecars;
+        self.label = Some("reading rip logs and CUE sheets".to_owned());
         let replaced = std::mem::take(&mut self.replaced);
         if replaced.is_empty() {
             return Ok(());
@@ -768,6 +845,128 @@ impl ScanRun {
         self.committed()
     }
 
+    /// Compares the sidecars the walk found near the audio with those the
+    /// library has: which to read, and which are gone. A sidecar counts
+    /// in a folder of audio, in a folder inside one, or in the folder
+    /// above one.
+    fn sort_sidecars(&mut self, library: &LibraryStore) -> Result<(), Error> {
+        let Some(walked) = &self.walked else {
+            return Err(Error::Corrupt("a scan with no walk"));
+        };
+        self.known_sidecars = library.known_sidecars(self.source.row)?;
+        let unread = |path: &str| {
+            walked.unreadable.iter().any(|folder| {
+                path.strip_prefix(folder.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        };
+        // The folders of audio: those the walk found, and those of known
+        // files in folders it could not read, which are left as they were.
+        let audio: HashSet<&str> = walked
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .chain(
+                self.known
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|path| unread(path)),
+            )
+            .map(folder_of)
+            .collect();
+        let above: HashSet<&str> = audio
+            .iter()
+            .filter(|folder| !folder.is_empty())
+            .map(|folder| folder_of(folder))
+            .collect();
+        let near = |folder: &str| {
+            audio.contains(folder)
+                || above.contains(folder)
+                || (!folder.is_empty() && audio.contains(folder_of(folder)))
+        };
+        let mut present: HashSet<&str> = HashSet::new();
+        for seen in &walked.sidecars {
+            if !near(folder_of(&seen.path)) {
+                continue;
+            }
+            present.insert(seen.path.as_str());
+            let same = self.known_sidecars.get(&seen.path).is_some_and(|known| {
+                !known.missing
+                    && unsigned(known.size) == seen.size
+                    && known.mtime_ms == seen.mtime_ms
+            });
+            if !same {
+                self.sidecar_queue.push(seen.clone());
+            }
+        }
+        let mut gone: Vec<i64> = self
+            .known_sidecars
+            .iter()
+            .filter(|(path, known)| {
+                !known.missing && !present.contains(path.as_str()) && !unread(path)
+            })
+            .map(|(_, known)| known.id)
+            .collect();
+        gone.sort_unstable();
+        self.sidecar_ops
+            .extend(gone.into_iter().map(|id| SidecarOp::Gone { id }));
+        Ok(())
+    }
+
+    /// Reads the next batch of the sidecar files that are new or changed:
+    /// files whose sizes, as the walk found them, come to at most
+    /// [`SIDECAR_BATCH_BYTES`], and of each file at most one byte more than
+    /// a sidecar may be. Every file read counts, kept or not. A file that is
+    /// no longer a sidecar, such as a text file that no longer reads as a
+    /// rip log, is gone. A file that cannot be read now is left as it was.
+    fn read_sidecars(&mut self, stop: &AtomicBool) {
+        let mut bytes_read = 0;
+        while bytes_read < SIDECAR_BATCH_BYTES && !stop.load(Ordering::Relaxed) {
+            let Some(seen) = self.sidecar_queue.pop() else {
+                break;
+            };
+            let size = usize::try_from(seen.size).unwrap_or(usize::MAX);
+            if bytes_read > 0 && bytes_read.saturating_add(size) > SIDECAR_BATCH_BYTES {
+                self.sidecar_queue.push(seen);
+                break;
+            }
+            // A sidecar already marked gone is not marked again.
+            let live = self
+                .known_sidecars
+                .get(&seen.path)
+                .filter(|known| !known.missing)
+                .map(|known| known.id);
+            let name = seen.path.rsplit('/').next().unwrap_or(&seen.path);
+            let read = std::fs::File::open(under(&self.root, &seen.path)).and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(layout::SIDECAR_MAX_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map(|_| bytes)
+            });
+            if let Ok(bytes) = &read {
+                bytes_read += bytes.len();
+            }
+            match read {
+                Ok(bytes) if layout::keeps(name, &bytes) => {
+                    self.sidecar_ops.push(SidecarOp::Read {
+                        path: seen.path,
+                        size: seen.size,
+                        mtime_ms: seen.mtime_ms,
+                        bytes,
+                    });
+                }
+                Ok(_) => self
+                    .sidecar_ops
+                    .extend(live.map(|id| SidecarOp::Gone { id })),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.sidecar_ops
+                        .extend(live.map(|id| SidecarOp::Gone { id }));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
     /// The job's counters and checkpoint as they now are, to be saved.
     pub fn progress(&self) -> Progress {
         let checkpoint = Checkpoint {
@@ -802,6 +1001,16 @@ impl ScanRun {
     pub fn take_items(&mut self) -> Vec<(String, &'static str, String)> {
         std::mem::take(&mut self.failed)
     }
+}
+
+/// What a step stores as its result ([`StepResult`]): the checkpoint, with
+/// `summary` as its counters and `dirty` as it is once the step has
+/// committed, and whether the step is the scan's last.
+fn stored(summary: ScanSummary, dirty: bool, last: bool) -> Result<String, Error> {
+    Ok(serde_json::to_string(&StepResult {
+        checkpoint: Checkpoint { summary, dirty },
+        last,
+    })?)
 }
 
 /// What a job's checkpoint says the scan has found so far.

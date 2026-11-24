@@ -16,6 +16,7 @@ jiff = { version = "=0.2.43", default-features = false, features = ["std", "tzdb
 # A payload is stored as JSON and a decision's evidence is written as JSON.
 # Only the derives are used here: the engine does the reading and writing.
 serde = { version = "1.0.229", features = ["derive"] }
+sha1 = "=0.10.7"
 # NFKC, the first step of the mechanical normalisation of a name. Pinned
 # exactly: a changed table would change stored match names.
 unicode-normalization = "=0.1.25"

@@ -346,14 +346,16 @@ pub(crate) const VERSIONS_SETTING: &str = "identity.versions";
 /// resolution that completes removes it.
 pub(crate) const PENDING_SETTING: &str = "identity.resolution_pending";
 
-/// Says, in the write's transaction, that a resolution is owed.
+/// Says, in the write's transaction, that a resolution is owed, and that the
+/// disc layouts are due.
 pub(crate) fn mark_pending(write: &Write<'_>) -> Result<(), Error> {
     write.connection().execute(
         "INSERT INTO library_setting (key, value_json, rev) VALUES (?1, 'true', ?2)
          ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, rev = excluded.rev",
         (PENDING_SETTING, write.rev()),
     )?;
-    Ok(())
+    // What the files are is what the disc layouts are read against.
+    crate::evidence_store::mark_layouts_pending(write)
 }
 
 impl LibraryStore {

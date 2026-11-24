@@ -39,6 +39,7 @@ pub mod extract;
 pub mod history;
 #[cfg(test)]
 mod history_tests;
+pub mod layout;
 pub mod library;
 pub mod normalize;
 pub mod payload;
