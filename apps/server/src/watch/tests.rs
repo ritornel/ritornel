@@ -232,9 +232,9 @@ impl Rig {
     /// watcher they ended. It returns how many there were.
     fn import(&mut self) -> usize {
         let asked = self.watch.take_imports();
-        for (folder, trigger) in &asked {
+        for (id, folder, trigger) in &asked {
             let run = self.core.auto_import(folder, *trigger);
-            self.watch.imported(&folder.key(), Some(run));
+            self.watch.imported(&folder.key(), *id, Some(run));
         }
         self.core.watching().unwrap().show(None, self.watch.shown());
         asked.len()
@@ -717,6 +717,18 @@ fn a_picture_folder_with_a_music_roots_name_is_watched_beside_it() {
     rig.watch.refresh(vec![music], rig.now());
     assert_eq!(rig.fake.0.lock().unwrap().watched, [rig.music()]);
     assert_eq!(rig.watch.shown()[0].state, WatchState::Watching);
+
+    // Replacing a shared path's watch that now fails moves both folders to
+    // polling together, leaving no folder claiming a dropped watch.
+    rig.look();
+    rig.fake.0.lock().unwrap().refuse = true;
+    let now = rig.now();
+    rig.watch
+        .signal(Signal::Lost(vec![rig.music()], "dropped".to_owned()), now);
+    rig.look();
+    assert!(rig.fake.0.lock().unwrap().watched.is_empty());
+    let states: Vec<WatchState> = rig.watch.shown().iter().map(|s| s.state).collect();
+    assert_eq!(states, [WatchState::Polling, WatchState::Polling]);
 }
 
 #[test]

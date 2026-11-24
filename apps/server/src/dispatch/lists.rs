@@ -495,4 +495,30 @@ mod tests {
             "{library:?} {lists:?}"
         );
     }
+
+    #[test]
+    fn a_portrait_import_tells_only_artists_views_to_read_again_in_place() {
+        let (session, fanout) = watching();
+        session.hold_view("artists".to_owned(), view(ListKind::Artists));
+        for method in [
+            ArtistsImportPictures::NAME,
+            crate::dispatch::watch::REFRESH_PICTURES,
+        ] {
+            fanout.changed(Committed {
+                revision: 11,
+                method,
+                shown: true,
+            });
+            let (library, lists) = told(&session);
+            assert_eq!(library.len(), 1);
+            assert_eq!(library[0].changed, [LibraryChange::Metadata]);
+            assert_eq!(
+                lists
+                    .iter()
+                    .map(|event| (event.view.as_str(), event.reorder))
+                    .collect::<Vec<_>>(),
+                [("artists", false)]
+            );
+        }
+    }
 }
