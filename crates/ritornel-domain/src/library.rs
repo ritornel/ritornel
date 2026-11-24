@@ -137,6 +137,19 @@ pub struct Join {
     pub groups: Vec<i64>,
 }
 
+/// What standing answers said no to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Noes {
+    /// An album or a release not to offer these files again: by its
+    /// MusicBrainz ID, release group or release.
+    pub not_candidate: Vec<(String, Vec<i64>)>,
+    /// Files not to ask about, for one kind of proposal or, with none, for
+    /// any.
+    pub stop_asking: Vec<(Option<String>, Vec<i64>)>,
+    /// Two sets of files never on one release or in one release group.
+    pub apart: Vec<(Vec<i64>, Vec<i64>)>,
+}
+
 /// A release that exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExistingRelease {
@@ -268,6 +281,9 @@ pub struct Library {
     /// What each standing answer put together. Rows one joins count as one
     /// to the guards that keep rows with input of their own apart.
     pub answer_joins: Vec<Join>,
+    /// What standing answers said no to: candidates not to offer files,
+    /// files not to ask about, and files never to put on one album.
+    pub noes: Noes,
     /// The owner's edits in force: entity kind, row and field, to value.
     pub edits: HashMap<(Kind, i64, String), String>,
 }

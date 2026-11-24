@@ -1056,6 +1056,229 @@ fn a_yes_undone_from_a_batch_takes_its_part_of_the_albums_join_and_a_retag_stays
     );
 }
 
+#[test]
+fn the_album_and_its_edition_together_make_one_release_of_two_discs_and_each_undoes() {
+    let rig = album();
+    let (before, lost) = (reachable(&rig), stranded(&rig));
+    let edition_yes = edition(&rig).expect("the two discs are proposed as one release");
+    assert!(edition_yes.release.is_some());
+    // An edition is said with or after the album of its discs.
+    assert!(matches!(
+        confirm(&rig, 1, vec![edition_yes.clone()]),
+        Err(Error::Invalid(_))
+    ));
+    let mut all = group(&rig);
+    all.push(edition_yes);
+    let answers = confirm(&rig, 2, all).unwrap();
+    assert_eq!(releases(&rig), ["Tin Weather|2|5"]);
+    // Each file has its disc and track on the release.
+    assert_eq!(
+        rig.rows(
+            "SELECT ta.display_disc_number || '-' || ta.display_track_number FROM assignment a
+             JOIN track_appearance ta ON ta.id = a.appearance_id
+             WHERE a.superseded_at_ms IS NULL ORDER BY 1"
+        ),
+        ["1-1", "1-2", "1-3", "2-1", "2-2"]
+    );
+    // The edition undone alone leaves the album's join.
+    let edition_answer = answers[2];
+    undo(&rig, 3, vec![edition_answer]).unwrap();
+    assert_eq!(releases(&rig), ["Tin Weather|2|5"]);
+    // The albums' yeses undone, everything is as it was.
+    undo(&rig, 4, answers[..2].to_vec()).unwrap();
+    assert_eq!(reachable(&rig), before);
+    assert_eq!(stranded(&rig), lost);
+}
+
+#[test]
+fn undoing_an_album_undoes_the_edition_that_rests_on_it() {
+    let rig = album();
+    let before = reachable(&rig);
+    let edition_yes = edition(&rig).unwrap();
+    let mut all = group(&rig);
+    all.push(edition_yes);
+    let answers = confirm(&rig, 1, all).unwrap();
+    let shown = rig.library.preview_undo(&answers[..1]).unwrap();
+    assert!(shown.undoes.contains(&answers[2]), "the edition goes too");
+    undo(&rig, 2, answers[..2].to_vec()).unwrap();
+    assert_eq!(
+        rig.rows("SELECT count(*) FROM answer WHERE verb = 'undo'"),
+        ["3"]
+    );
+    assert_eq!(reachable(&rig), before);
+}
+
+fn decline(rig: &Rig, byte: u8, proposal: &Confirmation, stop_asking: bool) -> Vec<Id> {
+    let written = rig
+        .library
+        .decline(
+            command(byte),
+            ritornel_contract::DeclineParams {
+                idempotency_key: Id::from_bytes([0xe0 + byte; 16]),
+                proposal_id: proposal.proposal_id,
+                fingerprint: proposal.fingerprint.clone(),
+                release_group: (!stop_asking).then(|| proposal.release_group.clone()),
+                release: if stop_asking {
+                    None
+                } else {
+                    proposal.release.clone()
+                },
+                stop_asking,
+            },
+            |_, answers, _| {
+                serde_json::json!(
+                    answers
+                        .iter()
+                        .map(|(answer, _)| answer.to_string())
+                        .collect::<Vec<_>>()
+                )
+                .to_string()
+            },
+        )
+        .unwrap();
+    serde_json::from_str::<Vec<String>>(&written.result_json)
+        .unwrap()
+        .iter()
+        .map(|id| id.parse().unwrap())
+        .collect()
+}
+
+/// The release each disc's first file is on, by its public ID.
+fn release_ids(rig: &Rig) -> (Id, Id) {
+    let of = |folder: &str| -> Id {
+        let hex = rig.one(&format!(
+            "SELECT hex(rel.public_id) FROM source_item si
+             JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+             JOIN track_appearance ta ON ta.id = a.appearance_id
+             JOIN release rel ON rel.id = ta.release_id
+             WHERE si.provider_key LIKE '{folder}/%' LIMIT 1"
+        ));
+        let bytes: Vec<u8> = (0..16)
+            .map(|at| u8::from_str_radix(&hex[at * 2..at * 2 + 2], 16).unwrap())
+            .collect();
+        Id::from_bytes(bytes.try_into().unwrap())
+    };
+    (
+        of("Moss Arcade/Tin Weather"),
+        of("Moss Arcade/Tin Weather Bonus"),
+    )
+}
+
+#[test]
+fn a_candidate_said_no_to_is_offered_no_more_until_the_no_is_undone() {
+    let mut rig = album();
+    let dump = reachable(&rig);
+    let bonus = discs(&rig).1.unwrap();
+    let no = decline(&rig, 1, &bonus, false);
+    assert_eq!(reachable(&rig), dump, "a no moves nothing");
+    // Its one candidate said no to, the bonus disc is proposed for no more.
+    assert!(rig.library.proposal(bonus.proposal_id).is_err());
+    let said = rig.library.answer(no[0]).unwrap();
+    assert_eq!(said.answer.verb, ritornel_contract::AnswerVerb::Decline);
+    assert_eq!(
+        said.evidence.candidate.unwrap().title.as_deref(),
+        Some("Tin Weather")
+    );
+    // A rescan and a re-resolve keep it.
+    rig.scan();
+    assert!(discs(&rig).1.is_none_or(|again| {
+        again.proposal_id != bonus.proposal_id
+            || rig
+                .library
+                .proposal(again.proposal_id)
+                .unwrap()
+                .1
+                .candidates
+                .is_empty()
+    }));
+    undo(&rig, 2, no).unwrap();
+    assert!(discs(&rig).1.is_some(), "offered again");
+}
+
+#[test]
+fn files_asked_no_more_about_are_in_no_proposal_until_the_no_is_undone() {
+    let rig = album();
+    let main = discs(&rig).0.unwrap();
+    let no = decline(&rig, 1, &main, true);
+    let about_main = |rig: &Rig| {
+        rig.one(
+            "SELECT count(*) FROM proposal_item pi JOIN source_item si ON si.id = pi.source_item_id
+             WHERE si.provider_key LIKE 'Moss Arcade/Tin Weather/%'",
+        )
+    };
+    assert_eq!(about_main(&rig), "0");
+    // Opened to what it said, a stop names no candidate.
+    let said = rig.library.answer(no[0]).unwrap();
+    assert!(said.evidence.candidate.is_none());
+    undo(&rig, 2, no).unwrap();
+    assert_ne!(about_main(&rig), "0");
+}
+
+#[test]
+fn files_asked_no_more_about_as_an_edition_are_still_asked_about_as_an_album() {
+    let rig = album();
+    let edition_now = edition(&rig).unwrap();
+    decline(&rig, 1, &edition_now, true);
+    let kinds: Vec<String> = rig
+        .library
+        .proposals()
+        .unwrap()
+        .proposals
+        .into_iter()
+        .map(|proposal| proposal.kind)
+        .collect();
+    assert_eq!(kinds, ["album", "album"]);
+    assert_eq!(
+        rig.one("SELECT about FROM answer_rule WHERE kind = 'stop_asking'"),
+        "edition"
+    );
+}
+
+#[test]
+fn two_albums_kept_apart_are_never_joined_and_the_no_is_undone() {
+    let rig = album();
+    let (before, lost) = (reachable(&rig), stranded(&rig));
+    let (main, bonus) = release_ids(&rig);
+    let written = rig
+        .library
+        .keep_apart(command(1), vec![main, bonus], |_, answer, _| {
+            answer.to_string()
+        })
+        .unwrap();
+    let apart: Id = written.result_json.parse().unwrap();
+    // The bonus disc is proposed as the album alone, joining nothing, and
+    // the two are no one release.
+    let proposals = rig.library.proposals().unwrap().proposals;
+    assert!(proposals.iter().all(|proposal| proposal.kind == "album"));
+    let answers = confirm(&rig, 2, group(&rig)).unwrap();
+    assert_eq!(releases(&rig).len(), 2, "still two albums");
+    undo(&rig, 3, answers).unwrap();
+    undo(&rig, 4, vec![apart]).unwrap();
+    assert_eq!(reachable(&rig), before);
+    assert_eq!(stranded(&rig), lost);
+    assert!(edition(&rig).is_some(), "proposed as one release again");
+}
+
+#[test]
+fn two_releases_of_a_group_chosen_for_both_are_not_kept_apart() {
+    let rig = album();
+    let (main, bonus) = release_ids(&rig);
+    rig.library
+        .write(command(1), |write| {
+            write.connection().execute(
+                "UPDATE release SET chosen_release_group_id = (SELECT min(id) FROM release_group)",
+                [],
+            )?;
+            Ok(String::new())
+        })
+        .unwrap();
+    assert!(matches!(
+        rig.library
+            .keep_apart(command(2), vec![main, bonus], |_, _, _| String::new()),
+        Err(Error::Invalid(_))
+    ));
+}
+
 /// A play another service reported of the bonus disc's first song, taken
 /// in and matched as an import is.
 fn scrobble_the_bonus_disc(rig: &Rig) {
@@ -1289,6 +1512,40 @@ fn undoing_one_answer_of_a_batch_leaves_the_group_the_other_and_a_tagged_release
 }
 
 #[test]
+fn an_edition_said_again_after_a_rescan_is_undone_to_where_the_rescan_left_its_files() {
+    let mut rig = album();
+    let album_yes = confirm(&rig, 1, group(&rig)).unwrap();
+    let first = confirm(&rig, 2, vec![edition(&rig).unwrap()]).unwrap();
+    undo(&rig, 3, first).unwrap();
+    let undone = reachable(&rig);
+    // A retitled song moves its file to other rows while the album's yes
+    // stands.
+    let bytes = crate::proposal_tests::aiff(
+        300,
+        5,
+        &[
+            ("TIT2", "Far Lights (Reprise)"),
+            ("TPE1", "Moss Arcade"),
+            ("TPE2", "Moss Arcade"),
+            ("TALB", "Tin Weather (Bonus Disc)"),
+            ("TRCK", "2"),
+        ],
+    );
+    crate::proposal_tests::write(
+        &mut rig,
+        "Moss Arcade/Tin Weather Bonus/02 Far Lights.aiff",
+        &bytes,
+    );
+    rig.scan();
+    let rescanned = reachable(&rig);
+    assert_ne!(rescanned, undone, "the rescan moved a file");
+    let again = confirm(&rig, 4, vec![edition(&rig).unwrap()]).unwrap();
+    undo(&rig, 5, again).unwrap();
+    assert_eq!(reachable(&rig), rescanned);
+    assert!(!album_yes.is_empty());
+}
+
+#[test]
 fn a_resolution_a_stopped_scan_still_owes_is_made_before_a_yes_and_is_not_its_own() {
     let mut rig = album();
     let song = |seed: u32, title: &str, album: &str| {
@@ -1411,92 +1668,6 @@ fn a_yes_that_left_two_releases_apart_does_not_join_them_after_a_retag() {
     retag_the_bonus_disc(&mut rig, &[("TXXX", main)]);
     assert_eq!(releases(&rig), ["Tin Weather|1|3", "Tin Weather|1|2"]);
     assert!(!answers.is_empty());
-}
-
-#[test]
-fn the_album_and_its_edition_together_make_one_release_of_two_discs_and_each_undoes() {
-    let rig = album();
-    let (before, lost) = (reachable(&rig), stranded(&rig));
-    let edition_yes = edition(&rig).expect("the two discs are proposed as one release");
-    assert!(edition_yes.release.is_some());
-    // An edition is said with or after the album of its discs.
-    assert!(matches!(
-        confirm(&rig, 1, vec![edition_yes.clone()]),
-        Err(Error::Invalid(_))
-    ));
-    let mut all = group(&rig);
-    all.push(edition_yes);
-    let answers = confirm(&rig, 2, all).unwrap();
-    assert_eq!(releases(&rig), ["Tin Weather|2|5"]);
-    // Each file has its disc and track on the release.
-    assert_eq!(
-        rig.rows(
-            "SELECT ta.display_disc_number || '-' || ta.display_track_number FROM assignment a
-             JOIN track_appearance ta ON ta.id = a.appearance_id
-             WHERE a.superseded_at_ms IS NULL ORDER BY 1"
-        ),
-        ["1-1", "1-2", "1-3", "2-1", "2-2"]
-    );
-    // The edition undone alone leaves the album's join.
-    let edition_answer = answers[2];
-    undo(&rig, 3, vec![edition_answer]).unwrap();
-    assert_eq!(releases(&rig), ["Tin Weather|2|5"]);
-    // The albums' yeses undone, everything is as it was.
-    undo(&rig, 4, answers[..2].to_vec()).unwrap();
-    assert_eq!(reachable(&rig), before);
-    assert_eq!(stranded(&rig), lost);
-}
-
-#[test]
-fn undoing_an_album_undoes_the_edition_that_rests_on_it() {
-    let rig = album();
-    let before = reachable(&rig);
-    let edition_yes = edition(&rig).unwrap();
-    let mut all = group(&rig);
-    all.push(edition_yes);
-    let answers = confirm(&rig, 1, all).unwrap();
-    let shown = rig.library.preview_undo(&answers[..1]).unwrap();
-    assert!(shown.undoes.contains(&answers[2]), "the edition goes too");
-    undo(&rig, 2, answers[..2].to_vec()).unwrap();
-    assert_eq!(
-        rig.rows("SELECT count(*) FROM answer WHERE verb = 'undo'"),
-        ["3"]
-    );
-    assert_eq!(reachable(&rig), before);
-}
-
-#[test]
-fn an_edition_said_again_after_a_rescan_is_undone_to_where_the_rescan_left_its_files() {
-    let mut rig = album();
-    let album_yes = confirm(&rig, 1, group(&rig)).unwrap();
-    let first = confirm(&rig, 2, vec![edition(&rig).unwrap()]).unwrap();
-    undo(&rig, 3, first).unwrap();
-    let undone = reachable(&rig);
-    // A retitled song moves its file to other rows while the album's yes
-    // stands.
-    let bytes = crate::proposal_tests::aiff(
-        300,
-        5,
-        &[
-            ("TIT2", "Far Lights (Reprise)"),
-            ("TPE1", "Moss Arcade"),
-            ("TPE2", "Moss Arcade"),
-            ("TALB", "Tin Weather (Bonus Disc)"),
-            ("TRCK", "2"),
-        ],
-    );
-    crate::proposal_tests::write(
-        &mut rig,
-        "Moss Arcade/Tin Weather Bonus/02 Far Lights.aiff",
-        &bytes,
-    );
-    rig.scan();
-    let rescanned = reachable(&rig);
-    assert_ne!(rescanned, undone, "the rescan moved a file");
-    let again = confirm(&rig, 4, vec![edition(&rig).unwrap()]).unwrap();
-    undo(&rig, 5, again).unwrap();
-    assert_eq!(reachable(&rig), rescanned);
-    assert!(!album_yes.is_empty());
 }
 
 #[test]
@@ -1638,88 +1809,6 @@ fn undoing_an_answer_of_a_batch_leaves_what_another_answer_of_it_moved() {
 }
 
 #[test]
-fn a_play_never_counts_for_one_song_heard_as_another_after_a_yes_parts_their_files() {
-    let mut rig = album();
-    // The bonus disc's first song is titled as the main disc's first: filed
-    // apart, the two are taken as one recording.
-    let bytes = crate::proposal_tests::aiff(
-        200,
-        4,
-        &[
-            ("TIT2", "Paper Kites"),
-            ("TPE1", "Moss Arcade"),
-            ("TPE2", "Moss Arcade"),
-            ("TALB", "Tin Weather (Bonus Disc)"),
-            ("TRCK", "1"),
-        ],
-    );
-    crate::proposal_tests::write(
-        &mut rig,
-        "Moss Arcade/Tin Weather Bonus/01 Glass Harbour.aiff",
-        &bytes,
-    );
-    rig.scan();
-    // A scrobble of the main disc's song.
-    let account = rig
-        .library
-        .ensure_service_account("lastfm", "someone")
-        .unwrap();
-    let batch = ritornel_source::Batch {
-        records: vec![ritornel_source::ImportRecord {
-            source_key: b"main kites".to_vec(),
-            played_at_ms: 1_000,
-            track: ritornel_source::TrackText {
-                artist: "Moss Arcade".to_owned(),
-                album: Some("Tin Weather".to_owned()),
-                title: "Paper Kites".to_owned(),
-            },
-            ids: ritornel_source::Identifiers::default(),
-            payload_json: "{}".to_owned(),
-        }],
-        span: ritornel_source::Span {
-            from_ms: 0,
-            to_ms: 2_000,
-        },
-        cursor: "{}".to_owned(),
-    };
-    rig.library
-        .ingest(crate::Observations::Imports {
-            account,
-            batch: &batch,
-            full: false,
-        })
-        .unwrap();
-    rig.library.match_library_for(account).unwrap();
-    // Every bound play's song is the song of the appearance it was heard
-    // from, or it was heard from none.
-    let mismatched = |rig: &Rig| {
-        rig.one(
-            "SELECT count(*) FROM play_event pe JOIN track_appearance ta ON ta.id = pe.appearance_id
-             JOIN recording r ON r.id = ta.recording_id JOIN recording pr ON pr.id = pe.recording_id
-             WHERE r.canonical_id <> pr.canonical_id",
-        )
-    };
-    assert_eq!(mismatched(&rig), "0");
-    let played = |rig: &Rig| rig.rows("SELECT recording_id, appearance_id FROM play_event");
-    let was = played(&rig);
-    // A yes puts the two on one release, where they are two songs: the
-    // main disc's file is on a recording of its own, and the scrobble's
-    // play counts for the song it is bound to, heard from no appearance of
-    // another.
-    let answers = confirm(&rig, 1, group(&rig)).unwrap();
-    assert_eq!(mismatched(&rig), "0", "after the yes");
-    // The same one play, still bound to its recording, heard from none.
-    let [before] = was.as_slice() else {
-        panic!("one play: {was:?}")
-    };
-    let (recording, appearance) = before.split_once('|').unwrap();
-    assert_ne!(appearance, "-", "heard from the main disc's song before");
-    assert_eq!(played(&rig), [format!("{recording}|-")]);
-    undo(&rig, 2, answers).unwrap();
-    assert_eq!(played(&rig), was, "after its undo");
-}
-
-#[test]
 fn an_edition_for_a_disc_added_later_goes_with_the_answers_its_other_discs_rest_on() {
     let mut rig = album();
     let shown = group(&rig);
@@ -1834,6 +1923,134 @@ fn an_album_said_with_its_edition_does_not_keep_the_edition_s_join_after_it_is_u
 }
 
 #[test]
+fn a_resolution_owed_that_changes_nothing_is_settled_by_the_answer() {
+    let mut rig = album();
+    // A tag no rule reads, and the scan stops once it has read it.
+    let bytes = crate::proposal_tests::aiff(
+        75,
+        1,
+        &[
+            ("TIT2", "Paper Kites"),
+            ("TPE1", "Moss Arcade"),
+            ("TPE2", "Moss Arcade"),
+            ("TALB", "Tin Weather"),
+            ("TRCK", "1"),
+            ("TXXX", "Mood\u{0}calm"),
+        ],
+    );
+    crate::proposal_tests::write(
+        &mut rig,
+        "Moss Arcade/Tin Weather/01 Paper Kites.aiff",
+        &bytes,
+    );
+    let source = rig.main.clone();
+    let cut_off = rig.try_scan(
+        &source,
+        ScanSettings {
+            fail_after_step: Some(1),
+            ..ScanSettings::default()
+        },
+    );
+    assert!(matches!(cut_off, Err(Error::FailPoint)), "{cut_off:?}");
+    let job = rig.server.jobs(1).unwrap().remove(0);
+    rig.server
+        .finish_job(job.id, JobState::Cancelled, None)
+        .unwrap();
+    let pending = |rig: &Rig| {
+        rig.one("SELECT count(*) FROM library_setting WHERE key = 'identity.resolution_pending'")
+    };
+    assert_eq!(pending(&rig), "1", "a resolution is owed");
+    // Two releases already apart kept apart: an answer that moves nothing.
+    let (main, bonus) = release_ids(&rig);
+    rig.library
+        .keep_apart(command(1), vec![main, bonus], |_, _, _| String::new())
+        .unwrap();
+    assert_eq!(pending(&rig), "0", "and made");
+}
+
+#[test]
+fn a_play_never_counts_for_one_song_heard_as_another_after_a_yes_parts_their_files() {
+    let mut rig = album();
+    // The bonus disc's first song is titled as the main disc's first: filed
+    // apart, the two are taken as one recording.
+    let bytes = crate::proposal_tests::aiff(
+        200,
+        4,
+        &[
+            ("TIT2", "Paper Kites"),
+            ("TPE1", "Moss Arcade"),
+            ("TPE2", "Moss Arcade"),
+            ("TALB", "Tin Weather (Bonus Disc)"),
+            ("TRCK", "1"),
+        ],
+    );
+    crate::proposal_tests::write(
+        &mut rig,
+        "Moss Arcade/Tin Weather Bonus/01 Glass Harbour.aiff",
+        &bytes,
+    );
+    rig.scan();
+    // A scrobble of the main disc's song.
+    let account = rig
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let batch = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: b"main kites".to_vec(),
+            played_at_ms: 1_000,
+            track: ritornel_source::TrackText {
+                artist: "Moss Arcade".to_owned(),
+                album: Some("Tin Weather".to_owned()),
+                title: "Paper Kites".to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: 0,
+            to_ms: 2_000,
+        },
+        cursor: "{}".to_owned(),
+    };
+    rig.library
+        .ingest(crate::Observations::Imports {
+            account,
+            batch: &batch,
+            full: false,
+        })
+        .unwrap();
+    rig.library.match_library_for(account).unwrap();
+    // Every bound play's song is the song of the appearance it was heard
+    // from, or it was heard from none.
+    let mismatched = |rig: &Rig| {
+        rig.one(
+            "SELECT count(*) FROM play_event pe JOIN track_appearance ta ON ta.id = pe.appearance_id
+             JOIN recording r ON r.id = ta.recording_id JOIN recording pr ON pr.id = pe.recording_id
+             WHERE r.canonical_id <> pr.canonical_id",
+        )
+    };
+    assert_eq!(mismatched(&rig), "0");
+    let played = |rig: &Rig| rig.rows("SELECT recording_id, appearance_id FROM play_event");
+    let was = played(&rig);
+    // A yes puts the two on one release, where they are two songs: the
+    // main disc's file is on a recording of its own, and the scrobble's
+    // play counts for the song it is bound to, heard from no appearance of
+    // another.
+    let answers = confirm(&rig, 1, group(&rig)).unwrap();
+    assert_eq!(mismatched(&rig), "0", "after the yes");
+    // The same one play, still bound to its recording, heard from none.
+    let [before] = was.as_slice() else {
+        panic!("one play: {was:?}")
+    };
+    let (recording, appearance) = before.split_once('|').unwrap();
+    assert_ne!(appearance, "-", "heard from the main disc's song before");
+    assert_eq!(played(&rig), [format!("{recording}|-")]);
+    undo(&rig, 2, answers).unwrap();
+    assert_eq!(played(&rig), was, "after its undo");
+}
+
+#[test]
 fn an_edition_said_first_in_a_batch_and_undone_alone_gives_its_discs_their_releases_back() {
     let main = "MusicBrainz Album Id\u{0}00000000-0000-4000-8000-0000000000e1";
     let bonus = "MusicBrainz Album Id\u{0}00000000-0000-4000-8000-0000000000e2";
@@ -1861,5 +2078,30 @@ fn an_edition_said_first_in_a_batch_and_undone_alone_gives_its_discs_their_relea
         ids(&rig),
         before,
         "the albums' yeses keep each disc's own release"
+    );
+}
+
+#[test]
+fn an_edition_s_candidate_is_said_no_to_by_its_release_alone() {
+    let rig = album();
+    let shown = edition(&rig).unwrap();
+    let release = shown.release.clone();
+    rig.library
+        .decline(
+            command(1),
+            ritornel_contract::DeclineParams {
+                idempotency_key: Id::from_bytes([0xe1; 16]),
+                proposal_id: shown.proposal_id,
+                fingerprint: shown.fingerprint.clone(),
+                release_group: None,
+                release: release.clone(),
+                stop_asking: false,
+            },
+            |_, _, _| String::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        rig.one("SELECT candidate FROM answer_rule WHERE kind = 'not_candidate'"),
+        release.unwrap()
     );
 }

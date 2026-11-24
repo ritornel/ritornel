@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use sha1::{Digest, Sha1};
 
 use crate::extract::{PRIMARY_TYPES, parse_date};
-use crate::library::{Item, Library};
+use crate::library::{Item, Library, Noes};
 use crate::values::{Origin, Value};
 use crate::{Facts, Policy};
 
@@ -345,6 +345,7 @@ pub fn propose(
     // The album an answer gave a file, if one did. Such a file is in no
     // album proposal: until it is undone, the answer is what it is. Its disc
     // is still one of that album's discs, which the others are joined to.
+    let noes = &library.noes;
     let answered = |id: &i64| {
         eligible
             .get(id)
@@ -378,7 +379,7 @@ pub fn propose(
             .items
             .iter()
             .copied()
-            .filter(|id| answered(id).is_none())
+            .filter(|id| answered(id).is_none() && !noes.stopped(*id, "album"))
             .collect();
         let Some(anchor) = subject.first().copied() else {
             continue;
@@ -386,6 +387,9 @@ pub fn propose(
         let mut rests_on = disc.rests_on.clone();
         let mut candidates: Vec<Candidate> = Vec::new();
         for (group, seen) in &disc.albums {
+            if noes.declined(&subject, group) {
+                continue;
+            }
             let pick = |value: fn(&ReplyRelease) -> Option<&String>| {
                 seen.iter().find_map(|seen| value(seen.release)).cloned()
             };
@@ -414,11 +418,14 @@ pub fn propose(
                 .filter(|other| {
                     other.albums.contains_key(group)
                         && (std::ptr::eq(*other, disc)
-                            || other
+                            || (other
                                 .items
                                 .iter()
                                 .filter_map(answered)
-                                .all(|held| held == *group))
+                                .all(|held| held == *group)
+                                && !noes.apart(&disc.items, &other.items)
+                                && !noes.declined(&other.items, group)
+                                && !other.items.iter().any(|id| noes.stopped(*id, "album"))))
                 })
                 .collect();
             let (values, change, joined, onto) =
@@ -440,6 +447,10 @@ pub fn propose(
                 .cmp(&a.releases)
                 .then_with(|| a.release_group.cmp(&b.release_group))
         });
+        // Every album said no to: nothing is left to ask.
+        if candidates.is_empty() {
+            continue;
+        }
         rests_on.sort();
         proposals.push(Proposal {
             id: proposal_id("album", public_ids.get(&anchor)),
@@ -453,7 +464,7 @@ pub fn propose(
             fingerprint: String::new(),
         });
     }
-    proposals.extend(editions(&discs, &eligible, public_ids));
+    proposals.extend(editions(&discs, &eligible, public_ids, noes));
     // A group is every proposal whose likeliest candidate is the same
     // album, named by the first-seen anchor among them.
     let mut groups: HashMap<String, i64> = HashMap::new();
@@ -488,6 +499,7 @@ fn editions(
     discs: &[Disc<'_>],
     eligible: &HashMap<i64, &Item>,
     public_ids: &HashMap<i64, [u8; 16]>,
+    noes: &Noes,
 ) -> Vec<Proposal> {
     let held = |id: &i64, field: &str| {
         eligible
@@ -511,7 +523,10 @@ fn editions(
                         .and_then(|item| item.facts.release_group_mbid.as_deref())
                         != Some(*group)
             });
-            if !elsewhere {
+            // Nor is one said no to as this album, or asked no more about.
+            let refused = noes.declined(&disc.items, group)
+                || disc.items.iter().any(|id| noes.stopped(*id, "edition"));
+            if !elsewhere && !refused {
                 albums.entry(group).or_default().push(disc);
             }
         }
@@ -523,10 +538,20 @@ fn editions(
         if members.len() < 2 || members.iter().any(|disc| !disc.tracks_agree) {
             continue;
         }
+        // Discs kept apart are not one release.
+        let kept_apart = members.iter().enumerate().any(|(at, one)| {
+            members
+                .iter()
+                .skip(at + 1)
+                .any(|other| noes.apart(&one.items, &other.items))
+        });
+        if kept_apart {
+            continue;
+        }
         let mut subject: Vec<i64> = members
             .iter()
             .flat_map(|disc| disc.items.iter().copied())
-            .filter(|id| !held(id, "mb_release"))
+            .filter(|id| !held(id, "mb_release") && !noes.stopped(*id, "edition"))
             .collect();
         subject.sort_by_key(first_seen);
         let Some(anchor) = subject.first().copied() else {
@@ -558,6 +583,9 @@ fn editions(
             .partition(|disc| disc.items.iter().any(|id| subject.contains(id)));
         let mut candidates = Vec::new();
         for release in releases {
+            if noes.declined(&subject, release) {
+                continue;
+            }
             let Some(media): Option<Vec<u32>> =
                 asked.iter().map(|disc| medium(disc, release)).collect()
             else {
@@ -682,6 +710,42 @@ fn editions(
         });
     }
     proposals
+}
+
+impl Noes {
+    /// Whether a no stops these files being asked about for `kind`: a
+    /// stop on an album proposal stops its editions too, which rest on a
+    /// yes to the album.
+    fn stopped(&self, item: i64, kind: &str) -> bool {
+        self.stop_asking.iter().any(|(stopped, items)| {
+            stopped
+                .as_deref()
+                .is_none_or(|stopped| stopped == kind || (stopped, kind) == ("album", "edition"))
+                && items.contains(&item)
+        })
+    }
+
+    /// Whether `candidate` was said no to for most of these files: a no
+    /// still applies to a subject that has changed while most of it
+    /// carries it.
+    fn declined(&self, subject: &[i64], candidate: &str) -> bool {
+        let said: BTreeSet<i64> = self
+            .not_candidate
+            .iter()
+            .filter(|(declined, _)| declined == candidate)
+            .flat_map(|(_, items)| items.iter().copied())
+            .collect();
+        let covered = subject.iter().filter(|id| said.contains(id)).count();
+        covered > 0 && covered * 2 >= subject.len()
+    }
+
+    /// Whether files of `one` and of `other` were kept apart.
+    fn apart(&self, one: &[i64], other: &[i64]) -> bool {
+        let any = |items: &[i64], side: &[i64]| items.iter().any(|item| side.contains(item));
+        self.apart.iter().any(|(left, right)| {
+            (any(one, left) && any(other, right)) || (any(one, right) && any(other, left))
+        })
+    }
 }
 
 /// A proposal's ID: a digest of its kind and its anchor's public ID.

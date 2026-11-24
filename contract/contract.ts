@@ -154,6 +154,8 @@ export const METHODS = {
   "corrections.preview": { kind: "query", needsFull: true },
   "corrections.confirm": { kind: "command", needsFull: true },
   "corrections.undo": { kind: "command", needsFull: true },
+  "corrections.decline": { kind: "command", needsFull: true },
+  "corrections.keepApart": { kind: "command", needsFull: true },
   "corrections.answers": { kind: "query", needsFull: true },
   "corrections.answer": { kind: "query", needsFull: true },
 } as const;
@@ -253,6 +255,8 @@ export type MethodMap = {
   "corrections.preview": { params: PreviewParams; result: PreviewShown };
   "corrections.confirm": { params: ConfirmParams; result: Answered };
   "corrections.undo": { params: UndoParams; result: Answered };
+  "corrections.decline": { params: DeclineParams; result: Answered };
+  "corrections.keepApart": { params: KeepApartParams; result: Answered };
   "corrections.answers": { params: AnswersParams; result: AnswerList };
   "corrections.answer": { params: AnswerParams; result: AnswerGot };
 };
@@ -532,23 +536,25 @@ export type Answer = {
    */
   verb: AnswerVerb,
   /**
-   * For a yes: the proposal it answered.
+   * For a yes or a no to a proposal: the proposal it answered.
    */
   proposalId?: string,
   /**
-   * For a yes: the album it said yes to, by its release group ID.
+   * For a yes, or a no to a candidate: the album, by its release group
+   * ID.
    */
   releaseGroup?: string,
   /**
-   * What a yes was about: `album`, or `edition`.
+   * What a yes or a no to a proposal was about: `album` or `edition`.
    */
   kind?: string,
   /**
-   * For a yes to an edition: the release, by its ID.
+   * For a yes or a no to an edition: the release, by its ID.
    */
   release?: string,
   /**
-   * For a yes: the album's title, as it was shown.
+   * For a yes or a no to a candidate: the album's title, as it was
+   * shown.
    */
   title?: string,
   /**
@@ -556,11 +562,11 @@ export type Answer = {
    */
   undoes?: string,
   /**
-   * For a yes that was undone: the undo.
+   * For an answer that was undone: the undo.
    */
   undoneBy?: string,
   /**
-   * How many files it put values on.
+   * How many files it is about: those it put values on, or a no's.
    */
   files: number,
   /**
@@ -574,7 +580,7 @@ export type Answer = {
  */
 export type AnswerEvidence = {
   /**
-   * For a yes: the album said yes to, as it was shown.
+   * For a yes or a no to a candidate: the candidate, as it was shown.
    */
   candidate?: AnsweredCandidate,
   /**
@@ -651,7 +657,7 @@ export type AnswerParams = {
 /**
  * What an answer said.
  */
-export type AnswerVerb = "confirm" | "undo";
+export type AnswerVerb = "confirm" | "decline" | "stop_asking" | "keep_apart" | "undo";
 
 /**
  * One answer a command wrote.
@@ -662,7 +668,7 @@ export type AnswerWritten = {
    */
   answerId: string,
   /**
-   * The proposal a yes answered.
+   * The proposal a yes or a no to one answered.
    */
   proposalId?: string,
   /**
@@ -672,7 +678,8 @@ export type AnswerWritten = {
 };
 
 /**
- * The result of `corrections.confirm` and `corrections.undo`.
+ * The result of `corrections.confirm`, `corrections.undo`,
+ * `corrections.decline` and `corrections.keepApart`.
  */
 export type Answered = {
   /**
@@ -1307,6 +1314,39 @@ export type Credit = {
 };
 
 /**
+ * The params of `corrections.decline`: no to a proposal, as it was shown.
+ */
+export type DeclineParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The proposal.
+   */
+  proposalId: string,
+  /**
+   * Its fingerprint as it was shown. A proposal that has changed since
+   * is refused, and nothing is written.
+   */
+  fingerprint: string,
+  /**
+   * The candidate not to offer these files again, by its release group
+   * ID; with `stop_asking`, none.
+   */
+  releaseGroup?: string,
+  /**
+   * For an edition: the release not to offer them again.
+   */
+  release?: string,
+  /**
+   * Ask no more about these files, by any proposal of this one's kind
+   * (and, for an album, its editions), in place of naming a candidate.
+   */
+  stopAsking: boolean,
+};
+
+/**
  * How many scrobbles are in one state.
  */
 export type DeliveryCount = {
@@ -1785,8 +1825,8 @@ export type FileValue = {
   path: string,
   /**
    * The field, named as tags are read: `album`, `album_artist`,
-   * `mb_album_artist`, `disc_number`, `mb_release_group`,
-   * `primary_type` or `original_date`.
+   * `mb_album_artist`, `disc_number`, `track_number`, `mb_release_group`,
+   * `mb_release`, `primary_type` or `original_date`.
    */
   field: string,
   /**
@@ -3004,6 +3044,21 @@ export type JoinSample = {
 };
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
+
+/**
+ * The params of `corrections.keepApart`: two albums never to be one.
+ */
+export type KeepApartParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * Two releases, by their IDs: the files on each now are never put on
+   * one release, or in one release group, with the other's.
+   */
+  releases: Array<string>,
+};
 
 /**
  * The params of a command that takes nothing but its key.
@@ -4904,7 +4959,8 @@ export type ProgressEvent = {
 };
 
 /**
- * One proposal: that one disc of the library is one album.
+ * One proposal: that a disc of the library is one album, or that discs
+ * of one album are one release of it.
  */
 export type Proposal = {
   /**
@@ -4912,7 +4968,7 @@ export type Proposal = {
    */
   proposalId: string,
   /**
-   * Its kind: `album`.
+   * Its kind: `album` or `edition`.
    */
   kind: string,
   /**
@@ -4980,7 +5036,7 @@ export type ProposalCandidate = {
    */
   artist: string,
   /**
-   * Its kind, such as `Album`.
+   * Its kind, such as `album`.
    */
   primaryType?: string,
   /**

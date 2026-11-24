@@ -314,6 +314,68 @@ fn keep_rows(
     kept
 }
 
+/// A part of a release split for files kept apart: its members, and the
+/// sides of the pairs they are on.
+type Part = (Vec<usize>, BTreeSet<(usize, bool)>);
+
+/// The sides of the pairs a person kept apart that each file is on, by
+/// the file: the pair's index, and which side.
+pub(crate) fn apart_sides(library: &Library) -> HashMap<i64, Vec<(usize, bool)>> {
+    let mut sides: HashMap<i64, Vec<(usize, bool)>> = HashMap::new();
+    for (pair, (one, other)) in library.noes.apart.iter().enumerate() {
+        for (side, items) in [(false, one), (true, other)] {
+            for item in items {
+                sides.entry(*item).or_default().push((pair, side));
+            }
+        }
+    }
+    sides
+}
+
+/// Whether two files are on opposite sides of a pair a person kept apart.
+pub(crate) fn kept_apart(sides: &HashMap<i64, Vec<(usize, bool)>>, one: i64, other: i64) -> bool {
+    let (Some(one), Some(other)) = (sides.get(&one), sides.get(&other)) else {
+        return false;
+    };
+    one.iter()
+        .any(|(pair, side)| other.contains(&(*pair, !side)))
+}
+
+/// A release's members split so that no part holds both sides of a pair
+/// kept apart, each member going with the first part it is not kept apart
+/// from, by the sides `sides_of` gives it.
+fn apart_parts<'a>(
+    members: Vec<usize>,
+    sides_of: impl Fn(usize) -> Option<&'a Vec<(usize, bool)>>,
+) -> Vec<Vec<usize>> {
+    let mut parts: Vec<Part> = Vec::new();
+    for member in members {
+        let mine: &[(usize, bool)] = sides_of(member).map_or(&[], Vec::as_slice);
+        let fits = |(_, taken): &&mut Part| {
+            mine.iter()
+                .all(|(pair, side)| !taken.contains(&(*pair, !side)))
+        };
+        match parts.iter_mut().find(fits) {
+            Some((members, taken)) => {
+                members.push(member);
+                taken.extend(mine);
+            }
+            None => parts.push((vec![member], mine.iter().copied().collect())),
+        }
+    }
+    parts.into_iter().map(|(members, _)| members).collect()
+}
+
+/// The key of a part of a release split for files kept apart: the first
+/// keeps the release's.
+fn apart_key(key: &str, part: usize) -> String {
+    if part == 0 {
+        key.to_owned()
+    } else {
+        format!("{key}\u{1f}a{part}")
+    }
+}
+
 /// Each row any of `sets` holds, to the least row joined with it through
 /// them, by one set or a chain of them.
 fn joined<'a>(sets: impl Iterator<Item = &'a Vec<i64>>) -> HashMap<i64, i64> {
@@ -462,11 +524,20 @@ pub(crate) fn release_keys(library: &Library) -> HashMap<i64, String> {
         .enumerate()
         .map(|(index, (item, spec))| (index, *item, spec.as_ref()))
         .collect();
+    // Files a person kept apart are on two releases, as the catalog forms
+    // them.
+    let sides = apart_sides(library);
     let mut keys = HashMap::new();
     for (key, members) in form_releases(&listed) {
-        for index in members {
-            if let Some(item) = items.get(index) {
-                keys.insert(item.id, key.clone());
+        let parts = apart_parts(members, |index| {
+            items.get(index).and_then(|item| sides.get(&item.id))
+        });
+        for (part, members) in parts.into_iter().enumerate() {
+            let key = apart_key(&key, part);
+            for index in members {
+                if let Some(item) = items.get(index) {
+                    keys.insert(item.id, key.clone());
+                }
             }
         }
     }
@@ -689,6 +760,28 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         }
     }
     forming = split_forming;
+    // Files a person kept apart are never on one release: a release that
+    // would hold both sides of a pair is split, each file going with the
+    // first part it is not kept apart from.
+    let sides = apart_sides(library);
+    if !sides.is_empty() {
+        let mut kept: Vec<Forming> = Vec::with_capacity(forming.len());
+        for release in forming {
+            let parts = apart_parts(release.members, |member| {
+                actives
+                    .get(member)
+                    .and_then(|active| sides.get(&active.item.id))
+            });
+            for (part, members) in parts.into_iter().enumerate() {
+                kept.push(Forming {
+                    key: apart_key(&release.key, part),
+                    members,
+                    r: Ref::New(0),
+                });
+            }
+        }
+        forming = kept;
+    }
 
     let no_preferred: HashSet<(i64, usize)> = HashSet::new();
     let votes = forming
@@ -1484,6 +1577,22 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
             Ref::New(_) => None,
         })
         .collect();
+    // The sides of pairs kept apart each group would hold, by its root:
+    // two groups that would hold both sides of one pair are never joined.
+    let comp_sides: std::cell::RefCell<Vec<BTreeSet<(usize, bool)>>> = std::cell::RefCell::new(
+        formed
+            .iter()
+            .map(|formed| {
+                formed
+                    .members
+                    .iter()
+                    .filter_map(|active| sides.get(&active.item.id))
+                    .flatten()
+                    .copied()
+                    .collect()
+            })
+            .collect(),
+    );
     let safe_union = |parents: &mut [usize], comp_owner: &mut [Option<i64>], a: usize, b: usize| {
         let (ra, rb) = (find(parents, a), find(parents, b));
         if ra == rb {
@@ -1498,10 +1607,25 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         {
             return;
         }
+        let mut comp_sides = comp_sides.borrow_mut();
+        let both = comp_sides
+            .get(ra)
+            .zip(comp_sides.get(rb))
+            .is_some_and(|(left, right)| {
+                left.iter()
+                    .any(|(pair, side)| right.contains(&(*pair, !side)))
+            });
+        if both {
+            return;
+        }
         let root = ra.min(rb);
         union(parents, ra, rb);
         if let Some(slot) = comp_owner.get_mut(root) {
             *slot = oa.or(ob);
+        }
+        let other = comp_sides.get(ra.max(rb)).cloned().unwrap_or_default();
+        if let Some(slot) = comp_sides.get_mut(root) {
+            slot.extend(other);
         }
     };
     let mut by_mbid: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
@@ -1581,6 +1705,20 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
         }
     }
     let components: Vec<Vec<usize>> = components.into_values().collect();
+    // The sides of pairs kept apart that releases hold.
+    let sides_of = |members: &[usize]| -> BTreeSet<(usize, bool)> {
+        let comp_sides = comp_sides.borrow();
+        members
+            .iter()
+            .filter_map(|index| comp_sides.get(*index))
+            .flatten()
+            .copied()
+            .collect()
+    };
+    let fixed_sides: HashMap<i64, BTreeSet<(usize, bool)>> = fixed
+        .iter()
+        .map(|(group, members)| (*group, sides_of(members)))
+        .collect();
     let mut preferred_group_hits: HashSet<(i64, usize)> = HashSet::new();
     let votes = components
         .iter()
@@ -1594,6 +1732,7 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                 .unwrap_or("")
                 .to_owned();
             let mut rows = Vec::new();
+            let mine = sides_of(members);
             for index in members {
                 if let Some(Ref::Row(rel_row)) = releases.get(*index).map(|release| release.r)
                     && let Some(existing) = library.releases.get(&rel_row)
@@ -1604,6 +1743,14 @@ pub fn resolve(library: &Library, policy: &Policy) -> Resolution {
                         .get(&rel_row)
                         .copied()
                         .unwrap_or(existing.group);
+                    // A group chosen for a release kept apart from these is
+                    // not theirs to keep.
+                    if fixed_sides.get(&group).is_some_and(|theirs| {
+                        mine.iter()
+                            .any(|(pair, side)| theirs.contains(&(*pair, !side)))
+                    }) {
+                        continue;
+                    }
                     if library.groups.get(&group).and_then(|g| g.preferred_release) == Some(rel_row)
                     {
                         preferred_group_hits.insert((group, comp_idx));

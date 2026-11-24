@@ -546,6 +546,8 @@ struct Fold<'a> {
     /// The release each item is on, by its row, when the policy tells two
     /// tracks of one release apart.
     releases: HashMap<i64, String>,
+    /// The sides of the pairs a person kept apart each item is on.
+    apart: HashMap<i64, Vec<(usize, bool)>>,
 }
 
 enum Outcome {
@@ -670,6 +672,7 @@ impl<'a> Fold<'a> {
             } else {
                 HashMap::new()
             },
+            apart: crate::catalog::apart_sides(library),
         }
     }
 
@@ -726,7 +729,12 @@ impl<'a> Fold<'a> {
     ///   one album, and so are two copies of a various-artists compilation
     ///   tagged with no album artist; a compilation and an artist's own
     ///   album, titled differently, are two.
+    /// - Two files a person kept apart are on two albums, whatever their
+    ///   tags say.
     fn same_album(&self, a: &Ev, b: &Ev) -> Option<bool> {
+        if crate::catalog::kept_apart(&self.apart, a.item, b.item) {
+            return Some(false);
+        }
         let (Some(a_full), Some(b_full)) = (&a.album_full, &b.album_full) else {
             return None;
         };

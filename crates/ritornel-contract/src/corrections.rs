@@ -247,7 +247,7 @@ pub struct ProposalCandidate {
     pub title: Option<String>,
     /// Who it is credited to.
     pub artist: String,
-    /// Its kind, such as `Album`.
+    /// Its kind, such as `album`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub primary_type: Option<String>,
@@ -276,8 +276,8 @@ pub struct FileValue {
     /// The file, by its path under its root.
     pub path: String,
     /// The field, named as tags are read: `album`, `album_artist`,
-    /// `mb_album_artist`, `disc_number`, `mb_release_group`,
-    /// `primary_type` or `original_date`.
+    /// `mb_album_artist`, `disc_number`, `track_number`, `mb_release_group`,
+    /// `mb_release`, `primary_type` or `original_date`.
     pub field: String,
     /// Its position among the field's values, from 0.
     pub ordinal: u32,
@@ -307,14 +307,15 @@ pub struct ProposalEvidence {
     pub replied_at_ms: u64,
 }
 
-/// One proposal: that one disc of the library is one album.
+/// One proposal: that a disc of the library is one album, or that discs
+/// of one album are one release of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct Proposal {
     /// Its ID. Worked out again, the same proposal keeps it.
     pub proposal_id: Id,
-    /// Its kind: `album`.
+    /// Its kind: `album` or `edition`.
     pub kind: String,
     /// The proposal its group is named by. Proposals about the same album
     /// share it, and are shown and answered together.
@@ -493,7 +494,7 @@ pub struct ConfirmParams {
 pub struct AnswerWritten {
     /// The answer's ID.
     pub answer_id: Id,
-    /// The proposal a yes answered.
+    /// The proposal a yes or a no to one answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub proposal_id: Option<Id>,
@@ -503,7 +504,8 @@ pub struct AnswerWritten {
     pub undoes: Option<Id>,
 }
 
-/// The result of `corrections.confirm` and `corrections.undo`.
+/// The result of `corrections.confirm`, `corrections.undo`,
+/// `corrections.decline` and `corrections.keepApart`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
@@ -515,6 +517,45 @@ pub struct Answered {
     pub answers: Vec<AnswerWritten>,
     /// Whether anything shown changed: an album, a song or an artist.
     pub moved: bool,
+}
+
+/// The params of `corrections.decline`: no to a proposal, as it was shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct DeclineParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// The proposal.
+    pub proposal_id: Id,
+    /// Its fingerprint as it was shown. A proposal that has changed since
+    /// is refused, and nothing is written.
+    pub fingerprint: String,
+    /// The candidate not to offer these files again, by its release group
+    /// ID; with `stop_asking`, none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release_group: Option<String>,
+    /// For an edition: the release not to offer them again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release: Option<String>,
+    /// Ask no more about these files, by any proposal of this one's kind
+    /// (and, for an album, its editions), in place of naming a candidate.
+    #[serde(default)]
+    pub stop_asking: bool,
+}
+
+/// The params of `corrections.keepApart`: two albums never to be one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct KeepApartParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// Two releases, by their IDs: the files on each now are never put on
+    /// one release, or in one release group, with the other's.
+    pub releases: Vec<Id>,
 }
 
 /// The params of `corrections.undo`.
@@ -535,6 +576,12 @@ pub struct UndoParams {
 pub enum AnswerVerb {
     /// Yes to a proposal's candidate.
     Confirm,
+    /// Not this candidate, for a proposal's files.
+    Decline,
+    /// Ask no more about a proposal's files.
+    StopAsking,
+    /// Never put two albums' files on one album.
+    KeepApart,
     /// The undo of an earlier answer.
     Undo,
 }
@@ -548,23 +595,25 @@ pub struct Answer {
     pub answer_id: Id,
     /// What it said.
     pub verb: AnswerVerb,
-    /// For a yes: the proposal it answered.
+    /// For a yes or a no to a proposal: the proposal it answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub proposal_id: Option<Id>,
-    /// For a yes: the album it said yes to, by its release group ID.
+    /// For a yes, or a no to a candidate: the album, by its release group
+    /// ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub release_group: Option<String>,
-    /// What a yes was about: `album`, or `edition`.
+    /// What a yes or a no to a proposal was about: `album` or `edition`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub kind: Option<String>,
-    /// For a yes to an edition: the release, by its ID.
+    /// For a yes or a no to an edition: the release, by its ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub release: Option<String>,
-    /// For a yes: the album's title, as it was shown.
+    /// For a yes or a no to a candidate: the album's title, as it was
+    /// shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub title: Option<String>,
@@ -572,11 +621,11 @@ pub struct Answer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub undoes: Option<Id>,
-    /// For a yes that was undone: the undo.
+    /// For an answer that was undone: the undo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub undone_by: Option<Id>,
-    /// How many files it put values on.
+    /// How many files it is about: those it put values on, or a no's.
     pub files: u32,
     /// When it was given, as Unix milliseconds.
     pub answered_at_ms: u64,
@@ -688,7 +737,7 @@ pub struct AnsweredLayout {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct AnswerEvidence {
-    /// For a yes: the album said yes to, as it was shown.
+    /// For a yes or a no to a candidate: the candidate, as it was shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub candidate: Option<AnsweredCandidate>,

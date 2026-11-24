@@ -12,11 +12,7 @@
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
 --   0008_spotify_streams  e9ce8045bd8ecad934d57ecb7150f891907050e0591b711f9884c1231d1747e1
---   0009_sidecars_and_disc_layouts  878233bcc6fed742092f02deba5765f167f1f9eb2bb1743c26a3235baea3e18a
---   0010_lookup_replies  28ed4aad4966e46edc0008b800d61348b49c8e03ceaab864f22c3d90c5ede3a7
---   0011_album_proposals  1a1ea91e5554dd76b0cef6be8665945177ff99b3d8853c2df2fa5effd92b70c2
---   0012_answers  872f809b8df1581f7dd802a0cd7086433449042f8c257a44c0775ac20bc30905
---   0013_edition_proposals  8eb90fa1f1564e2ff847a15ff122c6f69009b277f1ebbcbf1e27bdaa597cacc6
+--   0009_corrections  55ebfb0e5fc33e399a26a4e8320c51ee33b1f930f98a9327b159c5b5160676dd
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -1239,14 +1235,70 @@ CREATE INDEX evidence_claim_response ON evidence_claim (lookup_response_id);
 
 CREATE INDEX evidence_claim_release ON evidence_claim (release_mbid, field);
 
+CREATE TABLE proposal (
+  id                    INTEGER PRIMARY KEY,
+  public_id             BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
+  kind                  TEXT NOT NULL CHECK (kind IN ('album', 'edition')),
+  anchor_item_id        INTEGER NOT NULL REFERENCES source_item(id),
+  group_public_id       BLOB NOT NULL CHECK (length(group_public_id) = 16),   -- the proposal whose anchor is its group's
+  source_instance_id    INTEGER NOT NULL REFERENCES source_instance(id),
+  folder                TEXT NOT NULL,                                       -- relative to the root: the anchor's
+  fingerprint           TEXT NOT NULL,                                       -- a digest of all of it, which a yes names
+  proposer_version      INTEGER NOT NULL,
+  rev                   INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX proposal_group ON proposal (group_public_id);
+
+CREATE TABLE proposal_item (
+  id                INTEGER PRIMARY KEY,
+  proposal_id       INTEGER NOT NULL REFERENCES proposal(id),
+  source_item_id    INTEGER NOT NULL REFERENCES source_item(id),
+  rev               INTEGER NOT NULL,
+  UNIQUE (proposal_id, source_item_id)
+) STRICT;
+
+CREATE INDEX proposal_item_item ON proposal_item (source_item_id);
+
+CREATE TABLE proposal_candidate (
+  id                    INTEGER PRIMARY KEY,
+  proposal_id           INTEGER NOT NULL REFERENCES proposal(id),
+  ordinal               INTEGER NOT NULL,              -- the likeliest first
+  release_group_mbid    TEXT NOT NULL,                 -- the album
+  release_mbid          TEXT,                          -- for an edition: the release
+  title                 TEXT,                          -- the album's, or for an edition the release's
+  artist                TEXT NOT NULL,
+  primary_type          TEXT,
+  first_date            TEXT,                          -- the album's first, or for an edition the release's
+  country               TEXT,                          -- for an edition: where the release came out
+  media                 INTEGER,                       -- for an edition: how many media the release has
+  releases              INTEGER NOT NULL,              -- how many of the replies' releases are of it
+  change                TEXT NOT NULL CHECK (change IN ('knows', 'gains', 'moves')),
+  values_json           TEXT NOT NULL,                 -- [{"item":12,"field":"disc_number","ordinal":0,"value":"2"}]
+  onto_json             TEXT NOT NULL,                 -- the files of the first disc a yes joins these onto: [14,15]
+  rev                   INTEGER NOT NULL,
+  CHECK (release_mbid IS NOT NULL OR (country IS NULL AND media IS NULL)),
+  UNIQUE (proposal_id, ordinal)
+) STRICT;
+
+CREATE TABLE proposal_evidence (
+  id                    INTEGER PRIMARY KEY,
+  proposal_id           INTEGER NOT NULL REFERENCES proposal(id),
+  role                  TEXT NOT NULL CHECK (role IN ('rests_on')),
+  disc_id               TEXT NOT NULL,
+  lookup_response_id    INTEGER NOT NULL REFERENCES lookup_response(id),   -- the reply, as it was current
+  rev                   INTEGER NOT NULL,
+  UNIQUE (proposal_id, role, disc_id, lookup_response_id)
+) STRICT;
+
 CREATE TABLE answer (
   id                      INTEGER PRIMARY KEY,
   public_id               BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
-  verb                    TEXT NOT NULL CHECK (length(verb) > 0),               -- 'confirm' or 'undo'
-  kind                    TEXT CHECK (length(kind) > 0),                        -- what a confirm was about: 'album'; NULL for an undo
+  verb                    TEXT NOT NULL CHECK (length(verb) > 0),               -- 'confirm', 'decline', 'stop_asking', 'apart' or 'undo'
+  kind                    TEXT CHECK (length(kind) > 0),                        -- what a yes or a no was about: 'album' or 'edition'; NULL otherwise
   proposal_public_id      BLOB CHECK (proposal_public_id IS NULL OR length(proposal_public_id) = 16),
   proposal_fingerprint    TEXT,                                                 -- the proposal as it was shown
-  candidate               TEXT,                                                 -- the release group a confirm said yes to
+  candidate               TEXT,                                                 -- what a yes or a no named: a release group, or for an edition a release
   undoes_answer_id        INTEGER REFERENCES answer(id),
   actor_kind              TEXT NOT NULL CHECK (actor_kind IN ('person', 'agent', 'rule')),
   actor_session_pid       BLOB CHECK (actor_session_pid IS NULL OR length(actor_session_pid) = 16),
@@ -1449,58 +1501,83 @@ BEGIN
   SELECT RAISE(ABORT, 'answer_dependency is immutable');
 END;
 
-CREATE TABLE proposal (
-  id                    INTEGER PRIMARY KEY,
-  public_id             BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
-  kind                  TEXT NOT NULL CHECK (kind IN ('album', 'edition')),
-  anchor_item_id        INTEGER NOT NULL REFERENCES source_item(id),
-  group_public_id       BLOB NOT NULL CHECK (length(group_public_id) = 16),   -- the proposal whose anchor is its group's
-  source_instance_id    INTEGER NOT NULL REFERENCES source_instance(id),
-  folder                TEXT NOT NULL,                                       -- relative to the root: the anchor's
-  fingerprint           TEXT NOT NULL,                                       -- a digest of all of it, which a yes names
-  proposer_version      INTEGER NOT NULL,
-  rev                   INTEGER NOT NULL
+CREATE TABLE answer_rule (
+  id                        INTEGER PRIMARY KEY,
+  answer_id                 INTEGER NOT NULL UNIQUE REFERENCES answer(id),
+  kind                      TEXT NOT NULL CHECK (kind IN ('not_candidate', 'stop_asking', 'apart')),
+  candidate                 TEXT,                     -- for not_candidate: the release group or release
+  about                     TEXT,                     -- stop_asking: the kind of proposal, 'album' or 'edition' (NULL for any); apart: what the sides are kept apart as, 'album'
+  withdrawn_by_answer_id    INTEGER REFERENCES answer(id),
+  rev                       INTEGER NOT NULL,
+  CHECK ((kind = 'not_candidate') = (candidate IS NOT NULL)),
+  CHECK (kind <> 'not_candidate' OR about IS NULL)
 ) STRICT;
 
-CREATE INDEX proposal_group ON proposal (group_public_id);
+CREATE TRIGGER answer_rule_withdrawn_once
+BEFORE UPDATE ON answer_rule
+WHEN OLD.withdrawn_by_answer_id IS NOT NULL
+  OR NEW.withdrawn_by_answer_id IS NULL
+  OR NOT EXISTS (SELECT 1 FROM answer u
+                 WHERE u.id = NEW.withdrawn_by_answer_id AND u.undoes_answer_id = OLD.answer_id)
+  OR NEW.id IS NOT OLD.id
+  OR NEW.answer_id IS NOT OLD.answer_id
+  OR NEW.kind IS NOT OLD.kind
+  OR NEW.candidate IS NOT OLD.candidate
+  OR NEW.about IS NOT OLD.about
+BEGIN
+  SELECT RAISE(ABORT, 'answer_rule changes only by being withdrawn, once');
+END;
 
-CREATE TABLE proposal_item (
+CREATE TRIGGER answer_rule_written_in_force
+BEFORE INSERT ON answer_rule
+WHEN NEW.withdrawn_by_answer_id IS NOT NULL
+  OR NOT EXISTS (SELECT 1 FROM answer a
+                 WHERE a.id = NEW.answer_id AND a.verb IN ('decline', 'stop_asking', 'apart')
+                   AND NOT EXISTS (SELECT 1 FROM answer u WHERE u.undoes_answer_id = a.id))
+BEGIN
+  SELECT RAISE(ABORT, 'answer_rule is written in force, by a no standing');
+END;
+
+CREATE TRIGGER answer_rule_no_delete
+BEFORE DELETE ON answer_rule
+BEGIN
+  SELECT RAISE(ABORT, 'answer_rule is never removed');
+END;
+
+CREATE TRIGGER answer_rule_no_replace
+BEFORE INSERT ON answer_rule
+WHEN EXISTS (SELECT 1 FROM answer_rule WHERE id = NEW.id OR answer_id = NEW.answer_id)
+BEGIN
+  SELECT RAISE(ABORT, 'answer_rule is never removed');
+END;
+
+CREATE TABLE answer_rule_item (
   id                INTEGER PRIMARY KEY,
-  proposal_id       INTEGER NOT NULL REFERENCES proposal(id),
+  rule_id           INTEGER NOT NULL REFERENCES answer_rule(id),
   source_item_id    INTEGER NOT NULL REFERENCES source_item(id),
+  side              INTEGER NOT NULL CHECK (side IN (0, 1)),
   rev               INTEGER NOT NULL,
-  UNIQUE (proposal_id, source_item_id)
+  UNIQUE (rule_id, source_item_id)
 ) STRICT;
 
-CREATE INDEX proposal_item_item ON proposal_item (source_item_id);
+CREATE INDEX answer_rule_item_item ON answer_rule_item (source_item_id);
 
-CREATE TABLE proposal_candidate (
-  id                    INTEGER PRIMARY KEY,
-  proposal_id           INTEGER NOT NULL REFERENCES proposal(id),
-  ordinal               INTEGER NOT NULL,              -- the likeliest first
-  release_group_mbid    TEXT NOT NULL,                 -- the album
-  release_mbid          TEXT,                          -- for an edition: the release
-  title                 TEXT,                          -- the album's, or for an edition the release's
-  artist                TEXT NOT NULL,
-  primary_type          TEXT,
-  first_date            TEXT,                          -- the album's first, or for an edition the release's
-  country               TEXT,                          -- for an edition: where the release came out
-  media                 INTEGER,                       -- for an edition: how many media the release has
-  releases              INTEGER NOT NULL,              -- how many of the replies' releases are of it
-  change                TEXT NOT NULL CHECK (change IN ('knows', 'gains', 'moves')),
-  values_json           TEXT NOT NULL,                 -- [{"item":12,"field":"disc_number","ordinal":0,"value":"2"}]
-  onto_json             TEXT NOT NULL,                 -- the files of the first disc a yes joins these onto: [14,15]
-  rev                   INTEGER NOT NULL,
-  CHECK (release_mbid IS NOT NULL OR (country IS NULL AND media IS NULL)),
-  UNIQUE (proposal_id, ordinal)
-) STRICT;
+CREATE TRIGGER answer_rule_item_no_update
+BEFORE UPDATE ON answer_rule_item
+BEGIN
+  SELECT RAISE(ABORT, 'answer_rule_item is immutable');
+END;
 
-CREATE TABLE proposal_evidence (
-  id                    INTEGER PRIMARY KEY,
-  proposal_id           INTEGER NOT NULL REFERENCES proposal(id),
-  role                  TEXT NOT NULL CHECK (role IN ('rests_on')),
-  disc_id               TEXT NOT NULL,
-  lookup_response_id    INTEGER NOT NULL REFERENCES lookup_response(id),   -- the reply, as it was current
-  rev                   INTEGER NOT NULL,
-  UNIQUE (proposal_id, role, disc_id, lookup_response_id)
-) STRICT;
+CREATE TRIGGER answer_rule_item_no_delete
+BEFORE DELETE ON answer_rule_item
+BEGIN
+  SELECT RAISE(ABORT, 'answer_rule_item is immutable');
+END;
+
+CREATE TRIGGER answer_rule_item_no_replace
+BEFORE INSERT ON answer_rule_item
+WHEN EXISTS (SELECT 1 FROM answer_rule_item
+             WHERE id = NEW.id OR (rule_id = NEW.rule_id AND source_item_id = NEW.source_item_id))
+BEGIN
+  SELECT RAISE(ABORT, 'answer_rule_item is immutable');
+END;

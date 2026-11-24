@@ -1,5 +1,6 @@
-//! Answers: yes to a proposal's candidate, and the undo of an answer. See
-//! "Answers" in docs/internals/corrections.md.
+//! Answers: yes to a proposal's candidate, a no (not this candidate, stop
+//! asking, or keep two albums apart), and the undo of an answer. See
+//! "Answers" and "Saying no" in docs/internals/corrections.md.
 //!
 //! An answer is one library write: the answer rows, the tag values each
 //! puts on its files, the catalog worked out again with them, plays bound
@@ -12,10 +13,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ritornel_contract::{
     Answer, AnswerEvidence, AnswerGot, AnswerList, AnswerVerb, AnsweredCandidate, AnsweredLayout,
-    AnsweredReply, AnswersParams, Confirmation, LayoutMethod,
+    AnsweredReply, AnswersParams, Confirmation, DeclineParams, LayoutMethod,
 };
 use ritornel_domain::layout::LAYOUT_VERSION;
-use ritornel_domain::library::{Join, Library};
+use ritornel_domain::library::{Join, Library, Noes};
 use ritornel_domain::propose::PROPOSER_VERSION;
 use ritornel_domain::reply::READER_VERSION;
 use ritornel_domain::values::{self, Value};
@@ -191,6 +192,85 @@ pub(crate) fn joins_in_force(
         }
     }
     Ok(joins.into_values().collect())
+}
+
+/// What standing answers said no to, but the answers in `undone`.
+pub(crate) fn noes_in_force(connection: &Connection, undone: &HashSet<i64>) -> Result<Noes, Error> {
+    type Rule = (i64, i64, String, Option<String>, Option<String>);
+    let rules: Vec<Rule> = rows(
+        connection,
+        "SELECT id, answer_id, kind, candidate, about FROM answer_rule
+         WHERE withdrawn_by_answer_id IS NULL ORDER BY id",
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
+    let mut noes = Noes::default();
+    for (rule, answer, kind, candidate, about) in rules {
+        if undone.contains(&answer) {
+            continue;
+        }
+        let items: Vec<(i64, i64)> = connection
+            .prepare_cached(
+                "SELECT source_item_id, side FROM answer_rule_item WHERE rule_id = ?1 ORDER BY source_item_id",
+            )?
+            .query_map([rule], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let side = |which: i64| -> Vec<i64> {
+            items
+                .iter()
+                .filter(|(_, side)| *side == which)
+                .map(|(item, _)| *item)
+                .collect()
+        };
+        match (kind.as_str(), candidate) {
+            ("not_candidate", Some(candidate)) => noes.not_candidate.push((candidate, side(0))),
+            ("stop_asking", _) => noes.stop_asking.push((about, side(0))),
+            // Kept apart as albums; what a later build keeps apart as
+            // something else is not this build's to heed.
+            ("apart", _) if about.as_deref().is_none_or(|about| about == "album") => {
+                noes.apart.push((side(0), side(1)));
+            }
+            _ => {}
+        }
+    }
+    Ok(noes)
+}
+
+/// Keeps a no an answer said, with the files it is about, each on its side.
+fn keep_rule(
+    write: &Write<'_>,
+    answer: i64,
+    kind: &str,
+    candidate: Option<&str>,
+    about: Option<&str>,
+    sides: [&[i64]; 2],
+) -> Result<(), Error> {
+    let connection = write.connection();
+    connection
+        .prepare_cached(
+            "INSERT INTO answer_rule (answer_id, kind, candidate, about, rev)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute((answer, kind, candidate, about, write.rev()))?;
+    let rule = connection.last_insert_rowid();
+    for (side, items) in (0..).zip(sides) {
+        for item in items {
+            connection
+                .prepare_cached(
+                    "INSERT INTO answer_rule_item (rule_id, source_item_id, side, rev)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?
+                .execute((rule, item, side, write.rev()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Keeps what an answer put together.
@@ -748,7 +828,7 @@ pub(crate) fn handed(
         connection,
         "SELECT a.id, a.rev, a.before_json,
                 (SELECT u.rev FROM answer u WHERE u.undoes_answer_id = a.id)
-         FROM answer a WHERE a.verb = 'confirm' ORDER BY a.id",
+         FROM answer a WHERE a.verb <> 'undo' ORDER BY a.id",
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -1181,7 +1261,9 @@ const ANSWER_SELECT: &str =
     "SELECT a.id, a.public_id, a.verb, a.proposal_public_id, a.candidate, a.evidence_json,
         (SELECT u.public_id FROM answer u WHERE u.id = a.undoes_answer_id),
         (SELECT u.public_id FROM answer u WHERE u.undoes_answer_id = a.id),
-        (SELECT count(DISTINCT source_item_id) FROM answer_value v WHERE v.answer_id = a.id),
+        (SELECT count(*) FROM (SELECT source_item_id FROM answer_value v WHERE v.answer_id = a.id
+                               UNION SELECT ri.source_item_id FROM answer_rule_item ri
+                               JOIN answer_rule r ON r.id = ri.rule_id WHERE r.answer_id = a.id)),
         a.answered_at_ms, a.kind
  FROM answer a";
 
@@ -1200,10 +1282,12 @@ fn answer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Answer, String)> {
     Ok((
         Answer {
             answer_id: Id::from_bytes(row.get(1)?),
-            verb: if verb == "undo" {
-                AnswerVerb::Undo
-            } else {
-                AnswerVerb::Confirm
+            verb: match verb.as_str() {
+                "undo" => AnswerVerb::Undo,
+                "decline" => AnswerVerb::Decline,
+                "stop_asking" => AnswerVerb::StopAsking,
+                "apart" => AnswerVerb::KeepApart,
+                _ => AnswerVerb::Confirm,
             },
             proposal_id: row.get::<_, Option<[u8; 16]>>(3)?.map(Id::from_bytes),
             release_group: said("/candidate/releaseGroup").or(row.get(4)?),
@@ -1261,7 +1345,7 @@ struct KeptLayout {
     provisional: bool,
 }
 
-/// The answers an undo names, by row: each a yes that stands.
+/// The answers an undo names, by row: each one that stands and is no undo.
 pub(crate) fn asked_to_undo(connection: &Connection, answers: &[Id]) -> Result<Vec<i64>, Error> {
     if answers.is_empty() {
         return Err(Error::Invalid("undo at least one answer"));
@@ -1278,9 +1362,9 @@ pub(crate) fn asked_to_undo(connection: &Connection, answers: &[Id]) -> Result<V
             )
             .optional()?;
         let (row, verb, undone) = one.ok_or(Error::NotFound("no such answer"))?;
-        if verb != "confirm" {
+        if verb == "undo" {
             return Err(Error::Invalid(
-                "only a yes is undone; to say it again, confirm it",
+                "an undo is not undone; to say it again, answer again",
             ));
         }
         if undone || found.contains(&row) {
@@ -1348,12 +1432,14 @@ pub(crate) fn undo_in(
             &evidence,
             &Before::default(),
         )?;
-        connection
-            .prepare_cached(
-                "UPDATE answer_value SET withdrawn_by_answer_id = ?2, rev = ?3
-                 WHERE answer_id = ?1 AND withdrawn_by_answer_id IS NULL",
-            )?
-            .execute((row, undo, write.rev()))?;
+        for table in ["answer_value", "answer_rule"] {
+            connection
+                .prepare_cached(&format!(
+                    "UPDATE {table} SET withdrawn_by_answer_id = ?2, rev = ?3
+                     WHERE answer_id = ?1 AND withdrawn_by_answer_id IS NULL"
+                ))?
+                .execute((row, undo, write.rev()))?;
+        }
         earlier.extend(&before.items);
         cleared.extend(redirects_of(connection, row)?);
         undos.push(undo);
@@ -1680,6 +1766,206 @@ impl LibraryStore {
             let (written, shown) = undo_in(write, &asked_by, &answers)?;
             crate::proposal_store::derive_proposals(write)?;
             Ok(finish(write.rev(), written, shown))
+        })
+    }
+
+    /// `corrections.decline`: not this candidate for a proposal's files, or
+    /// ask no more about them, in one write, refused if the proposal has
+    /// changed since it was shown. Nothing shown changes; the proposals are
+    /// worked out again.
+    pub fn decline<F>(
+        &self,
+        request: WriteRequest,
+        params: DeclineParams,
+        finish: F,
+    ) -> Result<Written, Error>
+    where
+        F: FnOnce(i64, Vec<(Id, Id)>, bool) -> String + Send + 'static,
+    {
+        self.write(request, move |write| {
+            let connection = write.connection();
+            // As a yes does, against what a scan may have changed since the
+            // proposal was shown.
+            if crate::evidence_store::layouts_are_stale(connection)? {
+                crate::evidence_store::apply(write)?;
+            }
+            let found: Option<(i64, String, String)> = connection
+                .query_row(
+                    "SELECT id, fingerprint, kind FROM proposal WHERE public_id = ?1",
+                    [params.proposal_id.as_bytes()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let (row, fingerprint, kind) = found.ok_or(Error::NotFound("no such proposal"))?;
+            if fingerprint != params.fingerprint {
+                return Err(Error::PlanStale);
+            }
+            let mut shown: Option<(Option<String>, String, String)> = None;
+            let candidate = if params.stop_asking {
+                if params.release_group.is_some() || params.release.is_some() {
+                    return Err(Error::Invalid(
+                        "say no to a candidate, or stop asking, not both",
+                    ));
+                }
+                None
+            } else {
+                if params.release_group.is_none() && params.release.is_none() {
+                    return Err(Error::Invalid("name the candidate to say no to"));
+                }
+                // An album's candidate by its release group; an edition's
+                // by its release, its group or not.
+                let offered: Option<(Option<String>, String, String)> = connection
+                    .query_row(
+                        "SELECT title, artist, release_group_mbid FROM proposal_candidate
+                         WHERE proposal_id = ?1 AND (?2 IS NULL OR release_group_mbid = ?2)
+                           AND release_mbid IS ?3",
+                        (row, &params.release_group, &params.release),
+                        |found| Ok((found.get(0)?, found.get(1)?, found.get(2)?)),
+                    )
+                    .optional()?;
+                let (title, artist, group) =
+                    offered.ok_or(Error::NotFound("no such candidate"))?;
+                shown = Some((title, artist, group.clone()));
+                // An edition's candidate is its release.
+                Some(params.release.clone().unwrap_or(group))
+            };
+            let items: Vec<i64> = connection
+                .prepare_cached(
+                    "SELECT source_item_id FROM proposal_item WHERE proposal_id = ?1 ORDER BY source_item_id",
+                )?
+                .query_map([row], |found| found.get(0))?
+                .collect::<Result<_, _>>()?;
+            let verb = if params.stop_asking {
+                "stop_asking"
+            } else {
+                "decline"
+            };
+            // The candidate said no to, as it was shown; none for a stop.
+            let evidence = serde_json::json!({
+                "kind": kind,
+                "candidate": shown.map(|(title, artist, group)| serde_json::json!({
+                    "releaseGroup": group,
+                    "release": params.release,
+                    "title": title,
+                    "artist": artist,
+                })),
+                "files": items.len(),
+            });
+            let answering = Answering {
+                kind: &kind,
+                proposal: *params.proposal_id.as_bytes(),
+                fingerprint: &fingerprint,
+                candidate: candidate.as_deref(),
+            };
+            let (answer, id) = insert_answer(
+                write,
+                &request,
+                verb,
+                Some(answering),
+                None,
+                &evidence,
+                &Before::default(),
+            )?;
+            if params.stop_asking {
+                keep_rule(write, answer, "stop_asking", None, Some(&kind), [&items, &[]])?;
+            } else {
+                keep_rule(write, answer, "not_candidate", candidate.as_deref(), None, [&items, &[]])?;
+            }
+            write.changes_nothing_shown();
+            crate::proposal_store::derive_proposals(write)?;
+            Ok(finish(write.rev(), vec![(id, params.proposal_id)], false))
+        })
+    }
+
+    /// `corrections.keepApart`: the files on two releases now are never on
+    /// one release or in one release group, in one write. Where the
+    /// projector had them together, they part, and the rows they leave
+    /// lead to where they went.
+    pub fn keep_apart<F>(
+        &self,
+        request: WriteRequest,
+        releases: Vec<Id>,
+        finish: F,
+    ) -> Result<Written, Error>
+    where
+        F: FnOnce(i64, Id, bool) -> String + Send + 'static,
+    {
+        self.write(request, move |write| {
+            let connection = write.connection();
+            let [one, other] = releases.as_slice() else {
+                return Err(Error::Invalid("name two releases to keep apart"));
+            };
+            let settled = settle_owed(write)?;
+            // Each release's live files, and the group chosen for it, if any.
+            let files_of = |release: &Id| -> Result<(Vec<i64>, Option<i64>), Error> {
+                let row: Option<(i64, Option<i64>)> = connection
+                    .query_row(
+                        "SELECT rel.id, rel.chosen_release_group_id FROM release rel
+                         WHERE rel.id = (SELECT canonical_id FROM release WHERE public_id = ?1)",
+                        [release.as_bytes()],
+                        |found| Ok((found.get(0)?, found.get(1)?)),
+                    )
+                    .optional()?;
+                let (row, chosen) = row.ok_or(Error::NotFound("no such release"))?;
+                let files = connection
+                    .prepare_cached(
+                        "SELECT a.source_item_id FROM assignment a
+                         JOIN source_item si ON si.id = a.source_item_id
+                         JOIN track_appearance ta ON ta.id = a.appearance_id
+                         JOIN release rel ON rel.id = ta.release_id
+                         WHERE a.superseded_at_ms IS NULL AND rel.canonical_id = ?1
+                           AND si.item_kind = 'file' AND si.retired_at_ms IS NULL
+                         ORDER BY a.source_item_id",
+                    )?
+                    .query_map([row], |found| found.get(0))?
+                    .collect::<Result<_, _>>()?;
+                Ok((files, chosen))
+            };
+            let ((left, left_chosen), (right, right_chosen)) = (files_of(one)?, files_of(other)?);
+            if left.is_empty() || right.is_empty() || left == right {
+                return Err(Error::Invalid(
+                    "keep apart two releases that each have files of their own",
+                ));
+            }
+            // A group chosen for both holds them together whatever a no
+            // says, so the no would be one that does nothing.
+            if left_chosen.is_some() && left_chosen == right_chosen {
+                return Err(Error::Invalid(
+                    "the two releases are of a group chosen for both, so they stay together",
+                ));
+            }
+            // Worked out with the pair kept apart, then kept as an answer
+            // with where each file it moved was, for its undo.
+            let was = where_now(connection)?;
+            let pair = (left.clone(), right.clone());
+            let Projected {
+                moved,
+                redirects,
+                shown,
+            } = project(
+                write,
+                &was,
+                &[],
+                |library| library.noes.apart.push(pair.clone()),
+                |_| {},
+            )?;
+            let before = Before {
+                items: moved.into_values().collect(),
+            };
+            let evidence = serde_json::json!({
+                "releases": [one.to_string(), other.to_string()],
+                "files": [left.len(), right.len()],
+            });
+            let (answer, id) =
+                insert_answer(write, &request, "apart", None, None, &evidence, &before)?;
+            keep_rule(write, answer, "apart", None, Some("album"), [&left, &right])?;
+            keep_redirects(write, answer, &redirects)?;
+            let shown = shown || settled;
+            if !shown {
+                write.changes_nothing_shown();
+            }
+            crate::proposal_store::derive_proposals(write)?;
+            Ok(finish(write.rev(), id, shown))
         })
     }
 

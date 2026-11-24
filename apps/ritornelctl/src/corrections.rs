@@ -9,26 +9,31 @@
 //!
 //! `ritornelctl corrections list`, `show` and `preview`: what the replies
 //! propose each disc is, and what a yes would change. See "Album
-//! proposals" there.
+//! proposals" and "Edition proposals" there.
+//!
+//! `ritornelctl corrections confirm`, `decline`, `stop`, `apart`, `undo`,
+//! `answers` and `answer`: a yes, a no, two albums kept apart, the undo of
+//! an answer, and the ledger. See "Answers" and "Saying no" there.
 
 use std::io::Write;
 
 use ritornel_client::contract::methods::{
-    CorrectionsAnswer, CorrectionsAnswers, CorrectionsConfirm, CorrectionsDiscs, CorrectionsGet,
-    CorrectionsList, CorrectionsLookup, CorrectionsPreview, CorrectionsUndo, LibrarySetSettings,
+    CorrectionsAnswer, CorrectionsAnswers, CorrectionsConfirm, CorrectionsDecline,
+    CorrectionsDiscs, CorrectionsGet, CorrectionsKeepApart, CorrectionsList, CorrectionsLookup,
+    CorrectionsPreview, CorrectionsUndo, LibrarySetSettings,
 };
 use ritornel_client::contract::{
     AlbumShape, Answer, AnswerGot, AnswerList, AnswerParams, AnswerVerb, Answered, AnswersParams,
-    Choice, ConfirmParams, Confirmation, Disc, DiscList, DiscsParams, FileValue, Id, LayoutMethod,
-    LibrarySettingsSet, LookupDone, LookupOutcome, LookupParams, NoParams, PreviewParams,
-    PreviewShown, Proposal, ProposalCandidate, ProposalChange, ProposalGetParams, ProposalGot,
-    ProposalList, SetLibrarySettingsParams, UndoParams,
+    Choice, ConfirmParams, Confirmation, DeclineParams, Disc, DiscList, DiscsParams, FileValue, Id,
+    KeepApartParams, LayoutMethod, LibrarySettingsSet, LookupDone, LookupOutcome, LookupParams,
+    NoParams, PreviewParams, PreviewShown, Proposal, ProposalCandidate, ProposalChange,
+    ProposalGetParams, ProposalGot, ProposalList, SetLibrarySettingsParams, UndoParams,
 };
 use ritornel_client::local;
 
 use crate::cli::{
-    AnswerArgs, AnswersArgs, ConfirmArgs, DiscsArgs, Error, LookupArgs, PreviewArgs, ProposalArgs,
-    ServerArgs, SwitchArgs, UndoArgs,
+    AnswerArgs, AnswersArgs, ApartArgs, ConfirmArgs, DeclineArgs, DiscsArgs, Error, LookupArgs,
+    PreviewArgs, ProposalArgs, ServerArgs, SwitchArgs, UndoArgs,
 };
 use crate::server;
 
@@ -390,6 +395,118 @@ pub(crate) fn undo(args: &UndoArgs, env: local::Env<'_>, out: &mut dyn Write) ->
     )
 }
 
+/// Says no to a proposal's candidate, as it is shown now.
+pub(crate) fn decline(
+    args: &DeclineArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let proposal_id = args
+        .proposal
+        .parse::<Id>()
+        .map_err(|_| Error::Usage("decline needs a proposal ID"))?;
+    let (candidate, release) = (args.candidate.clone(), args.release.clone());
+    let done = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
+        let got = client
+            .call::<CorrectionsGet>(&ProposalGetParams { proposal_id })
+            .await?;
+        let chosen = got.proposal.candidates.iter().find(|one| {
+            candidate
+                .as_ref()
+                .is_none_or(|group| *group == one.release_group)
+                && release
+                    .as_ref()
+                    .is_none_or(|release| one.release.as_ref() == Some(release))
+        });
+        client
+            .call::<CorrectionsDecline>(&DeclineParams {
+                idempotency_key: ritornel_client::idempotency_key()?,
+                proposal_id,
+                fingerprint: got.proposal.fingerprint,
+                release_group: chosen
+                    .map(|one| one.release_group.clone())
+                    .or_else(|| candidate.clone()),
+                release: chosen
+                    .and_then(|one| one.release.clone())
+                    .or_else(|| release.clone()),
+                stop_asking: false,
+            })
+            .await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &done,
+        serde_json::to_string_pretty,
+        |done: &Answered| render_no(done, "no to this candidate for these files"),
+    )
+}
+
+/// Asks no more about a proposal's files.
+pub(crate) fn stop(
+    args: &ProposalArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let proposal_id = args
+        .proposal
+        .parse::<Id>()
+        .map_err(|_| Error::Usage("stop needs a proposal ID"))?;
+    let done = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
+        let got = client
+            .call::<CorrectionsGet>(&ProposalGetParams { proposal_id })
+            .await?;
+        client
+            .call::<CorrectionsDecline>(&DeclineParams {
+                idempotency_key: ritornel_client::idempotency_key()?,
+                proposal_id,
+                fingerprint: got.proposal.fingerprint,
+                release_group: None,
+                release: None,
+                stop_asking: true,
+            })
+            .await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &done,
+        serde_json::to_string_pretty,
+        |done: &Answered| render_no(done, "ask no more about these files"),
+    )
+}
+
+/// Keeps two albums apart.
+pub(crate) fn apart(
+    args: &ApartArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let releases = args
+        .releases
+        .iter()
+        .map(|text| {
+            text.parse::<Id>()
+                .map_err(|_| Error::Usage("apart needs two release IDs"))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let done = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
+        client
+            .call::<CorrectionsKeepApart>(&KeepApartParams {
+                idempotency_key: ritornel_client::idempotency_key()?,
+                releases,
+            })
+            .await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &done,
+        serde_json::to_string_pretty,
+        |done: &Answered| render_no(done, "keep these two albums apart"),
+    )
+}
+
 pub(crate) fn answers(
     args: &AnswersArgs,
     env: local::Env<'_>,
@@ -442,6 +559,20 @@ pub(crate) fn answer(
     )
 }
 
+/// A no's result: each answer it wrote, which `undo` takes back.
+fn render_no(done: &Answered, said: &str) -> String {
+    let mut text = String::new();
+    for answer in &done.answers {
+        text.push_str(&format!("{}  {said}\n", answer.answer_id));
+    }
+    text.push_str(if done.moved {
+        "The library changed.\n"
+    } else {
+        "Nothing shown changed.\n"
+    });
+    text
+}
+
 fn render_answered(done: &Answered) -> String {
     let mut text = String::new();
     for answer in &done.answers {
@@ -479,8 +610,13 @@ fn render_answer(got: &AnswerGot) -> String {
     let mut text = answer_line(&got.answer);
     let evidence = &got.evidence;
     if let Some(candidate) = &evidence.candidate {
+        let said = if got.answer.verb == AnswerVerb::Decline {
+            "no"
+        } else {
+            "yes"
+        };
         text.push_str(&format!(
-            "\nSaid yes to: {} by {} ({})\n",
+            "\nSaid {said} to: {} by {} ({})\n",
             candidate.title.as_deref().unwrap_or("an untitled album"),
             candidate.artist.as_deref().unwrap_or("?"),
             candidate
@@ -549,6 +685,18 @@ fn answer_line(answer: &Answer) -> String {
                 plural(answer.files, "file", "files")
             ),
         },
+        AnswerVerb::Decline => format!(
+            "no: not {} ({}), {}",
+            answer.title.as_deref().unwrap_or("that album"),
+            answer
+                .release
+                .as_deref()
+                .or(answer.release_group.as_deref())
+                .unwrap_or("?"),
+            plural(answer.files, "file", "files")
+        ),
+        AnswerVerb::StopAsking => "no: ask no more about these files".to_owned(),
+        AnswerVerb::KeepApart => "no: keep two albums apart".to_owned(),
         AnswerVerb::Undo => format!(
             "undid {}",
             answer.undoes.map(|id| id.to_string()).unwrap_or_default()

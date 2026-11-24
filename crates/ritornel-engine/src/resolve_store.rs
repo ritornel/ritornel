@@ -606,6 +606,7 @@ pub(crate) fn load_except(
     crate::answer_store::apply_in_force(connection, &mut library, undone)?;
     library.answer_redirects = crate::answer_store::answer_redirects(connection)?;
     library.answer_joins = crate::answer_store::joins_in_force(connection, undone)?;
+    library.noes = crate::answer_store::noes_in_force(connection, undone)?;
     Ok((library, shown))
 }
 

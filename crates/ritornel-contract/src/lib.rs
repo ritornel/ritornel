@@ -70,10 +70,11 @@ pub use command::{LibraryCreateParams, LibraryCreated, Receipt, ReceiptStatus};
 pub use corrections::{
     AlbumShape, Answer, AnswerEvidence, AnswerGot, AnswerList, AnswerParams, AnswerVerb,
     AnswerWritten, Answered, AnsweredCandidate, AnsweredLayout, AnsweredReply, AnswersParams,
-    CatalogueAlbum, Choice, ConfirmParams, Confirmation, CorrectionsSummary, Disc, DiscFile,
-    DiscList, DiscLookup, DiscsParams, FileValue, LayoutMethod, LookupDone, LookupOutcome,
-    LookupParams, PreviewParams, PreviewShown, Proposal, ProposalCandidate, ProposalChange,
-    ProposalEvidence, ProposalGetParams, ProposalGot, ProposalList, UndoParams,
+    CatalogueAlbum, Choice, ConfirmParams, Confirmation, CorrectionsSummary, DeclineParams, Disc,
+    DiscFile, DiscList, DiscLookup, DiscsParams, FileValue, KeepApartParams, LayoutMethod,
+    LookupDone, LookupOutcome, LookupParams, PreviewParams, PreviewShown, Proposal,
+    ProposalCandidate, ProposalChange, ProposalEvidence, ProposalGetParams, ProposalGot,
+    ProposalList, UndoParams,
 };
 pub use device::{DeviceKind, Platform, PlayedVia};
 pub use error::{ErrorCode, ErrorData, RpcError};

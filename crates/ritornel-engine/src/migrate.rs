@@ -96,28 +96,8 @@ pub(crate) const LIBRARY: &[Migration] = &[
     },
     Migration {
         version: 9,
-        name: "0009_sidecars_and_disc_layouts",
-        sql: include_str!("../migrations/library/0009_sidecars_and_disc_layouts.sql"),
-    },
-    Migration {
-        version: 10,
-        name: "0010_lookup_replies",
-        sql: include_str!("../migrations/library/0010_lookup_replies.sql"),
-    },
-    Migration {
-        version: 11,
-        name: "0011_album_proposals",
-        sql: include_str!("../migrations/library/0011_album_proposals.sql"),
-    },
-    Migration {
-        version: 12,
-        name: "0012_answers",
-        sql: include_str!("../migrations/library/0012_answers.sql"),
-    },
-    Migration {
-        version: 13,
-        name: "0013_edition_proposals",
-        sql: include_str!("../migrations/library/0013_edition_proposals.sql"),
+        name: "0009_corrections",
+        sql: include_str!("../migrations/library/0009_corrections.sql"),
     },
 ];
 
