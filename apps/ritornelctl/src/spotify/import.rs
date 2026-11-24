@@ -199,8 +199,8 @@ fn report_text(report: &ImportReport, samples: bool) -> String {
     ));
     text.push_str(&server::facts(&lines));
     text.push_str(
-        "\nYear  Listens  Joined (A B C pin)          Alone: counted  not  unknown  Scrobbles alone  \
-         Plays now  after   Counted now  after  No zone\n",
+        "\nYear  Listens  Joined (A B C pin)          Alone: counted   not  unknown  Scrobbles alone  \
+         Plays now  after  Counted now  after  No zone\n",
     );
     for year in &report.years {
         let _ = writeln!(
