@@ -7,16 +7,9 @@
 //! out of the system's media session, and listens on a port the system
 //! picks.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -29,29 +22,10 @@ use ritornel_client::launch::{Launcher, Program, STOP_WAIT, Stopped};
 use ritornel_client::local::LocalServer;
 use ritornel_client::{Client, Error, NotRunning};
 
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{Scratch, WAIT};
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-launch-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path.canonicalize().unwrap())
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+fn scratch() -> Scratch {
+    Scratch::canonical("ritornel-launch-")
 }
 
 /// The server as the app would start it, but quiet and on any port.
@@ -112,7 +86,7 @@ fn assert_stopped_cleanly(stopped: Option<Stopped>, data_dir: &Path) {
 #[tokio::test]
 async fn the_first_launch_starts_and_owns_a_server_and_the_next_attaches_to_it() {
     tokio::time::timeout(WAIT, async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let data_dir = scratch.data_dir();
         let first = launcher(&data_dir);
         let found = first.find_or_start().await.unwrap();
@@ -139,7 +113,7 @@ async fn the_first_launch_starts_and_owns_a_server_and_the_next_attaches_to_it()
 #[tokio::test]
 async fn two_launches_at_once_end_on_one_server_and_one_owns_it() {
     tokio::time::timeout(WAIT, async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let data_dir = scratch.data_dir();
         let (one, other) = (launcher(&data_dir), launcher(&data_dir));
         let (a, b) = tokio::join!(find_or_start(&one), find_or_start(&other));
@@ -160,7 +134,7 @@ async fn two_launches_at_once_end_on_one_server_and_one_owns_it() {
 
 #[tokio::test]
 async fn a_server_started_by_hand_is_used_and_never_stopped() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let by_hand = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
         .arg("serve")
@@ -259,7 +233,7 @@ fn long_track(folder: &Path) {
 #[tokio::test]
 async fn quitting_pauses_what_plays_and_the_next_start_is_where_it_stopped() {
     tokio::time::timeout(WAIT, async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let data_dir = scratch.data_dir();
         let folder = scratch.0.join("music/Invented");
         long_track(&folder);

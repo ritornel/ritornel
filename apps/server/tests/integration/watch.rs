@@ -3,13 +3,6 @@
 //! being asked. The system's latency is not counted on: the test waits for
 //! the rescan's job to end, and is cut off only after [`WAIT`].
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,36 +10,13 @@ use std::time::Duration;
 use ritornel_client::Client;
 use ritornel_client::contract::methods::{LibrarySetWatching, LibraryStats};
 use ritornel_client::contract::{
-    AutoTrigger, CONTRACT_VERSION, ClientKind, Event, HelloParams, Id, NoParams, SessionKind,
-    Topic, WatchState, WatchingParams,
+    AutoTrigger, CONTRACT_VERSION, ClientKind, Event, HelloParams, NoParams, SessionKind, Topic,
+    WatchState, WatchingParams,
 };
 use ritornel_engine::{OsEntropy, SystemClock};
 use ritornel_server::{Bounds, HeldDir, Listen, Run, Server, WatchRun};
 
-const WAIT: Duration = Duration::from_secs(60);
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-watch-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn key() -> Id {
-    ritornel_client::idempotency_key().unwrap()
-}
+use super::support::{Scratch, WAIT, key};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -57,7 +27,7 @@ fn fixture(name: &str) -> PathBuf {
 #[tokio::test]
 async fn a_file_copied_into_a_watched_root_is_scanned_in_on_its_own() {
     tokio::time::timeout(WAIT, async {
-        let scratch = Scratch::new();
+        let scratch = Scratch::new("ritornel-watch-");
         let run = Run {
             watch: WatchRun {
                 quiet: Duration::from_millis(200),

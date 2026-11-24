@@ -11,138 +11,18 @@
 //! Each wait is for a process to print a line, report a state, or end.
 //! [`WAIT`] bounds the waits, and a process that hangs is killed.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
-mod support;
-
-use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// How long a test waits for a process to do what it should before it
-/// kills the process and fails. It is a bound, not a wait: a process that
-/// works never comes near it.
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{Ended, Scratch, Server, WAIT, logs, ritornelctl_command as ritornelctl, run};
 
 /// The exit code `ritornelctl` keeps for "no server is running".
 const NO_SERVER: i32 = 4;
 
-/// A directory that is removed when the test ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornelctl-status-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-
-    /// The data directory. The server creates it.
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Reads a pipe on a thread of its own and hands over each line, so that
-/// whoever wants them can stop waiting. The channel closes at the pipe's
-/// end, which comes when the process ends.
-fn lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
-    let (send, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            // The test has gone only if it has failed already.
-            if send.send(line.unwrap()).is_err() {
-                break;
-            }
-        }
-    });
-    lines
-}
-
-/// The rest of what a pipe carries, up to its end. `None` if the end did
-/// not come within [`WAIT`].
-fn rest(lines: &Receiver<String>) -> Option<String> {
-    let mut text = String::new();
-    loop {
-        match lines.recv_timeout(WAIT) {
-            Ok(line) => {
-                text.push_str(&line);
-                text.push('\n');
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(text),
-            Err(mpsc::RecvTimeoutError::Timeout) => return None,
-        }
-    }
-}
-
-/// How a process ended, and what it printed.
-#[derive(Debug)]
-struct Ended {
-    code: Option<i32>,
-    /// Its exit status as the system says it, which names a signal. A
-    /// failure shows it, through `Debug`, which dead-code analysis ignores.
-    #[allow(dead_code)]
-    status: String,
-    stdout: String,
-    stderr: String,
-}
-
-/// `ritornelctl` with these arguments, and nothing in its environment that
-/// this test did not put there.
-fn ritornelctl(args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ritornelctl"));
-    command.args(args).env_remove("RITORNEL_DATA_DIR");
-    command
-}
-
-/// Runs a command that should end by itself. It is killed, and the test
-/// fails, if it has not ended within [`WAIT`].
-fn run(mut command: Command) -> Ended {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = lines(child.stdout.take().unwrap());
-    let stderr = lines(child.stderr.take().unwrap());
-    let (Some(stdout), Some(stderr)) = (rest(&stdout), rest(&stderr)) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("{command:?} did not end within {WAIT:?}");
-    };
-    // Both pipes are at their end, so the process has ended. No test has
-    // ritornelctl ended by a signal: one that was, was ended from outside
-    // the test, and the failure says so rather than as a code.
-    let ended = child.wait().unwrap();
-    assert!(
-        ended.code().is_some(),
-        "{command:?} was ended from outside: {ended}\n--- stdout\n{stdout}--- stderr\n{stderr}"
-    );
-    Ended {
-        code: ended.code(),
-        status: ended.to_string(),
-        stdout,
-        stderr,
-    }
+fn scratch() -> Scratch {
+    Scratch::new("ritornelctl-status-")
 }
 
 /// `ritornelctl status` on a data directory, with more arguments.
@@ -152,146 +32,16 @@ fn status(data_dir: &Path, extra: &[&str]) -> Ended {
     run(command)
 }
 
-/// The `ritornel-server` that was built beside `ritornelctl`.
-fn server_binary() -> PathBuf {
-    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl"))
-        .with_file_name(format!("ritornel-server{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        binary.exists(),
-        "there is no ritornel-server beside ritornelctl at {}. Build the workspace: `mise run \
-         test` does, and `cargo test --package ritornelctl` alone does not",
-        binary.display()
-    );
-    binary
+fn start(data_dir: &Path) -> Server {
+    Server::start_captured(data_dir, &[])
 }
 
-/// A `ritornel-server` that is running, on a port the system picked. It is
-/// killed if a test ends without stopping it, so a failed test leaves no
-/// process behind.
-struct Server {
-    child: Child,
-    stdout: Receiver<String>,
-    stderr: Receiver<String>,
-    /// The server ID from the ready line.
-    server_id: String,
-}
-
-impl Server {
-    /// Starts a server on `data_dir` and waits for its ready line.
-    fn start(data_dir: &Path) -> Self {
-        Self::start_with(data_dir, &[])
-    }
-
-    /// As [`start`](Self::start), with these variables set.
-    fn start_with(data_dir: &Path, variables: &[(&str, &str)]) -> Self {
-        let mut child = Command::new(server_binary())
-            .arg("serve")
-            .arg("--data-dir")
-            .arg(data_dir)
-            .args(["--listen", "127.0.0.1:0"])
-            .env_remove("RITORNEL_DATA_DIR")
-            .env_remove("RITORNEL_LISTEN")
-            .env_remove("RITORNEL_LOG_LEVEL")
-            .env_remove("RITORNEL_BACKUP_DIR")
-            .env_remove("RITORNEL_NAME")
-            .env_remove("RITORNEL_CACHE_SIZE")
-            .env("RITORNEL_TEST_COMPUTER_NAME", "Invented Desk")
-            .envs(variables.iter().copied())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = lines(child.stdout.take().unwrap());
-        let stderr = lines(child.stderr.take().unwrap());
-        let ready = stdout.recv_timeout(WAIT);
-        let Some(server_id) = ready
-            .as_deref()
-            .ok()
-            .and_then(|line| line.strip_prefix(&format!("ready pid={} server_id=", child.id())))
-        else {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "no ready line within {WAIT:?}. stdout: {ready:?}, stderr: {:?}",
-                rest(&stderr)
-            );
-        };
-        Self {
-            server_id: server_id.to_owned(),
-            child,
-            stdout,
-            stderr,
-        }
-    }
-
-    /// Sends the server a signal, by name: `TERM`, `KILL`.
-    /// On Windows `TERM` is `taskkill /PID`, which asks the server's hidden
-    /// window to close, and `KILL` is `taskkill /F /PID`, which ends it.
-    fn signal(&self, name: &str) {
-        let sent = if cfg!(windows) {
-            let mut taskkill = Command::new("taskkill");
-            match name {
-                "TERM" => {}
-                "KILL" => {
-                    taskkill.arg("/F");
-                }
-                other => panic!("no Windows equivalent of SIG{other}"),
-            }
-            taskkill
-                .arg("/PID")
-                .arg(self.child.id().to_string())
-                .output()
-                .unwrap()
-                .status
-        } else {
-            Command::new("kill")
-                .arg(format!("-{name}"))
-                .arg(self.child.id().to_string())
-                .status()
-                .unwrap()
-        };
-        assert!(sent.success(), "asking it to stop: {sent}");
-    }
-
-    /// Sends the server a signal and waits for it to end. It is killed, and
-    /// the test fails, if it has not ended within [`WAIT`].
-    fn end(mut self, signal: &str) -> Ended {
-        self.signal(signal);
-        // Both pipes end when the process does.
-        let (Some(stdout), Some(stderr)) = (rest(&self.stdout), rest(&self.stderr)) else {
-            // Dropping `self` kills it.
-            panic!("the server did not end within {WAIT:?} of SIG{signal}");
-        };
-        let ended = self.child.wait().unwrap();
-        Ended {
-            code: ended.code(),
-            status: ended.to_string(),
-            stdout,
-            stderr,
-        }
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        support::say_if_gone(&mut self.child, Some(&self.stderr));
-        // After `end` these do nothing.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+fn start_with(data_dir: &Path, variables: &[(&str, &str)]) -> Server {
+    Server::start_captured(data_dir, variables)
 }
 
 fn read_json(path: &Path) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
-}
-
-/// Every log line in the data directory, as text.
-fn logs(data_dir: &Path) -> String {
-    std::fs::read_dir(data_dir.join("logs"))
-        .unwrap()
-        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
-        .collect()
 }
 
 fn no_server(data_dir: &Path) -> String {
@@ -303,9 +53,9 @@ fn no_server(data_dir: &Path) -> String {
 
 #[test]
 fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
-    let server = Server::start(&data_dir);
+    let server = start(&data_dir);
     let server_id = server.server_id.clone();
     let named = read_json(&data_dir.join("server.json"));
     assert_eq!(named["serverId"], server_id.as_str());
@@ -444,10 +194,10 @@ fn facts(printed: &Ended) -> Vec<(&str, &str)> {
 
 #[test]
 fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let dir = data_dir.to_str().unwrap();
-    let server = Server::start(&data_dir);
+    let server = start(&data_dir);
 
     let created = run(ritornelctl(&["library", "create", "--data-dir", dir]));
     let created = facts(&created);
@@ -512,7 +262,7 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
         (Some(0), ""),
         "{stopped:?}"
     );
-    let server = Server::start(&data_dir);
+    let server = start(&data_dir);
     let printed = status(&data_dir, &[]);
     let shown = facts(&printed);
     assert_eq!(shown[2], ("Role", "hub"));
@@ -524,9 +274,9 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
 
 #[test]
 fn library_create_prints_its_receipt_as_json_when_asked() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
-    let server = Server::start(&data_dir);
+    let server = start(&data_dir);
 
     let mut command = ritornelctl(&["library", "create", "--json"]);
     command.env("RITORNEL_DATA_DIR", &data_dir);
@@ -546,7 +296,7 @@ fn library_create_prints_its_receipt_as_json_when_asked() {
 
 #[test]
 fn with_no_server_status_says_so_and_starts_none() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     for extra in [&[][..], &["--json"]] {
         let none = status(&data_dir, extra);
@@ -560,9 +310,9 @@ fn with_no_server_status_says_so_and_starts_none() {
 
 #[test]
 fn a_server_that_was_killed_is_not_taken_for_a_running_one_and_its_port_is_not_asked() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
-    let killed = Server::start(&data_dir).end("KILL");
+    let killed = start(&data_dir).end("KILL");
     // A signal ended it on Unix, with no code; `taskkill /F` ends a process
     // with 1.
     assert_eq!(
@@ -630,9 +380,9 @@ fn a_wrong_command_line_exits_with_2_and_help_with_0() {
 
 #[test]
 fn server_stop_stops_the_server_cleanly_and_then_finds_none() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
-    let mut server = Server::start(&data_dir);
+    let server = start(&data_dir);
 
     let mut command = ritornelctl(&["server", "stop", "--data-dir"]);
     command.arg(&data_dir);
@@ -640,7 +390,7 @@ fn server_stop_stops_the_server_cleanly_and_then_finds_none() {
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     assert_eq!(stopped.stdout, "The server has stopped.\n");
     // It stopped as a signal stops it, and cleanly.
-    assert_eq!(server.child.wait().unwrap().code(), Some(0));
+    assert_eq!(server.ended().code(), Some(0));
     assert!(
         logs(&data_dir).contains("\"stopped\""),
         "{}",
@@ -657,11 +407,11 @@ fn server_stop_stops_the_server_cleanly_and_then_finds_none() {
 
 #[test]
 fn settings_say_what_gave_each_and_the_wake_setting_is_changed_from_a_terminal() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     std::fs::create_dir_all(&data_dir).unwrap();
     std::fs::write(data_dir.join("config.toml"), "cache_size = \"512 MiB\"\n").unwrap();
-    let server = Server::start_with(&data_dir, &[("RITORNEL_NAME", "Kitchen Speakers")]);
+    let server = start_with(&data_dir, &[("RITORNEL_NAME", "Kitchen Speakers")]);
     let settings = |extra: &[&str]| {
         let mut command = ritornelctl(&["settings", "--data-dir"]);
         command.arg(&data_dir).args(extra);
@@ -720,7 +470,7 @@ fn settings_say_what_gave_each_and_the_wake_setting_is_changed_from_a_terminal()
     // nothing gives it now, as the name a server already had.
     let stopped = server.end("TERM");
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
-    let server = Server::start(&data_dir);
+    let server = start(&data_dir);
     let shown = read();
     assert_eq!(
         shown["awake"],

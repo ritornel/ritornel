@@ -7,170 +7,73 @@
 //! docs/internals/contract.md).
 //! Covers are plain HTTP, so their tests run over the socket's listener.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use std::time::Duration;
 
 use ritornel_client::contract::{
     AlbumTile, CONTRACT_VERSION, ClientKind, ErrorCode, Event, FILTER_VERSION, Filter, HelloParams,
     ListKind, ListLocateParams, ListOpenParams, ListOpened, MEDIA_TOKEN_PARAM, Predicate, Query,
-    Replaces, Row, SessionKind, Sort, SortKey, Topic, Window, route,
+    Replaces, Row, Sort, SortKey, Topic, Window, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::invent::{ChurnKind, Churned};
-use ritornel_engine::{OsEntropy, SystemClock};
-use ritornel_server::{Bounds, HeldDir, Listen, Server};
+use ritornel_server::Bounds;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{
+    self, Scratch, Via, bounded, invent as run_invent, on_both_transports, terminate,
+};
 
-async fn bounded(test: impl Future<Output = ()>) {
-    tokio::time::timeout(WAIT, test)
-        .await
-        .unwrap_or_else(|_| panic!("the test did not finish within {WAIT:?}"));
-}
-
-/// A directory that is removed when the test ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-server-lists-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-
-    fn root(&self) -> PathBuf {
-        self.0.join("root")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Via {
-    Memory,
-    Socket,
-}
-
-macro_rules! on_both_transports {
-    ($($test:ident)*) => {$(
-        mod $test {
-            use super::{Via, bounded};
-
-            #[tokio::test]
-            async fn in_memory() {
-                bounded(super::$test(Via::Memory)).await;
-            }
-
-            #[tokio::test]
-            async fn over_a_socket() {
-                bounded(super::$test(Via::Socket)).await;
-            }
-        }
-    )*};
+fn scratch() -> Scratch {
+    Scratch::new("ritornel-server-lists-")
 }
 
 /// Invents a library on a data directory with the server's own hidden
 /// command, as a developer would.
 fn invent(data_dir: &Path, root: &Path, albums: usize) {
-    let output = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
-        .arg("invent")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--root")
-        .arg(root)
-        .args(["--albums", &albums.to_string(), "--seed", "3"])
-        .args(["--cover-min", "200", "--cover-max", "300"])
-        .env_remove("RITORNEL_DATA_DIR")
-        .output()
-        .unwrap();
-    // A process a signal ended has no code, and may have said nothing.
-    assert!(
-        output.status.success(),
-        "ritornel-server invent: {}\n--- stderr\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+    let albums = albums.to_string();
+    run_invent(
+        data_dir,
+        root,
+        &[
+            "--albums",
+            &albums,
+            "--seed",
+            "3",
+            "--cover-min",
+            "200",
+            "--cover-max",
+            "300",
+        ],
     );
 }
 
 /// A server inside the test, on an invented library of its own.
-struct Running {
-    server: Server,
-    scratch: Scratch,
+struct Running(support::Running);
+
+impl std::ops::Deref for Running {
+    type Target = support::Running;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl Running {
     async fn start(albums: usize) -> Self {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         if albums > 0 {
             invent(&scratch.data_dir(), &scratch.root(), albums);
         }
-        let server = Server::start_with(
-            HeldDir::take(scratch.data_dir()).unwrap(),
-            Listen::on_port(0),
-            Arc::new(SystemClock),
-            Arc::new(OsEntropy),
-            Bounds::default(),
-        )
-        .await
-        .unwrap();
-        Self { server, scratch }
-    }
-
-    fn endpoint(&self) -> SocketAddr {
-        self.server.endpoint()
-    }
-
-    fn token(&self) -> String {
-        std::fs::read_to_string(self.scratch.data_dir().join("credential"))
-            .unwrap()
-            .trim()
-            .to_owned()
+        Self(support::Running::on_scratch(scratch, Bounds::default()).await)
     }
 
     async fn greeted(&self, via: Via) -> Client {
-        let client = match via {
-            Via::Memory => {
-                let (outgoing, incoming) = self.server.connect_in_memory(SessionKind::Full);
-                Client::over_memory(outgoing, incoming)
-            }
-            Via::Socket => Client::connect(self.endpoint(), &Credential::new(self.token()))
-                .await
-                .unwrap(),
-        };
-        client
-            .hello(&HelloParams {
-                name: "lists-test".to_owned(),
-                kind: ClientKind::Cli,
-                version: "1".to_owned(),
-                contract_version: CONTRACT_VERSION,
-            })
-            .await
-            .unwrap();
-        client
+        self.0.greeted(via, "lists-test").await
     }
 
     fn step(&self, kind: ChurnKind) -> Churned {
@@ -1006,7 +909,7 @@ async fn a_cover_needs_the_media_token_and_the_token_opens_nothing_else() {
 #[tokio::test]
 async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbose() {
     bounded(async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         invent(&scratch.data_dir(), &scratch.root(), 8);
         let mut child = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
             .arg("serve")
@@ -1077,21 +980,7 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
             401
         );
         drop(client);
-        // SIGTERM, or on Windows `taskkill /PID` without `/F`, which asks
-        // the server's hidden window to close.
-        let killed = if cfg!(windows) {
-            Command::new("taskkill")
-                .args(["/PID", &child.id().to_string()])
-                .output()
-                .unwrap()
-                .status
-        } else {
-            Command::new("kill")
-                .args(["-TERM", &child.id().to_string()])
-                .status()
-                .unwrap()
-        };
-        assert!(killed.success(), "asking it to stop: {killed}");
+        terminate(child.id());
         let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),

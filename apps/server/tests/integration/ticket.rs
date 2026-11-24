@@ -16,25 +16,16 @@
 //! Nothing here sleeps, and every test is cut off, with a message, if it
 //! has not finished in [`WAIT`].
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use ritornel_client::Credential;
 use ritornel_client::contract::{SocketTicket, TICKET_PARAM, route};
-use ritornel_engine::{OsEntropy, SystemClock};
-use ritornel_server::{Bounds, HeldDir, Listen, Server, TICKET_LIFE};
+use ritornel_server::{Bounds, TICKET_LIFE};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -42,97 +33,17 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-/// How long a test may take before it is failed. It is a bound, not a
-/// wait: a test that passes never comes near it.
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{Running, Scratch, WAIT, bounded, terminate, token_in};
 
 /// The `Origin` the desktop's page presents.
 const DESKTOP: &str = "tauri://localhost";
 
-/// Runs a test, and fails it if it has not finished in [`WAIT`].
-async fn bounded(test: impl Future<Output = ()>) {
-    tokio::time::timeout(WAIT, test)
-        .await
-        .unwrap_or_else(|_| panic!("the test did not finish within {WAIT:?}"));
+async fn start() -> Running {
+    Running::start("ritornel-server-ticket-").await
 }
 
-/// A directory that is removed when the test ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-server-ticket-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-
-    /// The data directory. The server creates it.
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// The local credential's token, as a client on this machine reads it.
-fn token_in(data_dir: &Path) -> String {
-    std::fs::read_to_string(data_dir.join("credential"))
-        .unwrap()
-        .trim()
-        .to_owned()
-}
-
-/// A server running inside the test, on a directory of its own.
-struct Running {
-    server: Server,
-    scratch: Scratch,
-}
-
-impl Running {
-    async fn start() -> Self {
-        Self::start_with(Bounds::default()).await
-    }
-
-    async fn start_with(bounds: Bounds) -> Self {
-        let scratch = Scratch::new();
-        let server = Server::start_with(
-            HeldDir::take(scratch.data_dir()).unwrap(),
-            Listen::on_port(0),
-            Arc::new(SystemClock),
-            Arc::new(OsEntropy),
-            bounds,
-        )
-        .await
-        .unwrap();
-        Self { server, scratch }
-    }
-
-    fn endpoint(&self) -> SocketAddr {
-        self.server.endpoint()
-    }
-
-    fn token(&self) -> String {
-        token_in(&self.scratch.data_dir())
-    }
-
-    fn credential(&self) -> Credential {
-        Credential::new(self.token())
-    }
-
-    /// A new ticket, asked for as a program on this machine asks.
-    async fn ticket(&self) -> String {
-        ritornel_client::ticket(self.endpoint(), &self.credential())
-            .await
-            .unwrap()
-            .ticket
-    }
+async fn start_with(bounds: Bounds) -> Running {
+    Running::start_with("ritornel-server-ticket-", bounds).await
 }
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -247,7 +158,7 @@ async fn http(
 #[tokio::test]
 async fn a_ticket_opens_one_socket_of_the_kind_the_credential_holds() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
 
         let issued = ritornel_client::ticket(endpoint, &running.credential())
@@ -296,7 +207,7 @@ async fn a_ticket_opens_one_socket_of_the_kind_the_credential_holds() {
 #[tokio::test]
 async fn the_desktops_page_opens_the_socket_with_a_ticket_and_gets_events() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let ticket = running.ticket().await;
 
         let mut socket = with_ticket(running.endpoint(), &ticket, Some(DESKTOP))
@@ -328,7 +239,7 @@ async fn the_desktops_page_opens_the_socket_with_a_ticket_and_gets_events() {
 #[tokio::test]
 async fn a_ticket_from_any_other_origin_is_refused_and_is_spent() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
         let own = format!("http://{endpoint}");
         // A page on the web, pages on this machine, a page with no origin
@@ -368,7 +279,7 @@ async fn a_ticket_from_any_other_origin_is_refused_and_is_spent() {
 #[tokio::test]
 async fn the_desktops_origin_opens_nothing_without_a_ticket() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
         let origin = [("origin", DESKTOP)];
 
@@ -413,7 +324,7 @@ async fn an_expired_ticket_is_refused() {
     bounded(async {
         // A ticket with no time to wait has run out by the time it is
         // presented, however soon that is.
-        let running = Running::start_with(Bounds {
+        let running = start_with(Bounds {
             ticket_life: Duration::ZERO,
             ..Bounds::default()
         })
@@ -442,7 +353,7 @@ async fn an_expired_ticket_is_refused() {
 #[tokio::test]
 async fn a_made_up_ticket_is_refused_and_the_credential_is_not_a_ticket() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
         let real = running.ticket().await;
         let token = running.token();
@@ -520,7 +431,7 @@ async fn a_made_up_ticket_is_refused_and_the_credential_is_not_a_ticket() {
 #[tokio::test]
 async fn a_ticket_opens_the_socket_and_no_other_route() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
         let ticket = running.ticket().await;
         let query = format!("?{TICKET_PARAM}={ticket}");
@@ -561,7 +472,7 @@ async fn a_ticket_opens_the_socket_and_no_other_route() {
 #[tokio::test]
 async fn a_ticket_is_made_only_for_the_credential_in_a_header() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
         let token = running.token();
         let authorization = format!("Bearer {token}");
@@ -628,7 +539,7 @@ async fn a_ticket_is_made_only_for_the_credential_in_a_header() {
 #[tokio::test]
 async fn a_page_cannot_ask_for_a_ticket() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
         let authorization = format!("Bearer {}", running.token());
 
@@ -740,21 +651,7 @@ impl Process {
 
     /// Asks the server to stop and waits until it has.
     fn stop(mut self) {
-        // SIGTERM, or on Windows `taskkill /PID` without `/F`, which asks
-        // the server's hidden window to close.
-        let asked = if cfg!(windows) {
-            Command::new("taskkill")
-                .args(["/PID", &self.0.id().to_string()])
-                .output()
-                .unwrap()
-                .status
-        } else {
-            Command::new("kill")
-                .args(["-TERM", &self.0.id().to_string()])
-                .status()
-                .unwrap()
-        };
-        assert!(asked.success(), "asking it to stop: {asked}");
+        terminate(self.0.id());
         let ended = self.0.wait().unwrap();
         assert!(ended.success(), "the server ended with {ended}");
     }
@@ -771,7 +668,7 @@ impl Drop for Process {
 #[tokio::test]
 async fn neither_a_ticket_nor_the_credential_is_in_anything_the_server_writes() {
     bounded(async {
-        let scratch = Scratch::new();
+        let scratch = Scratch::new("ritornel-server-ticket-");
         let data_dir = scratch.data_dir();
         let (process, printed) = Process::start(&data_dir);
         let found = ritornel_client::local::find(&data_dir).await.unwrap();

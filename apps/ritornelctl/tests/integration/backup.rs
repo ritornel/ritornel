@@ -13,276 +13,36 @@
 //! and nothing here sleeps: each wait is for a process to print a line or
 //! to end, or for an answer from the server, and is bounded.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
-mod support;
-
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// How long a test waits for a process before it kills it and fails.
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{Scratch, Server, json, ok, ritornelctl, until, write_wav};
 
-struct Scratch(PathBuf);
+fn scratch() -> Scratch {
+    Scratch::new("ritornelctl-backup-")
+}
 
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornelctl-backup-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
+/// A folder of two invented tracks of these lengths in seconds.
+fn album(scratch: &Scratch, name: &str, seconds: [u32; 2]) -> PathBuf {
+    let folder = scratch.0.canonicalize().unwrap().join("music").join(name);
+    std::fs::create_dir_all(&folder).unwrap();
+    let names = [("01 First.wav", 440.0), ("02 Second.wav", 660.0)];
+    for ((name, hz), seconds) in names.into_iter().zip(seconds) {
+        write_wav(&folder.join(name), seconds, hz);
     }
-
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-
-    /// A folder of two invented tracks of these lengths in seconds.
-    fn album(&self, name: &str, seconds: [u32; 2]) -> PathBuf {
-        let folder = self.0.canonicalize().unwrap().join("music").join(name);
-        std::fs::create_dir_all(&folder).unwrap();
-        let names = [("01 First.wav", 440.0), ("02 Second.wav", 660.0)];
-        for ((name, hz), seconds) in names.into_iter().zip(seconds) {
-            write_wav(&folder.join(name), seconds, hz);
-        }
-        folder
-    }
+    folder
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn write_wav(path: &Path, seconds: u32, hz: f64) {
-    let rate: u32 = 8000;
-    let frames = rate * seconds;
-    let mut bytes = Vec::with_capacity(44 + frames as usize * 2);
-    let data = frames * 2;
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(36 + data).to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&16_u32.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&rate.to_le_bytes());
-    bytes.extend_from_slice(&(rate * 2).to_le_bytes());
-    bytes.extend_from_slice(&2_u16.to_le_bytes());
-    bytes.extend_from_slice(&16_u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&data.to_le_bytes());
-    for frame in 0..frames {
-        let t = f64::from(frame) / f64::from(rate);
-        let sample = (0.25 * (2.0 * std::f64::consts::PI * hz * t).sin() * 32767.0) as i16;
-        bytes.extend_from_slice(&sample.to_le_bytes());
-    }
-    std::fs::File::create(path)
-        .unwrap()
-        .write_all(&bytes)
-        .unwrap();
-}
-
-fn lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
-    let (send, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            if send.send(line.unwrap()).is_err() {
-                break;
-            }
-        }
-    });
-    lines
-}
-
-fn rest(lines: &Receiver<String>) -> Option<String> {
-    let mut text = String::new();
-    loop {
-        match lines.recv_timeout(WAIT) {
-            Ok(line) => {
-                text.push_str(&line);
-                text.push('\n');
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(text),
-            Err(mpsc::RecvTimeoutError::Timeout) => return None,
-        }
-    }
-}
-
-fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ritornelctl"))
-        .args(args)
-        .arg("--data-dir")
-        .arg(data_dir)
-        .env_remove("RITORNEL_DATA_DIR")
-        .env_remove("RITORNEL_BACKUP_DIR")
-        .env_remove("RITORNEL_NAME")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = lines(child.stdout.take().unwrap());
-    let stderr = lines(child.stderr.take().unwrap());
-    let (Some(stdout), Some(stderr)) = (rest(&stdout), rest(&stderr)) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("ritornelctl {args:?} did not end within {WAIT:?}");
-    };
-    let ended = child.wait().unwrap();
-    // No test has ritornelctl ended by a signal: one that was, was ended from
-    // outside the test, and the failure says so rather than as a code.
-    assert!(
-        ended.code().is_some(),
-        "ritornelctl {args:?} was ended from outside: {ended}\n--- stdout\n{stdout}--- stderr\n{stderr}"
-    );
-    (ended.code(), stdout, stderr)
-}
-
-fn json(data_dir: &Path, args: &[&str]) -> Value {
-    let mut args = args.to_vec();
-    args.push("--json");
-    serde_json::from_str(&ok(data_dir, &args)).unwrap()
-}
-
-/// Runs `ritornelctl` and returns what it printed. Unless it succeeded,
-/// the test fails with its exit code and everything it printed.
-fn ok(data_dir: &Path, args: &[&str]) -> String {
-    let (code, stdout, stderr) = ritornelctl(data_dir, args);
-    assert_eq!(
-        code,
-        Some(0),
-        "ritornelctl {args:?}\n--- stdout\n{stdout}--- stderr\n{stderr}"
-    );
-    stdout
-}
-
-/// Asks the server, again and again, until `done` says so, for at most
-/// [`WAIT`]. Each ask is a whole `ritornelctl` run, which is the wait.
-fn until(data_dir: &Path, args: &[&str], done: impl Fn(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let answer = json(data_dir, args);
-        if done(&answer) {
-            return answer;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{args:?} never got there: {answer}"
-        );
-    }
-}
-
-/// A `ritornel-server` on the null output.
-struct Server {
-    child: Child,
-    stdout: Receiver<String>,
-}
-
-fn spawn(data_dir: &Path, variables: &[(&str, &str)]) -> (Child, Receiver<String>) {
-    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl"))
-        .with_file_name(format!("ritornel-server{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        binary.exists(),
-        "there is no ritornel-server beside ritornelctl: build the workspace"
-    );
-    let mut child = Command::new(binary)
-        .arg("serve")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .args(["--listen", "127.0.0.1:0", "--output", "null"])
-        .env_remove("RITORNEL_DATA_DIR")
-        .env_remove("RITORNEL_LISTEN")
-        .env_remove("RITORNEL_LOG_LEVEL")
-        .env_remove("RITORNEL_BACKUP_DIR")
-        .env_remove("RITORNEL_NAME")
-        // A test that plays leaves the media keys where they were.
-        .env("RITORNEL_TEST_NO_MEDIA_SESSION", "1")
-        .envs(variables.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        // The server logs to a file and says on stderr only what went wrong,
-        // which then shows with the failing test.
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let stdout = lines(child.stdout.take().unwrap());
-    (child, stdout)
-}
-
-impl Server {
-    fn start(data_dir: &Path, variables: &[(&str, &str)]) -> Self {
-        let (mut child, stdout) = spawn(data_dir, variables);
-        let ready = stdout.recv_timeout(WAIT);
-        if !ready
-            .as_deref()
-            .is_ok_and(|line| line.starts_with("ready pid="))
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("no ready line within {WAIT:?}: {ready:?}");
-        }
-        Self { child, stdout }
-    }
-
-    /// Waits for the server to end by itself, and says how it did: its
-    /// exit status names the signal when one ended it, as an abort does.
-    fn ended(mut self) -> ExitStatus {
-        assert!(
-            rest(&self.stdout).is_some(),
-            "the server did not end within {WAIT:?}"
-        );
-        self.child.wait().unwrap()
-    }
-
-    fn stop(self) {
-        // `taskkill /PID` without `/F` is what Windows has for SIGTERM: it
-        // asks the server's hidden window to close.
-        let sent = if cfg!(windows) {
-            Command::new("taskkill")
-                .arg("/PID")
-                .arg(self.child.id().to_string())
-                .output()
-                .unwrap()
-                .status
-        } else {
-            Command::new("kill")
-                .arg("-TERM")
-                .arg(self.child.id().to_string())
-                .status()
-                .unwrap()
-        };
-        assert!(sent.success(), "asking it to stop: {sent}");
-        let ended = self.ended();
-        assert!(ended.success(), "the server ended with {ended}");
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        support::say_if_gone(&mut self.child, None);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+fn start(data_dir: &Path, variables: &[(&str, &str)]) -> Server {
+    Server::start_null_output(data_dir, variables)
 }
 
 #[test]
 fn with_no_backup_folder_there_is_no_backup_and_nothing_is_written_beside_the_data() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
-    let server = Server::start(&data_dir, &[]);
+    let server = start(&data_dir, &[]);
     ok(&data_dir, &["library", "create"]);
 
     let status = json(&data_dir, &["status"]);
@@ -312,16 +72,16 @@ fn with_no_backup_folder_there_is_no_backup_and_nothing_is_written_beside_the_da
 
 #[test]
 fn a_backup_taken_while_the_server_plays_is_restored_elsewhere_with_its_history_whole() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let place = scratch.0.join("backups elsewhere");
     std::fs::create_dir_all(&place).unwrap();
-    let short = scratch.album("Short Album", [40, 40]);
-    let long = scratch.album("Long Album", [600, 600]);
+    let short = album(&scratch, "Short Album", [40, 40]);
+    let long = album(&scratch, "Long Album", [600, 600]);
 
     // Twenty times real time: the short album is over in four seconds and
     // the long one plays on for a minute.
-    let server = Server::start(
+    let server = start(
         &data_dir,
         &[
             ("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20"),
@@ -384,7 +144,7 @@ fn a_backup_taken_while_the_server_plays_is_restored_elsewhere_with_its_history_
     for name in ["server.db", "library.db"] {
         std::fs::copy(backup.join(name), restored.join(name)).unwrap();
     }
-    let server = Server::start(&restored, &[]);
+    let server = start(&restored, &[]);
     let status = json(&restored, &["status"]);
     assert_eq!(status["serverId"], manifest["serverId"]);
     assert_eq!(status["library"]["libraryId"], manifest["libraryId"]);
@@ -416,12 +176,12 @@ fn a_backup_taken_while_the_server_plays_is_restored_elsewhere_with_its_history_
 #[test]
 fn an_export_is_read_back_without_ritornel_and_holds_a_skipped_listen_with_where_it_was_played_from()
  {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
-    let album = scratch.album("Long Album", [600, 600]);
+    let album = album(&scratch, "Long Album", [600, 600]);
     let out = scratch.0.join("exports");
     std::fs::create_dir_all(&out).unwrap();
-    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
+    let server = start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
     ok(&data_dir, &["library", "create"]);
     let folder = album.to_str().unwrap();
     ok(&data_dir, &["scan", folder]);
@@ -496,14 +256,14 @@ fn an_export_is_read_back_without_ritornel_and_holds_a_skipped_listen_with_where
 
 #[test]
 fn while_a_listen_cannot_be_saved_playback_goes_on_and_the_status_says_so_and_since_when() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
-    let album = scratch.album("Long Album", [600, 600]);
+    let album = album(&scratch, "Long Album", [600, 600]);
     // Past a minute into a track, every save of its listen fails, as a full
     // disk's would. It plays in real time, so that the next track's first
     // minute, while its saves work again, outlasts any wait for the status
     // to say so.
-    let server = Server::start(
+    let server = start(
         &data_dir,
         &[
             ("RITORNEL_TEST_NULL_OUTPUT_SPEED", "1"),
