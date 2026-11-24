@@ -25,6 +25,17 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), Error> {
         .map_err(io_error("create", path))
 }
 
+/// Checks without changing anything that `path` is a usable data directory.
+pub(crate) fn check_dir_usable(path: &Path) -> Result<(), Error> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err(io_error("check", path)(
+            std::io::ErrorKind::NotADirectory.into(),
+        ))
+    }
+}
+
 /// Nothing: a folder's mode does not reach the files made in it, which each
 /// take the mode they are created with, and SQLite gives a database's logs
 /// the database's own mode. A folder that is there keeps its mode.
@@ -32,11 +43,42 @@ pub(crate) fn close_dir_to_others(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Same as [`close_dir_to_others`] on Unix.
+pub(crate) fn close_data_dir_to_others(_path: &Path, _keep_open: &[&Path]) -> Result<(), Error> {
+    Ok(())
+}
+
+/// Holds a staged private directory open while files are written into it.
+/// On Unix, nothing extra is held.
+#[derive(Debug)]
+pub(crate) struct PrivateDir;
+
+impl PrivateDir {
+    /// Releases the directory pin before renaming or removing the folder.
+    pub(crate) fn release(self) {}
+}
+
 /// Creates the one folder at `path`, with mode `0700`, and fails if it is
 /// there already: two writers never share it. Its parent must be there.
-pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<PrivateDir> {
     use std::os::unix::fs::DirBuilderExt;
-    DirBuilder::new().mode(0o700).create(path)
+    DirBuilder::new().mode(0o700).create(path)?;
+    Ok(PrivateDir)
+}
+
+/// Opens or creates the lock file at `path` with mode `0600` without
+/// following a symbolic link.
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    create_owner_only(&mut options);
+    options.open(path)
 }
 
 /// Syncs the folder at `path`, so that the names made, renamed or removed

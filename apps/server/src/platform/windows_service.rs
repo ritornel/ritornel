@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use ritornel_windows::window::{self, Window};
 
 use super::service::{installed, prepare};
-use super::{close_to_others, create_owner_only};
+use super::{close_to_others, create_owner_only, create_private_file};
 use crate::data_dir::{self, DataDir};
 use crate::error::io_error;
 use crate::{Env, Error};
@@ -478,13 +478,21 @@ pub(crate) fn run_service(data_dir: &Path, env: Env<'_>) -> Result<(), Error> {
     let program = std::env::current_exe()
         .map_err(|error| Error::Service(format!("cannot find this program: {error}")))?;
     let log_path = dir.logs().join("service.log");
+    // Create private from birth when missing, avoiding a post-create window
+    // if `logs/` already existed with an open ACL.
+    match create_private_file(&log_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            close_to_others(&log_path).map_err(io_error("close", &log_path))?;
+        }
+        Err(error) => return Err(io_error("open", &log_path)(error)),
+    }
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.append(true);
     create_owner_only(&mut options);
     let log = options
         .open(&log_path)
         .map_err(io_error("open", &log_path))?;
-    close_to_others(&log_path).map_err(io_error("close", &log_path))?;
     let mut notes = log.try_clone().map_err(io_error("open", &log_path))?;
     let (heard, hearing) = mpsc::channel();
     let window = Window::open(SUPERVISOR, {

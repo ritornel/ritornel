@@ -39,8 +39,8 @@ use tracing::{info, warn};
 
 use crate::data_dir::DataDir;
 use crate::platform::{
-    close_to_others, create_new_private_dir, create_private_dir, create_private_file, rename_dir,
-    sync_dir,
+    PrivateDir, close_dir_to_others, close_to_others, create_new_private_dir, create_private_dir,
+    create_private_file, rename_dir, sync_dir,
 };
 
 /// The version of `backup.json`.
@@ -254,6 +254,7 @@ pub(crate) fn before_migrations(
     }
     let rollback = dir.backups();
     create_private_dir(&rollback)?;
+    close_dir_to_others(&rollback)?;
     let kept = write(dir, &rollback, at_ms, reason, about).map_err(|error| crate::Error::Io {
         doing: "copy the databases before migrating them into",
         path: rollback.clone(),
@@ -349,13 +350,13 @@ fn write(
     if !place.is_dir() {
         return Err(BackupError::Missing(place.to_owned()));
     }
-    let (name, partial) = reserve(place, at_ms, reason)?;
-    if let Err(error) = fill(dir, &partial, at_ms, reason, about) {
+    let staged = reserve(place, at_ms, reason)?;
+    if let Err(error) = fill(dir, &staged.partial, at_ms, reason, about) {
         // What was written of it is no backup.
-        let _ = std::fs::remove_dir_all(&partial);
+        staged.discard();
         return Err(error);
     }
-    let finished = publish(&partial, place, &name)?;
+    let finished = publish(staged, place)?;
     Ok(Taken {
         path: finished,
         at_ms,
@@ -363,12 +364,25 @@ fn write(
     })
 }
 
+/// A reserved staging folder pinned open while files are written inside it.
+/// Dropping the pin happens only right before renaming or removing it.
+pub(crate) struct Staged {
+    pub(crate) name: String,
+    pub(crate) partial: PathBuf,
+    pin: PrivateDir,
+}
+
+impl Staged {
+    /// Releases the pin and removes the partial staging folder.
+    pub(crate) fn discard(self) {
+        let Self { partial, pin, .. } = self;
+        pin.release();
+        let _ = std::fs::remove_dir_all(&partial);
+    }
+}
+
 /// A new backup's folder name, and the folder it is written in first.
-fn reserve(
-    place: &Path,
-    at_ms: i64,
-    reason: BackupReason,
-) -> Result<(String, PathBuf), BackupError> {
+fn reserve(place: &Path, at_ms: i64, reason: BackupReason) -> Result<Staged, BackupError> {
     let suffix = match reason {
         BackupReason::OnDemand => "",
         BackupReason::BeforeMigration => "-before-migration",
@@ -392,7 +406,7 @@ const SAME_SECOND: u32 = 1_000;
 /// folder it is written in first, under a dotted name, which this call
 /// makes and no other can: two writers in the same second, in this server
 /// or another writing to the same place, take two names.
-pub(crate) fn reserve_named(place: &Path, base: &str) -> Result<(String, PathBuf), BackupError> {
+pub(crate) fn reserve_named(place: &Path, base: &str) -> Result<Staged, BackupError> {
     for n in 1..=SAME_SECOND {
         let name = if n == 1 {
             base.to_owned()
@@ -406,10 +420,11 @@ pub(crate) fn reserve_named(place: &Path, base: &str) -> Result<(String, PathBuf
         match create_new_private_dir(&partial) {
             // Another writer may have finished a folder of this name since
             // it was looked for; then the next name is taken.
-            Ok(()) if place.join(&name).exists() => {
+            Ok(pin) if place.join(&name).exists() => {
+                pin.release();
                 let _ = std::fs::remove_dir(&partial);
             }
-            Ok(()) => return Ok((name, partial)),
+            Ok(pin) => return Ok(Staged { name, partial, pin }),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(io("create", &partial)(error)),
         }
@@ -421,19 +436,21 @@ pub(crate) fn reserve_named(place: &Path, base: &str) -> Result<(String, PathBuf
     })
 }
 
-/// Makes the folder written under `partial` whole, as `name` in `place`:
-/// it is synced, so that its names are kept, renamed, and the place synced,
-/// so that the new name is. On Windows, where a folder is not synced, the
-/// rename asks to be written through to the disk instead. Each file in it
-/// was synced as it was written. On an error nothing of it is left, and it
-/// is not to be called whole.
-pub(crate) fn publish(partial: &Path, place: &Path, name: &str) -> Result<PathBuf, BackupError> {
-    let finished = place.join(name);
-    let renamed = sync_dir(partial)
-        .map_err(io("sync", partial))
-        .and_then(|()| rename_dir(partial, &finished).map_err(io("finish", &finished)));
+/// Makes the folder written under `staged` whole, as `staged.name` in
+/// `place`: it is synced, so that its names are kept, its pin released,
+/// renamed, and the place synced, so that the new name is. On Windows,
+/// where a folder is not synced, the rename asks to be written through to
+/// the disk instead. Each file in it was synced as it was written. On an
+/// error nothing of it is left, and it is not to be called whole.
+pub(crate) fn publish(staged: Staged, place: &Path) -> Result<PathBuf, BackupError> {
+    let Staged { name, partial, pin } = staged;
+    let finished = place.join(&name);
+    let synced = sync_dir(&partial).map_err(io("sync", &partial));
+    pin.release();
+    let renamed =
+        synced.and_then(|()| rename_dir(&partial, &finished).map_err(io("finish", &finished)));
     if let Err(error) = renamed {
-        let _ = std::fs::remove_dir_all(partial);
+        let _ = std::fs::remove_dir_all(&partial);
         return Err(error);
     }
     if let Err(error) = sync_dir(place) {
@@ -810,8 +827,9 @@ mod tests {
         let scratch = Scratch::new();
         let place = elsewhere(&scratch);
         open_to_others(&place);
-        let (_, partial) = reserve_named(&place, "ritornel-backup").unwrap();
-        assert!(path_is_private(&partial));
+        let staged = reserve_named(&place, "ritornel-backup").unwrap();
+        assert!(path_is_private(&staged.partial));
+        staged.discard();
     }
 
     #[test]

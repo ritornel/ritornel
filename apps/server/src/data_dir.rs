@@ -25,7 +25,7 @@
 //! `preparing.json` and `credential`, are the contract's (`ritornel_contract::local`): a local client reads
 //! what the server writes here.
 
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -34,7 +34,8 @@ use ritornel_contract::local;
 use crate::error::io_error;
 use crate::lock::DirLock;
 use crate::platform::{
-    close_dir_to_others, close_to_others, create_owner_only, create_private_dir,
+    check_dir_usable, close_data_dir_to_others, close_dir_to_others, close_to_others,
+    create_private_dir, create_private_file, is_private,
 };
 use crate::{Env, Error, server_json};
 
@@ -56,29 +57,37 @@ pub(crate) struct DataDir {
 }
 
 impl DataDir {
+    /// Makes sure the root data directory exists, private from the moment it
+    /// is created, without creating subdirectories or changing what is there.
+    fn ensure_root(root: PathBuf) -> Result<Self, Error> {
+        let dir = Self { root };
+        create_private_dir(&dir.root)?;
+        Ok(dir)
+    }
+
     /// Makes sure the directory and its logs folder exist. What it creates,
     /// only the OS user can open: the directory holds the local credential
-    /// and the databases. It changes nothing that is there already, so a
-    /// server refused the directory's lock changes nothing in it.
+    /// and the databases. It changes nothing that is there already.
     pub(crate) fn prepare(root: PathBuf) -> Result<Self, Error> {
-        let dir = Self { root };
-        for path in [dir.root.clone(), dir.logs()] {
-            create_private_dir(&path)?;
-        }
+        let dir = Self::ensure_root(root)?;
+        create_private_dir(&dir.logs())?;
         Ok(dir)
     }
 
     /// Readies what is there for the directory's holder alone. The
     /// directory and its logs are closed to others where what is made in
-    /// them takes its access from them, as on Windows. `server.db` is made
-    /// if it is missing, and it and `library.db` are made readable by the OS
-    /// user alone, whether they were made here or found: `server.db` holds
-    /// the server's signing key, and a database restored from a backup may
-    /// arrive open to everyone.
+    /// them takes its access from them, as on Windows (preserving visibility
+    /// of any previously open credential or `lastfm.env`). `server.db` is
+    /// made if it is missing, and it and `library.db` are made readable by
+    /// the OS user alone, whether they were made here or found: `server.db`
+    /// holds the server's signing key, and a database restored from a backup
+    /// may arrive open to everyone.
     fn ready(&self) -> Result<(), Error> {
-        for path in [self.root.clone(), self.logs()] {
-            close_dir_to_others(&path)?;
-        }
+        let credential = self.credential();
+        let lastfm = self.root.join("lastfm.env");
+        close_data_dir_to_others(&self.root, &[credential.as_path(), lastfm.as_path()])?;
+        create_private_dir(&self.logs())?;
+        close_dir_to_others(&self.logs())?;
         close_database(&self.server_db())?;
         close_if_there(&self.library_db())
     }
@@ -140,10 +149,19 @@ impl DataDir {
     }
 
     /// The built-in cache root, made if it is missing: `covers/` and
-    /// `tmp/` are in it. Nothing in it need be backed up.
+    /// `tmp/` are in it. Nothing in it need be backed up. On Windows, any
+    /// pre-existing cache folders are closed so newly cached covers inherit
+    /// owner-only access.
     pub(crate) fn cache(&self) -> Result<PathBuf, Error> {
         let cache = self.root.join("cache");
         create_private_dir(&cache)?;
+        close_dir_to_others(&cache)?;
+        for sub in ["covers", "tmp"] {
+            let dir = cache.join(sub);
+            if dir.is_dir() {
+                close_dir_to_others(&dir)?;
+            }
+        }
         Ok(cache)
     }
 }
@@ -151,17 +169,26 @@ impl DataDir {
 /// Makes sure the database file at `path` exists and that only the OS user
 /// can read it.
 ///
-/// SQLite keeps the mode of a file it finds, and gives the same mode to the
-/// write-ahead log it puts beside it. The mode asked for here applies only
-/// to a file this call creates, so one that was already there is closed as
-/// well, with any log left beside it.
+/// A missing file is created private from the moment it exists. An empty
+/// pre-existing file that others could open is replaced with a fresh
+/// private file so no already-open handle can read secrets written to it.
+/// A non-empty file that was already there (such as a restored database)
+/// is closed in place, along with any log left beside it.
 fn close_database(database: &Path) -> Result<(), Error> {
-    let mut options = OpenOptions::new();
-    options.append(true).create(true);
-    create_owner_only(&mut options);
-    options
-        .open(database)
-        .map_err(io_error("create", database))?;
+    match create_private_file(database) {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let open = File::open(database).map_err(io_error("open", database))?;
+            let empty = open.metadata().map_err(io_error("read", database))?.len() == 0;
+            let private = is_private(&open).map_err(io_error("read", database))?;
+            drop(open);
+            if empty && !private {
+                std::fs::remove_file(database).map_err(io_error("remove", database))?;
+                create_private_file(database).map_err(io_error("create", database))?;
+            }
+        }
+        Err(error) => return Err(io_error("create", database)(error)),
+    }
     close_if_there(database)
 }
 
@@ -193,11 +220,13 @@ pub struct HeldDir {
 }
 
 impl HeldDir {
-    /// Makes sure the directory exists, takes its lock, and then readies
-    /// its databases. It fails with [`Error::InUse`] if another server has
-    /// it, having touched nothing in it.
+    /// Makes sure the directory exists, validates it without modifying it,
+    /// takes its lock, and then readies its subdirectories and databases. It
+    /// fails with [`Error::InUse`] if another server has it, having touched
+    /// nothing in it.
     pub fn take(root: PathBuf) -> Result<Self, Error> {
-        let dir = DataDir::prepare(root)?;
+        let dir = DataDir::ensure_root(root)?;
+        check_dir_usable(dir.root())?;
         let lock = DirLock::acquire(dir.root(), &dir.lock_file()).map_err(|error| match error {
             // The server that has it says where it listens in `server.json`,
             // once it listens.
@@ -316,9 +345,11 @@ mod tests {
         let scratch = Scratch::new();
         let root = scratch.path().join("data");
         let held = HeldDir::take(root.clone()).unwrap();
-        // The holder has not made its database yet, or has moved it, and
-        // the directory and a database in it are open to others again.
+        // The holder has not made its database or logs yet, or has moved
+        // them, and the directory and a database in it are open to others
+        // again.
         std::fs::remove_file(held.dir().server_db()).unwrap();
+        std::fs::remove_dir(held.dir().logs()).unwrap();
         open_to_others(&root);
         std::fs::write(held.dir().library_db(), "").unwrap();
         open_to_others(&held.dir().library_db());
@@ -326,8 +357,69 @@ mod tests {
         let refused = HeldDir::take(root.clone());
         assert!(matches!(refused, Err(Error::InUse { .. })), "{refused:?}");
         assert!(!held.dir().server_db().exists());
+        assert!(!held.dir().logs().exists());
         assert!(!private(&held.dir().library_db()));
         assert!(!private(&root));
+    }
+
+    #[test]
+    fn an_exposed_credential_in_an_open_directory_is_revoked_and_replaced() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("data");
+        let held = HeldDir::take(root.clone()).unwrap();
+        let store = ServerStore::open(
+            &held.dir().server_db(),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        let (_, issued) = store.ensure_identity("desk").unwrap();
+        let original = issued.clone().unwrap();
+        let (first, _) =
+            crate::credential::ensure(&store, &held.dir().credential(), issued).unwrap();
+        assert_eq!(first, crate::credential::Credential::Issued);
+        drop(store);
+        drop(held);
+
+        // Make the data directory and credential readable by others, as after
+        // a restore that did not keep permissions.
+        open_to_others(&root);
+        open_to_others(&root.join(local::CREDENTIAL));
+        assert!(!private(&root.join(local::CREDENTIAL)));
+
+        let held = HeldDir::take(root).unwrap();
+        let store = ServerStore::open(
+            &held.dir().server_db(),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        let (second, verifier) =
+            crate::credential::ensure(&store, &held.dir().credential(), None).unwrap();
+        assert_eq!(second, crate::credential::Credential::Replaced);
+        assert!(!verifier.accepts(&original));
+        assert!(!store.is_local_credential(&original).unwrap());
+        assert!(private(&held.dir().credential()));
+    }
+
+    #[test]
+    fn a_new_file_in_an_existing_open_cache_is_private() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("data");
+        let held = HeldDir::take(root.clone()).unwrap();
+        let tmp = root.join("cache").join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        open_to_others(&root.join("cache"));
+        open_to_others(&tmp);
+
+        let cache = held.dir().cache().unwrap();
+        if cfg!(windows) {
+            assert!(private(&cache));
+            assert!(private(&cache.join("tmp")));
+            let cover = cache.join("tmp").join("cover.part");
+            std::fs::write(&cover, b"img").unwrap();
+            assert!(private(&cover));
+        }
     }
 
     #[test]

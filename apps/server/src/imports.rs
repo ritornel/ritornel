@@ -31,7 +31,7 @@ use tracing::{error, info, warn};
 use crate::Error;
 use crate::dispatch::Core;
 use crate::error::io_error;
-use crate::platform::{create_private_dir, create_private_file};
+use crate::platform::{close_dir_to_others, create_private_dir, create_private_file};
 
 /// The kind of the job that dry runs a staged run.
 pub(crate) const DRY_RUN_JOB: &str = "imports.dryRun";
@@ -242,7 +242,9 @@ impl Staging {
             Some(meta) => meta,
             None => {
                 create_private_dir(&self.dir).map_err(Refused::Disk)?;
+                close_dir_to_others(&self.dir).map_err(Refused::Disk)?;
                 create_private_dir(&dir).map_err(Refused::Disk)?;
+                close_dir_to_others(&dir).map_err(Refused::Disk)?;
                 Meta {
                     pieces,
                     begun_at: now,

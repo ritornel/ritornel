@@ -11,7 +11,7 @@
 //! locks, it holds one byte past the file's end, so that the pid in it can
 //! still be read ([`local::WINDOWS_LOCK_BYTE`]).
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -56,10 +56,7 @@ impl DirLock {
         path: &Path,
         mut wait_for_look: impl FnMut(),
     ) -> Result<Self, Error> {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        platform::create_owner_only(&mut options);
-        let mut file = options.open(path).map_err(io_error("open", path))?;
+        let mut file = platform::open_lock_file(path).map_err(io_error("open", path))?;
         let started = Instant::now();
         loop {
             if platform::take_lock(&file).map_err(io_error("lock", path))? {
@@ -205,5 +202,18 @@ mod tests {
             without.to_string(),
             "data directory in use by another server: /srv/ritornel"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_lock_file_is_refused_without_touching_its_target() {
+        let scratch = Scratch::new();
+        let target = scratch.path().join("outside");
+        std::fs::write(&target, "untouched").unwrap();
+        let lock = scratch.path().join("server.lock");
+        std::os::unix::fs::symlink(&target, &lock).unwrap();
+        let refused = DirLock::acquire(scratch.path(), &lock);
+        assert!(matches!(refused, Err(Error::Io { .. })), "{refused:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
     }
 }

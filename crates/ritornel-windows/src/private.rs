@@ -18,7 +18,7 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::marker::PhantomData;
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
@@ -48,9 +48,10 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
-    FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetVolumeInformationByHandleW, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+    WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -64,11 +65,12 @@ const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
 const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 11;
 
 /// The revision of a security descriptor made here, the access that asks
-/// for all that would be granted, and a group that counts: `winnt.h`'s
-/// values.
+/// for all that would be granted, a group that counts, and the volume flag
+/// saying the file system keeps access lists: `winnt.h`'s values.
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 const SE_GROUP_ENABLED: u32 = 4;
+const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
 
 /// What anyone may be let do without being let in: see that the file is
 /// there, read its attributes and its access list, and wait on it.
@@ -285,6 +287,104 @@ pub fn restrict(path: &Path) -> io::Result<()> {
     set_list(&file, list.acl())
 }
 
+/// Whether the volume holding `file` keeps access lists.
+fn supports_acls(file: &File) -> io::Result<bool> {
+    let mut flags = 0u32;
+    // SAFETY: the handle is valid, and every optional pointer is null
+    // except `flags`, which is written by the call.
+    let got = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle() as HANDLE,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if got == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(flags & FILE_PERSISTENT_ACLS != 0)
+}
+
+/// Fails with [`not_kept`] before anything is created if the parent folder
+/// of `path` sits on a volume that keeps no access lists.
+fn check_parent_supports_acls(path: &Path) -> io::Result<()> {
+    let abs = std::path::absolute(path)?;
+    let Some(parent) = abs.parent() else {
+        return Ok(());
+    };
+    let folder = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(parent)?;
+    if !supports_acls(&folder)? {
+        return Err(not_kept());
+    }
+    Ok(())
+}
+
+/// Checks without changing anything that `path` is a folder on a volume
+/// that keeps access lists, owned by a trusted owner, and whose access list
+/// no untrusted user may change.
+pub fn check_folder_usable(path: &Path) -> io::Result<()> {
+    let folder = open(path, false)?;
+    if !folder.metadata()?.is_dir() {
+        return Err(io::Error::from(io::ErrorKind::NotADirectory));
+    }
+    if !supports_acls(&folder)? {
+        return Err(not_kept());
+    }
+    let user = User::current()?;
+    let descriptor = Descriptor::of(
+        &folder,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+    )?;
+    let Some(owner) = descriptor.owner()? else {
+        return Err(owned_by_another());
+    };
+    if !trusted_owner(owner, &user) {
+        return Err(owned_by_another());
+    }
+    let Some(acl) = descriptor.dacl()? else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "other users may change who can open it, so it cannot be closed to them",
+        ));
+    };
+    if lets_others(acl, &user, CHANGE, false)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "other users may change who can open it, so it cannot be closed to them",
+        ));
+    }
+    Ok(())
+}
+
+/// Opens or creates the lock file at `path` without following a reparse
+/// point, refusing links and non-regular files before anything is locked
+/// or written.
+pub fn open_lock_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the lock file must be a regular file, not a link",
+        ));
+    }
+    Ok(file)
+}
+
 /// Makes the folder at `path` one only this user can open, with what is
 /// made in it from now on, unless it is so already: owned by a trusted
 /// owner, with a list that inherits nothing, lets nobody else in, and
@@ -296,9 +396,20 @@ pub fn restrict(path: &Path) -> io::Result<()> {
 /// list. It fails on a folder another user owns, or one whose list others
 /// may change, since a handle they opened for that outlasts the new list.
 pub fn close_folder(path: &Path) -> io::Result<()> {
+    close_folder_preserving(path, &[])
+}
+
+/// Like [`close_folder`], and also ensures that any existing file in
+/// `keep_open` that others could read beforehand (even through a link into
+/// a subfolder) stays visibly open after the folder's list changes, failing
+/// closed if that evidence would be lost.
+pub fn close_folder_preserving(path: &Path, keep_open: &[&Path]) -> io::Result<()> {
     let folder = open(path, true)?;
     if !folder.metadata()?.is_dir() {
         return Err(io::Error::from(io::ErrorKind::NotADirectory));
+    }
+    if !supports_acls(&folder)? {
+        return Err(not_kept());
     }
     let user = User::current()?;
     let descriptor = Descriptor::of(
@@ -329,6 +440,19 @@ pub fn close_folder(path: &Path) -> io::Result<()> {
     {
         return Ok(());
     }
+    let mut was_open = Vec::new();
+    for sensitive in keep_open {
+        match open(sensitive, false) {
+            Ok(file) => {
+                if !is_private(&file)? {
+                    was_open.push(*sensitive);
+                    let _ = freeze(sensitive);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         if entry.file_type()?.is_file() {
@@ -348,11 +472,17 @@ pub fn close_folder(path: &Path) -> io::Result<()> {
         .map(|acl| passes_on(acl, &user))
         .transpose()?
         .unwrap_or(false);
-    if judge(&closed, true, &user)? && closed.protected()? && passes {
-        Ok(())
-    } else {
-        Err(io::Error::other("it is still open to others once closed"))
+    if !(judge(&closed, true, &user)? && closed.protected()? && passes) {
+        return Err(io::Error::other("it is still open to others once closed"));
     }
+    for sensitive in was_open {
+        if path_is_private(sensitive)? {
+            return Err(io::Error::other(
+                "closing the folder hid that a sensitive file was open to others",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Stops the file at `path` inheriting its list, keeping the entries it
@@ -390,6 +520,7 @@ fn freeze(path: &Path) -> io::Result<()> {
 /// included, and where the file system keeps no access list, removing what
 /// it made.
 pub fn create_restricted(path: &Path) -> io::Result<File> {
+    check_parent_supports_acls(path)?;
     let wide = crate::wide_absolute(path)?;
     let file = owner_only(false, |attributes| {
         // SAFETY: `wide` ends in a NUL, and `attributes` is valid for the
@@ -432,6 +563,14 @@ pub fn create_restricted(path: &Path) -> io::Result<File> {
 /// something is there, if its parent is not, and where the file system
 /// keeps no access list, removing what it made.
 pub fn create_restricted_dir(path: &Path) -> io::Result<()> {
+    create_pinned_restricted_dir(path).map(|_| ())
+}
+
+/// Like [`create_restricted_dir`], and returns an open handle to the new
+/// folder without `FILE_SHARE_DELETE` so another user cannot delete or
+/// swap the folder at `path` while the handle is held.
+pub fn create_pinned_restricted_dir(path: &Path) -> io::Result<File> {
+    check_parent_supports_acls(path)?;
     let wide = crate::wide_absolute(path)?;
     owner_only(true, |attributes| {
         // SAFETY: `wide` ends in a NUL, and `attributes` is valid for the
@@ -442,21 +581,40 @@ pub fn create_restricted_dir(path: &Path) -> io::Result<()> {
         Ok(())
     })?;
     let checked = OpenOptions::new()
-        .access_mode(READ_CONTROL)
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        // Without FILE_SHARE_DELETE, the folder cannot be removed or renamed
+        // while this handle lives, even if its parent grants delete-child.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .and_then(|folder| {
+            let meta = folder.metadata()?;
+            if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Ok((folder, false));
+            }
+            let user = User::current()?;
             let descriptor = Descriptor::of(
                 &folder,
                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             )?;
-            judge(&descriptor, true, &User::current()?)
+            let passes = descriptor
+                .dacl()?
+                .map(|acl| passes_on(acl, &user))
+                .transpose()?
+                .unwrap_or(false);
+            let ok = judge(&descriptor, true, &user)? && descriptor.protected()? && passes;
+            Ok((folder, ok))
         });
     match checked {
-        Ok(true) => Ok(()),
-        checked => {
+        Ok((folder, true)) => Ok(folder),
+        Ok((folder, false)) => {
+            drop(folder);
             let _ = std::fs::remove_dir(path);
-            Err(checked.err().unwrap_or_else(not_kept))
+            Err(not_kept())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir(path);
+            Err(error)
         }
     }
 }
@@ -677,13 +835,15 @@ pub fn path_is_private(path: &Path) -> io::Result<bool> {
     is_private(&open(path, false)?)
 }
 
-/// Whether Windows itself would let another user do more with what is at
-/// `path` than see that it is there: a user invented for the question, in
-/// the groups every signed-in user is in. It asks the system's own access
-/// check of the descriptor the file or folder has, rather than reading the
-/// list as [`is_private`] does, so tests can hold the two to each other. It
-/// weighs access to the file or folder itself, not what a folder passes on
-/// to what is made in it.
+/// Whether Windows AuthZ grants a synthetic signed-in user (an invented
+/// SID in `Everyone`, `Authenticated Users`, `Users`, and `Interactive`)
+/// more than [`HARMLESS`] access to the security descriptor at `path`.
+///
+/// This cross-checks [`is_private`] against Windows' own access evaluator
+/// for fixtures granting those groups or owned by that synthetic SID. It
+/// evaluates one synthetic identity on the object itself, so it does not
+/// detect grants to an unrelated named user SID, explicit deny rules that
+/// only block this identity, or inherit-only entries on a folder.
 pub fn another_user_may_open(path: &Path) -> io::Result<bool> {
     let descriptor = Descriptor::of(
         &open(path, false)?,
@@ -818,11 +978,11 @@ fn granted_to_another(descriptor: &Descriptor) -> io::Result<u32> {
         ObjectTypeListLength: 0,
         OptionalArguments: std::ptr::null_mut(),
     };
-    let (mut granted, mut error) = (0u32, 0u32);
+    let (mut granted, mut sacl, mut error) = (0u32, 0u32, 0u32);
     let mut reply = AUTHZ_ACCESS_REPLY {
         ResultListLength: 1,
         GrantedAccessMask: &mut granted,
-        SaclEvaluationResults: std::ptr::null_mut(),
+        SaclEvaluationResults: &mut sacl,
         Error: &mut error,
     };
     // SAFETY: the context and the descriptor are valid, and the reply has

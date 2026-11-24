@@ -46,16 +46,16 @@ impl Core {
                 warn!(%error, "an export failed");
                 RpcError::new(ErrorCode::Unavailable, error).with_detail("reason", "export_failed")
             };
-            let (name, partial) =
-                reserve_named(folder, &format!("ritornel-record-{}", stamp(at_ms)))
-                    .map_err(|error| unwritten(error.to_string()))?;
+            let staged = reserve_named(folder, &format!("ritornel-record-{}", stamp(at_ms)))
+                .map_err(|error| unwritten(error.to_string()))?;
             // A listening history is its owner's alone, as a backup is, and
             // stays so when its files are copied out of the folder.
             let exported = library
-                .export_record(&partial, at_ms)
+                .export_record(&staged.partial, at_ms)
                 .map_err(|error| format!("cannot export the record: {error}"))
                 .and_then(|exported| {
-                    let files = std::fs::read_dir(&partial).map_err(|error| error.to_string())?;
+                    let files =
+                        std::fs::read_dir(&staged.partial).map_err(|error| error.to_string())?;
                     for file in files {
                         let path = file.map_err(|error| error.to_string())?.path();
                         close_to_others(&path)
@@ -66,12 +66,11 @@ impl Core {
             let exported = match exported {
                 Ok(exported) => exported,
                 Err(error) => {
-                    let _ = std::fs::remove_dir_all(&partial);
+                    staged.discard();
                     return Err(unwritten(error));
                 }
             };
-            let path =
-                publish(&partial, folder, &name).map_err(|error| unwritten(error.to_string()))?;
+            let path = publish(staged, folder).map_err(|error| unwritten(error.to_string()))?;
             info!(path = %path.display(), observations = exported.observations, "exported the record");
             Ok(HistoryExported {
                 receipt: Receipt {

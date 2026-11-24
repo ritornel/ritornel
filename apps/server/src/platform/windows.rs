@@ -86,6 +86,13 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), Error> {
     }
 }
 
+/// Checks without changing anything that `path` is a folder on an
+/// ACL-capable volume, owned by a trusted owner, and whose access list
+/// no untrusted user may change.
+pub(crate) fn check_dir_usable(path: &Path) -> Result<(), Error> {
+    restricted::check_folder_usable(path).map_err(io_error("check", path))
+}
+
 /// Closes the folder at `path`, which is there, to everyone but the OS
 /// user, with what is made in it from now on, unless it is closed already.
 /// On Windows that is all that keeps a new file private: SQLite's logs
@@ -98,11 +105,39 @@ pub(crate) fn close_dir_to_others(path: &Path) -> Result<(), Error> {
     restricted::close_folder(path).map_err(io_error("close", path))
 }
 
+/// Closes the data directory at `path`, guaranteeing that any file in
+/// `keep_open` that others could read before closing stays visibly open
+/// after (even if reached through a link into a subfolder).
+pub(crate) fn close_data_dir_to_others(path: &Path, keep_open: &[&Path]) -> Result<(), Error> {
+    restricted::close_folder_preserving(path, keep_open).map_err(io_error("close", path))
+}
+
+/// Holds a staged private directory open without `FILE_SHARE_DELETE` so
+/// another user cannot delete or replace it while files are written inside.
+#[derive(Debug)]
+pub(crate) struct PrivateDir {
+    _handle: File,
+}
+
+impl PrivateDir {
+    /// Releases the directory handle before renaming or removing the folder.
+    pub(crate) fn release(self) {
+        drop(self._handle);
+    }
+}
+
 /// Creates the one folder at `path`, with an access list of the OS user
 /// alone from the moment it exists, and fails if it is there already: two
-/// writers never share it. Its parent must be there.
-pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
-    restricted::create_restricted_dir(path)
+/// writers never share it. Its parent must be there. The returned guard
+/// pins the folder against removal or rename until dropped.
+pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<PrivateDir> {
+    restricted::create_pinned_restricted_dir(path).map(|_handle| PrivateDir { _handle })
+}
+
+/// Opens or creates the lock file at `path` without following a link or
+/// reparse point.
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    restricted::open_lock_file(path)
 }
 
 /// Nothing: a folder cannot be flushed on every file system a rename works

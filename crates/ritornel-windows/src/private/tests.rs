@@ -1,9 +1,11 @@
 //! The access lists these tests make are checked by [`is_private`] and by
-//! the system's own access check for a second user
-//! (`another_user_may_open`), one invented for the question, since a test
-//! cannot make a real one without an administrator. That second check sees
-//! what the user may do with the file or folder itself, not with what a
-//! folder will pass on, which the tests check on a file made in it.
+//! Windows AuthZ for one synthetic signed-in user (`another_user_may_open`,
+//! belonging to `Everyone`, `Authenticated Users`, `Users`, and
+//! `Interactive`), since a test cannot create a real second local account
+//! without an administrator. That cross-checks descriptors granting those
+//! groups (or owned by that synthetic SID) on the object itself, not grants
+//! to unrelated user SIDs or inherit-only entries on a folder (which the
+//! tests check on a file made in it).
 
 use std::io::Write;
 use std::process::Command;
@@ -267,5 +269,76 @@ fn a_folder_that_passes_nothing_on_is_closed_again() {
         Descriptor::of(&open(&inner, false).unwrap(), DACL_SECURITY_INFORMATION).unwrap();
     let acl = descriptor.dacl().unwrap().unwrap();
     assert!(passes_on(acl, &User::current().unwrap()).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_folder_usable_refuses_a_folder_others_may_change_without_modifying_it() {
+    let dir = scratch("usable");
+    check_folder_usable(&dir).unwrap();
+    let done = Command::new("icacls")
+        .arg(&dir)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)(F)"])
+        .output()
+        .unwrap();
+    assert!(done.status.success(), "{done:?}");
+    let refused = check_folder_usable(&dir).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    assert!(!private(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pinned_restricted_dir_cannot_be_removed_or_renamed_until_dropped() {
+    let dir = scratch("pinned");
+    open_to_everyone(&dir);
+    let staging = dir.join(".staging");
+    let finished = dir.join("finished");
+    let pin = create_pinned_restricted_dir(&staging).unwrap();
+    assert!(private(&staging));
+    // Files can be written inside while the folder is pinned, and inherit its ACL.
+    std::fs::write(staging.join("db"), "x").unwrap();
+    assert!(private(&staging.join("db")));
+    // Removing or renaming the pinned folder itself is refused while the pin lives.
+    assert!(std::fs::rename(&staging, &finished).is_err());
+    drop(pin);
+    std::fs::rename(&staging, &finished).unwrap();
+    assert!(private(&finished));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn close_folder_preserving_keeps_a_nested_open_file_open() {
+    let dir = scratch("preserve");
+    open_to_everyone(&dir);
+    let inner = dir.join("data");
+    let sub = inner.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let nested = sub.join("secret");
+    std::fs::write(&nested, "x").unwrap();
+    assert!(!private(&nested));
+    close_folder_preserving(&inner, &[nested.as_path()]).unwrap();
+    assert!(private(&inner));
+    // The preserved file kept its open ACL even though its parent subfolder took the new one.
+    assert!(!private(&nested));
+    assert!(private(&sub));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn open_lock_file_refuses_a_directory_junction() {
+    let dir = scratch("lock-junction");
+    let target = dir.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.join("server.lock");
+    let done = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(done.status.success(), "{done:?}");
+    assert!(open_lock_file(&link).is_err());
+    let _ = std::fs::remove_dir(&link);
     let _ = std::fs::remove_dir_all(&dir);
 }
