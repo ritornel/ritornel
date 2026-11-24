@@ -72,7 +72,7 @@ A sleeping hub is one its satellites cannot reach, but a satellite or a player s
 
 The data directory must sit on a local filesystem because SQLite WAL shared memory and OS file locks are unreliable on network shares. Master music folders may live on local disks or network mounts; a missing or empty root is treated as offline rather than empty so scans skip it without dropping locations.
 
-`DataDir::prepare` creates private directories (`0700` on Unix, owner-only ACL on Windows) and tightens permissions on `server.db` and `library.db` at startup (protecting restored databases that may arrive world-readable).
+`DataDir::prepare` creates private directories (`0700` on Unix, owner-only ACL on Windows, where an existing data directory open to others is also closed, since files created in it inherit its list). Once the lock is held, `HeldDir::take` tightens permissions on `server.db` and `library.db` (protecting restored databases that may arrive world-readable), so a second server refused the lock touches no database file.
 
 Cache files are written in `cache/tmp/`, synced, and renamed into `cache/covers/` before being indexed. Cover art bytes remain in the audio/folder files and are extracted into `cache/covers/` on demand; nothing in `cache/`, `logs/`, `backups/`, `imports/`, `server.json`, `preparing.json`, or `server.lock` needs to be backed up.
 

@@ -2096,6 +2096,7 @@ name = "ritornel-lastfm"
 version = "0.1.0"
 dependencies = [
  "ritornel-source",
+ "ritornel-windows",
  "scrobl",
  "serde_json",
  "sha2",

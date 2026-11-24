@@ -313,7 +313,8 @@ const TERM_REASON: &str = if cfg!(windows) {
 
 /// Whether only the owner can open a file or directory: the modes `0600`
 /// and `0700` on Unix, and an access list that names the owner alone on
-/// Windows.
+/// Windows, which the system's own access check for another user must
+/// agree with.
 fn private(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -322,7 +323,10 @@ fn private(path: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        ritornel_windows::private::path_is_private(path).unwrap()
+        use ritornel_windows::private::{another_user_may_open, path_is_private};
+        let private = path_is_private(path).unwrap();
+        assert_eq!(another_user_may_open(path).unwrap(), !private, "{path:?}");
+        private
     }
 }
 

@@ -137,12 +137,13 @@ pub(crate) fn path_is_private(path: &Path) -> bool {
     mode(path) & 0o077 == 0
 }
 
-/// Opens a file to other users, as a copy that did not keep its mode might
-/// be.
+/// Opens a file or folder to other users, as a copy that did not keep its
+/// mode might be.
 #[cfg(test)]
 pub(crate) fn open_to_others(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mode = if path.is_dir() { 0o755 } else { 0o644 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
 /// The permission bits of a file or directory.
@@ -155,16 +156,16 @@ fn mode(path: &Path) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_dir::DataDir;
+    use crate::HeldDir;
     use crate::testing::Scratch;
 
     #[test]
     fn a_new_data_directory_has_the_modes_of_its_owner_alone() {
         let scratch = Scratch::new();
         let root = scratch.path().join("deep/inside/data");
-        let dir = DataDir::prepare(root.clone()).unwrap();
+        let held = HeldDir::take(root.clone()).unwrap();
         assert_eq!(mode(&root), 0o700);
-        assert_eq!(mode(&dir.logs()), 0o700);
-        assert_eq!(mode(&dir.server_db()), 0o600);
+        assert_eq!(mode(&held.dir().logs()), 0o700);
+        assert_eq!(mode(&held.dir().server_db()), 0o600);
     }
 }

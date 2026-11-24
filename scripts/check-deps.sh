@@ -58,15 +58,16 @@ only ritornel-domain ritornel-contract
 forbid ritornel-domain rusqlite
 
 # A plugin builds on the traits and on nothing of the core's, and the core
-# builds on no plugin.
+# builds on no plugin. ritornel-windows is not the core's, and stands beside
+# it for a plugin as for the server.
 only ritornel-source
-only ritornel-lastfm ritornel-source
+only ritornel-lastfm ritornel-source ritornel-windows
 forbid ritornel-lastfm rusqlite
 forbid ritornel-engine ritornel-lastfm scrobl
 
 # What Windows asks for that takes unsafe code stands beside the core: it
-# builds on no crate of the workspace, and the engine, the server and the
-# tests build on it.
+# builds on no crate of the workspace, and the engine, the server, the
+# Last.fm plugin and the tests build on it.
 only ritornel-windows
 
 # A server built without its default features, as the hub is, has no

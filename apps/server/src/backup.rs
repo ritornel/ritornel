@@ -545,6 +545,7 @@ mod tests {
     use ritornel_engine::{OsEntropy, ServerStore, SystemClock};
 
     use super::*;
+    use crate::platform::{open_to_others, path_is_private};
     use crate::testing::Scratch;
     use ritornel_contract::Id;
 
@@ -805,18 +806,25 @@ mod tests {
     }
 
     #[test]
+    fn a_backup_is_staged_closed_to_others_in_a_place_open_to_them() {
+        let scratch = Scratch::new();
+        let place = elsewhere(&scratch);
+        open_to_others(&place);
+        let (_, partial) = reserve_named(&place, "ritornel-backup").unwrap();
+        assert!(path_is_private(&partial));
+    }
+
+    #[test]
     fn every_file_of_a_backup_is_its_owners_alone() {
         let scratch = Scratch::new();
         let dir = data(&scratch);
         let place = elsewhere(&scratch);
+        open_to_others(&place);
         std::fs::write(dir.config_toml(), "log_level = \"warn\"\n").unwrap();
         let taken = backup(&dir, &place, About::default()).unwrap();
-        assert!(crate::platform::path_is_private(&taken.path));
+        assert!(path_is_private(&taken.path));
         for name in ["server.db", "config.toml", "backup.json", "README.txt"] {
-            assert!(
-                crate::platform::path_is_private(&taken.path.join(name)),
-                "{name}"
-            );
+            assert!(path_is_private(&taken.path.join(name)), "{name}");
         }
     }
 

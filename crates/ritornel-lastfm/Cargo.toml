@@ -26,6 +26,11 @@ serde_json = "1.0.154"
 # that its callers, a job's thread and the dispatcher, stay synchronous.
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "time"] }
 
+# Whether the credentials file is private, on Windows, where that is an
+# access list rather than a mode.
+[target.'cfg(windows)'.dependencies]
+ritornel-windows.workspace = true
+
 [dev-dependencies]
 # A folder of its own for each test, named at random and created only if
 # it is new, so no test finds another's.

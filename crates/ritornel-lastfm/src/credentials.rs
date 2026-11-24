@@ -65,11 +65,12 @@ impl ApiCredentials {
         if !metadata.is_file() {
             return Err(format!("{} must be a regular file", path.display()));
         }
-        if !crate::platform::private(&metadata) {
+        if !crate::platform::private(&file).map_err(unreadable)? {
             return Err(format!(
                 "{} can be read by other users; make it readable by its owner alone \
-                 (chmod 600) and start the server again",
-                path.display()
+                 ({}) and start the server again",
+                path.display(),
+                crate::platform::HOW_TO_CLOSE
             ));
         }
         let mut text = String::new();
@@ -149,6 +150,30 @@ pub(crate) mod tests {
             .unwrap()
             .into_parts();
         assert_eq!(key.expose(), "ENV_SCROBL_API_KEY");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_others_can_read_is_refused_without_saying_what_is_in_it() {
+        let dir = dir();
+        let none = |_: &str| None;
+        let path = dir.join(CREDENTIALS_FILE);
+        std::fs::write(
+            &path,
+            "SCROBL_API_KEY=SENTINEL_KEY\nSCROBL_API_SECRET=SENTINEL_SECRET\n",
+        )
+        .unwrap();
+        crate::platform::open_to_others(&path);
+        let refused = ApiCredentials::find(none, &dir).unwrap_err();
+        assert!(refused.contains(crate::platform::HOW_TO_CLOSE), "{refused}");
+        assert!(!refused.contains("SENTINEL"), "{refused}");
+        // The permissions error must precede any attempt to decode these bytes.
+        std::fs::write(&path, [0xff]).unwrap();
+        let refused = ApiCredentials::find(none, &dir).unwrap_err();
+        assert!(refused.contains(crate::platform::HOW_TO_CLOSE), "{refused}");
+        std::fs::write(&path, "SCROBL_API_KEY=test\nSCROBL_API_SECRET=test").unwrap();
+        crate::platform::close_to_others(&path);
+        assert!(ApiCredentials::find(none, &dir).unwrap().is_some());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -54,22 +54,26 @@ pub(crate) struct DataDir {
 }
 
 impl DataDir {
-    /// Makes sure the directory and what this layer keeps in it exist.
-    ///
-    /// What it creates, only the OS user can read: the directory holds the
-    /// local credential, and `server.db` holds the server's signing key. A
-    /// directory that already exists keeps the permissions it has, so
-    /// `server.db` is closed too, whether this call creates it or finds it,
-    /// and `library.db` if it is there: a database restored from a backup
-    /// may arrive open to everyone.
+    /// Makes sure the directory and its logs folder exist, and that only
+    /// the OS user can open them or what is made in them: the directory
+    /// holds the local credential and the databases. It touches no file in
+    /// them, so a server refused the directory's lock changes nothing there.
     pub(crate) fn prepare(root: PathBuf) -> Result<Self, Error> {
         let dir = Self { root };
         for path in [dir.root.clone(), dir.logs()] {
             create_private_dir(&path)?;
         }
-        close_database(&dir.server_db())?;
-        close_if_there(&dir.library_db())?;
         Ok(dir)
+    }
+
+    /// Makes sure `server.db` exists and that only the OS user can read it,
+    /// whether this creates it or finds it, and closes `library.db` if it is
+    /// there: `server.db` holds the server's signing key, and a database
+    /// restored from a backup may arrive open to everyone. Only the
+    /// directory's holder does this.
+    fn close_databases(&self) -> Result<(), Error> {
+        close_database(&self.server_db())?;
+        close_if_there(&self.library_db())
     }
 
     /// Makes sure there is a file for a new library that only the OS user
@@ -182,8 +186,9 @@ pub struct HeldDir {
 }
 
 impl HeldDir {
-    /// Makes sure the directory exists and takes its lock. It fails with
-    /// [`Error::InUse`] if another server has it.
+    /// Makes sure the directory exists, takes its lock, and then readies
+    /// its databases. It fails with [`Error::InUse`] if another server has
+    /// it, having touched nothing in it.
     pub fn take(root: PathBuf) -> Result<Self, Error> {
         let dir = DataDir::prepare(root)?;
         let lock = DirLock::acquire(dir.root(), &dir.lock_file()).map_err(|error| match error {
@@ -204,6 +209,7 @@ impl HeldDir {
         // that is gone wrote them.
         server_json::remove(&dir.server_json())?;
         server_json::remove(&dir.preparing_json())?;
+        dir.close_databases()?;
         Ok(Self { dir, _lock: lock })
     }
 
@@ -214,6 +220,10 @@ impl HeldDir {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use ritornel_engine::{OsEntropy, ServerStore, SystemClock};
+
     use super::*;
     use crate::platform::{open_to_others, path_is_private as private};
     use crate::testing::{Scratch, env};
@@ -263,11 +273,51 @@ mod tests {
     #[test]
     fn a_new_data_directory_is_closed_to_other_users() {
         let scratch = Scratch::new();
+        // Even inside a folder anyone may open.
+        open_to_others(scratch.path());
         let root = scratch.path().join("deep/inside/data");
-        let dir = DataDir::prepare(root.clone()).unwrap();
+        let held = HeldDir::take(root.clone()).unwrap();
+        assert!(private(&scratch.path().join("deep")));
         assert!(private(&root));
-        assert!(private(&dir.logs()));
-        assert!(private(&dir.server_db()));
+        assert!(private(&held.dir().logs()));
+        assert!(private(&held.dir().server_db()));
+        assert!(private(&held.dir().cache().unwrap()));
+    }
+
+    #[test]
+    fn a_databases_logs_are_private_in_a_data_directory_open_to_others() {
+        let scratch = Scratch::new();
+        // As one a person made, or restored without its permissions.
+        let root = scratch.path().join("data");
+        std::fs::create_dir(&root).unwrap();
+        open_to_others(&root);
+        let held = HeldDir::take(root.clone()).unwrap();
+        // SQLite makes its logs beside the database while it is open.
+        let _store = ServerStore::open(
+            &held.dir().server_db(),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        for name in ["server.db", "server.db-wal", "server.db-shm"] {
+            assert!(private(&root.join(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_server_refused_the_directory_touches_no_database_in_it() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("data");
+        let held = HeldDir::take(root.clone()).unwrap();
+        // The holder has not made its database yet, or has moved it.
+        std::fs::remove_file(held.dir().server_db()).unwrap();
+        std::fs::write(held.dir().library_db(), "").unwrap();
+        open_to_others(&held.dir().library_db());
+
+        let refused = HeldDir::take(root.clone());
+        assert!(matches!(refused, Err(Error::InUse { .. })), "{refused:?}");
+        assert!(!held.dir().server_db().exists());
+        assert!(!private(&held.dir().library_db()));
     }
 
     #[test]
@@ -291,7 +341,7 @@ mod tests {
             assert!(!private(&root.join(name)));
         }
 
-        DataDir::prepare(root.clone()).unwrap();
+        let _held = HeldDir::take(root.clone()).unwrap();
         for name in names {
             assert!(private(&root.join(name)), "{name}");
         }
@@ -300,18 +350,20 @@ mod tests {
     #[test]
     fn a_server_with_no_library_is_not_given_a_library_file() {
         let scratch = Scratch::new();
-        let dir = DataDir::prepare(scratch.path().join("data")).unwrap();
-        assert!(!dir.library_db().exists());
+        let held = HeldDir::take(scratch.path().join("data")).unwrap();
+        assert!(!held.dir().library_db().exists());
     }
 
     #[test]
-    fn preparing_again_leaves_what_is_there() {
+    fn taking_again_leaves_what_is_there() {
         let scratch = Scratch::new();
-        let dir = DataDir::prepare(scratch.path().join("data")).unwrap();
-        std::fs::write(dir.server_db(), b"not really a database").unwrap();
-        DataDir::prepare(dir.root().to_owned()).unwrap();
+        let root = scratch.path().join("data");
+        let held = HeldDir::take(root.clone()).unwrap();
+        std::fs::write(held.dir().server_db(), b"not really a database").unwrap();
+        drop(held);
+        let held = HeldDir::take(root).unwrap();
         assert_eq!(
-            std::fs::read(dir.server_db()).unwrap(),
+            std::fs::read(held.dir().server_db()).unwrap(),
             b"not really a database"
         );
     }

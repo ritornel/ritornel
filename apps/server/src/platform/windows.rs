@@ -6,12 +6,14 @@
 //! standard library cannot ask is in
 //! `ritornel-windows`.
 
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 
 use ritornel_contract::local;
 use ritornel_windows::lock::{Hold, try_lock, unlock};
+use ritornel_windows::private as restricted;
 use tokio::runtime::Runtime;
 
 use crate::Error;
@@ -61,41 +63,57 @@ fn host_name() -> Option<String> {
         .or_else(|| std::env::var("COMPUTERNAME").ok())
 }
 
-/// Creates the folder at `path`, and those above it that are missing, with
-/// an access list of the OS user alone, which what is later made inside it
-/// inherits. A folder that is there already is left as it is.
+/// Creates the folder at `path`, and those above it that are missing, each
+/// with an access list of the OS user alone from the moment it exists,
+/// which what is later made inside it inherits.
+///
+/// A folder that is there already is closed if anyone else may open it or
+/// what is made in it, since that is all that keeps a new file private
+/// here: SQLite's logs beside a database, and a file made with
+/// [`create_owner_only`], take their list from the folder. Windows gives
+/// the new list to what the folder already holds that inherits its list.
+/// A folder another user owns is refused, since its owner may change its
+/// list.
 pub(crate) fn create_private_dir(path: &Path) -> Result<(), Error> {
     if path.is_dir() {
+        return close_dir(path).map_err(io_error("close", path));
+    }
+    let missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|folder| !folder.as_os_str().is_empty() && !folder.exists())
+        .collect();
+    for folder in missing.into_iter().rev() {
+        match restricted::create_restricted_dir(folder) {
+            // Made meanwhile, as by another server starting on it.
+            Err(error) if error.kind() == ErrorKind::AlreadyExists && folder.is_dir() => {}
+            made => made.map_err(io_error("create", folder))?,
+        }
+    }
+    Ok(())
+}
+
+/// Closes the folder at `path` unless it is closed already, and fails if
+/// it cannot be.
+fn close_dir(path: &Path) -> std::io::Result<()> {
+    if restricted::path_is_private(path)? {
         return Ok(());
     }
-    // The highest folder this call makes is closed, and those it makes
-    // inside it inherit that.
-    let mut highest = path;
-    while let Some(parent) = highest
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        if parent.exists() {
-            break;
-        }
-        highest = parent;
+    restricted::restrict(path)?;
+    if restricted::path_is_private(path)? {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "another user owns it, so it cannot be closed to others",
+        ))
     }
-    DirBuilder::new()
-        .recursive(true)
-        .create(path)
-        .map_err(io_error("create", path))?;
-    ritornel_windows::private::restrict(highest).map_err(io_error("close", highest))
 }
 
 /// Creates the one folder at `path`, with an access list of the OS user
-/// alone, and fails if it is there already: two writers never share it.
-/// Its parent must be there.
+/// alone from the moment it exists, and fails if it is there already: two
+/// writers never share it. Its parent must be there.
 pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir(path)?;
-    // A folder open to others is not left behind.
-    ritornel_windows::private::restrict(path).inspect_err(|_| {
-        let _ = std::fs::remove_dir(path);
-    })
+    restricted::create_restricted_dir(path)
 }
 
 /// Nothing: a folder cannot be flushed on every file system a rename works
@@ -114,24 +132,25 @@ pub(crate) fn rename_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// Closes the file at `path` to everyone but the OS user.
 pub(crate) fn close_to_others(path: &Path) -> std::io::Result<()> {
-    ritornel_windows::private::restrict(path)
+    restricted::restrict(path)
 }
 
 /// Makes a file that `options` creates one only the OS user can open: here
-/// the data directory's own access list does that, and the file inherits
-/// it.
+/// the access list of the folder it is made in does that, which
+/// [`create_private_dir`] closes, and the file inherits it.
 pub(crate) fn create_owner_only(_options: &mut OpenOptions) {}
 
 /// Creates a new file at `path` that only the OS user can open, from before
 /// anything is written to it. It fails if something is there.
 pub(crate) fn create_private_file(path: &Path) -> std::io::Result<File> {
-    ritornel_windows::private::create_restricted(path)
+    restricted::create_restricted(path)
 }
 
-/// Whether the file's access list has no entry for anyone but the OS user,
-/// the system and the administrators, who can take any file.
+/// Whether the file is owned by the OS user, and its access list has no
+/// entry for anyone but that user, the system and the administrators, who
+/// can take any file.
 pub(crate) fn is_private(file: &File) -> std::io::Result<bool> {
-    ritornel_windows::private::is_private(file)
+    restricted::is_private(file)
 }
 
 /// What this user may still write on the disk that holds `path`, after any
@@ -221,20 +240,57 @@ pub(crate) fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::
 }
 
 /// Whether only the owner can open a file or directory: an access list that
-/// names the owner alone.
+/// names the owner alone. The system's own access check for another user
+/// must agree.
 #[cfg(test)]
 pub(crate) fn path_is_private(path: &Path) -> bool {
-    ritornel_windows::private::path_is_private(path).unwrap()
+    let private = restricted::path_is_private(path).unwrap();
+    assert_eq!(
+        restricted::another_user_may_open(path).unwrap(),
+        !private,
+        "{}",
+        path.display()
+    );
+    private
 }
 
-/// Opens a file to other users, as a copy that did not keep its access list
-/// might be.
+/// Opens a file or folder to other users, as a copy that did not keep its
+/// access list might be. A folder passes it on to what is made in it.
 #[cfg(test)]
 pub(crate) fn open_to_others(path: &Path) {
+    let grant = if path.is_dir() {
+        "*S-1-1-0:(OI)(CI)(R)"
+    } else {
+        "*S-1-1-0:(R)"
+    };
     let done = std::process::Command::new("icacls")
         .arg(path)
-        .args(["/grant", "*S-1-1-0:(R)"])
+        .args(["/grant", grant])
         .output()
         .unwrap();
     assert!(done.status.success(), "{done:?}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::Scratch;
+
+    #[test]
+    fn a_folder_that_was_open_to_others_is_closed_with_what_it_holds() {
+        let scratch = Scratch::new();
+        let folder = scratch.path().join("data");
+        std::fs::create_dir(&folder).unwrap();
+        open_to_others(&folder);
+        std::fs::write(folder.join("made-before"), "").unwrap();
+        assert!(!path_is_private(&folder));
+        assert!(!path_is_private(&folder.join("made-before")));
+
+        create_private_dir(&folder).unwrap();
+        assert!(path_is_private(&folder));
+        // It took its list from the folder, and takes the new one.
+        assert!(path_is_private(&folder.join("made-before")));
+        std::fs::write(folder.join("made-after"), "").unwrap();
+        assert!(path_is_private(&folder.join("made-after")));
+    }
 }
