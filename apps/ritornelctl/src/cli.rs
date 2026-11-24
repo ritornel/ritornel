@@ -17,9 +17,9 @@
 //! ritornelctl corrections lookup <folder> [--root <name>] | --album <release> [--again] [--data-dir <dir>] [--json]
 //! ritornelctl corrections list [--data-dir <dir>] [--json]
 //! ritornelctl corrections show <proposal> [--data-dir <dir>] [--json]
-//! ritornelctl corrections preview <proposal>... [--candidate <release group>] [--data-dir <dir>] [--json]
+//! ritornelctl corrections preview <proposal>... [--candidate <release group>] [--release <release>] [--data-dir <dir>] [--json]
 //! ritornelctl corrections preview --undo <answer>... [--data-dir <dir>] [--json]
-//! ritornelctl corrections confirm <proposal>... [--candidate <release group>] [--fingerprint <f>] [--data-dir <dir>] [--json]
+//! ritornelctl corrections confirm <proposal>... [--candidate <release group>] [--release <release>] [--fingerprint <f>] [--data-dir <dir>] [--json]
 //! ritornelctl corrections undo <answer>... [--data-dir <dir>] [--json]
 //! ritornelctl corrections answers [--before <answer>] [--limit <n>] [--data-dir <dir>] [--json]
 //! ritornelctl corrections answer <answer> [--data-dir <dir>] [--json]
@@ -96,11 +96,11 @@ Usage:
   ritornelctl corrections list [--data-dir <dir>] [--json]
   ritornelctl corrections show <proposal> [--data-dir <dir>] [--json]
   ritornelctl corrections preview <proposal>... [--candidate <release group>]
-                                  [--data-dir <dir>] [--json]
+                                  [--release <release>] [--data-dir <dir>] [--json]
   ritornelctl corrections preview --undo <answer>... [--data-dir <dir>] [--json]
   ritornelctl corrections confirm <proposal>... [--candidate <release group>]
-                                  [--fingerprint <f>] [--data-dir <dir>]
-                                  [--json]
+                                  [--release <release>] [--fingerprint <f>]
+                                  [--data-dir <dir>] [--json]
   ritornelctl corrections undo <answer>... [--data-dir <dir>] [--json]
   ritornelctl corrections answers [--before <answer>] [--limit <n>]
                                   [--data-dir <dir>] [--json]
@@ -223,10 +223,14 @@ Commands:
                    Say yes to proposals together, each with its likeliest
                    candidate or the one --candidate names: the album's ID,
                    kind and first year go on the files, and a bonus disc
-                   joins its album. Each proposal is read as it is when
-                   this runs, or, for one, as --fingerprint says `show`
-                   printed it, and the answer is refused if it changed
-                   since. Every answer can be undone
+                   joins its album. A yes to an edition, with its
+                   likeliest release or the one --release names, puts the
+                   discs on that release, each file at its disc and track;
+                   it is said with or after the album's yeses. Each
+                   proposal is read as it is when this runs, or, for one,
+                   as --fingerprint says `show` printed it, and the answer
+                   is refused if it changed since. Every answer can be
+                   undone
   corrections undo <answer>...
                    Undo answers, each alone or together: the files go back
                    to what they were, on the albums they were on. An
@@ -928,6 +932,9 @@ pub(crate) struct PreviewArgs {
     /// The candidate, by its release group ID, for one proposal.
     #[arg(long)]
     pub(crate) candidate: Option<String>,
+    /// For one edition: the candidate release, by its ID.
+    #[arg(long)]
+    pub(crate) release: Option<String>,
     /// Preview undoing these answers instead.
     #[arg(long)]
     pub(crate) undo: bool,
@@ -944,6 +951,9 @@ pub(crate) struct ConfirmArgs {
     /// The candidate, by its release group ID, for one proposal.
     #[arg(long)]
     pub(crate) candidate: Option<String>,
+    /// For one edition: the candidate release, by its ID.
+    #[arg(long)]
+    pub(crate) release: Option<String>,
     /// The fingerprint `corrections show` printed, for one proposal: the
     /// answer is refused if the proposal changed since.
     #[arg(long)]
@@ -1389,6 +1399,7 @@ mod tests {
             Command::Corrections(CorrectionsCommand::Confirm(ConfirmArgs {
                 proposals: vec!["proposal".to_owned()],
                 candidate: Some("group".to_owned()),
+                release: None,
                 fingerprint: Some("shown".to_owned()),
                 server: ServerArgs::default(),
             }))
@@ -1430,6 +1441,7 @@ mod tests {
             Command::Corrections(CorrectionsCommand::Preview(PreviewArgs {
                 proposals: vec!["one".to_owned()],
                 candidate: None,
+                release: None,
                 undo: true,
                 server: ServerArgs::default(),
             }))

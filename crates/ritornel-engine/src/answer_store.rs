@@ -531,6 +531,34 @@ fn put_together(
     joined.into_iter().collect()
 }
 
+/// Those of `releases` whose files, of `files`, share a release key with
+/// another's files (`keys`, by file).
+fn alike(
+    releases: &[i64],
+    files: impl Iterator<Item = i64>,
+    was: &HashMap<i64, Was>,
+    keys: &HashMap<i64, String>,
+) -> Vec<i64> {
+    if releases.len() < 2 {
+        return releases.to_vec();
+    }
+    let mut on: BTreeMap<&str, BTreeSet<i64>> = BTreeMap::new();
+    for file in files {
+        if let (Some(Some(release)), Some(key)) =
+            (was.get(&file).map(|was| was.release), keys.get(&file))
+            && releases.contains(&release)
+        {
+            on.entry(key.as_str()).or_default().insert(release);
+        }
+    }
+    let alike: BTreeSet<i64> = on
+        .into_values()
+        .filter(|rows| rows.len() > 1)
+        .flatten()
+        .collect();
+    alike.into_iter().collect()
+}
+
 /// The files each answer of a write moved besides its own: a file no
 /// answer of it is about moved with those whose own files are in the album
 /// it went to or came from, or, where none is, with every answer of the
@@ -935,10 +963,10 @@ struct Answering<'a> {
 impl Chosen {
     fn answering(&self) -> Answering<'_> {
         Answering {
-            kind: "album",
+            kind: &self.kind,
             proposal: self.proposal,
             fingerprint: &self.fingerprint,
-            candidate: Some(&self.candidate),
+            candidate: Some(self.release.as_deref().unwrap_or(&self.candidate)),
         }
     }
 }
@@ -989,8 +1017,13 @@ fn insert_answer(
 /// What a confirm of one proposal reads first.
 struct Chosen {
     proposal: [u8; 16],
+    /// `album` or `edition`.
+    kind: String,
     fingerprint: String,
+    /// The album said yes to: for an edition, the album of the release.
     candidate: String,
+    /// For an edition: the release said yes to.
+    release: Option<String>,
     items: Vec<i64>,
     /// The files of the first disc a yes joins these onto, whose title and
     /// credit it takes.
@@ -1002,14 +1035,19 @@ struct Chosen {
 /// Reads one confirmation's proposal and candidate, checking it was shown
 /// as it is now.
 fn chosen(connection: &Connection, confirmation: &Confirmation) -> Result<Chosen, Error> {
-    let found: Option<(i64, String)> = connection
+    let found: Option<(i64, String, String)> = connection
         .query_row(
-            "SELECT id, fingerprint FROM proposal WHERE public_id = ?1",
+            "SELECT id, fingerprint, kind FROM proposal WHERE public_id = ?1",
             [confirmation.proposal_id.as_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let (row, fingerprint) = found.ok_or(Error::NotFound("no such proposal"))?;
+    let (row, fingerprint, kind) = found.ok_or(Error::NotFound("no such proposal"))?;
+    if (kind == "edition") != confirmation.release.is_some() {
+        return Err(Error::Invalid(
+            "a yes to an edition names its release, and a yes to an album none",
+        ));
+    }
     if fingerprint != confirmation.fingerprint {
         return Err(Error::PlanStale);
     }
@@ -1027,8 +1065,9 @@ fn chosen(connection: &Connection, confirmation: &Confirmation) -> Result<Chosen
     let candidate: Option<Row> = connection
         .query_row(
             "SELECT values_json, title, artist, primary_type, first_date, releases, onto_json
-             FROM proposal_candidate WHERE proposal_id = ?1 AND release_group_mbid = ?2",
-            (row, &confirmation.release_group),
+             FROM proposal_candidate
+             WHERE proposal_id = ?1 AND release_group_mbid = ?2 AND release_mbid IS ?3",
+            (row, &confirmation.release_group, &confirmation.release),
             |row| {
                 Ok((
                     row.get(0)?,
@@ -1091,21 +1130,23 @@ fn chosen(connection: &Connection, confirmation: &Confirmation) -> Result<Chosen
     // The candidates it was chosen among, in the order shown.
     let shown: Vec<serde_json::Value> = connection
         .prepare_cached(
-            "SELECT release_group_mbid, title FROM proposal_candidate
+            "SELECT release_group_mbid, title, release_mbid FROM proposal_candidate
              WHERE proposal_id = ?1 ORDER BY ordinal",
         )?
         .query_map([row], |row| {
             Ok(serde_json::json!({
                 "releaseGroup": row.get::<_, String>(0)?,
                 "title": row.get::<_, Option<String>>(1)?,
+                "release": row.get::<_, Option<String>>(2)?,
             }))
         })?
         .collect::<Result<_, _>>()?;
     let values: Vec<StoredValue> = serde_json::from_str(&values_json)?;
     let evidence = serde_json::json!({
-        "kind": "album",
+        "kind": kind,
         "candidate": {
             "releaseGroup": confirmation.release_group,
+            "release": confirmation.release,
             "title": title,
             "artist": artist,
             "primaryType": primary_type,
@@ -1119,8 +1160,10 @@ fn chosen(connection: &Connection, confirmation: &Confirmation) -> Result<Chosen
     });
     Ok(Chosen {
         proposal: *confirmation.proposal_id.as_bytes(),
+        kind,
         fingerprint,
         candidate: confirmation.release_group.clone(),
+        release: confirmation.release.clone(),
         items,
         onto: serde_json::from_str(&onto)?,
         values,
@@ -1139,21 +1182,20 @@ const ANSWER_SELECT: &str =
         (SELECT u.public_id FROM answer u WHERE u.id = a.undoes_answer_id),
         (SELECT u.public_id FROM answer u WHERE u.undoes_answer_id = a.id),
         (SELECT count(DISTINCT source_item_id) FROM answer_value v WHERE v.answer_id = a.id),
-        a.answered_at_ms
+        a.answered_at_ms, a.kind
  FROM answer a";
 
 /// One answer of the ledger, and its evidence as kept, from
 /// [`ANSWER_SELECT`].
 fn answer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Answer, String)> {
-    let evidence: String = row.get(5)?;
-    let title = serde_json::from_str::<serde_json::Value>(&evidence)
-        .ok()
-        .and_then(|evidence| {
-            evidence
-                .pointer("/candidate/title")?
-                .as_str()
-                .map(str::to_owned)
-        });
+    let kept: String = row.get(5)?;
+    let evidence = serde_json::from_str::<serde_json::Value>(&kept).unwrap_or_default();
+    let said = |path: &str| {
+        evidence
+            .pointer(path)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
     let verb: String = row.get(2)?;
     Ok((
         Answer {
@@ -1164,14 +1206,16 @@ fn answer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Answer, String)> {
                 AnswerVerb::Confirm
             },
             proposal_id: row.get::<_, Option<[u8; 16]>>(3)?.map(Id::from_bytes),
-            release_group: row.get(4)?,
-            title,
+            release_group: said("/candidate/releaseGroup").or(row.get(4)?),
+            kind: row.get(10)?,
+            release: said("/candidate/release"),
+            title: said("/candidate/title"),
             undoes: row.get::<_, Option<[u8; 16]>>(6)?.map(Id::from_bytes),
             undone_by: row.get::<_, Option<[u8; 16]>>(7)?.map(Id::from_bytes),
             files: row.get(8)?,
             answered_at_ms: unsigned(row.get(9)?),
         },
-        evidence,
+        kept,
     ))
 }
 
@@ -1193,6 +1237,7 @@ struct Kept {
 #[serde(rename_all = "camelCase", default)]
 struct KeptCandidate {
     release_group: String,
+    release: Option<String>,
     title: Option<String>,
     artist: Option<String>,
     primary_type: Option<String>,
@@ -1389,6 +1434,13 @@ impl LibraryStore {
                 }
                 all.push(chosen(connection, confirmation)?);
             }
+            // A batch's albums are said before its editions, which rest on
+            // them, so that the ledger holds them in the order they could be
+            // said one after another; each answer is still given back where
+            // it was asked.
+            let mut asked: Vec<(usize, Chosen)> = all.into_iter().enumerate().collect();
+            asked.sort_by_key(|(_, one)| one.kind == "edition");
+            let (positions, all): (Vec<usize>, Vec<Chosen>) = asked.into_iter().unzip();
             // Two answers that give one field of one file different values
             // cannot both be said.
             let each: Vec<Vec<Value>> = all
@@ -1397,6 +1449,32 @@ impl LibraryStore {
                 .collect();
             if crate::proposal_store::disagree(&each) {
                 return Err(Error::Invalid("the answers disagree about a file"));
+            }
+            // An edition is said with or after the album of its discs:
+            // each of its files is of that album by a yes standing, or by
+            // one given here.
+            for one in all.iter().filter(|one| one.kind == "edition") {
+                for item in &one.items {
+                    let here = all.iter().any(|other| {
+                        other.values.iter().any(|value| {
+                            value.item == *item
+                                && value.field == "mb_release_group"
+                                && value.value.as_deref() == Some(one.candidate.as_str())
+                        })
+                    });
+                    let standing: bool = connection.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM answer_value
+                                        WHERE source_item_id = ?1 AND field = 'mb_release_group'
+                                          AND value = ?2 AND withdrawn_by_answer_id IS NULL)",
+                        (item, &one.candidate),
+                        |row| row.get(0),
+                    )?;
+                    if !here && !standing {
+                        return Err(Error::Invalid(
+                            "an edition is said with or after the album of its discs",
+                        ));
+                    }
+                }
             }
             // Worked out with the values said here above those in force.
             // Two answers that give a file the same values give them once.
@@ -1413,6 +1491,18 @@ impl LibraryStore {
             // library the projector's first pass loads, before anything
             // moves, and kept for the passes after it.
             let joins: std::cell::RefCell<Option<Vec<Join>>> = std::cell::RefCell::new(None);
+            // Said with an edition, an album's yes joins only the releases
+            // its own values would put together: the release each file is
+            // on with the albums' values alone.
+            let albums_said: Vec<Value> = all
+                .iter()
+                .filter(|one| one.kind == "album")
+                .flat_map(|one| &one.values)
+                .filter_map(StoredValue::value)
+                .collect();
+            let with_edition = all.iter().any(|one| one.kind == "edition");
+            let album_keys: std::cell::RefCell<Option<HashMap<i64, String>>> =
+                std::cell::RefCell::new(None);
             let was = where_now(connection)?;
             let Projected {
                 moved,
@@ -1423,6 +1513,11 @@ impl LibraryStore {
                 &was,
                 &[],
                 |library| {
+                    if with_edition && album_keys.borrow().is_none() {
+                        let mut alone = library.clone();
+                        values::apply(&mut alone, &albums_said);
+                        *album_keys.borrow_mut() = Some(values::release_keys(&alone));
+                    }
                     values::apply(library, &said);
                     let mut known = joins.borrow_mut();
                     let these = known.get_or_insert_with(|| {
@@ -1447,7 +1542,11 @@ impl LibraryStore {
                 .zip(&all)
                 .map(|(mut join, one)| {
                     let files = one.items.iter().chain(&one.onto).copied();
-                    join.releases = put_together(&join.releases, files, &was, &now);
+                    join.releases = put_together(&join.releases, files.clone(), &was, &now);
+                    if let (Some(keys), "album") = (album_keys.borrow().as_ref(), one.kind.as_str())
+                    {
+                        join.releases = alike(&join.releases, files, &was, keys);
+                    }
                     join
                 })
                 .collect();
@@ -1509,22 +1608,37 @@ impl LibraryStore {
                 written.push((id, Id::from_bytes(one.proposal)));
                 answered.push(row);
             }
-            // A yes that took its album's title or credit from the disc it
-            // joins its own onto, which an answer gave them, rests on that
-            // answer: undoing it undoes this one.
+            // A yes rests on the answers it took from: one that took its
+            // album's title or credit from the disc it joins its own onto,
+            // which an answer gave them, rests on that answer, and an
+            // edition on the yeses to its discs' album and, for discs
+            // already said, to the release they were said to be. Undoing
+            // one undoes it.
             for (one, row) in all.iter().zip(&answered) {
-                if !one.values.iter().any(|value| value.origin == "library") {
+                let edition_files: Vec<i64>;
+                let (items, sql) = if one.kind == "edition" {
+                    edition_files = one.items.iter().chain(&one.onto).copied().collect();
+                    (
+                        &edition_files,
+                        "SELECT DISTINCT answer_id FROM answer_value
+                         WHERE source_item_id = ?1 AND withdrawn_by_answer_id IS NULL
+                           AND field IN ('mb_release_group', 'mb_release')",
+                    )
+                } else if one.values.iter().any(|value| value.origin == "library") {
+                    (
+                        &one.onto,
+                        "SELECT DISTINCT answer_id FROM answer_value
+                         WHERE source_item_id = ?1 AND withdrawn_by_answer_id IS NULL
+                           AND field IN ('album', 'album_artist', 'mb_album_artist')",
+                    )
+                } else {
                     continue;
-                }
+                };
                 let mut on: BTreeSet<i64> = BTreeSet::new();
-                for item in &one.onto {
+                for item in items {
                     on.extend(
                         connection
-                            .prepare_cached(
-                                "SELECT DISTINCT answer_id FROM answer_value
-                                 WHERE source_item_id = ?1 AND withdrawn_by_answer_id IS NULL
-                                   AND field IN ('album', 'album_artist', 'mb_album_artist')",
-                            )?
+                            .prepare_cached(sql)?
                             .query_map([item], |found| found.get::<_, i64>(0))?
                             .collect::<Result<Vec<_>, _>>()?,
                     );
@@ -1540,6 +1654,9 @@ impl LibraryStore {
                 }
             }
             crate::proposal_store::derive_proposals(write)?;
+            let mut in_order: Vec<(usize, (Id, Id))> = positions.into_iter().zip(written).collect();
+            in_order.sort_by_key(|(at, _)| *at);
+            let written = in_order.into_iter().map(|(_, said)| said).collect();
             Ok(finish(write.rev(), written, shown))
         })
     }
@@ -1646,6 +1763,7 @@ impl LibraryStore {
                 evidence: AnswerEvidence {
                     candidate: evidence.candidate.map(|candidate| AnsweredCandidate {
                         release_group: candidate.release_group,
+                        release: candidate.release,
                         title: candidate.title,
                         artist: candidate.artist,
                         primary_type: candidate.primary_type,
@@ -1657,6 +1775,7 @@ impl LibraryStore {
                         .into_iter()
                         .map(|shown| AnsweredCandidate {
                             release_group: shown.release_group,
+                            release: shown.release,
                             title: shown.title,
                             artist: None,
                             primary_type: None,

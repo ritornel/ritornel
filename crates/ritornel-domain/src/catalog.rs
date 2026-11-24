@@ -408,7 +408,9 @@ fn release_credits(items: &[&Item]) -> Vec<Option<CreditSpec>> {
 
 /// Forms releases from items and their album artist credits: a release
 /// MBID picks the release, and otherwise album artist and album title do,
-/// split by folder where two folders claim the same disc and track. Gives
+/// split by folder where two folders claim the same disc and track. A
+/// release MBID an answer gave is split so too, so two copies of one
+/// edition said yes to stay two. Gives
 /// each release's key and the indexes of its members. An item with no
 /// album is on none.
 fn form_releases(items: &[(usize, &Item, Option<&CreditSpec>)]) -> Vec<(String, Vec<usize>)> {
@@ -429,7 +431,10 @@ fn form_releases(items: &[(usize, &Item, Option<&CreditSpec>)]) -> Vec<(String, 
     }
     let mut formed = Vec::new();
     for (key, members) in keyed {
-        if key.starts_with('m') {
+        let answered = members
+            .iter()
+            .any(|(_, item)| item.held.contains(&"mb_release"));
+        if key.starts_with('m') && !answered {
             formed.push((key, members.into_iter().map(|(index, _)| index).collect()));
             continue;
         }

@@ -4173,3 +4173,32 @@ fn a_yes_joins_the_group_of_a_release_only_when_every_file_of_it_is_the_album() 
     both.dedup();
     assert_eq!(join.groups, both);
 }
+
+#[test]
+fn two_copies_of_one_edition_an_answer_gave_its_release_id_stay_two() {
+    let mut world = World::default();
+    let copies: Vec<i64> = ["Moss Arcade/Tin Weather", "Moss Arcade/Tin Weather (FLAC)"]
+        .into_iter()
+        .zip([10, 20])
+        .map(|(folder, audio)| {
+            let path: &'static str = Box::leak(format!("{folder}/01.flac").into_boxed_str());
+            world.add(
+                file(path, audio)
+                    .song("Paper Kites", "Moss Arcade", 200)
+                    .on("Tin Weather", Some(1), 1)
+                    .by("Moss Arcade")
+                    .with(|facts| facts.release_mbid = Some("rel-1".to_owned())),
+            )
+        })
+        .collect();
+    world.settle();
+    // Tagged so, they are one release, as before.
+    assert_eq!(world.release(copies[0]), world.release(copies[1]));
+    // Given by an answer, the release ID parts them by folder, as a title
+    // does where two folders claim one position.
+    for item in &mut world.library.items {
+        item.held.push("mb_release");
+    }
+    world.settle();
+    assert_ne!(world.release(copies[0]), world.release(copies[1]));
+}

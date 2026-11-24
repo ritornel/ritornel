@@ -74,6 +74,10 @@ fn release(id: &str, position: u32) -> ReplyRelease {
         artist: "Moss Arcade".to_owned(),
         primary_type: Some("Album".to_owned()),
         first_date: Some("2004-05-11".to_owned()),
+        title: Some(format!("Tin Weather ({id})")),
+        date: Some("2004-05-11".to_owned()),
+        country: Some("XW".to_owned()),
+        media: Some(2),
         positions: vec![position],
     }
 }
@@ -87,6 +91,7 @@ fn discs() -> Vec<FolderDiscs> {
                 provisional: false,
                 found: String::new(),
                 items: vec![1, 2, 3],
+                positions: vec![1, 2, 3],
             }],
         },
         FolderDiscs {
@@ -96,6 +101,7 @@ fn discs() -> Vec<FolderDiscs> {
                 provisional: false,
                 found: String::new(),
                 items: vec![4, 5],
+                positions: vec![1, 2],
             }],
         },
     ]
@@ -109,6 +115,14 @@ fn replies() -> HashMap<String, Vec<ReplyRelease>> {
         ),
         ("bonus".to_owned(), vec![release("deluxe", 2)]),
     ])
+}
+
+/// The album proposals alone, leaving out any edition.
+fn albums(proposals: Vec<Proposal>) -> Vec<Proposal> {
+    proposals
+        .into_iter()
+        .filter(|proposal| proposal.kind == "album")
+        .collect()
 }
 
 fn ids() -> HashMap<i64, [u8; 16]> {
@@ -126,13 +140,13 @@ fn values_of(candidate: &Candidate, item: i64) -> Vec<(&'static str, &str)> {
 
 #[test]
 fn each_disc_is_proposed_as_the_album_and_the_bonus_disc_joins_the_first() {
-    let proposals = propose(
+    let proposals = albums(propose(
         &library(),
         &discs(),
         &replies(),
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     assert_eq!(proposals.len(), 2);
     let (main, bonus) = (&proposals[0], &proposals[1]);
     assert_eq!((main.anchor, bonus.anchor), (1, 4));
@@ -174,13 +188,13 @@ fn each_disc_is_proposed_as_the_album_and_the_bonus_disc_joins_the_first() {
     );
     // Asked again, the same proposals, IDs and fingerprints.
     assert_eq!(
-        propose(
+        albums(propose(
             &library(),
             &discs(),
             &replies(),
             &ids(),
             &crate::Policy::current()
-        ),
+        )),
         proposals
     );
 }
@@ -188,13 +202,13 @@ fn each_disc_is_proposed_as_the_album_and_the_bonus_disc_joins_the_first() {
 #[test]
 fn the_preview_of_the_group_is_one_album_of_two_discs() {
     let library = library();
-    let proposals = propose(
+    let proposals = albums(propose(
         &library,
         &discs(),
         &replies(),
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     let values: Vec<_> = proposals
         .iter()
         .flat_map(|proposal| proposal.candidates[0].values.clone())
@@ -259,13 +273,13 @@ fn a_disc_with_no_reply_or_only_a_provisional_layout_is_not_proposed_for() {
 fn two_copies_of_the_same_disc_are_not_joined() {
     let mut replies = replies();
     replies.insert("bonus".to_owned(), vec![release("standard", 1)]);
-    let proposals = propose(
+    let proposals = albums(propose(
         &library(),
         &discs(),
         &replies,
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     for proposal in &proposals {
         let candidate = &proposal.candidates[0];
         assert!(
@@ -315,12 +329,14 @@ fn two_discs_in_one_folder_are_two_proposals_and_a_log_that_fits_no_file_joins_n
                 provisional: false,
                 found: String::new(),
                 items: vec![1, 2, 3],
+                positions: vec![1, 2, 3],
             },
             DiscLayout {
                 disc_id: "bonus".to_owned(),
                 provisional: false,
                 found: String::new(),
                 items: vec![4, 5],
+                positions: vec![1, 2],
             },
             // A log of some other disc, whose lengths fit none of these.
             DiscLayout {
@@ -328,6 +344,7 @@ fn two_discs_in_one_folder_are_two_proposals_and_a_log_that_fits_no_file_joins_n
                 provisional: false,
                 found: String::new(),
                 items: vec![],
+                positions: vec![],
             },
         ],
     }];
@@ -339,13 +356,13 @@ fn two_discs_in_one_folder_are_two_proposals_and_a_log_that_fits_no_file_joins_n
             ..release("other", 1)
         }],
     );
-    let proposals = propose(
+    let proposals = albums(propose(
         &library,
         &discs,
         &replies,
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     assert_eq!(proposals.len(), 2);
     assert_eq!(
         (proposals[0].items.as_slice(), proposals[1].items.as_slice()),
@@ -370,13 +387,13 @@ fn a_disc_two_releases_place_differently_is_not_joined() {
         "bonus".to_owned(),
         vec![release("deluxe", 2), release("box", 3)],
     );
-    let proposals = propose(
+    let proposals = albums(propose(
         &library(),
         &discs(),
         &replies,
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     for proposal in &proposals {
         assert!(
             proposal.candidates[0]
@@ -393,13 +410,13 @@ fn a_join_takes_the_first_discs_whole_credit_and_clears_ids_it_lacks() {
     for item in library.items.iter_mut().skip(3) {
         item.facts.album_artist_mbids = vec!["00000000-0000-4000-8000-0000000000ff".to_owned()];
     }
-    let proposals = propose(
+    let proposals = albums(propose(
         &library,
         &discs(),
         &replies(),
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     let bonus = &proposals[1].candidates[0];
     let cleared: Vec<&Value> = bonus
         .values
@@ -427,13 +444,13 @@ fn proposals_of_different_first_albums_are_not_one_group() {
             release("deluxe", 2),
         ],
     );
-    let proposals = propose(
+    let proposals = albums(propose(
         &library(),
         &discs(),
         &replies,
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     assert_eq!(proposals[1].candidates[0].release_group, "another");
     assert_ne!(proposals[0].group, proposals[1].group);
 }
@@ -450,13 +467,13 @@ fn a_disc_answered_alone_is_proposed_for_no_more_and_the_other_still_joins_it() 
         &crate::Policy::current(),
     );
     crate::values::apply(&mut library, &first[0].candidates[0].values);
-    let proposals = propose(
+    let proposals = albums(propose(
         &library,
         &discs(),
         &replies(),
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].anchor, 4);
     let candidate = &proposals[0].candidates[0];
@@ -490,13 +507,13 @@ fn a_disc_with_one_file_answered_is_proposed_for_the_others() {
         .cloned()
         .collect();
     crate::values::apply(&mut library, &one);
-    let proposals = propose(
+    let proposals = albums(propose(
         &library,
         &discs(),
         &replies(),
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     let bonus = proposals
         .iter()
         .find(|proposal| proposal.folder.ends_with("Bonus"))
@@ -521,13 +538,13 @@ fn a_disc_answered_as_another_album_is_not_joined_to_this_one() {
             }],
         );
     }
-    let proposals = propose(
+    let proposals = albums(propose(
         &library,
         &discs(),
         &replies(),
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     assert_eq!(proposals.len(), 1);
     let candidate = &proposals[0].candidates[0];
     assert!(
@@ -615,13 +632,13 @@ fn a_disc_whose_files_name_no_album_and_no_artist_is_not_proposed_for() {
     for item in library.items.iter_mut().filter(|item| item.id >= 4) {
         item.facts.album = None;
     }
-    let proposals = propose(
+    let proposals = albums(propose(
         &library,
         &discs(),
         &replies(),
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     assert_eq!(proposals.len(), 2);
     // One that names no artist either would show under none: its disc
     // gets no proposal, and the other disc is proposed for alone.
@@ -629,13 +646,13 @@ fn a_disc_whose_files_name_no_album_and_no_artist_is_not_proposed_for() {
         item.facts.artist.clear();
         item.facts.album_artist.clear();
     }
-    let proposals = propose(
+    let proposals = albums(propose(
         &library,
         &discs(),
         &replies(),
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     assert_eq!(proposals.len(), 1);
     assert_eq!(proposals[0].items, [1, 2, 3]);
     assert!(proposals[0].candidates[0].onto.is_empty());
@@ -661,6 +678,7 @@ fn answering_the_second_disc_alone_keeps_the_release_the_disc_rules_joined() {
                 provisional: false,
                 found: String::new(),
                 items: vec![1, 2, 3],
+                positions: vec![1, 2, 3],
             }],
         },
         FolderDiscs {
@@ -670,17 +688,18 @@ fn answering_the_second_disc_alone_keeps_the_release_the_disc_rules_joined() {
                 provisional: false,
                 found: String::new(),
                 items: vec![4, 5],
+                positions: vec![1, 2],
             }],
         },
     ];
     let replies = HashMap::from([("bonus".to_owned(), vec![release("half", 2)])]);
-    let proposals = propose(
+    let proposals = albums(propose(
         &library,
         &discs,
         &replies,
         &ids(),
         &crate::Policy::current(),
-    );
+    ));
     assert_eq!(proposals.len(), 1, "only the second disc is proposed for");
     let values = &proposals[0].candidates[0].values;
     let shown = preview(&library, values, &[], &crate::Policy::current());
@@ -693,4 +712,462 @@ fn answering_the_second_disc_alone_keeps_the_release_the_disc_rules_joined() {
     assert_eq!(shape(&shown.now), [(1, 2, 5)]);
     assert_eq!(shape(&shown.after), [(1, 2, 5)], "still one release");
     assert_eq!((shown.songs_joined, shown.songs_parted), (0, 0));
+}
+
+/// The edition proposals alone.
+fn editions_of(proposals: Vec<Proposal>) -> Vec<Proposal> {
+    proposals
+        .into_iter()
+        .filter(|proposal| proposal.kind == "edition")
+        .collect()
+}
+
+#[test]
+fn the_two_discs_are_proposed_as_the_one_release_that_holds_both() {
+    let library = library();
+    let all = propose(
+        &library,
+        &discs(),
+        &replies(),
+        &ids(),
+        &crate::Policy::current(),
+    );
+    let editions = editions_of(all.clone());
+    assert_eq!(editions.len(), 1);
+    let edition = &editions[0];
+    assert_eq!(edition.items, [1, 2, 3, 4, 5]);
+    assert_eq!(edition.group, 1, "in the album's group");
+    // Only the deluxe release holds the bonus disc.
+    assert_eq!(edition.candidates.len(), 1);
+    let candidate = &edition.candidates[0];
+    assert_eq!(candidate.release.as_deref(), Some("deluxe"));
+    assert_eq!(candidate.title.as_deref(), Some("Tin Weather (deluxe)"));
+    assert_eq!(
+        values_of(candidate, 5),
+        [
+            ("disc_number", "2"),
+            ("mb_release", "deluxe"),
+            ("track_number", "2")
+        ]
+    );
+    // With the album's yeses, one release of two discs.
+    let values: Vec<_> = all
+        .iter()
+        .flat_map(|proposal| proposal.candidates[0].values.clone())
+        .collect();
+    let shown = preview(&library, &values, &[], &crate::Policy::current());
+    assert_eq!(shown.after.len(), 1);
+    assert_eq!(
+        (
+            shown.after[0].releases,
+            shown.after[0].discs,
+            shown.after[0].songs
+        ),
+        (1, 2, 5)
+    );
+}
+
+#[test]
+fn an_edition_several_releases_hold_alike_has_each_and_copies_of_one_disc_have_none() {
+    let mut replies = replies();
+    replies.insert(
+        "bonus".to_owned(),
+        vec![release("deluxe", 2), release("japan", 2)],
+    );
+    replies.insert(
+        "main".to_owned(),
+        vec![
+            release("standard", 1),
+            release("deluxe", 1),
+            release("japan", 1),
+        ],
+    );
+    let editions = editions_of(propose(
+        &library(),
+        &discs(),
+        &replies,
+        &ids(),
+        &crate::Policy::current(),
+    ));
+    let releases: Vec<_> = editions[0]
+        .candidates
+        .iter()
+        .map(|candidate| candidate.release.as_deref().unwrap())
+        .collect();
+    assert_eq!(releases, ["deluxe", "japan"]);
+
+    // A second copy of the main disc: two discs are the same medium of
+    // every release, so no edition is proposed.
+    let mut library = library();
+    for id in [6, 7, 8] {
+        let mut copy = file(
+            id,
+            "Moss Arcade/Tin Weather (copy)",
+            "Tin Weather",
+            id - 5,
+            "Copy",
+        );
+        copy.first_seen_ms = 100 + id;
+        library.items.push(copy);
+    }
+    let mut discs = discs();
+    discs.push(FolderDiscs {
+        folder: "1/Moss Arcade/Tin Weather (copy)".to_owned(),
+        layouts: vec![DiscLayout {
+            disc_id: "main".to_owned(),
+            provisional: false,
+            found: String::new(),
+            items: vec![6, 7, 8],
+            positions: vec![1, 2, 3],
+        }],
+    });
+    let mut ids = ids();
+    ids.extend((6..=8).map(|id| (id, [id as u8; 16])));
+    assert!(
+        editions_of(propose(
+            &library,
+            &discs,
+            &replies,
+            &ids,
+            &crate::Policy::current()
+        ))
+        .is_empty()
+    );
+}
+
+#[test]
+fn a_file_an_answer_gave_a_release_is_in_no_edition() {
+    let mut library = library();
+    for item in &mut library.items {
+        item.facts.release_mbid = Some("deluxe".to_owned());
+        item.held.push("mb_release");
+    }
+    assert!(
+        editions_of(propose(
+            &library,
+            &discs(),
+            &replies(),
+            &ids(),
+            &crate::Policy::current()
+        ))
+        .is_empty()
+    );
+}
+
+#[test]
+fn two_albums_proposed_for_the_same_discs_get_two_editions() {
+    let mut replies = replies();
+    let other = |id: &str, position: u32| ReplyRelease {
+        group: "other-album".to_owned(),
+        ..release(id, position)
+    };
+    replies.get_mut("main").unwrap().push(other("reissue", 1));
+    replies.get_mut("bonus").unwrap().push(other("reissue", 2));
+    let editions = editions_of(propose(
+        &library(),
+        &discs(),
+        &replies,
+        &ids(),
+        &crate::Policy::current(),
+    ));
+    assert_eq!(editions.len(), 2);
+    assert_eq!(editions[0].anchor, editions[1].anchor);
+    assert_ne!(editions[0].id, editions[1].id);
+}
+
+#[test]
+fn a_disc_whose_layouts_place_a_file_at_two_tracks_is_in_no_edition() {
+    // A file one layout makes the whole disc and another a track of it.
+    let mut image = discs();
+    image[1].layouts.push(DiscLayout {
+        disc_id: "bonus-image".to_owned(),
+        provisional: false,
+        found: String::new(),
+        items: vec![4, 5],
+        positions: vec![0, 2],
+    });
+    assert!(
+        editions_of(propose(
+            &library(),
+            &image,
+            &replies(),
+            &ids(),
+            &crate::Policy::current()
+        ))
+        .is_empty()
+    );
+    let mut discs = discs();
+    discs[1].layouts.push(DiscLayout {
+        disc_id: "bonus-other".to_owned(),
+        provisional: false,
+        found: String::new(),
+        items: vec![4, 5],
+        positions: vec![2, 1],
+    });
+    // Whether or not the other layout has been looked up.
+    let mut replied = replies();
+    replied.insert("bonus-other".to_owned(), vec![release("deluxe", 2)]);
+    for replies in [replies(), replied] {
+        assert!(
+            editions_of(propose(
+                &library(),
+                &discs,
+                &replies,
+                &ids(),
+                &crate::Policy::current()
+            ))
+            .is_empty()
+        );
+    }
+}
+
+#[test]
+fn an_edition_for_a_disc_added_later_puts_it_with_those_answered_before() {
+    // The main disc already said to be the deluxe release: the bonus
+    // disc's edition is about its files, and puts them with the main's.
+    let mut library = library();
+    for item in library.items.iter_mut().filter(|item| item.id <= 3) {
+        item.facts.release_mbid = Some("deluxe".to_owned());
+        item.held.push("mb_release");
+    }
+    let editions = editions_of(propose(
+        &library,
+        &discs(),
+        &replies(),
+        &ids(),
+        &crate::Policy::current(),
+    ));
+    assert_eq!(editions.len(), 1);
+    assert_eq!(editions[0].items, [4, 5]);
+    assert_eq!(editions[0].candidates[0].onto, [1, 2, 3]);
+}
+
+#[test]
+fn a_disc_added_later_is_offered_only_the_release_those_answered_before_are() {
+    let mut replies = replies();
+    replies.insert(
+        "bonus".to_owned(),
+        vec![release("deluxe", 2), release("japan", 2)],
+    );
+    replies.insert(
+        "main".to_owned(),
+        vec![release("deluxe", 1), release("japan", 1)],
+    );
+    let mut library = library();
+    for item in library.items.iter_mut().filter(|item| item.id <= 3) {
+        item.facts.release_mbid = Some("japan".to_owned());
+        item.held.push("mb_release");
+    }
+    let editions = editions_of(propose(
+        &library,
+        &discs(),
+        &replies,
+        &ids(),
+        &crate::Policy::current(),
+    ));
+    let releases: Vec<_> = editions[0]
+        .candidates
+        .iter()
+        .map(|candidate| candidate.release.as_deref().unwrap())
+        .collect();
+    assert_eq!(releases, ["japan"]);
+}
+
+#[test]
+fn a_second_copy_of_an_edition_answered_before_is_proposed_as_a_release_of_its_own() {
+    // The first copy said to be the deluxe release.
+    let mut library = library();
+    for item in &mut library.items {
+        item.facts.release_mbid = Some("deluxe".to_owned());
+        item.held.push("mb_release");
+    }
+    let copy = [
+        (
+            6,
+            "Moss Arcade/Tin Weather (copy)",
+            "Tin Weather",
+            1,
+            "Paper Kites",
+        ),
+        (
+            7,
+            "Moss Arcade/Tin Weather (copy)",
+            "Tin Weather",
+            2,
+            "Low Tide",
+        ),
+        (
+            8,
+            "Moss Arcade/Tin Weather (copy)",
+            "Tin Weather",
+            3,
+            "Salt Roads",
+        ),
+        (
+            9,
+            "Moss Arcade/Tin Weather Bonus (copy)",
+            "Tin Weather (Bonus Disc)",
+            1,
+            "Glass Harbour",
+        ),
+        (
+            10,
+            "Moss Arcade/Tin Weather Bonus (copy)",
+            "Tin Weather (Bonus Disc)",
+            2,
+            "Far Lights",
+        ),
+    ];
+    for (id, folder, album, track, title) in copy {
+        let mut file = file(id, folder, album, track, title);
+        file.first_seen_ms = 100 + id;
+        library.items.push(file);
+    }
+    let mut discs = discs();
+    for (folder, disc_id, items) in [
+        ("1/Moss Arcade/Tin Weather (copy)", "main", vec![6, 7, 8]),
+        (
+            "1/Moss Arcade/Tin Weather Bonus (copy)",
+            "bonus",
+            vec![9, 10],
+        ),
+    ] {
+        let positions = (1..=items.len() as u32).collect();
+        discs.push(FolderDiscs {
+            folder: folder.to_owned(),
+            layouts: vec![DiscLayout {
+                disc_id: disc_id.to_owned(),
+                provisional: false,
+                found: String::new(),
+                items,
+                positions,
+            }],
+        });
+    }
+    let mut ids = ids();
+    ids.extend((6..=10).map(|id| (id, [id as u8; 16])));
+    let editions = editions_of(propose(
+        &library,
+        &discs,
+        &replies(),
+        &ids,
+        &crate::Policy::current(),
+    ));
+    assert_eq!(editions.len(), 1);
+    assert_eq!(editions[0].items, [6, 7, 8, 9, 10]);
+    let candidate = &editions[0].candidates[0];
+    assert_eq!(candidate.release.as_deref(), Some("deluxe"));
+    assert!(candidate.onto.is_empty(), "not put with the first copy");
+}
+
+/// The main disc said to be `said`, and copies of discs with these disc
+/// IDs, each in a folder of its own, as files from 6.
+fn with_copies(
+    said: &str,
+    copies: &[(&str, &str, usize)],
+) -> (Library, Vec<FolderDiscs>, HashMap<i64, [u8; 16]>) {
+    let mut library = library();
+    library.items.retain(|item| item.id <= 3);
+    for item in &mut library.items {
+        item.facts.release_mbid = Some(said.to_owned());
+        item.held.push("mb_release");
+    }
+    let mut discs = discs();
+    discs.truncate(1);
+    let mut ids = ids();
+    let mut next = 6;
+    for (folder, disc_id, files) in copies {
+        let items: Vec<i64> = (next..next + *files as i64).collect();
+        next += *files as i64;
+        for (track, id) in (1..).zip(&items) {
+            let mut copy = file(*id, folder, "Tin Weather", track, "Song");
+            copy.first_seen_ms = 100 + id;
+            library.items.push(copy);
+            ids.insert(*id, [*id as u8; 16]);
+        }
+        let positions = (1..=items.len() as u32).collect();
+        discs.push(FolderDiscs {
+            folder: format!("1/{folder}"),
+            layouts: vec![DiscLayout {
+                disc_id: (*disc_id).to_owned(),
+                provisional: false,
+                found: String::new(),
+                items,
+                positions,
+            }],
+        });
+    }
+    (library, discs, ids)
+}
+
+#[test]
+fn a_disc_said_to_be_a_release_that_does_not_hold_these_leaves_their_edition_alone() {
+    // The main disc is the one-disc release; a copy of the two-disc one,
+    // its first disc mastered otherwise, is another release of the album.
+    let (library, discs, ids) = with_copies(
+        "single",
+        &[
+            ("Moss Arcade/Two Discs 1", "two-1", 3),
+            ("Moss Arcade/Two Discs 2", "two-2", 2),
+        ],
+    );
+    let mut replies = replies();
+    replies.insert("main".to_owned(), vec![release("single", 1)]);
+    replies.insert("two-1".to_owned(), vec![release("double", 1)]);
+    replies.insert("two-2".to_owned(), vec![release("double", 2)]);
+    let editions = editions_of(propose(
+        &library,
+        &discs,
+        &replies,
+        &ids,
+        &crate::Policy::current(),
+    ));
+    assert_eq!(editions.len(), 1);
+    assert_eq!(editions[0].candidates[0].release.as_deref(), Some("double"));
+    assert!(editions[0].candidates[0].onto.is_empty());
+}
+
+#[test]
+fn a_lone_second_copy_of_a_disc_is_put_with_none_of_the_first_copy_s_discs() {
+    // The first copy whole, said to be the deluxe release, and later a
+    // second copy of its bonus disc alone.
+    let mut library = library();
+    for item in &mut library.items {
+        item.facts.release_mbid = Some("deluxe".to_owned());
+        item.held.push("mb_release");
+    }
+    let mut discs = discs();
+    let mut ids = ids();
+    for (track, id) in [(1, 6), (2, 7)] {
+        let mut copy = file(
+            id,
+            "Moss Arcade/Bonus Copy",
+            "Tin Weather (Bonus Disc)",
+            track,
+            "Song",
+        );
+        copy.first_seen_ms = 100 + id;
+        library.items.push(copy);
+        ids.insert(id, [id as u8; 16]);
+    }
+    discs.push(FolderDiscs {
+        folder: "1/Moss Arcade/Bonus Copy".to_owned(),
+        layouts: vec![DiscLayout {
+            disc_id: "bonus".to_owned(),
+            provisional: false,
+            found: String::new(),
+            items: vec![6, 7],
+            positions: vec![1, 2],
+        }],
+    });
+    assert!(
+        editions_of(propose(
+            &library,
+            &discs,
+            &replies(),
+            &ids,
+            &crate::Policy::current()
+        ))
+        .is_empty()
+    );
 }
