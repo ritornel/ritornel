@@ -350,7 +350,9 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         streams: &union,
         ..*input
     };
-    let of_run: HashSet<&[u8]> = run.iter().map(|stream| stream.key.as_slice()).collect();
+    // The run's own listens, whoever's they stay: one is stored already
+    // when any of its rows is.
+    let run_events = crate::streams::events(run);
     // The pins of the streams matched, as derivation finds them among the
     // streams it is given.
     let pins = |streams: &[Stream]| {
@@ -409,21 +411,20 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         .filter(|join| !join.second)
         .map(|join| (join.event, join.tier))
         .collect();
+    for event in &run_events {
+        if event
+            .streams
+            .iter()
+            .filter_map(|at| run.get(*at))
+            .any(|stream| input.stored.contains_key(&stream.key))
+        {
+            row(&mut years, year(event.start_ms)).already_stored += 1;
+        }
+    }
     let mut alone: Vec<usize> = Vec::new();
     for (index, event) in matched.events.iter().enumerate() {
         let row = row(&mut years, year(event.start_ms));
         row.streams += 1;
-        // Stored already when any row of the run's for it is.
-        if event
-            .streams
-            .iter()
-            .filter_map(|at| input.streams.get(*at))
-            .any(|stream| {
-                of_run.contains(stream.key.as_slice()) && input.stored.contains_key(&stream.key)
-            })
-        {
-            row.already_stored += 1;
-        }
         if assumed_zone(input.listener, event.start_ms, input.zone_periods).is_none() {
             row.no_zone += 1;
         }
@@ -537,7 +538,7 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         grouper_version: crate::history::GROUPER_VERSION,
         play_rule_version: crate::history::PlayRule::CURRENT.version,
         streams: run.len() as u64,
-        events: crate::streams::events(run).len() as u64,
+        events: run_events.len() as u64,
         respelled: run
             .iter()
             .filter(|stream| {
@@ -1103,14 +1104,16 @@ mod tests {
         // The plays now: their scrobble.
         let plays = BTreeMap::from([(2019, (1, 1))]);
         // A run brings it back: it joins their scrobble, and adds no play.
-        let year = dry_run(&DryRunInput {
+        // It is the run's listen, stored already.
+        let report = dry_run(&DryRunInput {
             others: &others,
             stored: &stored,
             owners: &owners,
             ..input(&streams, &[], &plays)
-        })
-        .years[0];
+        });
+        let year = report.years[0];
         assert_eq!((year.plays_after, year.counted_after), (1, 1));
+        assert_eq!((report.events, year.already_stored), (1, 1));
     }
 
     #[test]
