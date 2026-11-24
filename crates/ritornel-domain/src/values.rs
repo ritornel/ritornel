@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::library::{Item, Join, Library, Ref, Resolution};
 
 /// The fields a value may set, named as claims are.
-pub const FIELDS: [&str; 7] = [
+pub const FIELDS: [&str; 9] = [
     "album",
     "album_artist",
     "mb_album_artist",
@@ -16,6 +16,8 @@ pub const FIELDS: [&str; 7] = [
     "mb_release_group",
     "primary_type",
     "original_date",
+    "mb_release",
+    "track_number",
 ];
 
 /// The field of this name, if a value may set it.
@@ -111,6 +113,13 @@ pub fn apply(library: &mut Library, values: &[Value]) {
                 "mb_release_group" => facts.release_group_mbid = first,
                 "primary_type" => facts.primary_type = first,
                 "original_date" => facts.original_date = first,
+                "mb_release" => facts.release_mbid = first,
+                // A track number is a number from 1, or none.
+                "track_number" => {
+                    facts.track = first
+                        .and_then(|track| track.parse().ok())
+                        .filter(|track: &i64| *track > 0);
+                }
                 _ => continue,
             }
             if !item.held.contains(field) {
@@ -138,6 +147,8 @@ pub fn hold(item: &crate::library::Item, facts: &mut crate::Facts) {
                 .clone_from(&from.release_group_mbid),
             "primary_type" => facts.primary_type.clone_from(&from.primary_type),
             "original_date" => facts.original_date.clone_from(&from.original_date),
+            "mb_release" => facts.release_mbid.clone_from(&from.release_mbid),
+            "track_number" => facts.track = from.track,
             _ => {}
         }
     }
@@ -254,6 +265,13 @@ fn songs_merged(from: &Resolution, to: &Resolution) -> u32 {
         .map(|had| had.len().saturating_sub(1))
         .sum();
     u32::try_from(merged).unwrap_or(u32::MAX)
+}
+
+/// The release each file's claims put it on, as the catalog forms releases
+/// for files the resolver places, by the file's row.
+#[must_use]
+pub fn release_keys(library: &Library) -> HashMap<i64, String> {
+    crate::catalog::release_keys(library)
 }
 
 /// What a yes to an album puts together (see [`Join`]): the releases its

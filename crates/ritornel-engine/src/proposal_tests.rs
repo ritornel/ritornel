@@ -192,8 +192,16 @@ pub(crate) fn album_with(main: &[(&str, &str)]) -> Rig {
 fn the_bonus_disc_filed_apart_is_proposed_as_the_album_and_says_what_it_rests_on() {
     let rig = album();
     let summary = rig.library.corrections_summary().unwrap();
-    assert_eq!((summary.open, summary.groups, summary.moves), (2, 1, 2));
-    let list = rig.library.proposals().unwrap().proposals;
+    // Each disc as the album, and the two as one release of it.
+    assert_eq!((summary.open, summary.groups, summary.moves), (3, 1, 3));
+    let list: Vec<_> = rig
+        .library
+        .proposals()
+        .unwrap()
+        .proposals
+        .into_iter()
+        .filter(|proposal| proposal.kind == "album")
+        .collect();
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].group_id, list[1].group_id);
     let bonus = list
@@ -237,6 +245,7 @@ fn the_preview_is_one_album_of_two_discs_and_writes_nothing() {
         .map(|proposal| Choice {
             proposal_id: proposal.proposal_id,
             release_group: None,
+            release: None,
         })
         .collect();
     let shown = rig.library.preview(&choices).unwrap();
@@ -273,6 +282,7 @@ fn the_preview_is_one_album_of_two_discs_and_writes_nothing() {
         .preview(&[Choice {
             proposal_id: bonus.proposal_id,
             release_group: Some(GROUP.to_owned()),
+            release: None,
         }])
         .unwrap();
     assert_eq!(
@@ -385,7 +395,7 @@ fn a_missing_file_keeps_its_place_and_its_proposal() {
     std::fs::write(&gone, kept).unwrap();
     rig.stamp(&gone);
     rig.scan();
-    assert_eq!(rig.library.proposals().unwrap().proposals.len(), 2);
+    assert_eq!(rig.library.proposals().unwrap().proposals.len(), 3);
 }
 
 #[test]
@@ -396,10 +406,12 @@ fn a_preview_refuses_a_proposal_twice_or_choices_that_disagree() {
         Choice {
             proposal_id: list[0].proposal_id,
             release_group: None,
+            release: None,
         },
         Choice {
             proposal_id: list[0].proposal_id,
             release_group: Some(GROUP.to_owned()),
+            release: None,
         },
     ];
     assert!(matches!(
@@ -411,6 +423,7 @@ fn a_preview_refuses_a_proposal_twice_or_choices_that_disagree() {
         .preview(&[Choice {
             proposal_id: list[1].proposal_id,
             release_group: None,
+            release: None,
         }])
         .unwrap();
     // What the bonus disc's files say now, beside what they would say.

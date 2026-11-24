@@ -17,8 +17,9 @@ use crate::library::{Item, Library};
 use crate::values::{Origin, Value};
 use crate::{Facts, Policy};
 
-/// The version of how proposals are worked out.
-pub const PROPOSER_VERSION: u32 = 1;
+/// The version of how proposals are worked out. 2: the discs of an album
+/// are proposed as one release of it, too.
+pub const PROPOSER_VERSION: u32 = 2;
 
 /// One layout of one folder's files, as the proposer reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,8 @@ pub struct DiscLayout {
     /// for a layout whose positions fit no file, such as a drive's log of
     /// a rip whose files lost their gaps.
     pub items: Vec<i64>,
+    /// The position on the disc of each of those items, from 1: its track.
+    pub positions: Vec<u32>,
 }
 
 /// One folder's layouts.
@@ -63,6 +66,14 @@ pub struct ReplyRelease {
     pub primary_type: Option<String>,
     /// When the album first came out.
     pub first_date: Option<String>,
+    /// The release's own title, which may name its edition.
+    pub title: Option<String>,
+    /// When the release came out.
+    pub date: Option<String>,
+    /// Where it came out.
+    pub country: Option<String>,
+    /// How many media it has.
+    pub media: Option<u32>,
     /// Which of the release's media the disc is, from 1.
     pub positions: Vec<u32>,
 }
@@ -113,6 +124,13 @@ pub struct Candidate {
     /// when it joins it to another: what the yes puts together, and where
     /// it takes the album's title and credit from.
     pub onto: Vec<i64>,
+    /// For an edition: the release's MusicBrainz ID. Its title and date
+    /// are then the release's own, not the album's.
+    pub release: Option<String>,
+    /// For an edition: where the release came out.
+    pub country: Option<String>,
+    /// For an edition: how many media the release has.
+    pub media: Option<u32>,
 }
 
 /// What a proposal rests on: one layout of a disc and the reply about it.
@@ -129,9 +147,10 @@ pub struct RestsOn {
 /// One proposal: that one disc of the library is one album.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proposal {
-    /// Its ID, computed from its kind and its anchor.
+    /// Its ID, computed from its kind and its anchor, and for an edition
+    /// its album.
     pub id: [u8; 16],
-    /// Its kind: `album`.
+    /// Its kind: `album`, or `edition`.
     pub kind: &'static str,
     /// The first-seen file it is about.
     pub anchor: i64,
@@ -162,6 +181,11 @@ struct Seen<'a> {
 struct Disc<'a> {
     folder: &'a str,
     items: Vec<i64>,
+    /// Each file's track on the disc, from its first layout that places it.
+    tracks: HashMap<i64, u32>,
+    /// Whether every layout of the folder places each file at the same
+    /// track.
+    tracks_agree: bool,
     rests_on: Vec<RestsOn>,
     /// Each album its replies name, with its releases.
     albums: BTreeMap<&'a str, Vec<Seen<'a>>>,
@@ -245,6 +269,25 @@ fn discs_of<'a>(
             items.sort_by_key(first_seen);
             let mut albums: BTreeMap<&str, Vec<Seen<'_>>> = BTreeMap::new();
             let mut rests_on = Vec::new();
+            let mut tracks: HashMap<i64, u32> = HashMap::new();
+            for layout in &layouts {
+                for (item, position) in layout.items.iter().zip(&layout.positions) {
+                    // A whole-disc image is at no track of its own.
+                    if *position > 0 {
+                        tracks.entry(*item).or_insert(*position);
+                    }
+                }
+            }
+            // Every layout of the folder, looked up or not, puts each file
+            // at the same track, or makes it the whole disc in each.
+            let mut placed: HashMap<i64, u32> = HashMap::new();
+            let tracks_agree = folder
+                .layouts
+                .iter()
+                .filter(|layout| !layout.provisional)
+                .flat_map(|layout| layout.items.iter().zip(&layout.positions))
+                .filter(|(item, _)| items.contains(item))
+                .all(|(item, position)| placed.entry(*item).or_insert(*position) == position);
             for layout in layouts {
                 for release in replies.get(&layout.disc_id).into_iter().flatten() {
                     let seen = albums.entry(release.group.as_str()).or_default();
@@ -271,6 +314,8 @@ fn discs_of<'a>(
             Disc {
                 folder: &folder.folder,
                 items,
+                tracks,
+                tracks_agree,
                 rests_on,
                 albums,
             }
@@ -359,6 +404,9 @@ pub fn propose(
                 change: Change::Knows,
                 values: Vec::new(),
                 onto: Vec::new(),
+                release: None,
+                country: None,
+                media: None,
             };
             // Another disc an answer gave an album is of that album alone.
             let cluster: Vec<&Disc<'_>> = discs
@@ -405,6 +453,7 @@ pub fn propose(
             fingerprint: String::new(),
         });
     }
+    proposals.extend(editions(&discs, &eligible, public_ids));
     // A group is every proposal whose likeliest candidate is the same
     // album, named by the first-seen anchor among them.
     let mut groups: HashMap<String, i64> = HashMap::new();
@@ -425,6 +474,212 @@ pub fn propose(
             proposal.group = *group;
         }
         proposal.fingerprint = fingerprint(proposal, public_ids);
+    }
+    proposals
+}
+
+/// Edition proposals: for an album the library holds two or more discs of,
+/// the releases of it that hold every one of them, each at a medium of its
+/// own. A yes says which release the discs are, and puts each file's disc
+/// and track on it. A file an answer gave a release is in none, and an
+/// album some discs of which are the same medium of every release, such as
+/// two copies of one disc, gets none.
+fn editions(
+    discs: &[Disc<'_>],
+    eligible: &HashMap<i64, &Item>,
+    public_ids: &HashMap<i64, [u8; 16]>,
+) -> Vec<Proposal> {
+    let held = |id: &i64, field: &str| {
+        eligible
+            .get(id)
+            .is_some_and(|item| item.held.contains(&field))
+    };
+    let first_seen = |id: &i64| {
+        eligible
+            .get(id)
+            .map_or((i64::MAX, *id), |item| (item.first_seen_ms, *id))
+    };
+    // Each album's discs. A disc an answer gave another album is not one
+    // of this one's.
+    let mut albums: BTreeMap<&str, Vec<&Disc<'_>>> = BTreeMap::new();
+    for disc in discs {
+        for group in disc.albums.keys() {
+            let elsewhere = disc.items.iter().any(|id| {
+                held(id, "mb_release_group")
+                    && eligible
+                        .get(id)
+                        .and_then(|item| item.facts.release_group_mbid.as_deref())
+                        != Some(*group)
+            });
+            if !elsewhere {
+                albums.entry(group).or_default().push(disc);
+            }
+        }
+    }
+    let mut proposals = Vec::new();
+    for (group, members) in albums {
+        // Discs whose layouts place a file at two tracks do not say which
+        // track of the release it is.
+        if members.len() < 2 || members.iter().any(|disc| !disc.tracks_agree) {
+            continue;
+        }
+        let mut subject: Vec<i64> = members
+            .iter()
+            .flat_map(|disc| disc.items.iter().copied())
+            .filter(|id| !held(id, "mb_release"))
+            .collect();
+        subject.sort_by_key(first_seen);
+        let Some(anchor) = subject.first().copied() else {
+            continue;
+        };
+        // The medium each disc is of a release: one, if every reply about
+        // it gives one.
+        let medium = |disc: &Disc<'_>, release: &str| -> Option<u32> {
+            let seen = disc
+                .albums
+                .get(group)?
+                .iter()
+                .find(|seen| seen.release.release == release)?;
+            match seen.positions.iter().collect::<Vec<_>>()[..] {
+                [only] => Some(*only),
+                _ => None,
+            }
+        };
+        let releases: BTreeSet<&str> = members
+            .iter()
+            .filter_map(|disc| disc.albums.get(group))
+            .flatten()
+            .map(|seen| seen.release.release.as_str())
+            .collect();
+        // The discs with files to say a release of, and those an answer
+        // has already put on one.
+        let (asked, settled): (Vec<&Disc<'_>>, Vec<&Disc<'_>>) = members
+            .iter()
+            .partition(|disc| disc.items.iter().any(|id| subject.contains(id)));
+        let mut candidates = Vec::new();
+        for release in releases {
+            let Some(media): Option<Vec<u32>> =
+                asked.iter().map(|disc| medium(disc, release)).collect()
+            else {
+                continue;
+            };
+            let distinct: BTreeSet<&u32> = media.iter().collect();
+            if distinct.len() != media.len() {
+                continue;
+            }
+            // A disc already said is put with these when it is another
+            // medium of the same release, and one said to be another
+            // release rules this one out. One this release does not hold
+            // is not of it, and one that is the same medium as a disc of
+            // these makes these another copy, put with none of the first's.
+            let said: Vec<(&&Disc<'_>, u32)> = settled
+                .iter()
+                .filter(|disc| disc.items.iter().any(|id| held(id, "mb_release")))
+                .filter_map(|disc| Some((disc, medium(disc, release)?)))
+                .collect();
+            let copy = said.iter().any(|(_, number)| distinct.contains(number));
+            let mut onto: Vec<i64> = Vec::new();
+            let mut other_release = false;
+            for (disc, _) in said.iter().filter(|_| !copy) {
+                other_release |= disc.items.iter().any(|id| {
+                    eligible
+                        .get(id)
+                        .and_then(|item| item.facts.release_mbid.as_deref())
+                        != Some(release)
+                });
+                onto.extend(disc.items.iter().copied());
+            }
+            let discs = asked.len() + if copy { 0 } else { said.len() };
+            if other_release || discs < 2 {
+                continue;
+            }
+            onto.sort_unstable();
+            let Some(about) = members
+                .iter()
+                .filter_map(|disc| disc.albums.get(group))
+                .flatten()
+                .find(|seen| seen.release.release == release)
+                .map(|seen| seen.release)
+            else {
+                continue;
+            };
+            let mut values = Vec::new();
+            let mut change = Change::Knows;
+            for (disc, number) in asked.iter().zip(&media) {
+                for id in disc.items.iter().filter(|id| subject.contains(id)) {
+                    let Some(item) = eligible.get(id) else {
+                        continue;
+                    };
+                    let track = disc.tracks.get(id).copied();
+                    let facts = &item.facts;
+                    if facts.release_mbid.as_deref() != Some(release)
+                        || facts.disc != Some(i64::from(*number))
+                        || track.is_some_and(|track| facts.track != Some(i64::from(track)))
+                    {
+                        change = Change::Moves;
+                    }
+                    let mut say = |field, value: String| {
+                        values.push(Value {
+                            item: *id,
+                            field,
+                            ordinal: 0,
+                            value: Some(value),
+                            origin: Origin::Catalogue,
+                        });
+                    };
+                    say("mb_release", release.to_owned());
+                    say("disc_number", number.to_string());
+                    if let Some(track) = track {
+                        say("track_number", track.to_string());
+                    }
+                }
+            }
+            values.sort();
+            candidates.push(Candidate {
+                release_group: group.to_owned(),
+                title: about.title.clone(),
+                artist: about.artist.clone(),
+                primary_type: about.primary_type.as_deref().and_then(kind),
+                first_date: about
+                    .date
+                    .as_deref()
+                    .and_then(parse_date)
+                    .map(|(date, _)| date),
+                releases: 1,
+                change,
+                values,
+                onto,
+                release: Some(release.to_owned()),
+                country: about.country.clone(),
+                media: about.media,
+            });
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        let mut rests_on: Vec<RestsOn> = members
+            .iter()
+            .flat_map(|disc| disc.rests_on.iter().cloned())
+            .collect();
+        rests_on.sort();
+        rests_on.dedup();
+        let folder = members
+            .iter()
+            .find(|disc| disc.items.contains(&anchor))
+            .map_or("", |disc| disc.folder);
+        proposals.push(Proposal {
+            // Of the album too: the same discs may be proposed as a release
+            // of each of two albums.
+            id: proposal_id(&format!("edition {group}"), public_ids.get(&anchor)),
+            kind: "edition",
+            anchor,
+            group: anchor,
+            folder: folder.to_owned(),
+            items: subject,
+            rests_on,
+            candidates,
+            fingerprint: String::new(),
+        });
     }
     proposals
 }
@@ -473,24 +728,48 @@ fn fingerprint(proposal: &Proposal, public_ids: &HashMap<i64, [u8; 16]>) -> Stri
     };
     let file = |item: &i64| public_ids.get(item).copied().unwrap_or_default();
     for candidate in &proposal.candidates {
-        text(&mut hash, Some(&candidate.release_group));
-        text(&mut hash, candidate.title.as_deref());
-        text(&mut hash, Some(&candidate.artist));
-        text(&mut hash, candidate.primary_type.as_deref());
-        text(&mut hash, candidate.first_date.as_deref());
-        hash.update(candidate.releases.to_be_bytes());
-        text(&mut hash, Some(candidate.change.as_str()));
-        hash.update((candidate.values.len() as u64).to_be_bytes());
-        for value in &candidate.values {
+        // Every field, so that one added is hashed or named here.
+        let Candidate {
+            release_group,
+            title,
+            artist,
+            primary_type,
+            first_date,
+            releases,
+            change,
+            values,
+            onto,
+            release,
+            country,
+            media,
+        } = candidate;
+        text(&mut hash, Some(release_group));
+        text(&mut hash, title.as_deref());
+        text(&mut hash, Some(artist));
+        text(&mut hash, primary_type.as_deref());
+        text(&mut hash, first_date.as_deref());
+        hash.update(releases.to_be_bytes());
+        text(&mut hash, Some(change.as_str()));
+        hash.update((values.len() as u64).to_be_bytes());
+        for value in values {
             hash.update(file(&value.item));
             text(&mut hash, Some(value.field));
             hash.update(value.ordinal.to_be_bytes());
             text(&mut hash, value.value.as_deref());
             text(&mut hash, Some(value.origin.name()));
         }
-        hash.update((candidate.onto.len() as u64).to_be_bytes());
-        for item in &candidate.onto {
+        hash.update((onto.len() as u64).to_be_bytes());
+        for item in onto {
             hash.update(file(item));
+        }
+        text(&mut hash, release.as_deref());
+        text(&mut hash, country.as_deref());
+        match media {
+            Some(media) => {
+                hash.update([1]);
+                hash.update(media.to_be_bytes());
+            }
+            None => hash.update([0]),
         }
     }
     hex(&hash.finalize())

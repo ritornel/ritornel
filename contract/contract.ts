@@ -540,6 +540,14 @@ export type Answer = {
    */
   releaseGroup?: string,
   /**
+   * What a yes was about: `album`, or `edition`.
+   */
+  kind?: string,
+  /**
+   * For a yes to an edition: the release, by its ID.
+   */
+  release?: string,
+  /**
    * For a yes: the album's title, as it was shown.
    */
   title?: string,
@@ -699,6 +707,10 @@ export type AnsweredCandidate = {
    * Its release group ID.
    */
   releaseGroup: string,
+  /**
+   * For an edition: the release, by its ID.
+   */
+  release?: string,
   /**
    * Its title.
    */
@@ -1142,6 +1154,11 @@ export type Choice = {
    * The candidate, by its release group ID. Left out, the likeliest.
    */
   releaseGroup?: string,
+  /**
+   * For an edition: the candidate release, by its ID. Left out, the
+   * likeliest of the album's.
+   */
+  release?: string,
 };
 
 /**
@@ -1173,9 +1190,13 @@ export type Confirmation = {
    */
   proposalId: string,
   /**
-   * The candidate, by its release group ID.
+   * The candidate, by its release group ID: for an edition, the album's.
    */
   releaseGroup: string,
+  /**
+   * For an edition: the candidate release, by its ID.
+   */
+  release?: string,
   /**
    * The proposal's fingerprint as it was shown. A proposal that has
    * changed since is refused, and nothing is written.
@@ -4934,9 +4955,22 @@ export type Proposal = {
  */
 export type ProposalCandidate = {
   /**
-   * Its MusicBrainz release group ID.
+   * Its MusicBrainz release group ID: the album.
    */
   releaseGroup: string,
+  /**
+   * For an edition: the release's MusicBrainz ID. Its title and first
+   * year are then the release's own.
+   */
+  release?: string,
+  /**
+   * For an edition: where the release came out.
+   */
+  country?: string,
+  /**
+   * For an edition: how many media the release has.
+   */
+  media?: number,
   /**
    * Its title.
    */

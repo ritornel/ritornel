@@ -197,12 +197,16 @@ pub(crate) fn preview(
     env: local::Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    if args.candidate.is_some() && args.proposals.len() != 1 {
-        return Err(Error::Usage("--candidate is for one proposal"));
+    if (args.candidate.is_some() || args.release.is_some()) && args.proposals.len() != 1 {
+        return Err(Error::Usage(
+            "--candidate and --release are for one proposal",
+        ));
     }
     if args.undo {
-        if args.candidate.is_some() {
-            return Err(Error::Usage("--candidate is not for an undo"));
+        if args.candidate.is_some() || args.release.is_some() {
+            return Err(Error::Usage(
+                "--candidate and --release are not for an undo",
+            ));
         }
         let undo = answer_ids(&args.proposals)?;
         let shown = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
@@ -230,6 +234,7 @@ pub(crate) fn preview(
                     .parse::<Id>()
                     .map_err(|_| Error::Usage("preview needs proposal IDs"))?,
                 release_group: args.candidate.clone(),
+                release: args.release.clone(),
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -273,8 +278,10 @@ pub(crate) fn confirm(
     env: local::Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    if args.candidate.is_some() && args.proposals.len() != 1 {
-        return Err(Error::Usage("--candidate is for one proposal"));
+    if (args.candidate.is_some() || args.release.is_some()) && args.proposals.len() != 1 {
+        return Err(Error::Usage(
+            "--candidate and --release are for one proposal",
+        ));
     }
     if args.fingerprint.is_some() && args.proposals.len() != 1 {
         return Err(Error::Usage("--fingerprint is for one proposal"));
@@ -287,7 +294,11 @@ pub(crate) fn confirm(
                 .map_err(|_| Error::Usage("confirm needs proposal IDs"))
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    let (candidate, fingerprint) = (args.candidate.clone(), args.fingerprint.clone());
+    let (candidate, release, fingerprint) = (
+        args.candidate.clone(),
+        args.release.clone(),
+        args.fingerprint.clone(),
+    );
     let done = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
         // Each proposal as it is now: its fingerprint, and its candidate.
         let mut answers = Vec::new();
@@ -295,15 +306,24 @@ pub(crate) fn confirm(
             let got = client
                 .call::<CorrectionsGet>(&ProposalGetParams { proposal_id })
                 .await?;
-            let release_group = candidate.clone().or_else(|| {
-                got.proposal
-                    .candidates
-                    .first()
-                    .map(|first| first.release_group.clone())
+            // The one named, or the likeliest: for an edition, a release.
+            let chosen = got.proposal.candidates.iter().find(|one| {
+                candidate
+                    .as_ref()
+                    .is_none_or(|group| *group == one.release_group)
+                    && release
+                        .as_ref()
+                        .is_none_or(|release| one.release.as_ref() == Some(release))
             });
             answers.push(Confirmation {
                 proposal_id,
-                release_group: release_group.unwrap_or_default(),
+                release_group: chosen
+                    .map(|one| one.release_group.clone())
+                    .or_else(|| candidate.clone())
+                    .unwrap_or_default(),
+                release: chosen
+                    .and_then(|one| one.release.clone())
+                    .or_else(|| release.clone()),
                 fingerprint: fingerprint.clone().unwrap_or(got.proposal.fingerprint),
             });
         }
@@ -463,7 +483,10 @@ fn render_answer(got: &AnswerGot) -> String {
             "\nSaid yes to: {} by {} ({})\n",
             candidate.title.as_deref().unwrap_or("an untitled album"),
             candidate.artist.as_deref().unwrap_or("?"),
-            candidate.release_group
+            candidate
+                .release
+                .as_ref()
+                .unwrap_or(&candidate.release_group)
         ));
     }
     if evidence.candidates.len() > 1 {
@@ -472,7 +495,7 @@ fn render_answer(got: &AnswerGot) -> String {
             text.push_str(&format!(
                 "  {} ({})\n",
                 shown.title.as_deref().unwrap_or("an untitled album"),
-                shown.release_group
+                shown.release.as_ref().unwrap_or(&shown.release_group)
             ));
         }
     }
@@ -513,12 +536,19 @@ fn render_answer(got: &AnswerGot) -> String {
 
 fn answer_line(answer: &Answer) -> String {
     let said = match answer.verb {
-        AnswerVerb::Confirm => format!(
-            "yes: {} ({}), {}",
-            answer.title.as_deref().unwrap_or("an album"),
-            answer.release_group.as_deref().unwrap_or("?"),
-            plural(answer.files, "file", "files")
-        ),
+        AnswerVerb::Confirm => match &answer.release {
+            Some(release) => format!(
+                "yes: edition {} (release {release}), {}",
+                answer.title.as_deref().unwrap_or("an untitled release"),
+                plural(answer.files, "file", "files")
+            ),
+            None => format!(
+                "yes: {} ({}), {}",
+                answer.title.as_deref().unwrap_or("an album"),
+                answer.release_group.as_deref().unwrap_or("?"),
+                plural(answer.files, "file", "files")
+            ),
+        },
         AnswerVerb::Undo => format!(
             "undid {}",
             answer.undoes.map(|id| id.to_string()).unwrap_or_default()
@@ -539,6 +569,21 @@ fn change(change: ProposalChange) -> &'static str {
 }
 
 fn candidate(candidate: &ProposalCandidate) -> String {
+    if let Some(release) = &candidate.release {
+        let title = candidate.title.as_deref().unwrap_or("an untitled release");
+        let mut about = vec![format!("release {release}")];
+        about.extend(candidate.country.clone());
+        about.extend(candidate.first_year.map(|year| year.to_string()));
+        if let Some(media) = candidate.media {
+            about.push(plural(media, "disc", "discs"));
+        }
+        return format!(
+            "{title} by {} ({}): {}",
+            candidate.artist,
+            about.join(", "),
+            change(candidate.change)
+        );
+    }
     let year = candidate
         .first_year
         .map_or_else(String::new, |year| format!(" ({year})"));
@@ -573,8 +618,13 @@ fn render_list(list: &ProposalList) -> String {
         } else {
             format!("{} files", proposal.file_count)
         };
+        let edition = if proposal.kind == "edition" {
+            "edition of "
+        } else {
+            ""
+        };
         text.push_str(&format!(
-            "{}  {}, {files}\n",
+            "{}  {edition}{}, {files}\n",
             proposal.proposal_id,
             place(&proposal.root, &proposal.folder)
         ));

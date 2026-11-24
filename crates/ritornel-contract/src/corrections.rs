@@ -226,8 +226,21 @@ pub struct CorrectionsSummary {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ProposalCandidate {
-    /// Its MusicBrainz release group ID.
+    /// Its MusicBrainz release group ID: the album.
     pub release_group: String,
+    /// For an edition: the release's MusicBrainz ID. Its title and first
+    /// year are then the release's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release: Option<String>,
+    /// For an edition: where the release came out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub country: Option<String>,
+    /// For an edition: how many media the release has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub media: Option<u32>,
     /// Its title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -365,6 +378,11 @@ pub struct Choice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub release_group: Option<String>,
+    /// For an edition: the candidate release, by its ID. Left out, the
+    /// likeliest of the album's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release: Option<String>,
 }
 
 /// The params of `corrections.preview`.
@@ -446,8 +464,12 @@ pub struct PreviewShown {
 pub struct Confirmation {
     /// The proposal.
     pub proposal_id: Id,
-    /// The candidate, by its release group ID.
+    /// The candidate, by its release group ID: for an edition, the album's.
     pub release_group: String,
+    /// For an edition: the candidate release, by its ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release: Option<String>,
     /// The proposal's fingerprint as it was shown. A proposal that has
     /// changed since is refused, and nothing is written.
     pub fingerprint: String,
@@ -534,6 +556,14 @@ pub struct Answer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub release_group: Option<String>,
+    /// What a yes was about: `album`, or `edition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub kind: Option<String>,
+    /// For a yes to an edition: the release, by its ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release: Option<String>,
     /// For a yes: the album's title, as it was shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -600,6 +630,10 @@ pub struct AnswerParams {
 pub struct AnsweredCandidate {
     /// Its release group ID.
     pub release_group: String,
+    /// For an edition: the release, by its ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub release: Option<String>,
     /// Its title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]

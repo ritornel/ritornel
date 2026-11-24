@@ -21,19 +21,41 @@ fn command(byte: u8) -> WriteRequest {
     }
 }
 
-/// Every confirmation of the group, as shown.
+/// Every confirmation of the group's album proposals, as shown.
 fn group(rig: &Rig) -> Vec<Confirmation> {
     rig.library
         .proposals()
         .unwrap()
         .proposals
         .into_iter()
+        .filter(|proposal| proposal.kind == "album")
         .map(|proposal| Confirmation {
             proposal_id: proposal.proposal_id,
             release_group: GROUP.to_owned(),
+            release: None,
             fingerprint: proposal.fingerprint,
         })
         .collect()
+}
+
+/// The confirmation of the group's edition, as shown, with its likeliest
+/// release.
+fn edition(rig: &Rig) -> Option<Confirmation> {
+    let proposal = rig
+        .library
+        .proposals()
+        .unwrap()
+        .proposals
+        .into_iter()
+        .find(|proposal| proposal.kind == "edition")?;
+    let id = proposal.proposal_id;
+    let whole = rig.library.proposal(id).unwrap().1;
+    Some(Confirmation {
+        proposal_id: id,
+        release_group: GROUP.to_owned(),
+        release: whole.candidates.first()?.release.clone(),
+        fingerprint: whole.fingerprint,
+    })
 }
 
 fn confirm(rig: &Rig, byte: u8, confirmations: Vec<Confirmation>) -> Result<Vec<Id>, Error> {
@@ -139,8 +161,17 @@ fn a_yes_to_the_group_joins_the_bonus_disc_in_one_revision_and_its_undo_gives_ev
         ),
         "album"
     );
-    // The answered discs are proposed for no more.
-    assert!(rig.library.proposals().unwrap().proposals.is_empty());
+    // The answered discs are proposed for as the album no more, only as
+    // one release of it.
+    let open: Vec<String> = rig
+        .library
+        .proposals()
+        .unwrap()
+        .proposals
+        .into_iter()
+        .map(|proposal| proposal.kind)
+        .collect();
+    assert_eq!(open, ["edition"]);
     // The bonus disc's emptied release and appearances lead to where its
     // files went.
     assert_eq!(
@@ -163,7 +194,8 @@ fn a_yes_to_the_group_joins_the_bonus_disc_in_one_revision_and_its_undo_gives_ev
         before,
         "the library is as it was, IDs and all"
     );
-    assert_eq!(rig.library.proposals().unwrap().proposals.len(), 2);
+    // Proposed for again: each disc as the album, and both as an edition.
+    assert_eq!(rig.library.proposals().unwrap().proposals.len(), 3);
     assert_eq!(
         rig.one("SELECT count(*) FROM answer_value WHERE withdrawn_by_answer_id IS NULL"),
         "0"
@@ -1382,6 +1414,92 @@ fn a_yes_that_left_two_releases_apart_does_not_join_them_after_a_retag() {
 }
 
 #[test]
+fn the_album_and_its_edition_together_make_one_release_of_two_discs_and_each_undoes() {
+    let rig = album();
+    let (before, lost) = (reachable(&rig), stranded(&rig));
+    let edition_yes = edition(&rig).expect("the two discs are proposed as one release");
+    assert!(edition_yes.release.is_some());
+    // An edition is said with or after the album of its discs.
+    assert!(matches!(
+        confirm(&rig, 1, vec![edition_yes.clone()]),
+        Err(Error::Invalid(_))
+    ));
+    let mut all = group(&rig);
+    all.push(edition_yes);
+    let answers = confirm(&rig, 2, all).unwrap();
+    assert_eq!(releases(&rig), ["Tin Weather|2|5"]);
+    // Each file has its disc and track on the release.
+    assert_eq!(
+        rig.rows(
+            "SELECT ta.display_disc_number || '-' || ta.display_track_number FROM assignment a
+             JOIN track_appearance ta ON ta.id = a.appearance_id
+             WHERE a.superseded_at_ms IS NULL ORDER BY 1"
+        ),
+        ["1-1", "1-2", "1-3", "2-1", "2-2"]
+    );
+    // The edition undone alone leaves the album's join.
+    let edition_answer = answers[2];
+    undo(&rig, 3, vec![edition_answer]).unwrap();
+    assert_eq!(releases(&rig), ["Tin Weather|2|5"]);
+    // The albums' yeses undone, everything is as it was.
+    undo(&rig, 4, answers[..2].to_vec()).unwrap();
+    assert_eq!(reachable(&rig), before);
+    assert_eq!(stranded(&rig), lost);
+}
+
+#[test]
+fn undoing_an_album_undoes_the_edition_that_rests_on_it() {
+    let rig = album();
+    let before = reachable(&rig);
+    let edition_yes = edition(&rig).unwrap();
+    let mut all = group(&rig);
+    all.push(edition_yes);
+    let answers = confirm(&rig, 1, all).unwrap();
+    let shown = rig.library.preview_undo(&answers[..1]).unwrap();
+    assert!(shown.undoes.contains(&answers[2]), "the edition goes too");
+    undo(&rig, 2, answers[..2].to_vec()).unwrap();
+    assert_eq!(
+        rig.rows("SELECT count(*) FROM answer WHERE verb = 'undo'"),
+        ["3"]
+    );
+    assert_eq!(reachable(&rig), before);
+}
+
+#[test]
+fn an_edition_said_again_after_a_rescan_is_undone_to_where_the_rescan_left_its_files() {
+    let mut rig = album();
+    let album_yes = confirm(&rig, 1, group(&rig)).unwrap();
+    let first = confirm(&rig, 2, vec![edition(&rig).unwrap()]).unwrap();
+    undo(&rig, 3, first).unwrap();
+    let undone = reachable(&rig);
+    // A retitled song moves its file to other rows while the album's yes
+    // stands.
+    let bytes = crate::proposal_tests::aiff(
+        300,
+        5,
+        &[
+            ("TIT2", "Far Lights (Reprise)"),
+            ("TPE1", "Moss Arcade"),
+            ("TPE2", "Moss Arcade"),
+            ("TALB", "Tin Weather (Bonus Disc)"),
+            ("TRCK", "2"),
+        ],
+    );
+    crate::proposal_tests::write(
+        &mut rig,
+        "Moss Arcade/Tin Weather Bonus/02 Far Lights.aiff",
+        &bytes,
+    );
+    rig.scan();
+    let rescanned = reachable(&rig);
+    assert_ne!(rescanned, undone, "the rescan moved a file");
+    let again = confirm(&rig, 4, vec![edition(&rig).unwrap()]).unwrap();
+    undo(&rig, 5, again).unwrap();
+    assert_eq!(reachable(&rig), rescanned);
+    assert!(!album_yes.is_empty());
+}
+
+#[test]
 fn undoing_an_answer_of_a_batch_leaves_what_another_answer_of_it_moved() {
     let mut rig = album();
     // Another pressing of the album, filed apart and already tagged with
@@ -1485,6 +1603,7 @@ fn undoing_an_answer_of_a_batch_leaves_what_another_answer_of_it_moved() {
                 GROUP
             }
             .to_owned(),
+            release: None,
             fingerprint: proposal.fingerprint,
         })
         .collect();
@@ -1598,4 +1717,149 @@ fn a_play_never_counts_for_one_song_heard_as_another_after_a_yes_parts_their_fil
     assert_eq!(played(&rig), [format!("{recording}|-")]);
     undo(&rig, 2, answers).unwrap();
     assert_eq!(played(&rig), was, "after its undo");
+}
+
+#[test]
+fn an_edition_for_a_disc_added_later_goes_with_the_answers_its_other_discs_rest_on() {
+    let mut rig = album();
+    let shown = group(&rig);
+    let bonus = shown
+        .iter()
+        .position(|yes| {
+            rig.library
+                .proposal(yes.proposal_id)
+                .unwrap()
+                .1
+                .folder
+                .ends_with("Bonus")
+        })
+        .unwrap();
+    let albums = confirm(&rig, 1, shown).unwrap();
+    confirm(&rig, 2, vec![edition(&rig).unwrap()]).unwrap();
+    // A third disc of the release, added later and looked up.
+    for (track, sectors, title) in [("1", 250, "No Signal"), ("2", 475, "Last Signal")] {
+        let bytes = crate::proposal_tests::aiff(
+            sectors,
+            if track == "1" { 56 } else { 57 },
+            &[
+                ("TIT2", title),
+                ("TPE1", "Moss Arcade"),
+                ("TPE2", "Moss Arcade"),
+                ("TALB", "Tin Weather"),
+                ("TRCK", track),
+            ],
+        );
+        crate::proposal_tests::write(
+            &mut rig,
+            &format!("Moss Arcade/Disc Three/0{track}.aiff"),
+            &bytes,
+        );
+    }
+    crate::proposal_tests::write(
+        &mut rig,
+        "Moss Arcade/Disc Three/rip.log",
+        b"Exact Audio Copy V1.6\n Track | Start | Length | Start sector | End sector\n  1 | 0:00.00 | 0:01.00 | 0 | 249\n  2 | 0:00.00 | 0:01.00 | 250 | 724\n",
+    );
+    rig.scan();
+    let disc = rig
+        .library
+        .discs(&ritornel_contract::DiscsParams::default())
+        .unwrap()
+        .discs
+        .into_iter()
+        .find(|disc| disc.folder.ends_with("/Disc Three"))
+        .unwrap();
+    let mut body: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/musicbrainz/disc-tin-weather-bonus.json"
+    ))
+    .unwrap();
+    body["id"] = serde_json::json!(disc.disc_id);
+    let mut third = body["releases"][0]["media"][1].clone();
+    third["position"] = serde_json::json!(3);
+    third["discs"][0]["id"] = serde_json::json!(disc.disc_id);
+    body["releases"][0]["media"]
+        .as_array_mut()
+        .unwrap()
+        .push(third);
+    rig.library
+        .keep_replies(
+            command(10),
+            crate::Asked {
+                catalogue: "musicbrainz",
+                kind: "disc",
+                includes: "artist-credits+release-groups+recordings",
+            },
+            vec![crate::KeptReply {
+                key: disc.disc_id,
+                status: 200,
+                body: body.to_string(),
+            }],
+            vec![],
+            |_, _| String::new(),
+        )
+        .unwrap();
+    let mut third = group(&rig);
+    assert_eq!(third.len(), 1);
+    third.push(edition(&rig).unwrap());
+    let later = confirm(&rig, 3, third).unwrap();
+    // Undoing the bonus disc's album undoes the first edition, and the one
+    // that put the third disc with it.
+    undo(&rig, 4, vec![albums[bonus]]).unwrap();
+    let continued = rig.library.answer(later[1]).unwrap();
+    assert!(continued.answer.undone_by.is_some(), "{continued:?}");
+}
+
+#[test]
+fn an_album_said_with_its_edition_does_not_keep_the_edition_s_join_after_it_is_undone() {
+    let main = "MusicBrainz Album Id\u{0}00000000-0000-4000-8000-0000000000e1";
+    let bonus = "MusicBrainz Album Id\u{0}00000000-0000-4000-8000-0000000000e2";
+    let mut rig = album_with(&[("TXXX", main)]);
+    retag_the_bonus_disc(&mut rig, &[("TXXX", bonus)]);
+    // Each release has a date a person gave it.
+    edit_each(&rig, "release", "date", &["2004", "2005"]);
+    let mut batch = group(&rig);
+    batch.push(edition(&rig).unwrap());
+    let answers = confirm(&rig, 1, batch).unwrap();
+    assert_eq!(
+        releases(&rig),
+        ["Tin Weather|2|5"],
+        "the edition joins them"
+    );
+    undo(&rig, 2, vec![answers[2]]).unwrap();
+    assert_eq!(releases(&rig), ["Tin Weather|1|3", "Tin Weather|1|2"]);
+    // A retag to one release ID does not join them by the albums' yeses,
+    // which never did.
+    retag_the_bonus_disc(&mut rig, &[("TXXX", main)]);
+    assert_eq!(releases(&rig), ["Tin Weather|1|3", "Tin Weather|1|2"]);
+}
+
+#[test]
+fn an_edition_said_first_in_a_batch_and_undone_alone_gives_its_discs_their_releases_back() {
+    let main = "MusicBrainz Album Id\u{0}00000000-0000-4000-8000-0000000000e1";
+    let bonus = "MusicBrainz Album Id\u{0}00000000-0000-4000-8000-0000000000e2";
+    let mut rig = album_with(&[("TXXX", main)]);
+    retag_the_bonus_disc(&mut rig, &[("TXXX", bonus)]);
+    edit_each(&rig, "release", "date", &["2004", "2005"]);
+    // Each file's appearance and release, by public ID.
+    let ids = |rig: &Rig| {
+        rig.rows(
+            "SELECT si.provider_key, hex(ta.public_id), hex(rel.public_id) FROM source_item si
+             JOIN assignment a ON a.source_item_id = si.id AND a.superseded_at_ms IS NULL
+             JOIN track_appearance ta ON ta.id = a.appearance_id
+             JOIN release rel ON rel.id = ta.release_id
+             WHERE si.item_kind = 'file' ORDER BY 1",
+        )
+    };
+    let before = ids(&rig);
+    // The edition listed before its discs' albums.
+    let mut batch = vec![edition(&rig).unwrap()];
+    batch.extend(group(&rig));
+    let answers = confirm(&rig, 1, batch).unwrap();
+    assert_eq!(releases(&rig), ["Tin Weather|2|5"]);
+    undo(&rig, 2, vec![answers[0]]).unwrap();
+    assert_eq!(
+        ids(&rig),
+        before,
+        "the albums' yeses keep each disc's own release"
+    );
 }

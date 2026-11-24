@@ -180,6 +180,10 @@ pub(crate) fn current_releases(
             artist,
             primary_type: first("primary_type"),
             first_date: first("first_release_date"),
+            title: first("title"),
+            date: first("date"),
+            country: first("country"),
+            media: first("medium_count").and_then(|count| count.parse().ok()),
             positions: fields
                 .get("disc_number")
                 .into_iter()
@@ -214,13 +218,20 @@ pub(crate) fn derive_proposals(write: &Write<'_>) -> Result<(), Error> {
     let (connection, rev) = (write.connection(), write.rev());
     let (library, _) = load_in(connection)?;
     let mut layouts: BTreeMap<String, Vec<DiscLayout>> = BTreeMap::new();
-    let mut placed: HashMap<i64, Vec<i64>> = HashMap::new();
-    for (disc, item) in rows(
+    let mut placed: HashMap<i64, Vec<(u32, i64)>> = HashMap::new();
+    for (disc, position, item) in rows(
         connection,
-        "SELECT evidence_disc_id, source_item_id FROM evidence_disc_item ORDER BY evidence_disc_id, position",
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        "SELECT evidence_disc_id, position, source_item_id FROM evidence_disc_item
+         ORDER BY evidence_disc_id, position",
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
     )? {
-        placed.entry(disc).or_default().push(item);
+        placed.entry(disc).or_default().push((position, item));
     }
     let stored = rows(
         connection,
@@ -258,7 +269,18 @@ pub(crate) fn derive_proposals(write: &Write<'_>) -> Result<(), Error> {
                 disc_id: disc_id.clone(),
                 provisional: *provisional,
                 found: found.get(disc_id.as_str()).cloned().unwrap_or_default(),
-                items: placed.remove(id).unwrap_or_default(),
+                items: placed
+                    .get(id)
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, item)| *item)
+                    .collect(),
+                positions: placed
+                    .remove(id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(position, _)| position)
+                    .collect(),
             });
     }
     let folders: Vec<FolderDiscs> = layouts
@@ -326,7 +348,8 @@ pub(crate) fn derive_proposals(write: &Write<'_>) -> Result<(), Error> {
             .split_once('/')
             .unwrap_or((&proposal.folder, ""));
         let group = public_ids.get(&proposal.group).copied().unwrap_or_default();
-        let group_id = ritornel_domain::propose::proposal_id(proposal.kind, Some(&group));
+        // A group is named by its anchor's album proposal, editions too.
+        let group_id = ritornel_domain::propose::proposal_id("album", Some(&group));
         connection
             .prepare_cached(
                 "INSERT INTO proposal
@@ -379,24 +402,28 @@ pub(crate) fn derive_proposals(write: &Write<'_>) -> Result<(), Error> {
             connection
                 .prepare_cached(
                     "INSERT INTO proposal_candidate
-                       (proposal_id, ordinal, release_group_mbid, title, artist, primary_type, first_date,
-                        releases, change, values_json, onto_json, rev)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                       (proposal_id, ordinal, release_group_mbid, release_mbid, title, artist,
+                        primary_type, first_date, country, media, releases, change, values_json,
+                        onto_json, rev)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 )?
-                .execute((
+                .execute(rusqlite::params![
                     row,
                     ordinal,
                     &candidate.release_group,
+                    &candidate.release,
                     &candidate.title,
                     &candidate.artist,
                     &candidate.primary_type,
                     &candidate.first_date,
+                    &candidate.country,
+                    candidate.media,
                     candidate.releases,
                     candidate.change.as_str(),
                     serde_json::to_string(&stored)?,
                     serde_json::to_string(&candidate.onto)?,
                     rev,
-                ))?;
+                ])?;
         }
     }
     crate::evidence_store::set_setting(
@@ -498,6 +525,8 @@ pub(crate) fn now_of(facts: &ritornel_domain::Facts, field: &str, ordinal: u32) 
         "mb_release_group" => one(facts.release_group_mbid.clone()),
         "primary_type" => one(facts.primary_type.clone()),
         "original_date" => one(facts.original_date.clone()),
+        "mb_release" => one(facts.release_mbid.clone()),
+        "track_number" => one(facts.track.map(|track| track.to_string())),
         _ => None,
     }
 }
@@ -544,24 +573,34 @@ fn read_proposals(connection: &Connection, one: Option<Id>) -> Result<Vec<Propos
         let (row, id, kind, group, root, folder, fingerprint, count) = found?;
         let mut candidates = Vec::new();
         let mut statement = connection.prepare_cached(
-            "SELECT release_group_mbid, title, artist, primary_type, first_date, releases, change, values_json
+            "SELECT release_group_mbid, title, artist, primary_type, first_date, releases, change, values_json,
+                    release_mbid, country, media
              FROM proposal_candidate WHERE proposal_id = ?1 ORDER BY ordinal",
         )?;
         let listed = statement.query_map([row], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, u32>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
+                (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, u32>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ),
+                (
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<u32>>(10)?,
+                ),
             ))
         })?;
         for listed in listed {
-            let (release_group, title, artist, primary_type, first_date, releases, said, values) =
-                listed?;
+            let (
+                (release_group, title, artist, primary_type, first_date, releases, said, values),
+                (release, country, media),
+            ) = listed?;
             let values: Vec<StoredValue> = if whole {
                 serde_json::from_str(&values)?
             } else {
@@ -569,6 +608,9 @@ fn read_proposals(connection: &Connection, one: Option<Id>) -> Result<Vec<Propos
             };
             candidates.push(ProposalCandidate {
                 release_group,
+                release,
+                country,
+                media,
                 title,
                 artist,
                 primary_type,
@@ -748,8 +790,9 @@ impl LibraryStore {
                     .query_row(
                         "SELECT values_json, onto_json, release_group_mbid FROM proposal_candidate
                          WHERE proposal_id = ?1 AND (?2 IS NULL OR release_group_mbid = ?2)
+                           AND (?3 IS NULL OR release_mbid = ?3)
                          ORDER BY ordinal LIMIT 1",
-                        (row, &choice.release_group),
+                        (row, &choice.release_group, &choice.release),
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()?;
