@@ -50,7 +50,4 @@ CI runs the tests in parallel on small, busy machines, Windows' slowest of all, 
 
 An agent opens a pull request when the person it works for asks. The title is `type(scope): what changed`, and the body ends with the model and harness that did the work. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest.
 
-- **Complete changes only.** Do not merge work with known gaps in its core behavior deferred to later pull requests.
-- **Data-format and wire changes land as one complete unit at a time.** Any feature that adds a migration, changes `CONTRACT_VERSION` or the wire contract, or changes how a user's record is written lands with one contract bump and the fewest migrations its purpose needs. Never add one migration or one contract bump per pull request in a stack: collapse migrations that are not yet on `main` before merging. (Migrations already on `main` stay frozen.)
-- **Independent changes land as they are ready.** Tests, CI, desktop fixes, documentation, and dependency updates land as soon as each change is complete and reviewed, without waiting on a data-format or contract unit.
-- **Keep pull request descriptions factual.** State what changed and how it was verified. Do not put open design questions in a pull request description; settle them in an issue or conversation first.
+Keep partial work on its branch until it works end to end rather than merging something half-built onto `main`. For a feature that changes the contract or adds migrations, use one `CONTRACT_VERSION` bump and collapse migrations not yet on `main` into as few files as it needs. Changes that write the library, listening history, or backups, or send scrobbles or Now Playing, get extra review.
