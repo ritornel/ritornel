@@ -187,6 +187,17 @@ impl Core {
         if let Some(replayed) = self.replayed::<ImportsDryRun>(stores, params)? {
             return Ok(replayed);
         }
+        // An applied run keeps the report it was applied with.
+        let applied = Self::library(stores, |library| {
+            library.stored_run(params.run_id).map_err(internal)
+        })?;
+        if applied.is_some() {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                "that run is applied, and keeps the report it was applied with",
+            )
+            .with_detail("reason", "applied"));
+        }
         self.whole_run(params)?;
         self.start_run_job::<ImportsDryRun>(stores, params, DRY_RUN_JOB)
     }
@@ -387,6 +398,33 @@ mod tests {
         );
         dry_run(&core, ritornel_engine::GROUPER_VERSION);
         assert!(call(&core, &session, "imports.apply", apply(5)).is_ok());
+    }
+
+    #[test]
+    fn a_run_applied_is_not_dry_run_again() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, session) = staged(&clock, 1);
+        let run = Id::from_bytes([9; 16]);
+        let streams = core.staging().streams(run, T0).unwrap().unwrap().0;
+        core.with_library(|_, library| {
+            library.apply_streams(
+                ritornel_engine::WriteRequest {
+                    method: ritornel_engine::APPLY_METHOD,
+                    command: None,
+                    client: None,
+                },
+                run,
+                streams,
+                "ritornelctl 0.1.0".to_owned(),
+                None,
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            call(&core, &session, "imports.dryRun", apply(6)),
+            Err(ErrorCode::Invalid)
+        );
     }
 
     #[test]

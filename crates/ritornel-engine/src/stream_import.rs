@@ -533,6 +533,8 @@ impl LibraryStore {
             let read = read(write.connection())?;
             let streams = keyed(records, &read.stored);
             let _ = sent.send(report(&read, &streams, write.now_ms()));
+            // What the report read is not held while the run is stored.
+            drop(read);
             let stored = apply_in(write, run, &streams, &reader, session)?;
             Ok(serde_json::to_string(&stored)?)
         })?;

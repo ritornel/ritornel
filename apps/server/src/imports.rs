@@ -395,15 +395,27 @@ pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &Atomic
         }
         Err(error) => return failed(error.to_string()),
     };
-    let report = core.with_library(|_, library| library.stream_dry_run(streams));
+    // A run applied meanwhile keeps the report it was applied with.
+    let report = core.with_library(|_, library| {
+        let report = library.stream_dry_run(streams)?;
+        Ok::<_, ritornel_engine::Error>(
+            library
+                .stored_run(params.run_id)?
+                .is_none()
+                .then_some(report),
+        )
+    });
     match report {
-        Some(Ok(report)) => match core.staging().save_report(params.run_id, begun_at, &report) {
-            Ok(true) => finish(core, &job, JobState::Succeeded, None),
-            Ok(false) => failed(
-                "the staged run expired, or was staged again, while it was dry run".to_owned(),
-            ),
-            Err(error) => failed(error.to_string()),
-        },
+        Some(Ok(None)) => failed("the run was applied while it was dry run".to_owned()),
+        Some(Ok(Some(report))) => {
+            match core.staging().save_report(params.run_id, begun_at, &report) {
+                Ok(true) => finish(core, &job, JobState::Succeeded, None),
+                Ok(false) => failed(
+                    "the staged run expired, or was staged again, while it was dry run".to_owned(),
+                ),
+                Err(error) => failed(error.to_string()),
+            }
+        }
         Some(Err(error)) => failed(error.to_string()),
         None => failed("this server holds no library".to_owned()),
     }
