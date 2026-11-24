@@ -47,12 +47,13 @@ impl Fanout {
     ///
     /// The rule for `reorder` is the coarse one of "Large lists" in
     /// docs/internals/contract.md:
-    /// a change of play counts reorders only views that sort or filter on
-    /// plays, and any other change reorders every view. No view sorts or
-    /// filters on plays, so a change of plays alone reorders none: only the
-    /// views whose rows show plays are told, to read their windows again
-    /// in place. A listen delivered while others browse costs them a
-    /// window's read in a list of songs, and nothing anywhere else.
+    /// a change of play counts or ratings reorders only views that sort or
+    /// filter on them, a change of portraits none, and any other change
+    /// reorders every view. No view sorts or filters on plays, ratings or
+    /// portraits, so a change of them alone reorders none: only the views
+    /// whose rows show them are told, to read their windows again in place.
+    /// A listen delivered while others browse costs them a window's read in
+    /// a list of songs, and nothing anywhere else.
     pub(crate) fn changed(&self, committed: Committed) {
         let revision = revision(committed.revision);
         let sessions: Vec<Arc<Session>> = self.lock().values().filter_map(Weak::upgrade).collect();
