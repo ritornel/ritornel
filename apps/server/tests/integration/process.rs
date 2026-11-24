@@ -9,16 +9,15 @@
 //! Every server here listens on a port the system picks, so no test needs
 //! the default port.
 
-use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::Receiver;
 
 use ritornel_engine::{OsEntropy, ServerStore, SessionToken, SystemClock};
 use serde_json::Value;
 
-use super::support::{Scratch, WAIT};
+use super::support::{Scratch, WAIT, lines, rest, signal};
 
 fn scratch() -> Scratch {
     Scratch::new("ritornel-server-process-")
@@ -47,38 +46,6 @@ fn serve(data_dir: &Path, extra: &[&str]) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
-}
-
-/// Reads a pipe on a thread of its own and hands over each line, so that
-/// whoever wants them can stop waiting. The channel closes at the pipe's
-/// end, which comes when the process ends.
-fn lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
-    let (send, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            // The test has gone only if it has failed already.
-            if send.send(line.unwrap()).is_err() {
-                break;
-            }
-        }
-    });
-    lines
-}
-
-/// The rest of what a pipe carries, up to its end. `None` if the end did
-/// not come within [`WAIT`].
-fn rest(lines: &Receiver<String>) -> Option<String> {
-    let mut text = String::new();
-    loop {
-        match lines.recv_timeout(WAIT) {
-            Ok(line) => {
-                text.push_str(&line);
-                text.push('\n');
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(text),
-            Err(mpsc::RecvTimeoutError::Timeout) => return None,
-        }
-    }
 }
 
 /// Runs a command that should end by itself, and returns how it ended and
@@ -161,29 +128,8 @@ impl Server {
     }
 
     /// Sends the server a signal, by name: `TERM`, `INT`.
-    #[cfg(unix)]
     fn signal(&self, name: &str) {
-        let sent = Command::new("kill")
-            .arg(format!("-{name}"))
-            .arg(self.pid.to_string())
-            .status()
-            .unwrap();
-        assert!(sent.success());
-    }
-
-    /// Asks the server to stop as Windows does in place of `TERM`:
-    /// `taskkill /PID` without `/F` asks its hidden window to close. A
-    /// process with no console of its own has no Ctrl+C to be sent, so
-    /// `INT` is not one of them.
-    #[cfg(windows)]
-    fn signal(&self, name: &str) {
-        assert_eq!(name, "TERM", "only TERM has a Windows equivalent here");
-        let sent = Command::new("taskkill")
-            .arg("/PID")
-            .arg(self.pid.to_string())
-            .output()
-            .unwrap();
-        assert!(sent.status.success(), "{sent:?}");
+        signal(self.pid, name);
     }
 
     /// Closes the server's standard input.

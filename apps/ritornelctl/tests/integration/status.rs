@@ -390,7 +390,8 @@ fn server_stop_stops_the_server_cleanly_and_then_finds_none() {
     assert_eq!(stopped.code, Some(0), "{stopped:?}");
     assert_eq!(stopped.stdout, "The server has stopped.\n");
     // It stopped as a signal stops it, and cleanly.
-    assert_eq!(server.ended().code(), Some(0));
+    let ended = server.wait_ended();
+    assert_eq!(ended.code, Some(0), "{ended:?}");
     assert!(
         logs(&data_dir).contains("\"stopped\""),
         "{}",

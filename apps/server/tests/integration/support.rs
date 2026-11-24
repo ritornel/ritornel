@@ -1,9 +1,11 @@
 //! Shared helpers for the `ritornel-server` integration tests.
 
+use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use ritornel_client::contract::{CONTRACT_VERSION, ClientKind, HelloParams, Id, SessionKind};
@@ -121,6 +123,7 @@ pub(crate) fn invent(data_dir: &Path, root: &Path, extra: &[&str]) {
 pub(crate) struct Running {
     pub(crate) server: Server,
     pub(crate) scratch: Scratch,
+    hello: HelloParams,
 }
 
 impl Running {
@@ -146,7 +149,28 @@ impl Running {
         )
         .await
         .unwrap();
-        Self { server, scratch }
+        Self {
+            server,
+            scratch,
+            hello: HelloParams {
+                name: "test".to_owned(),
+                kind: ClientKind::Cli,
+                version: "1".to_owned(),
+                contract_version: CONTRACT_VERSION,
+            },
+        }
+    }
+
+    /// Sets the `hello` parameters used by [`greeted`](Self::greeted).
+    pub(crate) fn with_hello(mut self, hello: HelloParams) -> Self {
+        self.hello = hello;
+        self
+    }
+
+    /// Sets the client name used by [`greeted`](Self::greeted).
+    pub(crate) fn with_client_name(mut self, name: &str) -> Self {
+        self.hello.name = name.to_owned();
+        self
     }
 
     pub(crate) fn data_dir(&self) -> PathBuf {
@@ -180,23 +204,9 @@ impl Running {
     }
 
     /// A client that has said hello.
-    pub(crate) async fn greeted(&self, via: Via, name: &str) -> Client {
-        self.greeted_with(
-            via,
-            &HelloParams {
-                name: name.to_owned(),
-                kind: ClientKind::Cli,
-                version: "1".to_owned(),
-                contract_version: CONTRACT_VERSION,
-            },
-        )
-        .await
-    }
-
-    /// A client that has said hello with these parameters.
-    pub(crate) async fn greeted_with(&self, via: Via, params: &HelloParams) -> Client {
+    pub(crate) async fn greeted(&self, via: Via) -> Client {
         let client = self.connect(via).await;
-        client.hello(params).await.unwrap();
+        client.hello(&self.hello).await.unwrap();
         client
     }
 
@@ -230,20 +240,66 @@ pub(crate) fn album(scratch: &Scratch) -> PathBuf {
     folder.canonicalize().unwrap()
 }
 
-/// Asks a server process to stop cleanly: SIGTERM on Unix, or `taskkill /PID`
-/// without `/F` on Windows, which asks the server's hidden window to close.
-pub(crate) fn terminate(pid: u32) {
-    let asked = if cfg!(windows) {
-        Command::new("taskkill")
+/// Reads a pipe on a thread of its own, forwarding each line into `send`.
+pub(crate) fn pipe_lines(pipe: impl Read + Send + 'static, send: Sender<String>) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(pipe).lines() {
+            // The test has gone only if it has failed already.
+            if send.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Reads a pipe on a thread of its own and hands over each line, so that
+/// whoever wants them can stop waiting. The channel closes at the pipe's
+/// end, which comes when the process ends.
+pub(crate) fn lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
+    let (send, lines) = mpsc::channel();
+    pipe_lines(pipe, send);
+    lines
+}
+
+/// The rest of what a pipe carries, up to its end. `None` if the end did
+/// not come within [`WAIT`].
+pub(crate) fn rest(lines: &Receiver<String>) -> Option<String> {
+    let mut text = String::new();
+    loop {
+        match lines.recv_timeout(WAIT) {
+            Ok(line) => {
+                text.push_str(&line);
+                text.push('\n');
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(text),
+            Err(mpsc::RecvTimeoutError::Timeout) => return None,
+        }
+    }
+}
+
+/// Sends a server process a signal by name (`TERM`, or `INT` on Unix).
+/// On Windows, `TERM` runs `taskkill /PID` without `/F`, which asks the
+/// server's hidden window to close; `INT` has no equivalent for a process
+/// without a console.
+pub(crate) fn signal(pid: u32, name: &str) {
+    if cfg!(windows) {
+        assert_eq!(name, "TERM", "only TERM has a Windows equivalent here");
+        let sent = Command::new("taskkill")
             .args(["/PID", &pid.to_string()])
             .output()
-            .unwrap()
-            .status
+            .unwrap();
+        assert!(sent.status.success(), "asking it to stop: {sent:?}");
     } else {
-        Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .unwrap()
-    };
-    assert!(asked.success(), "asking it to stop: {asked}");
+        let sent = Command::new("kill")
+            .args([&format!("-{name}"), &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(sent.status.success(), "asking it to stop: {sent:?}");
+    }
+}
+
+/// Asks a server process to stop cleanly (`SIGTERM` on Unix, `taskkill /PID`
+/// on Windows).
+pub(crate) fn terminate(pid: u32) {
+    signal(pid, "TERM");
 }

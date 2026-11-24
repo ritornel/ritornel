@@ -120,8 +120,8 @@ pub(crate) struct Ended {
     pub(crate) stderr: String,
 }
 
-/// `ritornelctl` with these arguments, and nothing in its environment that
-/// this test did not put there.
+/// `ritornelctl` with these arguments, with ambient `RITORNEL_DATA_DIR`,
+/// `RITORNEL_BACKUP_DIR`, and `RITORNEL_NAME` cleared.
 pub(crate) fn ritornelctl_command(args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ritornelctl"));
     command
@@ -244,7 +244,10 @@ pub(crate) fn server_binary() -> PathBuf {
 }
 
 /// A `ritornel-server serve` command on `data_dir` and a system-picked port,
-/// with ambient `RITORNEL_*` and `SCROBL_*` variables cleared.
+/// clearing ambient settings and credentials (`RITORNEL_DATA_DIR`,
+/// `RITORNEL_LISTEN`, `RITORNEL_LOG_LEVEL`, `RITORNEL_BACKUP_DIR`,
+/// `RITORNEL_NAME`, `RITORNEL_CACHE_SIZE`, `SCROBL_API_KEY`, and
+/// `SCROBL_API_SECRET`).
 pub(crate) fn server_command(data_dir: &Path) -> Command {
     let mut command = Command::new(server_binary());
     command
@@ -393,6 +396,27 @@ impl Server {
         self.signal("TERM");
         let ended = self.ended();
         assert!(ended.success(), "the server ended with {ended}");
+    }
+
+    /// Waits for the server to end by itself and returns its exit status and
+    /// captured output. Fails if it does not end within [`WAIT`].
+    pub(crate) fn wait_ended(mut self) -> Ended {
+        let Some(stdout) = rest(&self.stdout) else {
+            panic!("the server did not end within {WAIT:?}");
+        };
+        let stderr = match self.stderr.as_ref() {
+            Some(pipe) => rest(pipe).unwrap_or_else(|| {
+                panic!("the server did not end within {WAIT:?}");
+            }),
+            None => String::new(),
+        };
+        let ended = self.child.wait().unwrap();
+        Ended {
+            code: ended.code(),
+            status: ended.to_string(),
+            stdout,
+            stderr,
+        }
     }
 
     /// Sends the server a signal and waits for it to end, returning its

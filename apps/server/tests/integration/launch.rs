@@ -22,7 +22,7 @@ use ritornel_client::launch::{Launcher, Program, STOP_WAIT, Stopped};
 use ritornel_client::local::LocalServer;
 use ritornel_client::{Client, Error, NotRunning};
 
-use super::support::{Scratch, WAIT};
+use super::support::{Scratch, WAIT, terminate};
 
 fn scratch() -> Scratch {
     Scratch::canonical("ritornel-launch-")
@@ -168,18 +168,7 @@ async fn a_server_started_by_hand_is_used_and_never_stopped() {
         assert_eq!(again.descriptor.server_id, found.descriptor.server_id);
     })
     .await;
-    // SIGTERM, or on Windows `taskkill /PID` without `/F`, which asks the
-    // server's hidden window to close.
-    if cfg!(windows) {
-        let _ = Command::new("taskkill")
-            .arg("/PID")
-            .arg(by_hand.0.id().to_string())
-            .output();
-    } else {
-        let _ = Command::new("kill")
-            .arg(by_hand.0.id().to_string())
-            .status();
-    }
+    terminate(by_hand.0.id());
     let ended = by_hand.0.wait().unwrap();
     assert!(ended.success(), "the server ended with {ended}");
     launched.unwrap();

@@ -16,7 +16,6 @@
 //! Nothing here sleeps, and every test is cut off, with a message, if it
 //! has not finished in [`WAIT`].
 
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -33,7 +32,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use super::support::{Running, Scratch, WAIT, bounded, terminate, token_in};
+use super::support::{Running, Scratch, WAIT, bounded, pipe_lines, terminate, token_in};
 
 /// The `Origin` the desktop's page presents.
 const DESKTOP: &str = "tauri://localhost";
@@ -627,20 +626,8 @@ impl Process {
         // Everything it prints, on both pipes, a line at a time. The
         // channel closes when the process has ended.
         let (send, printed) = std::sync::mpsc::channel();
-        let pipes: [Box<dyn std::io::Read + Send>; 2] = [
-            Box::new(child.stdout.take().unwrap()),
-            Box::new(child.stderr.take().unwrap()),
-        ];
-        for pipe in pipes {
-            let send = send.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(pipe).lines() {
-                    if send.send(line.unwrap()).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        pipe_lines(child.stdout.take().unwrap(), send.clone());
+        pipe_lines(child.stderr.take().unwrap(), send);
         let process = Self(child);
         let ready = printed
             .recv_timeout(WAIT)

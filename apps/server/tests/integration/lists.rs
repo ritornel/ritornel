@@ -25,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::support::{
-    self, Scratch, Via, bounded, invent as run_invent, on_both_transports, terminate,
+    Running, Scratch, Via, bounded, invent as run_invent, on_both_transports, terminate,
 };
 
 fn scratch() -> Scratch {
@@ -52,33 +52,19 @@ fn invent(data_dir: &Path, root: &Path, albums: usize) {
     );
 }
 
-/// A server inside the test, on an invented library of its own.
-struct Running(support::Running);
-
-impl std::ops::Deref for Running {
-    type Target = support::Running;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+/// Starts a server inside the test, on an invented library of its own.
+async fn start(albums: usize) -> Running {
+    let scratch = scratch();
+    if albums > 0 {
+        invent(&scratch.data_dir(), &scratch.root(), albums);
     }
+    Running::on_scratch(scratch, Bounds::default())
+        .await
+        .with_client_name("lists-test")
 }
 
-impl Running {
-    async fn start(albums: usize) -> Self {
-        let scratch = scratch();
-        if albums > 0 {
-            invent(&scratch.data_dir(), &scratch.root(), albums);
-        }
-        Self(support::Running::on_scratch(scratch, Bounds::default()).await)
-    }
-
-    async fn greeted(&self, via: Via) -> Client {
-        self.0.greeted(via, "lists-test").await
-    }
-
-    fn step(&self, kind: ChurnKind) -> Churned {
-        self.server.invent_step(kind).unwrap()
-    }
+fn step(running: &Running, kind: ChurnKind) -> Churned {
+    running.server.invent_step(kind).unwrap()
 }
 
 fn open(kind: ListKind, sort: Option<SortKey>, window: Option<(u64, u64)>) -> ListOpenParams {
@@ -138,7 +124,7 @@ on_both_transports! {
 }
 
 async fn a_list_opens_with_an_exact_total_and_the_window_asked_for(via: Via) {
-    let running = Running::start(40).await;
+    let running = start(40).await;
     let client = running.greeted(via).await;
     for (kind, expected) in [
         (ListKind::Artists, "artist"),
@@ -201,7 +187,7 @@ async fn a_list_opens_with_an_exact_total_and_the_window_asked_for(via: Via) {
 }
 
 async fn sections_are_letters_years_or_stretches_of_time(via: Via) {
-    let running = Running::start(60).await;
+    let running = start(60).await;
     let client = running.greeted(via).await;
     for (kind, sort) in [
         (ListKind::Artists, SortKey::Name),
@@ -271,7 +257,7 @@ async fn sections_are_letters_years_or_stretches_of_time(via: Via) {
 }
 
 async fn a_row_is_found_by_its_id_and_by_the_start_of_its_name(via: Via) {
-    let running = Running::start(60).await;
+    let running = start(60).await;
     let client = running.greeted(via).await;
     let opened = client
         .list_open(&open(
@@ -358,7 +344,7 @@ fn folded(text: &str) -> String {
 }
 
 async fn text_matches_ignoring_case_and_accents_and_short_text_a_word_start(via: Via) {
-    let running = Running::start(150).await;
+    let running = start(150).await;
     let client = running.greeted(via).await;
     // An artist with an accent in their name.
     let artists = client
@@ -436,7 +422,7 @@ async fn text_matches_ignoring_case_and_accents_and_short_text_a_word_start(via:
 }
 
 async fn a_filter_by_artist_gives_their_records(via: Via) {
-    let running = Running::start(80).await;
+    let running = start(80).await;
     let client = running.greeted(via).await;
     let artists = client
         .list_open(&open(ListKind::Artists, None, Some((0, 500))))
@@ -494,7 +480,7 @@ async fn a_filter_by_artist_gives_their_records(via: Via) {
 }
 
 async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_read(via: Via) {
-    let running = Running::start(30).await;
+    let running = start(30).await;
     let mut client = running.greeted(via).await;
     client.subscribe(&[Topic::Library]).await.unwrap();
     let opened = client
@@ -504,10 +490,10 @@ async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_r
     // Two writes with nothing sent between them: the test's runtime has one
     // thread, and this does not let go of it.
     assert!(matches!(
-        running.step(ChurnKind::Change),
+        step(&running, ChurnKind::Change),
         Churned::Changed(_)
     ));
-    assert!(matches!(running.step(ChurnKind::Add), Churned::Added(_)));
+    assert!(matches!(step(&running, ChurnKind::Add), Churned::Added(_)));
 
     let mut library = Vec::new();
     let mut lists = Vec::new();
@@ -539,13 +525,13 @@ async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_r
 
     // A session that holds no view and is not subscribed is told nothing.
     let mut quiet = running.greeted(via).await;
-    running.step(ChurnKind::Change);
+    step(&running, ChurnKind::Change);
     quiet.servers().await.unwrap();
     assert!(quiet.try_next_event().is_none());
 }
 
 async fn a_view_replaced_with_an_anchor_says_where_the_anchor_is_now(via: Via) {
-    let running = Running::start(40).await;
+    let running = start(40).await;
     let client = running.greeted(via).await;
     let opened = client
         .list_open(&open(
@@ -558,7 +544,7 @@ async fn a_view_replaced_with_an_anchor_says_where_the_anchor_is_now(via: Via) {
     let anchor = album(&opened.rows[20]).album.id().to_string();
     // Records come in, some of them before the anchor.
     for _ in 0..4 {
-        running.step(ChurnKind::Add);
+        step(&running, ChurnKind::Add);
     }
     let mut replaced = open(ListKind::Albums, Some(SortKey::Title), Some((0, 200)));
     replaced.replaces = Some(Replaces {
@@ -585,13 +571,13 @@ async fn a_view_replaced_with_an_anchor_says_where_the_anchor_is_now(via: Via) {
 }
 
 async fn a_row_gone_since_the_view_opened_is_gone_at_its_index(via: Via) {
-    let running = Running::start(40).await;
+    let running = start(40).await;
     let client = running.greeted(via).await;
     let opened = client
         .list_open(&open(ListKind::Songs, None, None))
         .await
         .unwrap();
-    assert_eq!(running.step(ChurnKind::Merge), Churned::Merged);
+    assert_eq!(step(&running, ChurnKind::Merge), Churned::Merged);
     let rows = all_rows(&client, &opened).await;
     // The view still has every index it had, and the merged tracks are
     // gone at theirs.
@@ -618,7 +604,7 @@ async fn a_row_gone_since_the_view_opened_is_gone_at_its_index(via: Via) {
 }
 
 async fn a_session_holds_at_most_its_limit_of_views(via: Via) {
-    let running = Running::start(10).await;
+    let running = start(10).await;
     let client = running.greeted(via).await;
     let descriptor = client
         .hello(&HelloParams {
@@ -674,7 +660,7 @@ async fn a_session_holds_at_most_its_limit_of_views(via: Via) {
 }
 
 async fn a_view_that_was_closed_or_never_opened_has_expired(via: Via) {
-    let running = Running::start(10).await;
+    let running = start(10).await;
     let client = running.greeted(via).await;
     let opened = client
         .list_open(&open(ListKind::Artists, None, None))
@@ -704,7 +690,7 @@ async fn a_view_that_was_closed_or_never_opened_has_expired(via: Via) {
 }
 
 async fn a_server_with_no_library_has_no_lists(via: Via) {
-    let running = Running::start(0).await;
+    let running = start(0).await;
     let client = running.greeted(via).await;
     match client.list_open(&open(ListKind::Artists, None, None)).await {
         Err(ritornel_client::Error::Call(error)) => {
@@ -716,7 +702,7 @@ async fn a_server_with_no_library_has_no_lists(via: Via) {
 }
 
 async fn the_media_token_is_the_same_for_the_session(via: Via) {
-    let running = Running::start(5).await;
+    let running = start(5).await;
     let client = running.greeted(via).await;
     let token = client.media_token().await.unwrap().token;
     assert_eq!(token.len(), 64);
@@ -781,7 +767,7 @@ fn art(art: &str, size: u32, token: Option<&str>) -> String {
 #[tokio::test]
 async fn a_cover_is_served_at_a_size_with_immutable_headers_and_kept_for_next_time() {
     bounded(async {
-        let running = Running::start(10).await;
+        let running = start(10).await;
         let client = running.greeted(Via::Socket).await;
         let token = client.media_token().await.unwrap().token;
         let arts = arts(&client).await;
@@ -855,7 +841,7 @@ fn image_size(jpeg: &[u8]) -> (u32, u32) {
 #[tokio::test]
 async fn a_cover_needs_the_media_token_and_the_token_opens_nothing_else() {
     bounded(async {
-        let running = Running::start(5).await;
+        let running = start(5).await;
         let client = running.greeted(Via::Socket).await;
         let token = client.media_token().await.unwrap().token;
         let first = arts(&client).await.remove(0);
