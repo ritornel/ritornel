@@ -21,6 +21,9 @@
 //! ritornelctl corrections preview --undo <answer>... [--data-dir <dir>] [--json]
 //! ritornelctl corrections confirm <proposal>... [--candidate <release group>] [--release <release>] [--fingerprint <f>] [--data-dir <dir>] [--json]
 //! ritornelctl corrections undo <answer>... [--data-dir <dir>] [--json]
+//! ritornelctl corrections decline <proposal> [--candidate <release group>] [--release <release>] [--data-dir <dir>] [--json]
+//! ritornelctl corrections stop <proposal> [--data-dir <dir>] [--json]
+//! ritornelctl corrections apart <release> <release> [--data-dir <dir>] [--json]
 //! ritornelctl corrections answers [--before <answer>] [--limit <n>] [--data-dir <dir>] [--json]
 //! ritornelctl corrections answer <answer> [--data-dir <dir>] [--json]
 //! ritornelctl play <folder | track>... [--album <release>] [--start <n>] [--follow]
@@ -102,6 +105,11 @@ Usage:
                                   [--release <release>] [--fingerprint <f>]
                                   [--data-dir <dir>] [--json]
   ritornelctl corrections undo <answer>... [--data-dir <dir>] [--json]
+  ritornelctl corrections decline <proposal> [--candidate <release group>]
+                                  [--release <release>] [--data-dir <dir>]
+                                  [--json]
+  ritornelctl corrections stop <proposal> [--data-dir <dir>] [--json]
+  ritornelctl corrections apart <release> <release> [--data-dir <dir>] [--json]
   ritornelctl corrections answers [--before <answer>] [--limit <n>]
                                   [--data-dir <dir>] [--json]
   ritornelctl corrections answer <answer> [--data-dir <dir>] [--json]
@@ -237,6 +245,18 @@ Commands:
                    answer that took its album's title or credit from one
                    undone rests on it, and is undone with it: those are
                    listed first
+  corrections decline <proposal>
+                   Say no to a proposal's likeliest candidate, or the one
+                   --candidate or --release names: it is not offered these
+                   files again. It moves nothing, and can be undone
+  corrections stop <proposal>
+                   Ask no more about a proposal's files, by any proposal,
+                   until the answer is undone
+  corrections apart <release> <release>
+                   Keep two albums apart: the files on each are never put
+                   on one release or in one release group with the
+                   other's, by a proposal or by the catalog. Undone like
+                   any answer
   corrections answers
                    Show the answers, newest first, a page at a time: 50,
                    or --limit, and the next page with the --before it
@@ -877,8 +897,37 @@ enum CorrectionsCommand {
     Preview(PreviewArgs),
     Confirm(ConfirmArgs),
     Undo(UndoArgs),
+    Decline(DeclineArgs),
+    Stop(ProposalArgs),
+    Apart(ApartArgs),
     Answers(AnswersArgs),
     Answer(AnswerArgs),
+}
+
+/// What `corrections decline` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct DeclineArgs {
+    /// The proposal, by its ID.
+    pub(crate) proposal: String,
+    /// The candidate to say no to, by its release group ID: the likeliest
+    /// when left out.
+    #[arg(long)]
+    pub(crate) candidate: Option<String>,
+    /// For an edition: the release to say no to.
+    #[arg(long)]
+    pub(crate) release: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `corrections apart` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ApartArgs {
+    /// Two releases, by their IDs.
+    #[arg(required = true, num_args = 2)]
+    pub(crate) releases: Vec<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `corrections answers` takes.
@@ -1205,6 +1254,13 @@ fn try_run(
             corrections::confirm(&args, env, out)
         }
         Command::Corrections(CorrectionsCommand::Undo(args)) => corrections::undo(&args, env, out),
+        Command::Corrections(CorrectionsCommand::Decline(args)) => {
+            corrections::decline(&args, env, out)
+        }
+        Command::Corrections(CorrectionsCommand::Stop(args)) => corrections::stop(&args, env, out),
+        Command::Corrections(CorrectionsCommand::Apart(args)) => {
+            corrections::apart(&args, env, out)
+        }
         Command::Corrections(CorrectionsCommand::Answer(args)) => {
             corrections::answer(&args, env, out)
         }
@@ -1446,6 +1502,46 @@ mod tests {
                 server: ServerArgs::default(),
             }))
         );
+    }
+
+    #[test]
+    fn corrections_says_no_three_ways() {
+        assert_eq!(
+            parse(args(&[
+                "corrections",
+                "decline",
+                "one",
+                "--candidate",
+                "group"
+            ]))
+            .unwrap()
+            .command,
+            Command::Corrections(CorrectionsCommand::Decline(DeclineArgs {
+                proposal: "one".to_owned(),
+                candidate: Some("group".to_owned()),
+                release: None,
+                server: ServerArgs::default(),
+            }))
+        );
+        assert_eq!(
+            parse(args(&["corrections", "stop", "one"]))
+                .unwrap()
+                .command,
+            Command::Corrections(CorrectionsCommand::Stop(ProposalArgs {
+                proposal: "one".to_owned(),
+                server: ServerArgs::default(),
+            }))
+        );
+        assert_eq!(
+            parse(args(&["corrections", "apart", "a", "b"]))
+                .unwrap()
+                .command,
+            Command::Corrections(CorrectionsCommand::Apart(ApartArgs {
+                releases: vec!["a".to_owned(), "b".to_owned()],
+                server: ServerArgs::default(),
+            }))
+        );
+        assert!(parse(args(&["corrections", "apart", "a"])).is_err());
     }
 
     #[test]

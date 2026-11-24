@@ -482,9 +482,9 @@ fn history_rule(library: &ritornel_engine::LibraryStore, steps: &Steps) -> Resul
         .map(|done| info!(%done, "history is derived again under the play rule in force"))
 }
 
-/// Reads the kept MusicBrainz replies again if this build reads them
-/// otherwise, with no network ("Replies and facts" in
-/// docs/internals/corrections.md).
+/// Works out again, from stored rows and with no network, whatever this
+/// build works out otherwise: the kept MusicBrainz replies' facts, the disc
+/// layouts and the proposals (docs/internals/corrections.md).
 fn corrections_rule(library: &ritornel_engine::LibraryStore) -> Result<(), Error> {
     let request = ritornel_engine::WriteRequest {
         method: ritornel_engine::FACTS_METHOD,
@@ -496,7 +496,7 @@ fn corrections_rule(library: &ritornel_engine::LibraryStore) -> Result<(), Error
         .map_err(Error::Library)?
         .is_some()
     {
-        info!("MusicBrainz's replies are read again by the reader in force");
+        info!("the corrections evidence and proposals are worked out again by this build");
     }
     Ok(())
 }

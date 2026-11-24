@@ -880,7 +880,7 @@ impl LibraryStore {
             let asked = crate::answer_store::asked_to_undo(connection, &answers)?;
             let all = crate::answer_store::with_dependents(connection, &asked)?;
             // What the answers said, and every file they are about: those
-            // they gave values, and those they moved.
+            // they gave values or a no, and those they moved.
             let mut said: Vec<(i64, String, u32)> = Vec::new();
             let mut touched: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
             for answer in &all {
@@ -891,6 +891,15 @@ impl LibraryStore {
                              WHERE answer_id = ?1 AND withdrawn_by_answer_id IS NULL",
                         )?
                         .query_map([answer], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                touched.extend(
+                    connection
+                        .prepare_cached(
+                            "SELECT ri.source_item_id FROM answer_rule_item ri
+                             JOIN answer_rule r ON r.id = ri.rule_id WHERE r.answer_id = ?1",
+                        )?
+                        .query_map([answer], |row| row.get::<_, i64>(0))?
                         .collect::<Result<Vec<_>, _>>()?,
                 );
                 let before: String = connection.query_row(

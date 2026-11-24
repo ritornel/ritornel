@@ -1,18 +1,21 @@
 //! The corrections calls: the disc layouts, the library's settings, whose
 //! one setting is the switch that lets it be asked about at MusicBrainz,
-//! and the lookup of one album. See docs/internals/corrections.md.
+//! the lookup of one album, the proposals and their previews, and the
+//! answers: a yes, a no, a keep-apart and an undo, and the ledger of them.
+//! See docs/internals/corrections.md.
 
 use std::sync::{Arc, PoisonError};
 
 use ritornel_contract::methods::{
-    CorrectionsConfirm, CorrectionsLookup, CorrectionsUndo, LibrarySetSettings, Method,
+    CorrectionsConfirm, CorrectionsDecline, CorrectionsKeepApart, CorrectionsLookup,
+    CorrectionsUndo, LibrarySetSettings, Method,
 };
 use ritornel_contract::{
     AnswerGot, AnswerList, AnswerParams, AnswerWritten, Answered, AnswersParams, ConfirmParams,
-    CorrectionsSummary, DiscList, DiscLookup, DiscsParams, ErrorCode, Id, LibrarySettings,
-    LibrarySettingsSet, LookupDone, LookupOutcome, LookupParams, PreviewParams, PreviewShown,
-    ProposalGetParams, ProposalGot, ProposalList, Receipt, ReceiptStatus, RpcError, SetBy,
-    SetLibrarySettingsParams, Setting, UndoParams,
+    CorrectionsSummary, DeclineParams, DiscList, DiscLookup, DiscsParams, ErrorCode, Id,
+    KeepApartParams, LibrarySettings, LibrarySettingsSet, LookupDone, LookupOutcome, LookupParams,
+    PreviewParams, PreviewShown, ProposalGetParams, ProposalGot, ProposalList, Receipt,
+    ReceiptStatus, RpcError, SetBy, SetLibrarySettingsParams, Setting, UndoParams,
 };
 use ritornel_engine::{Asked, Command, KeptReply, WriteRequest, reads_as_disc_reply};
 use ritornel_source::Catalogue;
@@ -262,6 +265,83 @@ impl Core {
                 .map_err(answer_refused)
         })?;
         stored(CorrectionsUndo::NAME, &written.result_json)
+    }
+
+    /// `corrections.decline`: not this candidate, or ask no more, in one
+    /// write.
+    pub(super) fn corrections_decline(
+        &self,
+        stores: &Stores,
+        params: &DeclineParams,
+    ) -> Result<Answered, RpcError> {
+        let key = params.idempotency_key;
+        let request = WriteRequest {
+            method: CorrectionsDecline::NAME,
+            command: Some(Command {
+                id: key,
+                fingerprint: fingerprint::<CorrectionsDecline>(params)?,
+            }),
+            client: self.client(),
+        };
+        let params = params.clone();
+        let written = Self::library(stores, |library| {
+            library
+                .decline(request, params, move |rev, said, moved| {
+                    answered(
+                        key,
+                        rev,
+                        said.into_iter().map(|(answer, proposal)| AnswerWritten {
+                            answer_id: answer,
+                            proposal_id: Some(proposal),
+                            undoes: None,
+                        }),
+                        moved,
+                    )
+                })
+                .map_err(answer_refused)
+        })?;
+        stored(CorrectionsDecline::NAME, &written.result_json)
+    }
+
+    /// `corrections.keepApart`: two albums never one, in one write.
+    pub(super) fn corrections_keep_apart(
+        &self,
+        stores: &Stores,
+        params: &KeepApartParams,
+    ) -> Result<Answered, RpcError> {
+        // No scan is claimed from this check to the end of the write.
+        let _answering = self
+            .answering
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        no_scan_running(stores)?;
+        let key = params.idempotency_key;
+        let request = WriteRequest {
+            method: CorrectionsKeepApart::NAME,
+            command: Some(Command {
+                id: key,
+                fingerprint: fingerprint::<CorrectionsKeepApart>(params)?,
+            }),
+            client: self.client(),
+        };
+        let releases = params.releases.clone();
+        let written = Self::library(stores, |library| {
+            library
+                .keep_apart(request, releases, move |rev, answer, moved| {
+                    answered(
+                        key,
+                        rev,
+                        std::iter::once(AnswerWritten {
+                            answer_id: answer,
+                            proposal_id: None,
+                            undoes: None,
+                        }),
+                        moved,
+                    )
+                })
+                .map_err(answer_refused)
+        })?;
+        stored(CorrectionsKeepApart::NAME, &written.result_json)
     }
 
     /// `corrections.answers`: the ledger.

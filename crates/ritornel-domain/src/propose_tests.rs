@@ -943,6 +943,44 @@ fn an_edition_for_a_disc_added_later_puts_it_with_those_answered_before() {
 }
 
 #[test]
+fn a_no_is_heard_a_candidate_declined_stops_and_discs_kept_apart_are_not_joined() {
+    let propose_with = |noes: crate::library::Noes| {
+        let mut library = library();
+        library.noes = noes;
+        propose(
+            &library,
+            &discs(),
+            &replies(),
+            &ids(),
+            &crate::Policy::current(),
+        )
+    };
+    // Not this album for the bonus disc: it is offered none.
+    let all = propose_with(crate::library::Noes {
+        not_candidate: vec![(GROUP.to_owned(), vec![4, 5])],
+        ..Default::default()
+    });
+    let bonus = all.iter().find(|proposal| proposal.anchor == 4);
+    assert!(bonus.is_none_or(|bonus| bonus.candidates.is_empty()));
+    // Stop asking about the main disc: no proposal is about it.
+    let all = propose_with(crate::library::Noes {
+        stop_asking: vec![(None, vec![1, 2, 3])],
+        ..Default::default()
+    });
+    assert!(all.iter().all(|proposal| !proposal.items.contains(&1)));
+    // The two discs kept apart: each is the album alone, not joined, and
+    // they are no one release.
+    let all = propose_with(crate::library::Noes {
+        apart: vec![(vec![1, 2, 3], vec![4, 5])],
+        ..Default::default()
+    });
+    assert!(editions_of(all.clone()).is_empty());
+    for proposal in albums(all) {
+        assert!(proposal.candidates[0].onto.is_empty());
+    }
+}
+
+#[test]
 fn a_disc_added_later_is_offered_only_the_release_those_answered_before_are() {
     let mut replies = replies();
     replies.insert(
@@ -1058,6 +1096,27 @@ fn a_second_copy_of_an_edition_answered_before_is_proposed_as_a_release_of_its_o
     let candidate = &editions[0].candidates[0];
     assert_eq!(candidate.release.as_deref(), Some("deluxe"));
     assert!(candidate.onto.is_empty(), "not put with the first copy");
+}
+
+#[test]
+fn a_stop_on_an_edition_leaves_the_album_proposals_and_one_on_an_album_stops_both() {
+    let propose_with = |kind: &str| {
+        let mut library = library();
+        library.noes.stop_asking = vec![(Some(kind.to_owned()), vec![1, 2, 3, 4, 5])];
+        let kinds: Vec<&str> = propose(
+            &library,
+            &discs(),
+            &replies(),
+            &ids(),
+            &crate::Policy::current(),
+        )
+        .into_iter()
+        .map(|proposal| proposal.kind)
+        .collect();
+        kinds
+    };
+    assert_eq!(propose_with("edition"), ["album", "album"]);
+    assert!(propose_with("album").is_empty());
 }
 
 /// The main disc said to be `said`, and copies of discs with these disc

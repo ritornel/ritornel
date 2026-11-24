@@ -627,6 +627,16 @@ methods! {
     CorrectionsUndo: "corrections.undo", Command, needs_full: true,
     UndoParams => Answered;
 
+    /// `corrections.decline`: not this candidate for a proposal's files, or
+    /// ask no more about them, in one write. Undone like any answer.
+    CorrectionsDecline: "corrections.decline", Command, needs_full: true,
+    DeclineParams => Answered;
+
+    /// `corrections.keepApart`: the files of two albums are never one
+    /// album, in one write. Undone like any answer.
+    CorrectionsKeepApart: "corrections.keepApart", Command, needs_full: true,
+    KeepApartParams => Answered;
+
     /// `corrections.answers`: the ledger of answers, newest first, a page
     /// at a time.
     CorrectionsAnswers: "corrections.answers", Query, needs_full: true,
@@ -743,6 +753,8 @@ mod tests {
                 "corrections.preview",
                 "corrections.confirm",
                 "corrections.undo",
+                "corrections.decline",
+                "corrections.keepApart",
                 "corrections.answers",
                 "corrections.answer"
             ]
@@ -813,6 +825,8 @@ mod tests {
                 "corrections.preview",
                 "corrections.confirm",
                 "corrections.undo",
+                "corrections.decline",
+                "corrections.keepApart",
                 "corrections.answers",
                 "corrections.answer"
             ]

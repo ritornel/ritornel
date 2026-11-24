@@ -4202,3 +4202,105 @@ fn two_copies_of_one_edition_an_answer_gave_its_release_id_stay_two() {
     world.settle();
     assert_ne!(world.release(copies[0]), world.release(copies[1]));
 }
+
+#[test]
+fn files_kept_apart_are_on_no_one_release_and_in_no_one_group() {
+    let mut world = World::default();
+    let group = "00000000-0000-4000-8000-0000000000b1";
+    let one = album(
+        &mut world,
+        "Moss Arcade/Tin Weather",
+        "Moss Arcade",
+        "Tin Weather",
+        10,
+    );
+    let other = album(
+        &mut world,
+        "Moss Arcade/Tin Weather (Copy)",
+        "Moss Arcade",
+        "Tin Weather",
+        40,
+    );
+    for item in &mut world.library.items {
+        item.facts.release_group_mbid = Some(group.to_owned());
+        item.facts.release_mbid = Some("rel-1".to_owned());
+    }
+    world.settle();
+    // One release ID and one album ID: one release.
+    assert_eq!(world.release(one[0]), world.release(other[0]));
+    world.library.noes.apart = vec![(one.clone(), other.clone())];
+    world.settle();
+    assert_ne!(world.release(one[0]), world.release(other[0]));
+    assert_ne!(world.group(one[0]), world.group(other[0]));
+    // Within each side, the files stay together.
+    assert_eq!(world.release(one[0]), world.release(one[2]));
+    assert_eq!(world.release(other[0]), world.release(other[2]));
+}
+
+#[test]
+fn a_release_kept_apart_from_one_whose_group_is_chosen_leaves_that_group() {
+    let mut world = World::default();
+    let group = "00000000-0000-4000-8000-0000000000b1";
+    let one = album(
+        &mut world,
+        "Moss Arcade/Tin Weather",
+        "Moss Arcade",
+        "Tin Weather",
+        10,
+    );
+    let other = album(
+        &mut world,
+        "Moss Arcade/Tin Weather (Reissue)",
+        "Moss Arcade",
+        "Tin Weather",
+        40,
+    );
+    for item in &mut world.library.items {
+        item.facts.release_group_mbid = Some(group.to_owned());
+    }
+    world.settle();
+    assert_ne!(world.release(one[0]), world.release(other[0]));
+    assert_eq!(world.group(one[0]), world.group(other[0]));
+    // The first is put in the group by choice; the second is there only
+    // by its tags.
+    let chosen = world.group(one[0]);
+    let row = world.release(one[0]).unwrap();
+    world.library.releases.get_mut(&row).unwrap().chosen_group = Some(chosen);
+    world.library.noes.apart = vec![(one.clone(), other.clone())];
+    world.settle();
+    assert_eq!(world.group(one[0]), chosen);
+    assert_ne!(world.group(other[0]), chosen);
+}
+
+#[test]
+fn songs_of_two_albums_kept_apart_are_bound_as_songs_of_different_albums() {
+    let mut world = World::default();
+    let one = album(
+        &mut world,
+        "Moss Arcade/Moss Arcade",
+        "Moss Arcade",
+        "Moss Arcade",
+        10,
+    );
+    // Another self-titled album, its songs titled alike and a second longer.
+    let other = album(
+        &mut world,
+        "Moss Arcade/Moss Arcade (2019)",
+        "Moss Arcade",
+        "Moss Arcade",
+        40,
+    );
+    for item in &mut world.library.items {
+        if other.contains(&item.id) {
+            item.facts.duration_ms = item.facts.duration_ms.map(|ms| ms + 1000);
+        }
+    }
+    world.settle();
+    // Taken as two copies of one album, each song is one recording.
+    assert_eq!(world.recording(one[0]), world.recording(other[0]));
+    world.library.noes.apart = vec![(one.clone(), other.clone())];
+    world.settle();
+    for (one, other) in one.iter().zip(&other) {
+        assert_ne!(world.recording(*one), world.recording(*other));
+    }
+}
