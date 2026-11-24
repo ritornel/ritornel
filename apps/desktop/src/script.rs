@@ -35,6 +35,10 @@
 //!   there, the pointer moved there in steps while it is held, and let go
 //!   where it is, as a drag by hand; in points from the window's top left
 //! - `mem <label>`: print the memory footprint
+//! - `count <label>`: print how many frames were drawn and covers asked of
+//!   the server since the last count
+//! - `held <label>`: print whether a drag that has ended still holds a
+//!   picture, and how many pictures wait to leave the sprite atlas
 //! - `waits <label>`: print how long tiles waited for their pictures since
 //!   the last, with `RITORNEL_GPUI_WAITS=1` (`waits.rs`); `waits -` starts
 //!   the count again
@@ -46,16 +50,29 @@
     reason = "a developer's tool: it reports on standard error"
 )]
 
-use std::time::Duration;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 
 use gpui::{AnyWindowHandle, AsyncApp, TouchPhase, px, size};
 
 use crate::shell::Shell;
 
+thread_local! {
+    /// Frames drawn so far, for `count`.
+    static FRAMES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A frame is drawn.
+pub(crate) fn frame() {
+    FRAMES.with(|frames| frames.set(frames.get() + 1));
+}
+
 pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) -> gpui::Task<()> {
     cx.spawn(async move |cx| {
         // Where the pointer is, for a drag by hand.
         let mut pointer = gpui::point(px(0.), px(0.));
+        // Frames, covers asked for, and when, at the last count.
+        let mut counted = (FRAMES.with(Cell::get), crate::net::art_reads(), Instant::now());
         for step in script
             .split(';')
             .map(str::trim)
@@ -586,6 +603,27 @@ pub(crate) fn run(script: String, window: AnyWindowHandle, cx: &mut AsyncApp) ->
                 "settings" => settings(rest, cx),
                 "close" => {
                     let _ = window.update(cx, |_, window, _| window.remove_window());
+                }
+                "count" => {
+                    let now = (FRAMES.with(Cell::get), crate::net::art_reads(), Instant::now());
+                    let secs = now.2.duration_since(counted.2).as_secs_f64();
+                    let frames = now.0 - counted.0;
+                    eprintln!(
+                        "count {}: {frames} frames in {secs:.1} s, {:.1} a second; {} covers asked for",
+                        rest.trim(),
+                        frames as f64 / secs.max(1e-3),
+                        now.1 - counted.1
+                    );
+                    counted = now;
+                }
+                "held" => {
+                    let carried = cx.update(|cx| crate::carry::holds_picture(cx));
+                    eprintln!(
+                        "held {}: a picture carried {}, {} waiting to leave the atlas",
+                        rest.trim(),
+                        if carried { "still held" } else { "let go" },
+                        crate::covers::waiting_drops()
+                    );
                 }
                 "mem" => eprintln!("mem {}: {}", rest.trim(), crate::platform::memory_line()),
                 "waits" => crate::waits::report(rest.trim()),

@@ -26,6 +26,14 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+/// Covers asked of the server, for the script's `count` step.
+static ART_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many covers have been asked of the server so far.
+pub(crate) fn art_reads() -> u64 {
+    ART_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The runtime calls, events and covers run on, for as long as the app does.
 pub(crate) fn rt() -> &'static Handle {
     static RUNTIME: OnceLock<Option<Runtime>> = OnceLock::new();
@@ -205,12 +213,7 @@ impl Net {
     /// The same, reading pictures from `endpoint` at `sizes`, for tests.
     #[cfg(test)]
     pub(crate) fn with_art(mut self, endpoint: SocketAddr, sizes: Vec<u32>) -> Self {
-        self.art = Arc::new(ArtHttp {
-            endpoint,
-            token: String::new(),
-            idle: Mutex::new(Vec::new()),
-            in_flight: Semaphore::new(MAX_ART_IN_FLIGHT),
-        });
+        self.art = Arc::new(ArtHttp::at(endpoint));
         self.art_sizes = sizes;
         self
     }
@@ -260,6 +263,17 @@ pub(crate) enum NoArt {
 }
 
 impl ArtHttp {
+    /// Covers read from `endpoint`, for tests.
+    #[cfg(test)]
+    pub(crate) fn at(endpoint: SocketAddr) -> Self {
+        Self {
+            endpoint,
+            token: String::new(),
+            idle: Mutex::new(Vec::new()),
+            in_flight: Semaphore::new(MAX_ART_IN_FLIGHT),
+        }
+    }
+
     /// Reads one cover. Dropped part way, the connection is closed, and the
     /// server drops the cover from its queue if it has not begun it.
     pub(crate) async fn get(&self, art: Id, size: u32) -> Result<Vec<u8>, NoArt> {
@@ -267,6 +281,7 @@ impl ArtHttp {
             NoArt::Failed
         }
         let _permit = self.in_flight.acquire().await.map_err(failed)?;
+        ART_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let idle = self.idle.lock().ok().and_then(|mut idle| idle.pop());
         let mut sender = match idle {
             Some(sender) if !sender.is_closed() => sender,
