@@ -64,6 +64,17 @@ struct Reach {
 /// not kept waiting on each.
 const RETRY_AFTER_MS: i64 = 2_000;
 
+/// How long a call waits for the hub's answer: a lookup of an album's
+/// discs as long as it can take
+/// ([`HUB_LOOKUP_WAIT`](crate::bounds::HUB_LOOKUP_WAIT)), any other `call_wait`.
+fn wait_for(method: &str, call_wait: std::time::Duration) -> std::time::Duration {
+    if method == "corrections.lookup" {
+        call_wait.max(crate::bounds::HUB_LOOKUP_WAIT)
+    } else {
+        call_wait
+    }
+}
+
 /// A satellite's link to its hub.
 #[derive(Debug)]
 pub(crate) struct Uplink {
@@ -422,13 +433,14 @@ impl Uplink {
         method: &str,
         params: Value,
     ) -> (Result<Value, ritornel_client::Error>, bool) {
-        match self.wait_on(Some(self.call_wait), client.call_raw(method, params)) {
+        let wait = wait_for(method, self.call_wait);
+        match self.wait_on(Some(wait), client.call_raw(method, params)) {
             Some(answer) => (answer, true),
             None => (
                 Err(ritornel_client::Error::Transport(if self.stopped() {
                     "the server is stopping".to_owned()
                 } else {
-                    format!("no answer in {} seconds", self.call_wait.as_secs())
+                    format!("no answer in {} seconds", wait.as_secs())
                 })),
                 false,
             ),
@@ -754,5 +766,20 @@ fn ping(core: &crate::dispatch::Core, uplink: &Arc<Uplink>, pinging: &Arc<Atomic
         });
     if started.is_err() {
         pinging.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use std::time::Duration;
+
+    #[test]
+    fn a_lookup_waits_as_long_as_it_can_take_and_any_other_call_the_usual_wait() {
+        let usual = Duration::from_secs(8);
+        assert_eq!(super::wait_for("library.status", usual), usual);
+        assert_eq!(
+            super::wait_for("corrections.lookup", usual),
+            crate::bounds::HUB_LOOKUP_WAIT
+        );
     }
 }

@@ -1,5 +1,6 @@
 //! A server's settings: what `server.settings` reports, each value with
-//! what gave it, and what `server.setSettings` changes. See "Settings" in
+//! what gave it, and what `server.setSettings` changes; and a library's,
+//! through `library.settings` and `library.setSettings`. See "Settings" in
 //! docs/internals/server.md.
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,8 @@ pub enum SetBy {
     Environment,
     /// The server's command line.
     Flag,
-    /// A call, `server.setSettings`, and the server keeps it.
+    /// A call, `server.setSettings` or `library.setSettings`, and the
+    /// server or the library keeps it.
     Call,
 }
 
@@ -29,7 +31,7 @@ pub enum SetBy {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct Setting<T> {
-    /// The value the server runs with.
+    /// The value the server, or the library, runs with.
     pub value: T,
     /// What gave it.
     pub set_by: SetBy,
@@ -153,6 +155,48 @@ pub struct ServerSettingsSet {
     pub receipt: crate::Receipt,
     /// The settings, as `server.settings` now reports them.
     pub settings: ServerSettings,
+}
+
+/// The result of `library.settings`: the library's settings, each with
+/// what gave it. They are kept with the library, on its hub, and a
+/// satellite reads its hub's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySettings {
+    /// Whether MusicBrainz may be asked about the library's discs: one album
+    /// or folder at a time, when `corrections.lookup` asks. Nothing is asked
+    /// by itself. Off by default, until a call turns it on.
+    pub lookups: Setting<bool>,
+}
+
+/// The params of `library.setSettings`: the settings to change, each left
+/// out to keep it as it is. At least one is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct SetLibrarySettingsParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// Whether MusicBrainz may be asked about the library's discs, one album
+    /// or folder at a time, when `corrections.lookup` asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub lookups: Option<bool>,
+}
+
+/// The result of `library.setSettings`: the receipt, and the settings as
+/// this change left them, at the receipt's revision. Sent again, it is
+/// answered as it was; `library.settings` says what they are now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LibrarySettingsSet {
+    /// The receipt.
+    #[serde(flatten)]
+    pub receipt: crate::Receipt,
+    /// The settings as this change left them.
+    pub settings: LibrarySettings,
 }
 
 #[cfg(test)]

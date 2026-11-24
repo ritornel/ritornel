@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::{Id, Receipt};
+
 /// The params of `corrections.discs`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -93,4 +95,93 @@ pub struct DiscList {
     pub with_layout: u64,
     /// Each layout, by root, folder and disc ID.
     pub discs: Vec<Disc>,
+}
+
+/// The params of `corrections.lookup`. It names one album: a release, or a
+/// folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LookupParams {
+    /// The command's ID, made by the client.
+    pub idempotency_key: Id,
+    /// A release, by its ID: the discs of the folders its files are in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub album: Option<Id>,
+    /// A folder, by its path under its root: its discs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub folder: Option<String>,
+    /// The root the folder is in, by its name. Needed only when more than
+    /// one root has a folder of that path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub root: Option<String>,
+    /// Ask again about a disc that has a reply already.
+    #[serde(default)]
+    pub again: bool,
+}
+
+/// What became of one disc a lookup was about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum LookupOutcome {
+    /// It was asked about, and the reply names releases.
+    Replied,
+    /// It was asked about, and the catalogue does not know it.
+    NotFound,
+    /// It had a reply already, and was not asked about again.
+    Kept,
+    /// Asking failed. Nothing was kept for it.
+    Failed,
+}
+
+/// One album a reply names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogueAlbum {
+    /// Its MusicBrainz release group ID.
+    pub release_group: String,
+    /// Its title.
+    pub title: String,
+    /// Who it is credited to, as written.
+    pub artist: String,
+    /// The year it was first released, when the catalogue knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub first_year: Option<u32>,
+    /// How many of the releases the reply names are of this album.
+    pub releases: u32,
+}
+
+/// One disc a lookup was about, and what its current reply says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct DiscLookup {
+    /// The disc ID asked about.
+    pub disc_id: String,
+    /// What became of it.
+    pub outcome: LookupOutcome,
+    /// Why asking failed: one line that can be shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub failure: Option<String>,
+    /// The albums its current reply names, if it has one.
+    pub albums: Vec<CatalogueAlbum>,
+}
+
+/// The result of `corrections.lookup`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct LookupDone {
+    /// The receipt.
+    #[serde(flatten)]
+    pub receipt: Receipt,
+    /// Each disc, in the order asked.
+    pub discs: Vec<DiscLookup>,
 }

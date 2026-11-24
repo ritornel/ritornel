@@ -43,6 +43,7 @@ pub mod layout;
 pub mod library;
 pub mod normalize;
 pub mod payload;
+pub mod reply;
 pub mod resolve;
 pub mod scrobble;
 pub mod selection;

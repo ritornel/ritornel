@@ -13,19 +13,20 @@ use std::time::Duration;
 
 use ritornel_contract::methods::{
     self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, CorrectionsDiscs,
-    EventsSubscribe, EventsUnsubscribe, HistoryAlbum, HistoryAlbums, HistoryArtist, HistoryArtists,
-    HistoryExport, HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones,
-    HistoryStreamCall, HistoryTrack, HistoryZones, IdentityDryRun, IdentityReview, ImportsApply,
-    ImportsDryRun, ImportsGet, ImportsList, ImportsStage, ImportsUndo, JobsCancel, JobsGet,
-    JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart,
-    LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching,
-    LibraryStats, LinkCopiesCall, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall,
-    LinkTracksCall, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
-    MediaTokenCall, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume,
-    PlaybackSeek, PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove,
-    QueueRemove, QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello,
-    ServerSetSettings, ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList,
-    SourcesTracks, TracksGet,
+    CorrectionsLookup, EventsSubscribe, EventsUnsubscribe, HistoryAlbum, HistoryAlbums,
+    HistoryArtist, HistoryArtists, HistoryExport, HistoryOnThisDay, HistoryRebuild, HistoryRecent,
+    HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones, IdentityDryRun, IdentityReview,
+    ImportsApply, ImportsDryRun, ImportsGet, ImportsList, ImportsStage, ImportsUndo, JobsCancel,
+    JobsGet, JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish,
+    LastfmSignInStart, LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySearch,
+    LibrarySetSettings, LibrarySetWatching, LibrarySettingsCall, LibraryStats, LinkCopiesCall,
+    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall, ListClose,
+    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
+    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
+    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
+    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerSetSettings,
+    ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks,
+    TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -52,6 +53,7 @@ use crate::{Bounds, Error};
 mod backup;
 mod calls;
 mod churn;
+mod corrections;
 mod export;
 mod history;
 mod imports;
@@ -69,6 +71,7 @@ mod watch;
 
 pub(crate) use backup::record_backup;
 pub(crate) use calls::job_state;
+pub(crate) use corrections::catalogue;
 use lists::Fanout;
 pub(crate) use settings::StartUp;
 
@@ -180,6 +183,12 @@ pub(crate) struct Core {
     lastfm: std::sync::OnceLock<crate::lastfm::Lastfm>,
     /// The runs of streams staged for a dry run.
     staging: crate::imports::Staging,
+    /// The catalogue the library is asked about at, once the server has
+    /// started, on a server built with one.
+    catalogue: std::sync::OnceLock<Arc<dyn ritornel_source::Catalogue>>,
+    /// Held by a lookup from its receipt's check to its commit, so that no
+    /// two lookups ask the same thing at once.
+    lookup: Mutex<()>,
     /// Watching the hub's folders, once the server has started.
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// Where backups go, once the server has started.
@@ -319,6 +328,8 @@ impl Core {
             audio_pace: std::sync::OnceLock::new(),
             lastfm: std::sync::OnceLock::new(),
             staging,
+            catalogue: std::sync::OnceLock::new(),
+            lookup: Mutex::new(()),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
             cache_bytes: std::sync::OnceLock::new(),
@@ -514,6 +525,9 @@ impl Core {
         .to_vec();
         if self.has_player() {
             capabilities.push(capability::PLAYBACK.to_owned());
+        }
+        if self.catalogue().is_some() {
+            capabilities.push(capability::CORRECTIONS_LOOKUP.to_owned());
         }
         PublicDescriptor {
             server_id: self.server_id,
@@ -940,6 +954,15 @@ impl Core {
             IdentityReview::NAME => run::<IdentityReview>(params, |_| self.identity_review(stores)),
             CorrectionsDiscs::NAME => {
                 run::<CorrectionsDiscs>(params, |params| self.corrections_discs(stores, &params))
+            }
+            LibrarySettingsCall::NAME => {
+                run::<LibrarySettingsCall>(params, |_| self.library_settings(stores))
+            }
+            LibrarySetSettings::NAME => run::<LibrarySetSettings>(params, |params| {
+                self.library_set_settings(stores, &params)
+            }),
+            CorrectionsLookup::NAME => {
+                run::<CorrectionsLookup>(params, |params| self.corrections_lookup(stores, &params))
             }
             ListOpen::NAME => {
                 run::<ListOpen>(params, |params| self.list_open(stores, session, params))

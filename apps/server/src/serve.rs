@@ -74,6 +74,10 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         scan: test_hooks(env),
         playback: playback(args.output.as_deref(), env),
         lastfm: lastfm(env),
+        // For the tests alone: a loopback address to send every
+        // MusicBrainz request to, with no pause between them.
+        musicbrainz_url: env("RITORNEL_TEST_MUSICBRAINZ_URL")
+            .and_then(|url| url.into_string().ok()),
         watch: crate::WatchRun::on(),
         backup_dir: settings.backup_dir.clone(),
         keep_awake: true,

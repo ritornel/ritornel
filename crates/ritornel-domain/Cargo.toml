@@ -14,8 +14,13 @@ ritornel-contract.workspace = true
 # a local date, which is a rebuild.
 jiff = { version = "=0.2.43", default-features = false, features = ["std", "tzdb-bundle-always"] }
 # A payload is stored as JSON and a decision's evidence is written as JSON.
-# Only the derives are used here: the engine does the reading and writing.
+# Only the derives are used for those: the engine does the reading and
+# writing.
 serde = { version = "1.0.229", features = ["derive"] }
+# A catalogue's reply is read here, so that its facts are read again with
+# no plugin and no network.
+serde_json = "1.0.154"
+# A CD's disc ID is a SHA-1, and so is a proposal's ID.
 sha1 = "=0.10.7"
 # NFKC, the first step of the mechanical normalisation of a name. Pinned
 # exactly: a changed table would change stored match names.

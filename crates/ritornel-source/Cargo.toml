@@ -1,6 +1,6 @@
 [package]
 name = "ritornel-source"
-description = "The traits a plugin implements: a history source, and later a metadata source."
+description = "The traits a plugin implements: a history source and a catalogue."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

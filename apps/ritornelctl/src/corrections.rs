@@ -1,14 +1,21 @@
 //! `ritornelctl corrections discs`: the disc layouts the library's
 //! sidecars give, and the disc ID each would be asked about by. See "Disc
 //! layouts" in docs/internals/corrections.md.
+//!
+//! `ritornelctl corrections musicbrainz` and `lookup`: the switch that
+//! lets the library be asked about at MusicBrainz, and asking about one
+//! album or folder, which is the only way it is asked. See "MusicBrainz lookups" there.
 
 use std::io::Write;
 
-use ritornel_client::contract::methods::CorrectionsDiscs;
-use ritornel_client::contract::{Disc, DiscList, DiscsParams, LayoutMethod};
+use ritornel_client::contract::methods::{CorrectionsDiscs, CorrectionsLookup, LibrarySetSettings};
+use ritornel_client::contract::{
+    Disc, DiscList, DiscsParams, Id, LayoutMethod, LibrarySettingsSet, LookupDone, LookupOutcome,
+    LookupParams, SetLibrarySettingsParams,
+};
 use ritornel_client::local;
 
-use crate::cli::{DiscsArgs, Error};
+use crate::cli::{DiscsArgs, Error, LookupArgs, SwitchArgs};
 use crate::server;
 
 pub(crate) fn discs(
@@ -29,6 +36,112 @@ pub(crate) fn discs(
         serde_json::to_string_pretty,
         render,
     )
+}
+
+pub(crate) fn musicbrainz(
+    args: &SwitchArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let enabled = match args.state.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return Err(Error::Usage("musicbrainz is `on` or `off`")),
+    };
+    let set = server::ask(&args.server, env, async |client| {
+        client
+            .call::<LibrarySetSettings>(&SetLibrarySettingsParams {
+                idempotency_key: ritornel_client::idempotency_key()?,
+                lookups: Some(enabled),
+            })
+            .await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &set,
+        serde_json::to_string_pretty,
+        |set: &LibrarySettingsSet| {
+            if set.settings.lookups.value {
+                "MusicBrainz may be asked about this library, one album or folder at a time, \
+                 with `ritornelctl corrections lookup`. Nothing is asked by itself.\n"
+                    .to_owned()
+            } else {
+                "MusicBrainz is not asked about this library.\n".to_owned()
+            }
+        },
+    )
+}
+
+pub(crate) fn lookup(
+    args: &LookupArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let album = args
+        .album
+        .as_deref()
+        .map(|text| {
+            text.parse::<Id>()
+                .map_err(|_| Error::Usage("--album needs a release ID"))
+        })
+        .transpose()?;
+    if album.is_some() == args.folder.is_some() {
+        return Err(Error::Usage("lookup needs a folder or --album, not both"));
+    }
+    let (folder, root, again) = (args.folder.clone(), args.root.clone(), args.again);
+    let done = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
+        client
+            .call::<CorrectionsLookup>(&LookupParams {
+                idempotency_key: ritornel_client::idempotency_key()?,
+                album,
+                folder,
+                root,
+                again,
+            })
+            .await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &done,
+        serde_json::to_string_pretty,
+        render_lookup,
+    )
+}
+
+/// How long a lookup may take: a request a second, for each disc.
+const LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn render_lookup(done: &LookupDone) -> String {
+    let mut text = String::new();
+    for disc in &done.discs {
+        let said = match disc.outcome {
+            LookupOutcome::Replied => "asked",
+            LookupOutcome::NotFound => "asked: MusicBrainz does not know this disc",
+            LookupOutcome::Kept => "asked before",
+            LookupOutcome::Failed => "could not be asked",
+        };
+        text.push_str(&format!("{}  {said}\n", disc.disc_id));
+        if let Some(failure) = &disc.failure {
+            text.push_str(&format!("    {failure}\n"));
+        }
+        for album in &disc.albums {
+            let year = album
+                .first_year
+                .map_or_else(String::new, |year| format!(" ({year})"));
+            let releases = if album.releases == 1 {
+                "1 release".to_owned()
+            } else {
+                format!("{} releases", album.releases)
+            };
+            text.push_str(&format!(
+                "    {} by {}{year}, {releases}\n",
+                album.title, album.artist
+            ));
+        }
+    }
+    text
 }
 
 fn method(method: LayoutMethod) -> &'static str {

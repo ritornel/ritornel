@@ -506,3 +506,163 @@ fn a_kept_sidecar_revision_is_not_replaced_by_its_id_or_its_bytes() {
     }
     assert_eq!(rig.dump(), kept);
 }
+
+const ASKED: crate::Asked<'static> = crate::Asked {
+    catalogue: "musicbrainz",
+    kind: "disc",
+    includes: "artist-credits+release-groups+recordings",
+};
+
+const REPLY: &str = include_str!("../../../fixtures/musicbrainz/disc-tin-weather.json");
+
+fn keep(rig: &mut Rig, byte: u8, replies: Vec<crate::KeptReply>) {
+    let request = crate::WriteRequest {
+        method: "corrections.lookup",
+        command: Some(crate::Command {
+            // Apart from the rig's own commands.
+            id: crate::Id::from_bytes([0xe0 + byte; 16]),
+            fingerprint: crate::Fingerprint::of("keep", &[byte]),
+        }),
+        client: None,
+    };
+    let keys = replies.iter().map(|reply| reply.key.clone()).collect();
+    rig.library
+        .keep_replies(request, ASKED, replies, keys, |_, _| String::new())
+        .unwrap();
+}
+
+fn reply(status: u16, body: &str) -> crate::KeptReply {
+    crate::KeptReply {
+        key: toc().disc_id().unwrap(),
+        status,
+        body: body.to_owned(),
+    }
+}
+
+#[test]
+fn a_reply_is_kept_once_and_a_different_one_after_it() {
+    let mut rig = Rig::new();
+    keep(&mut rig, 1, vec![reply(200, REPLY)]);
+    keep(&mut rig, 2, vec![reply(200, REPLY)]);
+    assert_eq!(rig.one("SELECT count(*) FROM lookup_response"), "1");
+    let facts = rig.one("SELECT count(*) FROM evidence_claim");
+    assert_ne!(facts, "0");
+    // MusicBrainz forgets the disc: that is a reply too, and it is now
+    // the current one.
+    keep(&mut rig, 3, vec![reply(404, r#"{"error":"Not Found"}"#)]);
+    assert_eq!(rig.one("SELECT count(*) FROM lookup_response"), "2");
+    // And back again: kept again, as the newest.
+    keep(&mut rig, 4, vec![reply(200, REPLY)]);
+    assert_eq!(rig.one("SELECT count(*) FROM lookup_response"), "3");
+    assert_eq!(
+        rig.rows("SELECT status FROM lookup_response ORDER BY id"),
+        ["200", "404", "200"]
+    );
+    assert_eq!(
+        [
+            rig.library
+                .replied(ASKED, &toc().disc_id().unwrap())
+                .unwrap(),
+            rig.library.replied(ASKED, "other").unwrap()
+        ],
+        [true, false]
+    );
+    // A reply is immutable.
+    let changed = rig.library.write(
+        crate::WriteRequest {
+            method: "test",
+            command: None,
+            client: None,
+        },
+        |write| {
+            write
+                .connection()
+                .execute("UPDATE lookup_response SET status = 404", [])?;
+            Ok(String::new())
+        },
+    );
+    assert!(changed.is_err());
+    for sql in [
+        "DELETE FROM lookup_response",
+        "INSERT OR REPLACE INTO lookup_response
+           (id, catalogue, request_kind, request_key, includes, status, body, body_hash,
+            received_at_ms, rev)
+         SELECT id, catalogue, request_kind, request_key, includes, 404, '{}', body_hash,
+                received_at_ms, rev
+         FROM lookup_response WHERE id = 1",
+    ] {
+        let refused = rig.library.write(
+            crate::WriteRequest {
+                method: "test",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(sql, [])?;
+                Ok(String::new())
+            },
+        );
+        assert!(refused.is_err(), "{sql}");
+    }
+    // And only a reply that reads as one about its disc is kept at all.
+    let request = crate::WriteRequest {
+        method: "corrections.lookup",
+        command: None,
+        client: None,
+    };
+    let html = reply(404, "<html>Not Found</html>");
+    let kept = rig
+        .library
+        .keep_replies(request, ASKED, vec![html], vec![], |_, _| String::new());
+    assert!(kept.is_err());
+}
+
+#[test]
+fn facts_read_by_another_reader_are_read_again_from_the_kept_replies() {
+    let mut rig = Rig::new();
+    keep(&mut rig, 1, vec![reply(200, REPLY)]);
+    assert_ne!(rig.one("SELECT count(*) FROM evidence_claim"), "0");
+    let before =
+        rig.rows("SELECT release_mbid, field, value, ordinal FROM evidence_claim ORDER BY 1, 2, 4");
+    // As an older reader would have left them: fewer, and of its version.
+    rig.library
+        .write(
+            crate::WriteRequest {
+                method: "test",
+                command: None,
+                client: None,
+            },
+            |write| {
+                write.connection().execute_batch(
+                    "DELETE FROM evidence_claim WHERE field <> 'title';
+                     UPDATE library_setting SET value_json = '0' WHERE key = 'corrections.reader_version';",
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    let refreshed = rig
+        .library
+        .refresh_corrections(crate::WriteRequest {
+            method: crate::FACTS_METHOD,
+            command: None,
+            client: None,
+        })
+        .unwrap();
+    assert!(refreshed.is_some());
+    assert_eq!(
+        rig.rows("SELECT release_mbid, field, value, ordinal FROM evidence_claim ORDER BY 1, 2, 4"),
+        before
+    );
+    assert_eq!(
+        rig.one("SELECT DISTINCT reader_version FROM evidence_claim"),
+        ritornel_domain::reply::READER_VERSION.to_string()
+    );
+    // Read by this reader, they are not read again.
+    let again = rig.library.refresh_corrections(crate::WriteRequest {
+        method: crate::FACTS_METHOD,
+        command: None,
+        client: None,
+    });
+    assert!(again.unwrap().is_none());
+}

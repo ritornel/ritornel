@@ -67,7 +67,10 @@ mod ticket;
 mod typescript;
 
 pub use command::{LibraryCreateParams, LibraryCreated, Receipt, ReceiptStatus};
-pub use corrections::{Disc, DiscFile, DiscList, DiscsParams, LayoutMethod};
+pub use corrections::{
+    CatalogueAlbum, Disc, DiscFile, DiscList, DiscLookup, DiscsParams, LayoutMethod, LookupDone,
+    LookupOutcome, LookupParams,
+};
 pub use device::{DeviceKind, Platform, PlayedVia};
 pub use error::{ErrorCode, ErrorData, RpcError};
 pub use event::{
@@ -143,8 +146,8 @@ pub use server::{
     WatchingSet, descriptor_proof,
 };
 pub use settings::{
-    ListenNetwork, ListenOn, LogLevel, ServerSettings, ServerSettingsSet, SetBy,
-    SetServerSettingsParams, Setting,
+    LibrarySettings, LibrarySettingsSet, ListenNetwork, ListenOn, LogLevel, ServerSettings,
+    ServerSettingsSet, SetBy, SetLibrarySettingsParams, SetServerSettingsParams, Setting,
 };
 pub use ticket::{SocketTicket, TICKET_PARAM};
 
@@ -183,6 +186,12 @@ pub mod capability {
     /// audio output has none, and refuses those calls as `unsupported`
     /// ("Audio pipeline" in docs/internals/playback.md).
     pub const PLAYBACK: &str = "playback";
+
+    /// The server can ask MusicBrainz about the library:
+    /// `corrections.lookup`. A server built without the catalogue refuses
+    /// it as `unavailable` ("MusicBrainz lookups" in
+    /// docs/internals/corrections.md).
+    pub const CORRECTIONS_LOOKUP: &str = "corrections.lookup";
 }
 
 /// The HTTP routes. Each is a `GET` but [`TICKET`](route::TICKET) and

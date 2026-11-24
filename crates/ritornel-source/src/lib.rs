@@ -1,16 +1,19 @@
 //! The traits a plugin implements, and what it hands the core through them.
 //! See "Traits and storage boundary" in docs/internals/plugins.md.
 //!
-//! There is one so far, [`HistorySource`]: something that brings plays in
-//! from elsewhere, under its own history endpoint, through the one ingest
-//! call. Last.fm (`ritornel-lastfm`) is the first. The metadata-source
-//! trait joins it with the first lookup.
+//! There are two. [`HistorySource`] brings plays in from elsewhere, under
+//! its own history endpoint, through the one ingest call; Last.fm
+//! (`ritornel-lastfm`) is the first. [`Catalogue`] answers questions about
+//! what the files are, such as which releases a CD's disc ID belongs to;
+//! MusicBrainz (`ritornel-musicbrainz`) is the first.
 //!
-//! A plugin reads its format and hands over each record as it was read with
-//! the facts it took from it. The core stores both, so a rebuild never
-//! needs the plugin. A plugin never writes anything itself: the core gives
-//! it a [`Sink`], which writes what it is handed in one transaction with
-//! the cursor that says how far the source has read.
+//! A history source reads its format and hands over each record as it was
+//! read with the facts it took from it. The core stores both, so a rebuild
+//! never needs the plugin. A plugin never writes anything itself: the core
+//! gives a history source a [`Sink`], which writes what it is handed in one
+//! transaction with the cursor that says how far the source has read. A
+//! catalogue reads nothing: it returns each reply as it came, and the core
+//! keeps it and reads it.
 //!
 //! The trait is not stable: "Traits and storage boundary" in
 //! docs/internals/plugins.md calls none stable until two plugins have used it.
@@ -174,8 +177,43 @@ pub trait HistorySource {
     fn sync(&self, sink: &mut dyn Sink, full: bool) -> Result<Synced, Error>;
 }
 
-/// Why a sync failed. `Display` is one line that is safe to log: it never
-/// holds a credential.
+/// One question a catalogue is asked.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Question {
+    /// What kind of question: `disc`, a CD's disc ID.
+    pub kind: &'static str,
+    /// What it is about: the disc ID.
+    pub key: String,
+    /// What the reply is asked to include, as the catalogue names it. The
+    /// same question with other inclusions is another question.
+    pub includes: &'static str,
+}
+
+/// What a catalogue replied, kept as it came. A catalogue that does not
+/// know the thing asked about replies too: that is an answer, not a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reply {
+    /// The HTTP status: 200, or 404 for nothing found.
+    pub status: u16,
+    /// The body, exactly as it came.
+    pub body: String,
+}
+
+/// Something that knows what music is: MusicBrainz. It only fetches. What
+/// its replies say is read by the core, so that a reply kept once can be
+/// read again without the plugin or the network.
+pub trait Catalogue: fmt::Debug + Send + Sync {
+    /// Its name as the core stores it, such as `musicbrainz`.
+    fn name(&self) -> &'static str;
+    /// The question about a CD with this disc ID, as this catalogue asks it.
+    fn disc(&self, disc_id: &str) -> Question;
+    /// Asks a question and returns the reply. A failure is an error of the
+    /// source: the catalogue could not be reached, was busy, or refused.
+    fn ask(&self, question: &Question) -> Result<Reply, Error>;
+}
+
+/// Why a sync or a question failed. `Display` is one line that is safe to
+/// log: it never holds a credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     kind: ErrorKind,

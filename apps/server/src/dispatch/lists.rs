@@ -5,7 +5,9 @@
 use std::sync::{Arc, PoisonError, Weak};
 use std::time::Instant;
 
-use ritornel_contract::methods::{HistoryRebuild, Method, RatingsSet, SourcesAdd};
+use ritornel_contract::methods::{
+    CorrectionsLookup, HistoryRebuild, LibrarySetSettings, Method, RatingsSet, SourcesAdd,
+};
 use ritornel_contract::{
     ErrorCode, Event, Id, LibraryChange, LibraryEvent, ListClosed, ListEvent, ListLocateParams,
     ListLocated, ListOpenParams, ListOpened, ListSections, ListWindow, ListWindowParams,
@@ -90,7 +92,14 @@ impl Fanout {
 fn changes(method: &str) -> Vec<LibraryChange> {
     // Sidecars and the disc layouts read from them are evidence: nothing
     // shown reads them.
-    if method == ritornel_engine::SIDECARS_METHOD || method == ritornel_engine::LAYOUTS_METHOD {
+    let evidence = [
+        ritornel_engine::SIDECARS_METHOD,
+        ritornel_engine::LAYOUTS_METHOD,
+        ritornel_engine::FACTS_METHOD,
+        LibrarySetSettings::NAME,
+        CorrectionsLookup::NAME,
+    ];
+    if evidence.contains(&method) {
         Vec::new()
     } else if method == SourcesAdd::NAME {
         vec![LibraryChange::Membership]

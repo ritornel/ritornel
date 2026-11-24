@@ -77,7 +77,9 @@ run = [
 description = "Run clippy with warnings denied, on the server with and without Last.fm"
 run = [
     "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
-    # The server as the headless hub may be built: without the plugin.
+    # The server as the headless hub is built: without Last.fm, with MusicBrainz.
+    "cargo clippy --locked --package ritornel-server --no-default-features --features musicbrainz --all-targets -- -D warnings",
+    # And with no plugin at all, which a server may still be built as.
     "cargo clippy --locked --package ritornel-server --no-default-features --all-targets -- -D warnings",
 ]
 

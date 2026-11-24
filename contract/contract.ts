@@ -132,6 +132,8 @@ export const METHODS = {
   "artists.importPictures": { kind: "command", needsFull: true },
   "artists.pictureFolders": { kind: "query", needsFull: true },
   "library.setWatching": { kind: "command", needsFull: true },
+  "library.settings": { kind: "query", needsFull: true },
+  "library.setSettings": { kind: "command", needsFull: true },
   "server.backup": { kind: "command", needsFull: true },
   "history.export": { kind: "command", needsFull: true },
   "record.dismiss": { kind: "command", needsFull: true },
@@ -145,6 +147,7 @@ export const METHODS = {
   "server.settings": { kind: "query", needsFull: true },
   "server.setSettings": { kind: "command", needsFull: true },
   "corrections.discs": { kind: "query", needsFull: true },
+  "corrections.lookup": { kind: "command", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -220,6 +223,8 @@ export type MethodMap = {
   "artists.importPictures": { params: ImportPicturesParams; result: PicturesImported };
   "artists.pictureFolders": { params: NoParams; result: PictureFolders };
   "library.setWatching": { params: WatchingParams; result: WatchingSet };
+  "library.settings": { params: NoParams; result: LibrarySettings };
+  "library.setSettings": { params: SetLibrarySettingsParams; result: LibrarySettingsSet };
   "server.backup": { params: BackupParams; result: BackedUp };
   "history.export": { params: HistoryExportParams; result: HistoryExported };
   "record.dismiss": { params: DismissParams; result: Dismissed };
@@ -233,6 +238,7 @@ export type MethodMap = {
   "server.settings": { params: NoParams; result: ServerSettings };
   "server.setSettings": { params: SetServerSettingsParams; result: ServerSettingsSet };
   "corrections.discs": { params: DiscsParams; result: DiscList };
+  "corrections.lookup": { params: LookupParams; result: LookupDone };
 };
 
 /** The name of a method. */
@@ -796,6 +802,32 @@ export type Binding = {
 };
 
 /**
+ * One album a reply names.
+ */
+export type CatalogueAlbum = {
+  /**
+   * Its MusicBrainz release group ID.
+   */
+  releaseGroup: string,
+  /**
+   * Its title.
+   */
+  title: string,
+  /**
+   * Who it is credited to, as written.
+   */
+  artist: string,
+  /**
+   * The year it was first released, when the catalogue knows.
+   */
+  firstYear?: number,
+  /**
+   * How many of the releases the reply names are of this album.
+   */
+  releases: number,
+};
+
+/**
  * What sort of program a client is. It is for logs and for display, and
  * never decides access: the session does.
  */
@@ -1031,6 +1063,28 @@ export type DiscList = {
    * Each layout, by root, folder and disc ID.
    */
   discs: Array<Disc>,
+};
+
+/**
+ * One disc a lookup was about, and what its current reply says.
+ */
+export type DiscLookup = {
+  /**
+   * The disc ID asked about.
+   */
+  discId: string,
+  /**
+   * What became of it.
+   */
+  outcome: LookupOutcome,
+  /**
+   * Why asking failed: one line that can be shown.
+   */
+  failure?: string,
+  /**
+   * The albums its current reply names, if it has one.
+   */
+  albums: Array<CatalogueAlbum>,
 };
 
 /**
@@ -2778,6 +2832,45 @@ export type LibraryEvent = {
 };
 
 /**
+ * The result of `library.settings`: the library's settings, each with
+ * what gave it. They are kept with the library, on its hub, and a
+ * satellite reads its hub's.
+ */
+export type LibrarySettings = {
+  /**
+   * Whether MusicBrainz may be asked about the library's discs: one album
+   * or folder at a time, when `corrections.lookup` asks. Nothing is asked
+   * by itself. Off by default, until a call turns it on.
+   */
+  lookups: Setting<boolean>,
+};
+
+/**
+ * The result of `library.setSettings`: the receipt, and the settings as
+ * this change left them, at the receipt's revision. Sent again, it is
+ * answered as it was; `library.settings` says what they are now.
+ */
+export type LibrarySettingsSet = {
+  /**
+   * The settings as this change left them.
+   */
+  settings: LibrarySettings,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
  * The result of `library.stats`: what the library holds, and what the
  * scans made of it.
  */
@@ -3384,6 +3477,62 @@ export type ListenTaken = "stored" | "duplicate" | "conflict";
  * The least severe level the server logs.
  */
 export type LogLevel = "error" | "warn" | "info" | "debug" | "trace";
+
+/**
+ * The result of `corrections.lookup`.
+ */
+export type LookupDone = {
+  /**
+   * Each disc, in the order asked.
+   */
+  discs: Array<DiscLookup>,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * What became of one disc a lookup was about.
+ */
+export type LookupOutcome = "replied" | "not_found" | "kept" | "failed";
+
+/**
+ * The params of `corrections.lookup`. It names one album: a release, or a
+ * folder.
+ */
+export type LookupParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * A release, by its ID: the discs of the folders its files are in.
+   */
+  album?: string,
+  /**
+   * A folder, by its path under its root: its discs.
+   */
+  folder?: string,
+  /**
+   * The root the folder is in, by its name. Needed only when more than
+   * one root has a folder of that path.
+   */
+  root?: string,
+  /**
+   * Ask again about a disc that has a reply already.
+   */
+  again: boolean,
+};
 
 /**
  * The result of `media.token`: what a page puts in the query string of a
@@ -5253,6 +5402,22 @@ export type SessionKind = "full" | "limited";
 export type SetBy = "default" | "file" | "environment" | "flag" | "call";
 
 /**
+ * The params of `library.setSettings`: the settings to change, each left
+ * out to keep it as it is. At least one is given.
+ */
+export type SetLibrarySettingsParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * Whether MusicBrainz may be asked about the library's discs, one album
+   * or folder at a time, when `corrections.lookup` asks.
+   */
+  lookups?: boolean,
+};
+
+/**
  * The params of `server.setSettings`: the settings to change, each left
  * out to keep it as it is. At least one is given.
  */
@@ -5286,7 +5451,7 @@ export type SetZonesParams = {
  */
 export type Setting<T> = {
   /**
-   * The value the server runs with.
+   * The value the server, or the library, runs with.
    */
   value: T,
   /**
