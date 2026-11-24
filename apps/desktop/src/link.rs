@@ -441,6 +441,7 @@ impl Link {
                     .await;
             }
             let _ = link.update(cx, |link, cx| {
+                // Compare the status snapshot itself so a newer restate supersedes this timer.
                 if let State::Connected(held) = &link.state
                     && Arc::ptr_eq(held, &net)
                 {
@@ -501,6 +502,16 @@ impl Link {
                 link.look(cx);
             });
         }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connect(
+        &mut self,
+        net: Arc<Net>,
+        events: tokio::sync::mpsc::UnboundedReceiver<Event>,
+        cx: &mut Context<Self>,
+    ) {
+        self.connected(net, events, cx);
     }
 }
 

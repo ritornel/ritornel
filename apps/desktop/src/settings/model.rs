@@ -81,6 +81,29 @@ pub(crate) struct Adding {
     pub from: String,
 }
 
+/// Where the listening time zones stand: editing stays off until the list
+/// has been read, so a save cannot overwrite periods Settings never saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Zones {
+    Loading,
+    NoLibrary,
+    Failed(String),
+    Loaded(Vec<ZonePeriod>),
+}
+
+impl Zones {
+    pub(crate) fn loaded(&self) -> Option<&[ZonePeriod]> {
+        match self {
+            Self::Loaded(periods) => Some(periods),
+            Self::Loading | Self::NoLibrary | Self::Failed(_) => None,
+        }
+    }
+
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.loaded().is_some()
+    }
+}
+
 pub(crate) struct Model {
     link: Entity<Link>,
     /// The music folders, or `None` until read.
@@ -90,13 +113,15 @@ pub(crate) struct Model {
     sources_read: u64,
     pub pictures: Option<PictureFolders>,
     pub lastfm: Option<LastfmStatus>,
-    pub zones: Option<Vec<ZonePeriod>>,
+    pub zones: Zones,
+    zones_read: u64,
     pub status: Option<ServerStatus>,
     /// The data directory, as this app looks in it.
     pub data_dir: Option<PathBuf>,
     pub signing_in: SigningIn,
-    /// What is under way.
-    pub busy: HashSet<Busy>,
+    /// What is under way, keyed to the operation that started it.
+    busy: HashMap<Busy, u64>,
+    busy_op: u64,
     /// What went wrong last, by the group it went wrong in.
     pub problems: HashMap<Group, String>,
     /// The zone chosen in the list, for the − button.
@@ -112,7 +137,7 @@ pub(crate) struct Model {
 }
 
 /// What a group says when it is used before there is a library.
-const NO_LIBRARY_YET: &str = "There is no library yet. Add a music folder first.";
+pub(crate) const NO_LIBRARY_YET: &str = "There is no library yet. Add a music folder first.";
 
 /// The words of what went wrong, for a line under the group it went wrong in.
 fn trouble(error: &Error) -> String {
@@ -258,6 +283,10 @@ impl Model {
             LinkEvent::Connected(_) => {
                 model.scans.clear();
                 model.busy.clear();
+                model.zones = Zones::Loading;
+                model.chosen = None;
+                model.adding = None;
+                model.problems.remove(&Group::Zones);
                 model.read_all(cx);
                 cx.notify();
             }
@@ -267,8 +296,14 @@ impl Model {
                 model.problems.retain(|_, said| said != NO_LIBRARY_YET);
                 model.read_all(cx);
             }
+            LinkEvent::Away => {
+                model.zones = Zones::Loading;
+                model.chosen = None;
+                model.adding = None;
+                cx.notify();
+            }
             LinkEvent::Server(Event::Jobs(event)) => model.heard_job(event.job.clone(), cx),
-            LinkEvent::Away | LinkEvent::Server(_) => cx.notify(),
+            LinkEvent::Server(_) => cx.notify(),
         });
         let data_dir = link.read(cx).data_dir();
         let mut model = Self {
@@ -278,11 +313,13 @@ impl Model {
             sources_read: 0,
             pictures: None,
             lastfm: None,
-            zones: None,
+            zones: Zones::Loading,
+            zones_read: 0,
             status: None,
             data_dir,
             signing_in: SigningIn::Idle,
-            busy: HashSet::new(),
+            busy: HashMap::new(),
+            busy_op: 0,
             problems: HashMap::new(),
             chosen: None,
             adding: None,
@@ -292,6 +329,10 @@ impl Model {
         };
         model.read_all(cx);
         model
+    }
+
+    pub(crate) fn is_busy(&self, what: Busy) -> bool {
+        self.busy.contains_key(&what)
     }
 
     fn net(&self, cx: &gpui::App) -> Option<Arc<Net>> {
@@ -337,7 +378,7 @@ impl Model {
             let _ = model.update(cx, |model, cx| {
                 if model
                     .net(cx)
-                    .is_some_and(|current| Arc::ptr_eq(&net, &current))
+                    .is_some_and(|current| current.same_session(&net))
                 {
                     then(model, found, cx);
                     cx.notify();
@@ -406,6 +447,11 @@ impl Model {
     }
 
     pub(crate) fn read_lastfm(&mut self, cx: &mut Context<Self>) {
+        if self.net(cx).is_none() {
+            return;
+        }
+        self.problems.remove(&Group::Account);
+        cx.notify();
         self.reading(
             cx,
             |net| ask::<LastfmStatusCall>(&net, NoParams {}),
@@ -419,14 +465,41 @@ impl Model {
     }
 
     pub(crate) fn read_zones(&mut self, cx: &mut Context<Self>) {
+        if self.net(cx).is_none() {
+            return;
+        }
+        self.zones_read += 1;
+        let asked = self.zones_read;
+        self.zones = Zones::Loading;
+        self.chosen = None;
+        self.adding = None;
+        self.problems.remove(&Group::Zones);
+        cx.notify();
         self.reading(
             cx,
             |net| ask::<HistoryZones>(&net, NoParams {}),
-            |model, found, _| match found {
-                Ok(zones) => model.zones = Some(zones.periods),
-                Err(error) if no_library(&error) => model.zones = Some(Vec::new()),
-                Err(error) => {
-                    model.problems.insert(Group::Zones, trouble(&error));
+            move |model, found, _| {
+                if asked != model.zones_read {
+                    return;
+                }
+                match found {
+                    Ok(zones) => {
+                        model.zones = Zones::Loaded(zones.periods);
+                        model.chosen = None;
+                        model.problems.remove(&Group::Zones);
+                    }
+                    Err(error) if no_library(&error) => {
+                        model.zones = Zones::NoLibrary;
+                        model.chosen = None;
+                        model.adding = None;
+                        model.problems.remove(&Group::Zones);
+                    }
+                    Err(error) => {
+                        model.zones = Zones::Failed(trouble(&error));
+                        model.chosen = None;
+                        model.adding = None;
+                        model.problems.remove(&Group::Zones);
+                    }
                 }
             },
         );
@@ -487,7 +560,9 @@ impl Model {
         let Some(net) = self.net(cx) else {
             return Task::ready(false);
         };
-        self.busy.insert(busy);
+        self.busy_op += 1;
+        let op = self.busy_op;
+        self.busy.insert(busy, op);
         self.problems.remove(&group);
         cx.notify();
         let work = work(Arc::clone(&net));
@@ -495,13 +570,19 @@ impl Model {
             let found = work.await;
             model
                 .update(cx, |model, cx| {
+                    let cleared = model.busy.get(&busy) == Some(&op);
+                    if cleared {
+                        model.busy.remove(&busy);
+                    }
                     if model
                         .net(cx)
-                        .is_none_or(|current| !Arc::ptr_eq(&net, &current))
+                        .is_none_or(|current| !current.same_session(&net))
                     {
+                        if cleared {
+                            cx.notify();
+                        }
                         return false;
                     }
-                    model.busy.remove(&busy);
                     cx.notify();
                     match found {
                         Ok(found) => {
@@ -921,7 +1002,13 @@ impl Model {
     }
 
     /// Replaces the zones with `periods`, and reads back what the server keeps.
+    /// Never sends a replacement unless the current list has been read.
     fn set_zones(&mut self, periods: Vec<ZonePeriod>, cx: &mut Context<Self>) -> Task<bool> {
+        if !self.zones.is_loaded() {
+            return Task::ready(false);
+        }
+        self.zones_read += 1;
+        let asked = self.zones_read;
         self.doing(
             Busy::Zones,
             Group::Zones,
@@ -932,13 +1019,27 @@ impl Model {
                     periods,
                 };
                 ask::<HistorySetZones>(&net, params).await?;
-                let zones = ask::<HistoryZones>(&net, NoParams {});
-                let lastfm = ask::<LastfmStatusCall>(&net, NoParams {});
-                Ok((zones.await?, lastfm.await?))
+                match ask::<HistoryZones>(&net, NoParams {}).await {
+                    Ok(zones) => Ok(Ok(zones)),
+                    Err(error) => Ok(Err(trouble(&error))),
+                }
             },
-            |model, (zones, lastfm), _| {
-                model.zones = Some(zones.periods);
-                model.lastfm = Some(lastfm);
+            move |model, read, cx| {
+                model.read_lastfm(cx);
+                if asked != model.zones_read {
+                    return;
+                }
+                match read {
+                    Ok(zones) => {
+                        model.zones = Zones::Loaded(zones.periods);
+                        model.chosen = None;
+                    }
+                    Err(reason) => {
+                        model.zones = Zones::Failed(reason);
+                        model.chosen = None;
+                        model.adding = None;
+                    }
+                }
             },
         )
     }
@@ -946,7 +1047,13 @@ impl Model {
     /// Opens the form for a zone: the system's own, from today, or from
     /// always when it is the first.
     pub(crate) fn start_adding(&mut self, clock: &words::Clock, cx: &mut Context<Self>) {
-        let first = self.zones.as_ref().is_none_or(Vec::is_empty);
+        let Some(zones) = self.zones.loaded() else {
+            return;
+        };
+        if self.is_busy(Busy::Zones) {
+            return;
+        }
+        let first = zones.is_empty();
         self.adding = Some(Adding {
             zone: words::system_zone(),
             from: if first {
@@ -960,7 +1067,13 @@ impl Model {
 
     /// Adds the zone of the form open, and closes it once the server keeps it.
     pub(crate) fn add(&mut self, cx: &mut Context<Self>) {
+        if self.is_busy(Busy::Zones) {
+            return;
+        }
         let Some(adding) = self.adding.clone() else {
+            return;
+        };
+        let Some(zones) = self.zones.loaded() else {
             return;
         };
         let period = ZonePeriod {
@@ -968,7 +1081,7 @@ impl Model {
             from: (!adding.from.is_empty()).then_some(adding.from),
             until: None,
         };
-        let mut periods = self.zones.clone().unwrap_or_default();
+        let mut periods = zones.to_vec();
         periods.push(period);
         let added = self.set_zones(periods, cx);
         cx.spawn(async move |model, cx| {
@@ -984,11 +1097,20 @@ impl Model {
 
     /// Removes the zone chosen, and lets go of it once the server has.
     pub(crate) fn remove(&mut self, cx: &mut Context<Self>) {
+        if self.is_busy(Busy::Zones) {
+            return;
+        }
         let Some(chosen) = self.chosen else { return };
-        let periods: Vec<ZonePeriod> = self
-            .zones
+        let Some(zones) = self.zones.loaded() else {
+            return;
+        };
+        if chosen >= zones.len() {
+            self.chosen = None;
+            cx.notify();
+            return;
+        }
+        let periods: Vec<ZonePeriod> = zones
             .iter()
-            .flatten()
             .enumerate()
             .filter(|(at, _)| *at != chosen)
             .map(|(_, period)| period.clone())
@@ -1195,5 +1317,824 @@ mod tests {
         assert!(!keep_scan(&mut scans, id, reading, true));
         assert_eq!(scans.get(&id), Some(&later));
         Ok(())
+    }
+
+    mod flow {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex, PoisonError};
+        use std::time::{Duration, Instant};
+
+        use ritornel_contract::{
+            CONTRACT_VERSION, EVENT_METHOD, Event, Frame, FreeDisk, Id, ImportSchedule, Job,
+            JobState, JobTarget, LastfmStatus, LibraryCreated, LibraryStatus, Notification,
+            Receipt, ReceiptStatus, Request, Response, RpcError, ScanStarted, ServerInfo,
+            ServerRole, ServerStatus, ServersEvent, Source, SourceAdded, SourceKind, Versions,
+            ZonePeriod, ZonePeriods, ZonesSet,
+        };
+        use serde_json::{Value, json};
+        use tokio::sync::{mpsc, watch};
+
+        use super::*;
+        use crate::link::State;
+        use crate::net::Net;
+
+        /// A single-use gate that holds one RPC until a test releases it.
+        #[derive(Clone)]
+        struct Gate {
+            tx: Arc<watch::Sender<bool>>,
+            arrived: Arc<AtomicUsize>,
+        }
+
+        impl Gate {
+            fn hold() -> Self {
+                let (tx, _) = watch::channel(false);
+                Self {
+                    tx: Arc::new(tx),
+                    arrived: Arc::new(AtomicUsize::new(0)),
+                }
+            }
+
+            fn release(&self) {
+                let _ = self.tx.send(true);
+            }
+
+            fn reached(&self) -> usize {
+                self.arrived.load(Ordering::SeqCst)
+            }
+
+            async fn wait(&self) {
+                let mut rx = self.tx.subscribe();
+                self.arrived.fetch_add(1, Ordering::SeqCst);
+                let _ = rx.wait_for(|open| *open).await;
+            }
+        }
+
+        #[derive(Default)]
+        struct ServerState {
+            has_library: bool,
+            zones_error: Option<String>,
+            zones: Vec<ZonePeriod>,
+            sources: Vec<Source>,
+            calls: HashMap<String, usize>,
+            sent_zones: Vec<Vec<ZonePeriod>>,
+            hold_zones: Option<Gate>,
+            hold_set_zones: Option<Gate>,
+        }
+
+        #[derive(Clone)]
+        struct FakeServer {
+            state: Arc<Mutex<ServerState>>,
+            unanswered: Arc<AtomicUsize>,
+            hold_scan: Option<Gate>,
+            hold_add: Option<Gate>,
+            emit_servers_on_create: bool,
+        }
+
+        impl FakeServer {
+            fn new(has_library: bool) -> Self {
+                Self {
+                    state: Arc::new(Mutex::new(ServerState {
+                        has_library,
+                        ..ServerState::default()
+                    })),
+                    unanswered: Arc::new(AtomicUsize::new(0)),
+                    hold_scan: None,
+                    hold_add: None,
+                    emit_servers_on_create: false,
+                }
+            }
+
+            fn lock(&self) -> std::sync::MutexGuard<'_, ServerState> {
+                self.state.lock().unwrap_or_else(PoisonError::into_inner)
+            }
+
+            fn asked(&self, method: &str) -> usize {
+                self.lock().calls.get(method).copied().unwrap_or(0)
+            }
+
+            fn status(has_library: bool) -> ServerStatus {
+                let server_id = Id::from_bytes([0x10; 16]);
+                let library_id = Id::from_bytes([0x20; 16]);
+                ServerStatus {
+                    server_id,
+                    name: "Test Server".to_owned(),
+                    role: if has_library {
+                        ServerRole::Hub
+                    } else {
+                        ServerRole::Unassigned
+                    },
+                    versions: Versions {
+                        server: "0.1.0".to_owned(),
+                        contract: CONTRACT_VERSION,
+                        sqlite: "3.0".to_owned(),
+                        server_schema: 1,
+                        library_schema: has_library.then_some(1),
+                    },
+                    library: has_library.then_some(LibraryStatus {
+                        library_id,
+                        revision: 1,
+                    }),
+                    free_disk: FreeDisk { data_bytes: None },
+                    log_path: "/tmp".to_owned(),
+                    watch: None,
+                    backup: None,
+                    record: None,
+                    hub: None,
+                }
+            }
+
+            fn connect(&self, role: ServerRole) -> (Arc<Net>, mpsc::UnboundedReceiver<Event>) {
+                let (send, mut calls) = mpsc::channel::<String>(64);
+                let (answers, receive) = mpsc::channel::<String>(64);
+                let _runtime = crate::net::rt().enter();
+                let mut client = ritornel_client::Client::over_memory(send, receive);
+                let events = client.take_events();
+                let client = Arc::new(client);
+                let fake = self.clone();
+                crate::net::rt().spawn(async move {
+                    while let Some(text) = calls.recv().await {
+                        let Ok(Frame::Request(request)) = Frame::decode(&text) else {
+                            continue;
+                        };
+                        fake.unanswered.fetch_add(1, Ordering::SeqCst);
+                        let fake = fake.clone();
+                        let answers = answers.clone();
+                        // Spawn each request independently so holding one RPC
+                        // (e.g. history.zones or scan.start) never blocks others
+                        // (e.g. server.status during Link::restate).
+                        tokio::spawn(async move {
+                            let (outcome, extra_event) = fake.handle(&request).await;
+                            if let Some(event) = extra_event {
+                                let frame = Frame::Notification(Notification {
+                                    method: EVENT_METHOD.to_owned(),
+                                    params: serde_json::to_value(event).ok(),
+                                });
+                                let _ = answers.send(frame.encode()).await;
+                            }
+                            let frame = Frame::Response(Response {
+                                id: Some(request.id),
+                                outcome,
+                            });
+                            let _ = answers.send(frame.encode()).await;
+                            fake.unanswered.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    }
+                });
+                (Arc::new(Net::test_session(client, role)), events)
+            }
+
+            async fn handle(&self, request: &Request) -> (Result<Value, RpcError>, Option<Event>) {
+                let (zones_gate, set_zones_gate) = {
+                    let mut state = self.lock();
+                    *state.calls.entry(request.method.clone()).or_default() += 1;
+                    (state.hold_zones.clone(), state.hold_set_zones.clone())
+                };
+                if request.method == "history.zones"
+                    && let Some(gate) = zones_gate
+                {
+                    gate.wait().await;
+                }
+                if request.method == "history.setZones"
+                    && let Some(gate) = set_zones_gate
+                {
+                    gate.wait().await;
+                }
+                if request.method == "scan.start"
+                    && let Some(gate) = &self.hold_scan
+                {
+                    gate.wait().await;
+                }
+                if request.method == "sources.add"
+                    && let Some(gate) = &self.hold_add
+                {
+                    gate.wait().await;
+                }
+                let mut state = self.lock();
+                let mut event = None;
+                let no_lib = || {
+                    RpcError::new(ErrorCode::Unavailable, "no library")
+                        .with_detail("reason", "no_library")
+                };
+                let ok = |value: Result<Value, serde_json::Error>| {
+                    value.map_err(|error| RpcError::new(ErrorCode::Internal, error.to_string()))
+                };
+                let outcome = match request.method.as_str() {
+                    "server.status" => ok(serde_json::to_value(Self::status(state.has_library))),
+                    "sources.list" => {
+                        if !state.has_library {
+                            Err(no_lib())
+                        } else {
+                            ok(serde_json::to_value(json!({ "sources": state.sources })))
+                        }
+                    }
+                    "jobs.list" => {
+                        if !state.has_library {
+                            Err(no_lib())
+                        } else {
+                            Ok(json!({ "jobs": [] }))
+                        }
+                    }
+                    "artists.pictureFolders" => {
+                        if !state.has_library {
+                            Err(no_lib())
+                        } else {
+                            Ok(json!({ "folders": [] }))
+                        }
+                    }
+                    "lastfm.status" => ok(serde_json::to_value(LastfmStatus {
+                        available: true,
+                        configured: true,
+                        account: Some("pat".to_owned()),
+                        sign_in_again: false,
+                        scrobbling_since: None,
+                        waiting_for_import_since: None,
+                        zones_set: !state.zones.is_empty(),
+                        imported: 0,
+                        import: ImportSchedule::default(),
+                        deliveries: Vec::new(),
+                    })),
+                    "history.zones" => {
+                        if !state.has_library {
+                            Err(no_lib())
+                        } else if let Some(message) = &state.zones_error {
+                            Err(RpcError::new(ErrorCode::Unavailable, message.clone()))
+                        } else {
+                            ok(serde_json::to_value(ZonePeriods {
+                                periods: state.zones.clone(),
+                            }))
+                        }
+                    }
+                    "history.setZones" => {
+                        if !state.has_library {
+                            Err(no_lib())
+                        } else {
+                            match request
+                                .params
+                                .clone()
+                                .ok_or_else(|| RpcError::new(ErrorCode::Invalid, "missing params"))
+                                .and_then(|raw| {
+                                    serde_json::from_value::<SetZonesParams>(raw).map_err(|err| {
+                                        RpcError::new(ErrorCode::Invalid, err.to_string())
+                                    })
+                                }) {
+                                Ok(params) => {
+                                    state.sent_zones.push(params.periods.clone());
+                                    state.zones = params.periods;
+                                    ok(serde_json::to_value(ZonesSet {
+                                        receipt: Receipt {
+                                            command_id: params.idempotency_key,
+                                            status: ReceiptStatus::Done,
+                                            revision: Some(2),
+                                        },
+                                        changed: 0,
+                                    }))
+                                }
+                                Err(err) => Err(err),
+                            }
+                        }
+                    }
+                    "library.create" => {
+                        let key = request
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("idempotencyKey"))
+                            .and_then(|value| serde_json::from_value::<Id>(value.clone()).ok())
+                            .unwrap_or_else(|| Id::from_bytes([0x30; 16]));
+                        state.has_library = true;
+                        if self.emit_servers_on_create {
+                            event = Some(Event::Servers(ServersEvent {
+                                server: ServerInfo {
+                                    server_id: Id::from_bytes([0x10; 16]),
+                                    name: "Test Server".to_owned(),
+                                    role: ServerRole::Hub,
+                                    is_this_server: true,
+                                    reachable: true,
+                                    revision: 2,
+                                },
+                            }));
+                        }
+                        ok(serde_json::to_value(LibraryCreated {
+                            receipt: Receipt {
+                                command_id: key,
+                                status: ReceiptStatus::Done,
+                                revision: Some(1),
+                            },
+                            library_id: Id::from_bytes([0x20; 16]),
+                        }))
+                    }
+                    "sources.add" => {
+                        if !state.has_library {
+                            Err(no_lib())
+                        } else {
+                            match request
+                                .params
+                                .clone()
+                                .ok_or_else(|| RpcError::new(ErrorCode::Invalid, "missing params"))
+                                .and_then(|raw| {
+                                    serde_json::from_value::<SourcesAddParams>(raw).map_err(|err| {
+                                        RpcError::new(ErrorCode::Invalid, err.to_string())
+                                    })
+                                }) {
+                                Ok(params) => {
+                                    let source = Source {
+                                        source_id: Id::from_bytes([0x40; 16]),
+                                        name: params.name,
+                                        kind: SourceKind::Folder,
+                                        path: Some(params.path),
+                                    };
+                                    state.sources.push(source.clone());
+                                    ok(serde_json::to_value(SourceAdded {
+                                        receipt: Receipt {
+                                            command_id: params.idempotency_key,
+                                            status: ReceiptStatus::Done,
+                                            revision: Some(2),
+                                        },
+                                        source,
+                                    }))
+                                }
+                                Err(err) => Err(err),
+                            }
+                        }
+                    }
+                    "scan.start" => {
+                        let key = request
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("idempotencyKey"))
+                            .and_then(|value| serde_json::from_value::<Id>(value.clone()).ok())
+                            .unwrap_or_else(|| Id::from_bytes([0x50; 16]));
+                        let source_id = request
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("sourceId"))
+                            .and_then(|value| serde_json::from_value::<Id>(value.clone()).ok())
+                            .unwrap_or_else(|| Id::from_bytes([0x40; 16]));
+                        let job = Job {
+                            job_id: Id::from_bytes([0x60; 16]),
+                            kind: "scan".to_owned(),
+                            target: Some(JobTarget::Source { id: source_id }),
+                            state: JobState::Running,
+                            done: 0,
+                            total: None,
+                            bytes: 0,
+                            failed: 0,
+                            skipped: 0,
+                            label: None,
+                            error: None,
+                            created_at: 1,
+                            started_at: Some(1),
+                            finished_at: None,
+                            scan: None,
+                            sync: None,
+                        };
+                        ok(serde_json::to_value(ScanStarted {
+                            receipt: Receipt {
+                                command_id: key,
+                                status: ReceiptStatus::Accepted,
+                                revision: None,
+                            },
+                            job,
+                        }))
+                    }
+                    _ => Err(RpcError::new(ErrorCode::Unsupported, "not in this test")),
+                };
+                (outcome, event)
+            }
+        }
+
+        fn wait_until(
+            cx: &mut gpui::TestAppContext,
+            what: &str,
+            mut done: impl FnMut(&mut gpui::TestAppContext) -> bool,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                cx.run_until_parked();
+                if done(cx) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "never {what}");
+                std::thread::yield_now();
+            }
+        }
+
+        fn test_clock() -> words::Clock {
+            words::Clock {
+                now: 1_763_391_600_000,
+                zone: jiff::tz::TimeZone::UTC,
+                style: words::Style::BRITISH,
+            }
+        }
+
+        fn period(zone: &str, from: Option<&str>) -> ZonePeriod {
+            ZonePeriod {
+                zone: zone.to_owned(),
+                from: from.map(str::to_owned),
+                until: None,
+            }
+        }
+
+        #[gpui::test]
+        fn saving_before_zones_load_never_replaces_them(cx: &mut gpui::TestAppContext) {
+            cx.executor().allow_parking();
+            let gate = Gate::hold();
+            let fake = FakeServer::new(true);
+            fake.lock().hold_zones = Some(gate.clone());
+            fake.lock().zones = vec![period("Europe/London", None)];
+
+            let (net, events) = fake.connect(ServerRole::Hub);
+            let link = cx.update(crate::link::unlinked);
+            link.update(cx, |link, cx| link.connect(net, events, cx));
+            let model = cx.update(|cx| super::super::new(link.clone(), true, cx));
+
+            // Wait until history.zones is in flight and other initial reads finished.
+            wait_until(cx, "started reading zones", |cx| {
+                gate.reached() == 1 && model.read_with(cx, |m, _| m.lastfm.is_some())
+            });
+            assert_eq!(model.read_with(cx, |m, _| m.zones.clone()), Zones::Loading);
+
+            // Editing is refused while loading: start_adding stays closed,
+            // and even a forced add/remove sends no replacement.
+            let clock = test_clock();
+            model.update(cx, |model, cx| {
+                model.start_adding(&clock, cx);
+                assert!(model.adding.is_none());
+                model.adding = Some(Adding {
+                    zone: "Asia/Tokyo".to_owned(),
+                    from: "2026-11-17".to_owned(),
+                });
+                model.add(cx);
+                model.chosen = Some(0);
+                model.remove(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(fake.asked("history.setZones"), 0);
+
+            // Once the initial read finishes, adding preserves the server's periods.
+            gate.release();
+            wait_until(cx, "loaded zones", |cx| {
+                model.read_with(cx, |m, _| {
+                    m.zones == Zones::Loaded(vec![period("Europe/London", None)])
+                })
+            });
+            model.update(cx, |model, cx| {
+                model.adding = Some(Adding {
+                    zone: "Asia/Tokyo".to_owned(),
+                    from: "2026-11-17".to_owned(),
+                });
+                model.add(cx);
+            });
+            wait_until(cx, "saved added zone", |cx| {
+                fake.asked("history.setZones") == 1
+                    && model.read_with(cx, |m, _| !m.is_busy(Busy::Zones) && m.adding.is_none())
+            });
+            assert_eq!(
+                fake.lock().sent_zones,
+                vec![vec![
+                    period("Europe/London", None),
+                    period("Asia/Tokyo", Some("2026-11-17")),
+                ]]
+            );
+        }
+
+        #[gpui::test]
+        fn a_failed_zones_read_blocks_edits_until_retry_succeeds(cx: &mut gpui::TestAppContext) {
+            cx.executor().allow_parking();
+            let fake = FakeServer::new(true);
+            fake.lock().zones = vec![period("America/New_York", None)];
+            fake.lock().zones_error = Some("Studio Mac does not answer".to_owned());
+
+            let (net, events) = fake.connect(ServerRole::Hub);
+            let link = cx.update(crate::link::unlinked);
+            link.update(cx, |link, cx| link.connect(net, events, cx));
+            let model = cx.update(|cx| super::super::new(link.clone(), true, cx));
+
+            wait_until(cx, "recorded zones failure", |cx| {
+                model.read_with(cx, |m, _| {
+                    m.zones == Zones::Failed("Studio Mac does not answer".to_owned())
+                })
+            });
+            assert!(model.read_with(cx, |m, _| !m.problems.contains_key(&Group::Zones)));
+
+            // No edit can send a replacement after a failed read.
+            let clock = test_clock();
+            model.update(cx, |model, cx| {
+                model.start_adding(&clock, cx);
+                assert!(model.adding.is_none());
+                model.adding = Some(Adding {
+                    zone: "Europe/Berlin".to_owned(),
+                    from: String::new(),
+                });
+                model.add(cx);
+                model.chosen = Some(0);
+                model.remove(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(fake.asked("history.setZones"), 0);
+
+            // Retrying transitions through Loading and enables editing once loaded.
+            fake.lock().zones_error = None;
+            model.update(cx, |model, cx| {
+                model.read_zones(cx);
+                assert_eq!(model.zones, Zones::Loading);
+            });
+            wait_until(cx, "reloaded zones after retry", |cx| {
+                model.read_with(cx, |m, _| {
+                    m.zones == Zones::Loaded(vec![period("America/New_York", None)])
+                })
+            });
+            model.update(cx, |model, cx| {
+                model.start_adding(&clock, cx);
+                assert!(model.adding.is_some());
+                model.adding = Some(Adding {
+                    zone: "Europe/Berlin".to_owned(),
+                    from: "2026-11-17".to_owned(),
+                });
+                model.add(cx);
+            });
+            wait_until(cx, "saved zone after retry", |cx| {
+                fake.asked("history.setZones") == 1
+                    && model.read_with(cx, |m, _| !m.is_busy(Busy::Zones) && m.adding.is_none())
+            });
+            assert_eq!(
+                fake.lock().sent_zones,
+                vec![vec![
+                    period("America/New_York", None),
+                    period("Europe/Berlin", Some("2026-11-17")),
+                ]]
+            );
+        }
+
+        #[gpui::test]
+        fn first_folder_clears_busy_when_status_restates_before_scan_finishes(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            cx.executor().allow_parking();
+            let scan_gate = Gate::hold();
+            let mut fake = FakeServer::new(false);
+            fake.hold_scan = Some(scan_gate.clone());
+            fake.emit_servers_on_create = true;
+
+            let (initial_net, events) = fake.connect(ServerRole::Unassigned);
+            let link = cx.update(crate::link::unlinked);
+            link.update(cx, |link, cx| {
+                link.connect(Arc::clone(&initial_net), events, cx);
+            });
+            let model = cx.update(|cx| super::super::new(link.clone(), true, cx));
+
+            wait_until(cx, "initial empty server reads settled", |cx| {
+                fake.unanswered.load(Ordering::SeqCst) == 0
+                    && model.read_with(cx, |m, _| {
+                        m.sources == Some(Vec::new()) && m.zones == Zones::NoLibrary
+                    })
+            });
+
+            let add_task = model.update(cx, |model, cx| {
+                model.add_folder("/Volumes/Records/Music".to_owned(), cx)
+            });
+            assert!(model.read_with(cx, |m, _| m.is_busy(Busy::Adding)));
+
+            // Wait until library.create triggered Link::restate (new Arc<Net>, same session)
+            // while scan.start is still in flight.
+            wait_until(cx, "restated status while scan.start is held", |cx| {
+                scan_gate.reached() == 1
+                    && link.read_with(cx, |link, _| {
+                        link.net().is_some_and(|current| {
+                            current.role == ServerRole::Hub
+                                && current.holds
+                                && !Arc::ptr_eq(&initial_net, &current)
+                                && initial_net.same_session(&current)
+                        })
+                    })
+            });
+
+            scan_gate.release();
+            let done = Arc::new(AtomicBool::new(false));
+            let succeeded = Arc::new(AtomicBool::new(false));
+            {
+                let done = Arc::clone(&done);
+                let succeeded = Arc::clone(&succeeded);
+                cx.spawn(async move |_| {
+                    let ok = add_task.await;
+                    succeeded.store(ok, Ordering::SeqCst);
+                    done.store(true, Ordering::SeqCst);
+                })
+                .detach();
+            }
+            wait_until(cx, "add_folder completed", |cx| {
+                done.load(Ordering::SeqCst)
+                    && fake.unanswered.load(Ordering::SeqCst) == 0
+                    && model.read_with(cx, |m, _| !m.is_busy(Busy::Adding))
+            });
+
+            assert!(succeeded.load(Ordering::SeqCst));
+            assert!(model.read_with(cx, |m, _| {
+                !m.is_busy(Busy::Adding)
+                    && m.sources.as_ref().is_some_and(|sources| {
+                        sources
+                            .iter()
+                            .any(|source| source.path.as_deref() == Some("/Volumes/Records/Music"))
+                    })
+                    && !m.scans.is_empty()
+            }));
+        }
+
+        #[gpui::test]
+        fn stale_operation_clears_only_its_own_busy_slot(cx: &mut gpui::TestAppContext) {
+            cx.executor().allow_parking();
+            let first_gate = Gate::hold();
+            let mut first = FakeServer::new(true);
+            first.hold_add = Some(first_gate.clone());
+            let (net1, events1) = first.connect(ServerRole::Hub);
+
+            let second_gate = Gate::hold();
+            let mut second = FakeServer::new(true);
+            second.hold_add = Some(second_gate.clone());
+            let (net2, events2) = second.connect(ServerRole::Hub);
+
+            let link = cx.update(crate::link::unlinked);
+            link.update(cx, |link, cx| link.connect(net1, events1, cx));
+            let model = cx.update(|cx| super::super::new(link.clone(), true, cx));
+
+            wait_until(cx, "first session settled", |cx| {
+                first.unanswered.load(Ordering::SeqCst) == 0
+                    && model.read_with(cx, |m, _| m.sources.is_some())
+            });
+
+            let op1 = model.update(cx, |model, cx| {
+                model.add_folder("/Volumes/One/Music".to_owned(), cx)
+            });
+            wait_until(cx, "first add_folder reached server", |_| {
+                first_gate.reached() == 1
+            });
+            assert!(model.read_with(cx, |m, _| m.is_busy(Busy::Adding)));
+
+            // Reconnect to a new session and start a new Add Folder while op1 is still in flight.
+            link.update(cx, |link, cx| link.connect(net2, events2, cx));
+            wait_until(cx, "second session connected", |cx| {
+                model.read_with(cx, |m, _| !m.is_busy(Busy::Adding))
+            });
+            let op2 = model.update(cx, |model, cx| {
+                model.add_folder("/Volumes/Two/Music".to_owned(), cx)
+            });
+            wait_until(cx, "second add_folder reached server", |_| {
+                second_gate.reached() == 1
+            });
+            assert!(model.read_with(cx, |m, _| m.is_busy(Busy::Adding)));
+
+            // Finishing op1 must NOT clear op2's busy slot.
+            first_gate.release();
+            let op1_done = Arc::new(AtomicBool::new(false));
+            {
+                let op1_done = Arc::clone(&op1_done);
+                cx.spawn(async move |_| {
+                    assert!(!op1.await);
+                    op1_done.store(true, Ordering::SeqCst);
+                })
+                .detach();
+            }
+            wait_until(cx, "op1 finished", |_| op1_done.load(Ordering::SeqCst));
+            assert!(model.read_with(cx, |m, _| m.is_busy(Busy::Adding)));
+
+            // Going Away and finishing op2 clears its matching busy slot.
+            link.update(cx, |link, cx| {
+                link.state = State::Away {
+                    why: crate::link::Why::Lost,
+                    message: None,
+                    data_dir: None,
+                };
+                cx.emit(LinkEvent::Away);
+            });
+            second_gate.release();
+            let op2_done = Arc::new(AtomicBool::new(false));
+            {
+                let op2_done = Arc::clone(&op2_done);
+                cx.spawn(async move |_| {
+                    assert!(!op2.await);
+                    op2_done.store(true, Ordering::SeqCst);
+                })
+                .detach();
+            }
+            wait_until(cx, "op2 cleared busy on away", |cx| {
+                op2_done.load(Ordering::SeqCst)
+                    && model.read_with(cx, |m, _| !m.is_busy(Busy::Adding))
+            });
+        }
+
+        #[gpui::test]
+        fn refreshing_zones_disables_edits_and_clears_selection_until_loaded(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            cx.executor().allow_parking();
+            let fake = FakeServer::new(true);
+            fake.lock().zones = vec![
+                period("Europe/London", None),
+                period("America/New_York", Some("2021-06-01")),
+            ];
+
+            let (net, events) = fake.connect(ServerRole::Hub);
+            let link = cx.update(crate::link::unlinked);
+            link.update(cx, |link, cx| link.connect(net, events, cx));
+            let model = cx.update(|cx| super::super::new(link.clone(), true, cx));
+
+            wait_until(cx, "initial zones loaded", |cx| {
+                model.read_with(cx, |m, _| m.zones.is_loaded())
+            });
+
+            // Select the second zone, then start a refresh on the same session
+            // while another client changed the server's list.
+            model.update(cx, |model, _| model.chosen = Some(1));
+            let refresh_gate = Gate::hold();
+            {
+                let mut state = fake.lock();
+                state.zones = vec![
+                    period("Asia/Tokyo", None),
+                    period("Europe/London", Some("2020-01-01")),
+                ];
+                state.hold_zones = Some(refresh_gate.clone());
+            }
+            model.update(cx, |model, cx| model.read_zones(cx));
+
+            wait_until(cx, "refresh reached server", |_| {
+                refresh_gate.reached() == 1
+            });
+            // Selection is cleared and writes are blocked while refresh is in flight.
+            assert_eq!(model.read_with(cx, |m, _| m.zones.clone()), Zones::Loading);
+            assert_eq!(model.read_with(cx, |m, _| m.chosen), None);
+            model.update(cx, |model, cx| {
+                model.chosen = Some(1);
+                model.remove(cx);
+                model.adding = Some(Adding {
+                    zone: "Europe/Berlin".to_owned(),
+                    from: String::new(),
+                });
+                model.add(cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(fake.asked("history.setZones"), 0);
+
+            // Releasing the refresh loads the server's new list with no stale selection.
+            refresh_gate.release();
+            wait_until(cx, "refresh completed", |cx| {
+                model.read_with(cx, |m, _| {
+                    m.zones
+                        == Zones::Loaded(vec![
+                            period("Asia/Tokyo", None),
+                            period("Europe/London", Some("2020-01-01")),
+                        ])
+                })
+            });
+            assert_eq!(model.read_with(cx, |m, _| m.chosen), None);
+        }
+
+        #[gpui::test]
+        fn a_save_does_not_overwrite_a_newer_zones_read(cx: &mut gpui::TestAppContext) {
+            cx.executor().allow_parking();
+            let fake = FakeServer::new(true);
+            fake.lock().zones = vec![period("Europe/London", None)];
+
+            let (net, events) = fake.connect(ServerRole::Hub);
+            let link = cx.update(crate::link::unlinked);
+            link.update(cx, |link, cx| link.connect(net, events, cx));
+            let model = cx.update(|cx| super::super::new(link.clone(), true, cx));
+
+            wait_until(cx, "initial zones loaded", |cx| {
+                model.read_with(cx, |m, _| m.zones.is_loaded())
+            });
+
+            // Hold history.setZones while a newer read_zones starts and fails.
+            let save_gate = Gate::hold();
+            fake.lock().hold_set_zones = Some(save_gate.clone());
+            model.update(cx, |model, cx| {
+                model.adding = Some(Adding {
+                    zone: "Asia/Tokyo".to_owned(),
+                    from: "2026-11-17".to_owned(),
+                });
+                model.add(cx);
+            });
+            wait_until(cx, "save reached server", |_| save_gate.reached() == 1);
+
+            // A newer refresh starts while the save is still in flight and fails.
+            fake.lock().zones_error = Some("Studio Mac does not answer".to_owned());
+            model.update(cx, |model, cx| model.read_zones(cx));
+            wait_until(cx, "newer refresh failed", |cx| {
+                model.read_with(cx, |m, _| {
+                    m.zones == Zones::Failed("Studio Mac does not answer".to_owned())
+                })
+            });
+
+            // Even if the older save's read-back succeeds, it must not overwrite
+            // the newer refresh's state.
+            fake.lock().zones_error = None;
+            save_gate.release();
+            wait_until(cx, "save finished", |cx| {
+                model.read_with(cx, |m, _| !m.is_busy(Busy::Zones))
+            });
+            assert_eq!(
+                model.read_with(cx, |m, _| m.zones.clone()),
+                Zones::Failed("Studio Mac does not answer".to_owned())
+            );
+        }
     }
 }

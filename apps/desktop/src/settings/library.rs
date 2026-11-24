@@ -80,7 +80,7 @@ fn record(
                 .child("Every listen is being recorded"),
         );
     }
-    let dismissing = model.busy.contains(&Busy::Dismissing);
+    let dismissing = model.is_busy(Busy::Dismissing);
     // The warnings, then the notes: what no one can act on, said quietly.
     let all: Vec<(&RecordProblem, bool)> = record
         .problems
@@ -191,7 +191,7 @@ pub(super) fn render(
                 .find(|folder| folder.name == name && folder.kind == kind)
         })
     };
-    let busy = |what: Busy| model.busy.contains(&what);
+    let busy = |what: Busy| model.is_busy(what);
 
     // ---- Music folders
     let mut rows = Vec::new();

@@ -11,9 +11,9 @@ use gpui::{
 use super::act;
 use super::controls::{
     MONO, actions, boxed, chosen, clickable, date_field, edit, group, grow, heading, label_value,
-    note, pop_up, problem, push, row, spinner, sub, switch_row,
+    note, pop_up, problem, push, row, spinner, sub, sub_wraps, switch_row,
 };
-use super::model::{Busy, Group, Model, SigningIn};
+use super::model::{Busy, Group, Model, NO_LIBRARY_YET, SigningIn, Zones};
 use super::words::{Clock, all_zones, last_import, next_import, when, zone_name, zone_span};
 use crate::theme;
 use crate::words::thousands;
@@ -56,6 +56,32 @@ pub(super) fn render(
 ) -> impl IntoElement {
     let base = div().id("lastfm").flex().flex_col();
     let Some(status) = &model.lastfm else {
+        if let Some(reason) = model.problems.get(&Group::Account) {
+            return base.child(group(true).child(heading("Last.fm")).child(boxed(vec![
+                    row()
+                        .child(
+                            grow()
+                                .child(
+                                    div()
+                                        .text_color(theme::warn())
+                                        .child("Last.fm settings could not be read"),
+                                )
+                                .when(!reason.is_empty(), |body| {
+                                    body.child(sub_wraps(reason.clone()))
+                                })
+                                .child(sub_wraps("Try again once the server is reachable.")),
+                        )
+                        .child(actions().child(push(
+                            "retry-lastfm",
+                            "Try Again",
+                            true,
+                            act(entity, |model, _, cx| {
+                                model.read_lastfm(cx);
+                                model.read_zones(cx);
+                            }),
+                        ))),
+                ])));
+        }
         return base.child(div().text_color(theme::dim()).child("Reading…"));
     };
     if !status.available {
@@ -63,7 +89,7 @@ pub(super) fn render(
             row().child("This server was built without Last.fm."),
         ])));
     }
-    let busy = |what: Busy| model.busy.contains(&what);
+    let busy = |what: Busy| model.is_busy(what);
     let data_dir = model.data_dir.as_ref().map(|dir| dir.display().to_string());
     if !status.configured {
         let reveal = model.data_dir.clone();
@@ -244,106 +270,147 @@ pub(super) fn render(
         .children(model.problems.get(&Group::Import).cloned().map(problem));
 
     // ---- Where you listened
-    let zones = model.zones.as_deref().unwrap_or_default();
-    let mut rows: Vec<Div> = zones
-        .iter()
-        .enumerate()
-        .map(|(index, period)| {
-            let is_chosen = model.chosen == Some(index);
-            let model = entity.clone();
-            let focus = zones_focus.clone();
-            // In a plain row of its own, for the line above it.
-            let option = row()
-                .min_h(px(34.))
-                .when(is_chosen, |row| {
-                    row.bg(if focused {
-                        // `color-mix(in srgb, var(--acc) 26%, transparent)`.
-                        gpui::Rgba {
-                            a: 0.26,
-                            ..theme::acc()
-                        }
-                    } else {
-                        chosen()
-                    })
-                    .when(index == 0, |row| row.rounded_t(px(7.)))
-                })
-                .child(div().flex_1().child(zone_name(&period.zone)))
-                .child(
-                    div()
-                        .text_color(theme::dim())
-                        .text_right()
-                        .child(zone_span(period, clock.style)),
-                );
-            clickable(option, ("zone", index), move |_, window, cx| {
-                window.focus(&focus, cx);
-                model.update(cx, |model, cx| {
-                    model.chosen = if model.chosen == Some(index) {
-                        None
-                    } else {
-                        Some(index)
-                    };
-                    cx.notify();
-                });
-            })
-        })
-        .collect();
-    if zones.is_empty() {
-        rows.push(
-            row()
-                .text_color(theme::dim())
-                .child("No zones yet. Imported plays wait for one."),
-        );
-    }
-    if let Some(adding) = &model.adding {
-        let zone = adding.zone.clone();
-        let choose = entity.clone();
-        rows.push(
-            row()
-                .flex_wrap()
-                .child(pop_up(
-                    "zone",
-                    zone_name(&adding.zone),
-                    move |event, window, cx| {
-                        let handle = window.window_handle();
-                        let at = event.position();
-                        let model = choose.clone();
-                        let zone = zone.clone();
-                        cx.spawn(async move |cx| {
-                            let zones = all_zones();
-                            let names = zones.iter().map(|zone| zone_name(zone)).collect();
-                            let checked = zones.iter().position(|each| *each == zone);
-                            let chosen = crate::menu::choose(handle, names, checked, at, cx).await;
-                            if let Some(zone) = chosen.and_then(|index| zones.get(index).cloned()) {
-                                model.update(cx, |model, cx| {
-                                    if let Some(adding) = &mut model.adding {
-                                        adding.zone = zone;
-                                    }
-                                    cx.notify();
-                                });
+    let zones_loaded = model.zones.is_loaded();
+    let mut rows: Vec<Div> = Vec::new();
+    match &model.zones {
+        Zones::Loading => {
+            rows.push(
+                row()
+                    .gap(px(8.))
+                    .text_color(theme::dim())
+                    .child(spinner("reading-zones"))
+                    .child("Reading…"),
+            );
+        }
+        Zones::NoLibrary => {
+            rows.push(row().text_color(theme::dim()).child(NO_LIBRARY_YET));
+        }
+        Zones::Failed(reason) => {
+            rows.push(
+                row()
+                    .child(
+                        grow()
+                            .child(
+                                div()
+                                    .text_color(theme::warn())
+                                    .child("Listening time zones could not be read"),
+                            )
+                            .when(!reason.is_empty(), |body| {
+                                body.child(sub_wraps(reason.clone()))
+                            })
+                            .child(sub_wraps(
+                                "Try again to load the list before making changes.",
+                            )),
+                    )
+                    .child(actions().child(push(
+                        "retry-zones",
+                        "Try Again",
+                        true,
+                        act(entity, |model, _, cx| model.read_zones(cx)),
+                    ))),
+            );
+        }
+        Zones::Loaded(zones) => {
+            for (index, period) in zones.iter().enumerate() {
+                let is_chosen = model.chosen == Some(index);
+                let model = entity.clone();
+                let focus = zones_focus.clone();
+                // In a plain row of its own, for the line above it.
+                let option = row()
+                    .min_h(px(34.))
+                    .when(is_chosen, |row| {
+                        row.bg(if focused {
+                            // `color-mix(in srgb, var(--acc) 26%, transparent)`.
+                            gpui::Rgba {
+                                a: 0.26,
+                                ..theme::acc()
                             }
+                        } else {
+                            chosen()
                         })
-                        .detach();
-                    },
-                ))
-                .child(div().text_color(theme::dim()).child("from"))
-                .child(date_field(&adding.from))
-                .child(div().flex_1())
-                .child(push(
-                    "cancel-zone",
-                    "Cancel",
-                    true,
-                    act(entity, |model, _, cx| {
-                        model.adding = None;
+                        .when(index == 0, |row| row.rounded_t(px(7.)))
+                    })
+                    .child(div().flex_1().child(zone_name(&period.zone)))
+                    .child(
+                        div()
+                            .text_color(theme::dim())
+                            .text_right()
+                            .child(zone_span(period, clock.style)),
+                    );
+                rows.push(clickable(option, ("zone", index), move |_, window, cx| {
+                    window.focus(&focus, cx);
+                    model.update(cx, |model, cx| {
+                        model.chosen = if model.chosen == Some(index) {
+                            None
+                        } else {
+                            Some(index)
+                        };
                         cx.notify();
-                    }),
-                ))
-                .child(push(
-                    "add-zone",
-                    "Add",
-                    !busy(Busy::Zones),
-                    act(entity, |model, _, cx| model.add(cx)),
-                )),
-        );
+                    });
+                }));
+            }
+            if zones.is_empty() {
+                rows.push(
+                    row()
+                        .text_color(theme::dim())
+                        .child("No zones yet. Imported plays wait for one."),
+                );
+            }
+            if let Some(adding) = &model.adding {
+                let zone = adding.zone.clone();
+                let choose = entity.clone();
+                rows.push(
+                    row()
+                        .flex_wrap()
+                        .child(pop_up(
+                            "zone",
+                            zone_name(&adding.zone),
+                            move |event, window, cx| {
+                                let handle = window.window_handle();
+                                let at = event.position();
+                                let model = choose.clone();
+                                let zone = zone.clone();
+                                cx.spawn(async move |cx| {
+                                    let zones = all_zones();
+                                    let names = zones.iter().map(|zone| zone_name(zone)).collect();
+                                    let checked = zones.iter().position(|each| *each == zone);
+                                    let chosen =
+                                        crate::menu::choose(handle, names, checked, at, cx).await;
+                                    if let Some(zone) =
+                                        chosen.and_then(|index| zones.get(index).cloned())
+                                    {
+                                        model.update(cx, |model, cx| {
+                                            if let Some(adding) = &mut model.adding {
+                                                adding.zone = zone;
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                })
+                                .detach();
+                            },
+                        ))
+                        .child(div().text_color(theme::dim()).child("from"))
+                        .child(date_field(&adding.from))
+                        .child(div().flex_1())
+                        .child(push(
+                            "cancel-zone",
+                            "Cancel",
+                            true,
+                            act(entity, |model, _, cx| {
+                                model.adding = None;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(push(
+                            "add-zone",
+                            "Add",
+                            !busy(Busy::Zones),
+                            act(entity, |model, _, cx| model.add(cx)),
+                        )),
+                );
+            }
+        }
     }
     let start = clock.clone();
     rows.push(
@@ -358,13 +425,13 @@ pub(super) fn render(
             .child(edit(
                 "add-a-zone",
                 "+",
-                model.adding.is_none(),
+                zones_loaded && model.adding.is_none() && !busy(Busy::Zones),
                 act(entity, move |model, _, cx| model.start_adding(&start, cx)),
             ))
             .child(edit(
                 "remove-the-zone",
                 "−",
-                model.chosen.is_some() && !busy(Busy::Zones),
+                zones_loaded && model.chosen.is_some() && !busy(Busy::Zones),
                 act(entity, |model, _, cx| model.remove(cx)),
             ))
             .when(busy(Busy::Zones), |foot| {
@@ -378,7 +445,10 @@ pub(super) fn render(
         .on_key_down(move |event, _, cx| {
             if matches!(event.keystroke.key.as_str(), "backspace" | "delete") {
                 removing.update(cx, |model, cx| {
-                    if model.chosen.is_some() {
+                    if model.chosen.is_some()
+                        && model.zones.is_loaded()
+                        && !model.is_busy(Busy::Zones)
+                    {
                         model.remove(cx);
                     }
                 });

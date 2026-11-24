@@ -143,6 +143,32 @@ impl Net {
         }
     }
 
+    /// Whether `other` is the same server session, even after its status was
+    /// read again (`restated`).
+    pub(crate) fn same_session(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.client, &other.client)
+    }
+
+    /// A session over `client` with `role`, for tests.
+    #[cfg(test)]
+    pub(crate) fn test_session(client: Arc<Client>, role: ServerRole) -> Self {
+        Self {
+            client,
+            art: Arc::new(ArtHttp {
+                endpoint: SocketAddr::from(([127, 0, 0, 1], 9)),
+                token: String::new(),
+                idle: Mutex::new(Vec::new()),
+                in_flight: Semaphore::new(MAX_ART_IN_FLIGHT),
+            }),
+            art_sizes: vec![300],
+            name: "Test Server".to_owned(),
+            role,
+            versions: None,
+            holds: role != ServerRole::Unassigned,
+            hub: None,
+        }
+    }
+
     /// A session over `client`, for tests: a satellite whose hub answers
     /// or not, with no covers to read.
     #[cfg(test)]
