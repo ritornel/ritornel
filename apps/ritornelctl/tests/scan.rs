@@ -14,9 +14,11 @@
     clippy::indexing_slicing
 )]
 
+mod support;
+
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -205,14 +207,14 @@ impl Server {
         Self { child, stdout }
     }
 
-    /// Waits for the server to end by itself, and returns its exit code:
-    /// `None` when a signal ended it.
-    fn ended(mut self) -> Option<i32> {
+    /// Waits for the server to end by itself, and says how it did: its
+    /// exit status names the signal when one ended it, as an abort does.
+    fn ended(mut self) -> ExitStatus {
         assert!(
             rest(&self.stdout).is_some(),
             "the server did not end within {WAIT:?}"
         );
-        self.child.wait().unwrap().code()
+        self.child.wait().unwrap()
     }
 
     /// Stops the server with SIGTERM and waits for it to end cleanly.
@@ -234,12 +236,14 @@ impl Server {
                 .unwrap()
         };
         assert!(sent.success(), "asking it to stop: {sent}");
-        assert_eq!(self.ended(), Some(0));
+        let ended = self.ended();
+        assert!(ended.success(), "the server ended with {ended}");
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
+        support::say_if_gone(&mut self.child, None);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -360,7 +364,8 @@ fn a_scan_cut_off_when_the_server_dies_is_taken_up_by_the_next_run_and_finishes(
     let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
     // It was killed by a signal, not stopped: no exit code, and it left
     // `server.json` behind.
-    assert_eq!(dying.ended(), ABORTED);
+    let ended = dying.ended();
+    assert_eq!(ended.code(), ABORTED, "the server ended with {ended}");
     assert!(data_dir.join("server.json").exists());
     assert_eq!(ritornelctl(&data_dir, &["status"]).0, Some(4));
 
