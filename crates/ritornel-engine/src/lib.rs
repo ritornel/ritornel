@@ -152,4 +152,4 @@ pub use stream_import::{APPLY_METHOD, StoredRun, UNDO_METHOD};
 /// The version of the play rule in force, which a dry run's report records.
 pub const PLAY_RULE_VERSION: i64 = ritornel_domain::history::PlayRule::CURRENT.version;
 pub use timekeeping::{SystemTimekeeper, Timekeeper, clock_boot};
-pub use walk::folder_id;
+pub use walk::{FolderId, folder_id};
