@@ -28,6 +28,7 @@ mod playback;
 mod scan;
 mod server;
 mod settings;
+mod spotify;
 mod status;
 
 use std::process::ExitCode;
