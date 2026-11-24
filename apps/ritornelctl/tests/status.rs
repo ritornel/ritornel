@@ -18,6 +18,8 @@
     clippy::indexing_slicing
 )]
 
+mod support;
+
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -266,6 +268,7 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        support::say_if_gone(&mut self.child, Some(&self.stderr));
         // After `end` these do nothing.
         let _ = self.child.kill();
         let _ = self.child.wait();
