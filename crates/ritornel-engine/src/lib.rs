@@ -41,6 +41,7 @@ mod entropy;
 mod error;
 mod export;
 mod history_facts;
+mod history_heard;
 mod history_pages;
 #[cfg(test)]
 mod history_size;

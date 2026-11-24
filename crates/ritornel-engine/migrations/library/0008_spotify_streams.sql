@@ -1,6 +1,7 @@
 -- =============================================================================
 -- Ritornel library.db, migration 0008: Spotify's streams, kept beside the
--- scrobbles and never in place of them.
+-- scrobbles and never in place of them, and who and what each play was
+-- heard as, with files for it or not.
 --
 -- A stream is one row of Spotify's extended streaming history. It is stored
 -- as an import observation of the library's Spotify endpoint, with its
@@ -141,3 +142,88 @@ CREATE TABLE stream_device (
 -- rewritten with the plays. NULL for a primary.
 ALTER TABLE play_event_observation ADD COLUMN joined_by TEXT
   CHECK (joined_by IN ('chain', 'echo', 'repeat', 'start', 'during', 'renamed', 'pin'));
+
+-- =============================================================================
+-- Who and what each play was of, when there are no files for it: derived,
+-- and rewritten with the plays and by nothing else. A play bound to a song
+-- has its credit's artists and the record it was heard from. Any other
+-- has its names, by their keys: an artist's name, and an album's under it.
+-- A name is the library's artist when exactly one artist it can be has
+-- that key: one with a record, one a bound play's song credits, or one
+-- credited on a record a play was heard from. An album's name is that
+-- artist's record when exactly one of theirs, with files or heard from,
+-- has its title; which, the catalog decides, and it is found
+-- again whenever the catalog changes, without touching a play. The History
+-- lists read these, so that no query folds every play's names as it runs.
+-- =============================================================================
+
+CREATE TABLE heard_artist (
+  id                 INTEGER PRIMARY KEY,
+  artist_id          INTEGER UNIQUE REFERENCES artist(id),   -- the library's artist a bound play's credit names, as canonical when linked; NULL for a name
+  name_key           TEXT,                                   -- a name's key (accents folded, no leading 'The' or featured credit); NULL for the library's
+  name               TEXT,                                   -- a name's spelling played most; NULL for the library's
+  library_artist_id  INTEGER REFERENCES artist(id),          -- for a name, the library's artist it is, when exactly one it can be has its key
+  rev                INTEGER NOT NULL,
+  CHECK ((artist_id IS NULL) = (name_key IS NOT NULL)),
+  CHECK ((name_key IS NULL) = (name IS NULL)),
+  CHECK (name_key IS NOT NULL OR library_artist_id IS NULL)
+) STRICT;
+
+CREATE UNIQUE INDEX heard_artist_name ON heard_artist (name_key) WHERE name_key IS NOT NULL;
+
+CREATE TABLE heard_album (
+  id                INTEGER PRIMARY KEY,
+  release_group_id  INTEGER UNIQUE REFERENCES release_group(id),   -- the record a bound play was heard from; NULL for a name
+  heard_artist_id   INTEGER REFERENCES heard_artist(id),           -- the artist's name it is under; NULL for the library's
+  name_key          TEXT,                                          -- a name's key under its artist; NULL for the library's
+  name              TEXT,                                          -- a name's spelling played most; NULL for the library's
+  library_group_id  INTEGER REFERENCES release_group(id),          -- for a name, the library's record it is, when its artist is the library's and exactly one of theirs has its title
+  rev               INTEGER NOT NULL,
+  CHECK ((release_group_id IS NULL) = (heard_artist_id IS NOT NULL)),
+  CHECK ((heard_artist_id IS NULL) = (name_key IS NULL)),
+  CHECK ((name_key IS NULL) = (name IS NULL)),
+  CHECK (name_key IS NOT NULL OR library_group_id IS NULL)
+) STRICT;
+
+CREATE UNIQUE INDEX heard_album_name ON heard_album (heard_artist_id, name_key)
+  WHERE heard_artist_id IS NOT NULL;
+
+-- A play's artists: one for each of its credit's artists, or its name's.
+-- Whose it is, whether it counts, its local date and its instant are
+-- copied from the play, so that a list is read from the index on them alone.
+CREATE TABLE play_event_artist (
+  id               INTEGER PRIMARY KEY,
+  heard_artist_id  INTEGER NOT NULL REFERENCES heard_artist(id),
+  play_event_id    INTEGER NOT NULL REFERENCES play_event(id),
+  listener_id      INTEGER NOT NULL REFERENCES listener(id),     -- the play's
+  counted          INTEGER NOT NULL CHECK (counted IN (0, 1)),   -- counts and not excluded
+  local_date       INTEGER,                                      -- YYYYMMDD
+  event_at_utc_ms  INTEGER,                                      -- the play's, so that one stamped after now is never a list's first or last
+  spelling         TEXT,                                         -- the name as the play gave it, for a name
+  rev              INTEGER NOT NULL,
+  UNIQUE (play_event_id, heard_artist_id)
+) STRICT;
+
+CREATE INDEX play_event_artist_heard ON play_event_artist (heard_artist_id, counted);
+CREATE INDEX play_event_artist_listed ON play_event_artist (listener_id, counted, heard_artist_id, local_date, event_at_utc_ms);
+
+-- A play's album, when it has one.
+CREATE TABLE play_event_album (
+  id              INTEGER PRIMARY KEY,
+  heard_album_id  INTEGER NOT NULL REFERENCES heard_album(id),
+  play_event_id   INTEGER NOT NULL UNIQUE REFERENCES play_event(id),
+  listener_id     INTEGER NOT NULL REFERENCES listener(id),
+  counted         INTEGER NOT NULL CHECK (counted IN (0, 1)),
+  local_date      INTEGER,
+  event_at_utc_ms INTEGER,
+  spelling        TEXT,
+  rev             INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted);
+CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date, event_at_utc_ms);
+
+-- An artist's page counts a song as the appearance it was heard from
+-- credits it, as the lists link it: the appearances whose credit names
+-- them are found by it.
+CREATE INDEX track_appearance_display_artist_credit ON track_appearance (display_artist_credit_id);

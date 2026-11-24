@@ -560,6 +560,16 @@ impl LibraryStore {
                     RecordOp::Displace(_) => {}
                 }
             }
+            // A file retired can leave an artist or a record without one,
+            // which a name heard was found to be: it is found again now,
+            // before the resolve that follows, which a scan cut off may not
+            // reach.
+            if ops
+                .iter()
+                .any(|op| matches!(op, RecordOp::Displace(_) | RecordOp::Retire { .. }))
+            {
+                crate::history_heard::find_names_again(write.connection(), write.rev())?;
+            }
             if !ops.is_empty() {
                 mark_pending(write)?;
             }

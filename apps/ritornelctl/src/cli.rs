@@ -18,6 +18,7 @@
 //! ritornelctl volume [<level> | mute | unmute]
 //! ritornelctl history [--limit <n>]
 //! ritornelctl history artist | album <name or ID>
+//! ritornelctl history artists | albums [--by <plays | first | last>] [--limit <n>]
 //! ritornelctl history on-this-day [--day <MM-DD>]
 //! ritornelctl history rebuild [--dry-run]
 //! ritornelctl history zones
@@ -85,6 +86,8 @@ Usage:
   ritornelctl now | queue [--data-dir <dir>] [--json]
   ritornelctl history [--limit <n>] [--data-dir <dir>] [--json]
   ritornelctl history artist | album <name or ID> [--data-dir <dir>] [--json]
+  ritornelctl history artists | albums [--by <plays | first | last>] [--limit <n>]
+                                       [--data-dir <dir>] [--json]
   ritornelctl history on-this-day [--day <MM-DD>] [--data-dir <dir>] [--json]
   ritornelctl history rebuild [--dry-run] [--data-dir <dir>] [--json]
   ritornelctl history zones [--data-dir <dir>] [--json]
@@ -182,6 +185,10 @@ Commands:
                    for an artist, the records played most. Only plays
                    matched to a song in the library count. Name it by its
                    ID, or by its name when that names one
+  history artists, history albums
+                   List every artist or album you have heard, with files
+                   or not: how often, and from when to when. Only plays
+                   that count are counted
   history on-this-day
                    Show what you listened to on this day in every year
   history rebuild  Drop the plays and derive them again from every listen
@@ -307,6 +314,11 @@ when given alone:
                         queue ends
   --limit <n>           history: how many plays. The default is 20
   --day <MM-DD>         history on-this-day: the day. The default is today
+  --by <order>          history artists, albums: plays, most first, the
+                        default; first, first heard longest ago first; or
+                        last, last heard most recently first
+  --limit <n>           history artists, albums: how many. The default is
+                        100
   --dry-run             history rebuild: say what would change, and change
                         nothing
   --from <YYYY-MM-DD>   history zone add: the first day
@@ -684,6 +696,8 @@ pub(crate) struct HistoryArgs {
 pub(crate) enum HistoryCommand {
     Artist(OfArgs),
     Album(OfArgs),
+    Artists(HeardArgs),
+    Albums(HeardArgs),
     OnThisDay(DayArgs),
     Rebuild(RebuildArgs),
     Zones(ServerArgs),
@@ -717,6 +731,19 @@ pub(crate) struct ZoneArgs {
 pub(crate) struct OfArgs {
     /// The artist or the album, by its ID or by its name.
     pub(crate) name: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `history artists` and `history albums` take.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct HeardArgs {
+    /// The order: plays, first or last.
+    #[arg(long, value_parser = ["plays", "first", "last"])]
+    pub(crate) by: Option<String>,
+    /// How many.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub(crate) limit: Option<u32>,
     #[command(flatten)]
     pub(crate) server: ServerArgs,
 }

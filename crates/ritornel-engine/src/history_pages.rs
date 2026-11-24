@@ -3,19 +3,22 @@
 //! an artist, the records played most ("Album and artist pages" in
 //! docs/internals/desktop.md).
 //!
-//! It counts the plays that count and are not excluded, of songs the
-//! library has bound them to. An artist's are the plays of their songs, by
-//! each song's credit; an album's are those heard from one of its versions.
-//! A play bound to no song reaches no page ("Queries" in
-//! docs/internals/history.md), and a play bound to a song but to no record
-//! counts for its artist and for no album. Everything is read from
-//! `play_event` through its index on counted plays, with no rollup table.
+//! It counts the plays that count and are not excluded. The library's
+//! artist's are the plays of their songs, by each song's credit, and the
+//! library's album's those heard from one of its versions: a play bound to
+//! no song reaches neither ("Queries" in docs/internals/history.md), and a
+//! play bound to a song but to no record counts for its artist and for no
+//! album. These are read from `play_event` through its index on counted
+//! plays. An artist or an album heard by its name alone has the plays
+//! linked to its name ("History by artist and album"), read from the index
+//! on those links. There is no rollup table.
 
 use std::collections::{BTreeMap, HashMap};
 
 use ritornel_contract::{AlbumRef, HistoryOf, Phrase, RecordPlayed, Row, YearPlays, YearSpan};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::history_heard::{library_artists, only, record_named, records_of};
 use crate::{Error, Id, LibraryStore};
 
 const DAY_MS: i64 = 86_400_000;
@@ -283,7 +286,7 @@ pub(crate) fn sentence(facts: &Facts, began_ms: Option<i64>, today: Today) -> Ve
 }
 
 /// A local date as `YYYY-MM-DD`.
-fn date(yyyymmdd: i64) -> String {
+pub(crate) fn date(yyyymmdd: i64) -> String {
     format!(
         "{:04}-{:02}-{:02}",
         yyyymmdd / 10_000,
@@ -431,20 +434,34 @@ fn played_most(connection: &Connection, facts: &Facts) -> Result<Vec<RecordPlaye
     Ok(records)
 }
 
-/// An artist's plays: of every recording whose credit names them, or the
-/// artist they were merged into. `?2` is the artist's canonical key.
+/// An artist's plays: of every song whose credit names them, or the artist
+/// they were merged into, as the appearance it was heard from credits it,
+/// or else as its recording does, as History's lists link it. `?2` is the
+/// artist's canonical key. The recordings either credit names, as canonical
+/// as a play holds them, narrow the read to the index on counted plays.
 const ARTIST_PLAYS: &str = "
+WITH credits AS MATERIALIZED (
+  SELECT acn.artist_credit_id FROM artist a
+  JOIN artist_credit_name acn ON acn.artist_id = a.id
+  WHERE a.canonical_id = ?2)
 SELECT pe.event_at_utc_ms, pe.local_date, rel.release_group_id
 FROM play_event pe
+JOIN recording song ON song.id = pe.recording_id
 LEFT JOIN track_appearance ta ON ta.id = pe.appearance_id
 LEFT JOIN release heard ON heard.id = ta.release_id
 LEFT JOIN release rel ON rel.id = heard.canonical_id
 WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
   AND pe.recording_id IN (
-    SELECT r.id FROM artist a
-    JOIN artist_credit_name acn ON acn.artist_id = a.id
-    JOIN recording r ON r.display_artist_credit_id = acn.artist_credit_id
-    WHERE a.canonical_id = ?2 AND r.redirect_to_id IS NULL)";
+    SELECT r.id FROM recording r
+    WHERE r.display_artist_credit_id IN (SELECT artist_credit_id FROM credits)
+      AND r.redirect_to_id IS NULL
+    UNION
+    SELECT yr.canonical_id FROM track_appearance y
+    JOIN recording yr ON yr.id = y.recording_id
+    WHERE y.display_artist_credit_id IN (SELECT artist_credit_id FROM credits))
+  AND song.redirect_to_id IS NULL
+  AND coalesce(ta.display_artist_credit_id, song.display_artist_credit_id)
+      IN (SELECT artist_credit_id FROM credits)";
 
 /// An album's plays: of a song heard from one of its versions. `?2` is its
 /// release group's key. The recordings narrow the read to the index on
@@ -463,6 +480,22 @@ WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
   AND pe.recording_id IN (
     SELECT r.canonical_id FROM heard JOIN recording r ON r.id = heard.recording_id)
   AND pe.appearance_id IN (SELECT id FROM heard)";
+
+/// The plays of an artist heard by name: those linked to their row. `?2`
+/// is the row.
+const NAME_PLAYS: &str = "
+SELECT pe.event_at_utc_ms, pe.local_date, NULL
+FROM play_event_artist pa
+CROSS JOIN play_event pe ON pe.id = pa.play_event_id
+WHERE pa.heard_artist_id = ?2 AND pa.counted = 1 AND pa.listener_id = ?1";
+
+/// The plays of an album heard by name: those linked to its row. `?2` is
+/// the row.
+const NAMED_ALBUM_PLAYS: &str = "
+SELECT pe.event_at_utc_ms, pe.local_date, NULL
+FROM play_event_album pa
+CROSS JOIN play_event pe ON pe.id = pa.play_event_id
+WHERE pa.heard_album_id = ?2 AND pa.counted = 1 AND pa.listener_id = ?1";
 
 impl LibraryStore {
     /// What an artist's page says of `listener`'s history with them, read
@@ -516,6 +549,74 @@ impl LibraryStore {
             group
                 .map(|group| history_of(connection, listener, group, ALBUM_PLAYS, today, false))
                 .transpose()
+        })
+    }
+}
+
+impl LibraryStore {
+    /// What a page says of `listener`'s history with an artist heard, by
+    /// their name's key, read `today`: the library's artist, when exactly
+    /// one a name can be has it (`library_artists`), as a name of theirs
+    /// heard is found to be, and otherwise the name's plays. `None` if no
+    /// play was heard under it.
+    pub fn heard_artist_history(
+        &self,
+        listener: Id,
+        key: String,
+        today: Today,
+    ) -> Result<Option<HistoryOf>, Error> {
+        self.read_snapshot(move |connection| {
+            if let Some(artist) = only(library_artists(connection)?.get(&key)) {
+                return history_of(connection, listener, artist, ARTIST_PLAYS, today, true)
+                    .map(Some);
+            }
+            let row: Option<i64> = connection
+                .query_row(
+                    "SELECT id FROM heard_artist WHERE name_key = ?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(row
+                .map(|row| history_of(connection, listener, row, NAME_PLAYS, today, false))
+                .transpose()?
+                .filter(|of| of.plays > 0))
+        })
+    }
+
+    /// What a page says of `listener`'s history with an album heard, by its
+    /// artist's key and its own, read `today`: the library's record, when
+    /// its artist is exactly one of the library's and exactly one of theirs
+    /// has that title, and otherwise the name's plays. `None` if no play
+    /// was heard under it.
+    pub fn heard_album_history(
+        &self,
+        listener: Id,
+        artist_key: String,
+        key: String,
+        today: Today,
+    ) -> Result<Option<HistoryOf>, Error> {
+        self.read_snapshot(move |connection| {
+            let artist = only(library_artists(connection)?.get(&artist_key));
+            if let Some(artist) = artist
+                && let Some(group) = record_named(Some(&records_of(connection, artist)?), &key)
+            {
+                return history_of(connection, listener, group, ALBUM_PLAYS, today, false)
+                    .map(Some);
+            }
+            let row: Option<i64> = connection
+                .query_row(
+                    "SELECT h.id FROM heard_album h
+                     JOIN heard_artist ha ON ha.id = h.heard_artist_id
+                     WHERE ha.name_key = ?1 AND h.name_key = ?2",
+                    [&artist_key, &key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(row
+                .map(|row| history_of(connection, listener, row, NAMED_ALBUM_PLAYS, today, false))
+                .transpose()?
+                .filter(|of| of.plays > 0))
         })
     }
 }

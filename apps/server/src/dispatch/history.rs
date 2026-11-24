@@ -7,11 +7,11 @@
 
 use ritornel_contract::methods::{HistoryRebuild, HistorySetZones, Method};
 use ritornel_contract::{
-    AlbumGetParams, ArtistGetParams, ErrorCode, HistoryOf, HistoryRebuildParams, HistoryRebuilt,
-    HistoryRecentParams, HistoryStream, OnThisDay, OnThisDayParams, Play, PlayCursor, PlayOutcome,
-    PlayedListen, PlayedTrack, Receipt, ReceiptStatus, RecentPlays, RpcError, SetZonesParams,
-    TrackDetail, TrackGetParams, TrackHistory, TrackHistoryParams, TrackLove, ZonePeriod,
-    ZonePeriods, ZonesSet,
+    ErrorCode, HeardAlbums, HeardArtists, HeardListParams, HistoryAlbumParams, HistoryArtistParams,
+    HistoryOf, HistoryRebuildParams, HistoryRebuilt, HistoryRecentParams, HistoryStream, OnThisDay,
+    OnThisDayParams, Play, PlayCursor, PlayOutcome, PlayedListen, PlayedTrack, Receipt,
+    ReceiptStatus, RecentPlays, RpcError, SetZonesParams, TrackDetail, TrackGetParams,
+    TrackHistory, TrackHistoryParams, TrackLove, ZonePeriod, ZonePeriods, ZonesSet,
 };
 use ritornel_engine::{
     Command, Id, LibraryStore, PlayRow, SystemTimekeeper, Timekeeper, Today, WriteRequest,
@@ -224,28 +224,76 @@ impl Core {
     pub(super) fn history_artist(
         &self,
         stores: &Stores,
-        params: &ArtistGetParams,
+        params: &HistoryArtistParams,
     ) -> Result<HistoryOf, RpcError> {
         let today = self.today();
         Self::library(stores, |library| {
-            library
-                .artist_history(Self::listener(library)?, params.artist_id, today)
+            let listener = Self::listener(library)?;
+            let found = match (params.artist_id, &params.key) {
+                (Some(artist), None) => library.artist_history(listener, artist, today),
+                (None, Some(key)) => library.heard_artist_history(listener, key.clone(), today),
+                _ => {
+                    return Err(RpcError::new(
+                        ErrorCode::Invalid,
+                        "name the artist by its ID or by its key, and not both",
+                    ));
+                }
+            };
+            found
                 .map_err(refused)?
-                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "the library has no such artist"))
+                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no such artist was heard"))
         })
     }
 
     pub(super) fn history_album(
         &self,
         stores: &Stores,
-        params: &AlbumGetParams,
+        params: &HistoryAlbumParams,
     ) -> Result<HistoryOf, RpcError> {
         let today = self.today();
         Self::library(stores, |library| {
-            library
-                .album_history(Self::listener(library)?, params.album, today)
+            let listener = Self::listener(library)?;
+            let found = match (params.album, &params.artist_key, &params.key) {
+                (Some(album), None, None) => library.album_history(listener, album, today),
+                (None, Some(artist), Some(key)) => {
+                    library.heard_album_history(listener, artist.clone(), key.clone(), today)
+                }
+                _ => {
+                    return Err(RpcError::new(
+                        ErrorCode::Invalid,
+                        "name the album by its ref, or by its artist's key and its own",
+                    ));
+                }
+            };
+            found
                 .map_err(refused)?
-                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "the library has no such album"))
+                .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "no such album was heard"))
+        })
+    }
+
+    pub(super) fn history_artists(
+        &self,
+        stores: &Stores,
+        params: &HeardListParams,
+    ) -> Result<HeardArtists, RpcError> {
+        let today = self.today();
+        Self::library(stores, |library| {
+            library
+                .heard_artists(Self::listener(library)?, *params, today)
+                .map_err(refused)
+        })
+    }
+
+    pub(super) fn history_albums(
+        &self,
+        stores: &Stores,
+        params: &HeardListParams,
+    ) -> Result<HeardAlbums, RpcError> {
+        let today = self.today();
+        Self::library(stores, |library| {
+            library
+                .heard_albums(Self::listener(library)?, *params, today)
+                .map_err(refused)
         })
     }
 

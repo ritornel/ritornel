@@ -9,18 +9,19 @@
 use std::io::Write;
 
 use ritornel_client::contract::methods::{
-    HistoryAlbum, HistoryArtist, HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones,
-    HistoryZones,
+    HistoryAlbum, HistoryAlbums, HistoryArtist, HistoryArtists, HistoryOnThisDay, HistoryRebuild,
+    HistoryRecent, HistorySetZones, HistoryZones,
 };
 use ritornel_client::contract::{
-    AlbumGetParams, AlbumRef, ArtistGetParams, ErrorCode, HistoryOf, HistoryRebuildParams,
-    HistoryRebuilt, HistoryRecentParams, Id, ListKind, ListOpenParams, NoParams, OnThisDay,
-    OnThisDayParams, Play, PlayOutcome, Query, RecentPlays, Row, SetZonesParams, Window,
-    ZonePeriod, ZonePeriods, ZonesSet,
+    AlbumRef, ErrorCode, Heard, HeardAlbums, HeardArtists, HeardListParams, HeardOrder,
+    HistoryAlbumParams, HistoryArtistParams, HistoryOf, HistoryRebuildParams, HistoryRebuilt,
+    HistoryRecentParams, Id, ListKind, ListOpenParams, NoParams, OnThisDay, OnThisDayParams, Play,
+    PlayOutcome, Query, RecentPlays, Row, SetZonesParams, Window, ZonePeriod, ZonePeriods,
+    ZonesSet,
 };
 use ritornel_client::{Client, local};
 
-use crate::cli::{Error, HistoryArgs, HistoryCommand, OfArgs, ServerArgs, ZoneCommand};
+use crate::cli::{Error, HeardArgs, HistoryArgs, HistoryCommand, OfArgs, ServerArgs, ZoneCommand};
 use crate::playback::clock;
 use crate::server;
 
@@ -317,6 +318,90 @@ fn candidate(row: Row) -> Option<Candidate> {
     }
 }
 
+/// What `history artists` and `history albums` ask for.
+fn heard_params(args: &HeardArgs) -> HeardListParams {
+    HeardListParams {
+        order: Some(match args.by.as_deref() {
+            Some("first") => HeardOrder::First,
+            Some("last") => HeardOrder::Last,
+            _ => HeardOrder::Plays,
+        }),
+        limit: args.limit,
+        offset: None,
+    }
+}
+
+/// The years an artist or an album was heard over, as `2014–2026`, or one
+/// year.
+fn years(heard: &Heard) -> String {
+    let year = |date: &Option<String>| {
+        date.as_deref()
+            .and_then(|date| date.get(..4))
+            .map(str::to_owned)
+    };
+    match (year(&heard.first_played), year(&heard.last_played)) {
+        (Some(first), Some(last)) if first == last => first,
+        (Some(first), Some(last)) => format!("{first}\u{2013}{last}"),
+        (one, other) => one.or(other).unwrap_or_default(),
+    }
+}
+
+/// Rows of names, plays and years, the names padded to one width.
+fn heard_rows(rows: &[(String, &Heard)], total: u64, kind: &str) -> String {
+    if rows.is_empty() {
+        return "Nothing heard yet.\n".to_owned();
+    }
+    let width = rows
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let plays = rows
+        .iter()
+        .map(|(_, heard)| heard.plays.to_string().len())
+        .max()
+        .unwrap_or(0);
+    let mut text = String::new();
+    for (name, heard) in rows {
+        let pad = width - name.chars().count();
+        let line = format!(
+            "{name}{:pad$}  {:>plays$}  {}",
+            "",
+            heard.plays,
+            years(heard)
+        );
+        text.push_str(line.trim_end());
+        text.push('\n');
+    }
+    if total > rows.len() as u64 {
+        text.push_str(&format!("{} of {total} {kind}\n", rows.len()));
+    }
+    text
+}
+
+fn render_artists(heard: &HeardArtists) -> String {
+    let rows: Vec<(String, &Heard)> = heard
+        .artists
+        .iter()
+        .map(|artist| (artist.name.clone(), &artist.heard))
+        .collect();
+    heard_rows(&rows, heard.total, "artists")
+}
+
+fn render_albums(heard: &HeardAlbums) -> String {
+    let rows: Vec<(String, &Heard)> = heard
+        .albums
+        .iter()
+        .map(|album| {
+            (
+                format!("{} \u{2014} {}", album.name, album.artist_name),
+                &album.heard,
+            )
+        })
+        .collect();
+    heard_rows(&rows, heard.total, "albums")
+}
+
 /// What a page says of an artist or an album, named by ID or by name.
 fn history_of(
     args: &OfArgs,
@@ -336,21 +421,26 @@ fn history_of(
         };
         if !album {
             return client
-                .call::<HistoryArtist>(&ArtistGetParams { artist_id: id })
+                .call::<HistoryArtist>(&HistoryArtistParams {
+                    artist_id: Some(id),
+                    key: None,
+                })
                 .await
                 .map(Ok);
         }
         // An album's ID is its record's or one release's: the record's first.
         let record = client
-            .call::<HistoryAlbum>(&AlbumGetParams {
-                album: AlbumRef::ReleaseGroup { id },
+            .call::<HistoryAlbum>(&HistoryAlbumParams {
+                album: Some(AlbumRef::ReleaseGroup { id }),
+                ..HistoryAlbumParams::default()
             })
             .await;
         match record {
             Err(ritornel_client::Error::Call(error)) if error.data.code == ErrorCode::NotFound => {
                 client
-                    .call::<HistoryAlbum>(&AlbumGetParams {
-                        album: AlbumRef::Release { id },
+                    .call::<HistoryAlbum>(&HistoryAlbumParams {
+                        album: Some(AlbumRef::Release { id }),
+                        ..HistoryAlbumParams::default()
                     })
                     .await
                     .map(Ok)
@@ -450,6 +540,32 @@ pub(crate) fn history(
         }
         Some(HistoryCommand::Artist(of)) => history_of(of, env, out, false),
         Some(HistoryCommand::Album(of)) => history_of(of, env, out, true),
+        Some(HistoryCommand::Artists(args)) => {
+            let params = heard_params(args);
+            let found = server::ask(&args.server, env, async |client| {
+                client.call::<HistoryArtists>(&params).await
+            })?;
+            server::print(
+                &args.server,
+                out,
+                &found,
+                serde_json::to_string_pretty,
+                render_artists,
+            )
+        }
+        Some(HistoryCommand::Albums(args)) => {
+            let params = heard_params(args);
+            let found = server::ask(&args.server, env, async |client| {
+                client.call::<HistoryAlbums>(&params).await
+            })?;
+            server::print(
+                &args.server,
+                out,
+                &found,
+                serde_json::to_string_pretty,
+                render_albums,
+            )
+        }
         Some(HistoryCommand::OnThisDay(day)) => {
             let params = OnThisDayParams {
                 day: day.day.clone(),

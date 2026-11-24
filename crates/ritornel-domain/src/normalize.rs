@@ -323,6 +323,35 @@ pub fn fold_accents(key: &str) -> String {
     folded.nfc().collect()
 }
 
+/// The key an artist heard is told by, in History: [`normalize`]d with its
+/// accents folded, and without a featured credit or a leading "the" before
+/// a word. It is narrower than the scrobble matcher's loose key, which also
+/// drops spaces and every "and": safe beside a title, and not on a name
+/// alone.
+pub fn artist_key(name: &str) -> String {
+    let key = fold_accents(&normalize(&artist_spelling(name)));
+    match key.strip_prefix("the ") {
+        Some(rest) if rest.chars().any(char::is_alphanumeric) => rest.to_owned(),
+        _ => key,
+    }
+}
+
+/// An artist's name as heard, without a featured credit: what History
+/// shows for it.
+pub fn artist_spelling(name: &str) -> String {
+    let without = crate::scrobble::without_featured(name);
+    match without.trim() {
+        "" => name.trim().to_owned(),
+        trimmed => trimmed.to_owned(),
+    }
+}
+
+/// The key an album heard is told by under its artist, in History:
+/// [`normalize`]d with its accents folded.
+pub fn album_key(title: &str) -> String {
+    fold_accents(&normalize(title))
+}
+
 /// How far apart two keys are, from 0 (the same) to 1 (nothing in common):
 /// the edit distance over the length of the longer.
 pub fn difference(a: &str, b: &str) -> f64 {
@@ -356,6 +385,35 @@ pub fn difference(a: &str, b: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_artist_heard_is_the_same_without_accents_a_leading_the_or_a_featured_credit() {
+        let key = artist_key("Calla Brandt");
+        for spelling in [
+            "calla brandt",
+            "Cálla Brändt",
+            "The Calla Brandt",
+            "Calla Brandt feat. Odile Castellan",
+            "Calla Brandt (ft. Odile Castellan)",
+        ] {
+            assert_eq!(artist_key(spelling), key, "{spelling}");
+        }
+        // "The" alone is a name, and "and" and spaces still part two.
+        assert_eq!(artist_key("The The"), "the");
+        assert_eq!(artist_key("The"), "the");
+        assert_eq!(artist_key("The !!!"), "the");
+        assert_eq!(artist_key("Ｔｈｅ\tCalla Brandt"), key);
+        assert_eq!(
+            artist_spelling("Calla Brandt feat. Odile Castellan"),
+            "Calla Brandt"
+        );
+        assert_ne!(
+            artist_key("Brandt and Castellan"),
+            artist_key("Brandt Castellan")
+        );
+        assert_eq!(album_key("Glasshouse"), album_key("Glásshouse"));
+        assert_ne!(album_key("Glasshouse"), album_key("Glasshouse (Live)"));
+    }
 
     #[test]
     fn a_key_ignores_case_width_punctuation_and_spacing() {

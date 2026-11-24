@@ -88,7 +88,7 @@ Three read paths do not use views:
 
 - **`library.search`** — Stateless single-call dropdown search returning top matching `artists`, `albums`, and `songs` (with album `artId`) plus `top` kind (default 5 per kind, max `MAX_SEARCH_RESULTS` = 20).
 - **`queue.window`** — Direct revision-stamped reads of the playback queue (`offset`, `limit` up to 500, `order: queue | play | up_next`) returning `queueRevision`, `total`, `currentIndex`, and `entries`.
-- **Direct history queries** — `history.recent` (cursor-paged), `history.onThisDay`, `history.artist`, `history.album`, `history.track`, and `history.stream` answer listening-history reads directly without opening a view.
+- **Direct history queries** — `history.recent` (cursor-paged), `history.onThisDay`, `history.artist`, `history.album`, `history.artists`, `history.albums` (paged), `history.track`, and `history.stream` answer listening-history reads directly without opening a view.
 
 ## Events and subscriptions
 
@@ -162,7 +162,7 @@ The methods registered in `crates/ritornel-contract/src/methods.rs`, by area (se
 | Jobs & identity | `jobs.list`, `jobs.get`, `jobs.cancel`, `identity.dryRun`, `identity.review` |
 | Browse & media | `list.open`, `list.window`, `list.sections`, `list.locate`, `list.close`, `library.search`, `album.get`, `artist.get`, `tracks.get`, `media.token` |
 | Playback & queue | `playback.get`, `playback.play`, `playback.pause`, `playback.resume`, `playback.stop`, `playback.seek`, `playback.skip`, `playback.jump`, `playback.set`, `queue.window`, `queue.add`, `queue.remove`, `queue.move`, `queue.clear` |
-| History & ratings | `history.recent`, `history.onThisDay`, `history.artist`, `history.album`, `history.track`, `history.stream`, `history.rebuild`, `history.zones`, `history.setZones`, `history.export`, `ratings.set` |
+| History & ratings | `history.recent`, `history.onThisDay`, `history.artist`, `history.album`, `history.artists`, `history.albums`, `history.track`, `history.stream`, `history.rebuild`, `history.zones`, `history.setZones`, `history.export`, `ratings.set` |
 | Last.fm | `lastfm.status`, `lastfm.signInStart`, `lastfm.signInFinish`, `lastfm.signOut`, `lastfm.sync`, `lastfm.setScrobbling`, `lastfm.report` |
 | Imports | `imports.stage`, `imports.dryRun`, `imports.apply`, `imports.undo`, `imports.get`, `imports.list` |
 

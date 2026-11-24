@@ -13,19 +13,19 @@ use std::time::Duration;
 
 use ritornel_contract::methods::{
     self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, EventsSubscribe,
-    EventsUnsubscribe, HistoryAlbum, HistoryArtist, HistoryExport, HistoryOnThisDay,
-    HistoryRebuild, HistoryRecent, HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones,
-    IdentityDryRun, IdentityReview, ImportsApply, ImportsDryRun, ImportsGet, ImportsList,
-    ImportsStage, ImportsUndo, JobsCancel, JobsGet, JobsList, LastfmReportCall,
-    LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall,
-    LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats, LinkCopiesCall,
-    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall, ListClose,
-    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
-    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
-    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
-    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerSetSettings,
-    ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks,
-    TracksGet,
+    EventsUnsubscribe, HistoryAlbum, HistoryAlbums, HistoryArtist, HistoryArtists, HistoryExport,
+    HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones, HistoryStreamCall,
+    HistoryTrack, HistoryZones, IdentityDryRun, IdentityReview, ImportsApply, ImportsDryRun,
+    ImportsGet, ImportsList, ImportsStage, ImportsUndo, JobsCancel, JobsGet, JobsList,
+    LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut,
+    LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats,
+    LinkCopiesCall, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall,
+    ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
+    PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek,
+    PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove,
+    QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello,
+    ServerSetSettings, ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList,
+    SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -1014,6 +1014,12 @@ impl Core {
             }
             HistoryAlbum::NAME => {
                 run::<HistoryAlbum>(params, |params| self.history_album(stores, &params))
+            }
+            HistoryArtists::NAME => {
+                run::<HistoryArtists>(params, |params| self.history_artists(stores, &params))
+            }
+            HistoryAlbums::NAME => {
+                run::<HistoryAlbums>(params, |params| self.history_albums(stores, &params))
             }
             HistoryTrack::NAME => {
                 run::<HistoryTrack>(params, |params| self.history_track(stores, &params))

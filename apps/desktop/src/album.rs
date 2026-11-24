@@ -32,8 +32,9 @@ use gpui::{
 use ritornel_contract::methods::{AlbumGet, HistoryAlbum, ListClose, ListOpen};
 use ritornel_contract::{
     AlbumGetParams, AlbumPage, AlbumRef, AlbumTile, AlbumVersion, ContextKind, Event,
-    FILTER_VERSION, Filter, HistoryOf, Id, LibraryChange, ListKind, ListOpenParams, PlayContext,
-    PlaySource, Predicate, Quality, Query, Row, Sort, SortKey, ViewParams,
+    FILTER_VERSION, Filter, HistoryAlbumParams, HistoryOf, Id, LibraryChange, ListKind,
+    ListOpenParams, PlayContext, PlaySource, Predicate, Quality, Query, Row, Sort, SortKey,
+    ViewParams,
 };
 
 use crate::banner::{self, Actions, Banner, Hung};
@@ -309,9 +310,13 @@ impl Album {
         let album = self.album;
         let read = self.net.rt().spawn(async move {
             let params = AlbumGetParams { album };
+            let of = HistoryAlbumParams {
+                album: Some(album),
+                ..HistoryAlbumParams::default()
+            };
             let (page, history) = tokio::join!(
                 client.call::<AlbumGet>(&params),
-                client.call::<HistoryAlbum>(&params),
+                client.call::<HistoryAlbum>(&of),
             );
             let page = page?;
             let more = if plays_only {

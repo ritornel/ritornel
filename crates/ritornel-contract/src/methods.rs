@@ -341,13 +341,23 @@ methods! {
     /// history with them: the sentence, the plays by year and the records
     /// played most.
     HistoryArtist: "history.artist", Query, needs_full: false,
-    ArtistGetParams => HistoryOf;
+    HistoryArtistParams => HistoryOf;
 
     /// `history.album`: what an album's page says of the listener's history
     /// with it, across every version of it: the sentence and the plays by
     /// year.
     HistoryAlbum: "history.album", Query, needs_full: false,
-    AlbumGetParams => HistoryOf;
+    HistoryAlbumParams => HistoryOf;
+
+    /// `history.artists`: every artist heard, with files or not, by their
+    /// plays or when they were first or last heard.
+    HistoryArtists: "history.artists", Query, needs_full: false,
+    HeardListParams => HeardArtists;
+
+    /// `history.albums`: every album heard, with files or not, by its plays
+    /// or when it was first or last heard.
+    HistoryAlbums: "history.albums", Query, needs_full: false,
+    HeardListParams => HeardAlbums;
 
     /// `history.track`: what Lean back says about a song and its record,
     /// one fact at a time.
@@ -618,6 +628,8 @@ mod tests {
                 "history.onThisDay",
                 "history.artist",
                 "history.album",
+                "history.artists",
+                "history.albums",
                 "history.track",
                 "history.stream",
                 "history.rebuild",
