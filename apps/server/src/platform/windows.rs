@@ -65,48 +65,37 @@ fn host_name() -> Option<String> {
 
 /// Creates the folder at `path`, and those above it that are missing, each
 /// with an access list of the OS user alone from the moment it exists,
-/// which what is later made inside it inherits.
-///
-/// A folder that is there already is closed if anyone else may open it or
-/// what is made in it, since that is all that keeps a new file private
-/// here: SQLite's logs beside a database, and a file made with
-/// [`create_owner_only`], take their list from the folder. Windows gives
-/// the new list to what the folder already holds that inherits its list.
-/// A folder another user owns is refused, since its owner may change its
-/// list.
+/// which what is later made inside it inherits. A folder that is there
+/// already is left as it is: [`close_dir_to_others`] closes one.
 pub(crate) fn create_private_dir(path: &Path) -> Result<(), Error> {
-    if path.is_dir() {
-        return close_dir(path).map_err(io_error("close", path));
-    }
     let missing: Vec<&Path> = path
         .ancestors()
         .take_while(|folder| !folder.as_os_str().is_empty() && !folder.exists())
         .collect();
     for folder in missing.into_iter().rev() {
         match restricted::create_restricted_dir(folder) {
-            // Made meanwhile, as by another server starting on it.
-            Err(error) if error.kind() == ErrorKind::AlreadyExists && folder.is_dir() => {}
+            // Made meanwhile, it is one that was there already.
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
             made => made.map_err(io_error("create", folder))?,
         }
     }
-    Ok(())
-}
-
-/// Closes the folder at `path` unless it is closed already, and fails if
-/// it cannot be.
-fn close_dir(path: &Path) -> std::io::Result<()> {
-    if restricted::path_is_private(path)? {
-        return Ok(());
-    }
-    restricted::restrict(path)?;
-    if restricted::path_is_private(path)? {
+    if path.is_dir() {
         Ok(())
     } else {
-        Err(std::io::Error::new(
-            ErrorKind::PermissionDenied,
-            "another user owns it, so it cannot be closed to others",
-        ))
+        Err(io_error("create", path)(ErrorKind::NotADirectory.into()))
     }
+}
+
+/// Closes the folder at `path`, which is there, to everyone but the OS
+/// user, with what is made in it from now on, unless it is closed already.
+/// On Windows that is all that keeps a new file private: SQLite's logs
+/// beside a database, and a file made with [`create_owner_only`], take
+/// their list from the folder. The files directly in it keep the access
+/// they had, so the checks of the credential and of `lastfm.env` still see
+/// whether others could read them. A folder another user owns, or one
+/// whose list others may change, is refused.
+pub(crate) fn close_dir_to_others(path: &Path) -> Result<(), Error> {
+    restricted::close_folder(path).map_err(io_error("close", path))
 }
 
 /// Creates the one folder at `path`, with an access list of the OS user
@@ -137,7 +126,8 @@ pub(crate) fn close_to_others(path: &Path) -> std::io::Result<()> {
 
 /// Makes a file that `options` creates one only the OS user can open: here
 /// the access list of the folder it is made in does that, which
-/// [`create_private_dir`] closes, and the file inherits it.
+/// [`create_private_dir`] and [`close_dir_to_others`] close, and the file
+/// inherits it.
 pub(crate) fn create_owner_only(_options: &mut OpenOptions) {}
 
 /// Creates a new file at `path` that only the OS user can open, from before
@@ -277,7 +267,7 @@ mod tests {
     use crate::testing::Scratch;
 
     #[test]
-    fn a_folder_that_was_open_to_others_is_closed_with_what_it_holds() {
+    fn a_folder_that_was_open_to_others_is_closed_to_what_is_made_in_it() {
         let scratch = Scratch::new();
         let folder = scratch.path().join("data");
         std::fs::create_dir(&folder).unwrap();
@@ -286,10 +276,11 @@ mod tests {
         assert!(!path_is_private(&folder));
         assert!(!path_is_private(&folder.join("made-before")));
 
-        create_private_dir(&folder).unwrap();
+        close_dir_to_others(&folder).unwrap();
         assert!(path_is_private(&folder));
-        // It took its list from the folder, and takes the new one.
-        assert!(path_is_private(&folder.join("made-before")));
+        // A file it held keeps the access it had, so a check of it still
+        // sees that others could read it.
+        assert!(!path_is_private(&folder.join("made-before")));
         std::fs::write(folder.join("made-after"), "").unwrap();
         assert!(path_is_private(&folder.join("made-after")));
     }

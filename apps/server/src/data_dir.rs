@@ -33,7 +33,9 @@ use ritornel_contract::local;
 
 use crate::error::io_error;
 use crate::lock::DirLock;
-use crate::platform::{close_to_others, create_owner_only, create_private_dir};
+use crate::platform::{
+    close_dir_to_others, close_to_others, create_owner_only, create_private_dir,
+};
 use crate::{Env, Error, server_json};
 
 /// Where the data directory is: `--data-dir`, then `RITORNEL_DATA_DIR`, then
@@ -54,10 +56,10 @@ pub(crate) struct DataDir {
 }
 
 impl DataDir {
-    /// Makes sure the directory and its logs folder exist, and that only
-    /// the OS user can open them or what is made in them: the directory
-    /// holds the local credential and the databases. It touches no file in
-    /// them, so a server refused the directory's lock changes nothing there.
+    /// Makes sure the directory and its logs folder exist. What it creates,
+    /// only the OS user can open: the directory holds the local credential
+    /// and the databases. It changes nothing that is there already, so a
+    /// server refused the directory's lock changes nothing in it.
     pub(crate) fn prepare(root: PathBuf) -> Result<Self, Error> {
         let dir = Self { root };
         for path in [dir.root.clone(), dir.logs()] {
@@ -66,12 +68,17 @@ impl DataDir {
         Ok(dir)
     }
 
-    /// Makes sure `server.db` exists and that only the OS user can read it,
-    /// whether this creates it or finds it, and closes `library.db` if it is
-    /// there: `server.db` holds the server's signing key, and a database
-    /// restored from a backup may arrive open to everyone. Only the
-    /// directory's holder does this.
-    fn close_databases(&self) -> Result<(), Error> {
+    /// Readies what is there for the directory's holder alone. The
+    /// directory and its logs are closed to others where what is made in
+    /// them takes its access from them, as on Windows. `server.db` is made
+    /// if it is missing, and it and `library.db` are made readable by the OS
+    /// user alone, whether they were made here or found: `server.db` holds
+    /// the server's signing key, and a database restored from a backup may
+    /// arrive open to everyone.
+    fn ready(&self) -> Result<(), Error> {
+        for path in [self.root.clone(), self.logs()] {
+            close_dir_to_others(&path)?;
+        }
         close_database(&self.server_db())?;
         close_if_there(&self.library_db())
     }
@@ -209,7 +216,7 @@ impl HeldDir {
         // that is gone wrote them.
         server_json::remove(&dir.server_json())?;
         server_json::remove(&dir.preparing_json())?;
-        dir.close_databases()?;
+        dir.ready()?;
         Ok(Self { dir, _lock: lock })
     }
 
@@ -305,12 +312,14 @@ mod tests {
     }
 
     #[test]
-    fn a_server_refused_the_directory_touches_no_database_in_it() {
+    fn a_server_refused_the_directory_changes_nothing_in_it() {
         let scratch = Scratch::new();
         let root = scratch.path().join("data");
         let held = HeldDir::take(root.clone()).unwrap();
-        // The holder has not made its database yet, or has moved it.
+        // The holder has not made its database yet, or has moved it, and
+        // the directory and a database in it are open to others again.
         std::fs::remove_file(held.dir().server_db()).unwrap();
+        open_to_others(&root);
         std::fs::write(held.dir().library_db(), "").unwrap();
         open_to_others(&held.dir().library_db());
 
@@ -318,6 +327,26 @@ mod tests {
         assert!(matches!(refused, Err(Error::InUse { .. })), "{refused:?}");
         assert!(!held.dir().server_db().exists());
         assert!(!private(&held.dir().library_db()));
+        assert!(!private(&root));
+    }
+
+    #[test]
+    fn a_credential_others_could_read_is_still_seen_as_open_once_the_directory_is_closed() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("data");
+        std::fs::create_dir(&root).unwrap();
+        open_to_others(&root);
+        let credential = root.join(local::CREDENTIAL);
+        // Made as a copy might be: on Windows with no access list of its
+        // own, so that it takes the directory's.
+        std::fs::write(&credential, "token").unwrap();
+        if cfg!(unix) {
+            open_to_others(&credential);
+        }
+        assert!(!private(&credential));
+        let _held = HeldDir::take(root).unwrap();
+        // So it is replaced, as one others may have read.
+        assert!(!private(&credential));
     }
 
     #[test]

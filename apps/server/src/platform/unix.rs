@@ -25,6 +25,13 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<(), Error> {
         .map_err(io_error("create", path))
 }
 
+/// Nothing: a folder's mode does not reach the files made in it, which each
+/// take the mode they are created with, and SQLite gives a database's logs
+/// the database's own mode. A folder that is there keeps its mode.
+pub(crate) fn close_dir_to_others(_path: &Path) -> Result<(), Error> {
+    Ok(())
+}
+
 /// Creates the one folder at `path`, with mode `0700`, and fails if it is
 /// there already: two writers never share it. Its parent must be there.
 pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {

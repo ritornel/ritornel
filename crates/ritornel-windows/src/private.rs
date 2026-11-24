@@ -33,20 +33,22 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, AddAccessAllowedAceEx,
     CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid,
-    GROUP_SECURITY_INFORMATION, GetAce, GetLengthSid, GetSecurityDescriptorDacl,
-    GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE, InitializeAcl,
-    InitializeSecurityDescriptor, IsWellKnownSid, OBJECT_INHERIT_ACE, OBJECT_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE,
-    SID_AND_ATTRIBUTES, SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY,
-    TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE, WinAuthenticatedUserSid,
-    WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinCreatorOwnerRightsSid, WinCreatorOwnerSid,
-    WinInteractiveSid, WinLocalSystemSid, WinWorldSid,
+    GROUP_SECURITY_INFORMATION, GetAce, GetLengthSid, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE,
+    INHERITED_ACE, InitializeAcl, InitializeSecurityDescriptor, IsWellKnownSid, OBJECT_INHERIT_ACE,
+    OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+    SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser, WELL_KNOWN_SID_TYPE,
+    WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinBuiltinUsersSid,
+    WinCreatorOwnerRightsSid, WinCreatorOwnerSid, WinInteractiveSid, WinLocalSystemSid,
+    WinWorldSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_READ_EA,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+    FILE_READ_ATTRIBUTES, FILE_READ_EA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    READ_CONTROL, SYNCHRONIZE, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -70,10 +72,14 @@ const SE_GROUP_ENABLED: u32 = 4;
 /// there, read its attributes and its access list, and wait on it.
 const HARMLESS: u32 = SYNCHRONIZE | READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_READ_EA;
 
-/// Opens what is at `path`, file or folder, to read its access list and,
-/// with `change`, to set it.
+/// What lets someone change who may open a folder: its list, its owner, or
+/// everything (`GENERIC_ALL`).
+const CHANGE: u32 = WRITE_DAC | WRITE_OWNER | 0x1000_0000;
+
+/// Opens what is at `path`, file or folder, to read its attributes and its
+/// access list and, with `change`, to set the list.
 fn open(path: &Path, change: bool) -> io::Result<File> {
-    let mut access = READ_CONTROL;
+    let mut access = READ_CONTROL | FILE_READ_ATTRIBUTES;
     if change {
         access |= WRITE_DAC;
     }
@@ -212,14 +218,9 @@ fn owner_only<T>(
     make(&attributes)
 }
 
-/// Closes `path` to everyone but the user this process runs as: its access
-/// list becomes that one user, with full control, and inherits nothing. A
-/// folder passes the entry on to what is made in it, and Windows gives it
-/// to what is already in it that inherits its list.
-pub fn restrict(path: &Path) -> io::Result<()> {
-    let file = open(path, true)?;
-    let folder = file.metadata()?.is_dir();
-    let mut list = OwnerOnly::new(folder)?;
+/// Gives what `file` is open on the access list `acl`, inheriting nothing.
+/// The handle must be open with `WRITE_DAC`.
+fn set_list(file: &File, acl: *mut ACL) -> io::Result<()> {
     // SAFETY: the handle is open with WRITE_DAC, and the list is valid for
     // the call.
     let set = unsafe {
@@ -229,7 +230,7 @@ pub fn restrict(path: &Path) -> io::Result<()> {
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            list.acl(),
+            acl,
             std::ptr::null(),
         )
     };
@@ -239,21 +240,133 @@ pub fn restrict(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The error for something another user owns: its owner may always change
+/// its list again.
+fn owned_by_another() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "another user owns it, so it cannot be closed to others",
+    )
+}
+
+/// Closes `path` to everyone but the user this process runs as: its access
+/// list becomes that one user, with full control, and inherits nothing. A
+/// folder passes the entry on to what is made in it, and Windows gives it
+/// to what is already in it that inherits its list. It fails if another
+/// user owns it.
+pub fn restrict(path: &Path) -> io::Result<()> {
+    let file = open(path, true)?;
+    let folder = file.metadata()?.is_dir();
+    let (owner, _) = Descriptor::of(&file, OWNER_SECURITY_INFORMATION)?.owner_and_list()?;
+    if owner.is_null() || !trusted_owner(owner, &User::current()?) {
+        return Err(owned_by_another());
+    }
+    set_list(&file, OwnerOnly::new(folder)?.acl())
+}
+
+/// Makes the folder at `path` one only this user can open, with what is
+/// made in it from now on, unless it is so already: owned by a trusted
+/// owner, with a list that inherits nothing, lets nobody else in, and
+/// passes this user's entry on to new files.
+///
+/// The files directly in it keep the access they had, where Windows would
+/// give them the new list, so that a check of one of them still sees
+/// whether others could read it; what the folders in it hold takes the new
+/// list. It fails on a folder another user owns, or one whose list others
+/// may change, since a handle they opened for that outlasts the new list.
+pub fn close_folder(path: &Path) -> io::Result<()> {
+    let folder = open(path, true)?;
+    if !folder.metadata()?.is_dir() {
+        return Err(io::Error::from(io::ErrorKind::NotADirectory));
+    }
+    let user = User::current()?;
+    let descriptor = Descriptor::of(
+        &folder,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+    )?;
+    let (owner, acl) = descriptor.owner_and_list()?;
+    if owner.is_null() || !trusted_owner(owner, &user) {
+        return Err(owned_by_another());
+    }
+    if acl.is_null() || lets_others(acl, &user, CHANGE, false)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "other users may change who can open it, so it cannot be closed to them",
+        ));
+    }
+    if descriptor.protected()?
+        && !lets_others(acl, &user, !HARMLESS, true)?
+        && passes_on(acl, &user)?
+    {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            // A file this user cannot change, Windows cannot change either
+            // as it passes the new list on.
+            let _ = freeze(&entry.path());
+        }
+    }
+    set_list(&folder, OwnerOnly::new(true)?.acl())?;
+    let closed = Descriptor::of(
+        &folder,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+    )?;
+    if judge(&closed, true, &user)? {
+        Ok(())
+    } else {
+        Err(io::Error::other("it is still open to others once closed"))
+    }
+}
+
+/// Stops the file at `path` inheriting its list, keeping the entries it
+/// has now as its own.
+fn freeze(path: &Path) -> io::Result<()> {
+    let file = open(path, true)?;
+    let descriptor = Descriptor::of(&file, DACL_SECURITY_INFORMATION)?;
+    let (_, acl) = descriptor.owner_and_list()?;
+    if acl.is_null() || descriptor.protected()? {
+        return Ok(());
+    }
+    // SAFETY: `acl` is valid while `descriptor` lives.
+    let (size, count) = unsafe { (usize::from((*acl).AclSize), (*acl).AceCount) };
+    let mut copy = vec![0u64; size.div_ceil(8)];
+    // SAFETY: the list is `size` bytes long, and the copy holds as many.
+    unsafe { std::ptr::copy_nonoverlapping(acl.cast::<u8>(), copy.as_mut_ptr().cast(), size) };
+    let copied = copy.as_mut_ptr().cast::<ACL>();
+    for index in 0..u32::from(count) {
+        let mut entry: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: the index is below the copy's count.
+        if unsafe { GetAce(copied, index, &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: every entry starts with its header, in the copy this
+        // function owns.
+        unsafe { (*entry.cast::<ACE_HEADER>()).AceFlags &= !(INHERITED_ACE as u8) };
+    }
+    set_list(&file, copied)
+}
+
 /// Creates a new file at `path`, open for writing, that only this user can
-/// open from the moment it exists. It fails if something is there.
+/// open from the moment it exists. It fails if something is there, a link
+/// included, and where the file system keeps no access list, removing what
+/// it made.
 pub fn create_restricted(path: &Path) -> io::Result<File> {
     let wide = crate::wide_absolute(path)?;
-    owner_only(false, |attributes| {
+    let file = owner_only(false, |attributes| {
         // SAFETY: `wide` ends in a NUL, and `attributes` is valid for the
         // call.
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                FILE_GENERIC_WRITE | READ_CONTROL,
+                FILE_GENERIC_WRITE | READ_CONTROL | FILE_READ_ATTRIBUTES,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 attributes,
                 CREATE_NEW,
-                FILE_ATTRIBUTE_NORMAL,
+                // A link at `path` is something there, as the standard
+                // library takes it, and is not followed.
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
                 std::ptr::null_mut(),
             )
         };
@@ -262,12 +375,25 @@ pub fn create_restricted(path: &Path) -> io::Result<File> {
         }
         // SAFETY: the call succeeded, so the handle is this code's to own.
         Ok(unsafe { File::from_raw_handle(handle) })
-    })
+    })?;
+    let descriptor = Descriptor::of(
+        &file,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+    );
+    match descriptor.and_then(|descriptor| judge(&descriptor, false, &User::current()?)) {
+        Ok(true) => Ok(file),
+        checked => {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            Err(checked.err().unwrap_or_else(not_kept))
+        }
+    }
 }
 
 /// Creates the one folder at `path` that only this user can open from the
 /// moment it exists, and passes that on to what is made in it. It fails if
-/// something is there, and its parent must be.
+/// something is there, if its parent is not, and where the file system
+/// keeps no access list, removing what it made.
 pub fn create_restricted_dir(path: &Path) -> io::Result<()> {
     let wide = crate::wide_absolute(path)?;
     owner_only(true, |attributes| {
@@ -277,7 +403,34 @@ pub fn create_restricted_dir(path: &Path) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         Ok(())
-    })
+    })?;
+    let checked = OpenOptions::new()
+        .access_mode(READ_CONTROL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .and_then(|folder| {
+            let descriptor = Descriptor::of(
+                &folder,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            )?;
+            judge(&descriptor, true, &User::current()?)
+        });
+    match checked {
+        Ok(true) => Ok(()),
+        checked => {
+            let _ = std::fs::remove_dir(path);
+            Err(checked.err().unwrap_or_else(not_kept))
+        }
+    }
+}
+
+/// The error for a file system that did not keep the list asked for, as
+/// FAT and exFAT keep none.
+fn not_kept() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the file system here does not keep who may open a file",
+    )
 }
 
 /// Something the system allocated with `LocalAlloc`, freed when dropped.
@@ -340,6 +493,17 @@ impl Descriptor {
         }
         Ok((owner, acl))
     }
+
+    /// Whether its access list inherits nothing.
+    fn protected(&self) -> io::Result<bool> {
+        let (mut control, mut revision) = (0, 0);
+        // SAFETY: the descriptor is valid while `self` lives, and the rest
+        // are written by the call.
+        if unsafe { GetSecurityDescriptorControl(self.0, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(control & SE_DACL_PROTECTED != 0)
+    }
 }
 
 impl Drop for Descriptor {
@@ -364,16 +528,22 @@ pub fn is_private(file: &File) -> io::Result<bool> {
 fn judge(descriptor: &Descriptor, folder: bool, user: &User) -> io::Result<bool> {
     let (owner, acl) = descriptor.owner_and_list()?;
     // The owner may always read and change the list, so one who is not
-    // trusted can let themselves in whatever it says.
-    if owner.is_null() || !trusted_owner(owner, user) {
+    // trusted can let themselves in whatever it says. No list at all lets
+    // everyone in.
+    if owner.is_null() || !trusted_owner(owner, user) || acl.is_null() {
         return Ok(false);
     }
-    // No list at all lets everyone in.
-    if acl.is_null() {
-        return Ok(false);
-    }
-    // SAFETY: `acl` is valid while `descriptor` lives.
+    Ok(!lets_others(acl, user, !HARMLESS, folder)?)
+}
+
+/// Each plain entry of `acl` that lets someone in: its flags, its access
+/// and its SID, or `None` for an entry of a kind this does not weigh, which
+/// is taken to let anyone do anything. Entries that deny, audit or label
+/// let nobody in, and are left out.
+fn entries(acl: *const ACL) -> io::Result<Vec<Option<(u32, u32, PSID)>>> {
+    // SAFETY: the caller's `acl` is valid while this runs.
     let count = unsafe { (*acl).AceCount };
+    let mut found = Vec::new();
     for index in 0..u32::from(count) {
         let mut entry: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: the index is below the list's count.
@@ -382,11 +552,6 @@ fn judge(descriptor: &Descriptor, folder: bool, user: &User) -> io::Result<bool>
         }
         // SAFETY: every entry starts with its header.
         let header = unsafe { *entry.cast::<ACE_HEADER>() };
-        // An entry only passed on applies to nothing a file holds, but to
-        // everything made in a folder.
-        if !folder && u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0 {
-            continue;
-        }
         match header.AceType {
             ACCESS_ALLOWED_ACE_TYPE => {
                 let allowed = entry.cast::<ACCESS_ALLOWED_ACE>();
@@ -398,19 +563,39 @@ fn judge(descriptor: &Descriptor, folder: bool, user: &User) -> io::Result<bool>
                         std::ptr::addr_of_mut!((*allowed).SidStart).cast(),
                     )
                 };
-                if mask & !HARMLESS != 0 && !trusted(sid, user) {
-                    return Ok(false);
-                }
+                found.push(Some((u32::from(header.AceFlags), mask, sid)));
             }
             ACCESS_ALLOWED_COMPOUND_ACE_TYPE
             | ACCESS_ALLOWED_OBJECT_ACE_TYPE
             | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
-            | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => return Ok(false),
-            // Entries that deny, audit or label let nobody in.
+            | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => found.push(None),
             _ => {}
         }
     }
-    Ok(true)
+    Ok(found)
+}
+
+/// Whether an entry of `acl` lets anyone untrusted do any of `mask` with
+/// what the list is on, or, with `passed_on`, with what is made in it: an
+/// entry only passed on applies to nothing but what a folder holds.
+fn lets_others(acl: *const ACL, user: &User, mask: u32, passed_on: bool) -> io::Result<bool> {
+    Ok(entries(acl)?.into_iter().any(|entry| match entry {
+        Some((flags, allowed, sid)) => {
+            (passed_on || flags & INHERIT_ONLY_ACE == 0)
+                && allowed & mask != 0
+                && !trusted(sid, user)
+        }
+        None => true,
+    }))
+}
+
+/// Whether `acl` passes this user's entry on to the files made in it, so
+/// that they never fall back on the process's default list.
+fn passes_on(acl: *const ACL, user: &User) -> io::Result<bool> {
+    Ok(entries(acl)?.into_iter().flatten().any(|(flags, _, sid)| {
+        // SAFETY: both SIDs are valid for the call.
+        flags & OBJECT_INHERIT_ACE != 0 && unsafe { EqualSid(sid, user.sid()) } != 0
+    }))
 }
 
 /// Whether `sid` may own a private file: this user, or those who can take

@@ -1,7 +1,9 @@
-//! Each access list is checked twice: by [`is_private`], and by the
-//! system's own access check for a second user (`another_user_may_open`),
-//! one invented for the question, since a test cannot make a real one
-//! without an administrator.
+//! The access lists these tests make are checked by [`is_private`] and by
+//! the system's own access check for a second user
+//! (`another_user_may_open`), one invented for the question, since a test
+//! cannot make a real one without an administrator. That second check sees
+//! what the user may do with the file or folder itself, not with what a
+//! folder will pass on, which the tests check on a file made in it.
 
 use std::io::Write;
 use std::process::Command;
@@ -38,16 +40,18 @@ fn open_to_everyone(path: &Path) {
     assert!(done.status.success(), "{done:?}");
 }
 
-/// Whether `path` is private, asserting that the system's access check
-/// for another user agrees.
+/// Whether `path` is private, asserting that the system's access check for
+/// another user agrees: on a file both ways, and on a folder, whose list
+/// may let others into only what is made in it, that one private lets
+/// nobody in.
 fn private(path: &Path) -> bool {
     let private = path_is_private(path).unwrap();
-    assert_eq!(
-        another_user_may_open(path).unwrap(),
-        !private,
-        "{}",
-        path.display()
-    );
+    let open = another_user_may_open(path).unwrap();
+    if path.is_dir() {
+        assert!(!(private && open), "{}", path.display());
+    } else {
+        assert_eq!(open, !private, "{}", path.display());
+    }
     private
 }
 
@@ -198,4 +202,67 @@ fn a_folder_is_judged_by_what_it_passes_on_and_a_file_is_not() {
 fn no_list_at_all_lets_everyone_in() {
     assert!(!judged("O:ME", false));
     assert!(!judged("O:MED:NO_ACCESS_CONTROL", false));
+}
+
+#[test]
+fn closing_a_folder_closes_what_is_made_in_it_and_leaves_its_files_as_they_were() {
+    let dir = scratch("close");
+    open_to_everyone(&dir);
+    let inner = dir.join("data");
+    std::fs::create_dir(&inner).unwrap();
+    std::fs::create_dir(inner.join("logs")).unwrap();
+    std::fs::write(inner.join("credential"), "x").unwrap();
+    std::fs::write(inner.join("logs").join("old.log"), "x").unwrap();
+    assert!(!private(&inner.join("credential")));
+    close_folder(&inner).unwrap();
+    assert!(private(&inner));
+    // A file in it keeps the access it had, for its own check to see.
+    assert!(!private(&inner.join("credential")));
+    // What a folder in it holds takes the new list.
+    assert!(private(&inner.join("logs")));
+    assert!(private(&inner.join("logs").join("old.log")));
+    std::fs::write(inner.join("made-after"), "x").unwrap();
+    assert!(private(&inner.join("made-after")));
+    // Closed, it is left as it is.
+    close_folder(&inner).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_folder_others_may_change_is_not_closed() {
+    let dir = scratch("change");
+    let done = Command::new("icacls")
+        .arg(&dir)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)(F)"])
+        .output()
+        .unwrap();
+    assert!(done.status.success(), "{done:?}");
+    let refused = close_folder(&dir).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    assert!(!private(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_folder_that_passes_nothing_on_is_closed_again() {
+    let dir = scratch("passes-nothing");
+    let inner = dir.join("data");
+    std::fs::create_dir(&inner).unwrap();
+    // This user alone, but for the folder itself: a file made in it would
+    // take the process's default list.
+    let done = Command::new("icacls")
+        .arg(&inner)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{}:(F)", std::env::var("USERNAME").unwrap()))
+        .output()
+        .unwrap();
+    assert!(done.status.success(), "{done:?}");
+    close_folder(&inner).unwrap();
+    std::fs::write(inner.join("made-after"), "x").unwrap();
+    assert!(private(&inner.join("made-after")));
+    let descriptor =
+        Descriptor::of(&open(&inner, false).unwrap(), DACL_SECURITY_INFORMATION).unwrap();
+    let (_, acl) = descriptor.owner_and_list().unwrap();
+    assert!(passes_on(acl, &User::current().unwrap()).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
 }
