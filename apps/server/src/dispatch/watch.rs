@@ -16,6 +16,10 @@ use tracing::{info, warn};
 use super::{Core, ServerRole, Stores, lock};
 use crate::watch::{Folder, Rescan, Signal, WatchRun, Watching};
 
+/// The internal write method of a picture folder imported again on its
+/// own.
+pub(crate) const REFRESH_PICTURES: &str = "artists.refreshPictures";
+
 /// The params an automatic scan's job holds: what started it, which is how
 /// the status tells it from one asked for.
 #[derive(Serialize)]
@@ -247,7 +251,7 @@ impl Core {
         let imported = self.with_library(|_, library| {
             let checked = ritornel_engine::check_picture_folder(&folder.path)?;
             let request = WriteRequest {
-                method: "artists.refreshPictures",
+                method: REFRESH_PICTURES,
                 command: None,
                 client: None,
             };

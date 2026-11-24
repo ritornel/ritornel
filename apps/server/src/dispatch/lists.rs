@@ -6,12 +6,13 @@ use std::sync::{Arc, PoisonError, Weak};
 use std::time::Instant;
 
 use ritornel_contract::methods::{
-    CorrectionsLookup, HistoryRebuild, LibrarySetSettings, Method, RatingsSet, SourcesAdd,
+    ArtistsImportPictures, CorrectionsLookup, HistoryRebuild, LibrarySetSettings, Method,
+    RatingsSet, SourcesAdd,
 };
 use ritornel_contract::{
-    ErrorCode, Event, Id, LibraryChange, LibraryEvent, ListClosed, ListEvent, ListLocateParams,
-    ListLocated, ListOpenParams, ListOpened, ListSections, ListWindow, ListWindowParams,
-    MediaToken, Row, RpcError, ViewParams, Window,
+    ErrorCode, Event, Id, LibraryChange, LibraryEvent, ListClosed, ListEvent, ListKind,
+    ListLocateParams, ListLocated, ListOpenParams, ListOpened, ListSections, ListWindow,
+    ListWindowParams, MediaToken, Row, RpcError, ViewParams, Window,
 };
 use ritornel_engine::covers::{CoverError, Rendered};
 use ritornel_engine::{Committed, LibraryStore, ListError, View};
@@ -46,12 +47,13 @@ impl Fanout {
     ///
     /// The rule for `reorder` is the coarse one of "Large lists" in
     /// docs/internals/contract.md:
-    /// a change of play counts reorders only views that sort or filter on
-    /// plays, and any other change reorders every view. No view sorts or
-    /// filters on plays, so a change of plays alone reorders none: only the
-    /// views whose rows show plays are told, to read their windows again
-    /// in place. A listen delivered while others browse costs them a
-    /// window's read in a list of songs, and nothing anywhere else.
+    /// a change of play counts or ratings reorders only views that sort or
+    /// filter on them, a change of portraits none, and any other change
+    /// reorders every view. No view sorts or filters on plays, ratings or
+    /// portraits, so a change of them alone reorders none: only the views
+    /// whose rows show them are told, to read their windows again in place.
+    /// A listen delivered while others browse costs them a window's read in
+    /// a list of songs, and nothing anywhere else.
     pub(crate) fn changed(&self, committed: Committed) {
         let revision = revision(committed.revision);
         let sessions: Vec<Arc<Session>> = self.lock().values().filter_map(Weak::upgrade).collect();
@@ -64,36 +66,46 @@ impl Fanout {
         if changed.is_empty() {
             return;
         }
-        // Plays and ratings show only on songs, and order no list.
+        // Plays and ratings show only on songs, portraits only on artists,
+        // and none of them orders a list.
         let plays_only = matches!(
             changed.as_slice(),
             [LibraryChange::Stats] | [LibraryChange::Ratings]
         );
+        let portraits = is_portraits(committed.method);
         for session in sessions {
             session.publish(Event::Library(LibraryEvent {
                 library_revision: revision,
                 changed: changed.clone(),
             }));
             for (view, held) in session.held_views() {
-                if plays_only && !held.shows_plays() {
+                if plays_only && !held.shows_plays() || portraits && held.kind != ListKind::Artists
+                {
                     continue;
                 }
                 session.publish(Event::List(ListEvent {
                     view,
                     library_revision: revision,
-                    reorder: !plays_only,
+                    reorder: !plays_only && !portraits,
                 }));
             }
         }
     }
 }
 
+/// Whether a write changed artists' portraits and nothing else: an import
+/// of a picture folder, asked for or on its own.
+fn is_portraits(method: &str) -> bool {
+    method == ArtistsImportPictures::NAME || method == super::watch::REFRESH_PICTURES
+}
+
 /// What kind of change a write made, by the method that made it: none, for
 /// a write that changes nothing shown, which sends no event. Adding a
 /// source adds a root and nothing in it. Taking in a listen and rebuilding
-/// history change plays and nothing else. Any other write does not yet
-/// say, so it is taken as every kind; a write of the resolver that moves a
-/// play with its file is among those.
+/// history change plays and nothing else, and importing portraits changes
+/// what artists show. Any other write does not yet say, so it is taken as
+/// every kind; a write of the resolver that moves a play with its file is
+/// among those.
 fn changes(method: &str) -> Vec<LibraryChange> {
     // Sidecars and the disc layouts read from them are evidence: nothing
     // shown reads them.
@@ -108,6 +120,8 @@ fn changes(method: &str) -> Vec<LibraryChange> {
         Vec::new()
     } else if method == SourcesAdd::NAME {
         vec![LibraryChange::Membership]
+    } else if is_portraits(method) {
+        vec![LibraryChange::Metadata]
     } else if method == ritornel_engine::INGEST_METHOD || method == HistoryRebuild::NAME {
         vec![LibraryChange::Stats]
     } else if method == RatingsSet::NAME {
@@ -480,5 +494,31 @@ mod tests {
             library.is_empty() && lists.is_empty(),
             "{library:?} {lists:?}"
         );
+    }
+
+    #[test]
+    fn a_portrait_import_tells_only_artists_views_to_read_again_in_place() {
+        let (session, fanout) = watching();
+        session.hold_view("artists".to_owned(), view(ListKind::Artists));
+        for method in [
+            ArtistsImportPictures::NAME,
+            crate::dispatch::watch::REFRESH_PICTURES,
+        ] {
+            fanout.changed(Committed {
+                revision: 11,
+                method,
+                shown: true,
+            });
+            let (library, lists) = told(&session);
+            assert_eq!(library.len(), 1);
+            assert_eq!(library[0].changed, [LibraryChange::Metadata]);
+            assert_eq!(
+                lists
+                    .iter()
+                    .map(|event| (event.view.as_str(), event.reorder))
+                    .collect::<Vec<_>>(),
+                [("artists", false)]
+            );
+        }
     }
 }
