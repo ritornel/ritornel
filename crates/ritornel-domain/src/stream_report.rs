@@ -491,20 +491,38 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
     // Another listener's plays move by a track's length, which the run's
     // streams can change, and by their streams it brings back into force.
     for other in input.others {
-        let mut once_applied = other.streams.clone();
-        once_applied.extend(back.get(&other.listener).into_iter().flatten().cloned());
-        for (into, streams, lengths) in [
-            (&mut after, &once_applied, &lengths),
-            (&mut now, &other.streams, &lengths_now),
+        let match_theirs = |streams: &[Stream]| {
+            if streams.is_empty() {
+                Matched::default()
+            } else {
+                match_streams(streams, &other.scrobbles, Tiers::ALL, &pins(streams))
+            }
+        };
+        let matched_now = match_theirs(&other.streams);
+        // Matched as now when the run brings none of theirs back.
+        let once_applied: Vec<Stream>;
+        let (streams_after, matched_after) = match back.get(&other.listener) {
+            None => (other.streams.as_slice(), None),
+            Some(brought) => {
+                once_applied = other.streams.iter().chain(brought).cloned().collect();
+                (once_applied.as_slice(), Some(match_theirs(&once_applied)))
+            }
+        };
+        for (into, streams, matched, lengths) in [
+            (
+                &mut after,
+                streams_after,
+                matched_after.as_ref().unwrap_or(&matched_now),
+                &lengths,
+            ),
+            (
+                &mut now,
+                other.streams.as_slice(),
+                &matched_now,
+                &lengths_now,
+            ),
         ] {
-            let matched = match_streams(streams, &other.scrobbles, Tiers::ALL, &pins(streams));
-            let theirs = added(
-                streams,
-                &other.scrobbles,
-                &matched,
-                lengths,
-                input.set_aside,
-            );
+            let theirs = added(streams, &other.scrobbles, matched, lengths, input.set_aside);
             for (year, (plays, counted)) in theirs {
                 let row = into.entry(year).or_default();
                 row.0 += plays;
