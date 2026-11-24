@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
-use ritornel_client::contract::{DeviceKind, Platform, PlayedVia, SpotifyStream};
+use ritornel_client::contract::{DeviceKind, Platform, PlayedVia, SpotifyStream, is_track_uri};
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -256,7 +256,7 @@ impl Raw {
 
     fn stream(&mut self) -> Result<Row, &'static str> {
         let track_uri = text(self, "spotify_track_uri")?;
-        let Some(track_uri) = track_uri.filter(|uri| is_track(uri)) else {
+        let Some(track_uri) = track_uri.filter(|uri| is_track_uri(uri)) else {
             return Ok(Row::NotMusic(NotMusic::NoTrack));
         };
         let title = text(self, "master_metadata_track_name")?.filter(|name| !name.is_empty());
@@ -318,12 +318,6 @@ fn whole(raw: &mut Raw, name: &'static str) -> Result<Option<i64>, &'static str>
         Some(Value::Number(number)) => number.as_i64().map(Some).ok_or(name),
         Some(_) => Err(name),
     }
-}
-
-/// Whether a URI is a track's, with an ID after the prefix.
-fn is_track(uri: &str) -> bool {
-    uri.strip_prefix("spotify:track:")
-        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// An instant in UTC, as Unix milliseconds.

@@ -11,7 +11,7 @@
 --   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
---   0008_spotify_streams  c57d0b61cdbd222acfdacfdf5708df035f2e5fc2bf0ef9f3f0b49ce9b41688d2
+--   0008_spotify_streams  d95d2cab0108c7d5cb07a869a1b9d0271470fd89f1cba9c82302bb7caadbcaaa
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -975,7 +975,7 @@ CREATE TABLE import_run (
   applied_by_server_id  INTEGER NOT NULL REFERENCES server(id),
   session_pid           BLOB CHECK (length(session_pid) = 16),                -- the session that asked, when one did
   reader                TEXT NOT NULL,                                       -- the reader's name and version, such as 'ritornelctl 0.1.0'
-  records_hash          BLOB NOT NULL CHECK (length(records_hash) = 32),     -- SHA-256 of the kept records in key order: the same archive has the same hash
+  records_hash          BLOB NOT NULL CHECK (length(records_hash) = 32),     -- SHA-256 of the kept records in their own order: the same archive has the same hash, whatever is stored
   streams               INTEGER NOT NULL CHECK (streams >= 0),               -- the streams the archive held
   new_streams           INTEGER NOT NULL CHECK (new_streams BETWEEN 0 AND streams),   -- of those, the ones it stored
   created_at_ms         INTEGER NOT NULL,

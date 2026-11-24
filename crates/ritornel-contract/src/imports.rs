@@ -81,17 +81,19 @@ pub const LATEST_STREAM_END: i64 = 4_102_444_800_000;
 /// The longest a stream may have played: a day.
 pub const LONGEST_STREAM_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// Whether a URI is a Spotify track's, with an ID after the prefix.
+pub fn is_track_uri(uri: &str) -> bool {
+    uri.strip_prefix("spotify:track:")
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
 impl SpotifyStream {
     /// Whether it is a stream there can be: a track's URI, an artist and a
     /// title, an end from 1970 to 2100 and a time played from nothing to a
     /// day, so that no sum or difference of two overflows and no two tracks
     /// share a key. `Err` names the field that is not.
     pub fn plausible(&self) -> Result<(), &'static str> {
-        let track = self
-            .track_uri
-            .strip_prefix("spotify:track:")
-            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric()));
-        if !track {
+        if !is_track_uri(&self.track_uri) {
             return Err("spotify_track_uri");
         }
         if self.title.is_empty() {

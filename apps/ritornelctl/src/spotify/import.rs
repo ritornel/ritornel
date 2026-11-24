@@ -90,21 +90,12 @@ pub(crate) fn import(
         Ok((job, run))
     })?;
     let (job, run) = run;
-    let text = if args.server.json {
-        let mut text = serde_json::to_string_pretty(&json!({
-            "read": to_json(&tally),
-            "run": run,
-            "job": job,
-        }))
-        .map_err(|error| Error::Output(error.into()))?;
-        text.push('\n');
-        text
-    } else {
-        rendered(&tally, &run, &job, args.samples)
-    };
-    out.write_all(text.as_bytes())
-        .and_then(|()| out.flush())
-        .map_err(Error::Output)?;
+    print(
+        &args.server,
+        out,
+        &json!({ "read": to_json(&tally), "run": run, "job": job }),
+        || rendered(&tally, &run, &job, args.samples),
+    )?;
     match job.state {
         JobState::Succeeded => Ok(()),
         state => Err(Error::Job(state.as_str())),

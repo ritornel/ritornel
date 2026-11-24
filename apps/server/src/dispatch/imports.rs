@@ -229,6 +229,7 @@ impl Core {
         stores: &Stores,
         params: &ImportsRunParams,
     ) -> Result<ImportsJobStarted, RpcError> {
+        no_library(stores)?;
         if let Some(replayed) = self.replayed::<ImportsUndo>(stores, params)? {
             return Ok(replayed);
         }
@@ -249,6 +250,7 @@ impl Core {
         stores: &Stores,
         params: &ImportsGetParams,
     ) -> Result<ImportRun, RpcError> {
+        no_library(stores)?;
         let mut run = self
             .staging
             .run(params.run_id, self.clock.now_ms())
@@ -267,6 +269,7 @@ impl Core {
     }
 
     pub(super) fn imports_list(&self, stores: &Stores) -> Result<ImportRuns, RpcError> {
+        no_library(stores)?;
         let runs = Self::library(stores, |library| library.stored_runs().map_err(internal))?;
         Ok(ImportRuns {
             runs: runs.into_iter().map(applied).collect(),

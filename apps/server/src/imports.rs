@@ -301,7 +301,7 @@ impl Staging {
         let Some(meta) = self.meta(run)? else {
             return Ok(None);
         };
-        let Some((streams, begun_at)) = self.streams(run, now)? else {
+        let Some((streams, begun_at)) = self.streams_held(run, now)? else {
             return Ok(None);
         };
         let report = read_json(&self.run_dir(run).join("report.json"))?;
@@ -322,6 +322,15 @@ impl Staging {
         run: Id,
         now: i64,
     ) -> Result<Option<(Vec<SpotifyStream>, i64)>, Error> {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.streams_held(run, now)
+    }
+
+    /// [`Self::streams`], with the lock held by the caller.
+    fn streams_held(&self, run: Id, now: i64) -> Result<Option<(Vec<SpotifyStream>, i64)>, Error> {
         let Some(meta) = self
             .meta(run)?
             .filter(|meta| now.saturating_sub(meta.begun_at) <= KEEP_MS)

@@ -58,7 +58,7 @@ CREATE TABLE import_run (
   applied_by_server_id  INTEGER NOT NULL REFERENCES server(id),
   session_pid           BLOB CHECK (length(session_pid) = 16),                -- the session that asked, when one did
   reader                TEXT NOT NULL,                                       -- the reader's name and version, such as 'ritornelctl 0.1.0'
-  records_hash          BLOB NOT NULL CHECK (length(records_hash) = 32),     -- SHA-256 of the kept records in key order: the same archive has the same hash
+  records_hash          BLOB NOT NULL CHECK (length(records_hash) = 32),     -- SHA-256 of the kept records in their own order: the same archive has the same hash, whatever is stored
   streams               INTEGER NOT NULL CHECK (streams >= 0),               -- the streams the archive held
   new_streams           INTEGER NOT NULL CHECK (new_streams BETWEEN 0 AND streams),   -- of those, the ones it stored
   created_at_ms         INTEGER NOT NULL,
