@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ritornel_contract::{DeviceKind, ImportReport, Platform, PlayedVia, SpotifyStream};
 use ritornel_domain::history::{Correction, StreamImport};
-use ritornel_domain::stream_report::{DryRunInput, Listened, dry_run, keyed};
+use ritornel_domain::stream_report::{DryRunInput, OtherListener, dry_run, keyed};
 use ritornel_domain::streams::{Scrobble, Stream, kept, repeat_order};
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -27,28 +27,38 @@ struct Read {
     zone_periods: Vec<ritornel_domain::history::ZonePeriod>,
     stored: HashMap<Vec<u8>, SpotifyStream>,
     observations: HashMap<Vec<u8>, i64>,
+    owners: HashMap<Vec<u8>, i64>,
     corrections: Vec<Correction>,
     in_force: Vec<Stream>,
-    others: Vec<Listened>,
+    others: Vec<OtherListener>,
     set_aside: HashSet<Vec<u8>>,
 }
 
-/// The streams stored already, by key: as they were stored, and their
-/// observations.
-type Stored = (HashMap<Vec<u8>, SpotifyStream>, HashMap<Vec<u8>, i64>);
+/// The streams stored already, each by its key.
+#[derive(Default)]
+struct Stored {
+    /// As it was stored.
+    records: HashMap<Vec<u8>, SpotifyStream>,
+    /// Its observation.
+    observations: HashMap<Vec<u8>, i64>,
+    /// Whose it is.
+    owners: HashMap<Vec<u8>, i64>,
+}
 
 fn stored_streams(connection: &Connection) -> Result<Stored, Error> {
     let mut statement = connection.prepare(&format!(
-        "SELECT o.id, {STORED_STREAM} FROM history_observation o {STORED_STREAM_JOINS}"
+        "SELECT o.id, o.listener_id, {STORED_STREAM}
+         FROM history_observation o {STORED_STREAM_JOINS}"
     ))?;
     let mut rows = statement.query([])?;
-    let (mut records, mut observations) = (HashMap::new(), HashMap::new());
+    let mut stored = Stored::default();
     while let Some(row) = rows.next()? {
-        let key: Vec<u8> = row.get(1)?;
-        observations.insert(key.clone(), row.get(0)?);
-        records.insert(key, stored_stream(row, 2)?);
+        let key: Vec<u8> = row.get(2)?;
+        stored.observations.insert(key.clone(), row.get(0)?);
+        stored.owners.insert(key.clone(), row.get(1)?);
+        stored.records.insert(key, stored_stream(row, 3)?);
     }
-    Ok((records, observations))
+    Ok(stored)
 }
 
 /// A stored stream's columns, after its source key: what [`stored_stream`]
@@ -195,7 +205,11 @@ fn read(connection: &Connection) -> Result<Read, Error> {
     // decide.
     let set_aside_ids = ritornel_domain::history::excluded(&corrections);
     let (scrobbles, excluded, echoes) = offered(connection, &set_aside_ids, listener)?;
-    let (stored, observations) = stored_streams(connection)?;
+    let Stored {
+        records: stored,
+        observations,
+        owners,
+    } = stored_streams(connection)?;
     let set_aside = observations
         .iter()
         .filter(|(_, observation)| set_aside_ids.contains(observation))
@@ -204,7 +218,12 @@ fn read(connection: &Connection) -> Result<Read, Error> {
     let (in_force, theirs): (Vec<_>, Vec<_>) = crate::history_streams::streams(connection, None)?
         .into_iter()
         .partition(|stream| stream.listener == listener);
-    let mut by_listener: BTreeMap<i64, Vec<StreamImport>> = BTreeMap::new();
+    // Every other listener with a stream stored, in force or not.
+    let mut by_listener: BTreeMap<i64, Vec<StreamImport>> = owners
+        .values()
+        .filter(|owner| **owner != listener)
+        .map(|owner| (*owner, Vec::new()))
+        .collect();
     for stream in theirs {
         by_listener.entry(stream.listener).or_default().push(stream);
     }
@@ -221,7 +240,8 @@ fn read(connection: &Connection) -> Result<Read, Error> {
     let others = by_listener
         .into_iter()
         .map(|(other, streams)| {
-            Ok(Listened {
+            Ok(OtherListener {
+                listener: other,
                 streams: as_streams(streams),
                 scrobbles: offered(connection, &set_aside_ids, other)?.0,
             })
@@ -236,6 +256,7 @@ fn read(connection: &Connection) -> Result<Read, Error> {
         zone_periods: zone_periods(connection)?,
         stored,
         observations,
+        owners,
         corrections,
         in_force: as_streams(in_force),
         others,
@@ -258,6 +279,7 @@ fn report(read: &Read, streams: &[Stream], made_at: i64) -> ImportReport {
         corrections: &read.corrections,
         observations: &read.observations,
         stored: &read.stored,
+        owners: &read.owners,
         set_aside: &read.set_aside,
         made_at,
     })

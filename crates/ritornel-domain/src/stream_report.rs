@@ -31,11 +31,11 @@ pub struct DryRunInput<'a> {
     /// The listener's streams in force now, with their keys, which applying
     /// keeps in force beside the run's.
     pub in_force: &'a [Stream],
-    /// Every other listener's streams in force and the scrobbles offered
-    /// to them: a track's length is taken from their streams too, as
-    /// derivation takes it from every stream in force, so a run can move
-    /// their plays.
-    pub others: &'a [Listened],
+    /// Every other listener with a stream stored, with their streams in
+    /// force and the scrobbles offered to them: a track's length is taken
+    /// from their streams too, as derivation takes it from every stream in
+    /// force, so a run can move their plays.
+    pub others: &'a [OtherListener],
     /// The scrobbles that may be offered to a stream.
     pub scrobbles: &'a [Scrobble],
     /// Scrobbles set aside, which are offered to none.
@@ -57,6 +57,9 @@ pub struct DryRunInput<'a> {
     pub observations: &'a HashMap<Vec<u8>, i64>,
     /// The streams stored already, by key, as they were stored.
     pub stored: &'a HashMap<Vec<u8>, SpotifyStream>,
+    /// Whose each stored stream is, by key: a stream stays the listener's
+    /// it was stored for.
+    pub owners: &'a HashMap<Vec<u8>, i64>,
     /// The keys of the streams a correction that stands sets aside: a play
     /// of one is excluded, with the scrobbles joined to it.
     pub set_aside: &'a HashSet<Vec<u8>>,
@@ -64,10 +67,12 @@ pub struct DryRunInput<'a> {
     pub made_at: i64,
 }
 
-/// One listener's streams in force and the scrobbles offered to them.
+/// Another listener's streams in force and the scrobbles offered to them.
 #[derive(Debug, Clone, Default)]
-pub struct Listened {
-    /// Their streams, with their keys.
+pub struct OtherListener {
+    /// Who they are.
+    pub listener: i64,
+    /// Their streams in force, with their keys.
     pub streams: Vec<Stream>,
     /// Their scrobbles that may be offered to a stream.
     pub scrobbles: Vec<Scrobble>,
@@ -317,24 +322,30 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         .chain(input.others.iter().flat_map(|other| &other.streams))
         .map(|s| s.key.as_slice())
         .collect();
-    // A stream stored already keeps its record as it was stored.
-    let union: Vec<Stream> = input
-        .in_force
+    // A stream stored already keeps its record as it was stored, and stays
+    // the listener's it was stored for: one of another listener's that the
+    // run brings back into force is theirs again.
+    let as_stored = |stream: &Stream| Stream {
+        key: stream.key.clone(),
+        record: input
+            .stored
+            .get(&stream.key)
+            .unwrap_or(&stream.record)
+            .clone(),
+    };
+    let mut back: BTreeMap<i64, Vec<Stream>> = BTreeMap::new();
+    let mut union: Vec<Stream> = input.in_force.to_vec();
+    for stream in run
         .iter()
-        .cloned()
-        .chain(
-            run.iter()
-                .filter(|stream| !held.contains(stream.key.as_slice()))
-                .map(|stream| Stream {
-                    key: stream.key.clone(),
-                    record: input
-                        .stored
-                        .get(&stream.key)
-                        .unwrap_or(&stream.record)
-                        .clone(),
-                }),
-        )
-        .collect();
+        .filter(|stream| !held.contains(stream.key.as_slice()))
+    {
+        match input.owners.get(&stream.key) {
+            Some(owner) if *owner != input.listener => {
+                back.entry(*owner).or_default().push(as_stored(stream));
+            }
+            _ => union.push(as_stored(stream)),
+        }
+    }
     let input = &DryRunInput {
         streams: &union,
         ..*input
@@ -356,19 +367,22 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         Tiers::ALL,
         &pins(input.streams),
     );
-    // A track's length, from these streams and every other listener's.
-    let lengths_of = |streams: &[Stream], events: &[Event]| {
-        if input.others.is_empty() {
+    // A track's length, from these streams and every other listener's in
+    // force, and once applied those the run brings back to them.
+    let lengths_of = |streams: &[Stream], events: &[Event], applied: bool| {
+        let back = back.values().flatten().filter(|_| applied);
+        if input.others.is_empty() && back.clone().next().is_none() {
             return lengths(streams, events);
         }
         let every: Vec<Stream> = streams
             .iter()
             .chain(input.others.iter().flat_map(|other| &other.streams))
+            .chain(back)
             .cloned()
             .collect();
         lengths(&every, &crate::streams::events(&every))
     };
-    let lengths = lengths_of(input.streams, &matched.events);
+    let lengths = lengths_of(input.streams, &matched.events, true);
 
     let counts = crate::streams::counts(&matched);
     let tiers = Tier::ALL
@@ -465,7 +479,7 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
             &pins(input.in_force),
         )
     };
-    let lengths_now = lengths_of(input.in_force, &in_force.events);
+    let lengths_now = lengths_of(input.in_force, &in_force.events, false);
     let mut now = added(
         input.in_force,
         input.scrobbles,
@@ -473,18 +487,18 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
         &lengths_now,
         input.set_aside,
     );
-    // Another listener's plays move only by a track's length, which the
-    // run's streams can change.
+    // Another listener's plays move by a track's length, which the run's
+    // streams can change, and by their streams it brings back into force.
     for other in input.others {
-        let matched = match_streams(
-            &other.streams,
-            &other.scrobbles,
-            Tiers::ALL,
-            &pins(&other.streams),
-        );
-        for (into, lengths) in [(&mut after, &lengths), (&mut now, &lengths_now)] {
+        let mut once_applied = other.streams.clone();
+        once_applied.extend(back.get(&other.listener).into_iter().flatten().cloned());
+        for (into, streams, lengths) in [
+            (&mut after, &once_applied, &lengths),
+            (&mut now, &other.streams, &lengths_now),
+        ] {
+            let matched = match_streams(streams, &other.scrobbles, Tiers::ALL, &pins(streams));
             let theirs = added(
-                &other.streams,
+                streams,
                 &other.scrobbles,
                 &matched,
                 lengths,
@@ -831,6 +845,7 @@ mod tests {
             corrections: &[],
             observations: &UNOBSERVED,
             stored: &EMPTY,
+            owners: &UNOBSERVED,
             set_aside: &NONE,
             made_at: 7,
         }
@@ -1023,7 +1038,7 @@ mod tests {
         // This run's stream of it played a minute and a half and stopped.
         let streams = fresh(vec![record(221, 90, "Low Tide", "endplay")]);
         let plays = BTreeMap::new();
-        let alone = |others: &[Listened]| {
+        let alone = |others: &[OtherListener]| {
             let year = dry_run(&DryRunInput {
                 others,
                 ..input(&streams, &[], &plays)
@@ -1033,7 +1048,8 @@ mod tests {
         };
         assert_eq!(alone(&[]), (0, 1));
         // Over half its length: it counts, as derivation counts it.
-        let others = [Listened {
+        let others = [OtherListener {
+            listener: 2,
             streams: theirs,
             scrobbles: Vec::new(),
         }];
@@ -1045,7 +1061,8 @@ mod tests {
         // Another listener's stream of Low Tide played a minute and a half
         // and stopped: with no length for it, it does not count.
         let theirs = fresh(vec![record(221, 90, "Low Tide", "endplay")]);
-        let others = [Listened {
+        let others = [OtherListener {
+            listener: 2,
             streams: theirs.clone(),
             scrobbles: Vec::new(),
         }];
@@ -1066,6 +1083,34 @@ mod tests {
         })
         .years[0];
         assert_eq!((year.plays_after, year.counted_after), (1, 0));
+    }
+
+    #[test]
+    fn a_stream_brought_back_into_force_stays_the_listeners_it_was_stored_for() {
+        // Another listener's stream, stored for them and out of force since
+        // its run was undone, and their scrobble of it as it began.
+        let streams = fresh(vec![record(221, 221, "Low Tide", "trackdone")]);
+        let stored: HashMap<Vec<u8>, SpotifyStream> = streams
+            .iter()
+            .map(|stream| (stream.key.clone(), stream.record.clone()))
+            .collect();
+        let owners = HashMap::from([(streams[0].key.clone(), 2)]);
+        let others = [OtherListener {
+            listener: 2,
+            streams: Vec::new(),
+            scrobbles: vec![scrobble(1, "Low Tide")],
+        }];
+        // The plays now: their scrobble.
+        let plays = BTreeMap::from([(2019, (1, 1))]);
+        // A run brings it back: it joins their scrobble, and adds no play.
+        let year = dry_run(&DryRunInput {
+            others: &others,
+            stored: &stored,
+            owners: &owners,
+            ..input(&streams, &[], &plays)
+        })
+        .years[0];
+        assert_eq!((year.plays_after, year.counted_after), (1, 1));
     }
 
     #[test]
@@ -1101,6 +1146,7 @@ mod tests {
             corrections: &[],
             observations: &UNOBSERVED,
             stored: &HashMap::new(),
+            owners: &HashMap::new(),
             set_aside: &NONE,
             made_at: 7,
         });
@@ -1151,6 +1197,7 @@ mod tests {
             corrections: &[],
             observations: &UNOBSERVED,
             stored: &HashMap::new(),
+            owners: &HashMap::new(),
             set_aside: &NONE,
             made_at: 7,
         });
