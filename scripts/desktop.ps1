@@ -5,8 +5,11 @@
 #
 #   pwsh -File .\scripts\desktop.ps1 check          check formatting, run clippy with
 #                                        warnings denied, run the tests and
-#                                        build the app, as `mise run
-#                                        desktop:check` and CI do
+#                                        check that the patched GPUI backend
+#                                        is used, as `mise run desktop:check`
+#                                        and CI do
+#   pwsh -File .\scripts\desktop.ps1 release        build the desktop app in release,
+#                                        as `mise run desktop:release` does
 #   pwsh -File .\scripts\desktop.ps1 run [args]     run it against an invented library
 #                                        of 8,600 albums, never a real one:
 #                                        made once in apps\desktop\.invented,
@@ -28,7 +31,7 @@
 #   pwsh -File .\scripts\desktop.ps1 run --size 1400x900
 #   pwsh -File .\scripts\desktop.ps1 run --measure 25 --out report.json
 param(
-    [Parameter(Position = 0)][ValidateSet('check', 'run', 'tones', 'app')][string]$Command = 'run',
+    [Parameter(Position = 0)][ValidateSet('check', 'release', 'run', 'tones', 'app')][string]$Command = 'run',
     [string]$DataDir,
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest
 )
@@ -106,6 +109,14 @@ switch ($Command) {
         Assert-Exit
         cargo test --locked --manifest-path "$app\Cargo.toml"
         Assert-Exit
+        $tree = cargo tree --locked --manifest-path "$app\Cargo.toml" --target x86_64-unknown-linux-gnu --edges normal --invert gpui-pre-linux --depth 0
+        Assert-Exit
+        if (-not ($tree | Select-String -SimpleMatch 'github.com/ritornel/gpui' -Quiet)) {
+            [Console]::Error.WriteLine('The desktop app no longer takes gpui-pre-linux from ritornel/gpui: move its [patch] with the GPUI pins.')
+            exit 1
+        }
+    }
+    'release' {
         cargo build --locked --release --manifest-path "$app\Cargo.toml"
         Assert-Exit
     }

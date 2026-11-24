@@ -165,8 +165,8 @@ jobs:
       - run: mise run test
 
   desktop:
-    # The desktop app, a workspace of its own, checked, linted, tested and
-    # built in release on each system. On Linux GPUI's Wayland and X11
+    # The desktop app, a workspace of its own, checked, linted and tested on
+    # each system. On Linux GPUI's Wayland and X11
     # backends link fontconfig, xcb and xkbcommon; scripts/desktop.sh skips
     # without them, and fails instead in CI, so the job cannot pass by
     # skipping. On Windows the task runs scripts/desktop.ps1.
@@ -178,7 +178,6 @@ jobs:
       matrix:
         name: ${{ fromJSON(needs.changes.outputs.systems) }}
     runs-on: ${{ fromJSON('{"Linux":"ubuntu-26.04","macOS":"macos-latest","Windows":"windows-latest"}')[matrix.name] }}
-    # It compiles GPUI twice: for clippy and the tests, and in release.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

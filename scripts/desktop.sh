@@ -4,9 +4,10 @@
 # each of them; on Windows the task runs scripts/desktop.ps1 instead.
 #
 #   scripts/desktop.sh check          check formatting, run clippy with
-#                                          warnings denied, run the tests,
+#                                          warnings denied, run the tests and
 #                                          check that the patched GPUI
-#                                          backend is used and build the app
+#                                          backend is used
+#   scripts/desktop.sh release        build the desktop app in release
 #   scripts/desktop.sh app            build Ritornel.app, with the release
 #                                          ritornel-server inside it, as
 #                                          `mise run build` does, in
@@ -119,6 +120,8 @@ case "${1:-}" in
             echo "The desktop app no longer takes gpui-pre-linux from ritornel/gpui: move its [patch] with the GPUI pins." >&2
             exit 1
         fi
+        ;;
+    release)
         gpui build --locked --release
         ;;
     run)
@@ -183,7 +186,7 @@ case "${1:-}" in
         echo "built $bundle"
         ;;
     *)
-        echo "usage: $0 check | app | run [args] | tones [args]" >&2
+        echo "usage: $0 check | release | app | run [args] | tones [args]" >&2
         exit 2
         ;;
 esac
