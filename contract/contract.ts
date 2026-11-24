@@ -1752,8 +1752,8 @@ export type ImportRun = {
   expiresAt: number,
   /**
    * The last report, once a dry run or an apply has finished: an
-   * apply works its report out again just before it writes, and that one
-   * is what applying did.
+   * apply works its report out again in the write that applies it, and
+   * that one is what applying did.
    */
   report?: ImportReport,
   /**

@@ -206,7 +206,7 @@ pub(crate) fn apply(
                     if let Some(report) = run.as_ref().and_then(|run| run.report.as_ref()) {
                         text.push_str(&report_text(
                             report,
-                            "What applying does, as worked out just before it wrote",
+                            "What applying did, as worked out in the write that applied it",
                             false,
                         ));
                     }

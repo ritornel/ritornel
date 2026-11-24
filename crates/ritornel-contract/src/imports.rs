@@ -234,8 +234,8 @@ pub struct ImportRun {
     /// When the hub removes it.
     pub expires_at: i64,
     /// The last report, once a dry run or an apply has finished: an
-    /// apply works its report out again just before it writes, and that one
-    /// is what applying did.
+    /// apply works its report out again in the write that applies it, and
+    /// that one is what applying did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub report: Option<ImportReport>,

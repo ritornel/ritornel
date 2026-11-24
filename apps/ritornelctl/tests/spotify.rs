@@ -320,7 +320,7 @@ fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere
         out.contains("4 streams, 4 of them new to the library. It is in force."),
         "{out}"
     );
-    assert!(out.contains("What applying does"), "{out}");
+    assert!(out.contains("What applying did"), "{out}");
     assert_eq!(revision(&data_dir).as_u64().unwrap(), before + 1);
     // The same archive again stores nothing new.
     let (code, out, _) = ritornelctl(

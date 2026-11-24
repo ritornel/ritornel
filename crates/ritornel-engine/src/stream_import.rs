@@ -509,10 +509,11 @@ impl LibraryStore {
     /// Applies a run of streams: stores those not stored yet and records
     /// the run, in one write, and returns it with the report of what it
     /// did, worked out in the same write from what it saw. A run applied
-    /// before writes nothing, and returns what it is with no report. That is looked at before the write is begun, as
-    /// one writer of runs, the hub's job worker, is enough to make sure of;
-    /// a second writer racing it would find the run inside the write, and
-    /// take a revision that changes nothing.
+    /// before writes nothing, and returns what it is with no report. That
+    /// is looked at before the write is begun, as one writer of runs, the
+    /// hub's job worker, is enough to make sure of; a second writer racing
+    /// it finds the run inside the write, and takes a revision that changes
+    /// nothing.
     pub fn apply_streams(
         &self,
         request: WriteRequest,
@@ -528,6 +529,9 @@ impl LibraryStore {
         // again is answered with, and not in it.
         let (sent, report_of) = std::sync::mpsc::channel();
         let written = self.write(request, move |write| {
+            if let Some(stored) = stored_run(write.connection(), run)? {
+                return Ok(serde_json::to_string(&stored)?);
+            }
             // Keyed against what is stored as this write sees it, so that a
             // row a run stored before keeps its key.
             let read = read(write.connection())?;
