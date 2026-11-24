@@ -1320,6 +1320,7 @@ pub fn judge_replacements(
                 first_seen_ms: i64::MAX,
                 cover: None,
                 facts,
+                held: Vec::new(),
                 current: None,
             };
             let probe = Ev::of(as_new.id, &as_new.facts, policy, None);

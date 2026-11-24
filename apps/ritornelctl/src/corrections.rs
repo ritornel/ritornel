@@ -4,18 +4,28 @@
 //!
 //! `ritornelctl corrections musicbrainz` and `lookup`: the switch that
 //! lets the library be asked about at MusicBrainz, and asking about one
-//! album or folder, which is the only way it is asked. See "MusicBrainz lookups" there.
+//! album or folder, which is the only way it is asked. See "MusicBrainz
+//! lookups" there.
+//!
+//! `ritornelctl corrections list`, `show` and `preview`: what the replies
+//! propose each disc is, and what a yes would change. See "Album
+//! proposals" there.
 
 use std::io::Write;
 
-use ritornel_client::contract::methods::{CorrectionsDiscs, CorrectionsLookup, LibrarySetSettings};
+use ritornel_client::contract::methods::{
+    CorrectionsDiscs, CorrectionsGet, CorrectionsList, CorrectionsLookup, CorrectionsPreview,
+    LibrarySetSettings,
+};
 use ritornel_client::contract::{
-    Disc, DiscList, DiscsParams, Id, LayoutMethod, LibrarySettingsSet, LookupDone, LookupOutcome,
-    LookupParams, SetLibrarySettingsParams,
+    AlbumShape, Choice, Disc, DiscList, DiscsParams, FileValue, Id, LayoutMethod,
+    LibrarySettingsSet, LookupDone, LookupOutcome, LookupParams, NoParams, PreviewParams,
+    PreviewShown, Proposal, ProposalCandidate, ProposalChange, ProposalGetParams, ProposalGot,
+    ProposalList, SetLibrarySettingsParams,
 };
 use ritornel_client::local;
 
-use crate::cli::{DiscsArgs, Error, LookupArgs, SwitchArgs};
+use crate::cli::{DiscsArgs, Error, LookupArgs, PreviewArgs, ProposalArgs, ServerArgs, SwitchArgs};
 use crate::server;
 
 pub(crate) fn discs(
@@ -138,6 +148,256 @@ fn render_lookup(done: &LookupDone) -> String {
             text.push_str(&format!(
                 "    {} by {}{year}, {releases}\n",
                 album.title, album.artist
+            ));
+        }
+    }
+    text
+}
+
+pub(crate) fn list(
+    args: &ServerArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let list = server::ask(args, env, async |client| {
+        client.call::<CorrectionsList>(&NoParams {}).await
+    })?;
+    server::print(args, out, &list, serde_json::to_string_pretty, render_list)
+}
+
+pub(crate) fn show(
+    args: &ProposalArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let proposal_id = args
+        .proposal
+        .parse::<Id>()
+        .map_err(|_| Error::Usage("show needs a proposal ID"))?;
+    let got = server::ask(&args.server, env, async |client| {
+        client
+            .call::<CorrectionsGet>(&ProposalGetParams { proposal_id })
+            .await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &got,
+        serde_json::to_string_pretty,
+        |got: &ProposalGot| render_proposal(&got.proposal),
+    )
+}
+
+pub(crate) fn preview(
+    args: &PreviewArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    if args.candidate.is_some() && args.proposals.len() != 1 {
+        return Err(Error::Usage("--candidate is for one proposal"));
+    }
+    let choices = args
+        .proposals
+        .iter()
+        .map(|text| {
+            Ok(Choice {
+                proposal_id: text
+                    .parse::<Id>()
+                    .map_err(|_| Error::Usage("preview needs proposal IDs"))?,
+                release_group: args.candidate.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let shown = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
+        client
+            .call::<CorrectionsPreview>(&PreviewParams { choices })
+            .await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &shown,
+        serde_json::to_string_pretty,
+        render_preview,
+    )
+}
+
+/// A count of things, in words.
+fn plural(count: u32, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{count} {many}")
+    }
+}
+
+/// A folder under its root, or the root itself.
+fn place(root: &str, folder: &str) -> String {
+    if folder.is_empty() {
+        root.to_owned()
+    } else {
+        format!("{root}/{folder}")
+    }
+}
+
+fn change(change: ProposalChange) -> &'static str {
+    match change {
+        ProposalChange::Knows => "adds an ID",
+        ProposalChange::Gains => "adds a kind or a first year",
+        ProposalChange::Moves => "moves files",
+    }
+}
+
+fn candidate(candidate: &ProposalCandidate) -> String {
+    let year = candidate
+        .first_year
+        .map_or_else(String::new, |year| format!(" ({year})"));
+    let title = candidate.title.as_deref().unwrap_or("an untitled album");
+    let releases = if candidate.releases == 1 {
+        "1 release".to_owned()
+    } else {
+        format!("{} releases", candidate.releases)
+    };
+    format!(
+        "{title} by {}{year}, {releases}: {}",
+        candidate.artist,
+        change(candidate.change)
+    )
+}
+
+fn render_list(list: &ProposalList) -> String {
+    if list.proposals.is_empty() {
+        return "Nothing is proposed.\n".to_owned();
+    }
+    let mut text = String::new();
+    let mut group = None;
+    for proposal in &list.proposals {
+        if group != Some(proposal.group_id) {
+            if group.is_some() {
+                text.push('\n');
+            }
+            group = Some(proposal.group_id);
+        }
+        let files = if proposal.file_count == 1 {
+            "1 file".to_owned()
+        } else {
+            format!("{} files", proposal.file_count)
+        };
+        text.push_str(&format!(
+            "{}  {}, {files}\n",
+            proposal.proposal_id,
+            place(&proposal.root, &proposal.folder)
+        ));
+        if let Some(first) = proposal.candidates.first() {
+            text.push_str(&format!("    {}\n", candidate(first)));
+        }
+    }
+    text
+}
+
+fn render_proposal(proposal: &Proposal) -> String {
+    let mut text = format!(
+        "{}  {}\n\nRests on:\n",
+        proposal.proposal_id,
+        place(&proposal.root, &proposal.folder)
+    );
+    for evidence in &proposal.rests_on {
+        let methods: Vec<&str> = evidence.methods.iter().copied().map(method).collect();
+        text.push_str(&format!(
+            "  disc {}, from {}; MusicBrainz names {}\n",
+            evidence.disc_id,
+            methods.join("; "),
+            plural(evidence.releases, "release", "releases")
+        ));
+    }
+    text.push_str("\nFiles:\n");
+    for file in &proposal.files {
+        text.push_str(&format!("  {file}\n"));
+    }
+    for (number, option) in (1..).zip(&proposal.candidates) {
+        text.push_str(&format!(
+            "\nCandidate {number}: {}\n  {}\n",
+            option.release_group,
+            candidate(option)
+        ));
+        for value in &option.values {
+            text.push_str(&format!("  {}  {}\n", value.path, change_of(value)));
+        }
+    }
+    text
+}
+
+fn shape(album: &AlbumShape) -> String {
+    let title = album.title.as_deref().unwrap_or("an untitled album");
+    let artist = album
+        .artist
+        .as_deref()
+        .map_or_else(String::new, |artist| format!(" by {artist}"));
+    let year = album
+        .first_year
+        .map_or_else(String::new, |year| format!(" ({year})"));
+    let editions = if album.releases > 1 {
+        format!(" in {} editions", album.releases)
+    } else {
+        String::new()
+    };
+    format!(
+        "  {title}{artist}{year}: {}, {}{editions}\n",
+        plural(album.discs, "disc", "discs"),
+        plural(album.songs, "song", "songs")
+    )
+}
+
+/// One value as it would change: the field, what it says now if known, and
+/// what it would say.
+fn change_of(value: &FileValue) -> String {
+    let after = value
+        .value
+        .as_deref()
+        .map_or_else(|| "nothing".to_owned(), |value| format!("\"{value}\""));
+    match &value.now {
+        Some(now) => format!("{}: \"{now}\" -> {after}", value.field),
+        None => format!("{} = {after}", value.field),
+    }
+}
+
+fn render_preview(shown: &PreviewShown) -> String {
+    let mut text = String::from("Now:\n");
+    for album in &shown.now {
+        text.push_str(&shape(album));
+    }
+    text.push_str("\nAfter:\n");
+    for album in &shown.after {
+        text.push_str(&shape(album));
+    }
+    // Songs that would be joined or parted are said first, as they move
+    // what a song's plays and ratings are counted on.
+    if shown.songs_joined > 0 {
+        text.push_str(&format!(
+            "\nJoins {} into others, as one song each.\n",
+            plural(shown.songs_joined, "song", "songs")
+        ));
+    }
+    if shown.songs_parted > 0 {
+        text.push_str(&format!(
+            "\nParts {} from the one each is now.\n",
+            plural(shown.songs_parted, "song", "songs")
+        ));
+    }
+    // What would change on each file, leaving out what it says already.
+    let changing: Vec<&FileValue> = shown
+        .values
+        .iter()
+        .filter(|value| value.now != value.value)
+        .collect();
+    if !changing.is_empty() {
+        text.push_str("\nOn the files:\n");
+        for value in changing {
+            text.push_str(&format!(
+                "  {}/{}  {}\n",
+                value.root,
+                value.path,
+                change_of(value)
             ));
         }
     }

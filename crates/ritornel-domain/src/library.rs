@@ -105,8 +105,12 @@ pub struct Item {
     pub first_seen_ms: i64,
     /// The `picture` row of its cover, when it has one.
     pub cover: Option<i64>,
-    /// What its claims say.
+    /// What its claims say, with any tag values an answer gave put in place
+    /// of its own.
     pub facts: Facts,
+    /// The fields of `facts` such a value gave, as claims name them. No
+    /// rule rewrites them: see [`crate::values`].
+    pub held: Vec<&'static str>,
     /// Its current assignment.
     pub current: Option<Current>,
 }

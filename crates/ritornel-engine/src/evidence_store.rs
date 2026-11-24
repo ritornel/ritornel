@@ -127,7 +127,7 @@ struct Found {
     sidecar_revision_id: i64,
 }
 
-fn method(text: &str) -> Option<LayoutMethod> {
+pub(crate) fn method(text: &str) -> Option<LayoutMethod> {
     Some(match text {
         "log" => LayoutMethod::Log,
         "cue" => LayoutMethod::Cue,
@@ -167,8 +167,9 @@ fn derive(connection: &Connection) -> Result<BTreeMap<DiscKey, DiscRow>, Error> 
         tags.remove(&(item, field.to_owned()))
             .map(|(_, value)| value)
     };
-    // Every file that is there, by source and folder, in the order of
-    // their paths.
+    // Every file of the library, by source and folder, in the order of
+    // their paths. A missing file keeps its place: it may be back, and
+    // until it is retired it is still the disc's.
     let mut folders: BTreeMap<i64, BTreeMap<String, Vec<AudioFile>>> = BTreeMap::new();
     let items = rows(
         connection,
@@ -177,7 +178,7 @@ fn derive(connection: &Connection) -> Result<BTreeMap<DiscKey, DiscRow>, Error> 
          FROM source_item si
          LEFT JOIN source_item_revision sr ON sr.id = si.current_revision_id
          LEFT JOIN audio_asset aa ON aa.id = sr.audio_asset_id
-         WHERE si.item_kind = 'file' AND si.retired_at_ms IS NULL AND si.missing_since_ms IS NULL
+         WHERE si.item_kind = 'file' AND si.retired_at_ms IS NULL
          ORDER BY si.source_instance_id, si.provider_key",
         |row| {
             Ok((
@@ -346,9 +347,22 @@ fn stored_version(connection: &Connection) -> Result<Option<i64>, Error> {
     Ok(json.and_then(|json| json.parse().ok()))
 }
 
+/// Whether the layouts are due: a write since the last derivation said so,
+/// or, in a library that has sidecars, they were derived by another layout
+/// version than this one.
+pub(crate) fn layouts_are_stale(connection: &Connection) -> Result<bool, Error> {
+    let (pending, any): (bool, bool) = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM library_setting WHERE key = ?1),
+                EXISTS (SELECT 1 FROM sidecar)",
+        [LAYOUTS_PENDING],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(pending || (any && stored_version(connection)? != Some(i64::from(LAYOUT_VERSION))))
+}
+
 /// Derives every layout again and writes what differs from the stored
 /// ones, then the version, and settles what was pending.
-fn apply(write: &Write<'_>) -> Result<(), Error> {
+pub(crate) fn apply(write: &Write<'_>) -> Result<(), Error> {
     let (connection, rev) = (write.connection(), write.rev());
     let mut stored = stored(connection)?;
     let version = i64::from(LAYOUT_VERSION);
@@ -414,6 +428,8 @@ fn apply(write: &Write<'_>) -> Result<(), Error> {
         "DELETE FROM library_setting WHERE key = ?1",
         [LAYOUTS_PENDING],
     )?;
+    // What the proposals rest on changed.
+    crate::proposal_store::derive_proposals(write)?;
     Ok(())
 }
 
@@ -531,15 +547,7 @@ impl LibraryStore {
     /// so, or, in a library that has sidecars, they were derived by another
     /// layout version than this one.
     pub(crate) fn layouts_are_stale(&self) -> Result<bool, Error> {
-        self.read(|connection| {
-            let (pending, any): (bool, bool) = connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM library_setting WHERE key = ?1),
-                        EXISTS (SELECT 1 FROM sidecar)",
-                [LAYOUTS_PENDING],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            Ok(pending || (any && stored_version(connection)? != Some(i64::from(LAYOUT_VERSION))))
-        })
+        self.read(layouts_are_stale)
     }
 
     /// Derives every disc layout again from the stored sidecars and files,

@@ -6,9 +6,10 @@ use std::sync::{Arc, PoisonError};
 
 use ritornel_contract::methods::{CorrectionsLookup, LibrarySetSettings, Method};
 use ritornel_contract::{
-    DiscList, DiscLookup, DiscsParams, ErrorCode, LibrarySettings, LibrarySettingsSet, LookupDone,
-    LookupOutcome, LookupParams, Receipt, ReceiptStatus, RpcError, SetBy, SetLibrarySettingsParams,
-    Setting,
+    CorrectionsSummary, DiscList, DiscLookup, DiscsParams, ErrorCode, LibrarySettings,
+    LibrarySettingsSet, LookupDone, LookupOutcome, LookupParams, PreviewParams, PreviewShown,
+    ProposalGetParams, ProposalGot, ProposalList, Receipt, ReceiptStatus, RpcError, SetBy,
+    SetLibrarySettingsParams, Setting,
 };
 use ritornel_engine::{Asked, Command, KeptReply, WriteRequest, reads_as_disc_reply};
 use ritornel_source::Catalogue;
@@ -77,6 +78,53 @@ impl Core {
         params: &DiscsParams,
     ) -> Result<DiscList, RpcError> {
         Self::library(stores, |library| library.discs(params).map_err(refused))
+    }
+
+    /// `corrections.summary`.
+    pub(super) fn corrections_summary(
+        &self,
+        stores: &Stores,
+    ) -> Result<CorrectionsSummary, RpcError> {
+        Self::library(stores, |library| {
+            library.corrections_summary().map_err(refused)
+        })
+    }
+
+    /// `corrections.list`.
+    pub(super) fn corrections_list(&self, stores: &Stores) -> Result<ProposalList, RpcError> {
+        Self::library(stores, |library| library.proposals().map_err(refused))
+    }
+
+    /// `corrections.get`.
+    pub(super) fn corrections_get(
+        &self,
+        stores: &Stores,
+        params: &ProposalGetParams,
+    ) -> Result<ProposalGot, RpcError> {
+        Self::library(stores, |library| {
+            let (revision, proposal) = library.proposal(params.proposal_id).map_err(refused)?;
+            Ok(ProposalGot {
+                library_revision: revision,
+                proposal,
+            })
+        })
+    }
+
+    /// `corrections.preview`: read-only.
+    pub(super) fn corrections_preview(
+        &self,
+        stores: &Stores,
+        params: &PreviewParams,
+    ) -> Result<PreviewShown, RpcError> {
+        if params.choices.is_empty() {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                "name at least one proposal",
+            ));
+        }
+        Self::library(stores, |library| {
+            library.preview(&params.choices).map_err(refused)
+        })
     }
 
     /// `library.settings`: whether the library may be asked about, and
@@ -746,5 +794,67 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert!(seen[0].path.starts_with(&format!("/ws/2/discid/{DISC}?")));
         assert_eq!(seen[0].user_agent, USER_AGENT);
+    }
+
+    #[test]
+    fn a_disc_asked_about_is_proposed_and_previewed_and_the_preview_writes_nothing() {
+        let catalogue = Arc::new(Recorded::default());
+        catalogue
+            .replies
+            .lock()
+            .unwrap()
+            .insert(DISC.to_owned(), (200, REPLY.to_owned()));
+        let (core, _scratch, session) = hub(Some(catalogue));
+        let summary = call(&core, &session, "corrections.summary", json!({})).unwrap();
+        assert_eq!(
+            (summary["open"].as_u64(), summary["lookups"].as_bool()),
+            (Some(0), Some(false))
+        );
+        switch(&core, &session, 2, true);
+        lookup(&core, &session, 3, false).unwrap();
+        let summary = call(&core, &session, "corrections.summary", json!({})).unwrap();
+        assert_eq!(
+            (summary["open"].as_u64(), summary["lookups"].as_bool()),
+            (Some(1), Some(true))
+        );
+        let list = call(&core, &session, "corrections.list", json!({})).unwrap();
+        let proposal = &list["proposals"][0];
+        assert_eq!(proposal["folder"], "Moss Arcade/Tin Weather");
+        assert_eq!(proposal["candidates"][0]["title"], "Tin Weather");
+        let id = proposal["proposalId"].clone();
+        let got = call(
+            &core,
+            &session,
+            "corrections.get",
+            json!({ "proposalId": id }),
+        )
+        .unwrap();
+        assert_eq!(got["proposal"]["restsOn"][0]["discId"], DISC);
+        assert_eq!(got["proposal"]["files"].as_array().unwrap().len(), 3);
+        let revision = got["libraryRevision"].clone();
+        let shown = call(
+            &core,
+            &session,
+            "corrections.preview",
+            json!({ "choices": [{ "proposalId": id }] }),
+        )
+        .unwrap();
+        assert_eq!(shown["after"][0]["primaryType"], "album");
+        assert_eq!(shown["after"][0]["firstYear"], 2004);
+        assert_eq!(shown["libraryRevision"], revision);
+        let none = call(
+            &core,
+            &session,
+            "corrections.preview",
+            json!({ "choices": [] }),
+        );
+        assert_eq!(none.unwrap_err().0, ErrorCode::Invalid);
+        let unknown = call(
+            &core,
+            &session,
+            "corrections.get",
+            json!({ "proposalId": key(0x55) }),
+        );
+        assert_eq!(unknown.unwrap_err().0, ErrorCode::NotFound);
     }
 }

@@ -68,8 +68,10 @@ mod typescript;
 
 pub use command::{LibraryCreateParams, LibraryCreated, Receipt, ReceiptStatus};
 pub use corrections::{
-    CatalogueAlbum, Disc, DiscFile, DiscList, DiscLookup, DiscsParams, LayoutMethod, LookupDone,
-    LookupOutcome, LookupParams,
+    AlbumShape, CatalogueAlbum, Choice, CorrectionsSummary, Disc, DiscFile, DiscList, DiscLookup,
+    DiscsParams, FileValue, LayoutMethod, LookupDone, LookupOutcome, LookupParams, PreviewParams,
+    PreviewShown, Proposal, ProposalCandidate, ProposalChange, ProposalEvidence, ProposalGetParams,
+    ProposalGot, ProposalList,
 };
 pub use device::{DeviceKind, Platform, PlayedVia};
 pub use error::{ErrorCode, ErrorData, RpcError};

@@ -92,6 +92,7 @@ impl World {
             first_seen_ms: self.next,
             cover: None,
             facts: file.facts,
+            held: Vec::new(),
             current: None,
         });
         self.next

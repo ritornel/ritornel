@@ -15,6 +15,9 @@
 //! ritornelctl corrections discs [<folder>] [--data-dir <dir>] [--json]
 //! ritornelctl corrections musicbrainz <on | off> [--data-dir <dir>] [--json]
 //! ritornelctl corrections lookup <folder> [--root <name>] | --album <release> [--again] [--data-dir <dir>] [--json]
+//! ritornelctl corrections list [--data-dir <dir>] [--json]
+//! ritornelctl corrections show <proposal> [--data-dir <dir>] [--json]
+//! ritornelctl corrections preview <proposal>... [--candidate <release group>] [--data-dir <dir>] [--json]
 //! ritornelctl play <folder | track>... [--album <release>] [--start <n>] [--follow]
 //! ritornelctl pause | resume | stop | next | previous | now | queue
 //! ritornelctl seek <position>
@@ -85,6 +88,10 @@ Usage:
   ritornelctl corrections musicbrainz <on | off> [--data-dir <dir>] [--json]
   ritornelctl corrections lookup <folder> [--root <name>] | --album <release>
                                  [--again] [--data-dir <dir>] [--json]
+  ritornelctl corrections list [--data-dir <dir>] [--json]
+  ritornelctl corrections show <proposal> [--data-dir <dir>] [--json]
+  ritornelctl corrections preview <proposal>... [--candidate <release group>]
+                                  [--data-dir <dir>] [--json]
   ritornelctl play <folder | track>... [--album <release>] [--start <n>]
                    [--follow] [--data-dir <dir>] [--json]
   ritornelctl pause | resume | stop | next | previous [--data-dir <dir>] [--json]
@@ -186,6 +193,16 @@ Commands:
                    root, or of a release with --album, and keep each
                    reply. A disc asked about before is not asked again
                    unless --again says to
+  corrections list Show what MusicBrainz's replies propose each disc is,
+                   by group: the album each disc's files may be on, and
+                   whether saying yes would move files
+  corrections show <proposal>
+                   Show one proposal whole: its files, the discs it rests
+                   on, and each candidate with the tag values a yes would
+                   put on each file
+  corrections preview <proposal>...
+                   Show what saying yes to proposals together would
+                   change: the albums now and after. It writes nothing
   play             Play the scanned tracks in a folder, album by album in
                    disc and track order, or tracks by their IDs, or a
                    release with --album. It replaces the queue. The server
@@ -306,6 +323,8 @@ Options:
   --again               corrections lookup: ask about discs that have a reply
   --root <name>         corrections lookup: the root the folder is in, when
                         more than one root has it
+  --candidate <release group>
+                        corrections preview: the candidate, for one proposal
 
 Policy values, for re-resolve --dry-run. A switch is on or off, and on
 when given alone:
@@ -809,6 +828,31 @@ enum CorrectionsCommand {
     Discs(DiscsArgs),
     Musicbrainz(SwitchArgs),
     Lookup(LookupArgs),
+    List(ServerArgs),
+    Show(ProposalArgs),
+    Preview(PreviewArgs),
+}
+
+/// What `corrections show` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ProposalArgs {
+    /// The proposal, by its ID.
+    pub(crate) proposal: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `corrections preview` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct PreviewArgs {
+    /// The proposals, by their IDs.
+    #[arg(required = true)]
+    pub(crate) proposals: Vec<String>,
+    /// The candidate, by its release group ID, for one proposal.
+    #[arg(long)]
+    pub(crate) candidate: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `corrections musicbrainz` takes.
@@ -1044,6 +1088,11 @@ fn try_run(
         }
         Command::Corrections(CorrectionsCommand::Lookup(args)) => {
             corrections::lookup(&args, env, out)
+        }
+        Command::Corrections(CorrectionsCommand::List(args)) => corrections::list(&args, env, out),
+        Command::Corrections(CorrectionsCommand::Show(args)) => corrections::show(&args, env, out),
+        Command::Corrections(CorrectionsCommand::Preview(args)) => {
+            corrections::preview(&args, env, out)
         }
         Command::Play(args) => playback::play(&args, env, out),
         Command::Pause(args) => playback::transport("pause", &args, env, out),

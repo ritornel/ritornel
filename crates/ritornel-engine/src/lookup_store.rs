@@ -153,10 +153,10 @@ fn facts_are_stale(connection: &Connection) -> Result<bool, Error> {
 
 /// Reads every kept reply to a disc lookup again, if the stored facts were
 /// read by another reader version.
-fn refresh_facts(write: &Write<'_>) -> Result<(), Error> {
+fn refresh_facts(write: &Write<'_>) -> Result<bool, Error> {
     let connection = write.connection();
     if setting(connection, READER_SETTING)? == Some(READER_VERSION.to_string()) {
-        return Ok(());
+        return Ok(false);
     }
     connection.execute("DELETE FROM evidence_claim", [])?;
     for (id, key, status, body) in rows(
@@ -179,7 +179,8 @@ fn refresh_facts(write: &Write<'_>) -> Result<(), Error> {
         READER_SETTING,
         &READER_VERSION.to_string(),
         write.rev(),
-    )
+    )?;
+    Ok(true)
 }
 
 /// A credit as written: each name with the join phrase after it, by
@@ -431,7 +432,7 @@ impl LibraryStore {
         self.write(request, move |write| {
             let asked = asked.borrow();
             let connection = write.connection();
-            refresh_facts(write)?;
+            let mut changed = refresh_facts(write)?;
             for reply in &replies {
                 if read_disc_reply(&reply.key, reply.status, &reply.body).is_err() {
                     return Err(Error::Invalid("only a reply to a disc lookup is kept"));
@@ -464,21 +465,44 @@ impl LibraryStore {
                     ))?;
                 let id = connection.last_insert_rowid();
                 read_into_claims(write, id, &reply.key, reply.status, &reply.body)?;
+                changed = true;
+            }
+            // What the proposals rest on changed, if anything was kept.
+            if changed {
+                crate::proposal_store::derive_proposals(write)?;
             }
             let found = albums(connection, asked, &keys)?;
             Ok(finish(write.rev(), found))
         })
     }
 
-    /// Reads every kept reply again if the stored facts were read by
-    /// another reader version, with no network: what a server does when it
-    /// starts. `None`, and nothing written, if they were not.
+    /// Works out again, from stored rows and with no network, whatever
+    /// another version of this build worked out otherwise: the facts of the
+    /// kept replies, the disc layouts, and the proposals. It is what a
+    /// server does when it starts. `None`, and nothing written, if nothing
+    /// is due.
     pub fn refresh_corrections(&self, request: WriteRequest) -> Result<Option<Written>, Error> {
-        if !self.read(facts_are_stale)? {
+        let due = |connection: &Connection| -> Result<(bool, bool, bool), Error> {
+            Ok((
+                facts_are_stale(connection)?,
+                crate::evidence_store::layouts_are_stale(connection)?,
+                crate::proposal_store::proposals_are_stale(connection)?,
+            ))
+        };
+        let (facts, layouts, proposals) = self.read(due)?;
+        if !(facts || layouts || proposals) {
             return Ok(None);
         }
-        let written = self.write(request, |write| {
-            refresh_facts(write)?;
+        let written = self.write(request, move |write| {
+            if facts {
+                refresh_facts(write)?;
+            }
+            if layouts {
+                // The proposals are worked out again with the layouts.
+                crate::evidence_store::apply(write)?;
+            } else if facts || proposals {
+                crate::proposal_store::derive_proposals(write)?;
+            }
             Ok(String::new())
         })?;
         Ok(Some(written))

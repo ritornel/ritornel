@@ -1,6 +1,6 @@
 # Corrections
 
-Corrections put a library right from MusicBrainz, starting from evidence gathered beside the files. What is built so far is that evidence: the sidecars a scan keeps with the audio, the CD layouts read from them, and MusicBrainz's replies about those discs. Pure layout and reply reading live in `crates/ritornel-domain/src/{layout,reply}.rs`; storage and derivation in `crates/ritornel-engine/src/{evidence_store,lookup_store}.rs`; the scan's part in `crates/ritornel-engine/src/{walk,scan}.rs`; the fetching in `crates/ritornel-musicbrainz`; the calls in `apps/server/src/dispatch/corrections.rs`; and the commands in `apps/ritornelctl/src/corrections.rs`.
+Corrections put a library right from MusicBrainz, starting from evidence gathered beside the files. What is built so far is that evidence: the sidecars a scan keeps with the audio, the CD layouts read from them, MusicBrainz's replies about those discs, and the album proposals worked out from them, which can be shown and previewed but not yet answered. Pure layout and reply reading, proposing and previewing live in `crates/ritornel-domain/src/{layout,reply,propose,values}.rs`; storage and derivation in `crates/ritornel-engine/src/{evidence_store,lookup_store,proposal_store}.rs`; the scan's part in `crates/ritornel-engine/src/{walk,scan}.rs`; the fetching in `crates/ritornel-musicbrainz`; the calls in `apps/server/src/dispatch/corrections.rs`; and the commands in `apps/ritornelctl/src/corrections.rs`.
 
 See [`docs/internals/identity.md`](identity.md) for the scan these steps ride on, [`docs/internals/schema.md`](schema.md) for durable and rebuildable tables, and [`docs/internals/plugins.md`](plugins.md) for the `Catalogue` trait.
 
@@ -69,6 +69,34 @@ A library is not asked about until its `lookups` setting is on, and with it on, 
 - **`lookup_response`** is one reply, verbatim: the catalogue, request kind, key and inclusions, the status (200 or 404), the body and its BLAKE3 hash, and when it came. It is immutable (`lookup_response_no_update`, `lookup_response_no_delete`, and `lookup_response_no_replace` against an `INSERT OR REPLACE`). The newest reply to a request is its current one; a reply the same as the current one is not kept again, and one that differs is kept as the new current one.
 - **`evidence_claim`** holds the facts each reply states, per release, read by `reply::read_disc_reply` (`READER_VERSION = 1`): the release's title, status, date, country and barcode; its credit (`album_artist`, `album_artist_join`, `mb_album_artist`); its album (`mb_release_group`, `release_group_title`, `primary_type`, `secondary_type`, `first_release_date`) and the album's own credit (`group_artist`, `group_artist_join`, `mb_group_artist`); how many media it has; and which of them the disc is, with its track count (`disc_number`, `track_count`). Each fact keeps its position, so a join phrase stays with its name. Facts read by another reader version are read again from every kept reply, with no network, when the server starts (`FACTS_METHOD`, `corrections.facts`) and in the next lookup's write (`library_setting` key `corrections.reader_version`); a kept reply the new reader cannot read states nothing.
 
+## Album proposals
+
+A proposal says that one disc of the library is one album: a MusicBrainz release group. It is derived, as plays are, and nothing it says is shown on a wall or written into the library's catalog.
+
+### Working them out
+
+`propose::propose` (`PROPOSER_VERSION = 1`) is a pure function of the disc layouts, the current reply about each disc ID and the files' facts:
+
+- **The subject is one disc:** the files a folder's layouts place, among layouts that are not provisional and have a current reply. A disc whose replies name no release gets no proposal, and nor does a disc with a file that names neither its album nor any artist: a yes would give it the album's title and no credit, and it would show under no artist with songs named for their files, so it waits until its songs and credit can be answered too.
+- **Each candidate is an album its replies name,** with its title, the album's own credit, kind, first date, and how many of the replies' releases are of it; the likeliest, with the most releases, first.
+- **What a yes would put on the files** (`values`): every file gets `mb_release_group`, and the album's `primary_type` and `original_date` where MusicBrainz knows them. Where other discs of the library are on the same album, each the same single medium of it in every release that holds it and no two the same, the yes joins them: each file gets its disc's `disc_number`, and the files of every disc but the first take the first disc's `album`, `album_artist` and `mb_album_artist` where their own differ. A file with no album title gets the album's. The candidate keeps the files of the first disc it joins its disc onto (`onto`), whose title and credit it takes, so what a yes puts together is known before it is said.
+- **What that would change** is worked out cheaply: `moves` when files would join or part, take another album's ID, or share a tile with another disc of the album without joining it; `gains` when a kind or a first year would differ from what the files say; `knows` for an ID alone. The preview says exactly.
+- **An ID is computed** from the kind and the anchor, the subject's first-seen file, by its public ID, so a proposal worked out again keeps its ID. Proposals that share their first candidate share a group, named by the proposal whose anchor is the first-seen file among them. A fingerprint is a digest of all of a proposal.
+
+Proposals are worked out again in the same write as anything they rest on: a derivation of the layouts, and a lookup's replies. Only those that differ, by fingerprint, are rewritten (`proposal`, `proposal_item`, `proposal_candidate` with each candidate's `values_json` and `onto_json`, and `proposal_evidence`). A new proposer version is worked out again from stored rows when the server starts (`library_setting` key `corrections.proposer_version`), as are a new reader or layout version.
+
+### Tag values
+
+A value replaces the file's own tag for its field before anything is formed (`values::apply`), for the fields `album`, `album_artist`, `mb_album_artist`, `disc_number`, `mb_release_group`, `primary_type` and `original_date`, and the item holds that field (`Item::held`). The disc rules (`discs::apply`) leave a held album title or disc number as it is. So far values are only previewed.
+
+### Showing and previewing
+
+- `corrections.summary` counts the open proposals and their groups, by what their likeliest candidate would change, and says whether lookups are on.
+- `corrections.list` lists every proposal by group, with its candidates but without their values. `corrections.get` gives one whole: its files, each disc it rests on with how its layout was found and how many releases the reply names, and each candidate with the values a yes would put on each file.
+- `corrections.preview` takes proposals, each with a candidate or its likeliest, and runs the projector twice, read-only (`values::preview`): on the library as it is, and with every chosen value in place. It reports the albums the touched files and everything else on those albums are on now, and after: each one's title, credit, kind, first year, releases, discs and songs. It also counts the songs the values would join into others (`songsJoined`), such as two editions' copies of one song that are two songs now and would be one, and those they would part from the one they are on (`songsParted`); `ritornelctl corrections preview` says both first, as they move what plays and ratings count on.
+
+`ritornelctl corrections list`, `show <proposal>` and `preview <proposal>... [--candidate <release group>]` print them.
+
 ## Decisions
 
 - **Evidence moves no wall.** No table here is read by the resolver or the projector, and the writes that change them (`scan.sidecars`, `corrections.layouts`, `library.setSettings`, `corrections.lookup`, `corrections.facts`) send no `library` or `list` event (`changes` in `apps/server/src/dispatch/lists.rs`). A scan that finds only sidecars leaves the catalog untouched.
@@ -78,7 +106,9 @@ A library is not asked about until its `lookups` setting is on, and with it on, 
 - **Off until switched on.** Asking a service about a library sends something about it, so a library is never asked about until its own switch says so. Sidecars are read regardless, since nothing leaves the machine.
 - **The plugin only fetches.** Replies are read in the domain crate, so the facts are rebuilt from kept replies with no plugin and no network, and a dry run never needs the network.
 - **A failure is not a reply.** Only a reply MusicBrainz gave is kept; a failure leaves the disc to be asked again.
+- **Proposals hang on files.** A proposal's subject and values name source items, and its ID comes from its anchor file, so a proposal outlives a rescan, a re-resolve and a rebuild of the proposals.
+- **A preview is the projector.** The preview runs the same pure projector a scan does, on the library with the values in place, so what it shows is what a yes would make.
 
 ## Later
 
-- `evidence_disc`, its items and `evidence_claim` are the evidence album proposals will rest on; `found_json` and `lookup_response_id` name the raw rows each came from so a later answer can keep its evidence by value.
+- `proposal_evidence` names the exact reply each proposal rests on, and `found_json` the sidecar revision each layout came from, so an answer can keep its evidence by value.

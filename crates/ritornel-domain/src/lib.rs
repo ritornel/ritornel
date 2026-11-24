@@ -43,6 +43,7 @@ pub mod layout;
 pub mod library;
 pub mod normalize;
 pub mod payload;
+pub mod propose;
 pub mod reply;
 pub mod resolve;
 pub mod scrobble;
@@ -51,6 +52,7 @@ pub mod stream_report;
 pub mod streams;
 #[cfg(test)]
 mod tests;
+pub mod values;
 
 pub use catalog::{CATALOG_VERSION, resolve};
 pub use extract::{Claim, EXTRACTOR_VERSION, Facts, Scope, Source, extract};
