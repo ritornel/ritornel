@@ -452,13 +452,13 @@ LEFT JOIN release heard ON heard.id = ta.release_id
 LEFT JOIN release rel ON rel.id = heard.canonical_id
 WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
   AND pe.recording_id IN (
-    SELECT r.id FROM credits
-    JOIN recording r ON r.display_artist_credit_id = credits.artist_credit_id
-    WHERE r.redirect_to_id IS NULL
+    SELECT r.id FROM recording r
+    WHERE r.display_artist_credit_id IN (SELECT artist_credit_id FROM credits)
+      AND r.redirect_to_id IS NULL
     UNION
-    SELECT yr.canonical_id FROM credits
-    JOIN track_appearance y ON y.display_artist_credit_id = credits.artist_credit_id
-    JOIN recording yr ON yr.id = y.recording_id)
+    SELECT yr.canonical_id FROM track_appearance y
+    JOIN recording yr ON yr.id = y.recording_id
+    WHERE y.display_artist_credit_id IN (SELECT artist_credit_id FROM credits))
   AND song.redirect_to_id IS NULL
   AND coalesce(ta.display_artist_credit_id, song.display_artist_credit_id)
       IN (SELECT artist_credit_id FROM credits)";

@@ -189,8 +189,8 @@ CREATE UNIQUE INDEX heard_album_name ON heard_album (heard_artist_id, name_key)
   WHERE heard_artist_id IS NOT NULL;
 
 -- A play's artists: one for each of its credit's artists, or its name's.
--- Whose it is, whether it counts and its local date are copied from the
--- play, so that a list is read from the index on them alone.
+-- Whose it is, whether it counts, its local date and its instant are
+-- copied from the play, so that a list is read from the index on them alone.
 CREATE TABLE play_event_artist (
   id               INTEGER PRIMARY KEY,
   heard_artist_id  INTEGER NOT NULL REFERENCES heard_artist(id),

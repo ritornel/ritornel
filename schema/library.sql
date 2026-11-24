@@ -11,7 +11,7 @@
 --   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
---   0008_spotify_streams  73d07afd9e06dfffb972e864eee89d6e88eb6668dd51a84bd64d14219b92a3ab
+--   0008_spotify_streams  e9ce8045bd8ecad934d57ecb7150f891907050e0591b711f9884c1231d1747e1
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,

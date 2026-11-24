@@ -277,6 +277,8 @@ impl Rig {
                     "SELECT hex(pe.public_id) || ' ' || coalesce(ha.artist_id, ha.name_key)
                             || ' ' || coalesce(ha.library_artist_id, '-')
                             || ' ' || coalesce(pa.spelling, '') || ' ' || pa.counted
+                            || ' ' || coalesce(pa.local_date, '-')
+                            || ' ' || coalesce(pa.event_at_utc_ms, '-')
                      FROM play_event_artist pa
                      JOIN play_event pe ON pe.id = pa.play_event_id
                      JOIN heard_artist ha ON ha.id = pa.heard_artist_id
@@ -285,7 +287,9 @@ impl Rig {
                             (SELECT coalesce(ha.artist_id, ha.name_key) FROM heard_artist ha
                              WHERE ha.id = h.heard_artist_id) || '/' || h.name_key)
                             || ' ' || coalesce(h.library_group_id, '-')
-                            || ' ' || coalesce(pa.spelling, '')
+                            || ' ' || coalesce(pa.spelling, '') || ' ' || pa.counted
+                            || ' ' || coalesce(pa.local_date, '-')
+                            || ' ' || coalesce(pa.event_at_utc_ms, '-')
                      FROM play_event_album pa
                      JOIN play_event pe ON pe.id = pa.play_event_id
                      JOIN heard_album h ON h.id = pa.heard_album_id
