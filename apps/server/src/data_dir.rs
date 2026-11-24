@@ -363,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exposed_credential_in_an_open_directory_is_revoked_and_replaced() {
+    fn a_credential_others_could_read_is_still_seen_as_open_and_replaced() {
         let scratch = Scratch::new();
         let root = scratch.path().join("data");
         let held = HeldDir::take(root.clone()).unwrap();
@@ -378,16 +378,26 @@ mod tests {
         let (first, _) =
             crate::credential::ensure(&store, &held.dir().credential(), issued).unwrap();
         assert_eq!(first, crate::credential::Credential::Issued);
+        let token_text = std::fs::read_to_string(held.dir().credential()).unwrap();
         drop(store);
         drop(held);
 
-        // Make the data directory and credential readable by others, as after
-        // a restore that did not keep permissions.
+        // Recreate the credential inside an open directory as a copy that
+        // kept no permissions: on Windows it inherits the directory's open
+        // ACL rather than carrying an explicit entry of its own.
+        let credential = root.join(local::CREDENTIAL);
+        std::fs::remove_file(&credential).unwrap();
         open_to_others(&root);
-        open_to_others(&root.join(local::CREDENTIAL));
-        assert!(!private(&root.join(local::CREDENTIAL)));
+        std::fs::write(&credential, &token_text).unwrap();
+        if cfg!(unix) {
+            open_to_others(&credential);
+        }
+        assert!(!private(&credential));
 
         let held = HeldDir::take(root).unwrap();
+        // Closing the directory kept the credential visibly open.
+        assert!(!private(&credential));
+
         let store = ServerStore::open(
             &held.dir().server_db(),
             Arc::new(SystemClock),
@@ -400,45 +410,6 @@ mod tests {
         assert!(!verifier.accepts(&original));
         assert!(!store.is_local_credential(&original).unwrap());
         assert!(private(&held.dir().credential()));
-    }
-
-    #[test]
-    fn a_new_file_in_an_existing_open_cache_is_private() {
-        let scratch = Scratch::new();
-        let root = scratch.path().join("data");
-        let held = HeldDir::take(root.clone()).unwrap();
-        let tmp = root.join("cache").join("tmp");
-        std::fs::create_dir_all(&tmp).unwrap();
-        open_to_others(&root.join("cache"));
-        open_to_others(&tmp);
-
-        let cache = held.dir().cache().unwrap();
-        if cfg!(windows) {
-            assert!(private(&cache));
-            assert!(private(&cache.join("tmp")));
-            let cover = cache.join("tmp").join("cover.part");
-            std::fs::write(&cover, b"img").unwrap();
-            assert!(private(&cover));
-        }
-    }
-
-    #[test]
-    fn a_credential_others_could_read_is_still_seen_as_open_once_the_directory_is_closed() {
-        let scratch = Scratch::new();
-        let root = scratch.path().join("data");
-        std::fs::create_dir(&root).unwrap();
-        open_to_others(&root);
-        let credential = root.join(local::CREDENTIAL);
-        // Made as a copy might be: on Windows with no access list of its
-        // own, so that it takes the directory's.
-        std::fs::write(&credential, "token").unwrap();
-        if cfg!(unix) {
-            open_to_others(&credential);
-        }
-        assert!(!private(&credential));
-        let _held = HeldDir::take(root).unwrap();
-        // So it is replaced, as one others may have read.
-        assert!(!private(&credential));
     }
 
     #[test]

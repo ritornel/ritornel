@@ -36,6 +36,9 @@ windows = { version = "0.62.2", optional = true, features = [
 
 [features]
 media = ["dep:windows"]
+# Exposes Windows AuthZ descriptor checks for integration tests without
+# linking AuthZ into production binaries.
+test-support = []
 
 # The workspace's lints, but for unsafe code, which is allowed here and held
 # to a written reason for each block.

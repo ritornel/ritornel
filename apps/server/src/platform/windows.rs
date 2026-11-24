@@ -116,22 +116,23 @@ pub(crate) fn close_data_dir_to_others(path: &Path, keep_open: &[&Path]) -> Resu
 /// another user cannot delete or replace it while files are written inside.
 #[derive(Debug)]
 pub(crate) struct PrivateDir {
-    _handle: File,
+    handle: File,
 }
 
 impl PrivateDir {
     /// Releases the directory handle before renaming or removing the folder.
     pub(crate) fn release(self) {
-        drop(self._handle);
+        drop(self.handle);
     }
 }
 
-/// Creates the one folder at `path`, with an access list of the OS user
-/// alone from the moment it exists, and fails if it is there already: two
-/// writers never share it. Its parent must be there. The returned guard
-/// pins the folder against removal or rename until dropped.
+/// Creates a new staging folder at `path` in a user-chosen backup or export
+/// location, applying an owner-only access list where the volume supports
+/// it, and fails if something is there already. Its parent must be there.
+/// The returned guard pins the folder against removal or rename while files
+/// are written inside it.
 pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<PrivateDir> {
-    restricted::create_pinned_restricted_dir(path).map(|_handle| PrivateDir { _handle })
+    restricted::create_pinned_backup_dir(path).map(|handle| PrivateDir { handle })
 }
 
 /// Opens or creates the lock file at `path` without following a link or
@@ -159,6 +160,13 @@ pub(crate) fn close_to_others(path: &Path) -> std::io::Result<()> {
     restricted::restrict(path)
 }
 
+/// Closes a file in a user-chosen backup or export folder to this user
+/// alone where the volume supports persistent access lists, without failing
+/// on drives or network shares that keep no permissions.
+pub(crate) fn close_backup_file(path: &Path) -> std::io::Result<()> {
+    restricted::restrict_if_supported(path)
+}
+
 /// Makes a file that `options` creates one only the OS user can open: here
 /// the access list of the folder it is made in does that, which
 /// [`create_private_dir`] and [`close_dir_to_others`] close, and the file
@@ -169,6 +177,12 @@ pub(crate) fn create_owner_only(_options: &mut OpenOptions) {}
 /// anything is written to it. It fails if something is there.
 pub(crate) fn create_private_file(path: &Path) -> std::io::Result<File> {
     restricted::create_restricted(path)
+}
+
+/// Creates a new file at `path` in a user-chosen backup or export folder,
+/// applying an owner-only access list where the volume supports it.
+pub(crate) fn create_backup_file(path: &Path) -> std::io::Result<File> {
+    restricted::create_backup_file(path)
 }
 
 /// Whether the file is owned by the OS user, and its access list has no
@@ -264,6 +278,13 @@ pub(crate) fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::
     Ok(Signals(window))
 }
 
+/// Gives a test scratch folder a protected owner-only ACL so it does not
+/// inherit permissive entries from `%TEMP%`.
+#[cfg(test)]
+pub(crate) fn close_scratch(path: &Path) {
+    restricted::restrict(path).unwrap();
+}
+
 /// Whether only the owner can open a file or directory: an access list that
 /// names the owner alone. Windows AuthZ for the synthetic signed-in user
 /// must never allow opening what this calls private.
@@ -295,6 +316,7 @@ pub(crate) fn open_to_others(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::HeldDir;
     use crate::testing::Scratch;
 
     #[test]
@@ -303,16 +325,39 @@ mod tests {
         let folder = scratch.path().join("data");
         std::fs::create_dir(&folder).unwrap();
         open_to_others(&folder);
-        std::fs::write(folder.join("made-before"), "").unwrap();
+        let kept = folder.join("credential");
+        let other = folder.join("config.toml");
+        std::fs::write(&kept, "").unwrap();
+        std::fs::write(&other, "").unwrap();
         assert!(!path_is_private(&folder));
-        assert!(!path_is_private(&folder.join("made-before")));
+        assert!(!path_is_private(&kept));
+        assert!(!path_is_private(&other));
 
-        close_dir_to_others(&folder).unwrap();
+        close_data_dir_to_others(&folder, &[kept.as_path()]).unwrap();
         assert!(path_is_private(&folder));
-        // A file it held keeps the access it had, so a check of it still
-        // sees that others could read it.
-        assert!(!path_is_private(&folder.join("made-before")));
+        // Named sensitive files keep their open access for their own checks.
+        assert!(!path_is_private(&kept));
+        // Other existing files and new files receive the new owner-only list.
+        assert!(path_is_private(&other));
         std::fs::write(folder.join("made-after"), "").unwrap();
         assert!(path_is_private(&folder.join("made-after")));
+    }
+
+    #[test]
+    fn a_new_file_in_an_existing_open_cache_is_private() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("data");
+        let held = HeldDir::take(root.clone()).unwrap();
+        let tmp = root.join("cache").join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        open_to_others(&root.join("cache"));
+        open_to_others(&tmp);
+
+        let cache = held.dir().cache().unwrap();
+        assert!(path_is_private(&cache));
+        assert!(path_is_private(&cache.join("tmp")));
+        let cover = cache.join("tmp").join("cover.part");
+        std::fs::write(&cover, b"img").unwrap();
+        assert!(path_is_private(&cover));
     }
 }

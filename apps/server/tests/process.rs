@@ -41,6 +41,8 @@ impl Scratch {
             .tempdir()
             .unwrap()
             .keep();
+        #[cfg(windows)]
+        ritornel_windows::private::restrict(&path).unwrap();
         Self(path)
     }
 

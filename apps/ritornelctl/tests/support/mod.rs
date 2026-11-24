@@ -1,8 +1,20 @@
 //! What the tests that start a `ritornel-server` share.
 
+use std::path::Path;
 use std::process::Child;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
+
+/// Gives a test scratch folder on Windows a protected owner-only ACL so
+/// pre-created data directories inside it do not inherit `%TEMP%`'s
+/// `ALL APPLICATION PACKAGES` entry.
+#[allow(dead_code, reason = "used by tests that pre-create data folders")]
+pub(crate) fn close_scratch(path: &Path) {
+    #[cfg(windows)]
+    ritornel_windows::private::restrict(path).unwrap();
+    #[cfg(not(windows))]
+    let _ = path;
+}
 
 /// Says, while a test is failing, why its server is gone if it is: how it
 /// ended, which names the signal when one ended it, and what it wrote to

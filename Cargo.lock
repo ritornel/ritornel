@@ -2157,6 +2157,7 @@ dependencies = [
  "jiff",
  "ritornel-client",
  "ritornel-lastfm",
+ "ritornel-windows",
  "serde",
  "serde_json",
  "tempfile",

@@ -39,8 +39,8 @@ use tracing::{info, warn};
 
 use crate::data_dir::DataDir;
 use crate::platform::{
-    PrivateDir, close_dir_to_others, close_to_others, create_new_private_dir, create_private_dir,
-    create_private_file, rename_dir, sync_dir,
+    PrivateDir, close_backup_file, close_dir_to_others, create_backup_file, create_new_private_dir,
+    create_private_dir, rename_dir, sync_dir,
 };
 
 /// The version of `backup.json`.
@@ -499,8 +499,9 @@ fn fill(
             held = hold_sending(&copy, at_ms).map_err(|error| BackupError::Copy(name, error))?;
         }
         // SQLite makes a file anyone may read, and server.db holds this
-        // server's signing key.
-        close_to_others(&copy).map_err(io("close", &copy))?;
+        // server's signing key. Close it where the backup volume supports
+        // file permissions.
+        close_backup_file(&copy).map_err(io("close", &copy))?;
         files.push(name);
     }
     let config = dir.config_toml();
@@ -544,10 +545,11 @@ fn present(path: &Path) -> Result<bool, BackupError> {
     }
 }
 
-/// Writes a new file that only its owner may open, and syncs it.
+/// Writes a new file in a backup folder, private where the volume supports
+/// permissions, and syncs it.
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), BackupError> {
     use std::io::Write;
-    create_private_file(path)
+    create_backup_file(path)
         .and_then(|mut file| {
             file.write_all(bytes)?;
             file.sync_all()

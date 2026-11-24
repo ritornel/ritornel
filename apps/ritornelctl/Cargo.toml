@@ -34,5 +34,10 @@ tempfile = "3.27.0"
 # against. A dev-dependency: the program itself links nothing of Last.fm.
 ritornel-lastfm = { workspace = true, features = ["fake"] }
 
+# Gives each test's scratch folder on Windows a protected owner-only ACL so
+# it does not inherit permissive entries from `%TEMP%`.
+[target.'cfg(windows)'.dev-dependencies]
+ritornel-windows.workspace = true
+
 [lints]
 workspace = true

@@ -46,6 +46,7 @@ impl Scratch {
             .tempdir()
             .unwrap()
             .keep();
+        support::close_scratch(&path);
         Self(path)
     }
 

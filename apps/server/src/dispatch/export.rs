@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use super::{Core, Stores};
 use crate::backup::{publish, reserve_named, stamp};
-use crate::platform::close_to_others;
+use crate::platform::close_backup_file;
 
 impl Core {
     /// Writes the record into a new folder, `ritornel-record-<time>`, in
@@ -58,7 +58,7 @@ impl Core {
                         std::fs::read_dir(&staged.partial).map_err(|error| error.to_string())?;
                     for file in files {
                         let path = file.map_err(|error| error.to_string())?.path();
-                        close_to_others(&path)
+                        close_backup_file(&path)
                             .map_err(|error| format!("cannot close {}: {error}", path.display()))?;
                     }
                     Ok(exported)

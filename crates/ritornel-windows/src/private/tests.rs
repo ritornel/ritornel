@@ -18,11 +18,15 @@ use windows_sys::core::PWSTR;
 use super::*;
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    tempfile::Builder::new()
+    let dir = tempfile::Builder::new()
         .prefix(&format!("ritornel-windows-private-{name}-"))
         .tempdir()
         .unwrap()
-        .keep()
+        .keep();
+    // Break inheritance from `%TEMP%` so tests do not inherit Windows 11's
+    // `ALL APPLICATION PACKAGES` entry unless they explicitly grant access.
+    restrict(&dir).unwrap();
+    dir
 }
 
 /// Lets everyone read `path`, as a copy from another machine might. On a
@@ -204,26 +208,65 @@ fn no_list_at_all_lets_everyone_in() {
 }
 
 #[test]
-fn closing_a_folder_closes_what_is_made_in_it_and_leaves_its_files_as_they_were() {
+fn callback_and_object_access_entries_fail_closed() {
+    assert!(!judged(
+        "O:MED:P(A;;FA;;;ME)(XA;;FA;;;WD;(Member_of {SID(BA)}))",
+        false
+    ));
+    assert!(!judged(
+        "O:MED:P(A;;FA;;;ME)(OA;;FA;1131f6aa-9c07-11d1-f79f-00c04fc2dcd2;;WD)",
+        false
+    ));
+}
+
+#[test]
+fn closing_a_folder_closes_existing_and_new_files_except_keep_open() {
     let dir = scratch("close");
     open_to_everyone(&dir);
     let inner = dir.join("data");
     std::fs::create_dir(&inner).unwrap();
     std::fs::create_dir(inner.join("logs")).unwrap();
-    std::fs::write(inner.join("credential"), "x").unwrap();
-    std::fs::write(inner.join("logs").join("old.log"), "x").unwrap();
-    assert!(!private(&inner.join("credential")));
-    close_folder(&inner).unwrap();
+    let credential = inner.join("credential");
+    let config = inner.join("config.toml");
+    let old_log = inner.join("logs").join("old.log");
+    std::fs::write(&credential, "x").unwrap();
+    std::fs::write(&config, "x").unwrap();
+    std::fs::write(&old_log, "x").unwrap();
+    assert!(!private(&credential));
+    assert!(!private(&config));
+    close_folder_preserving(&inner, &[credential.as_path()]).unwrap();
     assert!(private(&inner));
-    // A file in it keeps the access it had, for its own check to see.
-    assert!(!private(&inner.join("credential")));
-    // What a folder in it holds takes the new list.
+    // Only the named keep_open file keeps its prior open access.
+    assert!(!private(&credential));
+    // Other existing files and subfolders take the new owner-only list.
+    assert!(private(&config));
     assert!(private(&inner.join("logs")));
-    assert!(private(&inner.join("logs").join("old.log")));
+    assert!(private(&old_log));
     std::fs::write(inner.join("made-after"), "x").unwrap();
     assert!(private(&inner.join("made-after")));
     // Closed, it is left as it is.
     close_folder(&inner).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_freeze_leaves_the_folder_unclosed() {
+    let dir = scratch("freeze-fail");
+    open_to_everyone(&dir);
+    let inner = dir.join("data");
+    std::fs::create_dir(&inner).unwrap();
+    let credential = inner.join("credential");
+    std::fs::write(&credential, "x").unwrap();
+    // Grant Everyone read, and replace implicit owner WRITE_DAC with
+    // OWNER RIGHTS allowing read and delete (for cleanup) but not WRITE_DAC.
+    let unfreezable = descriptor("O:MED:P(A;;FR;;;WD)(A;;0x00130089;;;OW)");
+    let acl = unfreezable.dacl().unwrap().unwrap();
+    set_list(&open(&credential, true).unwrap(), acl.0.cast_mut()).unwrap();
+
+    let refused = close_folder_preserving(&inner, &[credential.as_path()]).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{refused}");
+    // The folder was not closed when freezing the open sensitive file failed.
+    assert!(!private(&inner));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -283,12 +326,12 @@ fn check_folder_usable_refuses_a_folder_others_may_change_without_modifying_it()
 }
 
 #[test]
-fn a_pinned_restricted_dir_cannot_be_removed_or_renamed_until_dropped() {
+fn a_pinned_backup_dir_cannot_be_removed_or_renamed_until_dropped() {
     let dir = scratch("pinned");
     open_to_everyone(&dir);
     let staging = dir.join(".staging");
     let finished = dir.join("finished");
-    let pin = create_pinned_restricted_dir(&staging).unwrap();
+    let pin = create_pinned_backup_dir(&staging).unwrap();
     assert!(private(&staging));
     // Files can be written inside while the folder is pinned, and inherit its ACL.
     std::fs::write(staging.join("db"), "x").unwrap();
@@ -332,22 +375,16 @@ fn open_lock_file_refuses_a_directory_junction() {
         .output()
         .unwrap();
     assert!(done.status.success(), "{done:?}");
-    assert!(open_lock_file(&link).is_err());
+    let refused = open_lock_file(&link).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{refused}");
     let _ = std::fs::remove_dir(&link);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn inherited_all_application_packages_is_not_private_but_may_be_stripped() {
+fn all_application_packages_with_change_rights_is_refused() {
     let user = User::current().unwrap();
     let inherited_ac = descriptor("O:MED:AI(A;OICIID;FA;;;ME)(A;OICIID;GA;;;AC)");
     assert!(!judge(&inherited_ac, true, &user).unwrap());
-    assert!(!lets_others_change(inherited_ac.dacl().unwrap().unwrap(), &user).unwrap());
-
-    let explicit_ac = descriptor("O:MED:P(A;OICI;FA;;;ME)(A;OICI;GA;;;AC)");
-    assert!(!judge(&explicit_ac, true, &user).unwrap());
-    assert!(lets_others_change(explicit_ac.dacl().unwrap().unwrap(), &user).unwrap());
-
-    let inherited_wd = descriptor("O:MED:AI(A;OICIID;FA;;;ME)(A;OICIID;GA;;;WD)");
-    assert!(lets_others_change(inherited_wd.dacl().unwrap().unwrap(), &user).unwrap());
+    assert!(lets_others(inherited_ac.dacl().unwrap().unwrap(), &user, CHANGE, false).unwrap());
 }

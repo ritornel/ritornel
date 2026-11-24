@@ -100,6 +100,30 @@ pub(crate) fn close_to_others(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(OWNER_ONLY))
 }
 
+/// Closes a file in a user-chosen backup or export folder to mode `0600`
+/// where the volume supports Unix modes, without failing on drives or shares
+/// (such as FAT, exFAT, or SMB) that refuse `chmod`.
+pub(crate) fn close_backup_file(path: &Path) -> std::io::Result<()> {
+    match close_to_others(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Creates a new file in a user-chosen backup or export folder with mode
+/// `0600` where the volume supports it.
+pub(crate) fn create_backup_file(path: &Path) -> std::io::Result<File> {
+    create_private_file(path)
+}
+
 /// Makes a file that `options` creates one only the OS user can open:
 /// mode `0600`.
 pub(crate) fn create_owner_only(options: &mut OpenOptions) {
@@ -178,6 +202,11 @@ pub(crate) fn watch_signals(runtime: &Runtime, stop: &Sender<Stop>) -> std::io::
     }
     Ok(Signals)
 }
+
+/// Nothing to do on Unix: a test scratch folder in `/tmp` does not inherit
+/// Windows' `%TEMP%` ACLs.
+#[cfg(test)]
+pub(crate) fn close_scratch(_path: &Path) {}
 
 /// Whether only the owner can open a file or directory: the modes `0600`
 /// and `0700`.
