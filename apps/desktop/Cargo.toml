@@ -105,3 +105,4 @@ indexing_slicing = "warn"
 codegen-units = 1
 lto = "thin"
 debug = "line-tables-only"
+# A throwaway change to test CI tiers (#233); not to be merged.
