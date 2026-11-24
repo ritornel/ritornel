@@ -380,15 +380,23 @@ impl ScanRun {
             self.phase,
             Phase::Read | Phase::Moves | Phase::Missing | Phase::Replaced | Phase::Sidecars
         );
-        // Every walk has the root's identity: one the system would not give
-        // was refused, since two unknown identities prove nothing.
+        if judged {
+            self.verify_root()?;
+        }
+        Ok(!stop.load(Ordering::Relaxed))
+    }
+
+    /// Checks that the root is still the folder the walk saw. Every walk has
+    /// the root's identity: one the system would not give was refused, since
+    /// two unknown identities prove nothing.
+    fn verify_root(&self) -> Result<(), Error> {
         let walked_id = self.walked.as_ref().map(|walked| walked.root_id);
-        if judged && (walked_id.is_none() || folder_id(&self.root) != walked_id) {
+        if walked_id.is_none() || folder_id(&self.root) != walked_id {
             return Err(Error::RootOffline {
                 path: self.root.clone(),
             });
         }
-        Ok(!stop.load(Ordering::Relaxed))
+        Ok(())
     }
 
     /// The request of the job's next library write: its next step.
@@ -440,6 +448,7 @@ impl ScanRun {
                 self.phase = Phase::Missing;
                 let ops = self.settle_moves();
                 if !ops.is_empty() {
+                    self.verify_root()?;
                     let request = self.next_step();
                     let receipt = self.step_result(self.summary)?;
                     library.record(request, self.source.row, ops, receipt)?;
@@ -455,6 +464,7 @@ impl ScanRun {
                 self.summary.missing += gone.len() as u64;
                 self.phase = Phase::Replaced;
                 if !gone.is_empty() {
+                    self.verify_root()?;
                     let request = self.next_step();
                     let receipt = self.step_result(self.summary)?;
                     library.mark_missing(request, gone, receipt)?;
@@ -468,6 +478,7 @@ impl ScanRun {
                 }
                 let ops = std::mem::take(&mut self.sidecar_ops);
                 if !ops.is_empty() {
+                    self.verify_root()?;
                     let request = self.next_step_as(SIDECARS_METHOD);
                     let receipt = stored(self.summary, self.dirty, false)?;
                     library.record_sidecars(request, self.source.row, ops, receipt)?;
@@ -706,6 +717,7 @@ impl ScanRun {
             self.summary = counted;
             return Ok(());
         }
+        self.verify_root()?;
         let request = self.next_step();
         let receipt = self.step_result(counted)?;
         library.record(request, self.source.row, ops, receipt)?;
@@ -843,6 +855,7 @@ impl ScanRun {
                 ops.push(RecordOp::Retire { item, payload });
             }
         }
+        self.verify_root()?;
         let request = self.next_step();
         let receipt = self.step_result(self.summary)?;
         library.record(request, self.source.row, ops, receipt)?;

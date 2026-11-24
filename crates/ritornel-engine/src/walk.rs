@@ -244,6 +244,20 @@ fn walk_tree(
         // The list is taken deepest first, so the folders on the way to
         // this one are the first `depth` of those last gone down.
         way.truncate(depth);
+        if depth > 0 {
+            // A folder on the work list may have been replaced by a link
+            // since its parent was listed: never follow a link to a folder.
+            match std::fs::symlink_metadata(&dir) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => continue,
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                    unreadable(walked, &rel);
+                    continue;
+                }
+                Err(error) => return Err(Error::Io(error)),
+            }
+        }
         let here = if depth == 0 {
             Some(walked.root_id)
         } else {
@@ -536,6 +550,44 @@ mod tests {
             matches!(&refused, Err(Error::RootOffline { path }) if path == root),
             "{refused:?}"
         );
+    }
+
+    #[test]
+    fn a_queued_folder_replaced_by_a_link_before_it_is_visited_is_not_followed() {
+        let scratch = Scratch::new();
+        let root = scratch.path().join("root");
+        let outside = scratch.path().join("outside");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("a/01.flac"), b"12345").unwrap();
+        std::fs::write(root.join("b/02.flac"), b"12345").unwrap();
+        std::fs::write(outside.join("escaped.flac"), b"12345").unwrap();
+        let swapped = AtomicBool::new(false);
+        let id_of = |path: &Path| {
+            // Once the walk visits one sibling, replace the other queued
+            // sibling with a link to a folder outside the root.
+            if (path == root.join("a") || path == root.join("b"))
+                && !swapped.swap(true, Ordering::Relaxed)
+            {
+                let other = if path == root.join("a") {
+                    root.join("b")
+                } else {
+                    root.join("a")
+                };
+                std::fs::remove_dir_all(&other).unwrap();
+                crate::platform::link_folder(&outside, &other);
+            }
+            folder_id(path)
+        };
+        let walked = walk_by(&root, &AtomicBool::new(false), &id_of).unwrap();
+        let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
+        assert!(swapped.load(Ordering::Relaxed));
+        assert!(
+            !paths.iter().any(|path| path.ends_with("escaped.flac")),
+            "{paths:?}"
+        );
+        assert_eq!(paths.len(), 1);
     }
 
     // Only Linux keeps a name that is not UTF-8 as it was given.

@@ -1636,6 +1636,64 @@ fn another_disk_mounted_at_the_root_after_the_walk_is_not_judged_against_it() {
 }
 
 #[test]
+fn a_root_swapped_between_prepare_and_commit_writes_nothing() {
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    let (root, away) = (rig.root(), rig.scratch.path().join("unmounted"));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+
+    // 1. Missing phase: prepare succeeds, then the root is swapped before commit.
+    std::fs::remove_file(root.join("Tin Weather/02.flac")).unwrap();
+    let (revision, before) = (rig.revision(), rig.dump());
+    let (mut run, row) = walked(&mut rig);
+    // Moves phase (no moves to commit), then prepare for Missing phase.
+    assert!(run.prepare(&stop, &mut |_| {}).unwrap());
+    assert_eq!(run.commit(&rig.library).unwrap(), None);
+    assert!(run.prepare(&stop, &mut |_| {}).unwrap());
+    std::fs::rename(&root, &away).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let refused = run.commit(&rig.library);
+    assert!(
+        matches!(&refused, Err(Error::RootOffline { path }) if *path == root),
+        "{refused:?}"
+    );
+    rig.server
+        .finish_job(row, JobState::Failed, Some("offline".to_owned()))
+        .unwrap();
+    assert_eq!((rig.revision(), rig.dump()), (revision, before));
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&away, &root).unwrap();
+
+    // 2. Replaced phase: prepare succeeds, then the root is swapped before commit.
+    rig.put("Tin Weather/02.flac", "b.flac");
+    rig.scan();
+    rig.put("Tin Weather/01.flac", "b.flac");
+    let (revision, before) = (rig.revision(), rig.dump());
+    let (mut run, row) = walked(&mut rig);
+    // Read, Moves, Missing, then prepare for Replaced.
+    for _ in 0..3 {
+        assert!(run.prepare(&stop, &mut |_| {}).unwrap());
+        assert_eq!(run.commit(&rig.library).unwrap(), None);
+    }
+    assert!(run.prepare(&stop, &mut |_| {}).unwrap());
+    std::fs::rename(&root, &away).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let refused = run.commit(&rig.library);
+    assert!(
+        matches!(&refused, Err(Error::RootOffline { path }) if *path == root),
+        "{refused:?}"
+    );
+    rig.server
+        .finish_job(row, JobState::Failed, Some("offline".to_owned()))
+        .unwrap();
+    assert_eq!((rig.revision(), rig.dump()), (revision, before));
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&away, &root).unwrap();
+}
+
+#[test]
 fn a_file_that_cannot_be_reached_when_it_is_read_keeps_what_was_last_read_of_it() {
     let mut rig = Rig::new();
     rig.put("Tin Weather/01.flac", "a.flac");
