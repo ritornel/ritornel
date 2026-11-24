@@ -20,7 +20,7 @@ mod support;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -258,12 +258,14 @@ impl Server {
 
     /// Waits for the server to end by itself: `None` when a signal ended
     /// it, as an abort does.
-    fn ended(mut self) -> Option<i32> {
+    /// Waits for the server to end, and says how it did: its exit status
+    /// names the signal when one ended it.
+    fn ended(mut self) -> ExitStatus {
         assert!(
             rest(&self.stdout).is_some(),
             "the server did not end within {WAIT:?}"
         );
-        self.child.wait().unwrap().code()
+        self.child.wait().unwrap()
     }
 
     fn stop(self) {
@@ -284,7 +286,8 @@ impl Server {
                 .unwrap()
         };
         assert!(sent.success(), "asking it to stop: {sent}");
-        assert_eq!(self.ended(), Some(0));
+        let ended = self.ended();
+        assert!(ended.success(), "the server ended with {ended}");
     }
 }
 
@@ -394,7 +397,8 @@ fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_on
     ok(&data_dir, &["library", "create"]);
     ok(&data_dir, &["scan", folder]);
     ok(&data_dir, &["play", folder]);
-    assert_eq!(dying.ended(), ABORTED);
+    let ended = dying.ended();
+    assert_eq!(ended.code(), ABORTED, "the server ended with {ended}");
 
     // The next run closes the listen as a crash, and dies itself just
     // after the library has taken it in and before server.db lets it go.
@@ -498,7 +502,8 @@ fn a_server_killed_just_after_a_join_keeps_both_listens_and_the_boundary_between
     ok(&data_dir, &["library", "create"]);
     ok(&data_dir, &["scan", folder]);
     ok(&data_dir, &["play", folder]);
-    assert_eq!(dying.ended(), ABORTED);
+    let ended = dying.ended();
+    assert_eq!(ended.code(), ABORTED, "the server ended with {ended}");
 
     let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
     let now = json(&data_dir, &["now"]);

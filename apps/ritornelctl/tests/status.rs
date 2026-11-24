@@ -97,6 +97,10 @@ fn rest(lines: &Receiver<String>) -> Option<String> {
 #[derive(Debug)]
 struct Ended {
     code: Option<i32>,
+    /// Its exit status as the system says it, which names a signal. A
+    /// failure shows it, through `Debug`, which dead-code analysis ignores.
+    #[allow(dead_code)]
+    status: String,
     stdout: String,
     stderr: String,
 }
@@ -135,6 +139,7 @@ fn run(mut command: Command) -> Ended {
     );
     Ended {
         code: ended.code(),
+        status: ended.to_string(),
         stdout,
         stderr,
     }
@@ -258,8 +263,10 @@ impl Server {
             // Dropping `self` kills it.
             panic!("the server did not end within {WAIT:?} of SIG{signal}");
         };
+        let ended = self.child.wait().unwrap();
         Ended {
-            code: self.child.wait().unwrap().code(),
+            code: ended.code(),
+            status: ended.to_string(),
             stdout,
             stderr,
         }
@@ -407,7 +414,8 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             stopped.stdout.as_str(),
             stopped.stderr.as_str()
         ),
-        (Some(0), "", "")
+        (Some(0), "", ""),
+        "{stopped:?}"
     );
     assert!(!data_dir.join("server.json").exists());
 
@@ -510,7 +518,8 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
     assert_eq!(shown[2], ("Role", "hub"));
     assert_eq!(shown[8], ("Library ID", library_id));
     assert_eq!(shown[9], ("Library revision", "1"));
-    assert_eq!(server.end("TERM").code, Some(0));
+    let stopped = server.end("TERM");
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
 }
 
 #[test]
@@ -531,7 +540,8 @@ fn library_create_prints_its_receipt_as_json_when_asked() {
         (&json["status"], &json["revision"]),
         (&"done".into(), &1.into())
     );
-    assert_eq!(server.end("TERM").code, Some(0));
+    let stopped = server.end("TERM");
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
 }
 
 #[test]
@@ -555,7 +565,11 @@ fn a_server_that_was_killed_is_not_taken_for_a_running_one_and_its_port_is_not_a
     let killed = Server::start(&data_dir).end("KILL");
     // A signal ended it on Unix, with no code; `taskkill /F` ends a process
     // with 1.
-    assert_eq!(killed.code, if cfg!(windows) { Some(1) } else { None });
+    assert_eq!(
+        killed.code,
+        if cfg!(windows) { Some(1) } else { None },
+        "{killed:?}"
+    );
     // It had no chance to clear up after itself.
     let left = read_json(&data_dir.join("server.json"));
     let endpoint = left["endpoint"].as_str().unwrap();
@@ -704,7 +718,8 @@ fn settings_say_what_gave_each_and_the_wake_setting_is_changed_from_a_terminal()
 
     // The change is kept with the server. The name stays too, though
     // nothing gives it now, as the name a server already had.
-    assert_eq!(server.end("TERM").code, Some(0));
+    let stopped = server.end("TERM");
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
     let server = Server::start(&data_dir);
     let shown = read();
     assert_eq!(
@@ -716,5 +731,6 @@ fn settings_say_what_gave_each_and_the_wake_setting_is_changed_from_a_terminal()
         json!({ "value": "Kitchen Speakers", "setBy": "default" })
     );
     assert_eq!(shown["cacheBytes"]["setBy"], "file");
-    assert_eq!(server.end("TERM").code, Some(0));
+    let stopped = server.end("TERM");
+    assert_eq!(stopped.code, Some(0), "{stopped:?}");
 }
