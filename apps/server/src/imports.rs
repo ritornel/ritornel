@@ -364,6 +364,23 @@ impl Staging {
             _ => Ok(false),
         }
     }
+
+    /// Removes a run's report, which no longer says what it did.
+    pub(crate) fn forget_report(&self, run: Id) -> Result<(), Error> {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = self.run_dir(run).join("report.json");
+        match std::fs::remove_file(&path) {
+            Err(source) if source.kind() != std::io::ErrorKind::NotFound => Err(Error::Io {
+                doing: "remove",
+                path,
+                source,
+            }),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// How often the staged runs are looked at for any that have expired.
@@ -520,11 +537,16 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
     });
     match applied {
         Some(Ok((_, report))) => {
-            // The run is applied whatever becomes of its report.
+            // The run is applied whatever becomes of its report. One that
+            // cannot be kept takes its dry run's with it, which would be
+            // shown as what applying did.
             if let Some(report) = report
                 && let Err(failed) = staging.save_report(run, begun_at, &report)
             {
                 warn!(error = %failed, "an applied run's report could not be kept");
+                if let Err(failed) = staging.forget_report(run) {
+                    warn!(error = %failed, "an applied run's dry run could not be removed");
+                }
             }
             finish(core, &job, JobState::Succeeded, None);
         }
@@ -750,6 +772,12 @@ mod tests {
         assert!(staging.run(run(), later).unwrap().unwrap().report.is_none());
         let (_, begun_again) = staging.streams(run(), later).unwrap().unwrap();
         assert!(staging.save_report(run(), begun_again, &report).unwrap());
+        assert!(staging.run(run(), later).unwrap().unwrap().report.is_some());
+        // A report that no longer says what the run did is forgotten, and
+        // forgetting it again is no error.
+        staging.forget_report(run()).unwrap();
+        staging.forget_report(run()).unwrap();
+        assert!(staging.run(run(), later).unwrap().unwrap().report.is_none());
     }
 
     #[test]
