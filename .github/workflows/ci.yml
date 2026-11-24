@@ -129,9 +129,10 @@ jobs:
       - name: Workspace doc tests
         run: cargo test --locked --workspace --all-features --doc
       # The headless hub, as built for a Linux machine with no desktop:
-      # pkg-config is pointed at nothing so any crate that would link a system
-      # library (ALSA among them) fails the build.
-      - name: Hub with no system library
+      # PKG_CONFIG_LIBDIR=/nonexistent blocks pkg-config discovery of system
+      # libraries (ALSA and desktop libraries among them) so any crate that
+      # probes for them through pkg-config fails the build.
+      - name: Hub without pkg-config system libraries
         env:
           PKG_CONFIG_LIBDIR: /nonexistent
           PKG_CONFIG_PATH: ''
