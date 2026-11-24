@@ -3,10 +3,60 @@
 //! this machine. See "Jobs and outbox" in docs/internals/server.md, and
 //! "Commands, playback, and jobs" in docs/internals/contract.md.
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 use sha2::{Digest, Sha256};
 
 use crate::{Command, Error, Id, ServerStore};
+
+/// Why a claimed job should stop before its next write or step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStop {
+    /// `jobs.cancel` asked this job to stop.
+    Cancelled,
+    /// The server is stopping: leave the job claimed for the next run.
+    Shutdown,
+}
+
+/// A live handle that checks whether a claimed job was asked to stop or
+/// the server is stopping. Held by a job's worker and checked at the start
+/// of each library transaction before any mutation.
+#[derive(Debug, Clone)]
+pub struct JobCancel {
+    job: i64,
+    cancels: Arc<Mutex<HashSet<i64>>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl JobCancel {
+    /// Whether the job was asked to stop, or the server is stopping.
+    /// Cancellation takes precedence over shutdown so a cancelled job ends
+    /// rather than waiting for the next run.
+    pub fn stopped(&self) -> Option<JobStop> {
+        if self
+            .cancels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&self.job)
+        {
+            return Some(JobStop::Cancelled);
+        }
+        if self.shutdown.load(Ordering::SeqCst) {
+            return Some(JobStop::Shutdown);
+        }
+        None
+    }
+
+    pub(crate) fn check(&self) -> Result<(), Error> {
+        match self.stopped() {
+            Some(stop) => Err(Error::JobStopped(stop)),
+            None => Ok(()),
+        }
+    }
+}
 
 /// Where a job is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,20 +472,68 @@ impl ServerStore {
         })
     }
 
-    /// Ends a job.
+    /// Ends a job. A job already asked to stop never ends as succeeded:
+    /// it ends as cancelled instead. A job that has already ended is
+    /// left as it ended.
     pub fn finish_job(
         &self,
         job: i64,
         state: JobState,
         error: Option<String>,
     ) -> Result<Job, Error> {
-        self.transact(move |transaction, now_ms, _| {
+        let ended = self.transact(move |transaction, now_ms, _| {
+            let current = job_by_row(transaction, job)?;
+            if current.state.ended() {
+                return Ok(current);
+            }
+            let (final_state, final_error) =
+                if current.cancel_requested && state == JobState::Succeeded {
+                    (JobState::Cancelled, None)
+                } else {
+                    (state, error)
+                };
             transaction.execute(
                 "UPDATE job SET state = ?2, error_json = ?3, finished_at_ms = ?4, current_label = NULL
-                 WHERE id = ?1",
-                (job, state.as_str(), &error, now_ms),
+                  WHERE id = ?1",
+                (job, final_state.as_str(), &final_error, now_ms),
             )?;
             job_by_row(transaction, job)
+        })?;
+        self.cancels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&job);
+        Ok(ended)
+    }
+
+    /// Whether this job has been asked to stop.
+    pub fn cancel_requested(&self, job: i64) -> Result<bool, Error> {
+        self.read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT cancel_requested_at_ms IS NOT NULL FROM job WHERE id = ?1",
+                    [job],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(false))
+        })
+    }
+
+    /// A live handle for a claimed job, checked before each write begins
+    /// its transaction. Sees both cancels recorded already and any
+    /// acknowledged while the job runs.
+    pub fn job_cancel(&self, job: i64, shutdown: Arc<AtomicBool>) -> Result<JobCancel, Error> {
+        if self.cancel_requested(job)? {
+            self.cancels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(job);
+        }
+        Ok(JobCancel {
+            job,
+            cancels: Arc::clone(&self.cancels),
+            shutdown,
         })
     }
 
@@ -449,7 +547,7 @@ impl ServerStore {
         method: &'static str,
         id: Id,
     ) -> Result<Option<Job>, Error> {
-        self.transact(move |transaction, now_ms, _| {
+        let updated = self.transact(move |transaction, now_ms, _| {
             let Some(found) = job_by_id(transaction, id)? else {
                 return Ok(None);
             };
@@ -465,7 +563,19 @@ impl ServerStore {
                 record_receipt(transaction, &command, method, &id.to_string(), now_ms)?;
             }
             Ok(Some(job_by_row(transaction, found.id)?))
-        })
+        })?;
+        // Publish after commit and before returning so a failed cancel never
+        // stops a running job, while any acknowledged cancel is visible before
+        // the caller or event stream sees it.
+        if let Some(job) = &updated
+            && job.state == JobState::Cancelling
+        {
+            self.cancels
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(job.id);
+        }
+        Ok(updated)
     }
 
     /// The job a command started before, if it did: what the command sent
@@ -882,6 +992,57 @@ mod tests {
         assert_eq!(
             store.job(third.public_id).unwrap().unwrap().state,
             JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_cancelling_job_never_finishes_as_succeeded_and_ended_jobs_stay_ended() {
+        let clock = Arc::new(FixedClock::at(T0));
+        let store = store(&clock);
+        let (running, _) = store
+            .start_job(command(1, "a"), "scan.start", scan("main"))
+            .unwrap();
+        assert!(!store.cancel_requested(running.id).unwrap());
+        store.claim_job(id(0xb1)).unwrap().unwrap();
+        store
+            .cancel_job(command(2, "x"), "jobs.cancel", running.public_id)
+            .unwrap()
+            .unwrap();
+        assert!(store.cancel_requested(running.id).unwrap());
+
+        clock.set(T0 + 10);
+        let ended = store
+            .finish_job(running.id, JobState::Succeeded, None)
+            .unwrap();
+        assert_eq!(
+            (ended.state, ended.error.as_deref(), ended.finished_at_ms),
+            (JobState::Cancelled, None, Some(T0 + 10))
+        );
+        // Once ended, a second finish changes neither its state nor its time.
+        clock.set(T0 + 20);
+        let again = store
+            .finish_job(running.id, JobState::Succeeded, None)
+            .unwrap();
+        assert_eq!(
+            (again.state, again.finished_at_ms),
+            (JobState::Cancelled, Some(T0 + 10))
+        );
+
+        // A real failure on a cancelling job still records the failure.
+        let (failing, _) = store
+            .start_job(command(3, "a"), "scan.start", scan("main"))
+            .unwrap();
+        store.claim_job(id(0xb1)).unwrap().unwrap();
+        store
+            .cancel_job(command(4, "x"), "jobs.cancel", failing.public_id)
+            .unwrap()
+            .unwrap();
+        let failed = store
+            .finish_job(failing.id, JobState::Failed, Some("disk full".to_owned()))
+            .unwrap();
+        assert_eq!(
+            (failed.state, failed.error.as_deref()),
+            (JobState::Failed, Some("disk full"))
         );
     }
 

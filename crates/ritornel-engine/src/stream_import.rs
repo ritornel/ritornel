@@ -620,13 +620,42 @@ impl LibraryStore {
         reader: String,
         session: Option<Id>,
     ) -> Result<(StoredRun, Option<ImportReport>), Error> {
+        self.apply_streams_with(request, run, records, reader, session, None)
+    }
+
+    /// As [`apply_streams`](Self::apply_streams), checking `cancel` inside
+    /// `BEGIN IMMEDIATE` before any mutation.
+    pub fn apply_streams_guarded(
+        &self,
+        request: WriteRequest,
+        run: Id,
+        records: Vec<SpotifyStream>,
+        reader: String,
+        session: Option<Id>,
+        cancel: crate::JobCancel,
+    ) -> Result<(StoredRun, Option<ImportReport>), Error> {
+        self.apply_streams_with(request, run, records, reader, session, Some(cancel))
+    }
+
+    fn apply_streams_with(
+        &self,
+        request: WriteRequest,
+        run: Id,
+        records: Vec<SpotifyStream>,
+        reader: String,
+        session: Option<Id>,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<(StoredRun, Option<ImportReport>), Error> {
+        if let Some(cancel) = &cancel {
+            cancel.check()?;
+        }
         if let Some(stored) = self.stored_run(run)? {
             return Ok((stored, None));
         }
         // The report goes beside the write's result, which a command sent
         // again is answered with, and not in it.
         let (sent, report_of) = std::sync::mpsc::channel();
-        let written = self.write(request, move |write| {
+        let written = self.write_guarded(request, cancel, move |write| {
             if let Some(stored) = stored_run(write.connection(), run)? {
                 return Ok(serde_json::to_string(&stored)?);
             }
@@ -661,13 +690,36 @@ impl LibraryStore {
     /// streams stay stored, and those another run in force holds stay in
     /// force. A run already out of force writes nothing.
     pub fn undo_streams(&self, request: WriteRequest, run: Id) -> Result<StoredRun, Error> {
+        self.undo_streams_with(request, run, None)
+    }
+
+    /// As [`undo_streams`](Self::undo_streams), checking `cancel` inside
+    /// `BEGIN IMMEDIATE` before any mutation.
+    pub fn undo_streams_guarded(
+        &self,
+        request: WriteRequest,
+        run: Id,
+        cancel: crate::JobCancel,
+    ) -> Result<StoredRun, Error> {
+        self.undo_streams_with(request, run, Some(cancel))
+    }
+
+    fn undo_streams_with(
+        &self,
+        request: WriteRequest,
+        run: Id,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<StoredRun, Error> {
+        if let Some(cancel) = &cancel {
+            cancel.check()?;
+        }
         let stored = self
             .stored_run(run)?
             .ok_or(Error::NotFound("no run of that ID was applied"))?;
         if !stored.in_force {
             return Ok(stored);
         }
-        let written = self.write(request, move |write| {
+        let written = self.write_guarded(request, cancel, move |write| {
             let connection = write.connection();
             let row: i64 = connection.query_row(
                 "SELECT id FROM import_run WHERE public_id = ?1",

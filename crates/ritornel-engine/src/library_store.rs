@@ -209,7 +209,7 @@ pub struct LibraryStore {
     /// Where the database is, for a read that wants a connection of its
     /// own: an export.
     location: Location,
-    writer: Writer,
+    pub(crate) writer: Writer,
     reader: Reader,
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
@@ -470,6 +470,23 @@ impl LibraryStore {
     where
         F: FnOnce(&Write<'_>) -> Result<String, Error> + Send + 'static,
     {
+        self.write_guarded(request, None, work)
+    }
+
+    /// As [`write`](Self::write), checking `cancel` before queuing and
+    /// again inside `BEGIN IMMEDIATE` before any mutation or revision bump.
+    pub(crate) fn write_guarded<F>(
+        &self,
+        request: WriteRequest,
+        cancel: Option<crate::JobCancel>,
+        work: F,
+    ) -> Result<Written, Error>
+    where
+        F: FnOnce(&Write<'_>) -> Result<String, Error> + Send + 'static,
+    {
+        if let Some(cancel) = &cancel {
+            cancel.check()?;
+        }
         let (clock, entropy, hub) = (Arc::clone(&self.clock), Arc::clone(&self.entropy), self.hub);
         let on_commit = self
             .on_commit
@@ -480,6 +497,9 @@ impl LibraryStore {
         self.writer.call(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(cancel) = cancel {
+                cancel.check()?;
+            }
             let (written, shown) =
                 write_in(&transaction, hub, &request, clock.now_ms(), &*entropy, work)?;
             transaction.commit()?;

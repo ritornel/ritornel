@@ -150,6 +150,7 @@ pub struct ScanRun {
     sidecar_ops: Vec<SidecarOp>,
     failed: Vec<(String, &'static str, String)>,
     label: Option<String>,
+    cancel: Option<crate::JobCancel>,
 }
 
 fn unsigned(number: i64) -> u64 {
@@ -300,7 +301,14 @@ impl ScanRun {
             sidecar_ops: Vec::new(),
             failed: Vec::new(),
             label: None,
+            cancel: None,
         })
+    }
+
+    /// Guards every library transaction this scan begins with `cancel`.
+    pub fn with_cancel(mut self, cancel: crate::JobCancel) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// The job this run is of.
@@ -453,7 +461,13 @@ impl ScanRun {
                     self.verify_root()?;
                     let request = self.next_step();
                     let receipt = self.step_result(self.summary)?;
-                    library.record(request, self.source.row, ops, receipt)?;
+                    library.record_with(
+                        request,
+                        self.source.row,
+                        ops,
+                        receipt,
+                        self.cancel.clone(),
+                    )?;
                     self.committed()?;
                 }
             }
@@ -469,7 +483,7 @@ impl ScanRun {
                     self.verify_root()?;
                     let request = self.next_step();
                     let receipt = self.step_result(self.summary)?;
-                    library.mark_missing(request, gone, receipt)?;
+                    library.mark_missing(request, gone, receipt, self.cancel.clone())?;
                     self.committed()?;
                 }
             }
@@ -483,7 +497,13 @@ impl ScanRun {
                     self.verify_root()?;
                     let request = self.next_step_as(SIDECARS_METHOD);
                     let receipt = stored(self.summary, self.dirty, false)?;
-                    library.record_sidecars(request, self.source.row, ops, receipt)?;
+                    library.record_sidecars(
+                        request,
+                        self.source.row,
+                        ops,
+                        receipt,
+                        self.cancel.clone(),
+                    )?;
                     self.fail_point()?;
                 }
             }
@@ -492,11 +512,11 @@ impl ScanRun {
                     self.label = Some("resolving".to_owned());
                     if library.claims_are_stale()? {
                         let request = self.next_step();
-                        library.rebuild_claims(request)?;
+                        library.rebuild_claims(request, self.cancel.clone())?;
                         self.committed()?;
                     }
                     let request = self.next_step();
-                    match library.resolve(request)? {
+                    match library.resolve_with(request, self.cancel.clone())? {
                         Some((_, resolved)) => {
                             self.summary.assignments += resolved.assignments;
                             self.summary.recordings += resolved.recordings;
@@ -522,7 +542,7 @@ impl ScanRun {
             Phase::Match => {
                 // A write of its own, which writes nothing when no binding
                 // moves, and so is safe to repeat.
-                library.match_library()?;
+                library.match_library_with(self.cancel.clone())?;
                 self.phase = Phase::Layouts;
             }
             Phase::Layouts => {
@@ -532,7 +552,7 @@ impl ScanRun {
                     self.label = Some("reading disc layouts".to_owned());
                     let request = self.next_step_as(LAYOUTS_METHOD);
                     let receipt = stored(self.summary, self.dirty, true)?;
-                    library.derive_layouts(request, receipt)?;
+                    library.derive_layouts(request, receipt, self.cancel.clone())?;
                     self.fail_point()?;
                 }
                 self.phase = Phase::Done;
@@ -722,7 +742,7 @@ impl ScanRun {
         self.verify_root()?;
         let request = self.next_step();
         let receipt = self.step_result(counted)?;
-        library.record(request, self.source.row, ops, receipt)?;
+        library.record_with(request, self.source.row, ops, receipt, self.cancel.clone())?;
         self.summary = counted;
         self.committed()
     }
@@ -860,7 +880,7 @@ impl ScanRun {
         self.verify_root()?;
         let request = self.next_step();
         let receipt = self.step_result(self.summary)?;
-        library.record(request, self.source.row, ops, receipt)?;
+        library.record_with(request, self.source.row, ops, receipt, self.cancel.clone())?;
         self.committed()
     }
 

@@ -18,13 +18,13 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ritornel_contract::{
     Id, ImportReport, ImportRun, MAX_CLIENT_TEXT, MAX_STREAMS_PER_PIECE, SpotifyStream,
 };
-use ritornel_engine::JobState;
+use ritornel_engine::{JobCancel, JobState, JobStop};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -354,6 +354,7 @@ impl Staging {
     /// Keeps a dry run's report beside its run, if the run is still the one
     /// begun at `begun_at` and holds every piece the report read. Returns
     /// whether it was kept.
+    #[cfg(test)]
     pub(crate) fn save_report(
         &self,
         run: Id,
@@ -363,9 +364,30 @@ impl Staging {
         self.save(run, begun_at, report, "report.json")
     }
 
-    /// Keeps the report of a run's apply beside it, as [`Self::save_report`]
-    /// keeps a dry run's, apart from it: an applied run shows this one, or
-    /// none.
+    /// Keeps a dry run's report beside its run, if the run is still the one
+    /// begun at `begun_at`, holds every piece the report read, and `cancel`
+    /// has not asked the job to stop. Checks `cancel` under the staging lock
+    /// before writing so a cancelled dry run never publishes a report.
+    pub(crate) fn save_report_guarded(
+        &self,
+        run: Id,
+        begun_at: i64,
+        report: &ImportReport,
+        cancel: &JobCancel,
+    ) -> Result<Result<bool, JobStop>, Error> {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(stop) = cancel.stopped() {
+            return Ok(Err(stop));
+        }
+        self.save_held(run, begun_at, report, "report.json").map(Ok)
+    }
+
+    /// Keeps the report of a run's apply beside it, as
+    /// [`Self::save_report_guarded`] keeps a dry run's, apart from it: an
+    /// applied run shows this one, or none.
     pub(crate) fn save_applied(
         &self,
         run: Id,
@@ -393,6 +415,16 @@ impl Staging {
             .writing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.save_held(run, begun_at, report, name)
+    }
+
+    fn save_held(
+        &self,
+        run: Id,
+        begun_at: i64,
+        report: &ImportReport,
+        name: &str,
+    ) -> Result<bool, Error> {
         match self.meta(run)? {
             Some(meta)
                 if meta.begun_at == begun_at && meta.received.len() == meta.pieces as usize =>
@@ -419,11 +451,59 @@ pub(crate) async fn sweep(core: std::sync::Arc<Core>) {
     }
 }
 
+/// Checks `cancel`; if the job was asked to stop or the server is
+/// stopping, handles it and returns `true`.
+fn stopped_early(core: &Core, job: &ritornel_engine::Job, cancel: &JobCancel) -> bool {
+    match cancel.stopped() {
+        Some(JobStop::Cancelled) => {
+            finish(core, job, JobState::Cancelled, None);
+            true
+        }
+        Some(JobStop::Shutdown) => true,
+        None => false,
+    }
+}
+
+/// Ends a job after a pre-transaction preparation error, giving an
+/// acknowledged cancel or shutdown precedence over the error.
+fn fail_before_commit(core: &Core, job: &ritornel_engine::Job, cancel: &JobCancel, why: String) {
+    if !stopped_early(core, job, cancel) {
+        finish(core, job, JobState::Failed, Some(why));
+    }
+}
+
 /// Carries a claimed dry run to its end: reads the run's streams, works
 /// out what applying them would do, and keeps the report beside the run.
-pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
+pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, shutdown: &Arc<AtomicBool>) {
+    dry_run_job(core, job, shutdown, || {});
+}
+
+#[cfg(test)]
+pub(crate) fn run_dry_run_before_save(
+    core: &Core,
+    job: ritornel_engine::Job,
+    shutdown: &Arc<AtomicBool>,
+    before_save: impl FnOnce(),
+) {
+    dry_run_job(core, job, shutdown, before_save);
+}
+
+fn dry_run_job(
+    core: &Core,
+    job: ritornel_engine::Job,
+    shutdown: &Arc<AtomicBool>,
+    before_save: impl FnOnce(),
+) {
     info!(job_id = %job.public_id, "a dry run of an import is claimed");
-    let failed = |why: String| finish(core, &job, JobState::Failed, Some(why));
+    let cancel = match crate::jobs::cancel_handle(core, job.id, shutdown) {
+        Some(Ok(cancel)) => cancel,
+        Some(Err(failed)) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
+        None => return,
+    };
+    if stopped_early(core, &job, &cancel) {
+        return;
+    }
+    let failed = |why: String| fail_before_commit(core, &job, &cancel, why);
     let Ok(params) = serde_json::from_str::<RunJobParams>(&job.params_json) else {
         return failed("the job's params are not a run".to_owned());
     };
@@ -440,6 +520,9 @@ pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &Atomic
         }
         Err(error) => return failed(error.to_string()),
     };
+    if stopped_early(core, &job, &cancel) {
+        return;
+    }
     let report = core.with_library(|_, library| {
         let report = library.stream_dry_run(streams)?;
         Ok::<_, ritornel_engine::Error>(
@@ -452,15 +535,22 @@ pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &Atomic
     match report {
         Some(Ok(None)) => failed("the run was applied while it was dry run".to_owned()),
         Some(Ok(Some(report))) => {
-            match core.staging().save_report(params.run_id, begun_at, &report) {
-                Ok(true) => finish(core, &job, JobState::Succeeded, None),
-                Ok(false) => failed(
+            before_save();
+            match core
+                .staging()
+                .save_report_guarded(params.run_id, begun_at, &report, &cancel)
+            {
+                Ok(Err(JobStop::Cancelled)) => finish(core, &job, JobState::Cancelled, None),
+                Ok(Err(JobStop::Shutdown)) => {}
+                Ok(Ok(true)) => finish(core, &job, JobState::Succeeded, None),
+                Ok(Ok(false)) => failed(
                     "the staged run expired, or was staged again, while it was dry run".to_owned(),
                 ),
                 Err(error) => failed(error.to_string()),
             }
         }
         Some(Err(error)) => failed(error.to_string()),
+        None if shutdown.load(Ordering::SeqCst) => {}
         None => failed("this server holds no library".to_owned()),
     }
 }
@@ -512,14 +602,41 @@ pub(crate) fn stale(report: Option<&ImportReport>) -> Option<&'static str> {
 /// Carries a claimed apply to its end: works out what applying the run does
 /// once more, as the library is now, stores what is new and records the
 /// run in one write, and keeps that report as the run's.
-pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
+pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, shutdown: &Arc<AtomicBool>) {
+    apply_job(core, job, shutdown, || {});
+}
+
+#[cfg(test)]
+pub(crate) fn run_apply_before_commit(
+    core: &Core,
+    job: ritornel_engine::Job,
+    shutdown: &Arc<AtomicBool>,
+    before_commit: impl FnOnce(),
+) {
+    apply_job(core, job, shutdown, before_commit);
+}
+
+fn apply_job(
+    core: &Core,
+    job: ritornel_engine::Job,
+    shutdown: &Arc<AtomicBool>,
+    before_commit: impl FnOnce(),
+) {
     info!(job_id = %job.public_id, "an import is applied");
+    let cancel = match crate::jobs::cancel_handle(core, job.id, shutdown) {
+        Some(Ok(cancel)) => cancel,
+        Some(Err(failed)) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
+        None => return,
+    };
+    if stopped_early(core, &job, &cancel) {
+        return;
+    }
     let Ok(params) = serde_json::from_str::<RunJobParams>(&job.params_json) else {
-        return finish(
+        return fail_before_commit(
             core,
             &job,
-            JobState::Failed,
-            Some("the job's params are not a run".to_owned()),
+            &cancel,
+            "the job's params are not a run".to_owned(),
         );
     };
     let run = params.run_id;
@@ -528,24 +645,24 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
     // not needed.
     match core.with_library(|_, library| library.stored_run(run)) {
         Some(Ok(Some(_))) => return finish(core, &job, JobState::Succeeded, None),
-        Some(Err(failed)) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
+        Some(Err(failed)) => return fail_before_commit(core, &job, &cancel, failed.to_string()),
         Some(Ok(None)) | None => {}
     }
     let staging = core.staging();
     let whole = match staging.whole(run, core.now_ms()) {
         Ok(Some(whole)) => whole,
         Ok(None) => {
-            return finish(
+            return fail_before_commit(
                 core,
                 &job,
-                JobState::Failed,
-                Some("the staged run is gone, or a piece of it is missing".to_owned()),
+                &cancel,
+                "the staged run is gone, or a piece of it is missing".to_owned(),
             );
         }
-        Err(failed) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
+        Err(failed) => return fail_before_commit(core, &job, &cancel, failed.to_string()),
     };
     if let Some(why) = stale(whole.report.as_ref()) {
-        return finish(core, &job, JobState::Failed, Some(why.to_owned()));
+        return fail_before_commit(core, &job, &cancel, why.to_owned());
     }
     let Whole {
         streams,
@@ -553,16 +670,22 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
         reader,
         ..
     } = whole;
+    before_commit();
     let applied = core.with_library(|_, library| {
-        library.apply_streams(
+        library.apply_streams_guarded(
             step(&job, ritornel_engine::APPLY_METHOD, run),
             run,
             streams,
             reader,
             params.session,
+            cancel.clone(),
         )
     });
     match applied {
+        Some(Err(ritornel_engine::Error::JobStopped(JobStop::Cancelled))) => {
+            finish(core, &job, JobState::Cancelled, None)
+        }
+        Some(Err(ritornel_engine::Error::JobStopped(JobStop::Shutdown))) => {}
         Some(Ok((_, report))) => {
             // The run is applied whatever becomes of its report: one that
             // cannot be kept leaves the run with none to show.
@@ -574,41 +697,76 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
             finish(core, &job, JobState::Succeeded, None);
         }
         Some(Err(failed)) => finish(core, &job, JobState::Failed, Some(failed.to_string())),
-        None => finish(
+        None if shutdown.load(Ordering::SeqCst) => {}
+        None => fail_before_commit(
             core,
             &job,
-            JobState::Failed,
-            Some("this server holds no library".to_owned()),
+            &cancel,
+            "this server holds no library".to_owned(),
         ),
     }
 }
 
 /// Carries a claimed undo to its end: takes the run out of force in one
 /// write.
-pub(crate) fn run_undo(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
+pub(crate) fn run_undo(core: &Core, job: ritornel_engine::Job, shutdown: &Arc<AtomicBool>) {
+    undo_job(core, job, shutdown, || {});
+}
+
+#[cfg(test)]
+pub(crate) fn run_undo_before_commit(
+    core: &Core,
+    job: ritornel_engine::Job,
+    shutdown: &Arc<AtomicBool>,
+    before_commit: impl FnOnce(),
+) {
+    undo_job(core, job, shutdown, before_commit);
+}
+
+fn undo_job(
+    core: &Core,
+    job: ritornel_engine::Job,
+    shutdown: &Arc<AtomicBool>,
+    before_commit: impl FnOnce(),
+) {
     info!(job_id = %job.public_id, "an import is undone");
+    let cancel = match crate::jobs::cancel_handle(core, job.id, shutdown) {
+        Some(Ok(cancel)) => cancel,
+        Some(Err(failed)) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
+        None => return,
+    };
+    if stopped_early(core, &job, &cancel) {
+        return;
+    }
     let Ok(params) = serde_json::from_str::<RunJobParams>(&job.params_json) else {
-        return finish(
+        return fail_before_commit(
             core,
             &job,
-            JobState::Failed,
-            Some("the job's params are not a run".to_owned()),
+            &cancel,
+            "the job's params are not a run".to_owned(),
         );
     };
+    before_commit();
     let undone = core.with_library(|_, library| {
-        library.undo_streams(
+        library.undo_streams_guarded(
             step(&job, ritornel_engine::UNDO_METHOD, params.run_id),
             params.run_id,
+            cancel.clone(),
         )
     });
     match undone {
+        Some(Err(ritornel_engine::Error::JobStopped(JobStop::Cancelled))) => {
+            finish(core, &job, JobState::Cancelled, None)
+        }
+        Some(Err(ritornel_engine::Error::JobStopped(JobStop::Shutdown))) => {}
         Some(Ok(_)) => finish(core, &job, JobState::Succeeded, None),
         Some(Err(failed)) => finish(core, &job, JobState::Failed, Some(failed.to_string())),
-        None => finish(
+        None if shutdown.load(Ordering::SeqCst) => {}
+        None => fail_before_commit(
             core,
             &job,
-            JobState::Failed,
-            Some("this server holds no library".to_owned()),
+            &cancel,
+            "this server holds no library".to_owned(),
         ),
     }
 }

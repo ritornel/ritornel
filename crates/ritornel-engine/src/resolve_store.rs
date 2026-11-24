@@ -1522,12 +1522,23 @@ impl LibraryStore {
     /// A plan that something else's write made stale is made again, a few
     /// times.
     pub fn resolve(&self, request: WriteRequest) -> Result<Option<(Written, Resolved)>, Error> {
+        self.resolve_with(request, None)
+    }
+
+    pub(crate) fn resolve_with(
+        &self,
+        request: WriteRequest,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<Option<(Written, Resolved)>, Error> {
         let mut tries = 0;
         loop {
+            if let Some(cancel) = &cancel {
+                cancel.check()?;
+            }
             let Some(plan) = self.plan()? else {
-                return self.settle_pending(request);
+                return self.settle_pending(request, cancel);
             };
-            match self.apply_plan(request, plan) {
+            match self.apply_plan_with(request, plan, cancel.clone()) {
                 Err(Error::PlanStale) if tries < 5 => tries += 1,
                 done => return done.map(Some),
             }
@@ -1553,7 +1564,11 @@ impl LibraryStore {
     /// A resolution that asks for nothing still completes what was owed:
     /// the pending mark is removed, which is a write. With no mark there is
     /// nothing to write.
-    fn settle_pending(&self, request: WriteRequest) -> Result<Option<(Written, Resolved)>, Error> {
+    fn settle_pending(
+        &self,
+        request: WriteRequest,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<Option<(Written, Resolved)>, Error> {
         let pending: bool = self.read(|connection| {
             Ok(connection.query_row(
                 "SELECT EXISTS (SELECT 1 FROM library_setting WHERE key = ?1)",
@@ -1564,7 +1579,7 @@ impl LibraryStore {
         if !pending {
             return Ok(None);
         }
-        let written = self.write(request, |write| {
+        let written = self.write_guarded(request, cancel, |write| {
             settle_pending_in(write)?;
             Ok(serde_json::to_string(&Resolved::default())?)
         })?;
@@ -1572,12 +1587,22 @@ impl LibraryStore {
     }
 
     /// Writes what a plan asks for, in one transaction.
+    #[cfg(test)]
     pub(crate) fn apply_plan(
         &self,
         request: WriteRequest,
         plan: Plan,
     ) -> Result<(Written, Resolved), Error> {
-        let written = self.write(request, move |write| {
+        self.apply_plan_with(request, plan, None)
+    }
+
+    fn apply_plan_with(
+        &self,
+        request: WriteRequest,
+        plan: Plan,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<(Written, Resolved), Error> {
+        let written = self.write_guarded(request, cancel, move |write| {
             let resolved = plan.apply(write)?;
             // Plays follow their source items' new bindings, and what each
             // was heard as follows the catalog.

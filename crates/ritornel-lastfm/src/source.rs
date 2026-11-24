@@ -498,7 +498,11 @@ impl LastfmSource<'_> {
                 return Ok(synced);
             };
             let records = records(&scrobbles);
-            synced.read += records.len() as u64;
+            if sink.stopping() {
+                synced.stopped = true;
+                return Ok(synced);
+            }
+            let read_count = records.len() as u64;
             let stored = sink.commit(Batch {
                 records,
                 span: Span {
@@ -507,6 +511,7 @@ impl LastfmSource<'_> {
                 },
                 cursor: cursor(to.max(previous_cursor.unwrap_or(0))),
             })?;
+            synced.read += read_count;
             synced.new += stored.new;
             synced.gone += stored.gone;
             sink.progress(Progress {

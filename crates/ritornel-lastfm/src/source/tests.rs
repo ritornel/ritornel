@@ -613,3 +613,32 @@ fn a_second_that_changed_before_it_was_read_again_has_its_span_read_again() {
         ]
     );
 }
+
+#[test]
+fn stopping_after_reading_a_span_writes_nothing() {
+    let fake = std::sync::Arc::new(FakeLastfm::start("someone", history(2)));
+    let mut sink = Memory {
+        on_stop_check: Some(Box::new({
+            let fake = fake.clone();
+            move || {
+                // Request 1 is the span count, request 2 is the span's page.
+                // Once that page has been fetched, stop before committing.
+                fake.seen()
+                    .iter()
+                    .filter(|seen| seen.method == "user.getRecentTracks")
+                    .count()
+                    >= 2
+            }
+        })),
+        ..Default::default()
+    };
+    let synced = lastfm(&fake, 100)
+        .source("someone")
+        .until(NOW)
+        .sync(&mut sink, false)
+        .unwrap();
+    assert!(synced.stopped);
+    assert_eq!(synced.read, 0);
+    assert_eq!(sink.writes, 0);
+    assert!(sink.records.is_empty());
+}

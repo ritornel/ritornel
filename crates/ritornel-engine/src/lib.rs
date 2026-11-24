@@ -122,7 +122,7 @@ pub use import_store::{
     Doubtful, ImportReport, LOVES_METHOD, LoveRow, MATCH_METHOD, SERVICES, ServiceAccount,
     TrackDetail,
 };
-pub use jobs::{Job, JobState, NewJob, Progress, step_command};
+pub use jobs::{Job, JobCancel, JobState, JobStop, NewJob, Progress, step_command};
 pub use library_store::{
     Client, Command, CommitHook, Committed, Fingerprint, LibraryMeta, LibraryStore, SubjectKind,
     WriteRequest, Written,

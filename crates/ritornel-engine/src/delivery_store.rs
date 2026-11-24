@@ -788,15 +788,37 @@ impl LibraryStore {
     /// that the import joins its play as its echo and it is not sent again.
     /// Whether scrobbling was held.
     pub fn release_hold(&self, account: Id) -> Result<bool, Error> {
+        self.release_hold_with(account, None)
+    }
+
+    /// As [`release_hold`](Self::release_hold), checking `cancel` inside
+    /// `BEGIN IMMEDIATE` before any mutation.
+    pub fn release_hold_guarded(
+        &self,
+        account: Id,
+        cancel: crate::JobCancel,
+    ) -> Result<bool, Error> {
+        self.release_hold_with(account, Some(cancel))
+    }
+
+    fn release_hold_with(
+        &self,
+        account: Id,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<bool, Error> {
+        if let Some(cancel) = &cancel {
+            cancel.check()?;
+        }
         if self.held_for_import()?.is_none() {
             return Ok(false);
         }
-        self.write(
+        self.write_guarded(
             WriteRequest {
                 method: DELIVERY_METHOD,
                 command: None,
                 client: None,
             },
+            cancel,
             move |write| {
                 let connection = write.connection();
                 let (endpoint, _) = endpoint_of(connection, account)?;

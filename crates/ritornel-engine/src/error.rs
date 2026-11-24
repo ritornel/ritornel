@@ -139,6 +139,9 @@ pub enum Error {
     /// A write that found nothing to change, and was rolled back so that
     /// it takes no revision. It never reaches a caller.
     Unchanged,
+    /// A job's write was stopped before its transaction began because the
+    /// job was asked to stop or the server is shutting down.
+    JobStopped(crate::JobStop),
 }
 
 impl fmt::Display for Error {
@@ -235,6 +238,8 @@ impl fmt::Display for Error {
             Self::BadListen(what) => write!(f, "a listen the hub cannot take: {what}"),
             Self::RolledBack(..) => f.write_str("a dry run, rolled back"),
             Self::Unchanged => f.write_str("nothing changed, so nothing was written"),
+            Self::JobStopped(crate::JobStop::Cancelled) => f.write_str("the job was cancelled"),
+            Self::JobStopped(crate::JobStop::Shutdown) => f.write_str("the server is stopping"),
         }
     }
 }
