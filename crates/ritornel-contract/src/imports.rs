@@ -267,8 +267,6 @@ pub enum StreamTier {
 pub struct TierJoins {
     /// The tier.
     pub tier: StreamTier,
-    /// Whether it is in force: whether applying would join what it finds.
-    pub in_force: bool,
     /// Scrobbles it joins as a stream's own.
     pub joined: u64,
     /// Scrobbles it joins as a second report of a stream that has one.
@@ -283,9 +281,11 @@ pub struct TierJoins {
 pub struct ImportYear {
     /// The year.
     pub year: i32,
-    /// Listens Spotify reported: streams, each repeat counted once.
+    /// Listens in force once the run is applied, the run's and those in
+    /// force now: streams, each repeat counted once.
     pub streams: u64,
-    /// Of those, the ones an earlier run stored already.
+    /// The run's own listens of the year that are stored already, whoever's
+    /// they stay: one of another listener's is not among `streams`.
     pub already_stored: u64,
     /// Of those, the ones joined to a scrobble by tier A.
     pub joined_start: u64,
@@ -348,9 +348,6 @@ pub enum ImportProblem {
     /// Streams fall where no zone covers: they would have no local date.
     /// Say where the listener was then (`history.setZones`).
     NoZone,
-    /// A tier finds joins and is not yet in force: what it would join
-    /// stands as plays of their own until it is.
-    TierNotInForce,
 }
 
 /// What a dry run found: what the run holds, and what applying it would
@@ -401,7 +398,7 @@ pub struct ImportReport {
     pub paused: u64,
     /// What stands in the way of applying.
     pub problems: Vec<ImportProblem>,
-    /// A sample of the joins of each tier not in force, for judging it.
+    /// A sample of the joins of tiers B and C, for judging them.
     pub samples: Vec<JoinSample>,
 }
 

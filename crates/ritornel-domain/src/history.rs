@@ -39,7 +39,11 @@ use jiff::tz::{TimeZone, TimeZoneDatabase};
 /// The grouper's version. Grouper 1 joins `continues` chains and groups
 /// nothing across sources. Version 2 uses known zones and the full clock
 /// difference when dating a chain, and bounds its accumulated play time.
-pub const GROUPER_VERSION: i64 = 2;
+/// Version 3 reads Spotify's streams, and joins a scrobble to the stream it
+/// is the report of by the stream matcher, which is part of the grouper: a
+/// change to the matcher is a new version, which derives every play again
+/// and refuses a dry run made before it.
+pub const GROUPER_VERSION: i64 = 3;
 
 /// How long after the end of a listen one that continues it may start and
 /// still be joined to it.
@@ -89,8 +93,16 @@ impl PlayRule {
         enough_ms: 240_000,
     };
 
+    /// Play rule 2: rule 1 for a listen, and a stream with no scrobble
+    /// judged by the length its track's finished streams give it
+    /// (`streams::judge_alone`).
+    pub const V2: Self = Self {
+        version: 2,
+        ..Self::V1
+    };
+
     /// The rule in force.
-    pub const CURRENT: Self = Self::V1;
+    pub const CURRENT: Self = Self::V2;
 
     /// Whether `ms_played` of a track `track_ms` long counts.
     pub fn counts(&self, ms_played: i64, track_ms: i64) -> bool {
@@ -296,6 +308,26 @@ text_enum! {
 }
 
 text_enum! {
+    /// How an observation that is not a play's primary came to join it.
+    Joined {
+        /// A listen that carries on the one before it.
+        Chain => "chain",
+        /// The scrobble a listen of this library's came back as.
+        Echo => "echo",
+        /// A stream that repeats the one that speaks for the play.
+        Repeat => "repeat",
+        /// A scrobble joined to a stream by tier A of the stream matcher.
+        Start => "start",
+        /// By tier B.
+        During => "during",
+        /// By tier C.
+        Renamed => "renamed",
+        /// By a correction that joined them.
+        Pin => "pin",
+    }
+}
+
+text_enum! {
     /// What a correction does.
     Verb {
         /// The play does not count.
@@ -390,6 +422,29 @@ pub struct Import {
     /// to the source, recorded before it was sent, and matched exactly on
     /// its time and names. `None` for a play of the source's own.
     pub echo_of: Option<i64>,
+    /// Its key at its endpoint, which orders it among ties.
+    pub key: Vec<u8>,
+    /// The artist and the title, as the source spelled them.
+    pub artist: String,
+    /// See `artist`.
+    pub title: String,
+}
+
+/// One of Spotify's streams in force, as derivation reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamImport {
+    /// The observation's row.
+    pub observation: i64,
+    /// The endpoint that reported it.
+    pub endpoint: i64,
+    /// Whose play it is.
+    pub listener: i64,
+    /// The source item of its track.
+    pub source_item: i64,
+    /// Its key at its endpoint.
+    pub key: Vec<u8>,
+    /// The stream as it was kept.
+    pub record: ritornel_contract::SpotifyStream,
 }
 
 /// What a source item is bound to now: its current assignment, with the
@@ -483,6 +538,12 @@ pub struct Inputs<'a> {
     pub zone_periods: &'a [ZonePeriod],
     /// The play rule in force.
     pub rule: PlayRule,
+    /// Spotify's streams in force. A scrobble joins one when the stream
+    /// matcher pairs them, and only when both are here.
+    pub streams: &'a [StreamImport],
+    /// Each track's length as its streams give it, by track URI, for
+    /// judging a stream that has no scrobble.
+    pub lengths: &'a HashMap<String, i64>,
 }
 
 /// A date and an hour on a wall clock somewhere, and the offset from UTC
@@ -558,8 +619,10 @@ pub struct Play {
     pub context_kind: Option<ContextKind>,
     /// What it was queued from.
     pub context_ref: Option<[u8; 16]>,
-    /// Whether it was played in a shuffled order. Unknown for an import.
+    /// Whether it was played in a shuffled order. Unknown for a scrobble.
     pub shuffle: Option<bool>,
+    /// How each observation that is not the primary joined it.
+    pub joined: Vec<(i64, Joined)>,
 }
 
 /// The zone database every local date is read from.
@@ -1038,7 +1101,11 @@ pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
     let mut imports: Vec<&Import> = inputs.imports.iter().collect();
     imports.sort_by_key(|import| import.observation);
     let mut echoed = BTreeSet::new();
+    let taken = derive_streams(inputs, &excluded, &overrides, &mut plays);
     for import in imports {
+        if taken.contains(&import.observation) {
+            continue;
+        }
         let import_override = overrides.for_observation(
             import.observation,
             import.endpoint,
@@ -1054,6 +1121,7 @@ pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
         {
             play.observations
                 .push((import.observation, Role::Corroborating));
+            play.joined.push((import.observation, Joined::Echo));
             play.excluded |= excluded.contains(&import.observation);
             if let Some((corr_id, chosen)) = import_override
                 && override_ids
@@ -1092,9 +1160,230 @@ pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
             context_kind: None,
             context_ref: None,
             shuffle: None,
+            joined: Vec::new(),
         });
     }
     plays
+}
+
+/// When a stream was: its end less the time played, in UTC, read in the
+/// zone the listener was in then, and marked as dated from its end, since
+/// a pause would make the start it gives late.
+fn stream_time(stream: &StreamImport, periods: &[ZonePeriod]) -> PlayTime {
+    let start = stream
+        .record
+        .ended_at
+        .saturating_sub(stream.record.ms_played);
+    let zone = assumed_zone(stream.listener, start, periods);
+    let local = zone.and_then(|period| local_time(start, &period.zone));
+    PlayTime {
+        event_at_ms: Some(start),
+        anchor: TimeAnchor::End,
+        clock_basis: ClockBasis::SourceUtc,
+        precision_ms: Some(SOURCE_SECOND_PRECISION_MS),
+        zone: zone.map(|period| period.zone.clone()),
+        zone_basis: if zone.is_some() {
+            ZoneBasis::Assumed
+        } else {
+            ZoneBasis::None
+        },
+        calendar_basis: if local.is_some() {
+            CalendarBasis::Zone
+        } else {
+            CalendarBasis::None
+        },
+        local,
+    }
+}
+
+/// The plays of Spotify's streams: one for each listen Spotify reported,
+/// with the scrobbles the stream matcher joins to it, which the stream
+/// speaks for. A joined play counts by the scrobble's verdict; a stream
+/// alone is judged by its track's length. A listener's streams are offered
+/// that listener's scrobbles alone. Returns the scrobbles joined.
+fn derive_streams(
+    inputs: &Inputs<'_>,
+    excluded: &BTreeSet<i64>,
+    overrides: &RecordingOverrides<'_>,
+    plays: &mut Vec<Play>,
+) -> BTreeSet<i64> {
+    let listeners: BTreeSet<i64> = inputs
+        .streams
+        .iter()
+        .map(|stream| stream.listener)
+        .collect();
+    let mut taken = BTreeSet::new();
+    for listener in listeners {
+        let streams: Vec<&StreamImport> = inputs
+            .streams
+            .iter()
+            .filter(|stream| stream.listener == listener)
+            .collect();
+        // A scrobble set aside, or a listen of this library's own come
+        // back, is offered to no stream.
+        let mut offered: Vec<&Import> = inputs
+            .imports
+            .iter()
+            .filter(|import| {
+                import.listener == listener
+                    && import.echo_of.is_none()
+                    && !excluded.contains(&import.observation)
+            })
+            .collect();
+        offered.sort_by_key(|import| import.observation);
+        taken.extend(derive_streams_of(
+            &streams, &offered, inputs, excluded, overrides, plays,
+        ));
+    }
+    taken
+}
+
+/// The plays of one listener's streams, `theirs`, with the scrobbles
+/// offered to them.
+fn derive_streams_of(
+    theirs: &[&StreamImport],
+    offered: &[&Import],
+    inputs: &Inputs<'_>,
+    excluded: &BTreeSet<i64>,
+    overrides: &RecordingOverrides<'_>,
+    plays: &mut Vec<Play>,
+) -> BTreeSet<i64> {
+    use crate::streams::{Scrobble, Stream, Tier, Tiers, judge_alone, match_streams, pins};
+    let streams: Vec<Stream> = theirs
+        .iter()
+        .map(|stream| Stream {
+            key: stream.key.clone(),
+            record: stream.record.clone(),
+        })
+        .collect();
+    let scrobbles: Vec<Scrobble> = offered
+        .iter()
+        .map(|import| Scrobble {
+            observation: import.observation,
+            key: import.key.clone(),
+            at_ms: import.played_at_ms,
+            artist: import.artist.clone(),
+            title: import.title.clone(),
+        })
+        .collect();
+    let pins = pins(
+        inputs.corrections,
+        theirs
+            .iter()
+            .zip(&streams)
+            .map(|(stored, stream)| (stored.observation, stream)),
+    );
+    let matched = match_streams(&streams, &scrobbles, Tiers::ALL, &pins);
+    let mut joins: HashMap<usize, Vec<(usize, Option<Tier>, bool)>> = HashMap::new();
+    let mut taken = BTreeSet::new();
+    for join in &matched.joins {
+        joins
+            .entry(join.event)
+            .or_default()
+            .push((join.scrobble, join.tier, join.second));
+        if let Some(scrobble) = offered.get(join.scrobble) {
+            taken.insert(scrobble.observation);
+        }
+    }
+    for (index, event) in matched.events.iter().enumerate() {
+        let members: Vec<&StreamImport> = event
+            .streams
+            .iter()
+            .filter_map(|at| theirs.get(*at).copied())
+            .collect();
+        let Some(&head) = members.first() else {
+            continue;
+        };
+        let mut observations = vec![(head.observation, Role::Primary)];
+        let mut joined = Vec::new();
+        for repeat in members.iter().skip(1) {
+            observations.push((repeat.observation, Role::Corroborating));
+            joined.push((repeat.observation, Joined::Repeat));
+        }
+        let mut own = false;
+        let mut scrobbled: Vec<&Import> = Vec::new();
+        for (scrobble, tier, second) in joins.get(&index).map(Vec::as_slice).unwrap_or_default() {
+            let Some(&import) = offered.get(*scrobble) else {
+                continue;
+            };
+            own |= !second;
+            observations.push((import.observation, Role::Corroborating));
+            joined.push((
+                import.observation,
+                match tier {
+                    Some(Tier::Start) => Joined::Start,
+                    Some(Tier::During) => Joined::During,
+                    Some(Tier::Renamed) => Joined::Renamed,
+                    None => Joined::Pin,
+                },
+            ));
+            scrobbled.push(import);
+        }
+        let record = &head.record;
+        let (counts, outcome, count_basis) = if own {
+            // Its sender knew the track's length, which the export lacks.
+            (true, Outcome::Listened, CountBasis::SourceVerdict)
+        } else {
+            let (counts, outcome) = judge_alone(
+                record.ms_played,
+                inputs.lengths.get(&record.track_uri).copied(),
+                record.reason_end.as_deref(),
+            );
+            (counts, outcome, CountBasis::PlayRule)
+        };
+        let start = record.ended_at.saturating_sub(record.ms_played);
+        // Each record answers a correction's window by its own time, as
+        // the store finds what a correction touches.
+        let chosen = members
+            .iter()
+            .map(|stream| {
+                (
+                    stream.observation,
+                    stream.endpoint,
+                    stream.source_item,
+                    start,
+                )
+            })
+            .chain(scrobbled.iter().map(|import| {
+                (
+                    import.observation,
+                    import.endpoint,
+                    import.source_item,
+                    import.played_at_ms,
+                )
+            }))
+            .filter_map(|(observation, endpoint, item, at_ms)| {
+                overrides.for_observation(observation, endpoint, item, at_ms)
+            })
+            .max_by_key(|(corr_id, _)| *corr_id);
+        let binding = match chosen {
+            Some((_, chosen)) => chosen.binding,
+            None => inputs.bindings.get(&head.source_item).copied(),
+        };
+        plays.push(Play {
+            excluded: observations
+                .iter()
+                .any(|(observation, _)| excluded.contains(observation)),
+            observations,
+            listener: head.listener,
+            recording: binding.map(|binding| binding.recording),
+            appearance: binding.and_then(|binding| binding.appearance),
+            source_item: head.source_item,
+            time: stream_time(head, inputs.zone_periods),
+            ms_played: Some(record.ms_played),
+            track_duration_ms: None,
+            outcome,
+            counts,
+            count_basis,
+            play_rule_version: inputs.rule.version,
+            grouper_version: GROUPER_VERSION,
+            context_kind: None,
+            context_ref: None,
+            shuffle: record.shuffle,
+            joined,
+        });
+    }
+    taken
 }
 
 /// The plays of the listens: one for each chain, paired with the newest
@@ -1169,6 +1458,11 @@ fn derive_listens(
             context_kind: Some(head.context_kind),
             context_ref: head.context_ref,
             shuffle: Some(head.shuffle),
+            joined: listens
+                .iter()
+                .skip(1)
+                .map(|listen| (listen.observation, Joined::Chain))
+                .collect(),
         });
         override_ids.push(chain_override.map(|(corr_id, _)| corr_id));
     }

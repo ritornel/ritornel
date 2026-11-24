@@ -136,3 +136,8 @@ CREATE TABLE stream_device (
   run_id          INTEGER NOT NULL REFERENCES import_run(id),   -- the run whose reader said them
   rev             INTEGER NOT NULL
 ) STRICT;
+
+-- How an observation that is not a play's primary joined it: derived, and
+-- rewritten with the plays. NULL for a primary.
+ALTER TABLE play_event_observation ADD COLUMN joined_by TEXT
+  CHECK (joined_by IN ('chain', 'echo', 'repeat', 'start', 'during', 'renamed', 'pin'));

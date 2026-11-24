@@ -1,0 +1,240 @@
+//! Spotify's streams as derivation reads them: those in force, each
+//! track's length as they give it, and, for any import, the streams and
+//! scrobbles the stream matcher could join it with, which derivation
+//! widens to so that an incremental derive equals a rebuild. See "Spotify
+//! streams" in docs/internals/history.md.
+
+use std::collections::{BTreeSet, HashMap};
+
+use ritornel_contract::{LONGEST_STREAM_MS, SpotifyStream};
+use ritornel_domain::history::StreamImport;
+use ritornel_domain::streams::{
+    PARTNER_WITHIN_MS, Stream, WITHIN_MS, events, lengths as track_lengths, name_key,
+};
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::Error;
+use crate::stream_import::{STORED_STREAM, STORED_STREAM_JOINS, stored_stream};
+
+/// The runs in force: those whose newest ledger entry is `applied`.
+macro_rules! runs_in_force {
+    () => {
+        "SELECT r.id FROM import_run r
+         WHERE (SELECT e.state FROM import_run_event e WHERE e.run_id = r.id
+                ORDER BY e.id DESC LIMIT 1) = 'applied'"
+    };
+}
+
+/// The streams in force, as a query: those a run in force held.
+pub(crate) const IN_FORCE: &str = concat!(
+    "SELECT DISTINCT h.observation_id FROM import_run_stream h WHERE h.run_id IN (",
+    runs_in_force!(),
+    ")"
+);
+
+/// Whether the observation `o` is a stream in force, as a condition that
+/// looks it up by its index rather than listing every stream in force.
+const HELD: &str = concat!(
+    "EXISTS (SELECT 1 FROM import_run_stream h
+             WHERE h.observation_id = o.id AND h.run_id IN (",
+    runs_in_force!(),
+    "))"
+);
+
+/// A stream in force as derivation reads it, from its typed columns, from
+/// [`columns`] and [`STORED_STREAM_JOINS`].
+fn stream_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StreamImport> {
+    Ok(StreamImport {
+        observation: row.get(0)?,
+        endpoint: row.get(1)?,
+        listener: row.get(2)?,
+        source_item: row.get(3)?,
+        key: row.get(4)?,
+        record: stored_stream(row, 5)?,
+    })
+}
+
+/// What [`stream_row`] reads, from the observation `o`.
+fn columns() -> String {
+    format!("o.id, o.endpoint_id, o.listener_id, o.source_item_id, {STORED_STREAM}")
+}
+
+/// The streams in force with these observation IDs, or every one.
+pub(crate) fn streams(
+    connection: &Connection,
+    only: Option<&BTreeSet<i64>>,
+) -> Result<Vec<StreamImport>, Error> {
+    let columns = columns();
+    let Some(only) = only else {
+        let mut statement = connection.prepare(&format!(
+            "SELECT {columns} FROM ({IN_FORCE}) f
+             JOIN history_observation o ON o.id = f.observation_id {STORED_STREAM_JOINS}
+             ORDER BY o.id"
+        ))?;
+        let rows = statement.query_map([], stream_row)?;
+        return Ok(rows.collect::<Result<_, _>>()?);
+    };
+    let mut one = connection.prepare_cached(&format!(
+        "SELECT {columns} FROM history_observation o {STORED_STREAM_JOINS}
+         WHERE o.id = ?1 AND {HELD}"
+    ))?;
+    let mut found = Vec::new();
+    for observation in only {
+        if let Some(stream) = one.query_row([observation], stream_row).optional()? {
+            found.push(stream);
+        }
+    }
+    Ok(found)
+}
+
+/// Each track's length as these streams give it, by track URI.
+pub(crate) fn lengths_of(streams: &[StreamImport]) -> HashMap<String, i64> {
+    let keyed: Vec<Stream> = streams
+        .iter()
+        .map(|stream| Stream {
+            key: stream.key.clone(),
+            record: stream.record.clone(),
+        })
+        .collect();
+    track_lengths(&keyed, &events(&keyed))
+}
+
+/// The length of each of these tracks, by their source items, as their
+/// streams in force give it, by track URI.
+pub(crate) fn lengths(
+    connection: &Connection,
+    tracks: &BTreeSet<i64>,
+) -> Result<HashMap<String, i64>, Error> {
+    let mut of_track = connection.prepare_cached(&format!(
+        "SELECT {} FROM history_observation o {STORED_STREAM_JOINS}
+         WHERE o.source_item_id = ?1 AND {HELD}",
+        columns()
+    ))?;
+    let mut found = Vec::new();
+    for track in tracks {
+        for stream in of_track.query_map([track], stream_row)? {
+            found.push(stream?);
+        }
+    }
+    Ok(lengths_of(&found))
+}
+
+/// An import as the neighbourhood reads it: a stream in force, or a
+/// scrobble of an account, by its time and names.
+enum Near {
+    Stream(SpotifyStream),
+    Scrobble { at_ms: i64, names: (String, String) },
+}
+
+fn near(connection: &Connection, observation: i64) -> Result<Option<Near>, Error> {
+    if let Some(stream) = streams(connection, Some(&BTreeSet::from([observation])))?.pop() {
+        return Ok(Some(Near::Stream(stream.record)));
+    }
+    let scrobble: Option<(i64, String, String)> = connection
+        .prepare_cached(
+            "SELECT i.played_at_utc_ms, i.artist, i.title FROM observation_import i
+             JOIN history_observation o ON o.id = i.observation_id
+             JOIN service_account a ON a.endpoint_id = o.endpoint_id
+             WHERE i.observation_id = ?1",
+        )?
+        .query_row([observation], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()?;
+    Ok(scrobble.map(|(at_ms, artist, title)| Near::Scrobble {
+        at_ms,
+        names: (name_key(&artist), name_key(&title)),
+    }))
+}
+
+/// Whether a scrobble of these names at `at_ms` could be joined to this
+/// stream by any tier, or is a record of its names close enough to decide
+/// whether tier C may join something else.
+fn could_join(stream: &SpotifyStream, at_ms: i64, names: &(String, String)) -> bool {
+    let own = (name_key(&stream.artist), name_key(&stream.title));
+    let start = stream.ended_at.saturating_sub(stream.ms_played);
+    let apart = (i128::from(at_ms) - i128::from(start)).abs();
+    if own == *names {
+        // Tier A, a partner that keeps tier C away, or tier B.
+        return apart <= i128::from(PARTNER_WITHIN_MS)
+            || (at_ms >= start && at_ms <= stream.ended_at.saturating_add(WITHIN_MS));
+    }
+    // Tier C.
+    apart <= i128::from(WITHIN_MS) && (own.0 == names.0 || own.1 == names.1)
+}
+
+/// The streams and scrobbles an import could be joined with by any tier,
+/// and a stream's repeats: what deriving it again must derive with it, so
+/// that the matcher sees all it would see in a rebuild.
+pub(crate) fn neighbours(connection: &Connection, observation: i64) -> Result<Vec<i64>, Error> {
+    let Some(this) = near(connection, observation)? else {
+        return Ok(Vec::new());
+    };
+    // Every import whose stored time, a stream's worked-out start or a
+    // scrobble's stamp, is within the hour that tier C looks for a partner
+    // in: of a stream's start or end, or of a scrobble's stamp.
+    let (from, to) = match &this {
+        Near::Stream(record) => (
+            record
+                .ended_at
+                .saturating_sub(record.ms_played)
+                .saturating_sub(PARTNER_WITHIN_MS),
+            record.ended_at.saturating_add(PARTNER_WITHIN_MS),
+        ),
+        Near::Scrobble { at_ms, .. } => (
+            at_ms.saturating_sub(PARTNER_WITHIN_MS),
+            at_ms.saturating_add(PARTNER_WITHIN_MS),
+        ),
+    };
+    let mut around: Vec<i64> = connection
+        .prepare_cached(
+            "SELECT observation_id FROM observation_import
+             WHERE played_at_utc_ms BETWEEN ?1 AND ?2 AND observation_id <> ?3",
+        )?
+        .query_map((from, to, observation), |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    // And for a scrobble, a stream that began before that hour and was
+    // still playing when it was stamped, which tier B may join it to.
+    if let Near::Scrobble { at_ms, .. } = &this {
+        let longest = PARTNER_WITHIN_MS.max(LONGEST_STREAM_MS.saturating_add(WITHIN_MS));
+        around.extend(
+            connection
+                .prepare_cached(
+                    "SELECT s.observation_id FROM observation_import i
+                     JOIN observation_import_stream s ON s.observation_id = i.observation_id
+                     WHERE i.played_at_utc_ms >= ?1 AND i.played_at_utc_ms < ?2
+                       AND s.ended_at_utc_ms >= ?3",
+                )?
+                .query_map(
+                    (
+                        at_ms.saturating_sub(longest),
+                        from,
+                        at_ms.saturating_sub(WITHIN_MS),
+                    ),
+                    |row| row.get::<_, i64>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    let mut found = Vec::new();
+    for other in around {
+        let Some(that) = near(connection, other)? else {
+            continue;
+        };
+        let joins = match (&this, &that) {
+            (Near::Stream(record), Near::Scrobble { at_ms, names })
+            | (Near::Scrobble { at_ms, names }, Near::Stream(record)) => {
+                could_join(record, *at_ms, names)
+            }
+            // A stream's repeats are one event with it.
+            (Near::Stream(a), Near::Stream(b)) => {
+                (a.ended_at, a.ms_played, &a.track_uri) == (b.ended_at, b.ms_played, &b.track_uri)
+            }
+            (Near::Scrobble { .. }, Near::Scrobble { .. }) => false,
+        };
+        if joins {
+            found.push(other);
+        }
+    }
+    Ok(found)
+}

@@ -11,7 +11,7 @@
 --   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
---   0008_spotify_streams  d95d2cab0108c7d5cb07a869a1b9d0271470fd89f1cba9c82302bb7caadbcaaa
+--   0008_spotify_streams  76f411fb51fded6956e5cd6d5ce1b0d8956a1513522643049076b1e971f5506c
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -767,7 +767,8 @@ CREATE TABLE play_event_observation (
   play_event_id   INTEGER NOT NULL REFERENCES play_event(id),
   observation_id  INTEGER NOT NULL REFERENCES history_observation(id),
   role            TEXT NOT NULL CHECK (role IN ('primary', 'corroborating')),   -- the primary supplies time, played time and outcome
-  rev             INTEGER NOT NULL,
+  rev             INTEGER NOT NULL, joined_by TEXT
+  CHECK (joined_by IN ('chain', 'echo', 'repeat', 'start', 'during', 'renamed', 'pin')),
   UNIQUE (play_event_id, observation_id)
 ) STRICT;
 

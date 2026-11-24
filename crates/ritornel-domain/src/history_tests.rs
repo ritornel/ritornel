@@ -68,6 +68,8 @@ fn derive_with(
         corrections,
         zone_periods: periods,
         rule: PlayRule::V1,
+        streams: &[],
+        lengths: &HashMap::new(),
     })
 }
 
@@ -611,6 +613,9 @@ fn import(observation: i64, at_ms: i64) -> Import {
         source_item: 9,
         played_at_ms: at_ms,
         echo_of: None,
+        key: observation.to_be_bytes().to_vec(),
+        artist: "Calla Brandt".to_owned(),
+        title: "Low Tide".to_owned(),
     }
 }
 
@@ -627,6 +632,8 @@ fn derive_all(
         corrections,
         zone_periods: periods,
         rule: PlayRule::V1,
+        streams: &[],
+        lengths: &HashMap::new(),
     })
 }
 
@@ -915,6 +922,8 @@ fn a_recording_correction_by_date_range_moves_only_matching_observations() {
         corrections: &[range],
         zone_periods: &[],
         rule: PlayRule::V1,
+        streams: &[],
+        lengths: &HashMap::new(),
     });
     assert_eq!(
         plays
@@ -979,4 +988,59 @@ fn a_recording_correction_moves_a_listen_chain_and_its_echo() {
     let plays = derive_all(&[first, second], &[echo], &[on_chain, on_echo], &[]);
     assert_eq!(plays.len(), 1);
     assert_eq!((plays[0].recording, plays[0].appearance), (Some(15), None));
+}
+
+#[test]
+fn a_listeners_stream_is_offered_that_listeners_scrobbles_alone() {
+    let (played, ended_at) = (221_000, T0 + 221_000);
+    let stream = StreamImport {
+        observation: 30,
+        endpoint: 3,
+        listener: 1,
+        source_item: 9,
+        key: b"sp1:low-tide".to_vec(),
+        record: ritornel_contract::SpotifyStream {
+            ended_at,
+            ms_played: played,
+            track_uri: "spotify:track:0000000000000000000001".to_owned(),
+            title: "Low Tide".to_owned(),
+            artist: "Calla Brandt".to_owned(),
+            album: None,
+            reason_start: None,
+            reason_end: Some("trackdone".to_owned()),
+            shuffle: None,
+            skipped: None,
+            offline: None,
+            offline_timestamp: None,
+            incognito: None,
+            platform: None,
+            device_kind: None,
+            via: None,
+        },
+    };
+    // Scrobbled as the stream began, which tier A would join, but by
+    // another listener.
+    let theirs = Import {
+        listener: 2,
+        ..import(5, T0)
+    };
+    let derive_one = |imports: &[Import]| {
+        derive(&Inputs {
+            listens: &[],
+            imports,
+            bindings: &bound(),
+            corrections: &[],
+            zone_periods: &[],
+            rule: PlayRule::V1,
+            streams: std::slice::from_ref(&stream),
+            lengths: &HashMap::new(),
+        })
+    };
+    let plays = derive_one(std::slice::from_ref(&theirs));
+    assert_eq!(plays.len(), 2);
+    assert!(plays.iter().all(|play| play.joined.is_empty()));
+    // The same scrobble of the stream's own listener is joined to it.
+    let plays = derive_one(&[import(5, T0)]);
+    assert_eq!(plays.len(), 1);
+    assert_eq!(plays[0].joined.len(), 1);
 }

@@ -3,16 +3,17 @@
 //! new and records the run; and undoing it. See "Spotify streams" in
 //! docs/internals/history.md.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ritornel_contract::{DeviceKind, ImportReport, Platform, PlayedVia, SpotifyStream};
-use ritornel_domain::stream_report::{DryRunInput, dry_run, keyed};
-use ritornel_domain::streams::{Pins, Scrobble, Stream, kept, repeat_order};
+use ritornel_domain::history::{Correction, StreamImport};
+use ritornel_domain::stream_report::{DryRunInput, OtherListener, dry_run, keyed};
+use ritornel_domain::streams::{Scrobble, Stream, kept, repeat_order};
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::history_store::{echo_of, zone_periods};
-use crate::import_store::{Scope, match_in};
+use crate::import_store::{Scope, bind_in};
 use crate::library_store::Write;
 use crate::{Error, Id, LibraryStore, WriteRequest};
 
@@ -25,17 +26,39 @@ struct Read {
     listener: i64,
     zone_periods: Vec<ritornel_domain::history::ZonePeriod>,
     stored: HashMap<Vec<u8>, SpotifyStream>,
+    observations: HashMap<Vec<u8>, i64>,
+    owners: HashMap<Vec<u8>, i64>,
+    corrections: Vec<Correction>,
+    in_force: Vec<Stream>,
+    others: Vec<OtherListener>,
+    set_aside: HashSet<Vec<u8>>,
 }
 
-/// The streams stored already, by key, as they were stored.
-fn stored_streams(connection: &Connection) -> Result<HashMap<Vec<u8>, SpotifyStream>, Error> {
+/// The streams stored already, each by its key.
+#[derive(Default)]
+struct Stored {
+    /// As it was stored.
+    records: HashMap<Vec<u8>, SpotifyStream>,
+    /// Its observation.
+    observations: HashMap<Vec<u8>, i64>,
+    /// Whose it is.
+    owners: HashMap<Vec<u8>, i64>,
+}
+
+fn stored_streams(connection: &Connection) -> Result<Stored, Error> {
     let mut statement = connection.prepare(&format!(
-        "SELECT {STORED_STREAM} FROM history_observation o {STORED_STREAM_JOINS}"
+        "SELECT o.id, o.listener_id, {STORED_STREAM}
+         FROM history_observation o {STORED_STREAM_JOINS}"
     ))?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, Vec<u8>>(0)?, stored_stream(row, 1)?))
-    })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    let mut rows = statement.query([])?;
+    let mut stored = Stored::default();
+    while let Some(row) = rows.next()? {
+        let key: Vec<u8> = row.get(2)?;
+        stored.observations.insert(key.clone(), row.get(0)?);
+        stored.owners.insert(key.clone(), row.get(1)?);
+        stored.records.insert(key, stored_stream(row, 3)?);
+    }
+    Ok(stored)
 }
 
 /// A stored stream's columns, after its source key: what [`stored_stream`]
@@ -73,24 +96,39 @@ pub(crate) fn stored_stream(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Res
     })
 }
 
-/// Every scrobble of every account, sorted into those a stream may take,
-/// those set aside and those that are this library's own listens come back.
+/// How many streams are in force. A run applied only adds to them and one
+/// undone only takes from them, so the same count is the same streams.
+fn in_force(connection: &Connection) -> Result<i64, Error> {
+    Ok(connection.query_row(
+        &format!(
+            "SELECT count(*) FROM ({})",
+            crate::history_streams::IN_FORCE
+        ),
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Every scrobble of a listener's accounts, sorted into those a stream may
+/// take, those set aside and those that are this library's own listens
+/// come back.
 /// An import is an echo when it matches a delivery of a listen, as
 /// derivation finds it, so that a second copy of an echo, which stands as a
-/// play of its own, is an echo too; and it is set aside when a correction
-/// that stands excludes it.
-fn scrobbles(connection: &Connection) -> Result<(Vec<Scrobble>, u64, u64), Error> {
-    // Set aside as derivation has it: by the corrections that stand, and
-    // never by what a play of it shows, which another record can decide.
-    let set_aside =
-        ritornel_domain::history::excluded(&crate::history_store::corrections(connection)?);
+/// play of its own, is an echo too; and it is set aside when it is one of
+/// `set_aside`, those a correction that stands excludes.
+fn offered(
+    connection: &Connection,
+    set_aside: &BTreeSet<i64>,
+    listener: i64,
+) -> Result<(Vec<Scrobble>, u64, u64), Error> {
     let mut statement = connection.prepare(
         "SELECT o.id, o.source_key, i.played_at_utc_ms, i.artist, i.title, o.endpoint_id
            FROM observation_import i
            JOIN history_observation o ON o.id = i.observation_id
-           JOIN service_account a ON a.endpoint_id = o.endpoint_id",
+           JOIN service_account a ON a.endpoint_id = o.endpoint_id
+          WHERE o.listener_id = ?1",
     )?;
-    let mut rows = statement.query([])?;
+    let mut rows = statement.query([listener])?;
     let (mut offered, mut excluded, mut echoes) = (Vec::new(), 0, 0);
     while let Some(row) = rows.next()? {
         let observation: i64 = row.get(0)?;
@@ -154,12 +192,61 @@ impl LibraryStore {
 
 /// What a dry run reads, as `connection` sees the library.
 fn read(connection: &Connection) -> Result<Read, Error> {
-    let (scrobbles, excluded, echoes) = scrobbles(connection)?;
+    // The run's streams are the first listener's, as applying
+    // stores them, and they are matched with that listener's own.
     let listener = connection.query_row(
         "SELECT coalesce((SELECT id FROM listener ORDER BY id LIMIT 1), 0)",
         [],
         |row| row.get(0),
     )?;
+    let corrections = crate::history_store::corrections(connection)?;
+    // Set aside as derivation has it: by the corrections that stand, and
+    // never by what a play of a record shows, which another record can
+    // decide.
+    let set_aside_ids = ritornel_domain::history::excluded(&corrections);
+    let (scrobbles, excluded, echoes) = offered(connection, &set_aside_ids, listener)?;
+    let Stored {
+        records: stored,
+        observations,
+        owners,
+    } = stored_streams(connection)?;
+    let set_aside = observations
+        .iter()
+        .filter(|(_, observation)| set_aside_ids.contains(observation))
+        .map(|(key, _)| key.clone())
+        .collect();
+    let (in_force, theirs): (Vec<_>, Vec<_>) = crate::history_streams::streams(connection, None)?
+        .into_iter()
+        .partition(|stream| stream.listener == listener);
+    // Every other listener with a stream stored, in force or not.
+    let mut by_listener: BTreeMap<i64, Vec<StreamImport>> = owners
+        .values()
+        .filter(|owner| **owner != listener)
+        .map(|owner| (*owner, Vec::new()))
+        .collect();
+    for stream in theirs {
+        by_listener.entry(stream.listener).or_default().push(stream);
+    }
+    let as_streams = |streams: Vec<StreamImport>| -> Vec<Stream> {
+        streams
+            .into_iter()
+            .map(|stream| Stream {
+                key: stream.key,
+                record: stream.record,
+            })
+            .collect()
+    };
+    // Every other listener's, matched with their own scrobbles.
+    let others = by_listener
+        .into_iter()
+        .map(|(other, streams)| {
+            Ok(OtherListener {
+                listener: other,
+                streams: as_streams(streams),
+                scrobbles: offered(connection, &set_aside_ids, other)?.0,
+            })
+        })
+        .collect::<Result<_, Error>>()?;
     Ok(Read {
         scrobbles,
         excluded,
@@ -167,7 +254,13 @@ fn read(connection: &Connection) -> Result<Read, Error> {
         plays_by_year: plays_by_year(connection)?,
         listener,
         zone_periods: zone_periods(connection)?,
-        stored: stored_streams(connection)?,
+        stored,
+        observations,
+        owners,
+        corrections,
+        in_force: as_streams(in_force),
+        others,
+        set_aside,
     })
 }
 
@@ -175,14 +268,19 @@ fn read(connection: &Connection) -> Result<Read, Error> {
 fn report(read: &Read, streams: &[Stream], made_at: i64) -> ImportReport {
     dry_run(&DryRunInput {
         streams,
+        in_force: &read.in_force,
+        others: &read.others,
         scrobbles: &read.scrobbles,
         excluded: read.excluded,
         echoes: read.echoes,
         plays_by_year: &read.plays_by_year,
         listener: read.listener,
         zone_periods: &read.zone_periods,
-        pins: &Pins::default(),
+        corrections: &read.corrections,
+        observations: &read.observations,
         stored: &read.stored,
+        owners: &read.owners,
+        set_aside: &read.set_aside,
         made_at,
     })
 }
@@ -318,8 +416,7 @@ fn stored_run(connection: &Connection, run: Id) -> Result<Option<StoredRun>, Err
 
 /// Stores a run's streams that are not stored yet, and records the run, the
 /// streams it held and that it is in force, in one write. A run applied
-/// before is not applied again. Derivation passes streams over, so no play
-/// changes.
+/// before is not applied again. It derives no play: its caller does.
 fn apply_in(
     write: &Write<'_>,
     run: Id,
@@ -540,11 +637,18 @@ impl LibraryStore {
             let _ = sent.send(report(&read, &streams, write.now_ms()));
             // What the report read is not held while the run is stored.
             drop(read);
+            let before = in_force(write.connection())?;
             let stored = apply_in(write, run, &streams, &reader, session)?;
+            drop(streams);
             // The tracks the run brought, and those whose newest stream in
-            // force it changed, are judged against the library in the same
-            // write.
-            match_in(write, Scope::Spotify)?;
+            // force it changed, are judged against the library; and since a
+            // stream in force can move its track's length, and so any play
+            // of it, every play is derived again, all in the same write. A
+            // run whose every stream was in force already changes neither.
+            if in_force(write.connection())? != before {
+                bind_in(write, Scope::Spotify)?;
+                crate::history_store::derive_every_play(write)?;
+            }
             Ok(serde_json::to_string(&stored)?)
         })?;
         Ok((
@@ -578,12 +682,17 @@ impl LibraryStore {
                 )
                 .optional()?;
             if state.as_deref() == Some("applied") {
+                let before = in_force(connection)?;
                 connection.execute(
                     "INSERT INTO import_run_event (run_id, state, at_ms, rev)
                      VALUES (?1, 'undone', ?2, ?3)",
                     (row, write.now_ms(), write.rev()),
                 )?;
-                match_in(write, Scope::Spotify)?;
+                // A run whose every stream another holds leaves them in force.
+                if in_force(connection)? != before {
+                    bind_in(write, Scope::Spotify)?;
+                    crate::history_store::derive_every_play(write)?;
+                }
             }
             let stored = stored_run(connection, run)?.ok_or(Error::Corrupt("a run undone"))?;
             Ok(serde_json::to_string(&stored)?)

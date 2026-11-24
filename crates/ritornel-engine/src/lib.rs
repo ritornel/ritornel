@@ -46,6 +46,7 @@ mod history_pages;
 mod history_size;
 mod history_store;
 mod history_stream;
+mod history_streams;
 mod id;
 mod identity_store;
 #[cfg(test)]

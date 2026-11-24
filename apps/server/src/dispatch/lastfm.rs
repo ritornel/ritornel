@@ -528,6 +528,7 @@ mod enabled {
                 plays: unsigned(report.plays),
                 matched_plays: unsigned(report.matched_plays),
                 echoes: unsigned(report.echoes),
+                joined_to_streams: unsigned(report.joined_to_streams),
                 tracks: unsigned(report.tracks),
                 matched_tracks: unsigned(report.matched_tracks),
                 doubtful_tracks: unsigned(report.doubtful_tracks),

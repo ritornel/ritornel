@@ -196,8 +196,9 @@ fn render_report(report: &LastfmReport) -> String {
         (
             "Imported",
             format!(
-                "{} scrobbles, {} of them echoes of plays sent from here",
-                report.imported, report.echoes
+                "{} scrobbles, {} of them echoes of plays sent from here and {} the same \
+                 listens as Spotify streams",
+                report.imported, report.echoes, report.joined_to_streams
             ),
         ),
         (
@@ -498,6 +499,7 @@ mod tests {
             plays: 9,
             matched_plays: 6,
             echoes: 1,
+            joined_to_streams: 0,
             tracks: 4,
             matched_tracks: 2,
             doubtful_tracks: 1,

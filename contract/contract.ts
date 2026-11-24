@@ -1636,7 +1636,7 @@ export type ImportPicturesParams = {
 /**
  * What stands in the way of applying a run, and what to do about it.
  */
-export type ImportProblem = "no_zone" | "tier_not_in_force";
+export type ImportProblem = "no_zone";
 
 /**
  * What a dry run found: what the run holds, and what applying it would
@@ -1720,7 +1720,7 @@ export type ImportReport = {
    */
   problems: Array<ImportProblem>,
   /**
-   * A sample of the joins of each tier not in force, for judging it.
+   * A sample of the joins of tiers B and C, for judging them.
    */
   samples: Array<JoinSample>,
 };
@@ -1816,11 +1816,13 @@ export type ImportYear = {
    */
   year: number,
   /**
-   * Listens Spotify reported: streams, each repeat counted once.
+   * Listens in force once the run is applied, the run's and those in
+   * force now: streams, each repeat counted once.
    */
   streams: number,
   /**
-   * Of those, the ones an earlier run stored already.
+   * The run's own listens of the year that are stored already, whoever's
+   * they stay: one of another listener's is not among `streams`.
    */
   alreadyStored: number,
   /**
@@ -2284,8 +2286,9 @@ export type LastfmReport = {
    */
   imported: number,
   /**
-   * Plays they make, the echoes of plays scrobbled from here not
-   * counted.
+   * Plays they make, the echoes of plays scrobbled from here and the
+   * scrobbles joined to a Spotify stream, whose plays the stream speaks
+   * for, not counted.
    */
   plays: number,
   /**
@@ -2296,6 +2299,10 @@ export type LastfmReport = {
    * Scrobbles that are echoes of plays scrobbled from here.
    */
   echoes: number,
+  /**
+   * Scrobbles joined to a Spotify stream: reports of the same listen.
+   */
+  joinedToStreams: number,
   /**
    * Distinct tracks the history names.
    */
@@ -5548,10 +5555,6 @@ export type TierJoins = {
    * The tier.
    */
   tier: StreamTier,
-  /**
-   * Whether it is in force: whether applying would join what it finds.
-   */
-  inForce: boolean,
   /**
    * Scrobbles it joins as a stream's own.
    */

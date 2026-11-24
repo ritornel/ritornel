@@ -314,13 +314,16 @@ pub struct LastfmReport {
     pub account: String,
     /// Scrobbles imported.
     pub imported: u64,
-    /// Plays they make, the echoes of plays scrobbled from here not
-    /// counted.
+    /// Plays they make, the echoes of plays scrobbled from here and the
+    /// scrobbles joined to a Spotify stream, whose plays the stream speaks
+    /// for, not counted.
     pub plays: u64,
     /// Of those, the ones bound to a recording.
     pub matched_plays: u64,
     /// Scrobbles that are echoes of plays scrobbled from here.
     pub echoes: u64,
+    /// Scrobbles joined to a Spotify stream: reports of the same listen.
+    pub joined_to_streams: u64,
     /// Distinct tracks the history names.
     pub tracks: u64,
     /// Of those, the ones bound.
