@@ -830,7 +830,7 @@ mod enabled {
                 summary.source_total = synced.source_total;
                 let account = session.account;
                 let after = core.with_library(|_, library| {
-                    let matched = library.match_scrobbles(account)?;
+                    let matched = library.match_library_for(account)?;
                     Ok::<_, ritornel_engine::Error>((matched, library.imported_count(account)?))
                 });
                 match after {
