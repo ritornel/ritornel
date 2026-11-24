@@ -68,6 +68,9 @@ mod media_fixtures;
 mod migrate;
 mod platform;
 pub mod playback;
+mod proposal_store;
+#[cfg(test)]
+mod proposal_tests;
 mod ratings;
 mod record_health;
 mod resolve_store;

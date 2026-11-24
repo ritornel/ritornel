@@ -14,6 +14,7 @@
 --   0008_spotify_streams  e9ce8045bd8ecad934d57ecb7150f891907050e0591b711f9884c1231d1747e1
 --   0009_sidecars_and_disc_layouts  878233bcc6fed742092f02deba5765f167f1f9eb2bb1743c26a3235baea3e18a
 --   0010_lookup_replies  28ed4aad4966e46edc0008b800d61348b49c8e03ceaab864f22c3d90c5ede3a7
+--   0011_album_proposals  1a1ea91e5554dd76b0cef6be8665945177ff99b3d8853c2df2fa5effd92b70c2
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -1235,3 +1236,55 @@ CREATE TABLE evidence_claim (
 CREATE INDEX evidence_claim_response ON evidence_claim (lookup_response_id);
 
 CREATE INDEX evidence_claim_release ON evidence_claim (release_mbid, field);
+
+CREATE TABLE proposal (
+  id                    INTEGER PRIMARY KEY,
+  public_id             BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
+  kind                  TEXT NOT NULL CHECK (kind IN ('album')),
+  anchor_item_id        INTEGER NOT NULL REFERENCES source_item(id),
+  group_public_id       BLOB NOT NULL CHECK (length(group_public_id) = 16),   -- the proposal whose anchor is its group's
+  source_instance_id    INTEGER NOT NULL REFERENCES source_instance(id),
+  folder                TEXT NOT NULL,                                       -- relative to the root
+  fingerprint           TEXT NOT NULL,                                       -- a digest of all of it, which a yes names
+  proposer_version      INTEGER NOT NULL,
+  rev                   INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX proposal_group ON proposal (group_public_id);
+
+CREATE TABLE proposal_item (
+  id                INTEGER PRIMARY KEY,
+  proposal_id       INTEGER NOT NULL REFERENCES proposal(id),
+  source_item_id    INTEGER NOT NULL REFERENCES source_item(id),
+  rev               INTEGER NOT NULL,
+  UNIQUE (proposal_id, source_item_id)
+) STRICT;
+
+CREATE INDEX proposal_item_item ON proposal_item (source_item_id);
+
+CREATE TABLE proposal_candidate (
+  id                    INTEGER PRIMARY KEY,
+  proposal_id           INTEGER NOT NULL REFERENCES proposal(id),
+  ordinal               INTEGER NOT NULL,              -- the likeliest first
+  release_group_mbid    TEXT NOT NULL,
+  title                 TEXT,
+  artist                TEXT NOT NULL,
+  primary_type          TEXT,
+  first_date            TEXT,
+  releases              INTEGER NOT NULL,              -- how many of the replies' releases are of it
+  change                TEXT NOT NULL CHECK (change IN ('knows', 'gains', 'moves')),
+  values_json           TEXT NOT NULL,                 -- [{"item":12,"field":"disc_number","ordinal":0,"value":"2"}]
+  onto_json             TEXT NOT NULL,                 -- the files of the first disc a yes joins these onto: [14,15]
+  rev                   INTEGER NOT NULL,
+  UNIQUE (proposal_id, ordinal)
+) STRICT;
+
+CREATE TABLE proposal_evidence (
+  id                    INTEGER PRIMARY KEY,
+  proposal_id           INTEGER NOT NULL REFERENCES proposal(id),
+  role                  TEXT NOT NULL CHECK (role IN ('rests_on')),
+  disc_id               TEXT NOT NULL,
+  lookup_response_id    INTEGER NOT NULL REFERENCES lookup_response(id),   -- the reply, as it was current
+  rev                   INTEGER NOT NULL,
+  UNIQUE (proposal_id, role, disc_id, lookup_response_id)
+) STRICT;

@@ -13,20 +13,20 @@ use std::time::Duration;
 
 use ritornel_contract::methods::{
     self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, CorrectionsDiscs,
-    CorrectionsLookup, EventsSubscribe, EventsUnsubscribe, HistoryAlbum, HistoryAlbums,
-    HistoryArtist, HistoryArtists, HistoryExport, HistoryOnThisDay, HistoryRebuild, HistoryRecent,
-    HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones, IdentityDryRun, IdentityReview,
-    ImportsApply, ImportsDryRun, ImportsGet, ImportsList, ImportsStage, ImportsUndo, JobsCancel,
-    JobsGet, JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish,
-    LastfmSignInStart, LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySearch,
-    LibrarySetSettings, LibrarySetWatching, LibrarySettingsCall, LibraryStats, LinkCopiesCall,
-    LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall, ListClose,
-    ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet,
-    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
-    PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow,
-    RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerSetSettings,
-    ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks,
-    TracksGet,
+    CorrectionsGet, CorrectionsList, CorrectionsLookup, CorrectionsPreview, CorrectionsSummaryCall,
+    EventsSubscribe, EventsUnsubscribe, HistoryAlbum, HistoryAlbums, HistoryArtist, HistoryArtists,
+    HistoryExport, HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones,
+    HistoryStreamCall, HistoryTrack, HistoryZones, IdentityDryRun, IdentityReview, ImportsApply,
+    ImportsDryRun, ImportsGet, ImportsList, ImportsStage, ImportsUndo, JobsCancel, JobsGet,
+    JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart,
+    LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySearch, LibrarySetSettings,
+    LibrarySetWatching, LibrarySettingsCall, LibraryStats, LinkCopiesCall, LinkInvite, LinkJoin,
+    LinkListen, LinkPing, LinkStatusCall, LinkTracksCall, ListClose, ListLocate, ListOpen,
+    ListSectionsCall, ListWindowCall, MediaTokenCall, Method, PlaybackGet, PlaybackJump,
+    PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet, PlaybackSkip,
+    PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove, QueueWindow, RatingsSet,
+    RecordDismiss, ScanStart, ServerBackup, ServerHello, ServerSetSettings, ServerSettingsCall,
+    ServerStatus, ServersList, SourcesAdd, SourcesList, SourcesTracks, TracksGet,
 };
 use ritornel_contract::{
     ART_SIZES, CONTRACT_VERSION, Descriptor, ErrorCode, Event, Frame, FreeDisk, HelloParams, Id,
@@ -964,6 +964,18 @@ impl Core {
             CorrectionsLookup::NAME => {
                 run::<CorrectionsLookup>(params, |params| self.corrections_lookup(stores, &params))
             }
+            CorrectionsSummaryCall::NAME => {
+                run::<CorrectionsSummaryCall>(params, |_| self.corrections_summary(stores))
+            }
+            CorrectionsList::NAME => {
+                run::<CorrectionsList>(params, |_| self.corrections_list(stores))
+            }
+            CorrectionsGet::NAME => {
+                run::<CorrectionsGet>(params, |params| self.corrections_get(stores, &params))
+            }
+            CorrectionsPreview::NAME => run::<CorrectionsPreview>(params, |params| {
+                self.corrections_preview(stores, &params)
+            }),
             ListOpen::NAME => {
                 run::<ListOpen>(params, |params| self.list_open(stores, session, params))
             }

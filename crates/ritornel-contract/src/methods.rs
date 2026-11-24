@@ -593,6 +593,25 @@ methods! {
     /// server built without MusicBrainz.
     CorrectionsLookup: "corrections.lookup", Command, needs_full: true,
     LookupParams => LookupDone;
+
+    /// `corrections.summary`: the open proposals counted, and whether the
+    /// library may be asked about.
+    CorrectionsSummaryCall: "corrections.summary", Query, needs_full: true,
+    NoParams => CorrectionsSummary;
+
+    /// `corrections.list`: every open proposal, by group.
+    CorrectionsList: "corrections.list", Query, needs_full: true,
+    NoParams => ProposalList;
+
+    /// `corrections.get`: one proposal whole: its files, what it rests on,
+    /// and the values a yes to each candidate would put on the files.
+    CorrectionsGet: "corrections.get", Query, needs_full: true,
+    ProposalGetParams => ProposalGot;
+
+    /// `corrections.preview`: what proposals, each with a candidate, would
+    /// change, as one: the albums now and after. It writes nothing.
+    CorrectionsPreview: "corrections.preview", Query, needs_full: true,
+    PreviewParams => PreviewShown;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -693,7 +712,11 @@ mod tests {
                 "server.settings",
                 "server.setSettings",
                 "corrections.discs",
-                "corrections.lookup"
+                "corrections.lookup",
+                "corrections.summary",
+                "corrections.list",
+                "corrections.get",
+                "corrections.preview"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -755,7 +778,11 @@ mod tests {
                 "server.settings",
                 "server.setSettings",
                 "corrections.discs",
-                "corrections.lookup"
+                "corrections.lookup",
+                "corrections.summary",
+                "corrections.list",
+                "corrections.get",
+                "corrections.preview"
             ]
         );
         // Everything but reading the library and controlling playback

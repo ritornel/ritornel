@@ -250,6 +250,7 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
             first_seen_ms,
             cover: covers.get(&id).map(|(_, picture)| *picture),
             facts: Facts::from_claims(claims.get(&id).map_or(&[], Vec::as_slice)),
+            held: Vec::new(),
             current: current.get(&id).copied(),
         });
     }

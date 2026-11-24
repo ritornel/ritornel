@@ -104,6 +104,11 @@ pub(crate) const LIBRARY: &[Migration] = &[
         name: "0010_lookup_replies",
         sql: include_str!("../migrations/library/0010_lookup_replies.sql"),
     },
+    Migration {
+        version: 11,
+        name: "0011_album_proposals",
+        sql: include_str!("../migrations/library/0011_album_proposals.sql"),
+    },
 ];
 
 /// What a run did.

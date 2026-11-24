@@ -148,6 +148,10 @@ export const METHODS = {
   "server.setSettings": { kind: "command", needsFull: true },
   "corrections.discs": { kind: "query", needsFull: true },
   "corrections.lookup": { kind: "command", needsFull: true },
+  "corrections.summary": { kind: "query", needsFull: true },
+  "corrections.list": { kind: "query", needsFull: true },
+  "corrections.get": { kind: "query", needsFull: true },
+  "corrections.preview": { kind: "query", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -239,6 +243,10 @@ export type MethodMap = {
   "server.setSettings": { params: SetServerSettingsParams; result: ServerSettingsSet };
   "corrections.discs": { params: DiscsParams; result: DiscList };
   "corrections.lookup": { params: LookupParams; result: LookupDone };
+  "corrections.summary": { params: NoParams; result: CorrectionsSummary };
+  "corrections.list": { params: NoParams; result: ProposalList };
+  "corrections.get": { params: ProposalGetParams; result: ProposalGot };
+  "corrections.preview": { params: PreviewParams; result: PreviewShown };
 };
 
 /** The name of a method. */
@@ -392,6 +400,40 @@ export type AlbumRef = { "type": "release_group",
    * The release.
    */
   id: string,
+};
+
+/**
+ * One album as a preview shows it.
+ */
+export type AlbumShape = {
+  /**
+   * The title its tile shows.
+   */
+  title?: string,
+  /**
+   * The credit its tile shows.
+   */
+  artist?: string,
+  /**
+   * Its kind.
+   */
+  primaryType?: string,
+  /**
+   * The year it first came out.
+   */
+  firstYear?: number,
+  /**
+   * How many releases it holds.
+   */
+  releases: number,
+  /**
+   * How many discs its fullest release has.
+   */
+  discs: number,
+  /**
+   * How many songs are on it.
+   */
+  songs: number,
 };
 
 /**
@@ -828,6 +870,20 @@ export type CatalogueAlbum = {
 };
 
 /**
+ * One proposal with the candidate to preview it with.
+ */
+export type Choice = {
+  /**
+   * The proposal.
+   */
+  proposalId: string,
+  /**
+   * The candidate, by its release group ID. Left out, the likeliest.
+   */
+  releaseGroup?: string,
+};
+
+/**
  * What sort of program a client is. It is for logs and for display, and
  * never decides access: the session does.
  */
@@ -872,6 +928,40 @@ export type CopyInUse = {
  * Which copy of a track a copy is.
  */
 export type CopyRole = "master" | "derived";
+
+/**
+ * The result of `corrections.summary`.
+ */
+export type CorrectionsSummary = {
+  /**
+   * The library revision it read.
+   */
+  libraryRevision: number,
+  /**
+   * Whether the library may be asked about at MusicBrainz.
+   */
+  lookups: boolean,
+  /**
+   * Open proposals.
+   */
+  open: number,
+  /**
+   * How many groups they make.
+   */
+  groups: number,
+  /**
+   * Of the open proposals, those whose likeliest candidate moves files.
+   */
+  moves: number,
+  /**
+   * Those that add a kind or a first year.
+   */
+  gains: number,
+  /**
+   * Those that add only an ID.
+   */
+  knows: number,
+};
 
 /**
  * One named count.
@@ -1360,6 +1450,43 @@ export type FileFacts = {
    * Its length in milliseconds, from the audio read.
    */
   durationMs?: number,
+};
+
+/**
+ * One tag value a yes would put on one file.
+ */
+export type FileValue = {
+  /**
+   * The file's ID.
+   */
+  fileId: string,
+  /**
+   * The root the file is in, by its name.
+   */
+  root: string,
+  /**
+   * The file, by its path under its root.
+   */
+  path: string,
+  /**
+   * The field, named as tags are read: `album`, `album_artist`,
+   * `mb_album_artist`, `disc_number`, `mb_release_group`,
+   * `primary_type` or `original_date`.
+   */
+  field: string,
+  /**
+   * Its position among the field's values, from 0.
+   */
+  ordinal: number,
+  /**
+   * The value, or nothing when the yes clears the field.
+   */
+  value?: string,
+  /**
+   * What the file says for it now, as the catalog reads it. Only from
+   * `corrections.preview`.
+   */
+  now?: string,
 };
 
 /**
@@ -4385,6 +4512,52 @@ export type Predicate = { "is": "by_artist",
 export type PredicateName = "by_artist" | "with_artist" | "no_record" | "all";
 
 /**
+ * The params of `corrections.preview`.
+ */
+export type PreviewParams = {
+  /**
+   * The proposals, each once with its candidate, previewed together as
+   * one. Choices whose values disagree for one field of one file are
+   * refused.
+   */
+  choices: Array<Choice>,
+};
+
+/**
+ * The result of `corrections.preview`: the albums the files are on now,
+ * with everything else on them, and the albums they would be on. Nothing
+ * is written.
+ */
+export type PreviewShown = {
+  /**
+   * The library revision it read.
+   */
+  libraryRevision: number,
+  /**
+   * The albums now.
+   */
+  now: Array<AlbumShape>,
+  /**
+   * The albums after.
+   */
+  after: Array<AlbumShape>,
+  /**
+   * How many songs would be joined into another: copies of one song,
+   * such as two editions' of it, that are two songs now and would be one.
+   */
+  songsJoined: number,
+  /**
+   * How many songs would be parted from one they are now: copies that
+   * are one song now and would be two.
+   */
+  songsParted: number,
+  /**
+   * The values the choices would put on the files.
+   */
+  values: Array<FileValue>,
+};
+
+/**
  * What an event on the `progress` topic carries: where the playing entry
  * is, about once a second and at once on a change. The client carries
  * the position on from when the event arrived.
@@ -4402,6 +4575,159 @@ export type ProgressEvent = {
    * Whether it is playing.
    */
   playing: boolean,
+};
+
+/**
+ * One proposal: that one disc of the library is one album.
+ */
+export type Proposal = {
+  /**
+   * Its ID. Worked out again, the same proposal keeps it.
+   */
+  proposalId: string,
+  /**
+   * Its kind: `album`.
+   */
+  kind: string,
+  /**
+   * The proposal its group is named by. Proposals about the same album
+   * share it, and are shown and answered together.
+   */
+  groupId: string,
+  /**
+   * The root its folder is in, by its name.
+   */
+  root: string,
+  /**
+   * The folder, by its path under its root.
+   */
+  folder: string,
+  /**
+   * How many files it is about.
+   */
+  fileCount: number,
+  /**
+   * Its candidates, the likeliest first.
+   */
+  candidates: Array<ProposalCandidate>,
+  /**
+   * A digest of all of it, which a yes names.
+   */
+  fingerprint: string,
+  /**
+   * The files, by their paths. Only from `corrections.get`.
+   */
+  files: Array<string>,
+  /**
+   * What it rests on. Only from `corrections.get`.
+   */
+  restsOn: Array<ProposalEvidence>,
+};
+
+/**
+ * An album a proposal's disc may be on.
+ */
+export type ProposalCandidate = {
+  /**
+   * Its MusicBrainz release group ID.
+   */
+  releaseGroup: string,
+  /**
+   * Its title.
+   */
+  title?: string,
+  /**
+   * Who it is credited to.
+   */
+  artist: string,
+  /**
+   * Its kind, such as `Album`.
+   */
+  primaryType?: string,
+  /**
+   * The year it first came out.
+   */
+  firstYear?: number,
+  /**
+   * How many of the replies' releases are of it.
+   */
+  releases: number,
+  /**
+   * What a yes would change.
+   */
+  change: ProposalChange,
+  /**
+   * The values a yes would put on the files. Only from
+   * `corrections.get`; empty in a list.
+   */
+  values: Array<FileValue>,
+};
+
+/**
+ * What a yes to a candidate would change, worked out cheaply. A preview
+ * says exactly.
+ */
+export type ProposalChange = "knows" | "gains" | "moves";
+
+/**
+ * What a proposal rests on: one disc, by its layout and the reply about it.
+ */
+export type ProposalEvidence = {
+  /**
+   * The disc ID.
+   */
+  discId: string,
+  /**
+   * How its layout was found.
+   */
+  methods: Array<LayoutMethod>,
+  /**
+   * How many releases the current reply about it names.
+   */
+  releases: number,
+  /**
+   * When that reply came, as Unix milliseconds.
+   */
+  repliedAtMs: number,
+};
+
+/**
+ * The params of `corrections.get`.
+ */
+export type ProposalGetParams = {
+  /**
+   * The proposal.
+   */
+  proposalId: string,
+};
+
+/**
+ * The result of `corrections.get`.
+ */
+export type ProposalGot = {
+  /**
+   * The library revision it read.
+   */
+  libraryRevision: number,
+  /**
+   * The proposal, whole.
+   */
+  proposal: Proposal,
+};
+
+/**
+ * The result of `corrections.list`: every open proposal, by group, then
+ * root and folder.
+ */
+export type ProposalList = {
+  /**
+   * The library revision it read.
+   */
+  libraryRevision: number,
+  /**
+   * Each proposal, without its files, evidence or values.
+   */
+  proposals: Array<Proposal>,
 };
 
 /**

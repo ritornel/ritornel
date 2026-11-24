@@ -160,6 +160,12 @@ fn disc_of_folder(name: &str) -> Option<i64> {
     marker(rest).or_else(|| disc_in_title(name).map(|(_, disc)| disc))
 }
 
+/// Whether a value holds this field of the item, which the disc rules
+/// then leave as it is.
+fn holds(item: &crate::library::Item, field: &str) -> bool {
+    item.held.contains(&field)
+}
+
 /// The library with the disc numbers the switches imply, or `None` when
 /// neither is on.
 pub(crate) fn apply(library: &Library, policy: &Policy) -> Option<Library> {
@@ -191,23 +197,31 @@ pub(crate) fn apply_with_probes(
                 conflicts(item.facts.disc, disc).then_some(album)
             })
             .collect();
-        let apply_title = |facts: &mut Facts| {
+        let apply_title = |facts: &mut Facts, keep_title: bool, keep_disc: bool| {
             if let Some(album) = facts.album.as_deref()
                 && !contradicted.contains(album)
                 && let Some((title, disc)) = disc_in_title(album)
                 && !conflicts(facts.disc, disc)
             {
-                facts.album = Some(title);
-                facts.disc = Some(disc);
+                if !keep_title {
+                    facts.album = Some(title);
+                }
+                if !keep_disc {
+                    facts.disc = Some(disc);
+                }
             }
         };
+        // A held title or disc number is left as it is.
         for item in &mut implied.items {
-            apply_title(&mut item.facts);
+            let (title, disc) = (holds(item, "album"), holds(item, "disc_number"));
+            if !(title && disc) {
+                apply_title(&mut item.facts, title, disc);
+            }
         }
         // A replacement's disc tag affects only its own title. It cannot
         // veto a different replacement being judged in the same scan.
         for facts in probes {
-            apply_title(facts);
+            apply_title(facts, false, false);
         }
     }
     if policy.discs_from_folders {
@@ -301,8 +315,12 @@ fn folder_discs(library: &mut Library, policy: &Policy) {
         }
         for ((_, folder), named) in list.iter().zip(&named) {
             let Some(disc) = named else { continue };
+            // A held disc number is left as it is; its file still counted
+            // as evidence above.
             for index in &folder.items {
-                if let Some(item) = library.items.get_mut(*index) {
+                if let Some(item) = library.items.get_mut(*index)
+                    && !holds(item, "disc_number")
+                {
                     item.facts.disc = Some(*disc);
                 }
             }
