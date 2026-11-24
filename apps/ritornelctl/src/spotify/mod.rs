@@ -289,22 +289,21 @@ mod tests {
 
     use super::*;
 
-    /// A folder of its own for a test, removed when it ends.
-    struct Scratch(std::path::PathBuf);
+    /// A folder of its own for a test, always new, removed when it ends.
+    struct Scratch(tempfile::TempDir);
 
     impl Scratch {
         fn new(name: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("ritornelctl-spotify-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(
+                tempfile::Builder::new()
+                    .prefix(&format!("ritornelctl-spotify-{name}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
-    }
 
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.0.path().join(name)
         }
     }
 
@@ -461,9 +460,9 @@ mod tests {
     #[test]
     fn a_zip_and_its_folder_read_the_same() {
         let scratch = Scratch::new("same");
-        let zip = scratch.0.join("my_spotify_data.zip");
+        let zip = scratch.join("my_spotify_data.zip");
         zip_of(&zip, &files());
-        let folder = scratch.0.join("unpacked");
+        let folder = scratch.join("unpacked");
         folder_of(&folder, &files());
         let from_zip = read(&zip).unwrap();
         let from_folder = read(&folder).unwrap();
@@ -476,7 +475,7 @@ mod tests {
     #[test]
     fn no_marked_value_reaches_what_is_kept_or_printed() {
         let scratch = Scratch::new("marks");
-        let zip = scratch.0.join("history.zip");
+        let zip = scratch.join("history.zip");
         zip_of(&zip, &files());
         let read = read(&zip).unwrap();
         let kept = serde_json::to_string(&read.streams).unwrap();
@@ -528,7 +527,7 @@ mod tests {
             wrong
         ]))
         .unwrap();
-        let zip = scratch.0.join("history.zip");
+        let zip = scratch.join("history.zip");
         zip_of(&zip, &[("Streaming_History_Audio_2019.json", file)]);
         let printed = command(&zip, false);
         assert!(
@@ -565,7 +564,7 @@ mod tests {
     #[test]
     fn a_damaged_file_of_the_history_is_said_and_never_passed_over() {
         let scratch = Scratch::new("damaged");
-        let zip = scratch.0.join("history.zip");
+        let zip = scratch.join("history.zip");
         zip_of(&zip, &files());
         // Break the second file's own header, which the archive's list of
         // names does not depend on.
@@ -587,7 +586,7 @@ mod tests {
     #[test]
     fn the_account_data_and_anything_else_are_refused_by_name() {
         let scratch = Scratch::new("refused");
-        let account = scratch.0.join("account.zip");
+        let account = scratch.join("account.zip");
         zip_of(
             &account,
             &[(
@@ -601,13 +600,13 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains("MARKED"));
-        let other = scratch.0.join("other.txt");
+        let other = scratch.join("other.txt");
         std::fs::write(&other, "MARKED").unwrap();
         assert_eq!(
             read(&other).unwrap_err().to_string(),
             "that is neither a folder nor a zip file"
         );
-        let empty = scratch.0.join("empty");
+        let empty = scratch.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         assert!(matches!(read(&empty), Err(archive::Error::NoHistory)));
     }
@@ -615,7 +614,7 @@ mod tests {
     #[test]
     fn what_was_read_is_printed_as_counts() {
         let scratch = Scratch::new("printed");
-        let zip = scratch.0.join("history.zip");
+        let zip = scratch.join("history.zip");
         zip_of(&zip, &files());
         let printed = command(&zip, false);
         for line in [
