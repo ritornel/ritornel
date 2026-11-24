@@ -53,8 +53,6 @@ pub(crate) struct Tracks {
     /// The record's cover, for a song carried to Up next to show: an
     /// album's songs have it, an artist's have none.
     pub art: Option<std::sync::Arc<gpui::RenderImage>>,
-    /// Timer driving the 13 px playing equalizer at ~30 Hz while playing.
-    eq_tick: Option<Task<()>>,
     _player: Subscription,
 }
 
@@ -77,7 +75,6 @@ impl Tracks {
             marked: std::rc::Rc::default(),
             menued: None,
             art: None,
-            eq_tick: None,
             _player: followed,
         }
     }
@@ -547,21 +544,8 @@ impl Render for Tracks {
                 }
             }
         }
-        if animating && !crate::platform::reduce_motion() {
-            if self.eq_tick.is_none() {
-                self.eq_tick = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(33))
-                        .await;
-                    this.update(cx, |tracks, cx| {
-                        tracks.eq_tick = None;
-                        cx.notify();
-                    })
-                    .ok();
-                }));
-            }
-        } else {
-            self.eq_tick = None;
+        if animating {
+            window.request_animation_frame();
         }
         list
     }

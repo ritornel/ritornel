@@ -17,13 +17,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui::{
     Bounds, BoxShadow, Context, DragMoveEvent, Entity, FontWeight, Hsla, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ObjectFit, ParentElement, Pixels, Render,
     RenderImage, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, StyledImage,
-    Subscription, Task, Window, canvas, div, img, prelude::FluentBuilder, px,
+    Subscription, Window, canvas, div, img, prelude::FluentBuilder, px,
 };
 use ritornel_contract::{Id, QueueEntry, QueuePlace, Repeat, TrackSummary};
 
@@ -58,8 +58,6 @@ const RADIUS: f32 = 16.;
 const ARRIVED_MS: f32 = 1400.;
 /// Covers kept beyond what the queue currently shows before pruning.
 const MAX_PICTURES: usize = 64;
-/// Cadence for the 13 px equalizer bars while playing (~30 Hz).
-const EQ_TICK: Duration = Duration::from_millis(33);
 
 /// The player state `UpNextCard` displays, so 250 ms progress ticks that do
 /// not change any visible field do not trigger full card rebuilds or art checks.
@@ -198,8 +196,6 @@ pub(crate) struct UpNextCard {
     /// none`, and one shown by a hover that changed after that would be
     /// painted unprepared.
     hovered: Option<usize>,
-    /// Timer driving the 13 px equalizer bars while playing.
-    eq_tick: Option<Task<()>>,
     /// Lying over the page, in a narrow window: the bigger shadow.
     pub over: bool,
     /// Over a colour the page borrows: a thinner fill.
@@ -255,7 +251,6 @@ impl UpNextCard {
             scroll: ScrollHandle::new(),
             star: None,
             hovered: None,
-            eq_tick: None,
             over: false,
             washed: false,
             _link: session,
@@ -816,8 +811,7 @@ impl Render for UpNextCard {
         if !carrying {
             self.target = None;
         }
-        let eq_moving = now.is_some() && playing && !crate::platform::reduce_motion();
-        let mut animating = false;
+        let mut animating = now.is_some() && playing && !crate::platform::reduce_motion();
 
         // Songs just added, in the accent for a moment.
         let arrived = match self.fresh_since {
@@ -992,21 +986,7 @@ impl Render for UpNextCard {
             css_shadow(10., 30., gpui::rgba(0x00000033))
         };
         if animating {
-            self.eq_tick = None;
             window.request_animation_frame();
-        } else if eq_moving {
-            if self.eq_tick.is_none() {
-                self.eq_tick = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(EQ_TICK).await;
-                    this.update(cx, |card, cx| {
-                        card.eq_tick = None;
-                        cx.notify();
-                    })
-                    .ok();
-                }));
-            }
-        } else {
-            self.eq_tick = None;
         }
         let height = f32::from(window.viewport_size().height) - TOP - BOTTOM;
 
@@ -1224,6 +1204,8 @@ fn take_picture(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use gpui::AppContext;
 
     use super::*;
