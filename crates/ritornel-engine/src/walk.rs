@@ -46,15 +46,16 @@ pub(crate) struct Walked {
     /// docs/internals/corrections.md.
     pub(crate) sidecars: Vec<Seen>,
     /// Files and folders passed over, with why: a name that is not UTF-8,
-    /// or a folder the server may not read.
+    /// a folder the server may not read, or one inside itself.
     pub(crate) skipped: Vec<(String, &'static str)>,
-    /// The folders the server may not read, relative to the root, in the
-    /// order of their paths. What was known in them is not taken for gone.
+    /// The folders the walk did not go into, relative to the root, in the
+    /// order of their paths: those the server may not read, and those inside
+    /// themselves. What was known in them is not taken for gone.
     pub(crate) unreadable: Vec<String>,
     /// Which folder the root was when it was walked: its device and inode,
     /// or on Windows its volume's serial number and its file index. An
     /// unmounted disk leaves another folder at the same path.
-    pub(crate) root_id: (u64, u64),
+    pub(crate) root_id: FolderId,
 }
 
 /// Which folder is at `path` now, if one is: its device and inode, or on
@@ -118,7 +119,7 @@ fn unreadable(walked: &mut Walked, rel: &str) {
 }
 
 /// A folder's identity, as [`folder_id`] gives it.
-type FolderId = Option<(u64, u64)>;
+type FolderId = (u64, u64);
 
 /// Lists the folder `dir`, at `rel` under the root: its audio files and
 /// images go into `walked`, and the folders in it are returned, to be
@@ -230,12 +231,12 @@ fn walk_tree(
     root: &Path,
     walked: &mut Walked,
     stop: &AtomicBool,
-    id_of: &dyn Fn(&Path) -> FolderId,
+    id_of: &dyn Fn(&Path) -> Option<FolderId>,
 ) -> Result<(), Error> {
     // Each folder still to list, with how deep it is; and the identity of
     // each folder on the way down to the one being listed.
     let mut todo = vec![(root.to_owned(), String::new(), 0)];
-    let mut way: Vec<FolderId> = Vec::new();
+    let mut way: Vec<Option<FolderId>> = Vec::new();
     while let Some((dir, rel, depth)) = todo.pop() {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -248,7 +249,10 @@ fn walk_tree(
         } else {
             id_of(&dir)
         };
+        // Not gone into, and what was known in it is kept, as in a folder
+        // that cannot be read: its files may well still be there.
         if here.is_some() && way.contains(&here) {
+            walked.unreadable.push(rel.clone());
             walked.skipped.push((rel, "the folder is inside itself"));
             continue;
         }
@@ -274,7 +278,7 @@ pub(crate) fn walk(root: &Path, stop: &AtomicBool) -> Result<Walked, Error> {
 fn walk_by(
     root: &Path,
     stop: &AtomicBool,
-    id_of: &dyn Fn(&Path) -> FolderId,
+    id_of: &dyn Fn(&Path) -> Option<FolderId>,
 ) -> Result<Walked, Error> {
     let offline = || Error::RootOffline {
         path: root.to_owned(),
@@ -444,28 +448,51 @@ mod tests {
     fn a_folder_that_is_one_it_is_inside_is_passed_over() {
         let scratch = Scratch::new();
         let root = scratch.path();
-        for path in ["a/01.flac", "a/loop/02.flac", "b/loop/03.flac"] {
+        let files = [
+            "a/01.flac",
+            "a/loop/02.flac",
+            "b/c/03.flac",
+            "b/c/up/04.flac",
+            "b/loop/05.flac",
+            "n/m/06.flac",
+        ];
+        for path in files {
             let path = root.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"12345").unwrap();
         }
-        // As a bind mount of the root inside it would: `a/loop` is the
-        // root again. `b/loop` is only another folder with the same name.
-        let looped = root.join("a/loop");
+        // As bind mounts would make them: `a/loop` is the root again, and
+        // `b/c/up` is `b`. `b/loop` is only another folder of the name, and
+        // `n` and `n/m` have no identity, which proves nothing.
+        let ids = [
+            ("", Some((1, 1))),
+            ("a", Some((1, 2))),
+            ("a/loop", Some((1, 1))),
+            ("b", Some((1, 3))),
+            ("b/c", Some((1, 4))),
+            ("b/c/up", Some((1, 3))),
+            ("b/loop", Some((1, 5))),
+            ("n", None),
+            ("n/m", None),
+        ];
         let id_of = |path: &Path| {
-            Some(if path == root || path == looped {
-                (1, 1)
-            } else {
-                (1, path.as_os_str().len() as u64)
-            })
+            ids.iter()
+                .find(|(rel, _)| under(root, rel) == path)
+                .and_then(|(_, id)| *id)
         };
         let walked = walk_by(root, &AtomicBool::new(false), &id_of).unwrap();
         let paths: Vec<&str> = walked.files.iter().map(|seen| seen.path.as_str()).collect();
-        assert_eq!(paths, ["a/01.flac", "b/loop/03.flac"]);
+        assert_eq!(
+            paths,
+            ["a/01.flac", "b/c/03.flac", "b/loop/05.flac", "n/m/06.flac"]
+        );
+        let inside = "the folder is inside itself";
         assert_eq!(
             walked.skipped,
-            [("a/loop".to_owned(), "the folder is inside itself")]
+            [("a/loop".to_owned(), inside), ("b/c/up".to_owned(), inside)]
         );
+        // What a scan knew in them is not taken for gone.
+        assert_eq!(walked.unreadable, ["a/loop", "b/c/up"]);
     }
 
     #[test]
