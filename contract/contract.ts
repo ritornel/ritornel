@@ -10,7 +10,7 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 3;
+export const CONTRACT_VERSION = 4;
 
 /** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
@@ -144,6 +144,7 @@ export const METHODS = {
   "link.ping": { kind: "session", needsFull: true },
   "server.settings": { kind: "query", needsFull: true },
   "server.setSettings": { kind: "command", needsFull: true },
+  "corrections.discs": { kind: "query", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -231,6 +232,7 @@ export type MethodMap = {
   "link.ping": { params: LinkPingParams; result: LinkPinged };
   "server.settings": { params: NoParams; result: ServerSettings };
   "server.setSettings": { params: SetServerSettingsParams; result: ServerSettingsSet };
+  "corrections.discs": { params: DiscsParams; result: DiscList };
 };
 
 /** The name of a method. */
@@ -945,6 +947,103 @@ export type Descriptor = {
  * The hardware the sound came out of.
  */
 export type DeviceKind = "computer" | "phone" | "tablet" | "watch" | "speaker" | "tv" | "car" | "console" | "group" | "other";
+
+/**
+ * One layout of one folder's files: one CD, as its sidecars give it.
+ */
+export type Disc = {
+  /**
+   * The root the folder is in, by its name.
+   */
+  root: string,
+  /**
+   * The folder, by its path under its root: empty for the root.
+   */
+  folder: string,
+  /**
+   * The MusicBrainz disc ID the layout gives.
+   */
+  discId: string,
+  /**
+   * How many tracks it has.
+   */
+  tracks: number,
+  /**
+   * How long it is, in CD sectors.
+   */
+  sectors: number,
+  /**
+   * Each way it was found, in the order found.
+   */
+  methods: Array<LayoutMethod>,
+  /**
+   * Whether the layout may not be the disc's: a CUE sheet that disagrees
+   * with the CDDB ID it prints.
+   */
+  provisional: boolean,
+  /**
+   * Whether one file holds the whole disc.
+   */
+  wholeFile: boolean,
+  /**
+   * Whether every track was matched to one file by its length.
+   */
+  matched: boolean,
+  /**
+   * The file at each position, when one folder was asked for. Empty
+   * otherwise.
+   */
+  files: Array<DiscFile>,
+};
+
+/**
+ * One file at one position of a disc.
+ */
+export type DiscFile = {
+  /**
+   * The track's position on the disc, from 1, or 0 for a file that holds
+   * the whole disc.
+   */
+  position: number,
+  /**
+   * The file, by its path under its root.
+   */
+  path: string,
+};
+
+/**
+ * The result of `corrections.discs`.
+ */
+export type DiscList = {
+  /**
+   * The library revision it read.
+   */
+  libraryRevision: number,
+  /**
+   * How many folders hold audio, of those asked about.
+   */
+  folders: number,
+  /**
+   * How many of those have at least one layout that is not provisional.
+   */
+  withLayout: number,
+  /**
+   * Each layout, by root, folder and disc ID.
+   */
+  discs: Array<Disc>,
+};
+
+/**
+ * The params of `corrections.discs`.
+ */
+export type DiscsParams = {
+  /**
+   * One folder, by its path under its root, with `/` between its parts.
+   * Its discs come with the file at each position. Left out, every
+   * disc of the library comes, without its files.
+   */
+  folder?: string,
+};
 
 /**
  * The params of `record.dismiss`.
@@ -2615,6 +2714,11 @@ export type LastfmSyncStarted = {
    */
   revision?: number,
 };
+
+/**
+ * How a disc's layout was found.
+ */
+export type LayoutMethod = "log" | "cue" | "renamed_cue" | "accuraterip" | "cddb";
 
 /**
  * What kind of change a library write made, for a client deciding what to

@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
+use ritornel_domain::layout;
+
 use crate::Error;
 use crate::media::is_folder_image;
 
@@ -38,6 +40,11 @@ pub(crate) struct Walked {
     /// Each folder's own images, by the folder's path relative to the
     /// root, in the order of their names.
     pub(crate) images: BTreeMap<String, Vec<Seen>>,
+    /// Every file that may be a sidecar, by its name and size, in the order
+    /// of their paths: a rip log, a CUE sheet, a checksum report, or a text
+    /// file that may be a rip log. See "Disc layouts" in
+    /// docs/internals/corrections.md.
+    pub(crate) sidecars: Vec<Seen>,
     /// Files and folders passed over, with why: a name that is not UTF-8,
     /// or a folder the server may not read.
     pub(crate) skipped: Vec<(String, &'static str)>,
@@ -99,6 +106,7 @@ fn unreadable(walked: &mut Walked, rel: &str) {
             .is_some_and(|rest| rest.starts_with('/'))
     };
     walked.files.retain(|seen| !inside(&seen.path));
+    walked.sidecars.retain(|seen| !inside(&seen.path));
     walked
         .images
         .retain(|folder, _| folder != rel && !inside(folder));
@@ -193,6 +201,8 @@ fn walk_into(dir: &Path, rel: &str, walked: &mut Walked, stop: &AtomicBool) -> R
             walked.files.push(seen);
         } else if is_folder_image(name) {
             walked.images.entry(rel.to_owned()).or_default().push(seen);
+        } else if layout::kind(name).is_some() && seen.size <= layout::SIDECAR_MAX_BYTES {
+            walked.sidecars.push(seen);
         }
     }
     Ok(())
@@ -219,6 +229,7 @@ pub(crate) fn walk(root: &Path, stop: &AtomicBool) -> Result<Walked, Error> {
         return Err(offline());
     }
     walked.files.sort_by(|a, b| a.path.cmp(&b.path));
+    walked.sidecars.sort_by(|a, b| a.path.cmp(&b.path));
     walked.unreadable.sort();
     walked.skipped.sort();
     for images in walked.images.values_mut() {
@@ -241,6 +252,9 @@ mod tests {
             "b/01.MP3",
             "b/cover.jpg",
             "b/notes.txt",
+            "b/rip.LOG",
+            "b/misc/album.cue",
+            "a/big.cue",
             "b/.hidden.flac",
             "a/deep/er/01.ogg",
             "a/Folder.PNG",
@@ -273,6 +287,15 @@ mod tests {
             })
             .collect();
         assert_eq!(images, [("a", "a/Folder.PNG"), ("b", "b/cover.jpg")]);
+        let sidecars: Vec<&str> = walked
+            .sidecars
+            .iter()
+            .map(|seen| seen.path.as_str())
+            .collect();
+        assert_eq!(
+            sidecars,
+            ["a/big.cue", "b/misc/album.cue", "b/notes.txt", "b/rip.LOG"]
+        );
         assert_eq!(folder_of("a/deep/er/01.ogg"), "a/deep/er");
         assert_eq!(folder_of("top.wav"), "");
     }

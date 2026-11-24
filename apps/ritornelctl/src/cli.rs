@@ -12,6 +12,7 @@
 //! ritornelctl jobs [<job>] [--cancel] [--data-dir <dir>] [--json]
 //! ritornelctl identity re-resolve --dry-run [--detail] [<policy values>] [--data-dir <dir>] [--json]
 //! ritornelctl identity review [--data-dir <dir>] [--json]
+//! ritornelctl corrections discs [<folder>] [--data-dir <dir>] [--json]
 //! ritornelctl play <folder | track>... [--album <release>] [--start <n>] [--follow]
 //! ritornelctl pause | resume | stop | next | previous | now | queue
 //! ritornelctl seek <position>
@@ -57,8 +58,8 @@ use ritornel_client::contract::SkipDirection;
 use ritornel_client::contract::local::Env;
 
 use crate::{
-    artists, backup, export, history, identity, jobs, lastfm, library, link, playback, scan,
-    settings, spotify, status,
+    artists, backup, corrections, export, history, identity, jobs, lastfm, library, link, playback,
+    scan, settings, spotify, status,
 };
 
 const USAGE: &str = "\
@@ -78,6 +79,7 @@ Usage:
   ritornelctl identity re-resolve --dry-run [--detail] [<policy values>]
                                   [--data-dir <dir>] [--json]
   ritornelctl identity review [--data-dir <dir>] [--json]
+  ritornelctl corrections discs [<folder>] [--data-dir <dir>] [--json]
   ritornelctl play <folder | track>... [--album <release>] [--start <n>]
                    [--follow] [--data-dir <dir>] [--json]
   ritornelctl pause | resume | stop | next | previous [--data-dir <dir>] [--json]
@@ -162,6 +164,12 @@ Commands:
   identity review  List the matches marked for review, grouped by cause:
                    each file, the one it nearly matched, the distance and
                    what made it up
+  corrections discs [<folder>]
+                   List the CD layouts read from the rip logs, CUE sheets
+                   and checksum reports beside the audio, each with its
+                   MusicBrainz disc ID and how it was found. With a
+                   folder, under its root, show that folder's alone, with
+                   the file at each track
   play             Play the scanned tracks in a folder, album by album in
                    disc and track order, or tracks by their IDs, or a
                    release with --album. It replaces the queue. The server
@@ -449,6 +457,8 @@ enum Command {
     Jobs(JobsArgs),
     #[command(subcommand)]
     Identity(IdentityCommand),
+    #[command(subcommand)]
+    Corrections(CorrectionsCommand),
     Play(PlayArgs),
     Pause(ServerArgs),
     Resume(ServerArgs),
@@ -775,6 +785,20 @@ enum LibraryCommand {
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
+enum CorrectionsCommand {
+    Discs(DiscsArgs),
+}
+
+/// What `corrections discs` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct DiscsArgs {
+    /// One folder, by its path under its root.
+    pub(crate) folder: Option<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+#[derive(Debug, PartialEq, Eq, Subcommand)]
 enum IdentityCommand {
     ReResolve(Box<ReResolveArgs>),
     Review(ServerArgs),
@@ -963,6 +987,9 @@ fn try_run(
             identity::re_resolve(&args, env, out)
         }
         Command::Identity(IdentityCommand::Review(args)) => identity::review(&args, env, out),
+        Command::Corrections(CorrectionsCommand::Discs(args)) => {
+            corrections::discs(&args, env, out)
+        }
         Command::Play(args) => playback::play(&args, env, out),
         Command::Pause(args) => playback::transport("pause", &args, env, out),
         Command::Resume(args) => playback::transport("resume", &args, env, out),

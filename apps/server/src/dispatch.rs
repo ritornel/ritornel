@@ -12,18 +12,18 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use ritornel_contract::methods::{
-    self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, EventsSubscribe,
-    EventsUnsubscribe, HistoryAlbum, HistoryAlbums, HistoryArtist, HistoryArtists, HistoryExport,
-    HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones, HistoryStreamCall,
-    HistoryTrack, HistoryZones, IdentityDryRun, IdentityReview, ImportsApply, ImportsDryRun,
-    ImportsGet, ImportsList, ImportsStage, ImportsUndo, JobsCancel, JobsGet, JobsList,
-    LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart, LastfmSignOut,
-    LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching, LibraryStats,
-    LinkCopiesCall, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall, LinkTracksCall,
-    ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall, MediaTokenCall, Method,
-    PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek,
-    PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove,
-    QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello,
+    self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, CorrectionsDiscs,
+    EventsSubscribe, EventsUnsubscribe, HistoryAlbum, HistoryAlbums, HistoryArtist, HistoryArtists,
+    HistoryExport, HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones,
+    HistoryStreamCall, HistoryTrack, HistoryZones, IdentityDryRun, IdentityReview, ImportsApply,
+    ImportsDryRun, ImportsGet, ImportsList, ImportsStage, ImportsUndo, JobsCancel, JobsGet,
+    JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish, LastfmSignInStart,
+    LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate, LibrarySearch, LibrarySetWatching,
+    LibraryStats, LinkCopiesCall, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall,
+    LinkTracksCall, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
+    MediaTokenCall, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume,
+    PlaybackSeek, PlaybackSet, PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove,
+    QueueRemove, QueueWindow, RatingsSet, RecordDismiss, ScanStart, ServerBackup, ServerHello,
     ServerSetSettings, ServerSettingsCall, ServerStatus, ServersList, SourcesAdd, SourcesList,
     SourcesTracks, TracksGet,
 };
@@ -938,6 +938,9 @@ impl Core {
                 run::<IdentityDryRun>(params, |params| self.identity_dry_run(stores, &params))
             }
             IdentityReview::NAME => run::<IdentityReview>(params, |_| self.identity_review(stores)),
+            CorrectionsDiscs::NAME => {
+                run::<CorrectionsDiscs>(params, |params| self.corrections_discs(stores, &params))
+            }
             ListOpen::NAME => {
                 run::<ListOpen>(params, |params| self.list_open(stores, session, params))
             }

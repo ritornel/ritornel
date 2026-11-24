@@ -38,6 +38,7 @@
 )]
 
 mod command;
+mod corrections;
 mod device;
 mod error;
 mod event;
@@ -66,6 +67,7 @@ mod ticket;
 mod typescript;
 
 pub use command::{LibraryCreateParams, LibraryCreated, Receipt, ReceiptStatus};
+pub use corrections::{Disc, DiscFile, DiscList, DiscsParams, LayoutMethod};
 pub use device::{DeviceKind, Platform, PlayedVia};
 pub use error::{ErrorCode, ErrorData, RpcError};
 pub use event::{
@@ -153,7 +155,7 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 /// one contract. A server refuses a client whose number is not its own,
 /// and a satellite refuses a hub of another ("Session and frames" in
 /// docs/internals/contract.md).
-pub const CONTRACT_VERSION: u32 = 3;
+pub const CONTRACT_VERSION: u32 = 4;
 
 /// The capability flags a server may list in its descriptor.
 pub mod capability {

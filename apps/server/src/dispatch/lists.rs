@@ -54,6 +54,9 @@ impl Fanout {
         let revision = revision(committed.revision);
         let sessions: Vec<Arc<Session>> = self.lock().values().filter_map(Weak::upgrade).collect();
         let changed = changes(committed.method);
+        if changed.is_empty() {
+            return;
+        }
         // Plays and ratings show only on songs, and order no list.
         let plays_only = matches!(
             changed.as_slice(),
@@ -78,13 +81,18 @@ impl Fanout {
     }
 }
 
-/// What kind of change a write made, by the method that made it. Adding a
+/// What kind of change a write made, by the method that made it: none, for
+/// a write that changes nothing shown, which sends no event. Adding a
 /// source adds a root and nothing in it. Taking in a listen and rebuilding
 /// history change plays and nothing else. Any other write does not yet
 /// say, so it is taken as every kind; a write of the resolver that moves a
 /// play with its file is among those.
 fn changes(method: &str) -> Vec<LibraryChange> {
-    if method == SourcesAdd::NAME {
+    // Sidecars and the disc layouts read from them are evidence: nothing
+    // shown reads them.
+    if method == ritornel_engine::SIDECARS_METHOD || method == ritornel_engine::LAYOUTS_METHOD {
+        Vec::new()
+    } else if method == SourcesAdd::NAME {
         vec![LibraryChange::Membership]
     } else if method == ritornel_engine::INGEST_METHOD || method == HistoryRebuild::NAME {
         vec![LibraryChange::Stats]
@@ -434,6 +442,22 @@ mod tests {
                 .map(|event| (event.view.as_str(), event.reorder))
                 .collect::<Vec<_>>(),
             [("albums", true), ("songs", true)]
+        );
+    }
+
+    #[test]
+    fn evidence_written_for_corrections_tells_no_one() {
+        let (session, fanout) = watching();
+        for (revision, method) in [
+            (9, ritornel_engine::SIDECARS_METHOD),
+            (10, ritornel_engine::LAYOUTS_METHOD),
+        ] {
+            fanout.changed(Committed { revision, method });
+        }
+        let (library, lists) = told(&session);
+        assert!(
+            library.is_empty() && lists.is_empty(),
+            "{library:?} {lists:?}"
         );
     }
 }

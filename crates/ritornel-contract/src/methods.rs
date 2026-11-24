@@ -568,6 +568,12 @@ methods! {
     /// linked server's.
     ServerSetSettings: "server.setSettings", Command, needs_full: true,
     SetServerSettingsParams => ServerSettingsSet;
+
+    /// `corrections.discs`: each disc layout the library's sidecars give:
+    /// every one, or one folder's with the file at each position. It names
+    /// paths, so it needs a `full` session.
+    CorrectionsDiscs: "corrections.discs", Query, needs_full: true,
+    DiscsParams => DiscList;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -664,7 +670,8 @@ mod tests {
                 "link.listen",
                 "link.ping",
                 "server.settings",
-                "server.setSettings"
+                "server.setSettings",
+                "corrections.discs"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");
@@ -722,7 +729,8 @@ mod tests {
                 "link.listen",
                 "link.ping",
                 "server.settings",
-                "server.setSettings"
+                "server.setSettings",
+                "corrections.discs"
             ]
         );
         // Everything but reading the library and controlling playback

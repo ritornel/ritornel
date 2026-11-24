@@ -17,6 +17,7 @@
 mod artists;
 mod backup;
 mod cli;
+mod corrections;
 mod export;
 mod history;
 mod identity;
