@@ -548,11 +548,17 @@ impl Wall {
                     batch.push(more);
                 }
                 let alive = this.update(cx, |wall, cx| {
+                    let expected_px = wall.wants.as_ref().map_or(0, |sender| sender.borrow().px);
                     for arrived in batch {
                         let frame = wall.frame;
                         let in_view = &wall.in_view;
-                        wall.covers
-                            .land(arrived, |art| in_view.contains(&art), frame, cx);
+                        wall.covers.land(
+                            arrived,
+                            expected_px,
+                            |art| in_view.contains(&art),
+                            frame,
+                            cx,
+                        );
                     }
                     cx.notify();
                 });
@@ -1795,15 +1801,17 @@ impl Wall {
     }
 
     /// What is wanted, most wanted first: where the flick will rest, what
-    /// is in view, the way between, and a screen past it.
-    fn regions(&self, viewport: f32, now: Instant) -> Vec<(f32, f32)> {
+    /// is in view, the way between, and a screen past it. The flag marks
+    /// regions currently in view so the look-ahead working-set cap never
+    /// excludes visible tiles.
+    fn regions(&self, viewport: f32, now: Instant) -> Vec<(f32, f32, bool)> {
         let max = (self.content_height() - viewport).max(0.);
         let velocity = self.motion.velocity(now);
         let throw = self.motion.throw(now);
         let rest = (self.top + throw).clamp(0., max);
         let mut regions = Vec::new();
         if velocity.abs() > 600. && (rest - self.top).abs() > viewport * 0.5 {
-            regions.push((rest, rest + viewport));
+            regions.push((rest, rest + viewport, false));
         }
         // What is in view, leading edge first, as it stays longest; but not
         // above 6,000 points a second, when a screen passes in a sixth of
@@ -1812,11 +1820,11 @@ impl Wall {
         if velocity.abs() <= 6000. || regions.is_empty() {
             let half = self.top + viewport * 0.5;
             if velocity < 0. {
-                regions.push((self.top, half));
-                regions.push((half, self.top + viewport));
+                regions.push((self.top, half, true));
+                regions.push((half, self.top + viewport, true));
             } else {
-                regions.push((half, self.top + viewport));
-                regions.push((self.top, half));
+                regions.push((half, self.top + viewport, true));
+                regions.push((self.top, half, true));
             }
         }
         let direction = if velocity < 0. { -1. } else { 1. };
@@ -1826,7 +1834,7 @@ impl Wall {
             } else {
                 (rest + viewport, self.top)
             };
-            regions.push((from, to));
+            regions.push((from, to, false));
         }
         // A screen on in the direction of travel, and half one behind.
         let ahead = if direction > 0. {
@@ -1837,13 +1845,14 @@ impl Wall {
         regions.push((
             ahead.min(rest),
             ahead.max(rest) + if direction > 0. { viewport } else { 0. },
+            false,
         ));
         let behind = if direction > 0. {
             self.top - viewport * 0.5
         } else {
             self.top + viewport
         };
-        regions.push((behind, behind + viewport * 0.5));
+        regions.push((behind, behind + viewport * 0.5, false));
         regions
     }
 
@@ -1852,11 +1861,12 @@ impl Wall {
             return;
         };
         let regions = self.regions(viewport, now);
+        let moving = self.motion.moving(now, Duration::from_secs(3)) || self.fling.is_some();
         let capacity = (self.covers_capacity(px) * 4 / 5).max(32);
         let mut ids = Vec::new();
         let mut wanted = HashSet::new();
         let mut pages = Vec::new();
-        for (from, to) in regions {
+        for (from, to, visible) in regions {
             let lines = layout.lines_between(from - HEADER, to - HEADER);
             // Nearest the start of the region first, in the direction it is read.
             for line in &lines {
@@ -1866,15 +1876,20 @@ impl Wall {
                     }
                 }
                 for index in line.first..line.first + line.count {
-                    if ids.len() >= capacity {
+                    if !visible && wanted.len() >= capacity {
                         break;
                     }
                     let Some(row) = self.row(index) else { continue };
                     let Some(art) = row.art else { continue };
-                    if self.covers.has(art, px)
-                        || self.covers.missing.contains(&art)
-                        || !wanted.insert(art)
-                    {
+                    if self.covers.missing.contains(&art) || !wanted.insert(art) {
+                        continue;
+                    }
+                    let cached = if moving {
+                        self.covers.touch(art, px, self.frame)
+                    } else {
+                        self.covers.has(art, px)
+                    };
+                    if cached {
                         continue;
                     }
                     ids.push(art);

@@ -8,10 +8,12 @@
 //!   then the way there in the direction of travel. The look-ahead is
 //!   simply the distance to the predicted rest, so it grows with speed.
 //! - **Stale requests are dropped.** The loader holds the latest list
-//!   only. A fetch whose cover has left the list is aborted, which closes
-//!   its connection, and the server drops the cover from its own queue if
-//!   it has not begun it. A fetched cover that is no longer wanted is kept
-//!   compressed and not decoded.
+//!   only. A fetch whose cover has left the list, or is wanted at other
+//!   pixels since the scale changed, is aborted, which closes its
+//!   connection, and the server drops the cover from its own queue if it
+//!   has not begun it. A fetched cover that is no longer wanted is kept
+//!   compressed and not decoded, and read again whenever it is wanted
+//!   again.
 //! - **Decoding is bounded**: a few threads at most, by a semaphore, and
 //!   each cover is resized there to the pixels it is drawn at.
 //! - **The caches are bounded**: decoded pixels by bytes, least recently
@@ -32,7 +34,7 @@ use ritornel_contract::Id;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::net::{Net, NoArt};
+use crate::net::{ArtHttp, Net, NoArt};
 
 /// Fetches at once. The server renders a cover on its own threads, newest
 /// first, when its size is not cached on disk yet.
@@ -133,11 +135,61 @@ impl Drop for FetchBag {
 }
 
 /// How a fetch for the wall ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Read {
-    /// The cover came, or it is not there, or it is no longer wanted.
-    Done,
+    /// The cover was sent to the wall, or it is not there.
+    Delivered,
+    /// It was read, but the wall had moved on before it was decoded: it is
+    /// kept compressed, and asked for again whenever it is wanted again.
+    Dropped,
     /// It could not be read this time.
     Failed,
+}
+
+/// What the loader holds back: covers sent while the wall still names
+/// them, and covers that could not be read.
+#[derive(Default)]
+struct Held {
+    /// Sent at these pixels: until the wall takes one in, its list still
+    /// names it.
+    delivered: HashSet<(Id, u32)>,
+    retries: Retries,
+}
+
+impl Held {
+    /// A fetch of `art` at `px` ended.
+    fn ended(&mut self, art: Id, px: u32, read: Read, now: Instant) {
+        match read {
+            Read::Delivered => {
+                self.retries.read(art);
+                self.delivered.insert((art, px));
+            }
+            Read::Dropped => self.retries.read(art),
+            Read::Failed => {
+                self.retries.failed(art, now);
+            }
+        }
+    }
+
+    /// Lets go of what the wall no longer names at the pixels it draws at:
+    /// it has taken those in, or moved on, and wanted again they are read
+    /// again.
+    fn settle(&mut self, wants: &Wants, wanted: &HashSet<Id>) {
+        self.delivered
+            .retain(|(art, px)| *px == wants.px && wanted.contains(art));
+    }
+
+    /// Whether `art` is not to be asked for at `px` yet.
+    fn holds(&self, art: Id, px: u32, now: Instant) -> bool {
+        self.delivered.contains(&(art, px)) || self.retries.waits(art, now)
+    }
+
+    /// When the first of `wants` that could not be read may be asked for
+    /// again: the wall says nothing new while it rests, so the loader wakes
+    /// itself then.
+    fn wake(&self, wants: &Wants, now: Instant) -> Option<Instant> {
+        self.retries.next(&wants.ids, now)
+    }
 }
 
 /// The first wait before a cover that could not be read is asked for again.
@@ -213,7 +265,8 @@ pub(crate) fn start(
     let (arrive, arrived) = unbounded();
     let counts = Arc::new(std::sync::Mutex::new(LoaderCounts::default()));
     let loader = Loader {
-        net: Arc::clone(&net),
+        art: Arc::clone(&net.art),
+        sizes: net.art_sizes.clone(),
         wanted,
         arrive,
         decode: decode_semaphore(),
@@ -225,7 +278,8 @@ pub(crate) fn start(
 }
 
 struct Loader {
-    net: Arc<Net>,
+    art: Arc<ArtHttp>,
+    sizes: Vec<u32>,
     wanted: watch::Receiver<Arc<Wants>>,
     arrive: UnboundedSender<Arrived>,
     decode: Arc<Semaphore>,
@@ -265,18 +319,16 @@ impl Compressed {
 
 impl Loader {
     async fn run(mut self) {
-        let mut tasks: JoinSet<(Id, Read)> = JoinSet::new();
-        let mut running: HashMap<Id, tokio::task::AbortHandle> = HashMap::new();
-        // Delivered a moment ago and not yet out of the wall's list.
-        let mut delivered: HashMap<Id, Instant> = HashMap::new();
-        // Could not be read: still wanted, they are asked for again later.
-        let mut retries = Retries::default();
+        let mut tasks: JoinSet<(Id, u32, Read)> = JoinSet::new();
+        // Each cover fetched, for the pixels it was asked at.
+        let mut running: HashMap<Id, (u32, tokio::task::AbortHandle)> = HashMap::new();
+        let mut held = Held::default();
         loop {
             let wants = Arc::clone(&self.wanted.borrow_and_update());
             let wanted: HashSet<Id> = wants.ids.iter().copied().collect();
-            // Stale: no longer wanted.
-            running.retain(|art, handle| {
-                let keep = wanted.contains(art);
+            // Stale: no longer wanted, or wanted at other pixels.
+            running.retain(|art, (px, handle)| {
+                let keep = *px == wants.px && wanted.contains(art);
                 if !keep {
                     handle.abort();
                     if let Ok(mut counts) = self.counts.lock() {
@@ -286,23 +338,18 @@ impl Loader {
                 keep
             });
             let now = Instant::now();
-            delivered.retain(|_, at| now.duration_since(*at) < Duration::from_millis(400));
+            held.settle(&wants, &wanted);
             for art in &wants.ids {
                 if running.len() >= MAX_FETCHES {
                     break;
                 }
-                if running.contains_key(art)
-                    || delivered.contains_key(art)
-                    || retries.waits(*art, now)
-                {
+                if running.contains_key(art) || held.holds(*art, wants.px, now) {
                     continue;
                 }
                 let handle = tasks.spawn(self.fetch(*art, wants.px));
-                running.insert(*art, handle);
+                running.insert(*art, (wants.px, handle));
             }
-            // The wall says nothing new while it rests: the loader wakes
-            // itself for the next cover to ask for again.
-            let again = retries.next(&wants.ids, now);
+            let again = held.wake(&wants, now);
             tokio::select! {
                 changed = self.wanted.changed() => {
                     if changed.is_err() {
@@ -313,19 +360,11 @@ impl Loader {
                 Some(done) = tasks.join_next_with_id(), if !tasks.is_empty() => {
                     // One aborted after it ended, for a cover asked for
                     // again since, says nothing of the fetch now running.
-                    if let Ok((id, (art, read))) = done
-                        && running.get(&art).is_some_and(|handle| handle.id() == id)
+                    if let Ok((id, (art, px, read))) = done
+                        && running.get(&art).is_some_and(|(_, handle)| handle.id() == id)
                     {
                         running.remove(&art);
-                        match read {
-                            Read::Done => {
-                                retries.read(art);
-                                delivered.insert(art, Instant::now());
-                            }
-                            Read::Failed => {
-                                retries.failed(art, Instant::now());
-                            }
-                        }
+                        held.ended(art, px, read, Instant::now());
                     }
                 }
                 () = sleep_until(again), if again.is_some() => {}
@@ -333,57 +372,64 @@ impl Loader {
         }
     }
 
-    fn fetch(&self, art: Id, px: u32) -> impl Future<Output = (Id, Read)> + Send + 'static {
-        let net = Arc::clone(&self.net);
+    fn fetch(&self, art: Id, px: u32) -> impl Future<Output = (Id, u32, Read)> + Send + 'static {
+        let http = Arc::clone(&self.art);
+        let sizes = self.sizes.clone();
         let decode = Arc::clone(&self.decode);
         let compressed = Arc::clone(&self.compressed);
         let arrive = self.arrive.clone();
         let wanted = self.wanted.clone();
+        let still_wanted = wanted.clone();
         let counts = Arc::clone(&self.counts);
+        // Whether the wall still wants it, at these pixels.
+        let still = move || {
+            let wants = still_wanted.borrow();
+            wants.px == px && wants.ids.contains(&art)
+        };
         async move {
-            let bucket = net.bucket(px);
+            let bucket = crate::net::bucket_in(&sizes, px);
             let key = (art, bucket);
             let held = compressed.lock().ok().and_then(|held| held.get(key));
             let bytes = match held {
                 Some(bytes) => bytes,
                 None => {
-                    let bytes = match net.art.get(art, bucket).await {
+                    let bytes = match http.get(art, bucket).await {
                         Ok(bytes) => bytes,
                         Err(NoArt::Missing) => {
                             let _ = arrive.unbounded_send(Arrived::Missing { art });
-                            return (art, Read::Done);
+                            return (art, px, Read::Delivered);
                         }
                         // Asked for again after a while (`Retries`).
-                        Err(NoArt::Failed) => return (art, Read::Failed),
+                        Err(NoArt::Failed) => return (art, px, Read::Failed),
                     };
-                    if let Ok(mut counts) = counts.lock() {
-                        counts.fetched += 1;
-                    }
                     let bytes = Arc::new(bytes);
                     if let Ok(mut held) = compressed.lock() {
                         held.put(key, Arc::clone(&bytes));
+                    }
+                    if let Ok(mut counts) = counts.lock() {
+                        counts.fetched += 1;
                     }
                     bytes
                 }
             };
             // Not square, and too short once cut square: once more, larger.
-            let larger = sharper(&bytes, px, bucket, &net.art_sizes)
+            let larger = sharper(&bytes, px, bucket, &sizes)
                 // Not if the wall has moved on meanwhile.
-                .filter(|_| wanted.borrow().ids.contains(&art));
+                .filter(|_| still());
             let bytes = match larger {
                 Some(larger) => {
                     let key = (art, larger);
                     let held = compressed.lock().ok().and_then(|held| held.get(key));
                     match held {
                         Some(bytes) => bytes,
-                        None => match net.art.get(art, larger).await {
+                        None => match http.get(art, larger).await {
                             Ok(again) => {
-                                if let Ok(mut counts) = counts.lock() {
-                                    counts.fetched += 1;
-                                }
                                 let again = Arc::new(again);
                                 if let Ok(mut held) = compressed.lock() {
                                     held.put(key, Arc::clone(&again));
+                                }
+                                if let Ok(mut counts) = counts.lock() {
+                                    counts.fetched += 1;
                                 }
                                 again
                             }
@@ -394,14 +440,14 @@ impl Loader {
                 None => bytes,
             };
             let Ok(permit) = Arc::clone(&decode).acquire_owned().await else {
-                return (art, Read::Done);
+                return (art, px, Read::Dropped);
             };
             // Waiting for a decoder, the wall may have moved on.
-            if !wanted.borrow().ids.contains(&art) {
+            if !still() {
                 if let Ok(mut counts) = counts.lock() {
                     counts.skipped_decode += 1;
                 }
-                return (art, Read::Done);
+                return (art, px, Read::Dropped);
             }
             let decoded = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
@@ -410,6 +456,10 @@ impl Loader {
             .await
             .ok()
             .flatten();
+            // A scale change may have landed while decoding on the blocking pool.
+            if wanted.borrow().px != px {
+                return (art, px, Read::Dropped);
+            }
             match decoded {
                 Some((image, color, size)) => {
                     if let Ok(mut counts) = counts.lock() {
@@ -427,7 +477,7 @@ impl Loader {
                     let _ = arrive.unbounded_send(Arrived::Missing { art });
                 }
             }
-            (art, Read::Done)
+            (art, px, Read::Delivered)
         }
     }
 }
@@ -679,14 +729,30 @@ impl Cache {
         self.ready.get(&art).map(|ready| Arc::clone(&ready.image))
     }
 
+    /// Marks `art` at `px` as recently wanted so eviction prefers covers outside
+    /// the current plan, returning whether it is already held at `px`.
+    pub(crate) fn touch(&mut self, art: Id, px: u32, frame: u64) -> bool {
+        let Some(ready) = self.ready.get_mut(&art) else {
+            return false;
+        };
+        if ready.px != px {
+            return false;
+        }
+        ready.used = frame;
+        true
+    }
+
     pub(crate) fn has(&self, art: Id, px: u32) -> bool {
         self.ready.get(&art).is_some_and(|ready| ready.px == px)
     }
 
-    /// Takes a cover in. `on_screen` says whether its tile is in view now.
+    /// Takes a cover in. `expected_px`, when nonzero, is the size the wall
+    /// currently draws at so a stale-scale completion cannot displace a sharp
+    /// cover. `on_screen` says whether its tile is in view now.
     pub(crate) fn land(
         &mut self,
         arrived: Arrived,
+        expected_px: u32,
         on_screen: impl Fn(Id) -> bool,
         frame: u64,
         cx: &mut App,
@@ -703,6 +769,10 @@ impl Cache {
                 bytes,
             } => {
                 self.colors.insert(art, color);
+                if expected_px > 0 && px != expected_px {
+                    cx.drop_image(image, None);
+                    return;
+                }
                 if let Some(old) = self.ready.remove(&art) {
                     self.bytes -= old.bytes;
                     cx.drop_image(old.image, None);
@@ -929,6 +999,300 @@ mod tests {
             assert!(peak.load(Ordering::SeqCst) <= limit);
             Ok(())
         })
+    }
+
+    #[test]
+    fn a_cover_sent_is_held_back_only_while_the_wall_names_it_at_those_pixels() {
+        let mut held = Held::default();
+        let (art, other) = (Id::from_bytes([3; 16]), Id::from_bytes([4; 16]));
+        let now = Instant::now();
+        let wants = |ids: &[Id], px| {
+            let wants = Wants {
+                ids: ids.to_vec(),
+                px,
+            };
+            let wanted = ids.iter().copied().collect::<HashSet<Id>>();
+            (wants, wanted)
+        };
+        held.ended(art, 64, Read::Delivered, now);
+        let (named, wanted) = wants(&[art, other], 64);
+        held.settle(&named, &wanted);
+        assert!(held.holds(art, 64, now));
+        // Wanted at other pixels, as after a change of scale: not held.
+        assert!(!held.holds(art, 200, now));
+        let (scaled, wanted) = wants(&[art], 200);
+        held.settle(&scaled, &wanted);
+        assert!(!held.holds(art, 64, now));
+        // Taken in, and so no longer named, then wanted again: read again.
+        held.ended(art, 64, Read::Delivered, now);
+        let (moved_on, wanted) = wants(&[other], 64);
+        held.settle(&moved_on, &wanted);
+        assert!(!held.holds(art, 64, now));
+        // Read, but the wall moved on before it was decoded: asked for
+        // again as soon as it is wanted again, as after scrolling back.
+        held.ended(other, 64, Read::Dropped, now);
+        assert!(!held.holds(other, 64, now));
+        assert_eq!(held.wake(&named, now), None);
+        // Not read: asked for again after a wait, which wakes the loader.
+        held.ended(other, 64, Read::Failed, now);
+        assert!(held.holds(other, 64, now));
+        assert_eq!(held.wake(&named, now), Some(now + RETRY_FIRST));
+    }
+
+    /// A JPEG `side` pixels square.
+    fn jpeg(side: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(side, side, image::Rgb([90, 30, 160]));
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 90)
+            .encode_image(&image)
+            .unwrap_or_default();
+        bytes
+    }
+
+    #[test]
+    fn a_cover_wanted_at_other_pixels_while_it_is_read_comes_at_those()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = listener.local_addr()?;
+            // Each request's path is told, and none is answered until
+            // `open` is.
+            let (asked, mut heard) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (open, opened) = watch::channel(false);
+            let server = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let asked = asked.clone();
+                    let mut opened = opened.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while let Ok(n) = socket.read(&mut chunk).await {
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                                continue;
+                            };
+                            let head = String::from_utf8_lossy(buf.get(..end).unwrap_or_default())
+                                .into_owned();
+                            buf.drain(..end + 4);
+                            let _ = asked.send(head);
+                            if opened.wait_for(|open| *open).await.is_err() {
+                                return;
+                            }
+                            let body = jpeg(256);
+                            let reply = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            );
+                            if socket.write_all(reply.as_bytes()).await.is_err()
+                                || socket.write_all(&body).await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            let (wants, wanted) = watch::channel(Arc::new(Wants::default()));
+            let (arrive, mut arrived) = unbounded();
+            let loader = Loader {
+                art: Arc::new(ArtHttp::at(endpoint)),
+                sizes: vec![64, 128, 256],
+                wanted,
+                arrive,
+                decode: Arc::new(Semaphore::new(2)),
+                compressed: Arc::new(std::sync::Mutex::new(Compressed::default())),
+                counts: Arc::default(),
+            };
+            tokio::spawn(loader.run());
+            let art = Id::from_bytes([7; 16]);
+            wants.send_replace(Arc::new(Wants {
+                ids: vec![art],
+                px: 64,
+            }));
+            let head = tokio::time::timeout(Duration::from_secs(60), heard.recv()).await?;
+            assert!(head.is_some_and(|head| head.contains("/64?")));
+            // The scale changes while it is read.
+            wants.send_replace(Arc::new(Wants {
+                ids: vec![art],
+                px: 200,
+            }));
+            open.send_replace(true);
+            loop {
+                let came = tokio::time::timeout(Duration::from_secs(60), arrived.next())
+                    .await
+                    .map_err(|_| "the cover never came at the pixels wanted now")?;
+                match came {
+                    Some(Arrived::Ready { px: 200, .. }) => break,
+                    Some(_) => {}
+                    None => return Err("the loader ended".into()),
+                }
+            }
+            server.abort();
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_cover_skipped_before_decode_comes_when_wanted_again()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = listener.local_addr()?;
+            let (asked, mut heard) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let server = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let asked = asked.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 512];
+                        while let Ok(n) = socket.read(&mut chunk).await {
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                            let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                                continue;
+                            };
+                            let head = String::from_utf8_lossy(buf.get(..end).unwrap_or_default())
+                                .into_owned();
+                            buf.drain(..end + 4);
+                            let _ = asked.send(head);
+                            let body = jpeg(128);
+                            let reply = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            );
+                            if socket.write_all(reply.as_bytes()).await.is_err()
+                                || socket.write_all(&body).await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+
+            // Hold the single decode permit so the fetch finishes HTTP, stores
+            // compressed bytes, and waits on the decoder semaphore.
+            let decode = Arc::new(Semaphore::new(1));
+            let permit = Arc::clone(&decode).acquire_owned().await?;
+            let counts = Arc::new(std::sync::Mutex::new(LoaderCounts::default()));
+            let (wants, wanted) = watch::channel(Arc::new(Wants::default()));
+            let (arrive, mut arrived) = unbounded();
+            let loader = Loader {
+                art: Arc::new(ArtHttp::at(endpoint)),
+                sizes: vec![64, 128],
+                wanted,
+                arrive,
+                decode: Arc::clone(&decode),
+                compressed: Arc::new(std::sync::Mutex::new(Compressed::default())),
+                counts: Arc::clone(&counts),
+            };
+
+            let art = Id::from_bytes([9; 16]);
+            wants.send_replace(Arc::new(Wants {
+                ids: vec![art],
+                px: 64,
+            }));
+            // Drive one fetch directly while the single decode permit is held,
+            // so scrolling away deterministically hits the `skipped_decode`
+            // path (`Read::Dropped`) after compressed bytes are cached.
+            let fetch = tokio::spawn(loader.fetch(art, 64));
+            let _ = tokio::time::timeout(Duration::from_secs(60), heard.recv()).await?;
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while counts.lock().map_or(0, |c| c.fetched) == 0 {
+                assert!(Instant::now() < deadline, "the cover was never fetched");
+                // sleep: poll until compressed bytes are stored and counted.
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            wants.send_replace(Arc::new(Wants {
+                ids: vec![],
+                px: 64,
+            }));
+            drop(permit);
+            let skipped = tokio::time::timeout(Duration::from_secs(60), fetch).await??;
+            assert_eq!(skipped, (art, 64, Read::Dropped));
+            assert_eq!(counts.lock().map_or(0, |c| c.skipped_decode), 1);
+
+            // Now run the loader and reverse scroll back to `art`: it must
+            // decode from the cached compressed bytes with no second HTTP read.
+            tokio::spawn(loader.run());
+            wants.send_replace(Arc::new(Wants {
+                ids: vec![art],
+                px: 64,
+            }));
+            let came = tokio::time::timeout(Duration::from_secs(60), arrived.next())
+                .await
+                .map_err(|_| "the cover was stranded after reversing scroll")?;
+            assert!(matches!(came, Some(Arrived::Ready { art: got, px: 64, .. }) if got == art));
+            assert_eq!(counts.lock().map_or(0, |c| c.fetched), 1);
+            server.abort();
+            Ok(())
+        })
+    }
+
+    #[gpui::test]
+    fn stale_scale_completion_does_not_displace_current_cover(cx: &mut gpui::TestAppContext) {
+        let art = Id::from_bytes([11; 16]);
+        let sharp = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(2, 2),
+        )]));
+        let stale = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]));
+        let mut cache = Cache::new(1024 * 1024);
+        cx.update(|cx| {
+            cache.land(
+                Arrived::Ready {
+                    art,
+                    px: 200,
+                    image: Arc::clone(&sharp),
+                    color: gpui::rgb(0x112233),
+                    bytes: 16,
+                },
+                200,
+                |_| true,
+                1,
+                cx,
+            );
+            cache.land(
+                Arrived::Ready {
+                    art,
+                    px: 100,
+                    image: Arc::clone(&stale),
+                    color: gpui::rgb(0x445566),
+                    bytes: 4,
+                },
+                200,
+                |_| true,
+                2,
+                cx,
+            );
+        });
+        assert!(cache.has(art, 200));
+        assert!(!cache.has(art, 100));
+        assert!(
+            cache
+                .image(art)
+                .is_some_and(|got| Arc::ptr_eq(&got, &sharp))
+        );
     }
 
     #[test]
