@@ -293,7 +293,9 @@ fn walk_by(
     };
     walk_tree(root, &mut walked, stop, id_of)?;
     // A walk that was asked to stop has not looked everywhere.
-    if walked.files.is_empty() && !stop.load(Ordering::Relaxed) {
+    if !stop.load(Ordering::Relaxed)
+        && (walked.files.is_empty() || id_of(root) != Some(walked.root_id))
+    {
         return Err(offline());
     }
     walked.files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -426,15 +428,18 @@ mod tests {
     #[test]
     fn a_deep_tree_is_walked_on_a_small_stack() {
         let scratch = Scratch::new();
-        let root = scratch.path().to_owned();
+        // Canonicalizing gives Windows the `\\?\` form for a path past
+        // `MAX_PATH`.
+        let root = std::fs::canonicalize(scratch.path()).unwrap();
         // Short names keep the deepest path inside every system's limit.
         let deep = (0..300).fold(root.clone(), |path, _| path.join("d"));
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(deep.join("01.flac"), b"12345").unwrap();
         std::fs::write(root.join("top.flac"), b"12345").unwrap();
+        let walk_root = root.clone();
         let walked = std::thread::Builder::new()
             .stack_size(128 * 1024)
-            .spawn(move || walk(&root, &AtomicBool::new(false)).unwrap())
+            .spawn(move || walk(&walk_root, &AtomicBool::new(false)).unwrap())
             .unwrap()
             .join()
             .unwrap();
@@ -442,6 +447,7 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0], format!("{}01.flac", "d/".repeat(300)));
         assert_eq!(paths[1], "top.flac");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -508,6 +514,28 @@ mod tests {
             "{refused:?}"
         );
         assert!(walk(root, &AtomicBool::new(false)).is_ok());
+    }
+
+    #[test]
+    fn a_root_whose_identity_changes_during_the_walk_is_offline() {
+        use std::sync::atomic::AtomicUsize;
+        let scratch = Scratch::new();
+        let root = scratch.path();
+        std::fs::write(root.join("01.flac"), b"12345").unwrap();
+        let calls = AtomicUsize::new(0);
+        let id_of = |path: &Path| {
+            if path == root {
+                let n = calls.fetch_add(1, Ordering::Relaxed);
+                Some((1, 1 + n as u64))
+            } else {
+                folder_id(path)
+            }
+        };
+        let refused = walk_by(root, &AtomicBool::new(false), &id_of);
+        assert!(
+            matches!(&refused, Err(Error::RootOffline { path }) if path == root),
+            "{refused:?}"
+        );
     }
 
     // Only Linux keeps a name that is not UTF-8 as it was given.
