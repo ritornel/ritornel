@@ -169,7 +169,7 @@ fn holds(item: &crate::library::Item, field: &str) -> bool {
 /// The library with the disc numbers the switches imply, or `None` when
 /// neither is on.
 pub(crate) fn apply(library: &Library, policy: &Policy) -> Option<Library> {
-    apply_with_probes(library, policy, &mut [])
+    apply_with_probes(library, policy, &mut [], &[])
 }
 
 /// Return a library with implied discs, or `None` when both disc rules are off.
@@ -179,6 +179,7 @@ pub(crate) fn apply_with_probes(
     library: &Library,
     policy: &Policy,
     probes: &mut [Facts],
+    keeps: &[(bool, bool)],
 ) -> Option<Library> {
     if !policy.disc_from_album_title && !policy.discs_from_folders {
         return None;
@@ -219,9 +220,11 @@ pub(crate) fn apply_with_probes(
             }
         }
         // A replacement's disc tag affects only its own title. It cannot
-        // veto a different replacement being judged in the same scan.
-        for facts in probes {
-            apply_title(facts, false, false);
+        // veto a different replacement being judged in the same scan. Its
+        // item's held title or disc number is left as it is, as above.
+        for (at, facts) in probes.iter_mut().enumerate() {
+            let (title, disc) = keeps.get(at).copied().unwrap_or_default();
+            apply_title(facts, title, disc);
         }
     }
     if policy.discs_from_folders {

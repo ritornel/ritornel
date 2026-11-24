@@ -159,7 +159,16 @@ fn work(core: &Core, boot: Id, scan: ScanSettings, stop: &AtomicBool) {
     loop {
         core.jobs().wait();
         while !stop.load(Ordering::SeqCst) {
-            let claimed = core.with_stores(|stores| stores.server().claim_job(boot));
+            // Not while an answer is between its check that no scan runs
+            // and its write: the gate is taken inside the stores' lock, in
+            // the order an answer takes the two.
+            let claimed = core.with_stores(|stores| {
+                let _answering = core
+                    .answering
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                stores.server().claim_job(boot)
+            });
             match claimed {
                 Some(Ok(Some(job))) => caught(core, job, |job| run(core, job, scan, stop)),
                 Some(Ok(None)) => break,

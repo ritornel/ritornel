@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::library::{Library, Ref, Resolution};
+use crate::library::{Item, Join, Library, Ref, Resolution};
 
 /// The fields a value may set, named as claims are.
 pub const FIELDS: [&str; 7] = [
@@ -120,6 +120,29 @@ pub fn apply(library: &mut Library, values: &[Value]) {
     }
 }
 
+/// Puts an item's held values on the facts of a file that replaced its
+/// audio, so the file is judged the same recording or not as the item
+/// answered is, not by its new tags alone.
+pub fn hold(item: &crate::library::Item, facts: &mut crate::Facts) {
+    for field in &item.held {
+        let from = &item.facts;
+        match *field {
+            "album" => facts.album.clone_from(&from.album),
+            "album_artist" => facts.album_artist.clone_from(&from.album_artist),
+            "mb_album_artist" => facts
+                .album_artist_mbids
+                .clone_from(&from.album_artist_mbids),
+            "disc_number" => facts.disc = from.disc,
+            "mb_release_group" => facts
+                .release_group_mbid
+                .clone_from(&from.release_group_mbid),
+            "primary_type" => facts.primary_type.clone_from(&from.primary_type),
+            "original_date" => facts.original_date.clone_from(&from.original_date),
+            _ => {}
+        }
+    }
+}
+
 /// One album as a preview shows it: a release group and what is on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlbumShape {
@@ -159,12 +182,31 @@ pub struct Preview {
 /// Previews values: the projector run on the library as it is and with the
 /// values in place, read-only. See "Album proposals" in
 /// docs/internals/corrections.md.
-pub fn preview(library: &Library, values: &[Value], policy: &crate::Policy) -> Preview {
+pub fn preview(
+    library: &Library,
+    values: &[Value],
+    joins: &[Join],
+    policy: &crate::Policy,
+) -> Preview {
     let mut changed = library.clone();
     apply(&mut changed, values);
-    let before = crate::resolve(library, policy);
-    let after = crate::resolve(&changed, policy);
+    changed.answer_joins.extend_from_slice(joins);
     let touched: BTreeSet<i64> = values.iter().map(|value| value.item).collect();
+    preview_between(library, &changed, &touched, policy)
+}
+
+/// Previews a change made otherwise, such as an undo: the projector run on
+/// the library as it is (`now`) and as it would be (`after`), read-only,
+/// for the albums the `touched` files are on, now or after.
+pub fn preview_between(
+    now: &Library,
+    after: &Library,
+    touched: &BTreeSet<i64>,
+    policy: &crate::Policy,
+) -> Preview {
+    let before = crate::resolve(now, policy);
+    let after = crate::resolve(after, policy);
+    let touched = touched.clone();
     // Every file on an album a touched file is on, now or after.
     let mut files = touched.clone();
     for resolution in [&before, &after] {
@@ -212,6 +254,57 @@ fn songs_merged(from: &Resolution, to: &Resolution) -> u32 {
         .map(|had| had.len().saturating_sub(1))
         .sum();
     u32::try_from(merged).unwrap_or(u32::MAX)
+}
+
+/// What a yes to an album puts together (see [`Join`]): the releases its
+/// own files (`items`) and the files it joins them with (`joins`) are on
+/// now, their groups, and the group of every release that is that album
+/// (`release_group`) now by its files' own tags, every file of it saying
+/// so. A release another answer made that album is not counted: its yes
+/// joins the album while it stands. `library` holds the values in force.
+pub fn join_of(library: &Library, items: &[i64], joins: &[i64], release_group: &str) -> Join {
+    let release_of = |item: &Item| -> Option<i64> {
+        let appearance = item.current.as_ref()?.appearance?;
+        let appearance = library
+            .appearance_canonical
+            .get(&appearance)
+            .copied()
+            .unwrap_or(appearance);
+        let release = library.appearances.get(&appearance)?.1?;
+        library
+            .releases
+            .get(&release)
+            .map(|existing| existing.canonical)
+    };
+    let wanted: BTreeSet<i64> = items.iter().chain(joins).copied().collect();
+    let mut releases = BTreeSet::new();
+    // Each release's files, and how many of them say they are the album.
+    let mut of_album: HashMap<i64, (usize, usize)> = HashMap::new();
+    for item in library.items.iter().filter(|item| !item.retired) {
+        let Some(release) = release_of(item) else {
+            continue;
+        };
+        if wanted.contains(&item.id) {
+            releases.insert(release);
+        }
+        let (files, saying) = of_album.entry(release).or_default();
+        *files += 1;
+        if item.facts.release_group_mbid.as_deref() == Some(release_group)
+            && !item.held.contains(&"mb_release_group")
+        {
+            *saying += 1;
+        }
+    }
+    let groups: BTreeSet<i64> = of_album
+        .iter()
+        .filter(|(release, (files, saying))| releases.contains(*release) || files == saying)
+        .filter_map(|(release, _)| library.releases.get(release).map(|existing| existing.group))
+        .collect();
+    Join {
+        album: release_group.to_owned(),
+        releases: releases.into_iter().collect(),
+        groups: groups.into_iter().collect(),
+    }
 }
 
 /// Where each appearance is, by its row or new index: its release and

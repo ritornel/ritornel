@@ -416,7 +416,7 @@ fn change(text: &str) -> ProposalChange {
 }
 
 /// Each source item's public ID, root and path, by row.
-fn paths(connection: &Connection) -> Result<HashMap<i64, (Id, String, String)>, Error> {
+pub(crate) fn paths(connection: &Connection) -> Result<HashMap<i64, (Id, String, String)>, Error> {
     Ok(rows(
         connection,
         "SELECT si.id, si.public_id, src.name, si.provider_key
@@ -437,9 +437,32 @@ fn paths(connection: &Connection) -> Result<HashMap<i64, (Id, String, String)>, 
     .collect())
 }
 
+/// The public ID, root and path of each of these source items, by row,
+/// reading those alone.
+pub(crate) fn paths_of(
+    connection: &Connection,
+    items: impl IntoIterator<Item = i64>,
+) -> Result<HashMap<i64, (Id, String, String)>, Error> {
+    let mut paths = HashMap::new();
+    for item in items {
+        let found: Option<([u8; 16], String, String)> = connection
+            .prepare_cached(
+                "SELECT si.public_id, src.name, si.provider_key
+                 FROM source_item si JOIN source_instance src ON src.id = si.source_instance_id
+                 WHERE si.id = ?1",
+            )?
+            .query_row([item], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .optional()?;
+        if let Some((id, root, path)) = found {
+            paths.insert(item, (Id::from_bytes(id), root, path));
+        }
+    }
+    Ok(paths)
+}
+
 /// One value as the contract shows it, with what the file says for it now
 /// when that is known.
-fn file_value(
+pub(crate) fn file_value(
     paths: &HashMap<i64, (Id, String, String)>,
     item: i64,
     field: String,
@@ -463,17 +486,29 @@ fn file_value(
 }
 
 /// What a file says now for one value of one field, as the catalog reads it.
-fn now_of(facts: &ritornel_domain::Facts, field: &str, ordinal: u32) -> Option<String> {
+pub(crate) fn now_of(facts: &ritornel_domain::Facts, field: &str, ordinal: u32) -> Option<String> {
     let at = |values: &Vec<String>| values.get(usize::try_from(ordinal).ok()?).cloned();
+    // A field of one value has it at the first position only.
+    let one = |value: Option<String>| value.filter(|_| ordinal == 0);
     match field {
-        "album" => facts.album.clone(),
+        "album" => one(facts.album.clone()),
         "album_artist" => at(&facts.album_artist),
         "mb_album_artist" => at(&facts.album_artist_mbids),
-        "disc_number" => facts.disc.map(|disc| disc.to_string()),
-        "mb_release_group" => facts.release_group_mbid.clone(),
-        "primary_type" => facts.primary_type.clone(),
-        "original_date" => facts.original_date.clone(),
+        "disc_number" => one(facts.disc.map(|disc| disc.to_string())),
+        "mb_release_group" => one(facts.release_group_mbid.clone()),
+        "primary_type" => one(facts.primary_type.clone()),
+        "original_date" => one(facts.original_date.clone()),
         _ => None,
+    }
+}
+
+/// How many values a file says for a field.
+pub(crate) fn values_of(facts: &ritornel_domain::Facts, field: &str) -> u32 {
+    let count = |values: &Vec<String>| u32::try_from(values.len()).unwrap_or(u32::MAX);
+    match field {
+        "album_artist" => count(&facts.album_artist),
+        "mb_album_artist" => count(&facts.album_artist_mbids),
+        _ => u32::from(now_of(facts, field, 0).is_some()),
     }
 }
 
@@ -691,6 +726,9 @@ impl LibraryStore {
         let choices = choices.to_vec();
         self.read_snapshot(move |connection| {
             let mut each: Vec<Vec<Value>> = Vec::new();
+            // What each choice would put together: its files, the first
+            // disc it joins them onto, and its album.
+            let mut joining: Vec<(Vec<i64>, Vec<i64>, String)> = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for choice in &choices {
                 if !seen.insert(choice.proposal_id) {
@@ -706,16 +744,28 @@ impl LibraryStore {
                     )
                     .optional()?;
                 let row = row.ok_or(Error::NotFound("no such proposal"))?;
-                let json: Option<String> = connection
+                let found: Option<(String, String, String)> = connection
                     .query_row(
-                        "SELECT values_json FROM proposal_candidate
+                        "SELECT values_json, onto_json, release_group_mbid FROM proposal_candidate
                          WHERE proposal_id = ?1 AND (?2 IS NULL OR release_group_mbid = ?2)
                          ORDER BY ordinal LIMIT 1",
                         (row, &choice.release_group),
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()?;
-                let json = json.ok_or(Error::NotFound("no such candidate"))?;
+                let (json, onto, release_group) =
+                    found.ok_or(Error::NotFound("no such candidate"))?;
+                let items: Vec<i64> = connection
+                    .prepare_cached(
+                        "SELECT source_item_id FROM proposal_item WHERE proposal_id = ?1",
+                    )?
+                    .query_map([row], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?;
+                joining.push((
+                    items,
+                    serde_json::from_str::<Vec<i64>>(&onto)?,
+                    release_group,
+                ));
                 let stored: Vec<StoredValue> = serde_json::from_str(&json)?;
                 each.push(stored.iter().filter_map(StoredValue::value).collect());
             }
@@ -728,7 +778,17 @@ impl LibraryStore {
             chosen.sort();
             chosen.dedup();
             let (library, _) = load_in(connection)?;
-            let shown = values::preview(&library, &chosen, &Policy::current());
+            // What each choice puts together, with every choice's values in
+            // place, as a confirm of them together works it out.
+            let joins: Vec<_> = {
+                let mut chosen_in = library.clone();
+                values::apply(&mut chosen_in, &chosen);
+                joining
+                    .iter()
+                    .map(|(items, onto, group)| values::join_of(&chosen_in, items, onto, group))
+                    .collect()
+            };
+            let shown = values::preview(&library, &chosen, &joins, &Policy::current());
             let shape = album_shape;
             let paths = paths(connection)?;
             let facts: HashMap<i64, &ritornel_domain::Facts> = library
@@ -742,6 +802,7 @@ impl LibraryStore {
                 after: shown.after.into_iter().map(shape).collect(),
                 songs_joined: shown.songs_joined,
                 songs_parted: shown.songs_parted,
+                undoes: Vec::new(),
                 values: chosen
                     .into_iter()
                     .map(|value| {
@@ -759,6 +820,125 @@ impl LibraryStore {
                     })
                     .collect(),
             })
+        })
+    }
+
+    /// `corrections.preview` of an undo: the undo itself, rehearsed in a
+    /// write that is rolled back, so what it shows is what the undo does.
+    /// It gives the albums the files it touches are on now and after, each
+    /// value it withdraws with what the file says now and would say after,
+    /// and every answer it undoes.
+    pub fn preview_undo(&self, answers: &[Id]) -> Result<PreviewShown, Error> {
+        let answers = answers.to_vec();
+        let rehearsed = self.rehearse(move |write| {
+            let connection = write.connection();
+            // The revision before the rehearsal's, which is rolled back.
+            let library_revision = unsigned(write.rev() - 1);
+            let asked = crate::answer_store::asked_to_undo(connection, &answers)?;
+            let all = crate::answer_store::with_dependents(connection, &asked)?;
+            // What the answers said, and every file they are about: those
+            // they gave values, and those they moved.
+            let mut said: Vec<(i64, String, u32)> = Vec::new();
+            let mut touched: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+            for answer in &all {
+                said.extend(
+                    connection
+                        .prepare_cached(
+                            "SELECT source_item_id, field, ordinal FROM answer_value
+                             WHERE answer_id = ?1 AND withdrawn_by_answer_id IS NULL",
+                        )?
+                        .query_map([answer], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let before: String = connection.query_row(
+                    "SELECT before_json FROM answer WHERE id = ?1",
+                    [answer],
+                    |row| row.get(0),
+                )?;
+                let before: serde_json::Value = serde_json::from_str(&before)?;
+                touched.extend(
+                    before
+                        .get("items")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|was| was.get("item")?.as_i64()),
+                );
+            }
+            touched.extend(said.iter().map(|(item, _, _)| *item));
+            let mut undoes = Vec::new();
+            for answer in &all {
+                let public: [u8; 16] = connection.query_row(
+                    "SELECT public_id FROM answer WHERE id = ?1",
+                    [answer],
+                    |row| row.get(0),
+                )?;
+                undoes.push(Id::from_bytes(public));
+            }
+            let (now, _) = load_in(connection)?;
+            let request = crate::WriteRequest {
+                method: "corrections.preview",
+                command: None,
+                client: None,
+            };
+            crate::answer_store::undo_in(write, &request, &answers)?;
+            let (after, _) = load_in(connection)?;
+            let paths = paths_of(connection, touched.iter().copied())?;
+            Ok((library_revision, said, touched, undoes, now, after, paths))
+        })?;
+        // Worked out once the rehearsal is rolled back, so the writer is
+        // held no longer than the undo itself takes.
+        let (library_revision, said, touched, undoes, now, after, paths) = rehearsed;
+        let shown = values::preview_between(&now, &after, &touched, &Policy::current());
+        let shape = album_shape;
+        let facts_of =
+            |library: &ritornel_domain::library::Library| -> HashMap<i64, ritornel_domain::Facts> {
+                library
+                    .items
+                    .iter()
+                    .filter(|item| touched.contains(&item.id))
+                    .map(|item| (item.id, item.facts.clone()))
+                    .collect()
+            };
+        let (facts_now, facts_after) = (facts_of(&now), facts_of(&after));
+        // Each field of each file, with how many values the answers
+        // gave it.
+        let mut by_field: std::collections::BTreeMap<(i64, String), u32> =
+            std::collections::BTreeMap::new();
+        for (item, field, ordinal) in said {
+            let count = by_field.entry((item, field)).or_default();
+            *count = (*count).max(ordinal + 1);
+        }
+        let values = by_field
+            .into_iter()
+            .flat_map(|((item, field), ordinals)| {
+                let read = |facts: &HashMap<i64, ritornel_domain::Facts>, ordinal| {
+                    facts
+                        .get(&item)
+                        .and_then(|facts| now_of(facts, &field, ordinal))
+                };
+                // Every value of the field, now or after: an answer that
+                // put one where the file had two gives both back.
+                let count = |facts: &HashMap<i64, ritornel_domain::Facts>| {
+                    facts.get(&item).map_or(0, |facts| values_of(facts, &field))
+                };
+                let shown = ordinals.max(count(&facts_now)).max(count(&facts_after));
+                (0..shown)
+                    .map(|ordinal| {
+                        let (was, will) = (read(&facts_now, ordinal), read(&facts_after, ordinal));
+                        file_value(&paths, item, field.clone(), ordinal, will, was)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Ok(PreviewShown {
+            library_revision,
+            now: shown.now.into_iter().map(shape).collect(),
+            after: shown.after.into_iter().map(shape).collect(),
+            songs_joined: shown.songs_joined,
+            songs_parted: shown.songs_parted,
+            undoes,
+            values,
         })
     }
 }

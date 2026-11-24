@@ -116,6 +116,15 @@ pub(crate) fn load(connection: &Connection) -> Result<(Library, Shown), Error> {
 
 /// Reads the library as the resolver sees it, in the caller's transaction.
 pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error> {
+    load_except(connection, &HashSet::new())
+}
+
+/// Reads the library as the resolver would see it with these answers
+/// undone: their values, and what they put together, left out.
+pub(crate) fn load_except(
+    connection: &Connection,
+    undone: &HashSet<i64>,
+) -> Result<(Library, Shown), Error> {
     let mut library = Library::default();
     let mut shown = Shown::default();
 
@@ -252,6 +261,8 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
             facts: Facts::from_claims(claims.get(&id).map_or(&[], Vec::as_slice)),
             held: Vec::new(),
             current: current.get(&id).copied(),
+            prior: None,
+            prior_recording: None,
         });
     }
 
@@ -591,7 +602,33 @@ pub(crate) fn load_in(connection: &Connection) -> Result<(Library, Shown), Error
             |row| row.get(0),
         )
         .optional()?;
+    // The tag values answers put on files, in place of their own.
+    crate::answer_store::apply_in_force(connection, &mut library, undone)?;
+    library.answer_redirects = crate::answer_store::answer_redirects(connection)?;
+    library.answer_joins = crate::answer_store::joins_in_force(connection, undone)?;
     Ok((library, shown))
+}
+
+/// Resolves the library in the write's own transaction, with `adjust`
+/// given the library first, and writes what differs; plays follow their
+/// files. It says what was written, and whether anything shown changed.
+pub(crate) fn resolve_in(
+    write: &Write<'_>,
+    adjust: impl FnOnce(&mut Library),
+) -> Result<(Resolved, bool), Error> {
+    let (mut library, mut shown) = load_in(write.connection())?;
+    adjust(&mut library);
+    shown.revision = write.rev() - 1;
+    let policy = Policy::current();
+    let resolution = ritornel_domain::resolve(&library, &policy);
+    let plan = Plan::new(resolution, &library, &shown, policy.version);
+    if plan.is_empty() {
+        return Ok((Resolved::default(), false));
+    }
+    let shown = plan.changes_shown();
+    let resolved = plan.apply(write)?;
+    crate::history_store::catalog_changed(write)?;
+    Ok((resolved, shown))
 }
 
 /// What a resolution changes: the resolution, and for each entry whether
@@ -941,6 +978,26 @@ impl Plan {
             && self.artist_key_writes.is_empty()
             && self.stale_artist_key_deletes.is_empty()
             && self.rekeyed_aliases.is_empty()
+    }
+
+    /// Whether it changes anything shown: a file's rows, what a row shows
+    /// or the search index. A version stamp or an artist key alone is not.
+    pub(crate) fn changes_shown(&self) -> bool {
+        let any = |flags: &[bool]| flags.iter().any(|flag| *flag);
+        self.resolution.items.iter().any(|item| item.changed)
+            || self
+                .resolution
+                .credits
+                .iter()
+                .any(|credit| as_row(credit.r).is_none())
+            || any(&self.artists)
+            || any(&self.recordings)
+            || any(&self.groups)
+            || any(&self.group_shows)
+            || any(&self.releases)
+            || any(&self.appearances)
+            || self.search.iter().any(Option::is_some)
+            || !self.unsearchable.is_empty()
     }
 
     /// Writes what differs, in the write's transaction.
@@ -1402,6 +1459,47 @@ impl Plan {
     }
 }
 
+/// Removes the mark that a resolution is owed, in the write's transaction,
+/// once one has been made.
+pub(crate) fn settle_pending_in(write: &Write<'_>) -> Result<(), Error> {
+    write.connection().execute(
+        "DELETE FROM library_setting WHERE key = ?1",
+        [PENDING_SETTING],
+    )?;
+    Ok(())
+}
+
+/// Whether anything is waiting on the resolver (see
+/// [`LibraryStore::needs_resolving`]).
+pub(crate) fn owes_resolution(connection: &Connection) -> Result<bool, Error> {
+    let stored: Text = connection
+        .query_row(
+            "SELECT value_json FROM library_setting WHERE key = ?1",
+            [VERSIONS_SETTING],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored.is_some_and(|stored| stored != versions(RESOLVER_VERSION)) {
+        return Ok(true);
+    }
+    let pending: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM library_setting WHERE key = ?1)",
+        [PENDING_SETTING],
+        |row| row.get(0),
+    )?;
+    if pending {
+        return Ok(true);
+    }
+    Ok(connection.query_row(
+        "SELECT EXISTS (
+           SELECT 1 FROM source_item si JOIN source_item_revision sr ON sr.id = si.current_revision_id
+           WHERE sr.audio_asset_id IS NOT NULL AND si.retired_at_ms IS NULL
+             AND si.current_recording_id IS NULL)",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 impl LibraryStore {
     /// Reads the library as the resolver sees it.
     pub(crate) fn load(&self) -> Result<(Library, Shown), Error> {
@@ -1414,32 +1512,7 @@ impl LibraryStore {
     /// makes the next scan resolve every item again by the policy in force,
     /// and write a decision of that version for each whose result differs.
     pub(crate) fn needs_resolving(&self) -> Result<bool, Error> {
-        self.read(|connection| {
-            let stored: Text = connection
-                .query_row("SELECT value_json FROM library_setting WHERE key = ?1", [VERSIONS_SETTING], |row| {
-                    row.get(0)
-                })
-                .optional()?;
-            if stored.is_some_and(|stored| stored != versions(RESOLVER_VERSION)) {
-                return Ok(true);
-            }
-            let pending: bool = connection.query_row(
-                "SELECT EXISTS (SELECT 1 FROM library_setting WHERE key = ?1)",
-                [PENDING_SETTING],
-                |row| row.get(0),
-            )?;
-            if pending {
-                return Ok(true);
-            }
-            Ok(connection.query_row(
-                "SELECT EXISTS (
-                   SELECT 1 FROM source_item si JOIN source_item_revision sr ON sr.id = si.current_revision_id
-                   WHERE sr.audio_asset_id IS NOT NULL AND si.retired_at_ms IS NULL
-                     AND si.current_recording_id IS NULL)",
-                [],
-                |row| row.get(0),
-            )?)
-        })
+        self.read(owes_resolution)
     }
 
     /// Resolves the whole library by the policy scans use and writes what
@@ -1491,10 +1564,7 @@ impl LibraryStore {
             return Ok(None);
         }
         let written = self.write(request, |write| {
-            write.connection().execute(
-                "DELETE FROM library_setting WHERE key = ?1",
-                [PENDING_SETTING],
-            )?;
+            settle_pending_in(write)?;
             Ok(serde_json::to_string(&Resolved::default())?)
         })?;
         Ok(Some((written, Resolved::default())))

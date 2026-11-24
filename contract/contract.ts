@@ -152,6 +152,10 @@ export const METHODS = {
   "corrections.list": { kind: "query", needsFull: true },
   "corrections.get": { kind: "query", needsFull: true },
   "corrections.preview": { kind: "query", needsFull: true },
+  "corrections.confirm": { kind: "command", needsFull: true },
+  "corrections.undo": { kind: "command", needsFull: true },
+  "corrections.answers": { kind: "query", needsFull: true },
+  "corrections.answer": { kind: "query", needsFull: true },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -247,6 +251,10 @@ export type MethodMap = {
   "corrections.list": { params: NoParams; result: ProposalList };
   "corrections.get": { params: ProposalGetParams; result: ProposalGot };
   "corrections.preview": { params: PreviewParams; result: PreviewShown };
+  "corrections.confirm": { params: ConfirmParams; result: Answered };
+  "corrections.undo": { params: UndoParams; result: Answered };
+  "corrections.answers": { params: AnswersParams; result: AnswerList };
+  "corrections.answer": { params: AnswerParams; result: AnswerGot };
 };
 
 /** The name of a method. */
@@ -509,6 +517,259 @@ export type AlbumVersion = {
    * Whether it is the one the group is set to show.
    */
   shown: boolean,
+};
+
+/**
+ * One answer in the ledger.
+ */
+export type Answer = {
+  /**
+   * Its ID.
+   */
+  answerId: string,
+  /**
+   * What it said.
+   */
+  verb: AnswerVerb,
+  /**
+   * For a yes: the proposal it answered.
+   */
+  proposalId?: string,
+  /**
+   * For a yes: the album it said yes to, by its release group ID.
+   */
+  releaseGroup?: string,
+  /**
+   * For a yes: the album's title, as it was shown.
+   */
+  title?: string,
+  /**
+   * For an undo: the answer it undid.
+   */
+  undoes?: string,
+  /**
+   * For a yes that was undone: the undo.
+   */
+  undoneBy?: string,
+  /**
+   * How many files it put values on.
+   */
+  files: number,
+  /**
+   * When it was given, as Unix milliseconds.
+   */
+  answeredAtMs: number,
+};
+
+/**
+ * What an answer rested on and said, kept by value when it was given.
+ */
+export type AnswerEvidence = {
+  /**
+   * For a yes: the album said yes to, as it was shown.
+   */
+  candidate?: AnsweredCandidate,
+  /**
+   * For a yes: the albums it was chosen among, in the order shown.
+   */
+  candidates: Array<AnsweredCandidate>,
+  /**
+   * For a yes: each disc it rested on, with its reply.
+   */
+  replies: Array<AnsweredReply>,
+  /**
+   * For a yes: each layout of those discs.
+   */
+  layouts: Array<AnsweredLayout>,
+  /**
+   * For a yes: the values it put on the files, each with the file as it
+   * is named now.
+   */
+  values: Array<FileValue>,
+  /**
+   * For an undo of an answer that rested on others: the answers it was
+   * undone with.
+   */
+  restsOn: Array<string>,
+};
+
+/**
+ * The result of `corrections.answer`: one answer, and what it rested on.
+ */
+export type AnswerGot = {
+  /**
+   * The library revision it read.
+   */
+  libraryRevision: number,
+  /**
+   * The answer.
+   */
+  answer: Answer,
+  /**
+   * What it rested on and said.
+   */
+  evidence: AnswerEvidence,
+};
+
+/**
+ * The result of `corrections.answers`: one page of the ledger, newest
+ * first.
+ */
+export type AnswerList = {
+  /**
+   * The library revision it read.
+   */
+  libraryRevision: number,
+  /**
+   * Each answer, newest first.
+   */
+  answers: Array<Answer>,
+  /**
+   * The `before` that reads the next page, while there is one.
+   */
+  next?: string,
+};
+
+/**
+ * The params of `corrections.answer`.
+ */
+export type AnswerParams = {
+  /**
+   * The answer.
+   */
+  answerId: string,
+};
+
+/**
+ * What an answer said.
+ */
+export type AnswerVerb = "confirm" | "undo";
+
+/**
+ * One answer a command wrote.
+ */
+export type AnswerWritten = {
+  /**
+   * The answer's ID.
+   */
+  answerId: string,
+  /**
+   * The proposal a yes answered.
+   */
+  proposalId?: string,
+  /**
+   * The answer an undo undid.
+   */
+  undoes?: string,
+};
+
+/**
+ * The result of `corrections.confirm` and `corrections.undo`.
+ */
+export type Answered = {
+  /**
+   * Each answer written.
+   */
+  answers: Array<AnswerWritten>,
+  /**
+   * Whether anything shown changed: an album, a song or an artist.
+   */
+  moved: boolean,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
+ * An album a yes was given among, as it was shown: all of it for the one
+ * said yes to, its ID and title for the others.
+ */
+export type AnsweredCandidate = {
+  /**
+   * Its release group ID.
+   */
+  releaseGroup: string,
+  /**
+   * Its title.
+   */
+  title?: string,
+  /**
+   * Who it is credited to.
+   */
+  artist?: string,
+  /**
+   * Its kind: `album`, `single`, `ep`.
+   */
+  primaryType?: string,
+  /**
+   * When it first came out.
+   */
+  firstDate?: string,
+  /**
+   * How many of the replies' releases were of it.
+   */
+  releases?: number,
+};
+
+/**
+ * A layout of a disc a yes rested on, as it was then.
+ */
+export type AnsweredLayout = {
+  /**
+   * The disc ID it gives.
+   */
+  discId: string,
+  /**
+   * The folder it is of, by its path under its root.
+   */
+  folder: string,
+  /**
+   * Each way it was found, in the order found.
+   */
+  methods: Array<LayoutMethod>,
+  /**
+   * Whether it may not be the disc's.
+   */
+  provisional: boolean,
+};
+
+/**
+ * A disc a yes rested on: its disc ID, and when the reply it was read
+ * from came.
+ */
+export type AnsweredReply = {
+  /**
+   * The disc ID.
+   */
+  discId: string,
+  /**
+   * When MusicBrainz replied, as Unix milliseconds.
+   */
+  repliedAtMs: number,
+};
+
+/**
+ * The params of `corrections.answers`: one page of the ledger.
+ */
+export type AnswersParams = {
+  /**
+   * The answers older than this one; from the newest when left out.
+   */
+  before?: string,
+  /**
+   * How many at most: 50 when left out, and never more than 500.
+   */
+  limit?: number,
 };
 
 /**
@@ -888,6 +1149,39 @@ export type Choice = {
  * never decides access: the session does.
  */
 export type ClientKind = "desktop" | "browser" | "phone" | "cli" | "agent" | "server";
+
+/**
+ * The params of `corrections.confirm`.
+ */
+export type ConfirmParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * Each yes, all kept in one write or none.
+   */
+  answers: Array<Confirmation>,
+};
+
+/**
+ * A yes to one proposal's candidate, naming the proposal as it was shown.
+ */
+export type Confirmation = {
+  /**
+   * The proposal.
+   */
+  proposalId: string,
+  /**
+   * The candidate, by its release group ID.
+   */
+  releaseGroup: string,
+  /**
+   * The proposal's fingerprint as it was shown. A proposal that has
+   * changed since is refused, and nothing is written.
+   */
+  fingerprint: string,
+};
 
 /**
  * Why tracks were queued: a kind, and what it refers to.
@@ -4521,6 +4815,12 @@ export type PreviewParams = {
    * refused.
    */
   choices: Array<Choice>,
+  /**
+   * Or answers, to preview their undo: what it would give back, and
+   * which answers resting on them it would undo too. Not with
+   * `choices`.
+   */
+  undo: Array<string>,
 };
 
 /**
@@ -4541,6 +4841,11 @@ export type PreviewShown = {
    * The albums after.
    */
   after: Array<AlbumShape>,
+  /**
+   * For an undo: every answer it would undo, those asked for and those
+   * resting on them, oldest first. Empty for choices.
+   */
+  undoes: Array<string>,
   /**
    * How many songs would be joined into another: copies of one song,
    * such as two editions' of it, that are two songs now and would be one.
@@ -6525,6 +6830,20 @@ export type TrackSummary = {
    * Whether its recording is loved, here or at a service.
    */
   loved: boolean,
+};
+
+/**
+ * The params of `corrections.undo`.
+ */
+export type UndoParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
+  /**
+   * The answers to undo, all in one write or none.
+   */
+  answers: Array<string>,
 };
 
 /**

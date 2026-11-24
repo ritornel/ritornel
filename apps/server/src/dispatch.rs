@@ -12,8 +12,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use ritornel_contract::methods::{
-    self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, CorrectionsDiscs,
-    CorrectionsGet, CorrectionsList, CorrectionsLookup, CorrectionsPreview, CorrectionsSummaryCall,
+    self, AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, CorrectionsAnswer,
+    CorrectionsAnswers, CorrectionsConfirm, CorrectionsDiscs, CorrectionsGet, CorrectionsList,
+    CorrectionsLookup, CorrectionsPreview, CorrectionsSummaryCall, CorrectionsUndo,
     EventsSubscribe, EventsUnsubscribe, HistoryAlbum, HistoryAlbums, HistoryArtist, HistoryArtists,
     HistoryExport, HistoryOnThisDay, HistoryRebuild, HistoryRecent, HistorySetZones,
     HistoryStreamCall, HistoryTrack, HistoryZones, IdentityDryRun, IdentityReview, ImportsApply,
@@ -189,6 +190,10 @@ pub(crate) struct Core {
     /// Held by a lookup from its receipt's check to its commit, so that no
     /// two lookups ask the same thing at once.
     lookup: Mutex<()>,
+    /// Held by a yes, an undo or a keep-apart from its check that no scan
+    /// runs to the end of its write, and by the job worker while it claims
+    /// a job, so that no scan is claimed between the two.
+    pub(crate) answering: Mutex<()>,
     /// Watching the hub's folders, once the server has started.
     watch: std::sync::OnceLock<crate::watch::Watching>,
     /// Where backups go, once the server has started.
@@ -330,6 +335,7 @@ impl Core {
             staging,
             catalogue: std::sync::OnceLock::new(),
             lookup: Mutex::new(()),
+            answering: Mutex::new(()),
             watch: std::sync::OnceLock::new(),
             backups: std::sync::OnceLock::new(),
             cache_bytes: std::sync::OnceLock::new(),
@@ -976,6 +982,18 @@ impl Core {
             CorrectionsPreview::NAME => run::<CorrectionsPreview>(params, |params| {
                 self.corrections_preview(stores, &params)
             }),
+            CorrectionsConfirm::NAME => run::<CorrectionsConfirm>(params, |params| {
+                self.corrections_confirm(stores, &params)
+            }),
+            CorrectionsUndo::NAME => {
+                run::<CorrectionsUndo>(params, |params| self.corrections_undo(stores, &params))
+            }
+            CorrectionsAnswers::NAME => {
+                run::<CorrectionsAnswers>(params, |params| self.corrections_answers(stores, params))
+            }
+            CorrectionsAnswer::NAME => {
+                run::<CorrectionsAnswer>(params, |params| self.corrections_answer(stores, &params))
+            }
             ListOpen::NAME => {
                 run::<ListOpen>(params, |params| self.list_open(stores, session, params))
             }

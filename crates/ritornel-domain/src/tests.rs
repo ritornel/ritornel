@@ -94,6 +94,8 @@ impl World {
             facts: file.facts,
             held: Vec::new(),
             current: None,
+            prior: None,
+            prior_recording: None,
         });
         self.next
     }
@@ -3830,4 +3832,344 @@ fn a_merged_appearance_shows_the_same_title_whichever_copy_held_its_parts() {
         .unwrap();
     assert_eq!(shown.title.as_deref(), Some("Glass Pier"));
     world.assert_settled();
+}
+
+#[test]
+fn a_song_an_undo_parts_again_takes_back_the_recording_it_had() {
+    let mut world = World::default();
+    let group = |mbid: &'static str| {
+        move |facts: &mut Facts| facts.release_group_mbid = Some(mbid.to_owned())
+    };
+    let first = world.add(
+        file("Moss Arcade/Tin Weather/01.flac", 1)
+            .song("Paper Kites", "Moss Arcade", 100)
+            .on("Tin Weather", None, 1)
+            .with(group("00000000-0000-4000-8000-0000000000b1")),
+    );
+    // The same song on another edition, a second longer.
+    let second = world.add(
+        file("Moss Arcade/Tin Weather Deluxe/01.flac", 2)
+            .song("Paper Kites", "Moss Arcade", 101)
+            .on("Tin Weather (Deluxe)", None, 1)
+            .with(group("00000000-0000-4000-8000-0000000000b2")),
+    );
+    world.settle();
+    let had = world.recording(second);
+    assert_ne!(world.recording(first), had);
+
+    // An answer puts the second edition in the first's group: one album,
+    // so the song binds to the first's recording.
+    let values = [crate::values::Value {
+        item: second,
+        field: "mb_release_group",
+        ordinal: 0,
+        value: Some("00000000-0000-4000-8000-0000000000b1".to_owned()),
+        origin: crate::values::Origin::Catalogue,
+    }];
+    let tagged = world.item(second).facts.clone();
+    crate::values::apply(&mut world.library, &values);
+    world.settle();
+    assert_eq!(world.recording(second), world.recording(first));
+
+    // Its undo: the tags again, and the recording it had handed over.
+    let undo = |world: &mut World, hint: bool| {
+        let item = world
+            .library
+            .items
+            .iter_mut()
+            .find(|item| item.id == second)
+            .unwrap();
+        item.facts = tagged.clone();
+        item.held.clear();
+        item.prior_recording = hint.then_some(had);
+        world.settle();
+        world.recording(second)
+    };
+    let mut without = World {
+        library: world.library.clone(),
+        next: world.next,
+        shown: world.shown.clone(),
+        policy: world.policy.clone(),
+    };
+    assert_ne!(undo(&mut without, false), had, "a new recording without it");
+    assert_eq!(undo(&mut world, true), had);
+}
+
+#[test]
+fn a_release_an_answer_gives_another_group_joins_it_though_both_carry_input() {
+    let mut world = World::default();
+    let main = album(
+        &mut world,
+        "Moss Arcade/Tin Weather",
+        "Moss Arcade",
+        "Tin Weather",
+        10,
+    );
+    let bonus = [
+        world.add(
+            file("Moss Arcade/Bonus/01.flac", 30)
+                .song("Glass Harbour", "Moss Arcade", 300)
+                .on("Tin Weather Extras", Some(1), 1)
+                .by("Moss Arcade"),
+        ),
+        world.add(
+            file("Moss Arcade/Bonus/02.flac", 31)
+                .song("Far Lights", "Moss Arcade", 310)
+                .on("Tin Weather Extras", Some(1), 2)
+                .by("Moss Arcade"),
+        ),
+    ];
+    world.settle();
+    assert_ne!(world.group(main[0]), world.group(bonus[0]));
+    // Each group carries input of its own: a presentation set on it.
+    for group in [world.group(main[0]), world.group(bonus[0])] {
+        world
+            .library
+            .groups
+            .get_mut(&group)
+            .unwrap()
+            .has_presentation = true;
+    }
+    let group = "00000000-0000-4000-8000-0000000000b1";
+    // Both discs' own tags come to name the album's ID: still two albums,
+    // as each group carries input of its own.
+    for item in &mut world.library.items {
+        item.facts.release_group_mbid = Some(group.to_owned());
+    }
+    world.settle();
+    assert_ne!(world.group(main[0]), world.group(bonus[0]));
+    // The yes to the bonus disc puts its files with the main disc's.
+    let join = crate::values::join_of(&world.library, &bonus, &main, group);
+    assert_eq!(
+        join.groups,
+        [world.group(main[0]), world.group(bonus[0])]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    world.library.answer_joins.push(join);
+    for id in main.iter().chain(&bonus) {
+        crate::values::apply(
+            &mut world.library,
+            &[crate::values::Value {
+                item: *id,
+                field: "mb_release_group",
+                ordinal: 0,
+                value: Some(group.to_owned()),
+                origin: crate::values::Origin::Catalogue,
+            }],
+        );
+    }
+    let tagged: Vec<Facts> = world
+        .library
+        .items
+        .iter()
+        .map(|item| item.facts.clone())
+        .collect();
+    let groups = (world.group(main[0]), world.group(bonus[0]));
+    world.settle();
+    assert_eq!(world.group(main[0]), world.group(bonus[0]));
+
+    // A third album of the artist's, whose group carries input of its own,
+    // retagged later with the same album ID, is not joined by that yes.
+    let other = album(
+        &mut world,
+        "Moss Arcade/Lantern",
+        "Moss Arcade",
+        "Lantern",
+        40,
+    );
+    world.settle();
+    let lantern = world.group(other[0]);
+    world
+        .library
+        .groups
+        .get_mut(&lantern)
+        .unwrap()
+        .has_presentation = true;
+    for item in &mut world.library.items {
+        if other.contains(&item.id) {
+            item.facts.release_group_mbid = Some(group.to_owned());
+        }
+    }
+    world.settle();
+    assert_eq!(world.group(other[0]), lantern);
+    assert_ne!(world.group(other[0]), world.group(main[0]));
+    world.library.items.retain(|item| !other.contains(&item.id));
+    world.settle();
+
+    // Its undo, with both discs tagged with the album's ID: each
+    // release is handed the group it was in, which still carries its input,
+    // and is not joined again.
+    let handed: std::collections::HashMap<i64, i64> = [(main[0], groups.0), (bonus[0], groups.1)]
+        .into_iter()
+        .map(|(item, group)| (world.release(item).unwrap(), group))
+        .collect();
+    for (item, facts) in world.library.items.iter_mut().zip(tagged) {
+        item.facts = facts;
+        item.held.clear();
+    }
+    world.library.prior_groups = handed;
+    world.library.answer_joins.clear();
+    world.settle();
+    assert_eq!((world.group(main[0]), world.group(bonus[0])), groups);
+}
+
+#[test]
+fn a_join_an_answer_gave_holds_two_edited_releases_and_a_later_retag_does_not() {
+    let mut world = World::default();
+    let main = album(
+        &mut world,
+        "Moss Arcade/Tin Weather",
+        "Moss Arcade",
+        "Tin Weather",
+        10,
+    );
+    let bonus: Vec<i64> = ["Glass Harbour", "Far Lights"]
+        .into_iter()
+        .zip(1..)
+        .map(|(name, n)| {
+            let path: &'static str =
+                Box::leak(format!("Moss Arcade/Bonus/{n:02}.flac").into_boxed_str());
+            world.add(
+                file(path, 30 + n)
+                    .song(name, "Moss Arcade", 300 + 10 * n)
+                    .on("Tin Weather Extras", Some(1), n)
+                    .by("Moss Arcade"),
+            )
+        })
+        .collect();
+    world.settle();
+    // Each release carries an edit of its own.
+    let edit = |world: &mut World, item: i64| {
+        let release = world.release(item).unwrap();
+        world.library.edits.insert(
+            (Kind::Release, release, "date".to_owned()),
+            "2004".to_owned(),
+        );
+        release
+    };
+    let (main_release, bonus_release) = (edit(&mut world, main[0]), edit(&mut world, bonus[0]));
+    // A yes to each disc: the main disc's numbers it disc 1, the bonus
+    // disc's joins it as disc 2.
+    let joining = |world: &mut World| {
+        for id in &main {
+            crate::values::apply(
+                &mut world.library,
+                &[crate::values::Value {
+                    item: *id,
+                    field: "disc_number",
+                    ordinal: 0,
+                    value: Some("1".to_owned()),
+                    origin: crate::values::Origin::Catalogue,
+                }],
+            );
+        }
+        for id in &bonus {
+            crate::values::apply(
+                &mut world.library,
+                &[
+                    crate::values::Value {
+                        item: *id,
+                        field: "album",
+                        ordinal: 0,
+                        value: Some("Tin Weather".to_owned()),
+                        origin: crate::values::Origin::Library,
+                    },
+                    crate::values::Value {
+                        item: *id,
+                        field: "disc_number",
+                        ordinal: 0,
+                        value: Some("2".to_owned()),
+                        origin: crate::values::Origin::Catalogue,
+                    },
+                ],
+            );
+        }
+    };
+    // The same values with no answer standing behind them, as a retag
+    // would give them: the guard keeps both edited releases.
+    let mut retagged = World {
+        library: world.library.clone(),
+        ..World::default()
+    };
+    joining(&mut retagged);
+    retagged.settle();
+    assert_ne!(retagged.release(main[0]), retagged.release(bonus[0]));
+
+    // Said yes to, with what it puts together kept: one release of two
+    // discs, an edit made after it notwithstanding.
+    let group = "00000000-0000-4000-8000-0000000000b1";
+    let join = crate::values::join_of(&world.library, &bonus, &main, group);
+    let mut releases = vec![main_release, bonus_release];
+    releases.sort_unstable();
+    assert_eq!(join.releases, releases);
+    world.library.answer_joins.push(join);
+    joining(&mut world);
+    world.settle();
+    assert_eq!(world.release(main[0]), world.release(bonus[0]));
+    edit(&mut world, main[0]);
+    world.settle();
+    assert_eq!(world.release(main[0]), world.release(bonus[0]));
+
+    // A third edited release, retagged to the same title later, stays
+    // apart: the yes did not join it.
+    let third = world.add(
+        file("Moss Arcade/Live/01.flac", 60)
+            .song("Ember", "Moss Arcade", 400)
+            .on("Tin Weather Live", Some(3), 1)
+            .by("Moss Arcade"),
+    );
+    world.settle();
+    let third_release = edit(&mut world, third);
+    for item in &mut world.library.items {
+        if item.id == third {
+            item.facts.album = Some("Tin Weather".to_owned());
+        }
+    }
+    world.settle();
+    assert_eq!(world.release(third), Some(third_release));
+    assert_ne!(world.release(third), world.release(main[0]));
+}
+
+#[test]
+fn a_yes_joins_the_group_of_a_release_only_when_every_file_of_it_is_the_album() {
+    let mut world = World::default();
+    let main = album(
+        &mut world,
+        "Moss Arcade/Tin Weather",
+        "Moss Arcade",
+        "Tin Weather",
+        10,
+    );
+    let other = album(
+        &mut world,
+        "Moss Arcade/Lantern",
+        "Moss Arcade",
+        "Lantern",
+        40,
+    );
+    let group = "00000000-0000-4000-8000-0000000000b1";
+    // One stray file of the other album says it is this one.
+    for item in &mut world.library.items {
+        if item.id == other[0] {
+            item.facts.release_group_mbid = Some(group.to_owned());
+        }
+    }
+    world.settle();
+    let join = crate::values::join_of(&world.library, &main, &[], group);
+    assert_eq!(join.groups, [world.group(main[0])]);
+    // Every file of it saying so, it is that album, and its group joins.
+    for item in &mut world.library.items {
+        if other.contains(&item.id) {
+            item.facts.release_group_mbid = Some(group.to_owned());
+        }
+    }
+    world.settle();
+    let join = crate::values::join_of(&world.library, &main, &[], group);
+    let mut both = vec![world.group(main[0]), world.group(other[0])];
+    both.sort_unstable();
+    both.dedup();
+    assert_eq!(join.groups, both);
 }

@@ -18,6 +18,11 @@
 //! ritornelctl corrections list [--data-dir <dir>] [--json]
 //! ritornelctl corrections show <proposal> [--data-dir <dir>] [--json]
 //! ritornelctl corrections preview <proposal>... [--candidate <release group>] [--data-dir <dir>] [--json]
+//! ritornelctl corrections preview --undo <answer>... [--data-dir <dir>] [--json]
+//! ritornelctl corrections confirm <proposal>... [--candidate <release group>] [--fingerprint <f>] [--data-dir <dir>] [--json]
+//! ritornelctl corrections undo <answer>... [--data-dir <dir>] [--json]
+//! ritornelctl corrections answers [--before <answer>] [--limit <n>] [--data-dir <dir>] [--json]
+//! ritornelctl corrections answer <answer> [--data-dir <dir>] [--json]
 //! ritornelctl play <folder | track>... [--album <release>] [--start <n>] [--follow]
 //! ritornelctl pause | resume | stop | next | previous | now | queue
 //! ritornelctl seek <position>
@@ -92,6 +97,14 @@ Usage:
   ritornelctl corrections show <proposal> [--data-dir <dir>] [--json]
   ritornelctl corrections preview <proposal>... [--candidate <release group>]
                                   [--data-dir <dir>] [--json]
+  ritornelctl corrections preview --undo <answer>... [--data-dir <dir>] [--json]
+  ritornelctl corrections confirm <proposal>... [--candidate <release group>]
+                                  [--fingerprint <f>] [--data-dir <dir>]
+                                  [--json]
+  ritornelctl corrections undo <answer>... [--data-dir <dir>] [--json]
+  ritornelctl corrections answers [--before <answer>] [--limit <n>]
+                                  [--data-dir <dir>] [--json]
+  ritornelctl corrections answer <answer> [--data-dir <dir>] [--json]
   ritornelctl play <folder | track>... [--album <release>] [--start <n>]
                    [--follow] [--data-dir <dir>] [--json]
   ritornelctl pause | resume | stop | next | previous [--data-dir <dir>] [--json]
@@ -202,7 +215,33 @@ Commands:
                    put on each file
   corrections preview <proposal>...
                    Show what saying yes to proposals together would
-                   change: the albums now and after. It writes nothing
+                   change: the albums now and after, and the songs it
+                   would join or part. With --undo, show what undoing
+                   answers would give back, and every answer that rests
+                   on them and would go with them. It writes nothing
+  corrections confirm <proposal>...
+                   Say yes to proposals together, each with its likeliest
+                   candidate or the one --candidate names: the album's ID,
+                   kind and first year go on the files, and a bonus disc
+                   joins its album. Each proposal is read as it is when
+                   this runs, or, for one, as --fingerprint says `show`
+                   printed it, and the answer is refused if it changed
+                   since. Every answer can be undone
+  corrections undo <answer>...
+                   Undo answers, each alone or together: the files go back
+                   to what they were, on the albums they were on. An
+                   answer that took its album's title or credit from one
+                   undone rests on it, and is undone with it: those are
+                   listed first
+  corrections answers
+                   Show the answers, newest first, a page at a time: 50,
+                   or --limit, and the next page with the --before it
+                   names
+  corrections answer <answer>
+                   Show one answer whole: the album it said yes to and the
+                   others it was chosen among, the discs and replies it
+                   rested on, and the values it put on each file, as they
+                   were when it was given
   play             Play the scanned tracks in a folder, album by album in
                    disc and track order, or tracks by their IDs, or a
                    release with --album. It replaces the queue. The server
@@ -324,7 +363,8 @@ Options:
   --root <name>         corrections lookup: the root the folder is in, when
                         more than one root has it
   --candidate <release group>
-                        corrections preview: the candidate, for one proposal
+                        corrections preview, confirm: the candidate, for one
+                        proposal
 
 Policy values, for re-resolve --dry-run. A switch is on or off, and on
 when given alone:
@@ -831,6 +871,43 @@ enum CorrectionsCommand {
     List(ServerArgs),
     Show(ProposalArgs),
     Preview(PreviewArgs),
+    Confirm(ConfirmArgs),
+    Undo(UndoArgs),
+    Answers(AnswersArgs),
+    Answer(AnswerArgs),
+}
+
+/// What `corrections answers` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct AnswersArgs {
+    /// The answers older than this one, as the last page's `--before`
+    /// said; from the newest when left out.
+    #[arg(long)]
+    pub(crate) before: Option<String>,
+    /// How many at most.
+    #[arg(long)]
+    pub(crate) limit: Option<u32>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `corrections answer` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct AnswerArgs {
+    /// The answer, by its ID.
+    pub(crate) answer: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `corrections undo` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct UndoArgs {
+    /// The answers, by their IDs.
+    #[arg(required = true)]
+    pub(crate) answers: Vec<String>,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `corrections show` takes.
@@ -845,12 +922,32 @@ pub(crate) struct ProposalArgs {
 /// What `corrections preview` takes.
 #[derive(Debug, Default, PartialEq, Eq, Args)]
 pub(crate) struct PreviewArgs {
+    /// The proposals, by their IDs, or with `--undo` the answers.
+    #[arg(required = true)]
+    pub(crate) proposals: Vec<String>,
+    /// The candidate, by its release group ID, for one proposal.
+    #[arg(long)]
+    pub(crate) candidate: Option<String>,
+    /// Preview undoing these answers instead.
+    #[arg(long)]
+    pub(crate) undo: bool,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
+}
+
+/// What `corrections confirm` takes.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct ConfirmArgs {
     /// The proposals, by their IDs.
     #[arg(required = true)]
     pub(crate) proposals: Vec<String>,
     /// The candidate, by its release group ID, for one proposal.
     #[arg(long)]
     pub(crate) candidate: Option<String>,
+    /// The fingerprint `corrections show` printed, for one proposal: the
+    /// answer is refused if the proposal changed since.
+    #[arg(long)]
+    pub(crate) fingerprint: Option<String>,
     #[command(flatten)]
     pub(crate) server: ServerArgs,
 }
@@ -1094,6 +1191,16 @@ fn try_run(
         Command::Corrections(CorrectionsCommand::Preview(args)) => {
             corrections::preview(&args, env, out)
         }
+        Command::Corrections(CorrectionsCommand::Confirm(args)) => {
+            corrections::confirm(&args, env, out)
+        }
+        Command::Corrections(CorrectionsCommand::Undo(args)) => corrections::undo(&args, env, out),
+        Command::Corrections(CorrectionsCommand::Answer(args)) => {
+            corrections::answer(&args, env, out)
+        }
+        Command::Corrections(CorrectionsCommand::Answers(args)) => {
+            corrections::answers(&args, env, out)
+        }
         Command::Play(args) => playback::play(&args, env, out),
         Command::Pause(args) => playback::transport("pause", &args, env, out),
         Command::Resume(args) => playback::transport("resume", &args, env, out),
@@ -1262,6 +1369,70 @@ mod tests {
         assert!(
             err.starts_with("ritornelctl: cannot scan that folder: "),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn corrections_confirm_takes_a_candidate_and_the_fingerprint_shown() {
+        assert_eq!(
+            parse(args(&[
+                "corrections",
+                "confirm",
+                "proposal",
+                "--candidate",
+                "group",
+                "--fingerprint",
+                "shown",
+            ]))
+            .unwrap()
+            .command,
+            Command::Corrections(CorrectionsCommand::Confirm(ConfirmArgs {
+                proposals: vec!["proposal".to_owned()],
+                candidate: Some("group".to_owned()),
+                fingerprint: Some("shown".to_owned()),
+                server: ServerArgs::default(),
+            }))
+        );
+    }
+
+    #[test]
+    fn corrections_answers_pages_and_answer_opens_one_and_preview_takes_an_undo() {
+        assert_eq!(
+            parse(args(&[
+                "corrections",
+                "answers",
+                "--before",
+                "earlier",
+                "--limit",
+                "10",
+            ]))
+            .unwrap()
+            .command,
+            Command::Corrections(CorrectionsCommand::Answers(AnswersArgs {
+                before: Some("earlier".to_owned()),
+                limit: Some(10),
+                server: ServerArgs::default(),
+            }))
+        );
+        assert_eq!(
+            parse(args(&["corrections", "answer", "one"]))
+                .unwrap()
+                .command,
+            Command::Corrections(CorrectionsCommand::Answer(AnswerArgs {
+                answer: "one".to_owned(),
+                server: ServerArgs::default(),
+            }))
+        );
+        assert_eq!(
+            parse(args(&["corrections", "preview", "--undo", "one"]))
+                .unwrap()
+                .command,
+            Command::Corrections(CorrectionsCommand::Preview(PreviewArgs {
+                proposals: vec!["one".to_owned()],
+                candidate: None,
+                undo: true,
+                server: ServerArgs::default(),
+            }))
         );
     }
 

@@ -380,13 +380,19 @@ pub enum CorrectionTargets {
 }
 
 /// The current binding of each of these source items that has one, or of
-/// every source item, the recording read through its redirects.
+/// every source item, the recording and appearance read through their
+/// redirects. An appearance that leads to another recording's is no
+/// appearance of this one, as for a correction.
 fn bindings(
     connection: &Connection,
     only: Option<&BTreeSet<i64>>,
 ) -> Result<HashMap<i64, Binding>, Error> {
-    const BINDING: &str = "SELECT a.source_item_id, r.canonical_id, a.appearance_id
+    const BINDING: &str = "SELECT a.source_item_id, r.canonical_id,
+                CASE WHEN r_ta.canonical_id = r.canonical_id THEN ta.canonical_id END
          FROM assignment a JOIN recording r ON r.id = a.recording_id
+         LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
+         LEFT JOIN track_appearance ta_canon ON ta_canon.id = ta.canonical_id
+         LEFT JOIN recording r_ta ON r_ta.id = ta_canon.recording_id
          WHERE a.superseded_at_ms IS NULL";
     let binding = |row: &Row<'_>| -> rusqlite::Result<(i64, Binding)> {
         Ok((
@@ -1261,7 +1267,11 @@ fn stale_bindings(connection: &Connection) -> Result<BTreeSet<i64>, Error> {
                                    AND a.superseded_at_ms IS NULL
              LEFT JOIN recording r ON r.id = a.recording_id
              LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
-             WHERE pe.recording_id IS NOT r.canonical_id OR pe.appearance_id IS NOT ta.canonical_id",
+             LEFT JOIN track_appearance ta_canon ON ta_canon.id = ta.canonical_id
+             LEFT JOIN recording r_ta ON r_ta.id = ta_canon.recording_id
+             WHERE pe.recording_id IS NOT r.canonical_id
+                OR pe.appearance_id IS NOT
+                   (CASE WHEN r_ta.canonical_id = r.canonical_id THEN ta.canonical_id END)",
         )?;
         let rows = statement.query_map([], |row| row.get(0))?;
         return Ok(rows.collect::<Result<_, _>>()?);
@@ -1329,11 +1339,15 @@ fn stale_bindings(connection: &Connection) -> Result<BTreeSet<i64>, Error> {
                                AND a.superseded_at_ms IS NULL
          LEFT JOIN recording r ON r.id = a.recording_id
          LEFT JOIN track_appearance ta ON ta.id = a.appearance_id
+         LEFT JOIN track_appearance ta_canon ON ta_canon.id = ta.canonical_id
+         LEFT JOIN recording r_ta ON r_ta.id = ta_canon.recording_id
          JOIN play_event_observation peo ON peo.play_event_id = pe.id
          WHERE (w.play_event_id IS NOT NULL
                 AND (pe.recording_id IS NOT w.want_rec OR pe.appearance_id IS NOT w.want_app))
             OR (w.play_event_id IS NULL
-                AND (pe.recording_id IS NOT r.canonical_id OR pe.appearance_id IS NOT ta.canonical_id))",
+                AND (pe.recording_id IS NOT r.canonical_id
+                     OR pe.appearance_id IS NOT
+                        (CASE WHEN r_ta.canonical_id = r.canonical_id THEN ta.canonical_id END)))",
     )?;
     let rows = statement.query_map([encoded], |row| row.get(0))?;
     Ok(rows.collect::<Result<_, _>>()?)

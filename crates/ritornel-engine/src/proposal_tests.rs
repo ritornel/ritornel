@@ -10,7 +10,7 @@ use crate::{Asked, Command, Fingerprint, Id, KeptReply, WriteRequest};
 
 /// An AIFF file of CD audio exactly `sectors` long, its samples made from
 /// `seed`, tagged in an ID3 chunk.
-fn aiff(sectors: u32, seed: u32, tags: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn aiff(sectors: u32, seed: u32, tags: &[(&str, &str)]) -> Vec<u8> {
     let frames = sectors * 588;
     let mut id3_frames = Vec::new();
     for (id, text) in tags {
@@ -60,7 +60,7 @@ fn aiff(sectors: u32, seed: u32, tags: &[(&str, &str)]) -> Vec<u8> {
     file
 }
 
-fn write(rig: &mut Rig, path: &str, bytes: &[u8]) {
+pub(crate) fn write(rig: &mut Rig, path: &str, bytes: &[u8]) {
     let to = rig.root().join(path);
     std::fs::create_dir_all(to.parent().unwrap()).unwrap();
     std::fs::write(&to, bytes).unwrap();
@@ -85,12 +85,17 @@ fn log(lengths: &[u32]) -> String {
 
 const MAIN: &str = "YuBQA_w4y7cbiR1haQP4UVic4Ko-";
 const BONUS: &str = "oAA1ZY.4QOAq6tpdobDdb4M9qyc-";
-const GROUP: &str = "00000000-0000-4000-8000-0000000000b1";
+pub(crate) const GROUP: &str = "00000000-0000-4000-8000-0000000000b1";
 
 /// The main disc, three songs tagged "Tin Weather", and the bonus disc of
 /// two, tagged "Tin Weather (Bonus Disc)" in a folder of its own, each with
 /// its rip log, scanned; and MusicBrainz's replies about both kept.
-fn album() -> Rig {
+pub(crate) fn album() -> Rig {
+    album_with(&[])
+}
+
+/// The same, with `main` tags also on each file of the main disc.
+pub(crate) fn album_with(main: &[(&str, &str)]) -> Rig {
     let mut rig = Rig::new();
     let songs = [
         ("Moss Arcade/Tin Weather", "Tin Weather", "Paper Kites", 75),
@@ -114,17 +119,17 @@ fn album() -> Rig {
         let track: &mut u32 = tracks.entry(folder).or_default();
         *track += 1;
         let number = track.to_string();
-        let bytes = aiff(
-            sectors,
-            seed,
-            &[
-                ("TIT2", title),
-                ("TPE1", "Moss Arcade"),
-                ("TPE2", "Moss Arcade"),
-                ("TALB", album),
-                ("TRCK", &number),
-            ],
-        );
+        let mut tags = vec![
+            ("TIT2", title),
+            ("TPE1", "Moss Arcade"),
+            ("TPE2", "Moss Arcade"),
+            ("TALB", album),
+            ("TRCK", number.as_str()),
+        ];
+        if album == "Tin Weather" {
+            tags.extend_from_slice(main);
+        }
+        let bytes = aiff(sectors, seed, &tags);
         write(
             &mut rig,
             &format!("{folder}/{number:0>2} {title}.aiff"),
@@ -417,4 +422,48 @@ fn a_preview_refuses_a_proposal_twice_or_choices_that_disagree() {
     assert_eq!(album.now.as_deref(), Some("Tin Weather (Bonus Disc)"));
     assert_eq!(album.value.as_deref(), Some("Tin Weather"));
     assert_eq!(album.root, "main");
+}
+
+/// A song of the invented album as an AIFF file, tagged.
+pub(crate) fn aiff_for_tests(
+    sectors: u32,
+    seed: u32,
+    title: &str,
+    album: &str,
+    track: &str,
+) -> Vec<u8> {
+    aiff(
+        sectors,
+        seed,
+        &[
+            ("TIT2", title),
+            ("TPE1", "Moss Arcade"),
+            ("TPE2", "Moss Arcade"),
+            ("TALB", album),
+            ("TRCK", track),
+        ],
+    )
+}
+
+#[test]
+fn a_field_of_one_value_has_it_once_and_a_credit_as_many_as_it_names() {
+    use crate::proposal_store::{now_of, values_of};
+    let facts = ritornel_domain::Facts {
+        album: Some("Tin Weather".to_owned()),
+        album_artist: vec!["Moss Arcade".to_owned(), "Salt Road".to_owned()],
+        release_group_mbid: Some(GROUP.to_owned()),
+        ..ritornel_domain::Facts::default()
+    };
+    // Past the first, a field of one value has none: what reads a field
+    // value by value comes to its end.
+    for field in ["album", "mb_release_group", "disc_number"] {
+        assert_eq!(now_of(&facts, field, 1), None, "{field}");
+        assert!(values_of(&facts, field) <= 1, "{field}");
+    }
+    assert_eq!(values_of(&facts, "album_artist"), 2);
+    assert_eq!(
+        now_of(&facts, "album_artist", 1).as_deref(),
+        Some("Salt Road")
+    );
+    assert_eq!(now_of(&facts, "album_artist", 2), None);
 }

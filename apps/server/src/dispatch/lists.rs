@@ -55,7 +55,12 @@ impl Fanout {
     pub(crate) fn changed(&self, committed: Committed) {
         let revision = revision(committed.revision);
         let sessions: Vec<Arc<Session>> = self.lock().values().filter_map(Weak::upgrade).collect();
-        let changed = changes(committed.method);
+        // A write that says it changed nothing shown tells no one.
+        let changed = if committed.shown {
+            changes(committed.method)
+        } else {
+            Vec::new()
+        };
         if changed.is_empty() {
             return;
         }
@@ -416,6 +421,7 @@ mod tests {
         fanout.changed(Committed {
             revision: 9,
             method: ritornel_engine::INGEST_METHOD,
+            shown: true,
         });
         let (library, lists) = told(&session);
         assert_eq!(library.len(), 1);
@@ -435,6 +441,7 @@ mod tests {
         fanout.changed(Committed {
             revision: 9,
             method: ritornel_contract::methods::HistoryRebuild::NAME,
+            shown: true,
         });
         let (library, lists) = told(&session);
         assert_eq!(library[0].changed, [LibraryChange::Stats]);
@@ -442,6 +449,7 @@ mod tests {
         fanout.changed(Committed {
             revision: 10,
             method: "scan.step",
+            shown: true,
         });
         let (library, lists) = told(&session);
         assert_eq!(library[0].changed, LibraryChange::ALL);
@@ -461,7 +469,11 @@ mod tests {
             (9, ritornel_engine::SIDECARS_METHOD),
             (10, ritornel_engine::LAYOUTS_METHOD),
         ] {
-            fanout.changed(Committed { revision, method });
+            fanout.changed(Committed {
+                revision,
+                method,
+                shown: true,
+            });
         }
         let (library, lists) = told(&session);
         assert!(

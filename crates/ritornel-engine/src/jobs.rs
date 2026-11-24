@@ -514,6 +514,17 @@ impl ServerStore {
         })
     }
 
+    /// Whether a job of this kind is running: claimed and not yet ended.
+    pub fn running(&self, kind: &str) -> Result<bool, Error> {
+        self.read(|connection| {
+            Ok(connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM job WHERE kind = ?1 AND state IN ('running', 'cancelling'))",
+                [kind],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     /// The job of this kind and key that ended last, however it ended.
     pub fn last_ended_job(&self, kind: &str, dedupe_key: &str) -> Result<Option<Job>, Error> {
         self.read(|connection| {

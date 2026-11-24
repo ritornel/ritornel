@@ -136,6 +136,9 @@ pub struct Committed {
     /// The contract call or the internal writer it was, as its
     /// [`WriteRequest`] names it.
     pub method: &'static str,
+    /// Whether the write may have changed anything shown. A write that says
+    /// it did not, such as an answer that moved nothing, is told so here.
+    pub shown: bool,
 }
 
 /// Told of every write after it commits, on the writer thread and in the
@@ -167,6 +170,8 @@ pub(crate) struct Write<'a> {
     rev: i64,
     now_ms: i64,
     entropy: &'a dyn Entropy,
+    /// Set when the write says it changed nothing shown.
+    nothing_shown: std::cell::Cell<bool>,
 }
 
 impl Write<'_> {
@@ -189,6 +194,11 @@ impl Write<'_> {
     /// of the write is stamped with.
     pub(crate) fn now_ms(&self) -> i64 {
         self.now_ms
+    }
+
+    /// Says that the write changed nothing shown: no event is sent for it.
+    pub(crate) fn changes_nothing_shown(&self) {
+        self.nothing_shown.set(true);
     }
 }
 
@@ -317,7 +327,7 @@ impl LibraryStore {
                      VALUES (1, ?1, ?2, 1, 0, ?3)",
                     (library_id.as_bytes(), hub_row, now_ms),
                 )?;
-                let written = write_in(&transaction, hub, &request, now_ms, &*entropy, |write| {
+                let (written, _) = write_in(&transaction, hub, &request, now_ms, &*entropy, |write| {
                     first_rows(write, hub_row)?;
                     Ok(receipt(&LibraryMeta {
                         library_id,
@@ -470,7 +480,8 @@ impl LibraryStore {
         self.writer.call(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let written = write_in(&transaction, hub, &request, clock.now_ms(), &*entropy, work)?;
+            let (written, shown) =
+                write_in(&transaction, hub, &request, clock.now_ms(), &*entropy, work)?;
             transaction.commit()?;
             // The one place a write is known to have committed. A replayed
             // command wrote nothing, so there is nothing to tell.
@@ -480,9 +491,53 @@ impl LibraryStore {
                 hook(Committed {
                     revision: written.revision,
                     method: request.method,
+                    shown,
                 });
             }
             Ok(written)
+        })
+    }
+
+    /// Runs `work` as a write would, on the writer thread in one
+    /// transaction with the next revision, and always rolls it back:
+    /// nothing is kept, no revision is used up, and no one is told. A
+    /// preview made so is what the write would do.
+    pub(crate) fn rehearse<F, T>(&self, work: F) -> Result<T, Error>
+    where
+        F: FnOnce(&Write<'_>) -> Result<T, Error> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (clock, entropy, hub) = (Arc::clone(&self.clock), Arc::clone(&self.entropy), self.hub);
+        self.writer.call(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let rev: Option<i64> = transaction
+                .query_row(
+                    "UPDATE library_meta SET rev = rev + 1
+                     WHERE id = 1 AND hub_server_id = (SELECT id FROM server WHERE public_id = ?1)
+                     RETURNING rev",
+                    [hub.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(rev) = rev else {
+                return Err(match read_meta(&transaction)? {
+                    Some(meta) => not_the_hub(&meta, hub),
+                    None => Error::NoLibrary,
+                });
+            };
+            let result = {
+                let write = Write {
+                    transaction: &transaction,
+                    rev,
+                    now_ms: clock.now_ms(),
+                    entropy: &*entropy,
+                    nothing_shown: std::cell::Cell::new(false),
+                };
+                work(&write)
+            };
+            transaction.rollback()?;
+            result
         })
     }
 
@@ -596,11 +651,11 @@ fn write_in(
     now_ms: i64,
     entropy: &dyn Entropy,
     work: impl FnOnce(&Write<'_>) -> Result<String, Error>,
-) -> Result<Written, Error> {
+) -> Result<(Written, bool), Error> {
     if let Some(command) = &request.command
         && let Some(written) = stored_receipt(transaction, command)?
     {
-        return Ok(written);
+        return Ok((written, false));
     }
 
     // The counter moves only while the pointer names this server, so no
@@ -621,12 +676,15 @@ fn write_in(
         });
     };
 
-    let result_json = work(&Write {
+    let write = Write {
         transaction,
         rev,
         now_ms,
         entropy,
-    })?;
+        nothing_shown: std::cell::Cell::new(false),
+    };
+    let result_json = work(&write)?;
+    let shown = !write.nothing_shown.get();
 
     let command_id = request.command.map(|command| command.id);
     transaction.execute(
@@ -660,11 +718,14 @@ fn write_in(
             ),
         )?;
     }
-    Ok(Written {
-        revision: rev,
-        result_json,
-        replayed: false,
-    })
+    Ok((
+        Written {
+            revision: rev,
+            result_json,
+            replayed: false,
+        },
+        shown,
+    ))
 }
 
 /// What a library has from the start, beside its pointer and its hub's

@@ -14,18 +14,22 @@
 use std::io::Write;
 
 use ritornel_client::contract::methods::{
-    CorrectionsDiscs, CorrectionsGet, CorrectionsList, CorrectionsLookup, CorrectionsPreview,
-    LibrarySetSettings,
+    CorrectionsAnswer, CorrectionsAnswers, CorrectionsConfirm, CorrectionsDiscs, CorrectionsGet,
+    CorrectionsList, CorrectionsLookup, CorrectionsPreview, CorrectionsUndo, LibrarySetSettings,
 };
 use ritornel_client::contract::{
-    AlbumShape, Choice, Disc, DiscList, DiscsParams, FileValue, Id, LayoutMethod,
+    AlbumShape, Answer, AnswerGot, AnswerList, AnswerParams, AnswerVerb, Answered, AnswersParams,
+    Choice, ConfirmParams, Confirmation, Disc, DiscList, DiscsParams, FileValue, Id, LayoutMethod,
     LibrarySettingsSet, LookupDone, LookupOutcome, LookupParams, NoParams, PreviewParams,
     PreviewShown, Proposal, ProposalCandidate, ProposalChange, ProposalGetParams, ProposalGot,
-    ProposalList, SetLibrarySettingsParams,
+    ProposalList, SetLibrarySettingsParams, UndoParams,
 };
 use ritornel_client::local;
 
-use crate::cli::{DiscsArgs, Error, LookupArgs, PreviewArgs, ProposalArgs, ServerArgs, SwitchArgs};
+use crate::cli::{
+    AnswerArgs, AnswersArgs, ConfirmArgs, DiscsArgs, Error, LookupArgs, PreviewArgs, ProposalArgs,
+    ServerArgs, SwitchArgs, UndoArgs,
+};
 use crate::server;
 
 pub(crate) fn discs(
@@ -196,6 +200,27 @@ pub(crate) fn preview(
     if args.candidate.is_some() && args.proposals.len() != 1 {
         return Err(Error::Usage("--candidate is for one proposal"));
     }
+    if args.undo {
+        if args.candidate.is_some() {
+            return Err(Error::Usage("--candidate is not for an undo"));
+        }
+        let undo = answer_ids(&args.proposals)?;
+        let shown = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
+            client
+                .call::<CorrectionsPreview>(&PreviewParams {
+                    choices: Vec::new(),
+                    undo,
+                })
+                .await
+        })?;
+        return server::print(
+            &args.server,
+            out,
+            &shown,
+            serde_json::to_string_pretty,
+            render_preview,
+        );
+    }
     let choices = args
         .proposals
         .iter()
@@ -210,7 +235,10 @@ pub(crate) fn preview(
         .collect::<Result<Vec<_>, Error>>()?;
     let shown = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
         client
-            .call::<CorrectionsPreview>(&PreviewParams { choices })
+            .call::<CorrectionsPreview>(&PreviewParams {
+                choices,
+                undo: Vec::new(),
+            })
             .await
     })?;
     server::print(
@@ -238,6 +266,268 @@ fn place(root: &str, folder: &str) -> String {
     } else {
         format!("{root}/{folder}")
     }
+}
+
+pub(crate) fn confirm(
+    args: &ConfirmArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    if args.candidate.is_some() && args.proposals.len() != 1 {
+        return Err(Error::Usage("--candidate is for one proposal"));
+    }
+    if args.fingerprint.is_some() && args.proposals.len() != 1 {
+        return Err(Error::Usage("--fingerprint is for one proposal"));
+    }
+    let ids = args
+        .proposals
+        .iter()
+        .map(|text| {
+            text.parse::<Id>()
+                .map_err(|_| Error::Usage("confirm needs proposal IDs"))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let (candidate, fingerprint) = (args.candidate.clone(), args.fingerprint.clone());
+    let done = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
+        // Each proposal as it is now: its fingerprint, and its candidate.
+        let mut answers = Vec::new();
+        for proposal_id in ids {
+            let got = client
+                .call::<CorrectionsGet>(&ProposalGetParams { proposal_id })
+                .await?;
+            let release_group = candidate.clone().or_else(|| {
+                got.proposal
+                    .candidates
+                    .first()
+                    .map(|first| first.release_group.clone())
+            });
+            answers.push(Confirmation {
+                proposal_id,
+                release_group: release_group.unwrap_or_default(),
+                fingerprint: fingerprint.clone().unwrap_or(got.proposal.fingerprint),
+            });
+        }
+        client
+            .call::<CorrectionsConfirm>(&ConfirmParams {
+                idempotency_key: ritornel_client::idempotency_key()?,
+                answers,
+            })
+            .await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &done,
+        serde_json::to_string_pretty,
+        render_answered,
+    )
+}
+
+/// Answer IDs, as typed.
+fn answer_ids(texts: &[String]) -> Result<Vec<Id>, Error> {
+    texts
+        .iter()
+        .map(|text| {
+            text.parse::<Id>()
+                .map_err(|_| Error::Usage("undo needs answer IDs"))
+        })
+        .collect()
+}
+
+/// Undoes answers. The answers resting on them, which went with them, are
+/// listed first.
+pub(crate) fn undo(args: &UndoArgs, env: local::Env<'_>, out: &mut dyn Write) -> Result<(), Error> {
+    let answers = answer_ids(&args.answers)?;
+    let asked = answers.clone();
+    let done = server::ask_for(&args.server, env, Some(LOOKUP_WAIT), async |client| {
+        client
+            .call::<CorrectionsUndo>(&UndoParams {
+                idempotency_key: ritornel_client::idempotency_key()?,
+                answers,
+            })
+            .await
+    })?;
+    let resting: Vec<Id> = done
+        .answers
+        .iter()
+        .filter_map(|written| written.undoes)
+        .filter(|answer| !asked.contains(answer))
+        .collect();
+    if !args.server.json && !resting.is_empty() {
+        let mut text = String::from("These rested on it, and are undone with it:\n");
+        for answer in resting {
+            text.push_str(&format!("  {answer}\n"));
+        }
+        text.push('\n');
+        out.write_all(text.as_bytes()).map_err(Error::Output)?;
+    }
+    server::print(
+        &args.server,
+        out,
+        &done,
+        serde_json::to_string_pretty,
+        render_answered,
+    )
+}
+
+pub(crate) fn answers(
+    args: &AnswersArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let before = args
+        .before
+        .as_deref()
+        .map(|text| {
+            text.parse::<Id>()
+                .map_err(|_| Error::Usage("--before needs an answer ID"))
+        })
+        .transpose()?;
+    let params = AnswersParams {
+        before,
+        limit: args.limit,
+    };
+    let list = server::ask(&args.server, env, async |client| {
+        client.call::<CorrectionsAnswers>(&params).await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &list,
+        serde_json::to_string_pretty,
+        render_answers,
+    )
+}
+
+pub(crate) fn answer(
+    args: &AnswerArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let answer_id = args
+        .answer
+        .parse::<Id>()
+        .map_err(|_| Error::Usage("answer needs an answer ID"))?;
+    let got = server::ask(&args.server, env, async |client| {
+        client
+            .call::<CorrectionsAnswer>(&AnswerParams { answer_id })
+            .await
+    })?;
+    server::print(
+        &args.server,
+        out,
+        &got,
+        serde_json::to_string_pretty,
+        render_answer,
+    )
+}
+
+fn render_answered(done: &Answered) -> String {
+    let mut text = String::new();
+    for answer in &done.answers {
+        match (answer.proposal_id, answer.undoes) {
+            (Some(proposal), _) => {
+                text.push_str(&format!("{}  yes to {proposal}\n", answer.answer_id))
+            }
+            (_, Some(undone)) => text.push_str(&format!("{}  undid {undone}\n", answer.answer_id)),
+            _ => {}
+        }
+    }
+    text.push_str(if done.moved {
+        "The library changed.\n"
+    } else {
+        "Nothing shown changed.\n"
+    });
+    text
+}
+
+fn render_answers(list: &AnswerList) -> String {
+    if list.answers.is_empty() {
+        return "No answers yet.\n".to_owned();
+    }
+    let mut text = String::new();
+    for answer in &list.answers {
+        text.push_str(&answer_line(answer));
+    }
+    if let Some(next) = list.next {
+        text.push_str(&format!("\nMore with --before {next}\n"));
+    }
+    text
+}
+
+fn render_answer(got: &AnswerGot) -> String {
+    let mut text = answer_line(&got.answer);
+    let evidence = &got.evidence;
+    if let Some(candidate) = &evidence.candidate {
+        text.push_str(&format!(
+            "\nSaid yes to: {} by {} ({})\n",
+            candidate.title.as_deref().unwrap_or("an untitled album"),
+            candidate.artist.as_deref().unwrap_or("?"),
+            candidate.release_group
+        ));
+    }
+    if evidence.candidates.len() > 1 {
+        text.push_str("Chosen among:\n");
+        for shown in &evidence.candidates {
+            text.push_str(&format!(
+                "  {} ({})\n",
+                shown.title.as_deref().unwrap_or("an untitled album"),
+                shown.release_group
+            ));
+        }
+    }
+    if !evidence.replies.is_empty() {
+        text.push_str("Rested on:\n");
+        for reply in &evidence.replies {
+            let found: Vec<String> = evidence
+                .layouts
+                .iter()
+                .filter(|layout| layout.disc_id == reply.disc_id)
+                .map(|layout| {
+                    let ways: Vec<&str> = layout.methods.iter().map(|way| method(*way)).collect();
+                    format!("{} ({})", layout.folder, ways.join(", "))
+                })
+                .collect();
+            text.push_str(&format!("  disc {}: {}\n", reply.disc_id, found.join("; ")));
+        }
+    }
+    if !evidence.values.is_empty() {
+        text.push_str("On the files:\n");
+        for value in &evidence.values {
+            text.push_str(&format!(
+                "  {}/{}  {}\n",
+                value.root,
+                value.path,
+                change_of(value)
+            ));
+        }
+    }
+    if !evidence.rests_on.is_empty() {
+        text.push_str("Undone with:\n");
+        for answer in &evidence.rests_on {
+            text.push_str(&format!("  {answer}\n"));
+        }
+    }
+    text
+}
+
+fn answer_line(answer: &Answer) -> String {
+    let said = match answer.verb {
+        AnswerVerb::Confirm => format!(
+            "yes: {} ({}), {}",
+            answer.title.as_deref().unwrap_or("an album"),
+            answer.release_group.as_deref().unwrap_or("?"),
+            plural(answer.files, "file", "files")
+        ),
+        AnswerVerb::Undo => format!(
+            "undid {}",
+            answer.undoes.map(|id| id.to_string()).unwrap_or_default()
+        ),
+    };
+    let undone = answer
+        .undone_by
+        .map_or_else(String::new, |by| format!(", undone by {by}"));
+    format!("{}  {said}{undone}\n", answer.answer_id)
 }
 
 fn change(change: ProposalChange) -> &'static str {
@@ -297,9 +587,10 @@ fn render_list(list: &ProposalList) -> String {
 
 fn render_proposal(proposal: &Proposal) -> String {
     let mut text = format!(
-        "{}  {}\n\nRests on:\n",
+        "{}  {}\nFingerprint {}\n\nRests on:\n",
         proposal.proposal_id,
-        place(&proposal.root, &proposal.folder)
+        place(&proposal.root, &proposal.folder),
+        proposal.fingerprint
     );
     for evidence in &proposal.rests_on {
         let methods: Vec<&str> = evidence.methods.iter().copied().map(method).collect();
@@ -362,7 +653,15 @@ fn change_of(value: &FileValue) -> String {
 }
 
 fn render_preview(shown: &PreviewShown) -> String {
-    let mut text = String::from("Now:\n");
+    let mut text = String::new();
+    if !shown.undoes.is_empty() {
+        text.push_str("Undoes:\n");
+        for answer in &shown.undoes {
+            text.push_str(&format!("  {answer}\n"));
+        }
+        text.push('\n');
+    }
+    text.push_str("Now:\n");
     for album in &shown.now {
         text.push_str(&shape(album));
     }

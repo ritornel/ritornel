@@ -67,7 +67,7 @@ Resolution runs once at the end of a scan that changed anything (`resolve.rs`, `
 
 ## Catalog projection and displayed metadata
 
-`crates/ritornel-domain/src/catalog.rs` and `discs.rs` (`CATALOG_VERSION = 4`) project claims and durable `metadata_edit` overrides into artists, artist credits, recordings, releases, release groups, track appearances, and FTS5 `search_text`:
+`crates/ritornel-domain/src/catalog.rs` and `discs.rs` (`CATALOG_VERSION = 5`) project claims, the tag values answers put on files (see [`docs/internals/corrections.md`](corrections.md), "Answers"), and durable `metadata_edit` overrides into artists, artist credits, recordings, releases, release groups, track appearances, and FTS5 `search_text`:
 
 - **Diffing writer (`resolve_store.rs`):** `Plan` compares the projected catalog against `Shown` rows in `library.db` and writes only changed rows. Running resolution when nothing changed writes nothing and takes no library revision. `library_setting` records the last applied `(extractor, resolver, normalizer, catalog)` versions so upgrades re-resolve automatically.
 - **Artists and credits:** Artist strings are not heuristically split on `"&"` or commas; multi-valued tags and MBID lists create multi-artist credits with preserved join phrases. Artists are keyed in `artist_key` by MBID or normalized name. An un-ID'd credit matching an artist's unique claimed sort name (same words reordered, guarded against ambiguous sort names) binds to that artist. Albums with differing track artists and no album artist use `"Various Artists"`; albums where no file names any artist display under `"Unknown Artist"` while keeping the same grouping behavior.

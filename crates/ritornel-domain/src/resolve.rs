@@ -529,6 +529,10 @@ struct Fold<'a> {
     by_row: HashMap<i64, usize>,
     /// The rows that an item of this fold has taken as its own recording.
     founded: HashSet<i64>,
+    /// The recordings, by canonical row, that items keeping their
+    /// assignment hold whatever is decided: pinned, retired or unreadable
+    /// ones. An undo's hint never takes one of them.
+    kept: HashSet<i64>,
     by_audio: HashMap<i64, usize>,
     by_mbid: HashMap<String, Vec<usize>>,
     by_core: HashMap<String, Vec<usize>>,
@@ -644,6 +648,15 @@ impl<'a> Fold<'a> {
             evs: Vec::new(),
             by_row: HashMap::new(),
             founded: HashSet::new(),
+            kept: library
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let current = item.current?;
+                    (item.retired || current.by_user || item.audio.is_none())
+                        .then(|| canonical(current.recording))
+                })
+                .collect(),
             by_audio: HashMap::new(),
             by_mbid: HashMap::new(),
             by_core: HashMap::new(),
@@ -1215,15 +1228,31 @@ impl<'a> Fold<'a> {
                     // An item whose recording was made for it keeps it,
                     // unless the owner has said the item is not that
                     // recording, wherever its redirects lead.
-                    let own = current
-                        .filter(|current| current.method == Method::New && !current.by_user)
-                        .map(|current| current.recording)
+                    let excluded = |fold: &Self, row: i64| {
+                        fold.excluded
+                            .get(&item.id)
+                            .is_some_and(|recordings| recordings.contains(&fold.canonical(row)))
+                    };
+                    // One an undo parts takes back the recording it had
+                    // before, where that leads nowhere else and no file
+                    // holds it.
+                    let prior = item
+                        .prior_recording
                         .filter(|row| {
-                            !self.excluded.get(&item.id).is_some_and(|recordings| {
-                                recordings.contains(&self.canonical(*row))
-                            })
+                            self.canonical(*row) == *row
+                                && !self.by_row.contains_key(row)
+                                && !self.kept.contains(row)
+                                && !excluded(self, *row)
                         })
                         .filter(|row| self.founded.insert(*row));
+                    let own = match prior {
+                        Some(row) => Some(row),
+                        None => current
+                            .filter(|current| current.method == Method::New && !current.by_user)
+                            .map(|current| current.recording)
+                            .filter(|row| !excluded(self, *row))
+                            .filter(|row| self.founded.insert(*row)),
+                    };
                     let rec = match own {
                         Some(row) => self.rec_for_row(row),
                         None => {
@@ -1297,8 +1326,25 @@ pub fn judge_replacements(
     replacements: &[Replacement],
     policy: &Policy,
 ) -> Vec<bool> {
-    let mut probes: Vec<Facts> = replacements.iter().map(|r| r.facts.clone()).collect();
-    let implied = crate::discs::apply_with_probes(library, policy, &mut probes);
+    // Each judged under the values its item was answered with, so a
+    // corrected file ripped again under its old tags stays itself.
+    let mut probes: Vec<Facts> = Vec::with_capacity(replacements.len());
+    let mut keeps = Vec::with_capacity(replacements.len());
+    for replacement in replacements {
+        let mut facts = replacement.facts.clone();
+        let item = library.items.get(replacement.index);
+        if let Some(item) = item {
+            crate::values::hold(item, &mut facts);
+        }
+        probes.push(facts);
+        keeps.push(item.map_or((false, false), |item| {
+            (
+                item.held.contains(&"album"),
+                item.held.contains(&"disc_number"),
+            )
+        }));
+    }
+    let implied = crate::discs::apply_with_probes(library, policy, &mut probes, &keeps);
     let mut fold = Fold::new(implied.as_ref().unwrap_or(library), policy);
     let bounds = fold.run();
     replacements
@@ -1322,6 +1368,8 @@ pub fn judge_replacements(
                 facts,
                 held: Vec::new(),
                 current: None,
+                prior: None,
+                prior_recording: None,
             };
             let probe = Ev::of(as_new.id, &as_new.facts, policy, None);
             matches!(fold.decide(&as_new, &probe, true), Outcome::Bind { rec, .. } if rec == had)

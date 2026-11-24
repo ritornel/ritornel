@@ -113,6 +113,28 @@ pub struct Item {
     pub held: Vec<&'static str>,
     /// Its current assignment.
     pub current: Option<Current>,
+    /// The appearance it is to be kept on, when not its current one: where
+    /// it was before an answer now undone moved it. It votes for its release
+    /// and appearance rows in place of its current one, so the undo gives
+    /// back the rows it had.
+    pub prior: Option<i64>,
+    /// The recording it was on before an answer now undone: the one it
+    /// takes again when it is parted from the recording it is on now.
+    pub prior_recording: Option<i64>,
+}
+
+/// What a yes put together: release and release group rows, which the
+/// guards that keep rows with input of their own apart count as one while
+/// it stands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Join {
+    /// The album the yes said its files are, by its release group ID. The
+    /// groups of every standing yes to one album count as one too.
+    pub album: String,
+    /// Release rows, each the end of its redirect chain.
+    pub releases: Vec<i64>,
+    /// Release group rows.
+    pub groups: Vec<i64>,
 }
 
 /// A release that exists.
@@ -236,6 +258,16 @@ pub struct Library {
     /// Pairs of normalised names the owner's actions showed to be the same
     /// thing, for titles ([`Kind::Recording`]) and artists.
     pub aliases: Vec<(Kind, String, String)>,
+    /// The group each of these releases is to be kept in, when not the one
+    /// it is in: the group it was in before an answer now undone moved it.
+    /// It votes for that group's row, since a group has no redirect.
+    pub prior_groups: HashMap<i64, i64>,
+    /// Release rows an answer led on to where their files went, as it left
+    /// them. They are the answer's, not merges made by hand.
+    pub answer_redirects: HashSet<i64>,
+    /// What each standing answer put together. Rows one joins count as one
+    /// to the guards that keep rows with input of their own apart.
+    pub answer_joins: Vec<Join>,
     /// The owner's edits in force: entity kind, row and field, to value.
     pub edits: HashMap<(Kind, i64, String), String>,
 }
