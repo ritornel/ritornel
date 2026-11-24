@@ -20,6 +20,8 @@ A change to the database schema is a new numbered migration plus `mise run schem
 
 Land complete changes without leaving known gaps in core behavior for follow-up pull requests. When a feature adds migrations or changes `CONTRACT_VERSION` (or the wire contract), keep it to one contract bump and the fewest migrations its purpose needs—collapse migrations not yet on `main` before merging rather than adding one per pull request in a stack. Keep pull request descriptions factual about what changed and how it was checked; settle open design questions in an issue before opening the pull request.
 
+In a stack of pull requests, CI runs only its Linux jobs on a layer that another open pull request builds on, and every job on the top layer, which holds the layers under it. Land a stack through its top layer.
+
 ## Using AI
 
 Ritornel was written with coding agents, and contributions made the same way are welcome. End the pull request with the model and harness that did the work. What matters is that you can say what the change does for someone using the app, that you ran it, and how you checked it.
