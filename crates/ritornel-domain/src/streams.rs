@@ -384,6 +384,25 @@ fn one_to_one(
     taken
 }
 
+/// The events of each pair of names, each with its start, by start.
+type ByNames<'n> = HashMap<&'n (String, String), Vec<(i64, usize)>>;
+
+/// The events of these names that start between `from` and `to`, with their
+/// starts.
+fn near<'a>(
+    by_names: &'a ByNames<'_>,
+    names: &(String, String),
+    from: i64,
+    to: i64,
+) -> &'a [(i64, usize)] {
+    let Some(list) = by_names.get(names) else {
+        return &[];
+    };
+    let first = list.partition_point(|(start, _)| *start < from);
+    let last = list.partition_point(|(start, _)| *start <= to);
+    list.get(first..last).unwrap_or_default()
+}
+
 /// Matches scrobbles to the events of these streams: pins first, then tier
 /// A, then B and C where they are in force, each over what the last left.
 /// The result depends on the records alone, never on the order they are
@@ -484,35 +503,16 @@ pub fn match_streams(
         });
     }
 
-    // The events of each pair of names, by start, for finding those near a
-    // scrobble.
-    let mut by_names: HashMap<&(String, String), Vec<usize>> = HashMap::new();
+    // The events of each pair of names, with their starts, by start, for
+    // finding those near a scrobble.
+    let mut by_names: ByNames<'_> = HashMap::new();
     for (event, names) in event_names.iter().enumerate() {
-        by_names.entry(names).or_default().push(event);
+        let start = events.get(event).map_or(0, |e| e.start_ms);
+        by_names.entry(names).or_default().push((start, event));
     }
     for list in by_names.values_mut() {
-        list.sort_by_key(|event| events.get(*event).map_or(0, |e| e.start_ms));
+        list.sort_by_key(|(start, _)| *start);
     }
-    let starts = |list: &[usize]| -> Vec<i64> {
-        list.iter()
-            .map(|event| events.get(*event).map_or(0, |e| e.start_ms))
-            .collect()
-    };
-    let start_index: HashMap<&(String, String), Vec<i64>> = by_names
-        .iter()
-        .map(|(names, list)| (*names, starts(list)))
-        .collect();
-    // Events of these names that start between `from` and `to`.
-    let near = |names: &(String, String), from: i64, to: i64| -> Vec<usize> {
-        let (Some(list), Some(starts)) = (by_names.get(names), start_index.get(names)) else {
-            return Vec::new();
-        };
-        let first = starts.partition_point(|start| *start < from);
-        let last = starts.partition_point(|start| *start <= to);
-        list.get(first..last)
-            .map(<[usize]>::to_vec)
-            .unwrap_or_default()
-    };
     let allowed = |event: usize, scrobble: usize| !apart.contains(&(event, scrobble));
 
     // Tier A.
@@ -524,7 +524,8 @@ pub fn match_streams(
         let Some(names) = scrobble_names.get(scrobble) else {
             continue;
         };
-        for event in near(
+        for &(start, event) in near(
+            &by_names,
             names,
             s.at_ms.saturating_sub(WITHIN_MS),
             s.at_ms.saturating_add(WITHIN_MS),
@@ -532,7 +533,6 @@ pub fn match_streams(
             if !allowed(event, scrobble) {
                 continue;
             }
-            let start = events.get(event).map_or(0, |e| e.start_ms);
             edges.push(Edge {
                 distance: distance(s.at_ms, start),
                 scrobble_key: &s.key,
@@ -573,7 +573,7 @@ pub fn match_streams(
                 } else {
                     s.at_ms
                 };
-                for event in near(names, from, to) {
+                for &(_, event) in near(&by_names, names, from, to) {
                     let Some(e) = events.get(event) else {
                         continue;
                     };
@@ -643,6 +643,7 @@ pub fn match_streams(
         }
         let scrobble_partner = |names: &(String, String), at: i64| {
             !near(
+                &by_names,
                 names,
                 at.saturating_sub(PARTNER_WITHIN_MS),
                 at.saturating_add(PARTNER_WITHIN_MS),
