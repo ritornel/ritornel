@@ -1821,7 +1821,8 @@ export type ImportYear = {
    */
   streams: number,
   /**
-   * Of those, the ones stored already.
+   * The run's own listens of the year that are stored already, whoever's
+   * they stay: one of another listener's is not among `streams`.
    */
   alreadyStored: number,
   /**

@@ -512,6 +512,14 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
             }
         }
     }
+    // A year whose plays move has a row, though no listen of it is the
+    // listener's: another listener's stream can move a scrobble's play into
+    // it.
+    for year in after.keys().chain(now.keys()) {
+        if after.get(year) != now.get(year) {
+            row(&mut years, *year);
+        }
+    }
     for row in years.values_mut() {
         let (after, now) = (
             after.get(&row.year).copied().unwrap_or_default(),
@@ -1114,6 +1122,48 @@ mod tests {
         let year = report.years[0];
         assert_eq!((year.plays_after, year.counted_after), (1, 1));
         assert_eq!((report.events, year.already_stored), (1, 1));
+    }
+
+    #[test]
+    fn a_year_another_listeners_stream_moves_a_play_into_has_its_row() {
+        // 2020-01-01 00:00:00 UTC, from the evening the records begin.
+        const NEW_YEAR: i64 = 25_153_200;
+        // Another listener's stream, renamed, began five seconds before
+        // the new year; their scrobble of it, three seconds into it, is
+        // joined by tier C, and the play is the old year's.
+        let renamed = fresh(vec![record(
+            NEW_YEAR + 205,
+            210,
+            "Low Tide - Remastered",
+            "trackdone",
+        )]);
+        let others = [OtherListener {
+            listener: 2,
+            streams: renamed,
+            scrobbles: vec![scrobble(NEW_YEAR + 3, "Low Tide")],
+        }];
+        // Their stream of the scrobble's own names, twenty minutes before,
+        // stored and out of force, which the run brings back: tier C no
+        // longer joins, and the scrobble is a play of the new year.
+        let back = fresh(vec![record(NEW_YEAR - 1200, 200, "Low Tide", "trackdone")]);
+        let stored: HashMap<Vec<u8>, SpotifyStream> = back
+            .iter()
+            .map(|stream| (stream.key.clone(), stream.record.clone()))
+            .collect();
+        let owners = HashMap::from([(back[0].key.clone(), 2)]);
+        let plays = BTreeMap::from([(2019, (1, 1))]);
+        let report = dry_run(&DryRunInput {
+            others: &others,
+            stored: &stored,
+            owners: &owners,
+            ..input(&back, &[], &plays)
+        });
+        let by_year: Vec<(i32, u64, u64)> = report
+            .years
+            .iter()
+            .map(|year| (year.year, year.plays_after, year.counted_after))
+            .collect();
+        assert_eq!(by_year, [(2019, 2, 2), (2020, 1, 1)]);
     }
 
     #[test]

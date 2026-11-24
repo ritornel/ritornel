@@ -284,7 +284,8 @@ pub struct ImportYear {
     /// Listens in force once the run is applied, the run's and those in
     /// force now: streams, each repeat counted once.
     pub streams: u64,
-    /// Of those, the ones stored already.
+    /// The run's own listens of the year that are stored already, whoever's
+    /// they stay: one of another listener's is not among `streams`.
     pub already_stored: u64,
     /// Of those, the ones joined to a scrobble by tier A.
     pub joined_start: u64,
