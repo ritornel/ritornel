@@ -197,27 +197,21 @@ fn report_text(report: &ImportReport, samples: bool) -> String {
             report.paused
         ),
     ));
-    let pinned: u64 = report.years.iter().map(|year| year.joined_pinned).sum();
-    if pinned > 0 {
-        lines.push((
-            "Pinned",
-            format!("{pinned} listens joined to a scrobble by a correction"),
-        ));
-    }
     text.push_str(&server::facts(&lines));
     text.push_str(
-        "\nYear  Listens  Joined (A B C)        Alone: counted  not  unknown  Scrobbles alone  \
+        "\nYear  Listens  Joined (A B C pin)        Alone: counted  not  unknown  Scrobbles alone  \
          Plays now  after   Counted now  after  No zone\n",
     );
     for year in &report.years {
         let _ = writeln!(
             text,
-            "{:<4}  {:>7}  {:>7} {:>6} {:>6}  {:>14} {:>5} {:>8}  {:>15}  {:>9} {:>6}  {:>11} {:>6}  {:>7}",
+            "{:<4}  {:>7}  {:>7} {:>6} {:>6} {:>4}  {:>14} {:>5} {:>8}  {:>15}  {:>9} {:>6}  {:>11} {:>6}  {:>7}",
             year.year,
             year.streams,
             year.joined_start,
             year.joined_during,
             year.joined_renamed,
+            year.joined_pinned,
             year.alone_counted,
             year.alone_not_counted,
             year.alone_unknown,

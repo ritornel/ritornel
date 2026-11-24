@@ -395,11 +395,6 @@ pub fn match_streams(
     pins: &Pins,
 ) -> Matched {
     let events = events(streams);
-    let event_of: HashMap<usize, usize> = events
-        .iter()
-        .enumerate()
-        .flat_map(|(event, e)| e.streams.iter().map(move |stream| (*stream, event)))
-        .collect();
     let event_key = |event: usize| -> &[u8] {
         events
             .get(event)
@@ -433,10 +428,16 @@ pub fn match_streams(
             (HashMap::new(), HashMap::new())
         } else {
             (
-                streams
+                events
                     .iter()
                     .enumerate()
-                    .filter_map(|(at, stream)| Some((stream.key.as_slice(), *event_of.get(&at)?)))
+                    .flat_map(|(event, e)| {
+                        e.streams.iter().filter_map(move |at| {
+                            streams
+                                .get(*at)
+                                .map(|stream| (stream.key.as_slice(), event))
+                        })
+                    })
                     .collect(),
                 scrobbles
                     .iter()
