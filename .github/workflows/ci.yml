@@ -33,11 +33,12 @@ jobs:
     # saved.
     #
     # And on which systems, by the tier. A pull request whose branch is the
-    # base of another open one, a layer under the top of a stack, has the
-    # Linux tier: the jobs on Linux x64 alone. Every other run has the full
-    # tier, every system: a pull request on its own, the top of a stack,
-    # which holds every layer under it and is where the stack lands, and a
-    # push to main. When the pull requests cannot be listed, the tier is full.
+    # base of another open one from this repository, a layer under the top
+    # of a stack, has the Linux tier: the jobs on Linux x64 alone. Every
+    # other run has the full tier, every system: a pull request on its own,
+    # the top of a stack, which holds every layer under it and is where the
+    # stack lands, and a push to main. When the pull requests cannot be
+    # listed, the tier is full.
     name: Jobs the change needs
     runs-on: ubuntu-slim
     timeout-minutes: 5
@@ -85,9 +86,10 @@ jobs:
           if [[ $EVENT != pull_request ]]; then
             why="a push to $GITHUB_REF_NAME"
           elif [[ $HEAD_REPO != "$GH_REPO" ]]; then
-            why="a pull request from another repository, which no other builds on"
+            why="a pull request from a fork"
+          # A pull request from a fork does not land through the one it is based on.
           elif ! above=$(gh api --method GET "repos/$GH_REPO/pulls" -f state=open -f base="$HEAD_REF" -F per_page=100 \
-            --jq 'map("#\(.number)") | join(", ")'); then
+            --jq 'map(select(.head.repo.full_name == .base.repo.full_name) | "#\(.number)") | join(", ")'); then
             why="the open pull requests could not be listed"
           elif [[ -n $above ]]; then
             tier=linux
