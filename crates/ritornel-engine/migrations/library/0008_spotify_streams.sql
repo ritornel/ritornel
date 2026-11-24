@@ -198,13 +198,14 @@ CREATE TABLE play_event_artist (
   listener_id      INTEGER NOT NULL REFERENCES listener(id),     -- the play's
   counted          INTEGER NOT NULL CHECK (counted IN (0, 1)),   -- counts and not excluded
   local_date       INTEGER,                                      -- YYYYMMDD
+  event_at_utc_ms  INTEGER,                                      -- the play's, so that one stamped after now is never a list's first or last
   spelling         TEXT,                                         -- the name as the play gave it, for a name
   rev              INTEGER NOT NULL,
   UNIQUE (play_event_id, heard_artist_id)
 ) STRICT;
 
 CREATE INDEX play_event_artist_heard ON play_event_artist (heard_artist_id, counted);
-CREATE INDEX play_event_artist_listed ON play_event_artist (listener_id, counted, heard_artist_id, local_date);
+CREATE INDEX play_event_artist_listed ON play_event_artist (listener_id, counted, heard_artist_id, local_date, event_at_utc_ms);
 
 -- A play's album, when it has one.
 CREATE TABLE play_event_album (
@@ -214,12 +215,13 @@ CREATE TABLE play_event_album (
   listener_id     INTEGER NOT NULL REFERENCES listener(id),
   counted         INTEGER NOT NULL CHECK (counted IN (0, 1)),
   local_date      INTEGER,
+  event_at_utc_ms INTEGER,
   spelling        TEXT,
   rev             INTEGER NOT NULL
 ) STRICT;
 
 CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted);
-CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date);
+CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date, event_at_utc_ms);
 
 -- An artist's page counts a song as the appearance it was heard from
 -- credits it, as the lists link it: the appearances whose credit names

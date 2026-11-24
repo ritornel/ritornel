@@ -11,7 +11,7 @@
 --   0005_artist_keys  87f1f257a31ef76053a0f7f6591d42176859dca46c9e4b8e809a5ea30467b36f
 --   0006_alias_spellings_and_unbind  5d6f0f953a8e5dab6217e7eeb472fcd0c9f5154ea3a65befc16b174ab20e21d1
 --   0007_delivery_sender  273949eacea8c041c35ba8fc54bc4e9c3f74a65a1c73bbf43106c987140c45cb
---   0008_spotify_streams  c39aaf0d9d117dcc4ae189a8b4c807fd89c3a8851aa0706ad1974efd0ee40077
+--   0008_spotify_streams  73d07afd9e06dfffb972e864eee89d6e88eb6668dd51a84bd64d14219b92a3ab
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -1085,6 +1085,7 @@ CREATE TABLE play_event_artist (
   listener_id      INTEGER NOT NULL REFERENCES listener(id),     -- the play's
   counted          INTEGER NOT NULL CHECK (counted IN (0, 1)),   -- counts and not excluded
   local_date       INTEGER,                                      -- YYYYMMDD
+  event_at_utc_ms  INTEGER,                                      -- the play's, so that one stamped after now is never a list's first or last
   spelling         TEXT,                                         -- the name as the play gave it, for a name
   rev              INTEGER NOT NULL,
   UNIQUE (play_event_id, heard_artist_id)
@@ -1092,7 +1093,7 @@ CREATE TABLE play_event_artist (
 
 CREATE INDEX play_event_artist_heard ON play_event_artist (heard_artist_id, counted);
 
-CREATE INDEX play_event_artist_listed ON play_event_artist (listener_id, counted, heard_artist_id, local_date);
+CREATE INDEX play_event_artist_listed ON play_event_artist (listener_id, counted, heard_artist_id, local_date, event_at_utc_ms);
 
 CREATE TABLE play_event_album (
   id              INTEGER PRIMARY KEY,
@@ -1101,12 +1102,13 @@ CREATE TABLE play_event_album (
   listener_id     INTEGER NOT NULL REFERENCES listener(id),
   counted         INTEGER NOT NULL CHECK (counted IN (0, 1)),
   local_date      INTEGER,
+  event_at_utc_ms INTEGER,
   spelling        TEXT,
   rev             INTEGER NOT NULL
 ) STRICT;
 
 CREATE INDEX play_event_album_heard ON play_event_album (heard_album_id, counted);
 
-CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date);
+CREATE INDEX play_event_album_listed ON play_event_album (listener_id, counted, heard_album_id, local_date, event_at_utc_ms);
 
 CREATE INDEX track_appearance_display_artist_credit ON track_appearance (display_artist_credit_id);

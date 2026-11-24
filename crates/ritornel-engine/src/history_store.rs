@@ -709,8 +709,13 @@ fn neighbours(connection: &Connection, at: i64) -> Result<Vec<i64>, Error> {
     Ok(near)
 }
 
-/// Drops the plays these observations support, and every link to them.
-fn drop_plays_of(write: &Write<'_>, observations: &BTreeSet<i64>) -> Result<(), Error> {
+/// Drops the plays these observations support, and every link to them,
+/// which `heard` tidies when it finishes.
+fn drop_plays_of(
+    write: &Write<'_>,
+    observations: &BTreeSet<i64>,
+    heard: &mut crate::history_heard::Linker<'_>,
+) -> Result<(), Error> {
     let connection = write.connection();
     let mut plays = BTreeSet::new();
     let mut find = connection.prepare_cached(
@@ -722,9 +727,7 @@ fn drop_plays_of(write: &Write<'_>, observations: &BTreeSet<i64>) -> Result<(), 
             .collect::<Result<_, _>>()?;
         plays.extend(found);
     }
-    let mut heard = crate::history_heard::Linker::new(connection, write.rev());
     heard.unlink(&plays)?;
-    heard.finish()?;
     for play in plays {
         connection
             .prepare_cached("DELETE FROM play_event_observation WHERE play_event_id = ?1")?
@@ -749,8 +752,19 @@ fn keys(connection: &Connection, observation: i64) -> Result<([u8; 16], Vec<u8>)
 
 /// Writes derived plays.
 fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
+    let mut heard = crate::history_heard::Linker::new(write.connection(), write.rev());
+    link_plays(write, plays, &mut heard)?;
+    heard.finish()
+}
+
+/// Writes derived plays and links them, with `heard`, which the caller
+/// finishes.
+fn link_plays(
+    write: &Write<'_>,
+    plays: &[Play],
+    heard: &mut crate::history_heard::Linker<'_>,
+) -> Result<(), Error> {
     let connection = write.connection();
-    let mut heard = crate::history_heard::Linker::new(connection, write.rev());
     for play in plays {
         let Some(&(head, _)) = play.observations.first() else {
             continue;
@@ -811,6 +825,7 @@ fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
             primary: head,
             counted: play.counts && !play.excluded,
             local_date: local.map(|local| local.date),
+            at_ms: time.event_at_ms,
         })?;
         let joined: HashMap<i64, derive::Joined> = play.joined.iter().copied().collect();
         for (observation, role) in &play.observations {
@@ -829,7 +844,7 @@ fn insert_plays(write: &Write<'_>, plays: &[Play]) -> Result<(), Error> {
                 ))?;
         }
     }
-    heard.finish()
+    Ok(())
 }
 
 /// Derives again what a change to a delivery can move: whether an import
@@ -897,7 +912,10 @@ pub(crate) fn rederive(
             }
         }
     }
-    drop_plays_of(write, &around)?;
+    // One linker drops the plays' links and makes the new ones, so that a
+    // row the old plays and the new share is never dropped and made again.
+    let mut heard = crate::history_heard::Linker::new(connection, write.rev());
+    drop_plays_of(write, &around, &mut heard)?;
     let listens = listens(connection, Some(&around))?;
     let imports = imports(connection, Some(&around))?;
     let streams = crate::history_streams::streams(connection, Some(&around))?;
@@ -918,7 +936,8 @@ pub(crate) fn rederive(
         lengths: &crate::history_streams::lengths(connection, &tracks)?,
         streams: &streams,
     });
-    insert_plays(write, &plays)
+    link_plays(write, &plays, &mut heard)?;
+    heard.finish()
 }
 
 /// Every play, derived from scratch, as the rows a rebuild would write.

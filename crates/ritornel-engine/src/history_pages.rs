@@ -437,10 +437,10 @@ fn played_most(connection: &Connection, facts: &Facts) -> Result<Vec<RecordPlaye
 /// An artist's plays: of every song whose credit names them, or the artist
 /// they were merged into, as the appearance it was heard from credits it,
 /// or else as its recording does, as History's lists link it. `?2` is the
-/// artist's canonical key. The recordings either credit narrows the read
-/// to the index on counted plays.
+/// artist's canonical key. The recordings either credit names, as canonical
+/// as a play holds them, narrow the read to the index on counted plays.
 const ARTIST_PLAYS: &str = "
-WITH credits AS (
+WITH credits AS MATERIALIZED (
   SELECT acn.artist_credit_id FROM artist a
   JOIN artist_credit_name acn ON acn.artist_id = a.id
   WHERE a.canonical_id = ?2)
@@ -456,8 +456,9 @@ WHERE pe.listener_id = ?1 AND pe.counts = 1 AND pe.excluded = 0
     JOIN recording r ON r.display_artist_credit_id = credits.artist_credit_id
     WHERE r.redirect_to_id IS NULL
     UNION
-    SELECT y.recording_id FROM credits
-    JOIN track_appearance y ON y.display_artist_credit_id = credits.artist_credit_id)
+    SELECT yr.canonical_id FROM credits
+    JOIN track_appearance y ON y.display_artist_credit_id = credits.artist_credit_id
+    JOIN recording yr ON yr.id = y.recording_id)
   AND song.redirect_to_id IS NULL
   AND coalesce(ta.display_artist_credit_id, song.display_artist_credit_id)
       IN (SELECT artist_credit_id FROM credits)";

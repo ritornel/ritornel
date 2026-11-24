@@ -30,8 +30,9 @@ pub(crate) struct ToLink {
     pub primary: i64,
     /// Whether it counts and is not excluded.
     pub counted: bool,
-    /// Its local date, YYYYMMDD.
+    /// Its local date, YYYYMMDD, and its instant in UTC.
     pub local_date: Option<i64>,
+    pub at_ms: Option<i64>,
 }
 
 /// The library's artists a name can be, as canonical, by their name's key:
@@ -503,9 +504,9 @@ impl<'c> Linker<'c> {
             self.connection
                 .prepare_cached(
                     "INSERT OR IGNORE INTO play_event_artist
-                       (heard_artist_id, play_event_id, listener_id, counted, local_date, spelling,
-                        rev)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                       (heard_artist_id, play_event_id, listener_id, counted, local_date,
+                        event_at_utc_ms, spelling, rev)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )?
                 .execute((
                     row,
@@ -513,6 +514,7 @@ impl<'c> Linker<'c> {
                     play.listener,
                     play.counted,
                     play.local_date,
+                    play.at_ms,
                     spelling,
                     self.rev,
                 ))?;
@@ -521,9 +523,9 @@ impl<'c> Linker<'c> {
             self.connection
                 .prepare_cached(
                     "INSERT INTO play_event_album
-                       (heard_album_id, play_event_id, listener_id, counted, local_date, spelling,
-                        rev)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                       (heard_album_id, play_event_id, listener_id, counted, local_date,
+                        event_at_utc_ms, spelling, rev)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )?
                 .execute((
                     row,
@@ -531,6 +533,7 @@ impl<'c> Linker<'c> {
                     play.listener,
                     play.counted,
                     play.local_date,
+                    play.at_ms,
                     spelling,
                     self.rev,
                 ))?;
@@ -664,7 +667,7 @@ pub(crate) fn catalog_changed(connection: &Connection, rev: i64) -> Result<(), E
     // to.
     let mut statement = connection.prepare(
         "SELECT pe.id, pe.listener_id, pe.recording_id, pe.appearance_id, peo.observation_id,
-                pe.counts = 1 AND pe.excluded = 0, pe.local_date,
+                pe.counts = 1 AND pe.excluded = 0, pe.local_date, pe.event_at_utc_ms,
                 (SELECT group_concat(h.artist_id) FROM play_event_artist pa
                  JOIN heard_artist h ON h.id = pa.heard_artist_id
                  WHERE pa.play_event_id = pe.id AND h.artist_id IS NOT NULL),
@@ -686,9 +689,10 @@ pub(crate) fn catalog_changed(connection: &Connection, rev: i64) -> Result<(), E
                     primary: row.get(4)?,
                     counted: row.get(5)?,
                     local_date: row.get(6)?,
+                    at_ms: row.get(7)?,
                 },
-                row.get(7)?,
                 row.get(8)?,
+                row.get(9)?,
             ))
         })?
         .collect::<Result<_, _>>()?;
@@ -735,17 +739,10 @@ pub(crate) fn find_names_again(connection: &Connection, rev: i64) -> Result<(), 
 /// How often a row was heard, and its first and last local dates.
 type Tally = (u64, Option<i64>, Option<i64>);
 
-/// The latest local date a play heard by now can have: today's in the zone
-/// furthest ahead, fourteen hours past UTC.
-fn latest_date(today: Today) -> i64 {
-    crate::local_time(today.now_ms.saturating_add(14 * 3_600_000), "UTC")
-        .map_or(today.date, |local| local.date)
-}
-
 /// How often and when each row was heard by the listener: their plays
-/// that count, and their first and last local dates. A date no play heard
-/// by now can have, stamped by a wrong clock, is never first or last, as
-/// on a page. Read from the index on the links alone.
+/// that count, and their first and last local dates. A play stamped after
+/// now, by a wrong clock, or with no instant counts and is never first or
+/// last, as on a page. Read from the index on the links alone.
 fn tallies(
     connection: &Connection,
     listener: i64,
@@ -755,12 +752,12 @@ fn tallies(
 ) -> Result<HashMap<i64, Tally>, Error> {
     let mut statement = connection.prepare(&format!(
         "SELECT {column}, count(*),
-                min(CASE WHEN local_date <= ?2 THEN local_date END),
-                max(CASE WHEN local_date <= ?2 THEN local_date END)
+                min(CASE WHEN event_at_utc_ms <= ?2 THEN local_date END),
+                max(CASE WHEN event_at_utc_ms <= ?2 THEN local_date END)
          FROM {table}
          WHERE listener_id = ?1 AND counted = 1 GROUP BY {column}"
     ))?;
-    let rows = statement.query_map((listener, latest_date(today)), |row| {
+    let rows = statement.query_map((listener, today.now_ms), |row| {
         Ok((
             row.get::<_, i64>(0)?,
             (

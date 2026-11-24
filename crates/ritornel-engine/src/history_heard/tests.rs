@@ -275,6 +275,7 @@ impl Rig {
             .read(|connection| {
                 let mut statement = connection.prepare(
                     "SELECT hex(pe.public_id) || ' ' || coalesce(ha.artist_id, ha.name_key)
+                            || ' ' || coalesce(ha.library_artist_id, '-')
                             || ' ' || coalesce(pa.spelling, '') || ' ' || pa.counted
                      FROM play_event_artist pa
                      JOIN play_event pe ON pe.id = pa.play_event_id
@@ -283,6 +284,7 @@ impl Rig {
                      SELECT hex(pe.public_id) || ' album ' || coalesce(h.release_group_id,
                             (SELECT coalesce(ha.artist_id, ha.name_key) FROM heard_artist ha
                              WHERE ha.id = h.heard_artist_id) || '/' || h.name_key)
+                            || ' ' || coalesce(h.library_group_id, '-')
                             || ' ' || coalesce(pa.spelling, '')
                      FROM play_event_album pa
                      JOIN play_event pe ON pe.id = pa.play_event_id
@@ -770,16 +772,77 @@ fn a_record_whose_files_are_retired_stays_one_entry_found_by_its_keys() {
 #[test]
 fn a_play_stamped_after_today_is_never_first_or_last_heard() {
     let rig = rig();
+    let mut soon = scrobble(0, "Odile Castellan", "Harbour", "Low Tide");
+    soon.played_at_ms = T0 + 3 * 3_600_000;
     rig.ingest(vec![
         scrobble(2, "Odile Castellan", "Harbour", "Night Ferry"),
-        // Stamped a year on, by a wrong clock.
+        // Stamped a year on, by a wrong clock, and three hours on.
         scrobble(-365, "Odile Castellan", "Harbour", "Paper Lanterns"),
+        soon,
     ]);
     let artists = rig.artists();
     let odile = &artists[0];
-    assert_eq!(odile.heard.plays, 2);
+    assert_eq!(odile.heard.plays, 3);
     assert_eq!(odile.heard.first_played.as_deref(), Some("2026-11-13"));
     assert_eq!(odile.heard.last_played.as_deref(), Some("2026-11-13"));
     let albums = rig.albums();
     assert_eq!(albums[0].heard.last_played.as_deref(), Some("2026-11-13"));
+}
+
+#[test]
+fn a_song_merged_into_another_is_counted_on_the_page_of_the_artist_it_was_heard_as() {
+    let rig = rig();
+    rig.record(&["Calla Brandt"], "Glasshouse", &["Low Tide"]);
+    rig.credit_odile();
+    rig.ingest(vec![scrobble(1, "Calla Brandt", "Glasshouse", "Low Tide")]);
+    // The song's recording is merged into another, credited to Calla
+    // Brandt alone; the appearance it was heard from still credits Odile
+    // Castellan too.
+    rig.library
+        .write(request("test.merge"), |write| {
+            let (c, rev) = (write.connection(), write.rev());
+            let merged: i64 = c.query_row(
+                "SELECT coalesce(max(id), 0) + 1 FROM recording",
+                [],
+                |row| row.get(0),
+            )?;
+            c.execute(
+                "INSERT INTO recording (id, public_id, canonical_id, display_title,
+                                        display_artist_credit_id, rev)
+                 SELECT ?1, ?2, ?1, display_title, display_artist_credit_id, ?3
+                 FROM recording WHERE display_title = 'Low Tide'",
+                (merged, write.new_id()?.as_bytes().to_vec(), rev),
+            )?;
+            c.execute(
+                "UPDATE recording SET redirect_to_id = ?1, canonical_id = ?1
+                 WHERE display_title = 'Low Tide' AND id <> ?1",
+                [merged],
+            )?;
+            crate::history_store::catalog_changed(write)?;
+            Ok(String::new())
+        })
+        .unwrap();
+    let held: i64 = rig
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT count(*) FROM play_event pe JOIN recording r ON r.id = pe.recording_id
+                 WHERE r.redirect_to_id IS NULL AND r.display_title = 'Low Tide'
+                   AND pe.appearance_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(held, 1, "the play holds the recording it was merged into");
+    assert_eq!(
+        plays_of(&rig.artists(), "Odile Castellan"),
+        [("odile castellan", 1, true)]
+    );
+    let page = rig
+        .library
+        .heard_artist_history(rig.listener, "odile castellan".to_owned(), rig.today())
+        .unwrap()
+        .unwrap();
+    assert_eq!(page.plays, 1);
 }
