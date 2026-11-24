@@ -212,7 +212,13 @@ impl Core {
             return Ok(replayed);
         }
         let run = self.whole_run(params)?;
-        if let Some(why) = stale(run.report.as_ref()) {
+        // An applied run needs no dry run: its job ends as done.
+        let applied = Self::library(stores, |library| {
+            library.stored_run(params.run_id).map_err(internal)
+        })?;
+        if applied.is_none()
+            && let Some(why) = stale(run.report.as_ref())
+        {
             return Err(RpcError::new(ErrorCode::Invalid, why).with_detail("reason", "dry_run"));
         }
         self.start_run_job::<ImportsApply>(stores, params, APPLY_JOB)
@@ -252,6 +258,11 @@ impl Core {
             library.stored_run(params.run_id).map_err(internal)
         })?
         .map(applied);
+        // An applied run shows what its apply did, or nothing: never its
+        // dry run.
+        if run.applied.is_some() {
+            run.report = self.staging.applied_report(params.run_id);
+        }
         Ok(run)
     }
 
@@ -401,9 +412,10 @@ mod tests {
     }
 
     #[test]
-    fn a_run_applied_is_not_dry_run_again() {
+    fn a_run_applied_is_not_dry_run_again_and_shows_no_dry_run_as_what_it_did() {
         let clock = Arc::new(SetClock::at(T0));
         let (core, _scratch, session) = staged(&clock, 1);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION);
         let run = Id::from_bytes([9; 16]);
         let streams = core.staging().streams(run, T0).unwrap().unwrap().0;
         core.with_library(|_, library| {
@@ -425,6 +437,15 @@ mod tests {
             call(&core, &session, "imports.dryRun", apply(6)),
             Err(ErrorCode::Invalid)
         );
+        // Its apply's report was never kept: it shows none, and not its
+        // dry run's.
+        let got = call(&core, &session, "imports.get", json!({ "runId": id(9) })).unwrap();
+        assert!(got["applied"].is_object());
+        assert!(got.get("report").is_none(), "{got}");
+        // Applied again, it needs no dry run of this grouper, and its job
+        // ends as done.
+        dry_run(&core, ritornel_engine::GROUPER_VERSION - 1);
+        assert!(call(&core, &session, "imports.apply", apply(7)).is_ok());
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //!   run.json        how many pieces, when it was begun, and each piece's count
 //!   piece-<n>.json  one piece's streams, as the contract's type
 //!   report.json     the last dry run's report
+//!   applied.json    the report of the apply, worked out in its write
 //! ```
 //!
 //! Everything here is readable by the OS user alone, holds the kept fields
@@ -350,6 +351,35 @@ impl Staging {
         begun_at: i64,
         report: &ImportReport,
     ) -> Result<bool, Error> {
+        self.save(run, begun_at, report, "report.json")
+    }
+
+    /// Keeps the report of a run's apply beside it, as [`Self::save_report`]
+    /// keeps a dry run's, apart from it: an applied run shows this one, or
+    /// none.
+    pub(crate) fn save_applied(
+        &self,
+        run: Id,
+        begun_at: i64,
+        report: &ImportReport,
+    ) -> Result<bool, Error> {
+        self.save(run, begun_at, report, "applied.json")
+    }
+
+    /// The report of a run's apply, when one was kept.
+    pub(crate) fn applied_report(&self, run: Id) -> Option<ImportReport> {
+        read_json(&self.run_dir(run).join("applied.json"))
+            .ok()
+            .flatten()
+    }
+
+    fn save(
+        &self,
+        run: Id,
+        begun_at: i64,
+        report: &ImportReport,
+        name: &str,
+    ) -> Result<bool, Error> {
         let _writing = self
             .writing
             .lock()
@@ -358,27 +388,10 @@ impl Staging {
             Some(meta)
                 if meta.begun_at == begun_at && meta.received.len() == meta.pieces as usize =>
             {
-                write_json(&self.run_dir(run).join("report.json"), report)?;
+                write_json(&self.run_dir(run).join(name), report)?;
                 Ok(true)
             }
             _ => Ok(false),
-        }
-    }
-
-    /// Removes a run's report, which no longer says what it did.
-    pub(crate) fn forget_report(&self, run: Id) -> Result<(), Error> {
-        let _writing = self
-            .writing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = self.run_dir(run).join("report.json");
-        match std::fs::remove_file(&path) {
-            Err(source) if source.kind() != std::io::ErrorKind::NotFound => Err(Error::Io {
-                doing: "remove",
-                path,
-                source,
-            }),
-            _ => Ok(()),
         }
     }
 }
@@ -542,16 +555,12 @@ pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBo
     });
     match applied {
         Some(Ok((_, report))) => {
-            // The run is applied whatever becomes of its report. One that
-            // cannot be kept takes its dry run's with it, which would be
-            // shown as what applying did.
+            // The run is applied whatever becomes of its report: one that
+            // cannot be kept leaves the run with none to show.
             if let Some(report) = report
-                && let Err(failed) = staging.save_report(run, begun_at, &report)
+                && let Err(failed) = staging.save_applied(run, begun_at, &report)
             {
                 warn!(error = %failed, "an applied run's report could not be kept");
-                if let Err(failed) = staging.forget_report(run) {
-                    warn!(error = %failed, "an applied run's dry run could not be removed");
-                }
             }
             finish(core, &job, JobState::Succeeded, None);
         }
@@ -778,11 +787,10 @@ mod tests {
         let (_, begun_again) = staging.streams(run(), later).unwrap().unwrap();
         assert!(staging.save_report(run(), begun_again, &report).unwrap());
         assert!(staging.run(run(), later).unwrap().unwrap().report.is_some());
-        // A report that no longer says what the run did is forgotten, and
-        // forgetting it again is no error.
-        staging.forget_report(run()).unwrap();
-        staging.forget_report(run()).unwrap();
-        assert!(staging.run(run(), later).unwrap().unwrap().report.is_none());
+        // An apply's report is kept apart from the dry run's.
+        assert!(staging.applied_report(run()).is_none());
+        assert!(staging.save_applied(run(), begun_again, &report).unwrap());
+        assert_eq!(staging.applied_report(run()), Some(report));
     }
 
     #[test]
