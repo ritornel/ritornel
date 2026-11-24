@@ -46,7 +46,8 @@
 //! - When the fingers lift, or when a flick's momentum reaches the end, the
 //!   page springs back: `_NSElasticDeltaForTimeDelta(x, v, t)` is
 //!   `(x − 0.31·v·t)·e^(−12.5·t)`, which WebKit calls with the stretch and
-//!   the momentum's velocity, negated. The rest of the flick is let go.
+//!   the momentum's velocity, negated. Outward momentum is let go; momentum
+//!   back into the page takes over.
 //! - A mouse wheel never stretches.
 //! - A scroll with no phase is a wheel's, however precise: many mice send
 //!   pixel deltas, but only a touch surface sends a gesture or momentum.
@@ -187,7 +188,6 @@ pub(crate) struct Elastic {
     stretch: f32,
     /// The touchpad's travel the stretch is made of.
     force: f32,
-    in_gesture: bool,
     /// Whether the gesture under way is this page's (WebKit's latching).
     /// `None` until its first movement says which way it goes.
     latched: Option<bool>,
@@ -220,11 +220,13 @@ impl Elastic {
         // A touch surface sends a gesture or momentum phase; a wheel, however
         // fine its steps, sends neither, and never stretches the page.
         let touch = wheel.precise && (wheel.phase != Phase::None || wheel.momentum != Phase::None);
-        // `updateGestureInProgressState`.
-        self.in_gesture = touch
-            && wheel.phase != Phase::Ended
-            && !(wheel.phase == Phase::None && wheel.momentum == Phase::Began);
-        if matches!(wheel.phase, Phase::MayBegin | Phase::Cancelled) {
+        let in_gesture = touch && matches!(wheel.phase, Phase::Began | Phase::Changed);
+        if wheel.phase == Phase::MayBegin {
+            return;
+        }
+        if wheel.phase == Phase::Cancelled {
+            self.velocity = 0.;
+            self.start_spring_if_needed(now);
             return;
         }
         if wheel.phase == Phase::Began {
@@ -236,10 +238,21 @@ impl Elastic {
             self.force = self.stretch * STIFFNESS;
             self.spring = None;
         }
+        if !touch {
+            // A non-gesture wheel interrupts any active spring or stretch and
+            // ignores trailing momentum from an interrupted flick.
+            if self.momentum || self.spring.is_some() {
+                self.ignore_momentum = true;
+            }
+            self.momentum = false;
+            self.latched = None;
+            self.spring = None;
+            self.stretch = 0.;
+            self.force = 0.;
+        }
         // Latching: a gesture and its momentum go to the page only if, when
         // it first moves, the page can move that way, or is stretched.
-        let gesture = wheel.phase != Phase::None || wheel.is_momentum();
-        if gesture {
+        if touch {
             if self.latched.is_none() && wheel.dy != 0. {
                 let can = (wheel.dy < 0. && *top > 0.)
                     || (wheel.dy > 0. && *top < max)
@@ -254,31 +267,60 @@ impl Elastic {
             self.start_spring_if_needed(now);
             return;
         }
-        if self.ignore_momentum && (wheel.is_momentum() || self.spring.is_some()) {
+        if self.ignore_momentum && wheel.is_momentum() {
             if wheel.momentum == Phase::Ended {
                 self.ignore_momentum = false;
             }
             return;
         }
         if self.spring.is_some() && wheel.is_momentum() {
-            // The flick after a pull let go, which would fight the spring.
-            return;
+            let delta = if self.stretch != 0. {
+                wheel.unaccelerated_dy
+            } else {
+                wheel.dy
+            };
+            let opposes = delta != 0.
+                && if self.stretch != 0. {
+                    self.stretch.signum() != delta.signum()
+                } else {
+                    !pinned(*top, max, delta)
+                };
+            if opposes {
+                // Opposing momentum (such as a quick flick back before the
+                // fingers clear the bounce, or during the 24 ms spring settle
+                // window) pulls the stretch back and takes over from the spring.
+                self.spring = None;
+                if self.stretch == 0. {
+                    self.force = 0.;
+                }
+            } else {
+                // Same-direction momentum after a pull let go would fight the
+                // spring; ignore the rest of that flick once it moves.
+                if delta != 0. {
+                    self.ignore_momentum = true;
+                    self.momentum = false;
+                }
+                if wheel.momentum == Phase::Ended {
+                    self.ignore_momentum = false;
+                    self.momentum = false;
+                }
+                return;
+            }
         }
         let stretched = self.stretch != 0.;
-        let event_delta = if stretched {
+        let delta = if stretched {
             wheel.unaccelerated_dy
         } else {
             wheel.dy
         };
-        let mut delta = event_delta;
         if !self.momentum && matches!(wheel.momentum, Phase::Began | Phase::Changed) {
             self.momentum = true;
         }
         let mut should_stretch = false;
-        if self.in_gesture || self.momentum {
+        if in_gesture || self.momentum {
             match self.last {
                 Some((at, _)) if wheel.time - at > 0. && wheel.time - at < VELOCITY_ZEROING => {
-                    self.velocity = event_delta / (wheel.time - at) as f32;
+                    self.velocity = delta / (wheel.time - at) as f32;
                 }
                 _ => self.velocity = 0.,
             }
@@ -288,7 +330,7 @@ impl Elastic {
         }
         if delta != 0. {
             if should_stretch || stretched {
-                let can_start = self.stretch_by(top, &mut delta, stretched, max);
+                let can_start = self.stretch_by(top, delta, stretched, max);
                 if self.momentum && can_start && self.last.is_some() {
                     self.ignore_momentum = true;
                     self.momentum = false;
@@ -296,33 +338,46 @@ impl Elastic {
                 }
             } else {
                 *top = (*top + delta).clamp(0., max);
+                self.force = 0.;
             }
         }
         if self.momentum && wheel.momentum == Phase::Ended {
             self.momentum = false;
             self.ignore_momentum = false;
             self.last = None;
+            self.start_spring_if_needed(now);
         }
     }
 
     /// `applyScrollDeltaWithStretching`. Whether a spring may start: the
     /// page is at the end the event goes towards.
-    fn stretch_by(&mut self, top: &mut f32, delta: &mut f32, stretched: bool, max: f32) -> bool {
+    fn stretch_by(&mut self, top: &mut f32, delta: f32, stretched: bool, max: f32) -> bool {
         let opposes = stretched && self.stretch.signum() != delta.signum();
-        let can_start = self.momentum && pinned(*top, max, *delta);
+        let can_start = self.momentum && pinned(*top, max, delta);
         if opposes {
-            // Going back takes the stretch in point for point; the force stays.
-            let to = self.stretch + *delta;
-            if to == 0. || to.signum() == self.stretch.signum() {
-                self.stretch = to;
-            } else {
-                // Past the end and back into the page.
+            // Going back takes the stretch in point for point; keep force
+            // matched to the remaining stretch so leaving the end clears it.
+            let to = self.stretch + delta;
+            if to == 0. || to.signum() != self.stretch.signum() {
+                // Back to the end, or past it into the page.
                 self.stretch = 0.;
-                *top = (*top + to).clamp(0., max);
+                self.force = 0.;
+                if to != 0. {
+                    *top = (*top + to).clamp(0., max);
+                }
+            } else {
+                self.stretch = to;
+                self.force = to * STIFFNESS;
             }
         } else {
-            self.force += *delta;
-            self.stretch = (self.force / STIFFNESS).ceil();
+            self.force += delta;
+            let next = (self.force / STIFFNESS).ceil();
+            // Never let a small outward push round a fractional stretch inward.
+            self.stretch = if delta < 0. {
+                self.stretch.min(next)
+            } else {
+                self.stretch.max(next)
+            };
         }
         can_start
     }
@@ -337,11 +392,19 @@ impl Elastic {
         if self.spring.is_some() || (self.stretch == 0. && self.force == 0.) {
             return;
         }
+        let velocity = if self.stretch != 0.
+            && self.velocity != 0.
+            && self.stretch.signum() != self.velocity.signum()
+        {
+            0.
+        } else {
+            -self.velocity
+        };
         self.spring = Some(Spring {
             start: now,
             overscroll: self.stretch,
             // WebKit passes the momentum's velocity negated.
-            velocity: -self.velocity,
+            velocity,
         });
     }
 
@@ -563,5 +626,562 @@ mod tests {
         }
         assert_eq!((top, elastic.shown()), (1000., 0.));
         assert!(!elastic.step(Instant::now()));
+    }
+
+    #[test]
+    fn a_flick_back_up_while_stretched_keeps_its_momentum() {
+        let t0 = Instant::now();
+        let mut elastic = Elastic::default();
+        let mut top = 900.;
+
+        // 1. A fast flick down hits the bottom and starts bouncing.
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, 0.),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(10., Phase::Changed, Phase::None, 0.01),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, 0.02),
+            t0,
+        );
+        let mut time = 0.03;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Began, time),
+            t0,
+        );
+        while top < 1000. {
+            time += 0.01;
+            scroll(
+                &mut elastic,
+                &mut top,
+                wheel(30., Phase::None, Phase::Changed, time),
+                t0,
+            );
+        }
+        time += 0.01;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Changed, time),
+            t0,
+        );
+        // Step the spring into its bounce so the page is stretched past the bottom.
+        time += 0.04;
+        assert!(elastic.step(t0 + Duration::from_secs_f64(time)));
+        let stretched = elastic.shown();
+        assert!(stretched > 5., "expected bottom stretch, got {stretched}");
+
+        // 2. While still stretched, start a new gesture upward past the stretch.
+        time += 0.01;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, time),
+            t0,
+        );
+        for _ in 0..3 {
+            time += 0.01;
+            scroll(
+                &mut elastic,
+                &mut top,
+                wheel(-20., Phase::Changed, Phase::None, time),
+                t0,
+            );
+        }
+        assert_eq!(elastic.shown(), 0.);
+        let after_drag = top;
+        assert!(
+            after_drag < 1000.,
+            "drag should move back into page: {after_drag}"
+        );
+
+        // 3. Lift fingers: no spring should start because stretch is back to zero.
+        time += 0.01;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, time),
+            t0,
+        );
+        assert!(!elastic.step(t0 + Duration::from_secs_f64(time + 0.016)));
+
+        // 4. Upward momentum must keep scrolling the page up.
+        time += 0.01;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(-30., Phase::None, Phase::Began, time),
+            t0,
+        );
+        for _ in 0..5 {
+            time += 0.01;
+            scroll(
+                &mut elastic,
+                &mut top,
+                wheel(-30., Phase::None, Phase::Changed, time),
+                t0,
+            );
+        }
+        assert!(
+            top <= after_drag - 150.,
+            "upward momentum was swallowed: after_drag={after_drag}, top={top}, stretch={}",
+            elastic.shown()
+        );
+        assert_eq!(elastic.shown(), 0.);
+    }
+
+    #[test]
+    fn a_small_pull_at_the_top_that_reverses_into_the_page_keeps_its_momentum() {
+        let t0 = Instant::now();
+        let mut elastic = Elastic::default();
+        let mut top = 10.;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, 0.),
+            t0,
+        );
+        // Reach the top and pull by less than STIFFNESS: stretch stays 0 while force is -5.
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(-10., Phase::Changed, Phase::None, 0.01),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(-5., Phase::Changed, Phase::None, 0.02),
+            t0,
+        );
+        assert_eq!((top, elastic.shown()), (0., 0.));
+        // Reverse back into the page, lift, and flick downward.
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(20., Phase::Changed, Phase::None, 0.03),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, 0.04),
+            t0,
+        );
+        assert!(!elastic.step(t0 + Duration::from_secs_f64(0.056)));
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Began, 0.05),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Changed, 0.06),
+            t0,
+        );
+        assert_eq!(top, 80.);
+        assert_eq!(elastic.shown(), 0.);
+    }
+
+    #[test]
+    fn pulling_back_partway_and_pushing_again_continues_from_remaining_stretch() {
+        let mut elastic = Elastic::default();
+        let mut top = 950.;
+        elastic.scroll(&mut top, wheel(0., Phase::Began, Phase::None, 0.), 1000.);
+        elastic.scroll(
+            &mut top,
+            wheel(50., Phase::Changed, Phase::None, 0.01),
+            1000.,
+        );
+        for at in 2..12 {
+            elastic.scroll(
+                &mut top,
+                wheel(20., Phase::Changed, Phase::None, f64::from(at) * 0.01),
+                1000.,
+            );
+        }
+        assert_eq!(elastic.shown(), 10.);
+        // Pull back 4 points to +6, then push 20 points further: must step to +7, not jump to +11.
+        elastic.scroll(
+            &mut top,
+            wheel(-4., Phase::Changed, Phase::None, 0.12),
+            1000.,
+        );
+        assert_eq!(elastic.shown(), 6.);
+        elastic.scroll(
+            &mut top,
+            wheel(20., Phase::Changed, Phase::None, 0.13),
+            1000.,
+        );
+        assert_eq!(elastic.shown(), 7.);
+    }
+
+    #[test]
+    fn a_mouse_wheel_interrupts_an_active_spring() {
+        let t0 = Instant::now();
+        let mut elastic = Elastic::default();
+        let mut top = 970.;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, 0.),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(10., Phase::Changed, Phase::None, 0.01),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, 0.02),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Began, 0.03),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Changed, 0.04),
+            t0,
+        );
+        assert!(elastic.step(t0 + Duration::from_secs_f64(0.08)));
+        assert!(elastic.shown() > 0.);
+        // A discrete mouse wheel scrolls back into the page instead of being ignored.
+        let mut notch = wheel(-48., Phase::None, Phase::None, 0.09);
+        notch.precise = false;
+        scroll(&mut elastic, &mut top, notch, t0);
+        assert_eq!(elastic.shown(), 0.);
+        assert_eq!(top, 952.);
+        assert!(!elastic.step(t0 + Duration::from_secs_f64(0.11)));
+        // Trailing momentum from the interrupted trackpad flick stays ignored.
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Changed, 0.12),
+            t0,
+        );
+        assert_eq!((top, elastic.shown()), (952., 0.));
+    }
+
+    #[test]
+    fn a_quick_flick_back_that_lifts_while_still_stretched_keeps_its_momentum() {
+        let t0 = Instant::now();
+        let mut elastic = Elastic::default();
+        let mut top = 900.;
+
+        // 1. Flick down into the bottom so the page bounces to a noticeable stretch.
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, 0.),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(10., Phase::Changed, Phase::None, 0.01),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, 0.02),
+            t0,
+        );
+        let mut time = 0.03;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Began, time),
+            t0,
+        );
+        while top < 1000. {
+            time += 0.01;
+            scroll(
+                &mut elastic,
+                &mut top,
+                wheel(30., Phase::None, Phase::Changed, time),
+                t0,
+            );
+        }
+        time += 0.01;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Changed, time),
+            t0,
+        );
+        time += 0.06;
+        assert!(elastic.step(t0 + Duration::from_secs_f64(time)));
+        let stretched = elastic.shown();
+        assert!(stretched > 15., "expected >15 pt stretch, got {stretched}");
+
+        // 2. Quick flick back up: fingers only move -10 pt before lifting, so the
+        //    page is still stretched when Phase::Ended arrives.
+        time += 0.01;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, time),
+            t0,
+        );
+        time += 0.01;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(-10., Phase::Changed, Phase::None, time),
+            t0,
+        );
+        assert!(elastic.shown() > 0., "still stretched before lift");
+        time += 0.01;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, time),
+            t0,
+        );
+        // One display tick before momentum arrives keeps the stretch positive.
+        time += 0.008;
+        assert!(elastic.step(t0 + Duration::from_secs_f64(time)));
+        assert!(elastic.shown() > 0.);
+
+        // 3. Upward momentum arrives and pulls the page back cleanly.
+        time += 0.008;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(-30., Phase::None, Phase::Began, time),
+            t0,
+        );
+        for _ in 0..5 {
+            time += 0.01;
+            scroll(
+                &mut elastic,
+                &mut top,
+                wheel(-30., Phase::None, Phase::Changed, time),
+                t0,
+            );
+        }
+        assert_eq!(elastic.shown(), 0.);
+        assert!(
+            top < 860.,
+            "expected upward momentum to scroll page, got top={top}"
+        );
+        assert!(!elastic.step(t0 + Duration::from_secs_f64(time + 0.016)));
+    }
+
+    #[test]
+    fn same_direction_momentum_after_a_pull_still_springs_back() {
+        let t0 = Instant::now();
+        let mut elastic = Elastic::default();
+        let mut top = 990.;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, 0.),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(10., Phase::Changed, Phase::None, 0.01),
+            t0,
+        );
+        for at in 2..12 {
+            scroll(
+                &mut elastic,
+                &mut top,
+                wheel(20., Phase::Changed, Phase::None, f64::from(at) * 0.01),
+                t0,
+            );
+        }
+        assert_eq!(elastic.shown(), 10.);
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, 0.12),
+            t0,
+        );
+        // Same-direction downward momentum after lifting should not fight the spring.
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Began, 0.13),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(30., Phase::None, Phase::Changed, 0.14),
+            t0,
+        );
+        let start = t0 + Duration::from_secs_f64(0.12);
+        let mut now = t0 + Duration::from_secs_f64(0.15);
+        while elastic.step(now) {
+            now += Duration::from_millis(8);
+            assert!(now - start < Duration::from_secs(1), "it settles");
+        }
+        assert_eq!((top, elastic.shown()), (1000., 0.));
+    }
+
+    #[test]
+    fn a_cancelled_stretched_gesture_springs_back() {
+        let t0 = Instant::now();
+        let mut elastic = Elastic::default();
+        let mut top = 990.;
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, 0.),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(10., Phase::Changed, Phase::None, 0.01),
+            t0,
+        );
+        for at in 2..12 {
+            scroll(
+                &mut elastic,
+                &mut top,
+                wheel(20., Phase::Changed, Phase::None, f64::from(at) * 0.01),
+                t0,
+            );
+        }
+        assert_eq!(elastic.shown(), 10.);
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Cancelled, Phase::None, 0.12),
+            t0,
+        );
+        let start = t0 + Duration::from_secs_f64(0.12);
+        let mut now = start;
+        while elastic.step(now) {
+            assert!(
+                elastic.shown() <= 10.,
+                "cancellation should not deepen stretch: {}",
+                elastic.shown()
+            );
+            now += Duration::from_millis(8);
+            assert!(now - start < Duration::from_secs(1), "it settles");
+        }
+        assert_eq!((top, elastic.shown()), (1000., 0.));
+    }
+
+    #[test]
+    fn inward_momentum_takes_over_when_spring_rounds_to_zero_in_grace_period() {
+        let t0 = Instant::now();
+        let mut elastic = Elastic::default();
+        let mut top = 990.;
+
+        // Pull past the bottom to +10, then reverse until +0.25 remains and lift.
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Began, Phase::None, 0.),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(10., Phase::Changed, Phase::None, 0.01),
+            t0,
+        );
+        for at in 2..12 {
+            scroll(
+                &mut elastic,
+                &mut top,
+                wheel(20., Phase::Changed, Phase::None, f64::from(at) * 0.01),
+                t0,
+            );
+        }
+        assert_eq!(elastic.shown(), 10.);
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(-9.75, Phase::Changed, Phase::None, 0.12),
+            t0,
+        );
+        assert_eq!(elastic.shown(), 0.25);
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(0., Phase::Ended, Phase::None, 0.13),
+            t0,
+        );
+
+        // An 8 ms display frame rounds the displayed stretch to 0 while keeping
+        // the spring alive during its 24 ms completion grace window.
+        assert!(elastic.step(t0 + Duration::from_secs_f64(0.138)));
+        assert_eq!(elastic.shown(), 0.);
+
+        // Inward upward momentum must still take over and scroll back into the page.
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(-30., Phase::None, Phase::Began, 0.14),
+            t0,
+        );
+        scroll(
+            &mut elastic,
+            &mut top,
+            wheel(-30., Phase::None, Phase::Changed, 0.15),
+            t0,
+        );
+        assert_eq!((top, elastic.shown()), (940., 0.));
+        assert!(!elastic.step(t0 + Duration::from_secs_f64(0.16)));
+    }
+
+    #[test]
+    fn small_outward_pull_at_top_does_not_move_fractional_stretch_inward() {
+        let mut elastic = Elastic::default();
+        let mut top = 10.;
+        elastic.scroll(&mut top, wheel(0., Phase::Began, Phase::None, 0.), 1000.);
+        elastic.scroll(
+            &mut top,
+            wheel(-10., Phase::Changed, Phase::None, 0.01),
+            1000.,
+        );
+        elastic.scroll(
+            &mut top,
+            wheel(-20., Phase::Changed, Phase::None, 0.02),
+            1000.,
+        );
+        assert_eq!(elastic.shown(), -1.);
+        // Reverse partially to -0.75, then push outward by -0.1: must not jump to 0.
+        elastic.scroll(
+            &mut top,
+            wheel(0.25, Phase::Changed, Phase::None, 0.03),
+            1000.,
+        );
+        assert_eq!(elastic.shown(), -0.75);
+        elastic.scroll(
+            &mut top,
+            wheel(-0.1, Phase::Changed, Phase::None, 0.04),
+            1000.,
+        );
+        assert_eq!(elastic.shown(), -0.75);
     }
 }
