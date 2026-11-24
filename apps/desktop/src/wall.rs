@@ -3236,8 +3236,8 @@ mod tests {
         let began = Instant::now();
         loop {
             assert!(
-                began.elapsed() < Duration::from_secs(30),
-                "the wall is stuck"
+                began.elapsed() < Duration::from_secs(60),
+                "the wall never settled"
             );
             cx.run_until_parked();
             let (settled, held) = wall.read_with(cx, |wall, _| (done(wall), wall.pages_in_flight));

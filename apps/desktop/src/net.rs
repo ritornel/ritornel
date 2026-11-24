@@ -176,6 +176,19 @@ impl Net {
         }
     }
 
+    /// The same, reading pictures from `endpoint` at `sizes`, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_art(mut self, endpoint: SocketAddr, sizes: Vec<u32>) -> Self {
+        self.art = Arc::new(ArtHttp {
+            endpoint,
+            token: String::new(),
+            idle: Mutex::new(Vec::new()),
+            in_flight: Semaphore::new(MAX_ART_IN_FLIGHT),
+        });
+        self.art_sizes = sizes;
+        self
+    }
+
     pub(crate) fn rt(&self) -> &'static Handle {
         rt()
     }
