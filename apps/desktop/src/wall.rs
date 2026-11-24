@@ -56,12 +56,15 @@ const RETRY_MOST: Duration = Duration::from_secs(30);
 /// second copy of each on the GPU. `RITORNEL_GPUI_COVER_MB` overrides it,
 /// for measuring.
 fn cover_budget() -> usize {
-    std::env::var("RITORNEL_GPUI_COVER_MB")
-        .ok()
-        .and_then(|mb| mb.parse::<usize>().ok())
-        .unwrap_or(96)
-        * 1024
-        * 1024
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("RITORNEL_GPUI_COVER_MB")
+            .ok()
+            .and_then(|mb| mb.parse::<usize>().ok())
+            .unwrap_or(96)
+            * 1024
+            * 1024
+    })
 }
 
 /// The tile selected: its row's ID, where the row is, and the view it was read in.
