@@ -469,8 +469,9 @@ impl LibraryStore {
         source: i64,
         ops: Vec<SidecarOp>,
         receipt: String,
+        cancel: Option<crate::JobCancel>,
     ) -> Result<Written, Error> {
-        self.write(request, move |write| {
+        self.write_guarded(request, cancel, move |write| {
             let (connection, rev, now_ms) = (write.connection(), write.rev(), write.now_ms());
             for op in &ops {
                 match op {
@@ -559,8 +560,9 @@ impl LibraryStore {
         &self,
         request: WriteRequest,
         receipt: String,
+        cancel: Option<crate::JobCancel>,
     ) -> Result<Written, Error> {
-        self.write(request, |write| {
+        self.write_guarded(request, cancel, |write| {
             apply(write)?;
             Ok(receipt)
         })

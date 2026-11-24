@@ -1277,13 +1277,22 @@ impl Wall {
             return;
         }
         self.revision = event.library_revision;
-        let Some(layout) = &self.layout else { return };
-        let wall_top = self.top - HEADER;
-        let lines = layout.lines_between(wall_top - self.viewport, wall_top + 2. * self.viewport);
-        let (Some(first), Some(last)) = (lines.first(), lines.last()) else {
-            return;
-        };
-        let pages: Vec<usize> = (first.first / PAGE..=(last.first + last.count) / PAGE).collect();
+        let pages: Vec<usize> = self
+            .layout
+            .as_ref()
+            .and_then(|layout| {
+                let wall_top = self.top - HEADER;
+                let lines =
+                    layout.lines_between(wall_top - self.viewport, wall_top + 2. * self.viewport);
+                let (first, last) = (lines.first()?, lines.last()?);
+                Some((first.first / PAGE..=(last.first + last.count) / PAGE).collect())
+            })
+            .unwrap_or_default();
+        // Drop offscreen ready pages so scrolling back to them reads fresh rows
+        // (such as newly imported artist portraits), while keeping visible
+        // pages on screen until their in-place reads return.
+        self.pages
+            .retain(|page, entry| pages.contains(page) || !matches!(entry, Page::Ready { .. }));
         for page in pages {
             if matches!(self.pages.get(&page), Some(Page::Ready { .. })) {
                 self.read_again(page, cx);
@@ -1301,6 +1310,7 @@ impl Wall {
         }
         let client = Arc::clone(&net.client);
         let asked_of = view.clone();
+        let asked_revision = self.revision;
         let read = net.rt().spawn(async move {
             client
                 .list_window(&view, (page * PAGE) as u64, PAGE as u64)
@@ -1309,7 +1319,7 @@ impl Wall {
         cx.spawn(async move |this, cx| {
             let Ok(Ok(window)) = read.await else { return };
             let _ = this.update(cx, |wall, cx| {
-                if wall.view_id() == Some(asked_of.as_str()) {
+                if wall.view_id() == Some(asked_of.as_str()) && asked_revision >= wall.revision {
                     let frame = wall.frame;
                     wall.pages.insert(
                         page,
@@ -1686,6 +1696,7 @@ impl Wall {
         self.pages.insert(page, Page::Loading);
         self.pages_in_flight += 1;
         let asked_of = view.clone();
+        let asked_revision = self.revision;
         let client = Arc::clone(&net.client);
         let read = net.rt().spawn(async move {
             client
@@ -1702,14 +1713,21 @@ impl Wall {
                 wall.pages_in_flight = wall.pages_in_flight.saturating_sub(1);
                 match answer {
                     Ok(Ok(window)) => {
-                        let frame = wall.frame;
-                        wall.pages.insert(
-                            page,
-                            Page::Ready {
-                                rows: rows_of(window.rows),
-                                used: frame,
-                            },
-                        );
+                        if wall.revision > asked_revision {
+                            // An in-place update arrived while this page was
+                            // loading: discard the stale rows so it is fetched
+                            // again at the new revision.
+                            wall.pages.remove(&page);
+                        } else {
+                            let frame = wall.frame;
+                            wall.pages.insert(
+                                page,
+                                Page::Ready {
+                                    rows: rows_of(window.rows),
+                                    used: frame,
+                                },
+                            );
+                        }
                         wall.failures = 0;
                         wall.evict_pages();
                     }

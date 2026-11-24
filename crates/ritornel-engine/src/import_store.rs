@@ -1118,7 +1118,11 @@ impl LibraryStore {
         batch: &Batch,
         full: bool,
         rule: ritornel_domain::history::PlayRule,
+        cancel: Option<crate::JobCancel>,
     ) -> Result<Stored, Error> {
+        if let Some(cancel) = &cancel {
+            cancel.check()?;
+        }
         // Read first: a batch that is all stored already, with nothing to
         // set aside or lift, writes nothing and takes no library revision.
         let (new, gone, rechecked) = {
@@ -1151,12 +1155,13 @@ impl LibraryStore {
             });
         }
         let batch = batch.clone();
-        let written = self.write(
+        let written = self.write_guarded(
             WriteRequest {
                 method: INGEST_METHOD,
                 command: None,
                 client: None,
             },
+            cancel,
             move |write| {
                 // Before the new records go in: what the library held is
                 // what is compared.
@@ -1193,6 +1198,29 @@ impl LibraryStore {
     /// for each loved here that the list no longer has. Nothing is written
     /// when they agree.
     pub fn replace_loves(&self, account: Id, loves: &[Love]) -> Result<LovesStored, Error> {
+        self.replace_loves_with(account, loves, None)
+    }
+
+    /// As [`replace_loves`](Self::replace_loves), checking `cancel` inside
+    /// `BEGIN IMMEDIATE` before any mutation.
+    pub fn replace_loves_guarded(
+        &self,
+        account: Id,
+        loves: &[Love],
+        cancel: crate::JobCancel,
+    ) -> Result<LovesStored, Error> {
+        self.replace_loves_with(account, loves, Some(cancel))
+    }
+
+    fn replace_loves_with(
+        &self,
+        account: Id,
+        loves: &[Love],
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<LovesStored, Error> {
+        if let Some(cancel) = &cancel {
+            cancel.check()?;
+        }
         let mut wanted: BTreeMap<(String, String), i64> = BTreeMap::new();
         for love in loves {
             wanted
@@ -1218,12 +1246,13 @@ impl LibraryStore {
         if new.is_empty() && cleared.is_empty() {
             return Ok(stored);
         }
-        self.write(
+        self.write_guarded(
             WriteRequest {
                 method: LOVES_METHOD,
                 command: None,
                 client: None,
             },
+            cancel,
             move |write| {
                 let connection = write.connection();
                 let rows = rows_of(connection, account)?;
@@ -1267,7 +1296,14 @@ impl LibraryStore {
     /// account with [`match_library_for`](Self::match_library_for).
     /// Returns how many bindings changed; with none, nothing is written.
     pub fn match_library(&self) -> Result<usize, Error> {
-        Ok(self.match_scope(Scope::Library)?.values().sum())
+        self.match_library_with(None)
+    }
+
+    pub(crate) fn match_library_with(
+        &self,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<usize, Error> {
+        Ok(self.match_scope(Scope::Library, cancel)?.values().sum())
     }
 
     /// As [`match_library`](Self::match_library), and returns how many of
@@ -1275,9 +1311,30 @@ impl LibraryStore {
     /// Only the account's tracks are judged: a scan and a run of streams
     /// judge the rest of the library when they change it.
     pub fn match_library_for(&self, account: Id) -> Result<usize, Error> {
+        self.match_library_for_with(account, None)
+    }
+
+    /// As [`match_library_for`](Self::match_library_for), checking `cancel`
+    /// inside `BEGIN IMMEDIATE` before any mutation.
+    pub fn match_library_for_guarded(
+        &self,
+        account: Id,
+        cancel: crate::JobCancel,
+    ) -> Result<usize, Error> {
+        self.match_library_for_with(account, Some(cancel))
+    }
+
+    fn match_library_for_with(
+        &self,
+        account: Id,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<usize, Error> {
+        if let Some(cancel) = &cancel {
+            cancel.check()?;
+        }
         let instance = self.read(move |connection| Ok(rows_of(connection, account)?.instance))?;
         Ok(self
-            .match_scope(Scope::Account(instance))?
+            .match_scope(Scope::Account(instance), cancel)?
             .get(&instance)
             .copied()
             .unwrap_or(0))
@@ -1287,18 +1344,26 @@ impl LibraryStore {
     /// differs is read first, so that nothing is written when nothing
     /// does; what is written is judged again inside the write, against what
     /// the library holds then.
-    fn match_scope(&self, scope: Scope) -> Result<BTreeMap<i64, usize>, Error> {
+    fn match_scope(
+        &self,
+        scope: Scope,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<BTreeMap<i64, usize>, Error> {
+        if let Some(cancel) = &cancel {
+            cancel.check()?;
+        }
         let differ =
             self.read_snapshot(move |connection| Ok(!changes(connection, scope)?.is_empty()))?;
         if !differ {
             return Ok(BTreeMap::new());
         }
-        let written = self.write(
+        let written = self.write_guarded(
             WriteRequest {
                 method: MATCH_METHOD,
                 command: None,
                 client: None,
             },
+            cancel,
             move |write| Ok(serde_json::to_string(&match_in(write, scope)?)?),
         )?;
         Ok(serde_json::from_str(&written.result_json)?)

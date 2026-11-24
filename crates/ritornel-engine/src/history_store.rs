@@ -1660,9 +1660,27 @@ impl LibraryStore {
     /// sent again as it was writes nothing. See "Observations and derivation"
     /// in docs/internals/history.md.
     pub fn ingest(&self, observations: Observations<'_>) -> Result<IngestOutcome, Error> {
+        self.ingest_with(observations, None)
+    }
+
+    /// As [`ingest`](Self::ingest), checking `cancel` inside `BEGIN IMMEDIATE`
+    /// before any mutation.
+    pub fn ingest_guarded(
+        &self,
+        observations: Observations<'_>,
+        cancel: crate::JobCancel,
+    ) -> Result<IngestOutcome, Error> {
+        self.ingest_with(observations, Some(cancel))
+    }
+
+    fn ingest_with(
+        &self,
+        observations: Observations<'_>,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<IngestOutcome, Error> {
         match observations {
             Observations::Listen { record, stamps } => Ok(IngestOutcome::Listen(
-                self.ingest_listen_by(record, stamps, PlayRule::CURRENT)?,
+                self.ingest_listen_with(record, stamps, PlayRule::CURRENT, cancel)?,
             )),
             Observations::Imports {
                 account,
@@ -1673,6 +1691,7 @@ impl LibraryStore {
                 batch,
                 full,
                 PlayRule::CURRENT,
+                cancel,
             )?)),
         }
     }
@@ -1693,12 +1712,26 @@ impl LibraryStore {
     }
 
     /// As [`ingest_listen`](Self::ingest_listen), judged by `rule`.
+    #[cfg(test)]
     pub(crate) fn ingest_listen_by(
         &self,
         record: &ListenRecord,
         stamps: SendStamps,
         rule: PlayRule,
     ) -> Result<Ingested, Error> {
+        self.ingest_listen_with(record, stamps, rule, None)
+    }
+
+    fn ingest_listen_with(
+        &self,
+        record: &ListenRecord,
+        stamps: SendStamps,
+        rule: PlayRule,
+        cancel: Option<crate::JobCancel>,
+    ) -> Result<Ingested, Error> {
+        if let Some(cancel) = &cancel {
+            cancel.check()?;
+        }
         // Received now, as the send's stamps were taken: the age and the
         // skew are measured from here, and the wait for the writer is no
         // part of either.
@@ -1723,12 +1756,13 @@ impl LibraryStore {
             return Ok(Ingested::Duplicate);
         }
         let record = record.clone();
-        let written = self.write(
+        let written = self.write_guarded(
             WriteRequest {
                 method: INGEST_METHOD,
                 command: None,
                 client: None,
             },
+            cancel,
             move |write| {
                 let ingested = ingest(write, &record, stamps, received_at_ms, &payload, rule)?;
                 Ok(match ingested {

@@ -9,33 +9,11 @@
 //! and nothing here sleeps: each wait is for a process to print a line or
 //! to end, or for an answer from the server, and is bounded.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
-mod support;
-
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
 
-use serde_json::Value;
-
-/// How long a test waits for a process before it kills it and fails.
-const WAIT: Duration = Duration::from_secs(60);
-
-/// What a server that `std::process::abort` ended exits with: no code on
-/// Unix, where SIGABRT ended it, and on Windows the fast-fail status
-/// (`0xC0000409`) that abort ends a process with.
-const ABORTED: Option<i32> = if cfg!(windows) {
-    Some(-1_073_740_791)
-} else {
-    None
+use super::support::{
+    ABORTED, Scratch, Server, WAIT, json, lines, null_output_command, ok, rest, ritornelctl, until,
+    write_wav,
 };
 
 /// How long a track of the invented album is.
@@ -47,260 +25,41 @@ const DIES_AT_MS: u64 = 7_000;
 /// How often a listen is saved while it plays.
 const CHECKPOINT_MS: u64 = 5_000;
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornelctl-play-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-
-    /// A folder of two invented tracks: forty seconds of tone each, as
-    /// 16-bit WAV at 8 kHz, written here so that no fixture has to be that
-    /// long.
-    fn music(&self) -> PathBuf {
-        self.album([TRACK_SECONDS, TRACK_SECONDS])
-    }
-
-    /// Two invented tracks of these lengths in seconds.
-    fn album(&self, seconds: [u32; 2]) -> PathBuf {
-        let folder = self.0.canonicalize().unwrap().join("music/Invented Album");
-        std::fs::create_dir_all(&folder).unwrap();
-        let names = [("01 First.wav", 440.0), ("02 Second.wav", 660.0)];
-        for ((name, hz), seconds) in names.into_iter().zip(seconds) {
-            write_wav(&folder.join(name), seconds, hz);
-        }
-        folder
-    }
+fn scratch() -> Scratch {
+    Scratch::new("ritornelctl-play-")
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// A folder of two invented tracks: forty seconds of tone each, as
+/// 16-bit WAV at 8 kHz, written here so that no fixture has to be that
+/// long.
+fn music(scratch: &Scratch) -> PathBuf {
+    album(scratch, [TRACK_SECONDS, TRACK_SECONDS])
 }
 
-fn write_wav(path: &Path, seconds: u32, hz: f64) {
-    let rate: u32 = 8000;
-    let frames = rate * seconds;
-    let mut bytes = Vec::with_capacity(44 + frames as usize * 2);
-    let data = frames * 2;
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(36 + data).to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&16_u32.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&1_u16.to_le_bytes());
-    bytes.extend_from_slice(&rate.to_le_bytes());
-    bytes.extend_from_slice(&(rate * 2).to_le_bytes());
-    bytes.extend_from_slice(&2_u16.to_le_bytes());
-    bytes.extend_from_slice(&16_u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&data.to_le_bytes());
-    for frame in 0..frames {
-        let t = f64::from(frame) / f64::from(rate);
-        let sample = (0.25 * (2.0 * std::f64::consts::PI * hz * t).sin() * 32767.0) as i16;
-        bytes.extend_from_slice(&sample.to_le_bytes());
-    }
-    std::fs::File::create(path)
+/// Two invented tracks of these lengths in seconds.
+fn album(scratch: &Scratch, seconds: [u32; 2]) -> PathBuf {
+    let folder = scratch
+        .0
+        .canonicalize()
         .unwrap()
-        .write_all(&bytes)
-        .unwrap();
-}
-
-fn lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
-    let (send, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            if send.send(line.unwrap()).is_err() {
-                break;
-            }
-        }
-    });
-    lines
-}
-
-fn rest(lines: &Receiver<String>) -> Option<String> {
-    let mut text = String::new();
-    loop {
-        match lines.recv_timeout(WAIT) {
-            Ok(line) => {
-                text.push_str(&line);
-                text.push('\n');
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(text),
-            Err(mpsc::RecvTimeoutError::Timeout) => return None,
-        }
+        .join("music/Invented Album");
+    std::fs::create_dir_all(&folder).unwrap();
+    let names = [("01 First.wav", 440.0), ("02 Second.wav", 660.0)];
+    for ((name, hz), seconds) in names.into_iter().zip(seconds) {
+        write_wav(&folder.join(name), seconds, hz);
     }
+    folder
 }
 
-fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ritornelctl"))
-        .args(args)
-        .arg("--data-dir")
-        .arg(data_dir)
-        .env_remove("RITORNEL_DATA_DIR")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = lines(child.stdout.take().unwrap());
-    let stderr = lines(child.stderr.take().unwrap());
-    let (Some(stdout), Some(stderr)) = (rest(&stdout), rest(&stderr)) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("ritornelctl {args:?} did not end within {WAIT:?}");
-    };
-    let ended = child.wait().unwrap();
-    // No test has ritornelctl ended by a signal: one that was, was ended from
-    // outside the test, and the failure says so rather than as a code.
-    assert!(
-        ended.code().is_some(),
-        "ritornelctl {args:?} was ended from outside: {ended}\n--- stdout\n{stdout}--- stderr\n{stderr}"
-    );
-    (ended.code(), stdout, stderr)
-}
-
-fn json(data_dir: &Path, args: &[&str]) -> Value {
-    let mut args = args.to_vec();
-    args.push("--json");
-    serde_json::from_str(&ok(data_dir, &args)).unwrap()
-}
-
-/// Runs `ritornelctl` and returns what it printed. Unless it succeeded,
-/// the test fails with its exit code and everything it printed.
-fn ok(data_dir: &Path, args: &[&str]) -> String {
-    let (code, stdout, stderr) = ritornelctl(data_dir, args);
-    assert_eq!(
-        code,
-        Some(0),
-        "ritornelctl {args:?}\n--- stdout\n{stdout}--- stderr\n{stderr}"
-    );
-    stdout
-}
-
-/// Asks the server, again and again, until `done` says so, for at most
-/// [`WAIT`]. Each ask is a whole `ritornelctl` run, which is the wait.
-fn until(data_dir: &Path, args: &[&str], done: impl Fn(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let answer = json(data_dir, args);
-        if done(&answer) {
-            return answer;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{args:?} never got there: {answer}"
-        );
-    }
-}
-
-/// A `ritornel-server` on the null output.
-struct Server {
-    child: Child,
-    stdout: Receiver<String>,
-}
-
-fn spawn(data_dir: &Path, variables: &[(&str, &str)]) -> (Child, Receiver<String>) {
-    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl"))
-        .with_file_name(format!("ritornel-server{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        binary.exists(),
-        "there is no ritornel-server beside ritornelctl: build the workspace"
-    );
-    let mut child = Command::new(binary)
-        .arg("serve")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .args(["--listen", "127.0.0.1:0", "--output", "null"])
-        .env_remove("RITORNEL_DATA_DIR")
-        .env_remove("RITORNEL_LISTEN")
-        .env_remove("RITORNEL_LOG_LEVEL")
-        .env_remove("RITORNEL_BACKUP_DIR")
-        .env_remove("RITORNEL_NAME")
-        // A test that plays leaves the media keys where they were.
-        .env("RITORNEL_TEST_NO_MEDIA_SESSION", "1")
-        .envs(variables.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        // The server logs to a file and says on stderr only what went wrong,
-        // which then shows with the failing test.
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let stdout = lines(child.stdout.take().unwrap());
-    (child, stdout)
-}
-
-impl Server {
-    fn start(data_dir: &Path, variables: &[(&str, &str)]) -> Self {
-        let (mut child, stdout) = spawn(data_dir, variables);
-        let ready = stdout.recv_timeout(WAIT);
-        if !ready
-            .as_deref()
-            .is_ok_and(|line| line.starts_with("ready pid="))
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("no ready line within {WAIT:?}: {ready:?}");
-        }
-        Self { child, stdout }
-    }
-
-    /// Waits for the server to end by itself, and says how it did: its
-    /// exit status names the signal when one ended it, as an abort does.
-    fn ended(mut self) -> ExitStatus {
-        assert!(
-            rest(&self.stdout).is_some(),
-            "the server did not end within {WAIT:?}"
-        );
-        self.child.wait().unwrap()
-    }
-
-    fn stop(self) {
-        // `taskkill /PID` without `/F` is what Windows has for SIGTERM: it
-        // asks the server's hidden window to close.
-        let sent = if cfg!(windows) {
-            Command::new("taskkill")
-                .arg("/PID")
-                .arg(self.child.id().to_string())
-                .output()
-                .unwrap()
-                .status
-        } else {
-            Command::new("kill")
-                .arg("-TERM")
-                .arg(self.child.id().to_string())
-                .status()
-                .unwrap()
-        };
-        assert!(sent.success(), "asking it to stop: {sent}");
-        let ended = self.ended();
-        assert!(ended.success(), "the server ended with {ended}");
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        support::say_if_gone(&mut self.child, None);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+fn start(data_dir: &Path, variables: &[(&str, &str)]) -> Server {
+    Server::start_null_output(data_dir, variables)
 }
 
 /// Runs a server that is to die before or just after it is ready, and
 /// waits for it to.
 fn run_until_it_dies(data_dir: &Path, variables: &[(&str, &str)]) -> Option<i32> {
-    let (mut child, stdout) = spawn(data_dir, variables);
+    let mut child = null_output_command(data_dir, variables).spawn().unwrap();
+    let stdout = lines(child.stdout.take().unwrap());
     if rest(&stdout).is_none() {
         let _ = child.kill();
         let _ = child.wait();
@@ -328,8 +87,8 @@ fn a_zone_at_noon() -> String {
 
 #[test]
 fn ritornelctl_play_plays_a_folder_start_to_finish_and_every_listen_reaches_history() {
-    let scratch = Scratch::new();
-    let (data_dir, music) = (scratch.data_dir(), scratch.music());
+    let scratch = scratch();
+    let (data_dir, music) = (scratch.data_dir(), music(&scratch));
     let folder = music.to_str().unwrap();
     // Ten times real time: each track lasts four seconds, through several
     // of the looks `play --follow` takes every half second, so a slow
@@ -337,7 +96,7 @@ fn ritornelctl_play_plays_a_folder_start_to_finish_and_every_listen_reaches_hist
     // so that "today" cannot turn between the plays and the question of
     // what was played on it.
     let zone = a_zone_at_noon();
-    let server = Server::start(
+    let server = start(
         &data_dir,
         &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "10"), ("TZ", &zone)],
     );
@@ -380,15 +139,15 @@ fn ritornelctl_play_plays_a_folder_start_to_finish_and_every_listen_reaches_hist
 
 #[test]
 fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_once_as_a_crash() {
-    let scratch = Scratch::new();
-    let (data_dir, music) = (scratch.data_dir(), scratch.music());
+    let scratch = scratch();
+    let (data_dir, music) = (scratch.data_dir(), music(&scratch));
     let folder = music.to_str().unwrap();
 
     // At real-time speed, so that the five-second checkpoints are what
     // they are in use. The server dies seven seconds into the first track,
     // two after its last checkpoint, saving nothing more.
     let dies_at = DIES_AT_MS.to_string();
-    let dying = Server::start(
+    let dying = start(
         &data_dir,
         &[("RITORNEL_TEST_FAIL_AT_POSITION_MS", dies_at.as_str())],
     );
@@ -408,7 +167,7 @@ fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_on
     // The run after that is a normal one. At twice real time, the rest of
     // the first track lasts long after the test stops it, however slowly
     // the stop comes.
-    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "2")]);
+    let server = start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "2")]);
     // The queue and the position are back, and nothing plays.
     let now = json(&data_dir, &["now"]);
     assert_eq!(now["status"], "paused");
@@ -489,21 +248,21 @@ fn a_server_killed_mid_track_comes_back_paused_and_its_listen_reaches_history_on
 
 #[test]
 fn a_server_killed_just_after_a_join_keeps_both_listens_and_the_boundary_between_them() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     // A three-second track joined to a forty-second one, at real time. The
     // server dies four seconds into the second, which the first never
     // reaches, before the second's first five-second save.
-    let music = scratch.album([3, TRACK_SECONDS]);
+    let music = album(&scratch, [3, TRACK_SECONDS]);
     let folder = music.to_str().unwrap();
-    let dying = Server::start(&data_dir, &[("RITORNEL_TEST_FAIL_AT_POSITION_MS", "4000")]);
+    let dying = start(&data_dir, &[("RITORNEL_TEST_FAIL_AT_POSITION_MS", "4000")]);
     ok(&data_dir, &["library", "create"]);
     ok(&data_dir, &["scan", folder]);
     ok(&data_dir, &["play", folder]);
     let ended = dying.ended();
     assert_eq!(ended.code(), ABORTED, "the server ended with {ended}");
 
-    let server = Server::start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
+    let server = start(&data_dir, &[("RITORNEL_TEST_NULL_OUTPUT_SPEED", "20")]);
     let now = json(&data_dir, &["now"]);
     assert_eq!(
         (now["status"].as_str(), now["index"].as_u64()),

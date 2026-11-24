@@ -1636,6 +1636,79 @@ fn another_disk_mounted_at_the_root_after_the_walk_is_not_judged_against_it() {
 }
 
 #[test]
+fn a_root_swapped_between_prepare_and_commit_writes_nothing() {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    for phase in ["record", "moves", "missing", "replaced", "sidecars"] {
+        let mut rig = Rig::new();
+        rig.put("Tin Weather/01.flac", "a.flac");
+        rig.put("Tin Weather/02.flac", "b.flac");
+        rig.scan();
+        let (root, away) = (rig.root(), rig.scratch.path().join("unmounted"));
+        let steps_before = match phase {
+            "record" => {
+                rig.put("Tin Weather/03.mp3", "a.mp3");
+                0
+            }
+            "moves" => {
+                // Swap both paths: Read holds both in `replaced` with no
+                // write, and Moves is the first step that writes.
+                rig.put("Tin Weather/01.flac", "b.flac");
+                rig.put("Tin Weather/02.flac", "a.flac");
+                1
+            }
+            "missing" => {
+                std::fs::remove_file(root.join("Tin Weather/02.flac")).unwrap();
+                1
+            }
+            "replaced" => {
+                rig.put("Tin Weather/01.flac", "b.flac");
+                3
+            }
+            "sidecars" => {
+                std::fs::write(
+                    root.join("Tin Weather/disc.cue"),
+                    "FILE \"01.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+                )
+                .unwrap();
+                3
+            }
+            _ => unreachable!(),
+        };
+        let (revision, before) = (rig.revision(), rig.dump());
+        let (mut run, row) = walked(&mut rig);
+        for _ in 0..steps_before {
+            assert!(run.prepare(&stop, &mut |_| {}).unwrap(), "{phase}");
+            assert_eq!(run.commit(&rig.library).unwrap(), None, "{phase}");
+        }
+        assert_eq!(
+            (rig.revision(), rig.dump()),
+            (revision, before.clone()),
+            "{phase}: no earlier step wrote"
+        );
+        // Prepare succeeds for the writing phase, then the root is swapped
+        // before commit runs.
+        assert!(run.prepare(&stop, &mut |_| {}).unwrap(), "{phase}");
+        std::fs::rename(&root, &away).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let refused = run.commit(&rig.library);
+        assert!(
+            matches!(&refused, Err(Error::RootOffline { path }) if *path == root),
+            "{phase}: {refused:?}"
+        );
+        rig.server
+            .finish_job(row, JobState::Failed, Some("offline".to_owned()))
+            .unwrap();
+        assert_eq!(
+            (rig.revision(), rig.dump()),
+            (revision, before),
+            "{phase}: nothing written after swap"
+        );
+        std::fs::remove_dir(&root).unwrap();
+        std::fs::rename(&away, &root).unwrap();
+    }
+}
+
+#[test]
 fn a_file_that_cannot_be_reached_when_it_is_read_keeps_what_was_last_read_of_it() {
     let mut rig = Rig::new();
     rig.put("Tin Weather/01.flac", "a.flac");
@@ -1720,6 +1793,60 @@ fn a_file_an_earlier_scan_recorded_as_unreadable_by_a_failed_read_is_read_again(
     let revision = rig.revision();
     assert_eq!(rig.scan().unchanged, 1);
     assert_eq!(rig.revision(), revision);
+}
+
+#[test]
+fn a_batch_with_nothing_to_write_still_counts_what_it_found_unchanged() {
+    use ritornel_domain::payload::ReadError;
+    let mut rig = Rig::new();
+    rig.put("Tin Weather/01.flac", "a.flac");
+    let path = "Tin Weather/02.flac";
+    std::fs::write(rig.root().join(path), b"not audio at all").unwrap();
+    rig.scan();
+    // Its last read failed on I/O, and it reads as nothing again: the
+    // only file read, and nothing to write.
+    let metadata = std::fs::metadata(rig.root().join(path)).unwrap();
+    let mut payload = crate::media::read_file(
+        &rig.root(),
+        path,
+        metadata.len(),
+        crate::walk::mtime_ms(&metadata),
+        Vec::new(),
+    );
+    assert!(payload.audio.is_none());
+    payload.error = Some(ReadError {
+        kind: "io".to_owned(),
+        message: "Input/output error (os error 5)".to_owned(),
+    });
+    let item: i64 = rig
+        .one("SELECT id FROM source_item WHERE provider_key = 'Tin Weather/02.flac'")
+        .parse()
+        .unwrap();
+    let request = WriteRequest {
+        method: "scan.step",
+        command: None,
+        client: None,
+    };
+    rig.library
+        .record(
+            request,
+            rig.main.row,
+            vec![crate::scan_store::RecordOp::Update { item, payload }],
+            String::new(),
+        )
+        .unwrap();
+    // Each scan counts both files unchanged. The first resolves what was
+    // written by hand; the next writes nothing.
+    let mut revision = None;
+    for _ in 0..2 {
+        let summary = rig.scan();
+        assert_eq!(
+            (summary.files, summary.unchanged, summary.unreadable),
+            (2, 2, 0)
+        );
+        assert!(revision.is_none_or(|revision| revision == rig.revision()));
+        revision = Some(rig.revision());
+    }
 }
 
 #[test]

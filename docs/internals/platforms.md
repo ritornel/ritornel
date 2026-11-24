@@ -35,11 +35,11 @@ What differs between systems sits in a `platform` module in each crate that need
 - **Closing the window never stops the music.** Only Quit stops a server the app started, and a server it found running is never stopped. That holds even on Windows and Linux, where closing the last window usually quits an app.
 - **One set of menus.** The menus are defined once. macOS shows them in its menu bar. On Linux and Windows they open from a button in the title bar, and the app draws its context menus itself.
 - **Shortcuts follow the system.** A shortcut that means the same thing everywhere is written once with GPUI's `secondary-` modifier: `⌘` on macOS and `Ctrl` elsewhere. Quit, Back, and moving through text differ by system, so each system's file sets them.
-- **Linking audio is optional.** The server's `audio-output` feature, on by default, is what links an audio library. On Linux that is `libasound`, so a default build needs ALSA's development files (`alsa-lib` or `libasound2-dev`). The hub is built without the feature and needs none. CI's `hub` job builds it with `PKG_CONFIG_LIBDIR=/nonexistent`, and `scripts/check-deps.sh` fails if `cpal`, ALSA, `zbus`, or `souvlaki` reach the hub's dependency tree.
+- **Linking audio is optional.** The server's `audio-output` feature, on by default, is what links an audio library. On Linux that is `libasound`, so a default build needs ALSA's development files (`alsa-lib` or `libasound2-dev`). The hub is built without the feature and needs none. CI's Linux job builds and tests it with `PKG_CONFIG_LIBDIR=/nonexistent`, and `scripts/check-deps.sh` fails if `cpal`, ALSA, `zbus`, or `souvlaki` reach the hub's dependency tree.
 
 ### Linux
 
-- **The arm64 player is built natively in CI, not cross-compiled.** CI's `player-arm64` job builds and tests the headless player on GitHub's arm64 Linux runner, which links ALSA as any Linux machine does. Cross-compiling would need an aarch64 sysroot with ALSA's development files. The job runs beside the others, so the check takes no longer.
+- **The arm64 player is built natively in CI, not cross-compiled.** CI's post-merge `player-arm64` job builds and tests the headless player on GitHub's arm64 Linux runner on pushes to `main`, linking ALSA as any Linux machine does. Cross-compiling would need an aarch64 sysroot with ALSA's development files. Every code pull request still lints the `--no-default-features --features audio-output` configuration in the Linux job.
 - **Sound goes through ALSA's `default` device, not `cpal`'s PipeWire or PulseAudio hosts.** ALSA needs only `libasound`, and on a desktop with a sound server, `default` routes to that server. The output opens as 32-bit float at the device's own rate and channels, as on macOS.
 - **MPRIS is served with `zbus` directly, not through `souvlaki`.** `souvlaki`'s Linux backend wakes every 10 ms while a player is registered, panics when there is no session bus, does not advance reported position between updates, and never emits `Seeked`. The `zbus` implementation avoids all four:
   - it wakes only for a change or a call;
@@ -83,7 +83,7 @@ What differs between systems sits in a `platform` module in each crate that need
 **Windows** (Windows 11, Realtek speakers, 48 kHz shared-mode mix):
 
 - The server test suite passes.
-- CI runs clippy and the whole workspace's tests on GitHub's `windows-latest` runner, and checks, tests and builds the desktop app there with `scripts/desktop.ps1 check`.
+- CI runs clippy and the whole workspace's tests on GitHub's `windows-latest` runner, and checks and tests the desktop app there with `scripts/desktop.ps1 check`.
 - 44.1, 48, and 96 kHz files play at the right pitch; pause, seek, next, previous, end of queue, and gapless joins (including sample-rate changes) match the source files.
 - Reported position runs ~55 ms ahead of what is heard (output latency) without drifting over three minutes.
 - The desktop app follows the server; the server uses 1–2% of one core and 27 MB while playing.

@@ -150,6 +150,7 @@ pub struct ScanRun {
     sidecar_ops: Vec<SidecarOp>,
     failed: Vec<(String, &'static str, String)>,
     label: Option<String>,
+    cancel: Option<crate::JobCancel>,
 }
 
 fn unsigned(number: i64) -> u64 {
@@ -300,7 +301,14 @@ impl ScanRun {
             sidecar_ops: Vec::new(),
             failed: Vec::new(),
             label: None,
+            cancel: None,
         })
+    }
+
+    /// Guards every library transaction this scan begins with `cancel`.
+    pub fn with_cancel(mut self, cancel: crate::JobCancel) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// The job this run is of.
@@ -371,22 +379,34 @@ impl ScanRun {
             Phase::Sidecars => self.read_sidecars(stop),
             _ => {}
         }
-        // What a batch read, and which files the walk found gone or other
+        // Early exit before taking the library lock or judging replacements:
+        // what a batch read, and which files the walk found gone or other
         // audio at, are of the folder that was walked. A root that is no
         // longer that folder, as when its disk went away or another was
         // mounted at its path, ends the scan: nothing more is recorded, and
-        // nothing is taken for gone or replaced.
+        // nothing is taken for gone or replaced. `commit` verifies again
+        // immediately before every write derived from the root.
         let judged = matches!(
             self.phase,
             Phase::Read | Phase::Moves | Phase::Missing | Phase::Replaced | Phase::Sidecars
         );
-        let walked_id = self.walked.as_ref().and_then(|walked| walked.root_id);
-        if judged && folder_id(&self.root) != walked_id {
+        if judged {
+            self.verify_root()?;
+        }
+        Ok(!stop.load(Ordering::Relaxed))
+    }
+
+    /// Checks that the root is still the folder the walk saw. Every walk has
+    /// the root's identity: one the system would not give was refused, since
+    /// two unknown identities prove nothing.
+    fn verify_root(&self) -> Result<(), Error> {
+        let walked_id = self.walked.as_ref().map(|walked| walked.root_id);
+        if walked_id.is_none() || folder_id(&self.root) != walked_id {
             return Err(Error::RootOffline {
                 path: self.root.clone(),
             });
         }
-        Ok(!stop.load(Ordering::Relaxed))
+        Ok(())
     }
 
     /// The request of the job's next library write: its next step.
@@ -438,9 +458,16 @@ impl ScanRun {
                 self.phase = Phase::Missing;
                 let ops = self.settle_moves();
                 if !ops.is_empty() {
+                    self.verify_root()?;
                     let request = self.next_step();
                     let receipt = self.step_result(self.summary)?;
-                    library.record(request, self.source.row, ops, receipt)?;
+                    library.record_with(
+                        request,
+                        self.source.row,
+                        ops,
+                        receipt,
+                        self.cancel.clone(),
+                    )?;
                     self.committed()?;
                 }
             }
@@ -453,9 +480,10 @@ impl ScanRun {
                 self.summary.missing += gone.len() as u64;
                 self.phase = Phase::Replaced;
                 if !gone.is_empty() {
+                    self.verify_root()?;
                     let request = self.next_step();
                     let receipt = self.step_result(self.summary)?;
-                    library.mark_missing(request, gone, receipt)?;
+                    library.mark_missing(request, gone, receipt, self.cancel.clone())?;
                     self.committed()?;
                 }
             }
@@ -466,9 +494,16 @@ impl ScanRun {
                 }
                 let ops = std::mem::take(&mut self.sidecar_ops);
                 if !ops.is_empty() {
+                    self.verify_root()?;
                     let request = self.next_step_as(SIDECARS_METHOD);
                     let receipt = stored(self.summary, self.dirty, false)?;
-                    library.record_sidecars(request, self.source.row, ops, receipt)?;
+                    library.record_sidecars(
+                        request,
+                        self.source.row,
+                        ops,
+                        receipt,
+                        self.cancel.clone(),
+                    )?;
                     self.fail_point()?;
                 }
             }
@@ -477,11 +512,11 @@ impl ScanRun {
                     self.label = Some("resolving".to_owned());
                     if library.claims_are_stale()? {
                         let request = self.next_step();
-                        library.rebuild_claims(request)?;
+                        library.rebuild_claims(request, self.cancel.clone())?;
                         self.committed()?;
                     }
                     let request = self.next_step();
-                    match library.resolve(request)? {
+                    match library.resolve_with(request, self.cancel.clone())? {
                         Some((_, resolved)) => {
                             self.summary.assignments += resolved.assignments;
                             self.summary.recordings += resolved.recordings;
@@ -507,7 +542,7 @@ impl ScanRun {
             Phase::Match => {
                 // A write of its own, which writes nothing when no binding
                 // moves, and so is safe to repeat.
-                library.match_library()?;
+                library.match_library_with(self.cancel.clone())?;
                 self.phase = Phase::Layouts;
             }
             Phase::Layouts => {
@@ -517,7 +552,7 @@ impl ScanRun {
                     self.label = Some("reading disc layouts".to_owned());
                     let request = self.next_step_as(LAYOUTS_METHOD);
                     let receipt = stored(self.summary, self.dirty, true)?;
-                    library.derive_layouts(request, receipt)?;
+                    library.derive_layouts(request, receipt, self.cancel.clone())?;
                     self.fail_point()?;
                 }
                 self.phase = Phase::Done;
@@ -698,15 +733,18 @@ impl ScanRun {
         if self.cursor >= self.queue.len() {
             self.phase = Phase::Moves;
         }
-        self.summary.bytes_read = counted.bytes_read;
-        if !ops.is_empty() {
-            let request = self.next_step();
-            let receipt = self.step_result(counted)?;
-            library.record(request, self.source.row, ops, receipt)?;
+        // A batch with nothing to write still counts the files it found
+        // unchanged.
+        if ops.is_empty() {
             self.summary = counted;
-            self.committed()?;
+            return Ok(());
         }
-        Ok(())
+        self.verify_root()?;
+        let request = self.next_step();
+        let receipt = self.step_result(counted)?;
+        library.record_with(request, self.source.row, ops, receipt, self.cancel.clone())?;
+        self.summary = counted;
+        self.committed()
     }
 
     /// Records a file at a path the library has no live item at. If its
@@ -839,9 +877,10 @@ impl ScanRun {
                 ops.push(RecordOp::Retire { item, payload });
             }
         }
+        self.verify_root()?;
         let request = self.next_step();
         let receipt = self.step_result(self.summary)?;
-        library.record(request, self.source.row, ops, receipt)?;
+        library.record_with(request, self.source.row, ops, receipt, self.cancel.clone())?;
         self.committed()
     }
 

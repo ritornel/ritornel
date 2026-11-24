@@ -2,14 +2,6 @@
 //! test process, each on a data directory of its own and a port the system
 //! picks, joined over loopback as two machines are over their network.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -32,40 +24,22 @@ use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
 use ritornel_server::{Bounds, HeldDir, Listen, Output, PlaybackRun, Run, Server};
 
-/// How long a test may take before it is failed.
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{self, album, bounded, key};
 
 /// How long a slow hub waits before each part of a master it sends: far
 /// longer than anything a test does while the pull is under way, so that
 /// none can outlast it however slow the machine.
 const PULL_PACE: Duration = Duration::from_secs(600);
 
-async fn bounded(test: impl Future<Output = ()>) {
-    tokio::time::timeout(WAIT, test)
-        .await
-        .expect("the test did not finish in time");
-}
-
-struct Scratch(PathBuf);
+struct Scratch(support::Scratch);
 
 impl Scratch {
     fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-link-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
+        Self(support::Scratch::new("ritornel-link-"))
     }
 
     fn data_dir(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.0.join(name)
     }
 }
 
@@ -111,31 +85,10 @@ async fn start_playing_with(
     .unwrap()
 }
 
-fn key() -> ritornel_client::contract::Id {
-    ritornel_client::idempotency_key().unwrap()
-}
-
-/// An album of three tracks from the audio fixtures, in the scratch
-/// directory.
-fn album(scratch: &Scratch) -> PathBuf {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio");
-    let folder = scratch.0.join("music");
-    for (to, fixture) in [
-        ("Tin Weather/01.flac", "a.flac"),
-        ("Tin Weather/02.flac", "b.flac"),
-        ("Tin Weather/03.mp3", "a.mp3"),
-    ] {
-        let to = folder.join(to);
-        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-        std::fs::copy(fixtures.join(fixture), to).unwrap();
-    }
-    folder.canonicalize().unwrap()
-}
-
 /// Adds the album to the hub's library and scans it, and waits for the
 /// scan to end.
 async fn scan(scratch: &Scratch, hub: &mut Client) {
-    let folder = album(scratch);
+    let folder = album(&scratch.0);
     let source = hub
         .add_source(key(), "music", folder.to_str().unwrap())
         .await
@@ -809,7 +762,7 @@ async fn a_satellite_keeps_no_more_of_the_hubs_music_than_its_cache_size() {
             ("Somebody Else", "a.retagged.flac"),
             ("Field Notes", "b.no-artist.flac"),
         ] {
-            let folder = scratch.0.join("music").join(folder);
+            let folder = scratch.0.0.join("music").join(folder);
             std::fs::create_dir_all(&folder).unwrap();
             std::fs::copy(fixtures.join(fixture), folder.join("01.flac")).unwrap();
         }

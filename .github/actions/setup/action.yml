@@ -20,12 +20,16 @@ inputs:
     default: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny
   rust-cache:
     description: >-
-      The Rust build cache the job uses. `own` restores the job's own and,
-      on main, saves it. `workspace` restores the workspace job's on the same
-      system and saves nothing, for a job whose build is mostly the same.
-      `crates` keeps only the crates downloaded, for a job that rebuilds
-      quickly enough to be worth no build cache.
+      The Rust build cache the job uses. `own` restores the job's cache and,
+      on main, saves it. `crates` keeps only the crates downloaded, for a job
+      that rebuilds quickly enough to be worth no build cache. `none` skips
+      rust-cache altogether, for jobs that compile nothing.
     default: own
+  shared-key:
+    description: >-
+      Optional shared cache key passed to Swatinem/rust-cache (for example
+      `workspace` or `desktop-release`). Empty uses the job id.
+    default: ''
 
 runs:
   using: composite
@@ -47,12 +51,10 @@ runs:
     - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
       with:
         cache_save: ${{ github.ref == 'refs/heads/main' }}
-    # The key is the job's, or with `workspace` the workspace job's (a
-    # shared key named for that job is the same key), and the system's and
-    # architecture's.
-    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - if: inputs.rust-cache != 'none'
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         workspaces: ${{ inputs.workspaces }}
-        shared-key: ${{ inputs.rust-cache == 'workspace' && 'workspace' || '' }}
+        shared-key: ${{ inputs.shared-key }}
         cache-targets: ${{ inputs.rust-cache != 'crates' }}
-        save-if: ${{ github.ref == 'refs/heads/main' && inputs.rust-cache != 'workspace' }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}

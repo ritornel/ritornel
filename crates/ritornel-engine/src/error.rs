@@ -98,9 +98,10 @@ pub enum Error {
         /// The root's name.
         name: String,
     },
-    /// A root's folder is missing, is not a folder or is empty: the root is
-    /// offline, not empty, and nothing in it is marked missing. See "Data
-    /// directory" in docs/internals/server.md.
+    /// A root's folder is missing, is not a folder, has no identity the
+    /// system will give, or is empty: the root is offline, not empty, and
+    /// nothing in it is marked missing. See "Data directory" in
+    /// docs/internals/server.md.
     RootOffline {
         /// Where the root should be.
         path: std::path::PathBuf,
@@ -138,6 +139,9 @@ pub enum Error {
     /// A write that found nothing to change, and was rolled back so that
     /// it takes no revision. It never reaches a caller.
     Unchanged,
+    /// A job's write was stopped before its transaction began because the
+    /// job was asked to stop or the server is shutting down.
+    JobStopped(crate::JobStop),
 }
 
 impl fmt::Display for Error {
@@ -215,7 +219,7 @@ impl fmt::Display for Error {
             }
             Self::RootOffline { path } => write!(
                 f,
-                "the root at {} is missing or holds no audio: it is taken to be offline, and nothing was changed",
+                "the root at {} is missing, holds no audio or cannot be told from another disk at its path: it is taken to be offline, and nothing was changed",
                 path.display()
             ),
             Self::Io(error) => write!(f, "reading a root: {error}"),
@@ -234,6 +238,8 @@ impl fmt::Display for Error {
             Self::BadListen(what) => write!(f, "a listen the hub cannot take: {what}"),
             Self::RolledBack(..) => f.write_str("a dry run, rolled back"),
             Self::Unchanged => f.write_str("nothing changed, so nothing was written"),
+            Self::JobStopped(crate::JobStop::Cancelled) => f.write_str("the job was cancelled"),
+            Self::JobStopped(crate::JobStop::Shutdown) => f.write_str("the server is stopping"),
         }
     }
 }
