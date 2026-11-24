@@ -1,0 +1,55 @@
+name: CI on a new top layer
+
+# A layer under the top of a stack runs CI on Linux alone (see the changes
+# job in ci.yml). When the pull request above it closes without merging,
+# nothing is pushed to it, so this runs its CI again, now with the full tier.
+# A pull request that merges into the layer under it pushes to that layer,
+# which starts its CI, and a stack that merges into main lands whole.
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  rerun:
+    name: Run CI again on the layer below
+    if: >-
+      !github.event.pull_request.merged &&
+      github.event.pull_request.base.ref != github.event.repository.default_branch &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      pull-requests: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          below=$(gh api --method GET "repos/$GH_REPO/pulls" -f state=open -f head="${GH_REPO%%/*}:$BASE" \
+            --jq '.[0].number // empty')
+          if [[ -z $below ]]; then
+            echo "No open pull request comes from $BASE."
+            exit 0
+          fi
+          above=$(gh api --method GET "repos/$GH_REPO/pulls" -f state=open -f base="$BASE" --jq 'length')
+          if ((above > 0)); then
+            echo "#$below is still the base of $above open pull request(s), so its tier is unchanged."
+            exit 0
+          fi
+          latest=$(gh run list --workflow ci.yml --event pull_request --branch "$BASE" --limit 1 \
+            --json databaseId,status --jq '.[0] // empty | "\(.databaseId) \(.status)"')
+          if [[ -z $latest ]]; then
+            echo "#$below has no CI run to run again."
+            exit 0
+          fi
+          read -r run status <<<"$latest"
+          if [[ $status != completed ]]; then
+            gh run cancel "$run" || true
+            gh run watch "$run" > /dev/null || true
+          fi
+          gh run rerun "$run"
+          echo "#$below is the top of its stack now: CI run $run runs again with the full tier." | tee -a "$GITHUB_STEP_SUMMARY"

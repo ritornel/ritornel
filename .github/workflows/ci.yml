@@ -31,13 +31,32 @@ jobs:
     # and one that touches only what the desktop app does not build skips
     # the desktop jobs. A push to main runs every job, so its caches are all
     # saved.
+    #
+    # And on which systems, by the tier. A pull request whose branch is the
+    # base of another open one, a layer under the top of a stack, has the
+    # Linux tier: the jobs on Linux x64 alone. Every other run has the full
+    # tier, every system: a pull request on its own, the top of a stack,
+    # which holds every layer under it and is where the stack lands, and a
+    # push to main. When the pull requests cannot be listed, the tier is full.
     name: Jobs the change needs
     runs-on: ubuntu-slim
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       workspace: ${{ steps.paths.outputs.workspace }}
       desktop: ${{ steps.paths.outputs.desktop }}
+      tier: ${{ steps.tier.outputs.tier }}
+      systems: ${{ steps.tier.outputs.systems }}
     steps:
+      # What started the run, so a run started twice for one commit can be
+      # told apart from the other.
+      - env:
+          ACTION: ${{ github.event.action }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: echo "event=$GITHUB_EVENT_NAME action=$ACTION before=$BEFORE after=$AFTER"
       # A pull request's run checks out its merge into the base branch, whose
       # first parent is the base: the two differ by what the pull request
       # changes. Without renames, a moved file is listed at both its paths.
@@ -54,6 +73,35 @@ jobs:
           else
             printf 'workspace=true\ndesktop=true\n' | tee -a "$GITHUB_OUTPUT"
           fi
+      - id: tier
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tier=full
+          if [[ $EVENT != pull_request ]]; then
+            why="a push to $GITHUB_REF_NAME"
+          elif [[ $HEAD_REPO != "$GH_REPO" ]]; then
+            why="a pull request from another repository, which no other builds on"
+          elif ! above=$(gh api --method GET "repos/$GH_REPO/pulls" -f state=open -f base="$HEAD_REF" -F per_page=100 \
+            --jq 'map("#\(.number)") | join(", ")'); then
+            why="the open pull requests could not be listed"
+          elif [[ -n $above ]]; then
+            tier=linux
+            why="$HEAD_REF is the base of $above"
+          else
+            why="no open pull request is based on $HEAD_REF"
+          fi
+          if [[ $tier == linux ]]; then
+            systems='["Linux"]'
+          else
+            systems='["Linux","macOS","Windows"]'
+          fi
+          printf 'tier=%s\nsystems=%s\n' "$tier" "$systems" | tee -a "$GITHUB_OUTPUT"
+          echo "The $tier tier: $why." | tee -a "$GITHUB_STEP_SUMMARY"
 
   checks:
     name: Formatting, dependencies, test sleeps, docs and licences
@@ -85,12 +133,12 @@ jobs:
     if: needs.changes.outputs.workspace == 'true'
     strategy:
       fail-fast: false
+      # The systems are the tier's, so a runner is named for each here
+      # rather than in an include, which would add back a system the tier
+      # leaves out.
       matrix:
-        include:
-          - { name: Linux, os: ubuntu-26.04, packages: libasound2-dev }
-          - { name: macOS, os: macos-latest }
-          - { name: Windows, os: windows-latest }
-    runs-on: ${{ matrix.os }}
+        name: ${{ fromJSON(needs.changes.outputs.systems) }}
+    runs-on: ${{ fromJSON('{"Linux":"ubuntu-26.04","macOS":"macos-latest","Windows":"windows-latest"}')[matrix.name] }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,7 +146,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup
         with:
-          packages: ${{ matrix.packages }}
+          packages: ${{ matrix.name == 'Linux' && 'libasound2-dev' || '' }}
       - run: mise run lint
       # The checks job runs it on Linux, with the rest of `mise run docs`.
       - if: runner.os != 'Linux'
@@ -117,13 +165,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Linux
-            os: ubuntu-26.04
-            packages: pkg-config libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
-          - { name: macOS, os: macos-latest }
-          - { name: Windows, os: windows-latest }
-    runs-on: ${{ matrix.os }}
+        name: ${{ fromJSON(needs.changes.outputs.systems) }}
+    runs-on: ${{ fromJSON('{"Linux":"ubuntu-26.04","macOS":"macos-latest","Windows":"windows-latest"}')[matrix.name] }}
     # It compiles GPUI twice: for clippy and the tests, and in release.
     timeout-minutes: 45
     steps:
@@ -132,7 +175,8 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup
         with:
-          packages: ${{ matrix.packages }}
+          packages: >-
+            ${{ matrix.name == 'Linux' && 'pkg-config libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev' || '' }}
           workspaces: apps/desktop
           disable-tools: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny,aqua:nextest-rs/nextest/cargo-nextest
       - run: mise run desktop:check
@@ -166,10 +210,10 @@ jobs:
     # session or Last.fm. GitHub's arm64 runner builds it natively, which is
     # simpler than cross-linking ALSA, and runs the engine's and the
     # server's tests on arm64. The last step prints the release build's
-    # size and the server's memory at idle.
+    # size and the server's memory at idle. The full tier alone runs it.
     name: Player on arm64 Linux
     needs: changes
-    if: needs.changes.outputs.workspace == 'true'
+    if: needs.changes.outputs.workspace == 'true' && needs.changes.outputs.tier == 'full'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -190,8 +234,9 @@ jobs:
   passed:
     # The one check for branch protection to require: it passes only when
     # every job above passed, or was skipped because the changes job said
-    # it was not needed. A job added above goes in this list and, if it is
-    # one the changes job can skip, in the condition below.
+    # it was not needed, for the change or the tier. A job added above goes
+    # in this list and, if it is one the changes job can skip, in the
+    # condition below.
     name: CI passed
     # Not in a run a newer one cancelled: its jobs say cancelled, and
     # failing here as well would mark the commit failed, though the newer
@@ -204,7 +249,8 @@ jobs:
     steps:
       - if: >-
           needs.changes.result != 'success' || needs.checks.result != 'success' ||
-          (needs.changes.outputs.workspace != 'false' && (needs.workspace.result != 'success' || needs.hub.result != 'success' || needs.player-arm64.result != 'success')) ||
+          (needs.changes.outputs.workspace != 'false' && (needs.workspace.result != 'success' || needs.hub.result != 'success')) ||
+          (needs.changes.outputs.workspace != 'false' && needs.changes.outputs.tier != 'linux' && needs.player-arm64.result != 'success') ||
           (needs.changes.outputs.desktop != 'false' && needs.desktop.result != 'success') ||
           contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
