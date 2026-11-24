@@ -9,163 +9,42 @@
 //! and over a real socket ("Transport-neutral dispatcher" in
 //! docs/internals/contract.md).
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
-use std::time::Duration;
 
+use ritornel_client::Client;
 use ritornel_client::contract::methods::{
     AlbumGet, ArtistGet, ArtistsImportPictures, ArtistsPictureFolders, HistoryTrack, LibrarySearch,
 };
 use ritornel_client::contract::{
-    AlbumGetParams, AlbumRef, AlbumTile, ArtistGetParams, ArtistRow, CONTRACT_VERSION, ClientKind,
-    ErrorCode, FILTER_VERSION, Filter, HelloParams, Id, ImportPicturesParams, ListKind,
-    ListOpenParams, ListOpened, MAX_SEARCH_RESULTS, NoParams, PictureFolder, Predicate, Query,
-    RecordType, Row, SearchParams, SearchResults, SessionKind, Shelf, SongRow, Sort, SortKey,
-    TrackHistoryParams, Window,
+    AlbumGetParams, AlbumRef, AlbumTile, ArtistGetParams, ArtistRow, ErrorCode, FILTER_VERSION,
+    Filter, Id, ImportPicturesParams, ListKind, ListOpenParams, ListOpened, MAX_SEARCH_RESULTS,
+    NoParams, PictureFolder, Predicate, Query, RecordType, Row, SearchParams, SearchResults, Shelf,
+    SongRow, Sort, SortKey, TrackHistoryParams, Window,
 };
-use ritornel_client::{Client, Credential};
-use ritornel_engine::{OsEntropy, SystemClock};
-use ritornel_server::{Bounds, HeldDir, Listen, Server};
+use ritornel_server::Bounds;
 
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{Running, Scratch, Via, invent, on_both_transports};
 
-async fn bounded(test: impl Future<Output = ()>) {
-    tokio::time::timeout(WAIT, test)
-        .await
-        .unwrap_or_else(|_| panic!("the test did not finish within {WAIT:?}"));
-}
-
-/// A directory that is removed when the test ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-server-pages-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-
-    fn root(&self) -> PathBuf {
-        self.0.join("root")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Via {
-    Memory,
-    Socket,
-}
-
-macro_rules! on_both_transports {
-    ($($test:ident)*) => {$(
-        mod $test {
-            use super::{Via, bounded};
-
-            #[tokio::test]
-            async fn in_memory() {
-                bounded(super::$test(Via::Memory)).await;
-            }
-
-            #[tokio::test]
-            async fn over_a_socket() {
-                bounded(super::$test(Via::Socket)).await;
-            }
-        }
-    )*};
-}
-
-/// Invents a library with the showcase in it, with the server's own hidden
-/// command, as a developer would.
-fn invent(data_dir: &Path, root: &Path) {
-    let output = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
-        .arg("invent")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--root")
-        .arg(root)
-        .args(["--albums", "40", "--seed", "5", "--showcase"])
-        .args(["--cover-min", "200", "--cover-max", "300"])
-        .env_remove("RITORNEL_DATA_DIR")
-        .output()
-        .unwrap();
-    // A process a signal ended has no code, and may have said nothing.
-    assert!(
-        output.status.success(),
-        "ritornel-server invent: {}\n--- stderr\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+async fn start() -> Running {
+    let scratch = Scratch::new("ritornel-server-pages-");
+    invent(
+        &scratch.data_dir(),
+        &scratch.root(),
+        &[
+            "--albums",
+            "40",
+            "--seed",
+            "5",
+            "--showcase",
+            "--cover-min",
+            "200",
+            "--cover-max",
+            "300",
+        ],
     );
-}
-
-struct Running {
-    server: Server,
-    scratch: Scratch,
-}
-
-impl Running {
-    async fn start() -> Self {
-        let scratch = Scratch::new();
-        invent(&scratch.data_dir(), &scratch.root());
-        let server = Server::start_with(
-            HeldDir::take(scratch.data_dir()).unwrap(),
-            Listen::on_port(0),
-            Arc::new(SystemClock),
-            Arc::new(OsEntropy),
-            Bounds::default(),
-        )
+    Running::on_scratch(scratch, Bounds::default())
         .await
-        .unwrap();
-        Self { server, scratch }
-    }
-
-    async fn greeted(&self, via: Via) -> Client {
-        let client = match via {
-            Via::Memory => {
-                let (outgoing, incoming) = self.server.connect_in_memory(SessionKind::Full);
-                Client::over_memory(outgoing, incoming)
-            }
-            Via::Socket => {
-                let token = std::fs::read_to_string(self.scratch.data_dir().join("credential"))
-                    .unwrap()
-                    .trim()
-                    .to_owned();
-                Client::connect(self.server.endpoint(), &Credential::new(token))
-                    .await
-                    .unwrap()
-            }
-        };
-        client
-            .hello(&HelloParams {
-                name: "pages-test".to_owned(),
-                kind: ClientKind::Cli,
-                version: "1".to_owned(),
-                contract_version: CONTRACT_VERSION,
-            })
-            .await
-            .unwrap();
-        client
-    }
+        .with_client_name("pages-test")
 }
 
 fn refused<T: std::fmt::Debug>(answer: Result<T, ritornel_client::Error>) -> ErrorCode {
@@ -308,7 +187,7 @@ fn newest_first(tiles: &[AlbumTile]) -> bool {
 }
 
 async fn a_discography_files_every_kind_newest_first_and_the_records_they_appear_on_last(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let calla = artist(&client, "Calla Brandt").await;
     let opened = discography(
@@ -389,7 +268,7 @@ async fn a_discography_files_every_kind_newest_first_and_the_records_they_appear
 }
 
 async fn records_of_no_known_kind_are_albums_and_those_with_no_year_come_last(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let ensemble = artist(&client, "Søren Dunmore Ensemble").await;
     let opened = discography(
@@ -423,7 +302,7 @@ async fn records_of_no_known_kind_are_albums_and_those_with_no_year_come_last(vi
 }
 
 async fn songs_on_no_record_are_found_by_artist(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let calla = artist(&client, "Calla Brandt").await;
     let loose = client
@@ -461,7 +340,7 @@ async fn songs_on_no_record_are_found_by_artist(via: Via) {
 }
 
 async fn a_list_that_cannot_be_asked_for_is_refused(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let calla = artist(&client, "Calla Brandt").await;
     let odile = artist(&client, "Odile Castellan").await;
@@ -513,7 +392,7 @@ fn numbers(tracks: &[SongRow]) -> Vec<(i64, i64)> {
 }
 
 async fn an_album_is_its_tracks_in_order_with_its_other_versions(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let ensemble = artist(&client, "Søren Dunmore Ensemble").await;
     let opened = discography(
@@ -650,7 +529,7 @@ async fn an_album_is_its_tracks_in_order_with_its_other_versions(via: Via) {
 }
 
 async fn an_artist_is_their_row_with_the_colour_of_their_picture(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let calla = artist(&client, "Calla Brandt").await;
     let page = client
@@ -717,7 +596,7 @@ fn a_cover(dir: &Path) -> Option<PathBuf> {
 }
 
 async fn an_artist_takes_their_portrait_from_a_picture_folder(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let trio = artist(&client, "Bram Kowal Trio").await;
     assert_eq!((trio.art_id, trio.portrait), (None, false));
@@ -829,7 +708,7 @@ async fn an_artist_takes_their_portrait_from_a_picture_folder(via: Via) {
 }
 
 async fn what_the_library_does_not_have_is_not_found(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let nothing = Id::from_bytes([7; 16]);
     assert_eq!(
@@ -864,7 +743,7 @@ async fn what_the_library_does_not_have_is_not_found(via: Via) {
 /// Lean back's facts about a song nobody has played: none, so that the
 /// window shows its title and artist alone.
 async fn a_song_nobody_has_played_has_no_facts(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let ensemble = artist(&client, "Søren Dunmore Ensemble").await;
     let records = discography(
@@ -902,7 +781,7 @@ async fn search(client: &Client, text: &str) -> SearchResults {
 }
 
 async fn search_finds_names_as_they_are_typed_best_first(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let names = |found: &SearchResults| -> Vec<String> {
         found

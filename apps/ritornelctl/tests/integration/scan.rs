@@ -7,259 +7,39 @@
 //! wait is for a process to print a line or to end, and is bounded by
 //! [`WAIT`].
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
-mod support;
-
-use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
 
 use serde_json::Value;
 
-/// How long a test waits for a process before it kills it and fails.
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{ABORTED, Scratch, Server, json, logs, ok, ritornelctl};
 
-/// What a server that `std::process::abort` ended exits with: no code on
-/// Unix, where SIGABRT ended it, and on Windows the fast-fail status
-/// (`0xC0000409`) that abort ends a process with.
-const ABORTED: Option<i32> = if cfg!(windows) {
-    Some(-1_073_740_791)
-} else {
-    None
-};
+fn scratch() -> Scratch {
+    Scratch::new("ritornelctl-scan-")
+}
 
-/// A directory that is removed when the test ends, with a data directory
-/// and a folder of music in it.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornelctl-scan-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
+/// A folder of the audio fixtures: three files that are audio, and one
+/// that is not.
+fn music(scratch: &Scratch) -> PathBuf {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio");
+    // The path a scan is given is made real, so the test names it so.
+    let folder = scratch.0.canonicalize().unwrap().join("music");
+    for (to, fixture) in [
+        ("Tin Weather/02.flac", "a.flac"),
+        ("Tin Weather/copy.mp3", "a.mp3"),
+        ("loose.ogg", "a.retagged.ogg"),
+        ("broken.flac", "not-audio.flac"),
+    ] {
+        let to = folder.join(to);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(fixtures.join(fixture), to).unwrap();
     }
-
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-
-    /// A folder of the audio fixtures: three files that are audio, and one
-    /// that is not.
-    fn music(&self) -> PathBuf {
-        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio");
-        // The path a scan is given is made real, so the test names it so.
-        let folder = self.0.canonicalize().unwrap().join("music");
-        for (to, fixture) in [
-            ("Tin Weather/02.flac", "a.flac"),
-            ("Tin Weather/copy.mp3", "a.mp3"),
-            ("loose.ogg", "a.retagged.ogg"),
-            ("broken.flac", "not-audio.flac"),
-        ] {
-            let to = folder.join(to);
-            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-            std::fs::copy(fixtures.join(fixture), to).unwrap();
-        }
-        folder
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
-    let (send, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            if send.send(line.unwrap()).is_err() {
-                break;
-            }
-        }
-    });
-    lines
-}
-
-/// The rest of what a pipe carries, up to its end, which comes when the
-/// process ends. `None` if it did not come within [`WAIT`].
-fn rest(lines: &Receiver<String>) -> Option<String> {
-    let mut text = String::new();
-    loop {
-        match lines.recv_timeout(WAIT) {
-            Ok(line) => {
-                text.push_str(&line);
-                text.push('\n');
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(text),
-            Err(mpsc::RecvTimeoutError::Timeout) => return None,
-        }
-    }
-}
-
-/// Runs `ritornelctl` with these arguments on a data directory, and returns
-/// its exit code, its standard output and its standard error.
-fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ritornelctl"));
-    command
-        .args(args)
-        .arg("--data-dir")
-        .arg(data_dir)
-        .env_remove("RITORNEL_DATA_DIR");
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = lines(child.stdout.take().unwrap());
-    let stderr = lines(child.stderr.take().unwrap());
-    let (Some(stdout), Some(stderr)) = (rest(&stdout), rest(&stderr)) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("ritornelctl {args:?} did not end within {WAIT:?}");
-    };
-    let ended = child.wait().unwrap();
-    // No test has ritornelctl ended by a signal: one that was, was ended from
-    // outside the test, and the failure says so rather than as a code.
-    assert!(
-        ended.code().is_some(),
-        "ritornelctl {args:?} was ended from outside: {ended}\n--- stdout\n{stdout}--- stderr\n{stderr}"
-    );
-    (ended.code(), stdout, stderr)
-}
-
-/// `ritornelctl` with `--json`, which must succeed, as the JSON it printed.
-fn json(data_dir: &Path, args: &[&str]) -> Value {
-    let mut args = args.to_vec();
-    args.push("--json");
-    serde_json::from_str(&ok(data_dir, &args)).unwrap()
-}
-
-/// Runs `ritornelctl` and returns what it printed. Unless it succeeded,
-/// the test fails with its exit code and everything it printed.
-fn ok(data_dir: &Path, args: &[&str]) -> String {
-    let (code, stdout, stderr) = ritornelctl(data_dir, args);
-    assert_eq!(
-        code,
-        Some(0),
-        "ritornelctl {args:?}\n--- stdout\n{stdout}--- stderr\n{stderr}"
-    );
-    stdout
-}
-
-/// A `ritornel-server` that is running. It is killed if a test ends
-/// without stopping it.
-struct Server {
-    child: Child,
-    stdout: Receiver<String>,
-}
-
-impl Server {
-    /// Starts a server on `data_dir`, with these variables in its
-    /// environment, and waits for its ready line.
-    fn start(data_dir: &Path, variables: &[(&str, &str)]) -> Self {
-        let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl"))
-            .with_file_name(format!("ritornel-server{}", std::env::consts::EXE_SUFFIX));
-        assert!(
-            binary.exists(),
-            "there is no ritornel-server beside ritornelctl: build the workspace"
-        );
-        let mut child = Command::new(binary)
-            .arg("serve")
-            .arg("--data-dir")
-            .arg(data_dir)
-            .args(["--listen", "127.0.0.1:0"])
-            .env_remove("RITORNEL_DATA_DIR")
-            .env_remove("RITORNEL_LISTEN")
-            .env_remove("RITORNEL_LOG_LEVEL")
-            .env_remove("RITORNEL_BACKUP_DIR")
-            .env_remove("RITORNEL_NAME")
-            .envs(variables.iter().copied())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            // The server logs to a file and says on stderr only what went wrong,
-            // which then shows with the failing test.
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let stdout = lines(child.stdout.take().unwrap());
-        let ready = stdout.recv_timeout(WAIT);
-        if !ready
-            .as_deref()
-            .is_ok_and(|line| line.starts_with("ready pid="))
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("no ready line within {WAIT:?}: {ready:?}");
-        }
-        Self { child, stdout }
-    }
-
-    /// Waits for the server to end by itself, and says how it did: its
-    /// exit status names the signal when one ended it, as an abort does.
-    fn ended(mut self) -> ExitStatus {
-        assert!(
-            rest(&self.stdout).is_some(),
-            "the server did not end within {WAIT:?}"
-        );
-        self.child.wait().unwrap()
-    }
-
-    /// Stops the server with SIGTERM and waits for it to end cleanly.
-    fn stop(self) {
-        // `taskkill /PID` without `/F` is what Windows has for SIGTERM: it
-        // asks the server's hidden window to close.
-        let sent = if cfg!(windows) {
-            Command::new("taskkill")
-                .arg("/PID")
-                .arg(self.child.id().to_string())
-                .output()
-                .unwrap()
-                .status
-        } else {
-            Command::new("kill")
-                .arg("-TERM")
-                .arg(self.child.id().to_string())
-                .status()
-                .unwrap()
-        };
-        assert!(sent.success(), "asking it to stop: {sent}");
-        let ended = self.ended();
-        assert!(ended.success(), "the server ended with {ended}");
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        support::say_if_gone(&mut self.child, None);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn logs(data_dir: &Path) -> String {
-    std::fs::read_dir(data_dir.join("logs"))
-        .unwrap()
-        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
-        .collect()
+    folder
 }
 
 #[test]
 fn scan_adds_the_folder_scans_it_and_the_stats_say_what_came_out() {
-    let scratch = Scratch::new();
-    let (data_dir, music) = (scratch.data_dir(), scratch.music());
+    let scratch = scratch();
+    let (data_dir, music) = (scratch.data_dir(), music(&scratch));
     let folder = music.to_str().unwrap();
     let server = Server::start(&data_dir, &[]);
 
@@ -345,8 +125,8 @@ fn scan_adds_the_folder_scans_it_and_the_stats_say_what_came_out() {
 
 #[test]
 fn a_scan_cut_off_when_the_server_dies_is_taken_up_by_the_next_run_and_finishes() {
-    let scratch = Scratch::new();
-    let (data_dir, music) = (scratch.data_dir(), scratch.music());
+    let scratch = scratch();
+    let (data_dir, music) = (scratch.data_dir(), music(&scratch));
     let folder = music.to_str().unwrap();
 
     // A server that reads one file a step, and dies straight after the
@@ -414,8 +194,8 @@ fn library_bytes(data_dir: &Path) -> (Vec<u8>, Option<Vec<u8>>) {
 
 #[test]
 fn a_dry_run_after_a_scan_changes_nothing_and_leaves_the_library_file_as_it_was() {
-    let scratch = Scratch::new();
-    let (data_dir, music) = (scratch.data_dir(), scratch.music());
+    let scratch = scratch();
+    let (data_dir, music) = (scratch.data_dir(), music(&scratch));
     let server = Server::start(&data_dir, &[]);
     ok(&data_dir, &["library", "create"]);
     ok(&data_dir, &["scan", music.to_str().unwrap()]);

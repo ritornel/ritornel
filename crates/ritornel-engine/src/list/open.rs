@@ -1083,6 +1083,10 @@ pub(super) fn locate_prefix(
 ) -> Result<Option<u64>, Error> {
     if resolved.sort == SortKey::Year {
         let typed = prefix.trim();
+        // An empty prefix finds nothing, as it does for a name below.
+        if typed.is_empty() {
+            return Ok(None);
+        }
         return Ok(resolved
             .sections
             .iter()

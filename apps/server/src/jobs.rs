@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ritornel_contract::Id;
-use ritornel_engine::{JobState, Progress, ScanRun, ScanSettings};
+use ritornel_engine::{JobCancel, JobState, JobStop, Progress, ScanRun, ScanSettings};
 use tracing::{error, info, warn};
 
 use crate::dispatch::Core;
@@ -155,7 +155,7 @@ impl Drop for Worker {
     }
 }
 
-fn work(core: &Core, boot: Id, scan: ScanSettings, stop: &AtomicBool) {
+fn work(core: &Core, boot: Id, scan: ScanSettings, stop: &Arc<AtomicBool>) {
     loop {
         core.jobs().wait();
         while !stop.load(Ordering::SeqCst) {
@@ -224,32 +224,32 @@ pub(crate) fn caught(
 }
 
 /// Carries one claimed job to its end, or until the server stops.
-fn run(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &AtomicBool) {
+fn run(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, shutdown: &Arc<AtomicBool>) {
     if job.kind == crate::lastfm::SYNC_JOB {
-        return sync(core, job, stop);
+        return sync(core, job, shutdown);
     }
     if job.kind == crate::imports::DRY_RUN_JOB {
-        return crate::imports::run_dry_run(core, job, stop);
+        return crate::imports::run_dry_run(core, job, shutdown);
     }
     if job.kind == crate::imports::APPLY_JOB {
-        return crate::imports::run_apply(core, job, stop);
+        return crate::imports::run_apply(core, job, shutdown);
     }
     if job.kind == crate::imports::UNDO_JOB {
-        return crate::imports::run_undo(core, job, stop);
+        return crate::imports::run_undo(core, job, shutdown);
     }
-    scan(core, job, settings, stop);
+    scan(core, job, settings, shutdown);
 }
 
 /// Carries a claimed sync of a Last.fm history on.
 #[cfg(feature = "lastfm")]
-fn sync(core: &Core, job: ritornel_engine::Job, stop: &AtomicBool) {
-    crate::lastfm::run_sync(core, job, stop);
+fn sync(core: &Core, job: ritornel_engine::Job, shutdown: &Arc<AtomicBool>) {
+    crate::lastfm::run_sync(core, job, shutdown);
 }
 
 /// A sync of a Last.fm history, on a server built without Last.fm: it
 /// fails, and says why.
 #[cfg(not(feature = "lastfm"))]
-fn sync(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
+fn sync(core: &Core, job: ritornel_engine::Job, _shutdown: &Arc<AtomicBool>) {
     let ended = core.with_stores(|stores| {
         stores.server().finish_job(
             job.id,
@@ -262,15 +262,39 @@ fn sync(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
     }
 }
 
+/// Opens a live cancel/shutdown handle for `job`.
+pub(crate) fn cancel_handle(
+    core: &Core,
+    job: i64,
+    shutdown: &Arc<AtomicBool>,
+) -> Option<Result<JobCancel, ritornel_engine::Error>> {
+    core.with_stores(|stores| stores.server().job_cancel(job, Arc::clone(shutdown)))
+}
+
 /// Carries one claimed scan to its end, or until the server stops.
-fn scan(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &AtomicBool) {
+fn scan(
+    core: &Core,
+    job: ritornel_engine::Job,
+    settings: ScanSettings,
+    shutdown: &Arc<AtomicBool>,
+) {
+    scan_with(core, job, settings, shutdown, |_| {});
+}
+
+fn scan_with(
+    core: &Core,
+    job: ritornel_engine::Job,
+    settings: ScanSettings,
+    shutdown: &Arc<AtomicBool>,
+    mut before_commit: impl FnMut(&ScanRun),
+) {
     let (row, job_id) = (job.id, job.public_id);
     info!(job_id = %job_id, kind = %job.kind, step = job.step, "a job is claimed");
     let finish = |state: JobState, failure: Option<String>| {
         let finished = core.with_stores(|stores| stores.server().finish_job(row, state, failure));
         match finished {
             Some(Ok(job)) => {
-                info!(job_id = %job_id, state = state.as_str(), "a job ended");
+                info!(job_id = %job_id, state = job.state.as_str(), "a job ended");
                 core.publish_job(&job);
                 // Changes that waited for this scan to end may go now.
                 core.wake_watch();
@@ -281,7 +305,19 @@ fn scan(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &A
             None => {}
         }
     };
-    let opened = core.with_library(|server, library| ScanRun::open(job, server, library, settings));
+    let cancel = match cancel_handle(core, row, shutdown) {
+        Some(Ok(cancel)) => cancel,
+        Some(Err(failed)) => return finish(JobState::Failed, Some(failed.to_string())),
+        None => return,
+    };
+    match cancel.stopped() {
+        Some(JobStop::Cancelled) => return finish(JobState::Cancelled, None),
+        Some(JobStop::Shutdown) => return,
+        None => {}
+    }
+    let opened = core.with_library(|server, library| {
+        ScanRun::open(job, server, library, settings).map(|run| run.with_cancel(cancel.clone()))
+    });
     let mut scan = match opened {
         Some(Ok(scan)) => scan,
         Some(Err(failed)) => return finish(JobState::Failed, Some(failed.to_string())),
@@ -289,10 +325,14 @@ fn scan(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &A
     };
     let mut saved = Instant::now();
     loop {
-        if stop.load(Ordering::SeqCst) {
-            // The job stays claimed by this run, and the next run takes it
-            // back from what it has committed.
-            return;
+        match cancel.stopped() {
+            Some(JobStop::Cancelled) => return finish(JobState::Cancelled, None),
+            Some(JobStop::Shutdown) => {
+                // The job stays claimed by this run, and the next run takes it
+                // back from what it has committed.
+                return;
+            }
+            None => {}
         }
         // Reading files: no database is held. The counters are saved, and
         // sent to subscribers, about once a second.
@@ -307,11 +347,23 @@ fn scan(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &A
                 }
             }
         };
-        match scan.prepare(stop, &mut tick) {
+        match scan.prepare(shutdown, &mut tick) {
             Ok(true) => {}
-            Ok(false) => return,
-            Err(failed) => return finish(JobState::Failed, Some(failed.to_string())),
+            Ok(false) => {
+                if cancel.stopped() == Some(JobStop::Cancelled) {
+                    finish(JobState::Cancelled, None);
+                }
+                return;
+            }
+            Err(failed) => {
+                return match cancel.stopped() {
+                    Some(JobStop::Cancelled) => finish(JobState::Cancelled, None),
+                    Some(JobStop::Shutdown) => {}
+                    None => finish(JobState::Failed, Some(failed.to_string())),
+                };
+            }
         }
+        before_commit(&scan);
         // What the step wrote reaches subscribers from the library itself,
         // after each commit (`dispatch::lists::hook`).
         let step = core.with_library(|server, library| {
@@ -321,6 +373,10 @@ fn scan(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &A
         });
         let (finished, job) = match step {
             Some(Ok(step)) => step,
+            Some(Err(ritornel_engine::Error::JobStopped(JobStop::Cancelled))) => {
+                return finish(JobState::Cancelled, None);
+            }
+            Some(Err(ritornel_engine::Error::JobStopped(JobStop::Shutdown))) => return,
             Some(Err(ritornel_engine::Error::FailPoint)) => {
                 // A crash test asked for the server to die here, between a
                 // step's commit and its checkpoint.
@@ -332,12 +388,132 @@ fn scan(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &A
         };
         core.publish_job(&job);
         saved = Instant::now();
-        if finished.is_some() {
-            return finish(JobState::Succeeded, None);
-        }
-        if job.cancel_requested {
+        if job.cancel_requested || cancel.stopped() == Some(JobStop::Cancelled) {
             // Committed steps stay.
             return finish(JobState::Cancelled, None);
         }
+        if finished.is_some() {
+            return finish(JobState::Succeeded, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use ritornel_contract::{CONTRACT_VERSION, Frame, Id, Request, RequestId, SessionKind};
+    use ritornel_engine::{JobState, ScanSettings};
+    use serde_json::{Value, json};
+
+    use super::scan_with;
+    use crate::dispatch::Core;
+    use crate::session::Session;
+
+    fn call(core: &Core, session: &Session, method: &str, params: Value) -> Value {
+        let request = Frame::Request(Request {
+            id: RequestId::Number(1),
+            method: method.to_owned(),
+            params: Some(params),
+        });
+        let Some(Frame::Response(response)) = core.dispatch(session, request) else {
+            panic!("a request gets a response");
+        };
+        response.outcome.unwrap()
+    }
+
+    fn id(byte: u8) -> String {
+        Id::from_bytes([byte; 16]).to_string()
+    }
+
+    #[test]
+    fn a_scan_cancelled_before_commit_does_not_commit_the_prepared_step() {
+        let (core, scratch) = crate::testing::core();
+        let session = core.open_session(SessionKind::Full).unwrap();
+        call(
+            &core,
+            &session,
+            "server.hello",
+            json!({
+                "name": "test", "kind": "cli", "version": "1", "contractVersion": CONTRACT_VERSION
+            }),
+        );
+        call(
+            &core,
+            &session,
+            "library.create",
+            json!({ "idempotencyKey": id(1) }),
+        );
+        let root = scratch.path().join("music");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("track.flac"), b"not real audio").unwrap();
+        let added = call(
+            &core,
+            &session,
+            "sources.add",
+            json!({
+                "idempotencyKey": id(2),
+                "name": "main",
+                "path": root.to_str().unwrap(),
+            }),
+        );
+        let source_id = added["source"]["sourceId"].as_str().unwrap();
+        let started = call(
+            &core,
+            &session,
+            "scan.start",
+            json!({ "idempotencyKey": id(3), "sourceId": source_id }),
+        );
+        let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
+        let before_revision = core
+            .with_library(|_, library| library.meta().unwrap().revision)
+            .unwrap();
+        let claimed = core
+            .with_stores(|stores| stores.server().claim_job(Id::from_bytes([0xb0; 16])))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut cancelled_once = false;
+        scan_with(
+            &core,
+            claimed,
+            ScanSettings::default(),
+            &Arc::new(AtomicBool::new(false)),
+            |scan| {
+                // Cancel once the walk has sorted the files and `prepare` has
+                // read the first batch, right before the batch would commit.
+                if !cancelled_once && scan.progress().total.is_some() {
+                    cancelled_once = true;
+                    let cancelled = call(
+                        &core,
+                        &session,
+                        "jobs.cancel",
+                        json!({ "idempotencyKey": id(4), "jobId": job_id }),
+                    );
+                    assert_eq!(cancelled["job"]["state"], "cancelling");
+                }
+            },
+        );
+        assert!(cancelled_once);
+        let ended = call(&core, &session, "jobs.get", json!({ "jobId": job_id }));
+        assert_eq!(ended["job"]["state"], "cancelled");
+        // Neither the walk (read-only) nor the cancelled recording batch bumped the revision.
+        assert_eq!(
+            core.with_library(|_, library| library.meta().unwrap().revision)
+                .unwrap(),
+            before_revision
+        );
+        assert_eq!(
+            core.with_library(|_, library| library.stats().unwrap().files)
+                .unwrap(),
+            0
+        );
+        let stored = core
+            .with_stores(|stores| stores.server().job(job_id.parse().unwrap()))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, JobState::Cancelled);
     }
 }

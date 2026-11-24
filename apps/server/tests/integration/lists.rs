@@ -7,175 +7,64 @@
 //! docs/internals/contract.md).
 //! Covers are plain HTTP, so their tests run over the socket's listener.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
 use std::time::Duration;
 
 use ritornel_client::contract::{
     AlbumTile, CONTRACT_VERSION, ClientKind, ErrorCode, Event, FILTER_VERSION, Filter, HelloParams,
     ListKind, ListLocateParams, ListOpenParams, ListOpened, MEDIA_TOKEN_PARAM, Predicate, Query,
-    Replaces, Row, SessionKind, Sort, SortKey, Topic, Window, route,
+    Replaces, Row, Sort, SortKey, Topic, Window, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::invent::{ChurnKind, Churned};
-use ritornel_engine::{OsEntropy, SystemClock};
-use ritornel_server::{Bounds, HeldDir, Listen, Server};
+use ritornel_server::Bounds;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{
+    Running, Scratch, Via, bounded, invent as run_invent, on_both_transports, terminate,
+};
 
-async fn bounded(test: impl Future<Output = ()>) {
-    tokio::time::timeout(WAIT, test)
-        .await
-        .unwrap_or_else(|_| panic!("the test did not finish within {WAIT:?}"));
-}
-
-/// A directory that is removed when the test ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-server-lists-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-
-    fn root(&self) -> PathBuf {
-        self.0.join("root")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Via {
-    Memory,
-    Socket,
-}
-
-macro_rules! on_both_transports {
-    ($($test:ident)*) => {$(
-        mod $test {
-            use super::{Via, bounded};
-
-            #[tokio::test]
-            async fn in_memory() {
-                bounded(super::$test(Via::Memory)).await;
-            }
-
-            #[tokio::test]
-            async fn over_a_socket() {
-                bounded(super::$test(Via::Socket)).await;
-            }
-        }
-    )*};
+fn scratch() -> Scratch {
+    Scratch::new("ritornel-server-lists-")
 }
 
 /// Invents a library on a data directory with the server's own hidden
 /// command, as a developer would.
 fn invent(data_dir: &Path, root: &Path, albums: usize) {
-    let output = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
-        .arg("invent")
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--root")
-        .arg(root)
-        .args(["--albums", &albums.to_string(), "--seed", "3"])
-        .args(["--cover-min", "200", "--cover-max", "300"])
-        .env_remove("RITORNEL_DATA_DIR")
-        .output()
-        .unwrap();
-    // A process a signal ended has no code, and may have said nothing.
-    assert!(
-        output.status.success(),
-        "ritornel-server invent: {}\n--- stderr\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+    let albums = albums.to_string();
+    run_invent(
+        data_dir,
+        root,
+        &[
+            "--albums",
+            &albums,
+            "--seed",
+            "3",
+            "--cover-min",
+            "200",
+            "--cover-max",
+            "300",
+        ],
     );
 }
 
-/// A server inside the test, on an invented library of its own.
-struct Running {
-    server: Server,
-    scratch: Scratch,
+/// Starts a server inside the test, on an invented library of its own.
+async fn start(albums: usize) -> Running {
+    let scratch = scratch();
+    if albums > 0 {
+        invent(&scratch.data_dir(), &scratch.root(), albums);
+    }
+    Running::on_scratch(scratch, Bounds::default())
+        .await
+        .with_client_name("lists-test")
 }
 
-impl Running {
-    async fn start(albums: usize) -> Self {
-        let scratch = Scratch::new();
-        if albums > 0 {
-            invent(&scratch.data_dir(), &scratch.root(), albums);
-        }
-        let server = Server::start_with(
-            HeldDir::take(scratch.data_dir()).unwrap(),
-            Listen::on_port(0),
-            Arc::new(SystemClock),
-            Arc::new(OsEntropy),
-            Bounds::default(),
-        )
-        .await
-        .unwrap();
-        Self { server, scratch }
-    }
-
-    fn endpoint(&self) -> SocketAddr {
-        self.server.endpoint()
-    }
-
-    fn token(&self) -> String {
-        std::fs::read_to_string(self.scratch.data_dir().join("credential"))
-            .unwrap()
-            .trim()
-            .to_owned()
-    }
-
-    async fn greeted(&self, via: Via) -> Client {
-        let client = match via {
-            Via::Memory => {
-                let (outgoing, incoming) = self.server.connect_in_memory(SessionKind::Full);
-                Client::over_memory(outgoing, incoming)
-            }
-            Via::Socket => Client::connect(self.endpoint(), &Credential::new(self.token()))
-                .await
-                .unwrap(),
-        };
-        client
-            .hello(&HelloParams {
-                name: "lists-test".to_owned(),
-                kind: ClientKind::Cli,
-                version: "1".to_owned(),
-                contract_version: CONTRACT_VERSION,
-            })
-            .await
-            .unwrap();
-        client
-    }
-
-    fn step(&self, kind: ChurnKind) -> Churned {
-        self.server.invent_step(kind).unwrap()
-    }
+fn step(running: &Running, kind: ChurnKind) -> Churned {
+    running.server.invent_step(kind).unwrap()
 }
 
 fn open(kind: ListKind, sort: Option<SortKey>, window: Option<(u64, u64)>) -> ListOpenParams {
@@ -235,7 +124,7 @@ on_both_transports! {
 }
 
 async fn a_list_opens_with_an_exact_total_and_the_window_asked_for(via: Via) {
-    let running = Running::start(40).await;
+    let running = start(40).await;
     let client = running.greeted(via).await;
     for (kind, expected) in [
         (ListKind::Artists, "artist"),
@@ -298,7 +187,7 @@ async fn a_list_opens_with_an_exact_total_and_the_window_asked_for(via: Via) {
 }
 
 async fn sections_are_letters_years_or_stretches_of_time(via: Via) {
-    let running = Running::start(60).await;
+    let running = start(60).await;
     let client = running.greeted(via).await;
     for (kind, sort) in [
         (ListKind::Artists, SortKey::Name),
@@ -368,7 +257,7 @@ async fn sections_are_letters_years_or_stretches_of_time(via: Via) {
 }
 
 async fn a_row_is_found_by_its_id_and_by_the_start_of_its_name(via: Via) {
-    let running = Running::start(60).await;
+    let running = start(60).await;
     let client = running.greeted(via).await;
     let opened = client
         .list_open(&open(
@@ -455,7 +344,7 @@ fn folded(text: &str) -> String {
 }
 
 async fn text_matches_ignoring_case_and_accents_and_short_text_a_word_start(via: Via) {
-    let running = Running::start(150).await;
+    let running = start(150).await;
     let client = running.greeted(via).await;
     // An artist with an accent in their name.
     let artists = client
@@ -533,7 +422,7 @@ async fn text_matches_ignoring_case_and_accents_and_short_text_a_word_start(via:
 }
 
 async fn a_filter_by_artist_gives_their_records(via: Via) {
-    let running = Running::start(80).await;
+    let running = start(80).await;
     let client = running.greeted(via).await;
     let artists = client
         .list_open(&open(ListKind::Artists, None, Some((0, 500))))
@@ -591,7 +480,7 @@ async fn a_filter_by_artist_gives_their_records(via: Via) {
 }
 
 async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_read(via: Via) {
-    let running = Running::start(30).await;
+    let running = start(30).await;
     let mut client = running.greeted(via).await;
     client.subscribe(&[Topic::Library]).await.unwrap();
     let opened = client
@@ -601,10 +490,10 @@ async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_r
     // Two writes with nothing sent between them: the test's runtime has one
     // thread, and this does not let go of it.
     assert!(matches!(
-        running.step(ChurnKind::Change),
+        step(&running, ChurnKind::Change),
         Churned::Changed(_)
     ));
-    assert!(matches!(running.step(ChurnKind::Add), Churned::Added(_)));
+    assert!(matches!(step(&running, ChurnKind::Add), Churned::Added(_)));
 
     let mut library = Vec::new();
     let mut lists = Vec::new();
@@ -636,13 +525,13 @@ async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_r
 
     // A session that holds no view and is not subscribed is told nothing.
     let mut quiet = running.greeted(via).await;
-    running.step(ChurnKind::Change);
+    step(&running, ChurnKind::Change);
     quiet.servers().await.unwrap();
     assert!(quiet.try_next_event().is_none());
 }
 
 async fn a_view_replaced_with_an_anchor_says_where_the_anchor_is_now(via: Via) {
-    let running = Running::start(40).await;
+    let running = start(40).await;
     let client = running.greeted(via).await;
     let opened = client
         .list_open(&open(
@@ -655,7 +544,7 @@ async fn a_view_replaced_with_an_anchor_says_where_the_anchor_is_now(via: Via) {
     let anchor = album(&opened.rows[20]).album.id().to_string();
     // Records come in, some of them before the anchor.
     for _ in 0..4 {
-        running.step(ChurnKind::Add);
+        step(&running, ChurnKind::Add);
     }
     let mut replaced = open(ListKind::Albums, Some(SortKey::Title), Some((0, 200)));
     replaced.replaces = Some(Replaces {
@@ -682,13 +571,13 @@ async fn a_view_replaced_with_an_anchor_says_where_the_anchor_is_now(via: Via) {
 }
 
 async fn a_row_gone_since_the_view_opened_is_gone_at_its_index(via: Via) {
-    let running = Running::start(40).await;
+    let running = start(40).await;
     let client = running.greeted(via).await;
     let opened = client
         .list_open(&open(ListKind::Songs, None, None))
         .await
         .unwrap();
-    assert_eq!(running.step(ChurnKind::Merge), Churned::Merged);
+    assert_eq!(step(&running, ChurnKind::Merge), Churned::Merged);
     let rows = all_rows(&client, &opened).await;
     // The view still has every index it had, and the merged tracks are
     // gone at theirs.
@@ -715,7 +604,7 @@ async fn a_row_gone_since_the_view_opened_is_gone_at_its_index(via: Via) {
 }
 
 async fn a_session_holds_at_most_its_limit_of_views(via: Via) {
-    let running = Running::start(10).await;
+    let running = start(10).await;
     let client = running.greeted(via).await;
     let descriptor = client
         .hello(&HelloParams {
@@ -771,7 +660,7 @@ async fn a_session_holds_at_most_its_limit_of_views(via: Via) {
 }
 
 async fn a_view_that_was_closed_or_never_opened_has_expired(via: Via) {
-    let running = Running::start(10).await;
+    let running = start(10).await;
     let client = running.greeted(via).await;
     let opened = client
         .list_open(&open(ListKind::Artists, None, None))
@@ -801,7 +690,7 @@ async fn a_view_that_was_closed_or_never_opened_has_expired(via: Via) {
 }
 
 async fn a_server_with_no_library_has_no_lists(via: Via) {
-    let running = Running::start(0).await;
+    let running = start(0).await;
     let client = running.greeted(via).await;
     match client.list_open(&open(ListKind::Artists, None, None)).await {
         Err(ritornel_client::Error::Call(error)) => {
@@ -813,7 +702,7 @@ async fn a_server_with_no_library_has_no_lists(via: Via) {
 }
 
 async fn the_media_token_is_the_same_for_the_session(via: Via) {
-    let running = Running::start(5).await;
+    let running = start(5).await;
     let client = running.greeted(via).await;
     let token = client.media_token().await.unwrap().token;
     assert_eq!(token.len(), 64);
@@ -878,7 +767,7 @@ fn art(art: &str, size: u32, token: Option<&str>) -> String {
 #[tokio::test]
 async fn a_cover_is_served_at_a_size_with_immutable_headers_and_kept_for_next_time() {
     bounded(async {
-        let running = Running::start(10).await;
+        let running = start(10).await;
         let client = running.greeted(Via::Socket).await;
         let token = client.media_token().await.unwrap().token;
         let arts = arts(&client).await;
@@ -952,7 +841,7 @@ fn image_size(jpeg: &[u8]) -> (u32, u32) {
 #[tokio::test]
 async fn a_cover_needs_the_media_token_and_the_token_opens_nothing_else() {
     bounded(async {
-        let running = Running::start(5).await;
+        let running = start(5).await;
         let client = running.greeted(Via::Socket).await;
         let token = client.media_token().await.unwrap().token;
         let first = arts(&client).await.remove(0);
@@ -1006,7 +895,7 @@ async fn a_cover_needs_the_media_token_and_the_token_opens_nothing_else() {
 #[tokio::test]
 async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbose() {
     bounded(async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         invent(&scratch.data_dir(), &scratch.root(), 8);
         let mut child = Command::new(env!("CARGO_BIN_EXE_ritornel-server"))
             .arg("serve")
@@ -1077,21 +966,7 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
             401
         );
         drop(client);
-        // SIGTERM, or on Windows `taskkill /PID` without `/F`, which asks
-        // the server's hidden window to close.
-        let killed = if cfg!(windows) {
-            Command::new("taskkill")
-                .args(["/PID", &child.id().to_string()])
-                .output()
-                .unwrap()
-                .status
-        } else {
-            Command::new("kill")
-                .args(["-TERM", &child.id().to_string()])
-                .status()
-                .unwrap()
-        };
-        assert!(killed.success(), "asking it to stop: {killed}");
+        terminate(child.id());
         let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),

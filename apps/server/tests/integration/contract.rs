@@ -11,13 +11,6 @@
 //! every test is cut off, with a message, if it has not finished in
 //! [`WAIT`].
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,66 +38,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-/// How long a test may take before it is failed. It is a bound, not a
-/// wait: a test that passes never comes near it.
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{Running, Scratch, Via, WAIT, bounded, on_both_transports};
 
-/// Runs a test, and fails it if it has not finished in [`WAIT`].
-async fn bounded(test: impl Future<Output = ()>) {
-    tokio::time::timeout(WAIT, test)
-        .await
-        .unwrap_or_else(|_| panic!("the test did not finish within {WAIT:?}"));
-}
-
-/// A directory that is removed when the test ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornel-server-contract-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-
-    /// The data directory. The server creates it.
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// What a test joins the client to the server with.
-#[derive(Clone, Copy)]
-enum Via {
-    Memory,
-    Socket,
-}
-
-/// Defines, for each test named, a module with the test run both ways.
-macro_rules! on_both_transports {
-    ($($test:ident)*) => {$(
-        mod $test {
-            use super::{Via, bounded};
-
-            #[tokio::test]
-            async fn in_memory() {
-                bounded(super::$test(Via::Memory)).await;
-            }
-
-            #[tokio::test]
-            async fn over_a_socket() {
-                bounded(super::$test(Via::Socket)).await;
-            }
-        }
-    )*};
+fn scratch() -> Scratch {
+    Scratch::new("ritornel-server-contract-")
 }
 
 async fn start_on(data_dir: &Path, listen: Listen) -> Result<Server, Error> {
@@ -117,115 +54,61 @@ async fn start_on(data_dir: &Path, listen: Listen) -> Result<Server, Error> {
     .await
 }
 
-/// A server running inside the test, on a directory of its own.
-struct Running {
-    server: Server,
-    scratch: Scratch,
+/// Starts a server on a port the system picks.
+async fn start() -> Running {
+    Running::start("ritornel-server-contract-")
+        .await
+        .with_hello(hello())
 }
 
-impl Running {
-    /// Starts a server on a port the system picks.
-    async fn start() -> Self {
-        Self::start_with(Bounds::default()).await
-    }
-
-    /// Starts a server with bounds small enough for a test to reach.
-    async fn start_with(bounds: Bounds) -> Self {
-        let scratch = Scratch::new();
-        let server = Server::start_with(
-            HeldDir::take(scratch.data_dir()).unwrap(),
-            Listen::on_port(0),
-            Arc::new(SystemClock),
-            Arc::new(OsEntropy),
-            bounds,
-        )
+/// Starts a server with bounds small enough for a test to reach.
+async fn start_with(bounds: Bounds) -> Running {
+    Running::start_with("ritornel-server-contract-", bounds)
         .await
-        .unwrap();
-        Self { server, scratch }
-    }
+        .with_hello(hello())
+}
 
-    fn data_dir(&self) -> PathBuf {
-        self.scratch.data_dir()
+/// What the server should say about itself to anyone.
+fn public_descriptor(running: &Running) -> PublicDescriptor {
+    PublicDescriptor {
+        server_id: running.server.server_id(),
+        name: "Ritornel server".to_owned(),
+        role: ServerRole::Unassigned,
+        contract_version: CONTRACT_VERSION,
+        capabilities: [
+            capability::EVENTS_SERVERS,
+            capability::EVENTS_LIBRARY,
+            capability::LISTS,
+            capability::MEDIA_ART,
+            capability::LINK,
+        ]
+        .into_iter()
+        // A server built with MusicBrainz can ask it.
+        .chain(cfg!(feature = "musicbrainz").then_some(capability::CORRECTIONS_LOOKUP))
+        .map(str::to_owned)
+        .collect(),
+        limits: Limits {
+            max_message_bytes: 1 << 20,
+            max_views: 16,
+            max_window_rows: 500,
+            view_idle_ms: 600_000,
+        },
+        lists: ListSupport::all(),
+        art_sizes: ART_SIZES.to_vec(),
+        public_key: Some(running.server.public_key()),
+        proof: None,
     }
+}
 
-    fn endpoint(&self) -> SocketAddr {
-        self.server.endpoint()
-    }
-
-    /// The local credential, as a client on this machine reads it.
-    fn credential(&self) -> Credential {
-        Credential::new(self.token())
-    }
-
-    fn token(&self) -> String {
-        std::fs::read_to_string(self.data_dir().join("credential"))
-            .unwrap()
-            .trim()
-            .to_owned()
-    }
-
-    /// A client that has not said hello yet.
-    async fn connect(&self, via: Via) -> Client {
-        match via {
-            Via::Memory => {
-                let (outgoing, incoming) = self.server.connect_in_memory(SessionKind::Full);
-                Client::over_memory(outgoing, incoming)
-            }
-            Via::Socket => Client::connect(self.endpoint(), &self.credential())
-                .await
-                .unwrap(),
-        }
-    }
-
-    /// A client that has said hello.
-    async fn greeted(&self, via: Via) -> Client {
-        let client = self.connect(via).await;
-        client.hello(&hello()).await.unwrap();
-        client
-    }
-
-    /// What the server should say about itself to anyone.
-    fn public_descriptor(&self) -> PublicDescriptor {
-        PublicDescriptor {
-            server_id: self.server.server_id(),
-            name: "Ritornel server".to_owned(),
-            role: ServerRole::Unassigned,
-            contract_version: CONTRACT_VERSION,
-            capabilities: [
-                capability::EVENTS_SERVERS,
-                capability::EVENTS_LIBRARY,
-                capability::LISTS,
-                capability::MEDIA_ART,
-                capability::LINK,
-            ]
-            .into_iter()
-            // A server built with MusicBrainz can ask it.
-            .chain(cfg!(feature = "musicbrainz").then_some(capability::CORRECTIONS_LOOKUP))
-            .map(str::to_owned)
-            .collect(),
-            limits: Limits {
-                max_message_bytes: 1 << 20,
-                max_views: 16,
-                max_window_rows: 500,
-                view_idle_ms: 600_000,
-            },
-            lists: ListSupport::all(),
-            art_sizes: ART_SIZES.to_vec(),
-            public_key: Some(self.server.public_key()),
-            proof: None,
-        }
-    }
-
-    /// This server's row of `servers.list`, with this name and revision.
-    fn info(&self, name: &str, revision: u64) -> ServerInfo {
-        ServerInfo {
-            server_id: self.server.server_id(),
-            name: name.to_owned(),
-            role: ServerRole::Unassigned,
-            is_this_server: true,
-            reachable: true,
-            revision,
-        }
+/// This server's row of `servers.list`, with this name and revision.
+fn info(running: &Running, name: &str, revision: u64) -> ServerInfo {
+    ServerInfo {
+        server_id: running.server.server_id(),
+        name: name.to_owned(),
+        role: ServerRole::Unassigned,
+        is_this_server: true,
+        reachable: true,
+        revision,
     }
 }
 
@@ -275,7 +158,7 @@ on_both_transports! {
 }
 
 async fn watching_is_turned_off_and_on_and_the_status_says_so(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     client
         .create_library(Id::from_bytes([1; 16]))
@@ -322,12 +205,12 @@ async fn watching_is_turned_off_and_on_and_the_status_says_so(via: Via) {
 }
 
 async fn hello_answers_with_the_descriptor(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.connect(via).await;
     assert_eq!(
         client.hello(&hello()).await.unwrap(),
         Descriptor {
-            server: running.public_descriptor(),
+            server: public_descriptor(&running),
             session_kind: SessionKind::Full,
         }
     );
@@ -336,7 +219,7 @@ async fn hello_answers_with_the_descriptor(via: Via) {
         ritornel_client::descriptor(running.endpoint())
             .await
             .unwrap(),
-        running.public_descriptor()
+        public_descriptor(&running)
     );
     // Nothing that does not exist yet is in it.
     let raw = client
@@ -368,7 +251,7 @@ async fn hello_answers_with_the_descriptor(via: Via) {
 }
 
 async fn the_status_reports_versions_role_and_server_id(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let status = client.status().await.unwrap();
     assert_eq!(status.server_id, running.server.server_id());
@@ -389,7 +272,7 @@ async fn the_status_reports_versions_role_and_server_id(via: Via) {
 }
 
 async fn creating_a_library_makes_the_server_its_hub(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let mut client = running.greeted(via).await;
     client.subscribe(&[Topic::Servers]).await.unwrap();
 
@@ -422,7 +305,7 @@ async fn creating_a_library_makes_the_server_its_hub(via: Via) {
     );
     let hub = ServerInfo {
         role: ServerRole::Hub,
-        ..running.info("Ritornel server", 2)
+        ..info(&running, "Ritornel server", 2)
     };
     let Some(Event::Servers(event)) = client.next_event().await else {
         panic!("the server's new status was not sent");
@@ -476,7 +359,7 @@ fn key() -> Id {
 }
 
 async fn a_folder_is_added_as_a_source_once_and_only_where_there_is_one(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     let folder = music(&running);
     let path = folder.to_str().unwrap();
@@ -576,7 +459,7 @@ async fn said(client: &mut Client, mut revisions: Vec<u64>, revision: u64) -> Ve
 }
 
 async fn a_scan_runs_as_a_job_and_the_stats_say_what_came_out(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let mut client = running.greeted(via).await;
     let folder = music(&running);
     client.create_library(key()).await.unwrap();
@@ -691,7 +574,7 @@ async fn a_scan_runs_as_a_job_and_the_stats_say_what_came_out(via: Via) {
 }
 
 async fn a_job_can_be_asked_to_stop_and_one_there_is_not_is_not_found(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let mut client = running.greeted(via).await;
     let folder = music(&running);
     client.create_library(key()).await.unwrap();
@@ -734,7 +617,7 @@ async fn a_job_can_be_asked_to_stop_and_one_there_is_not_is_not_found(via: Via) 
 }
 
 async fn the_dry_run_and_the_review_read_the_library_and_check_what_they_are_asked(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let mut client = running.greeted(via).await;
     let (code, ..) = refused(client.call_raw(IdentityDryRun::NAME, json!({})).await);
     assert_eq!(code, ErrorCode::Unavailable);
@@ -786,16 +669,16 @@ async fn the_dry_run_and_the_review_read_the_library_and_check_what_they_are_ask
 }
 
 async fn the_list_of_servers_is_this_server(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     assert_eq!(
         client.servers().await.unwrap().servers,
-        [running.info("Ritornel server", 1)]
+        [info(&running, "Ritornel server", 1)]
     );
 }
 
 async fn a_subscriber_is_sent_a_servers_event_and_after_unsubscribing_none(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let mut subscriber = running.greeted(via).await;
     let mut other = running.greeted(via).await;
     assert_eq!(
@@ -813,7 +696,7 @@ async fn a_subscriber_is_sent_a_servers_event_and_after_unsubscribing_none(via: 
         panic!("the connection closed");
     };
     // The event is the server's full status, not what changed in it.
-    assert_eq!(event.server, running.info("attic", 2));
+    assert_eq!(event.server, info(&running, "attic", 2));
     // What a call reads afterwards agrees with it.
     assert_eq!(
         subscriber.servers().await.unwrap().servers,
@@ -837,13 +720,13 @@ async fn a_subscriber_is_sent_a_servers_event_and_after_unsubscribing_none(via: 
     running.server.rename("cellar").unwrap();
     assert_eq!(
         subscriber.servers().await.unwrap().servers,
-        [running.info("cellar", 3)]
+        [info(&running, "cellar", 3)]
     );
     assert_eq!(subscriber.try_next_event(), None);
 }
 
 async fn changes_a_client_has_not_read_yet_reach_it_as_one_event(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let mut subscriber = running.greeted(via).await;
     subscriber.subscribe(&[Topic::Servers]).await.unwrap();
 
@@ -855,13 +738,13 @@ async fn changes_a_client_has_not_read_yet_reach_it_as_one_event(via: Via) {
     let Some(Event::Servers(event)) = subscriber.next_event().await else {
         panic!("the connection closed");
     };
-    assert_eq!(event.server, running.info("cellar", 3));
+    assert_eq!(event.server, info(&running, "cellar", 3));
     subscriber.servers().await.unwrap();
     assert_eq!(subscriber.try_next_event(), None);
 }
 
 async fn a_method_the_server_does_not_have_is_unsupported(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     assert_eq!(
         refused(client.call_raw("weather.get", json!({})).await),
@@ -872,7 +755,7 @@ async fn a_method_the_server_does_not_have_is_unsupported(via: Via) {
 }
 
 async fn params_of_the_wrong_shape_are_invalid(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.greeted(via).await;
     for (method, params) in [
         (ServerHello::NAME, json!({ "name": "contract-test" })),
@@ -892,7 +775,7 @@ async fn params_of_the_wrong_shape_are_invalid(via: Via) {
 }
 
 async fn a_call_before_hello_is_refused(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.connect(via).await;
     assert_eq!(
         refused(client.servers().await),
@@ -912,7 +795,7 @@ async fn a_call_before_hello_is_refused(via: Via) {
 }
 
 async fn a_client_built_for_another_contract_version_is_refused(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let client = running.connect(via).await;
     let other = HelloParams {
         contract_version: CONTRACT_VERSION + 1,
@@ -987,7 +870,7 @@ impl Raw {
 }
 
 async fn a_batch_is_refused_and_a_notification_gets_no_answer(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let mut raw = Raw::open(&running, via).await;
 
     raw.send(r#"[{"jsonrpc":"2.0","id":1,"method":"servers.list"}]"#)
@@ -1026,12 +909,14 @@ async fn a_batch_is_refused_and_a_notification_gets_no_answer(via: Via) {
 }
 
 async fn stopping_the_server_closes_its_connections_and_then_its_database(via: Via) {
-    let running = Running::start().await;
+    let running = start().await;
     let mut client = running.greeted(via).await;
     let data_dir = running.data_dir();
     assert!(data_dir.join("server.json").exists());
 
-    let Running { server, scratch } = running;
+    let Running {
+        server, scratch, ..
+    } = running;
     server.stop().await.unwrap();
 
     // The connection was closed from the server's side.
@@ -1054,8 +939,8 @@ async fn stopping_the_server_closes_its_connections_and_then_its_database(via: V
 /// frame of exactly the limit is read, and one byte more closes the
 /// connection with no answer.
 async fn a_message_over_the_limit_closes_the_connection_and_no_other(via: Via) {
-    let running = Running::start().await;
-    let limit = usize::try_from(running.public_descriptor().limits.max_message_bytes).unwrap();
+    let running = start().await;
+    let limit = usize::try_from(public_descriptor(&running).limits.max_message_bytes).unwrap();
     let bystander = running.greeted(via).await;
     // Valid JSON, so only its length can be what refuses it.
     let frame = |bytes: usize| {
@@ -1109,7 +994,7 @@ async fn status_of(endpoint: SocketAddr, path: &str, credential: Option<&Credent
 #[tokio::test]
 async fn a_limited_session_may_not_ask_for_the_status_or_change_anything() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let (outgoing, incoming) = running.server.connect_in_memory(SessionKind::Limited);
         let client = Client::over_memory(outgoing, incoming);
         assert_eq!(
@@ -1150,7 +1035,7 @@ async fn a_limited_session_may_not_ask_for_the_status_or_change_anything() {
 #[tokio::test]
 async fn a_socket_upgrade_needs_the_local_credential() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
         let token = running.token();
 
@@ -1197,12 +1082,12 @@ async fn a_socket_upgrade_needs_the_local_credential() {
 #[tokio::test]
 async fn a_socket_upgrade_with_an_origin_is_refused() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let authorization = format!("Bearer {}", running.token());
         // A page cannot send the header, so with the header every origin
         // is a stranger: one on the web, one on this machine, and the
         // desktop's own, which is let in only with a ticket
-        // (`tests/ticket.rs`).
+        // (`ticket.rs`).
         for origin in [
             "https://example.com",
             "http://127.0.0.1:4747",
@@ -1235,7 +1120,7 @@ async fn a_socket_upgrade_with_an_origin_is_refused() {
 #[tokio::test]
 async fn the_descriptor_is_the_only_route_that_needs_no_credential() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
         let credential = running.credential();
         let wrong = Credential::new("0".repeat(64));
@@ -1246,7 +1131,7 @@ async fn the_descriptor_is_the_only_route_that_needs_no_credential() {
         assert_eq!(open.status, 200);
         assert_eq!(
             serde_json::from_slice::<PublicDescriptor>(&open.body).unwrap(),
-            running.public_descriptor()
+            public_descriptor(&running)
         );
         // Nothing in it is a secret.
         assert!(
@@ -1294,7 +1179,7 @@ async fn the_descriptor_is_the_only_route_that_needs_no_credential() {
 #[tokio::test]
 async fn the_descriptor_signs_a_nonce_with_the_key_it_gives() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let endpoint = running.endpoint();
         let nonce = [0x5a_u8; 16];
         let path = format!("{}?nonce={}", route::DESCRIPTOR, hex::encode(&nonce));
@@ -1326,7 +1211,7 @@ async fn the_descriptor_signs_a_nonce_with_the_key_it_gives() {
 #[tokio::test]
 async fn a_server_on_the_private_network_is_found_on_loopback() {
     bounded(async {
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let server = start_on(&scratch.data_dir(), Listen::private_on_port(0))
             .await
             .unwrap();
@@ -1358,7 +1243,7 @@ async fn read_until_closed(connection: &mut TcpStream) -> String {
 async fn a_connection_that_sends_no_whole_request_is_closed_when_its_time_is_up() {
     bounded(async {
         let header_wait = Duration::from_millis(250);
-        let running = Running::start_with(Bounds {
+        let running = start_with(Bounds {
             header_wait,
             ..Bounds::default()
         })
@@ -1401,7 +1286,7 @@ async fn a_connection_that_sends_no_whole_request_is_closed_when_its_time_is_up(
 async fn with_every_place_taken_a_connection_waits_for_one_and_is_then_served() {
     bounded(async {
         let header_wait = Duration::from_millis(300);
-        let running = Running::start_with(Bounds {
+        let running = start_with(Bounds {
             max_connections: 2,
             header_wait,
             ..Bounds::default()
@@ -1421,7 +1306,7 @@ async fn with_every_place_taken_a_connection_waits_for_one_and_is_then_served() 
         let descriptor = ritornel_client::descriptor(running.endpoint())
             .await
             .unwrap();
-        assert_eq!(descriptor, running.public_descriptor());
+        assert_eq!(descriptor, public_descriptor(&running));
         assert!(
             taken.elapsed() >= header_wait / 2,
             "it was served after {:?}, while both places were taken",
@@ -1441,7 +1326,7 @@ async fn with_every_place_taken_a_connection_waits_for_one_and_is_then_served() 
 #[tokio::test]
 async fn no_more_sessions_open_than_the_server_takes() {
     bounded(async {
-        let running = Running::start_with(Bounds {
+        let running = start_with(Bounds {
             max_sessions: 2,
             ..Bounds::default()
         })
@@ -1504,7 +1389,7 @@ async fn a_taken_default_port_falls_back_to_one_the_system_picks() {
             );
         }
 
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let server = start_on(&scratch.data_dir(), Listen::DEFAULT)
             .await
             .unwrap();
@@ -1545,7 +1430,7 @@ async fn a_chosen_port_that_is_taken_stops_the_start() {
     bounded(async {
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = taken.local_addr().unwrap().port();
-        let scratch = Scratch::new();
+        let scratch = scratch();
         let refused = start_on(&scratch.data_dir(), Listen::on_port(port)).await;
         let Err(error @ Error::Listen { .. }) = &refused else {
             panic!("{refused:?}");
@@ -1571,12 +1456,12 @@ async fn a_chosen_port_that_is_taken_stops_the_start() {
 #[tokio::test]
 async fn a_local_client_finds_the_server_through_its_data_directory() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let data_dir = running.data_dir();
 
         let found = local::find(&data_dir).await.unwrap();
         assert_eq!(found.endpoint, running.endpoint());
-        assert_eq!(found.descriptor, running.public_descriptor());
+        assert_eq!(found.descriptor, public_descriptor(&running));
         let client = found.connect().await.unwrap();
         assert_eq!(
             client.hello(&hello()).await.unwrap().session_kind,
@@ -1656,15 +1541,17 @@ fn not_running(found: Result<local::LocalServer, ritornel_client::Error>) -> Not
 #[tokio::test]
 async fn an_impersonator_on_a_killed_servers_port_is_sent_no_credential() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let (data_dir, endpoint, token) = (running.data_dir(), running.endpoint(), running.token());
-        let descriptor = serde_json::to_string(&running.public_descriptor()).unwrap();
+        let descriptor = serde_json::to_string(&public_descriptor(&running)).unwrap();
         let left = std::fs::read_to_string(data_dir.join("server.json")).unwrap();
 
         // What a kill leaves: the lock file with the pid in it and nobody
         // holding it, the credential, and `server.json`. A stop removes
         // that last one, so it is put back.
-        let Running { server, scratch } = running;
+        let Running {
+            server, scratch, ..
+        } = running;
         server.stop().await.unwrap();
         std::fs::write(data_dir.join("server.json"), &left).unwrap();
 
@@ -1701,13 +1588,15 @@ async fn an_impersonator_on_a_killed_servers_port_is_sent_no_credential() {
 #[tokio::test]
 async fn a_server_that_goes_between_being_found_and_connected_to_is_sent_no_credential() {
     bounded(async {
-        let running = Running::start().await;
+        let running = start().await;
         let (data_dir, endpoint, token) = (running.data_dir(), running.endpoint(), running.token());
-        let descriptor = serde_json::to_string(&running.public_descriptor()).unwrap();
+        let descriptor = serde_json::to_string(&public_descriptor(&running)).unwrap();
         let found = local::find(&data_dir).await.unwrap();
 
         let left = std::fs::read_to_string(data_dir.join("server.json")).unwrap();
-        let Running { server, scratch } = running;
+        let Running {
+            server, scratch, ..
+        } = running;
         server.stop().await.unwrap();
         std::fs::write(data_dir.join("server.json"), &left).unwrap();
         let listener = tokio::net::TcpListener::bind(endpoint).await.unwrap();
@@ -1740,8 +1629,8 @@ async fn a_server_that_goes_between_being_found_and_connected_to_is_sent_no_cred
 #[tokio::test]
 async fn what_answers_for_a_live_server_and_is_not_it_is_sent_no_credential() {
     bounded(async {
-        let running = Running::start().await;
-        let dir = Scratch::new();
+        let running = start().await;
+        let dir = scratch();
         std::fs::create_dir_all(dir.data_dir()).unwrap();
         let token = "0".repeat(64);
         std::fs::write(dir.data_dir().join("credential"), &token).unwrap();
@@ -1791,7 +1680,7 @@ async fn what_answers_for_a_live_server_and_is_not_it_is_sent_no_credential() {
 /// server must not take the look for another server.
 #[test]
 fn clients_looking_for_a_server_do_not_keep_one_from_starting() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let looking = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let looks = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1849,7 +1738,7 @@ async fn a_server_that_speaks_another_contract_version_is_not_connected_to() {
             "limits": { "maxMessageBytes": 1024 },
         });
         let stranger = Stranger::start(&newer.to_string()).await;
-        let scratch = Scratch::new();
+        let scratch = scratch();
         std::fs::create_dir_all(scratch.data_dir()).unwrap();
         let _held = hold(&scratch.data_dir());
         let named = json!({

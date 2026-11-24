@@ -8,190 +8,32 @@
 //! As in `status.rs`, `ritornel-server` is taken from beside `ritornelctl`,
 //! and each wait is bounded.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
-mod support;
-
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
 
 use serde_json::{Value, json};
 
-/// How long a test waits for a process before it kills it and fails.
-const WAIT: Duration = Duration::from_secs(60);
+use super::support::{self, Scratch, Server, ok, server_command};
 
-/// A directory that is removed when the test ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        let path = tempfile::Builder::new()
-            .prefix("ritornelctl-spotify-")
-            .tempdir()
-            .unwrap()
-            .keep();
-        Self(path)
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.0.join("data")
-    }
+fn scratch() -> Scratch {
+    Scratch::new("ritornelctl-spotify-")
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// Starts a server on `data_dir`, taking its backups into `backups`.
+fn start(data_dir: &Path, backups: &Path) -> Server {
+    std::fs::create_dir_all(backups).unwrap();
+    let mut command = server_command(data_dir);
+    command
+        .args(["--output", "none"])
+        .arg("--backup-dir")
+        .arg(backups)
+        .env("RITORNEL_TEST_COMPUTER_NAME", "Invented Desk");
+    Server::start_command(command, false)
 }
 
-fn lines(pipe: impl Read + Send + 'static) -> Receiver<String> {
-    let (send, lines) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(pipe).lines() {
-            if send.send(line.unwrap()).is_err() {
-                break;
-            }
-        }
-    });
-    lines
-}
-
-fn rest(lines: &Receiver<String>) -> Option<String> {
-    let mut text = String::new();
-    loop {
-        match lines.recv_timeout(WAIT) {
-            Ok(line) => {
-                text.push_str(&line);
-                text.push('\n');
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Some(text),
-            Err(mpsc::RecvTimeoutError::Timeout) => return None,
-        }
-    }
-}
-
-/// Runs `ritornelctl` on a data directory, and returns its exit code, its
-/// output and its errors. It is killed if it has not ended within [`WAIT`].
-fn ritornelctl(data_dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ritornelctl"))
-        .args(args)
-        .arg("--data-dir")
-        .arg(data_dir)
-        .env_remove("RITORNEL_DATA_DIR")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = lines(child.stdout.take().unwrap());
-    let stderr = lines(child.stderr.take().unwrap());
-    let (Some(stdout), Some(stderr)) = (rest(&stdout), rest(&stderr)) else {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("ritornelctl {args:?} did not end within {WAIT:?}");
-    };
-    let ended = child.wait().unwrap();
-    // No test has ritornelctl ended by a signal: one that was, was ended from
-    // outside the test, and the failure says so rather than as a code.
-    assert!(
-        ended.code().is_some(),
-        "ritornelctl {args:?} was ended from outside: {ended}\n--- stdout\n{stdout}--- stderr\n{stderr}"
-    );
-    (ended.code(), stdout, stderr)
-}
-
-/// Runs `ritornelctl` and returns what it printed. Unless it succeeded,
-/// the test fails with its exit code and everything it printed.
-fn ok(data_dir: &Path, args: &[&str]) -> String {
-    let (code, stdout, stderr) = ritornelctl(data_dir, args);
-    assert_eq!(
-        code,
-        Some(0),
-        "ritornelctl {args:?}\n--- stdout\n{stdout}--- stderr\n{stderr}"
-    );
-    stdout
-}
-
-/// `ritornelctl` with `--json`, which must succeed, as the JSON it printed.
-fn json(data_dir: &Path, args: &[&str]) -> Value {
-    let mut args = args.to_vec();
-    args.push("--json");
-    serde_json::from_str(&ok(data_dir, &args)).unwrap()
-}
-
-fn server_binary() -> PathBuf {
-    let binary = Path::new(env!("CARGO_BIN_EXE_ritornelctl"))
-        .with_file_name(format!("ritornel-server{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        binary.exists(),
-        "there is no ritornel-server beside ritornelctl at {}. Build the workspace: `mise run \
-         test` does, and `cargo test --package ritornelctl` alone does not",
-        binary.display()
-    );
-    binary
-}
-
-/// A running `ritornel-server` with no player, killed if the test ends
-/// without stopping it.
-struct Server {
-    child: Child,
-}
-
-impl Server {
-    /// Starts a server on `data_dir`, taking its backups into `backups`.
-    fn start(data_dir: &Path, backups: &Path) -> Self {
-        std::fs::create_dir_all(backups).unwrap();
-        let mut child = Command::new(server_binary())
-            .arg("serve")
-            .arg("--data-dir")
-            .arg(data_dir)
-            .args(["--listen", "127.0.0.1:0", "--output", "none"])
-            .arg("--backup-dir")
-            .arg(backups)
-            .env_remove("RITORNEL_DATA_DIR")
-            .env_remove("RITORNEL_LISTEN")
-            .env_remove("RITORNEL_BACKUP_DIR")
-            .env_remove("SCROBL_API_KEY")
-            .env_remove("SCROBL_API_SECRET")
-            .env("RITORNEL_TEST_COMPUTER_NAME", "Invented Desk")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let stdout = lines(child.stdout.take().unwrap());
-        let ready = stdout.recv_timeout(WAIT);
-        if !ready
-            .as_deref()
-            .is_ok_and(|line| line.starts_with("ready "))
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("no ready line within {WAIT:?}: {ready:?}");
-        }
-        Self { child }
-    }
-
-    fn stop(mut self, data_dir: &Path) {
-        ok(data_dir, &["server", "stop"]);
-        let _ = self.child.wait();
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        support::say_if_gone(&mut self.child, None);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+fn stop(server: Server, data_dir: &Path) {
+    ok(data_dir, &["server", "stop"]);
+    let _ = server.ended();
 }
 
 /// An invented row, every field Spotify gives filled in, each that is
@@ -269,12 +111,13 @@ fn holds(folder: &Path, mark: &[u8]) -> Vec<PathBuf> {
 
 #[test]
 fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere() {
-    let scratch = Scratch::new();
+    let scratch = scratch();
     let data_dir = scratch.data_dir();
     let backups = scratch.0.join("backups");
-    let server = Server::start(&data_dir, &backups);
+    let server = start(&data_dir, &backups);
     ok(&data_dir, &["library", "create"]);
-    let revision = |data_dir: &Path| json(data_dir, &["status"])["library"]["revision"].clone();
+    let revision =
+        |data_dir: &Path| support::json(data_dir, &["status"])["library"]["revision"].clone();
     let before = revision(&data_dir);
     let archive_path = scratch.0.join("my_spotify_data.zip");
     archive(&archive_path);
@@ -293,7 +136,7 @@ fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere
     }
     assert!(!out.replace("MARKED_FIELD", "").contains("MARKED"), "{out}");
 
-    let answer = json(
+    let answer = support::json(
         &data_dir,
         &["spotify", "import", archive_path.to_str().unwrap()],
     );
@@ -337,7 +180,7 @@ fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere
     assert_eq!(revision(&data_dir).as_u64().unwrap(), before + 1);
     // The artist and the album heard, with no files: two of the three
     // listens count, and the skip does not.
-    let artists = json(&data_dir, &["history", "artists"]);
+    let artists = support::json(&data_dir, &["history", "artists"]);
     assert_eq!(artists["total"], 1, "{artists}");
     assert_eq!(artists["artists"][0]["name"], "Calla Brandt");
     assert_eq!(artists["artists"][0]["key"], "calla brandt");
@@ -345,13 +188,13 @@ fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere
     let out = ok(&data_dir, &["history", "albums"]);
     assert_eq!(out, "Glasshouse \u{2014} Calla Brandt  2\n", "{out}");
     // The same archive again stores nothing new.
-    let again = json(
+    let again = support::json(
         &data_dir,
         &["spotify", "import", archive_path.to_str().unwrap()],
     );
     assert_eq!(again["run"]["report"]["years"][0]["alreadyStored"], 3);
     let second = again["run"]["runId"].as_str().unwrap().to_owned();
-    let applied = json(&data_dir, &["spotify", "apply", &second]);
+    let applied = support::json(&data_dir, &["spotify", "apply", &second]);
     assert_eq!(applied["run"]["applied"]["newStreams"], 0);
     let out = ok(&data_dir, &["spotify", "runs"]);
     assert_eq!(out.lines().count(), 2, "{out}");
@@ -359,7 +202,7 @@ fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere
     // Undone, the first is out of force and the second holds its streams.
     let out = ok(&data_dir, &["spotify", "undo", &run]);
     assert!(out.contains("is out of force"), "{out}");
-    let runs = json(&data_dir, &["spotify", "runs"]);
+    let runs = support::json(&data_dir, &["spotify", "runs"]);
     assert_eq!(runs["runs"][0]["inForce"], true);
     assert_eq!(runs["runs"][1]["inForce"], false);
 
@@ -376,8 +219,8 @@ fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere
     assert_eq!(exported.len(), 1, "the streams are in observations.jsonl");
 
     // A staged run does not outlive the server.
-    server.stop(&data_dir);
-    let server = Server::start(&data_dir, &backups);
+    stop(server, &data_dir);
+    let server = start(&data_dir, &backups);
     assert!(!data_dir.join("imports").exists());
-    server.stop(&data_dir);
+    stop(server, &data_dir);
 }

@@ -482,7 +482,11 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        crate::imports::run_apply(&core, job, &std::sync::atomic::AtomicBool::new(false));
+        crate::imports::run_apply(
+            &core,
+            job,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let job_id = started["job"]["jobId"].as_str().unwrap();
         let ended = call(&core, &session, "jobs.get", json!({ "jobId": job_id })).unwrap();
         assert_eq!(ended["job"]["state"], "succeeded");
@@ -504,6 +508,289 @@ mod tests {
         assert_eq!(
             call(&core, &session, "imports.apply", apply(5)),
             Err(ErrorCode::NotFound)
+        );
+    }
+
+    fn observations(core: &Core, session: &Session, scratch: &Scratch, name: &str, key: u8) -> u64 {
+        let dir = scratch.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exported = call(
+            core,
+            session,
+            "history.export",
+            json!({ "idempotencyKey": id(key), "folder": dir.to_str().unwrap() }),
+        )
+        .unwrap();
+        exported["observations"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn a_cancelled_apply_before_the_library_transaction_writes_nothing_and_ends_cancelled() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, scratch, session) = staged(&clock, 1);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION);
+        let before_observations = observations(&core, &session, &scratch, "export-before", 80);
+        let before_revision = core
+            .with_library(|_, library| library.meta().unwrap().revision)
+            .unwrap();
+        let started = call(&core, &session, "imports.apply", apply(4)).unwrap();
+        let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
+        let claimed = core
+            .with_stores(|stores| stores.server().claim_job(Id::from_bytes([0xb0; 16])))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        crate::imports::run_apply_before_commit(
+            &core,
+            claimed,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            || {
+                let cancelled = call(
+                    &core,
+                    &session,
+                    "jobs.cancel",
+                    json!({ "idempotencyKey": id(5), "jobId": job_id }),
+                )
+                .unwrap();
+                assert_eq!(cancelled["job"]["state"], "cancelling");
+            },
+        );
+        let ended = call(&core, &session, "jobs.get", json!({ "jobId": job_id })).unwrap();
+        assert_eq!(ended["job"]["state"], "cancelled");
+        assert_eq!(
+            observations(&core, &session, &scratch, "export-after", 81),
+            before_observations
+        );
+        assert_eq!(
+            core.with_library(|_, library| library.meta().unwrap().revision)
+                .unwrap(),
+            before_revision
+        );
+        assert!(
+            core.with_library(|_, library| library.stored_run(Id::from_bytes([9; 16])).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            core.staging()
+                .applied_report(Id::from_bytes([9; 16]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_cancel_after_apply_commits_keeps_the_run_and_never_reports_success() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, scratch, session) = staged(&clock, 1);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION);
+        let started = call(&core, &session, "imports.apply", apply(4)).unwrap();
+        let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
+        let claimed = core
+            .with_stores(|stores| stores.server().claim_job(Id::from_bytes([0xb0; 16])))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let core = Arc::new(core);
+        {
+            let (core_hook, session_hook, job_id_hook) =
+                (Arc::downgrade(&core), Arc::clone(&session), job_id.clone());
+            core.with_library(|_, library| {
+                library.on_commit(Arc::new(move |committed| {
+                    if committed.method == ritornel_engine::APPLY_METHOD
+                        && let Some(core_hook) = core_hook.upgrade()
+                    {
+                        let cancelled = call(
+                            &core_hook,
+                            &session_hook,
+                            "jobs.cancel",
+                            json!({ "idempotencyKey": id(5), "jobId": job_id_hook }),
+                        )
+                        .unwrap();
+                        assert_eq!(cancelled["job"]["state"], "cancelling");
+                    }
+                }));
+            });
+        }
+        crate::imports::run_apply(
+            &core,
+            claimed,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let ended = call(&core, &session, "jobs.get", json!({ "jobId": job_id })).unwrap();
+        assert_eq!(ended["job"]["state"], "cancelled");
+        // The commit had already begun and committed atomically.
+        assert_eq!(
+            observations(&core, &session, &scratch, "export-after", 82),
+            1
+        );
+        assert!(
+            core.with_library(|_, library| library.stored_run(Id::from_bytes([9; 16])).unwrap())
+                .unwrap()
+                .is_some_and(|run| run.in_force)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_apply_with_a_missing_staged_run_still_ends_cancelled() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, session) = staged(&clock, 1);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION);
+        let started = call(&core, &session, "imports.apply", apply(4)).unwrap();
+        let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
+        let claimed = core
+            .with_stores(|stores| stores.server().claim_job(Id::from_bytes([0xb0; 16])))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // Cancel is acknowledged and the staged run expires before apply runs.
+        let cancelled = call(
+            &core,
+            &session,
+            "jobs.cancel",
+            json!({ "idempotencyKey": id(5), "jobId": job_id }),
+        )
+        .unwrap();
+        assert_eq!(cancelled["job"]["state"], "cancelling");
+        core.staging().sweep(T0 + KEEP_MS + 1);
+        crate::imports::run_apply(
+            &core,
+            claimed,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let ended = call(&core, &session, "jobs.get", json!({ "jobId": job_id })).unwrap();
+        assert_eq!(ended["job"]["state"], "cancelled");
+    }
+
+    #[test]
+    fn a_shutdown_leaves_a_claimed_apply_running_for_the_next_boot() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, scratch, session) = staged(&clock, 1);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION);
+        let started = call(&core, &session, "imports.apply", apply(4)).unwrap();
+        let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
+        let claimed = core
+            .with_stores(|stores| stores.server().claim_job(Id::from_bytes([0xb0; 16])))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::imports::run_apply_before_commit(&core, claimed, &shutdown, || {
+            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let paused = call(&core, &session, "jobs.get", json!({ "jobId": job_id })).unwrap();
+        assert_eq!(paused["job"]["state"], "running");
+        assert_eq!(observations(&core, &session, &scratch, "export-mid", 83), 0);
+
+        // Next boot requeues the abandoned running job.
+        let requeued = core
+            .with_stores(|stores| {
+                stores
+                    .server()
+                    .requeue_jobs_of_other_runs(Id::from_bytes([0xb1; 16]))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(requeued, 1);
+        let queued = call(&core, &session, "jobs.get", json!({ "jobId": job_id })).unwrap();
+        assert_eq!(queued["job"]["state"], "queued");
+    }
+
+    #[test]
+    fn a_cancelled_undo_before_the_library_transaction_leaves_the_run_in_force() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, session) = staged(&clock, 1);
+        dry_run(&core, ritornel_engine::GROUPER_VERSION);
+        let run = Id::from_bytes([9; 16]);
+        let streams = core.staging().streams(run, T0).unwrap().unwrap().0;
+        core.with_library(|_, library| {
+            library.apply_streams(
+                ritornel_engine::WriteRequest {
+                    method: ritornel_engine::APPLY_METHOD,
+                    command: None,
+                    client: None,
+                },
+                run,
+                streams,
+                "ritornelctl 0.1.0".to_owned(),
+                None,
+            )
+        })
+        .unwrap()
+        .unwrap();
+        let before_revision = core
+            .with_library(|_, library| library.meta().unwrap().revision)
+            .unwrap();
+        let started = call(&core, &session, "imports.undo", apply(4)).unwrap();
+        let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
+        let claimed = core
+            .with_stores(|stores| stores.server().claim_job(Id::from_bytes([0xb0; 16])))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        crate::imports::run_undo_before_commit(
+            &core,
+            claimed,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            || {
+                let cancelled = call(
+                    &core,
+                    &session,
+                    "jobs.cancel",
+                    json!({ "idempotencyKey": id(5), "jobId": job_id }),
+                )
+                .unwrap();
+                assert_eq!(cancelled["job"]["state"], "cancelling");
+            },
+        );
+        let ended = call(&core, &session, "jobs.get", json!({ "jobId": job_id })).unwrap();
+        assert_eq!(ended["job"]["state"], "cancelled");
+        assert_eq!(
+            core.with_library(|_, library| library.meta().unwrap().revision)
+                .unwrap(),
+            before_revision
+        );
+        assert!(
+            core.with_library(|_, library| library.stored_run(run).unwrap())
+                .unwrap()
+                .is_some_and(|stored| stored.in_force)
+        );
+    }
+
+    #[test]
+    fn a_cancelled_dry_run_saves_no_report_and_ends_cancelled() {
+        let clock = Arc::new(SetClock::at(T0));
+        let (core, _scratch, session) = staged(&clock, 1);
+        let started = call(&core, &session, "imports.dryRun", apply(4)).unwrap();
+        let job_id = started["job"]["jobId"].as_str().unwrap().to_owned();
+        let claimed = core
+            .with_stores(|stores| stores.server().claim_job(Id::from_bytes([0xb0; 16])))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        crate::imports::run_dry_run_before_save(
+            &core,
+            claimed,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            || {
+                let cancelled = call(
+                    &core,
+                    &session,
+                    "jobs.cancel",
+                    json!({ "idempotencyKey": id(5), "jobId": job_id }),
+                )
+                .unwrap();
+                assert_eq!(cancelled["job"]["state"], "cancelling");
+            },
+        );
+        let ended = call(&core, &session, "jobs.get", json!({ "jobId": job_id })).unwrap();
+        assert_eq!(ended["job"]["state"], "cancelled");
+        assert!(
+            core.staging()
+                .run(Id::from_bytes([9; 16]), T0)
+                .unwrap()
+                .unwrap()
+                .report
+                .is_none()
         );
     }
 }

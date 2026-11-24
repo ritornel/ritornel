@@ -106,9 +106,14 @@ env = { RITORNEL_BLESS = "1" }
 # the libraries it links, these say so and do nothing. See scripts/desktop.sh,
 # and on Windows scripts/desktop.ps1, which `desktop:check` runs there.
 [tasks."desktop:check"]
-description = "Check, lint and test the desktop app, and build it"
+description = "Check, lint and test the desktop app"
 run = "scripts/desktop.sh check"
 run_windows = "pwsh -NoProfile -File scripts/desktop.ps1 check"
+
+[tasks."desktop:release"]
+description = "Build the desktop app in release"
+run = "scripts/desktop.sh release"
+run_windows = "pwsh -NoProfile -File scripts/desktop.ps1 release"
 
 [tasks."desktop:run"]
 description = "Run the desktop app against an invented library, never a real one"
