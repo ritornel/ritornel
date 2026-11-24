@@ -50,10 +50,6 @@ CI runs the tests in parallel on small, busy machines, Windows' slowest of all, 
 
 An agent opens a pull request when the person it works for asks. The title is `type(scope): what changed`, and the body ends with the model and harness that did the work. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest.
 
-**Land nothing a revert cannot undo until it is complete and proven.** Every change lands complete—known-incomplete work never lands, and partial features wait on their branch. Care follows what can go wrong after merge:
-
-1. **Contract changes and migrations** *(risk: peers that cannot talk, or a database layout that cannot be taken back)*: land one complete unit at a time, with one `CONTRACT_VERSION` bump and the fewest migrations it needs (collapse unmerged migrations before merging; migrations on `main` stay frozen). Dry-run the migration on a copy of a real backup before landing; a release carrying a contract or migration change ships alone, and the next contract or migration unit waits to merge until that release is deployed.
-2. **Record writes, outward sends, and backups** *(risk: wrong data that outlives a revert)*: anything that writes the library or listening history, sends outward (scrobbles, Now Playing), or writes or restores backups gets two reviews from two different model vendors, plus a dry run on a copy of a real backup whenever it rewrites existing data. It lands when ready unless it also carries a contract change or migration.
-3. **Everything else** *(tests, CI, desktop, website, docs — risk: a bug a revert fixes)*: one review from another vendor, then lands when ready.
-
-Keep pull request descriptions factual about what changed and how it was verified; settle open design questions in an issue or conversation first.
+- **Pull requests land complete.** Don't merge known-incomplete work; partial features stay on their branch.
+- **Contract changes and migrations** land one complete change at a time: one `CONTRACT_VERSION` bump, with migrations not yet on `main` collapsed into as few as the change needs.
+- **Extra review for lasting changes.** Changes that write the library, listening history, or backups, or send scrobbles or Now Playing, get extra review.

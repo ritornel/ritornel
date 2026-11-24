@@ -18,13 +18,8 @@ Ritornel is early and has one maintainer, so please keep that in mind when you w
 
 A change to the database schema is a new numbered migration plus `mise run schema`. A change to a call or a wire type is that change plus `mise run contract`.
 
-**Land nothing a revert cannot undo until it is complete and proven.** Every change lands complete—known-incomplete work never lands, and partial features wait on their branch. Care follows what can go wrong after merge:
-
-- **Contract changes and migrations** land one complete unit at a time, with one `CONTRACT_VERSION` bump and the fewest migrations it needs (collapse unmerged migrations before merging), after a migration dry run on a copy of a real backup. A release carrying a contract or migration change ships alone, and the next contract or migration unit waits to merge until that release is deployed.
-- **Changes whose mistakes outlive a revert**—writing the library or listening history, sending outward (scrobbles, Now Playing), or writing or restoring backups—need two independent reviews (from two different model vendors for agent work) and a dry run on a copy of a real backup whenever they rewrite existing data. They land when ready unless they also carry a contract change or migration.
-- **Everything else** (tests, CI, desktop, website, docs) lands after review (one review from another model vendor for agent work) as soon as it is ready.
-
-Keep pull request descriptions factual about what changed and how it was checked; settle open design questions in an issue before opening the pull request.
+- **Pull requests land complete.** Don't merge known-incomplete work; partial features stay on their branch.
+- **Contract changes and migrations** land one complete change at a time: one `CONTRACT_VERSION` bump, with migrations not yet on `main` collapsed into as few as the change needs. A migration already on `main` is never edited.
 
 In a stack of pull requests, CI runs only its Linux jobs on a layer that another open pull request builds on, and every job on the top layer, which holds the layers under it. Land a stack through its top layer.
 
