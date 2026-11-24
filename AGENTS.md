@@ -50,6 +50,4 @@ CI runs the tests in parallel on small, busy machines, Windows' slowest of all, 
 
 An agent opens a pull request when the person it works for asks. The title is `type(scope): what changed`, and the body ends with the model and harness that did the work. [`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest.
 
-- **Pull requests land complete.** Don't merge known-incomplete work; partial features stay on their branch.
-- **Contract changes and migrations** land one complete change at a time: one `CONTRACT_VERSION` bump, with migrations not yet on `main` collapsed into as few as the change needs.
-- **Extra review for lasting changes.** Changes that write the library, listening history, or backups, or send scrobbles or Now Playing, get extra review.
+Keep partial work on its branch until it works end to end rather than merging something half-built onto `main`. For a feature that changes the contract or adds migrations, use one `CONTRACT_VERSION` bump and collapse migrations not yet on `main` into as few files as it needs. Changes that write the library, listening history, or backups, or send scrobbles or Now Playing, get extra review.

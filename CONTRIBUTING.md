@@ -16,10 +16,9 @@ Ritornel is early and has one maintainer, so please keep that in mind when you w
 3. Run `mise run check`. It runs everything CI runs.
 4. Write the commit subject as `type(scope): what changed`, as the history does.
 
-A change to the database schema is a new numbered migration plus `mise run schema`. A change to a call or a wire type is that change plus `mise run contract`.
+A change to the database schema is a new numbered migration plus `mise run schema`, and a migration already on `main` is never edited. A change to a call or a wire type is that change plus `mise run contract`.
 
-- **Pull requests land complete.** Don't merge known-incomplete work; partial features stay on their branch.
-- **Contract changes and migrations** land one complete change at a time: one `CONTRACT_VERSION` bump, with migrations not yet on `main` collapsed into as few as the change needs. A migration already on `main` is never edited.
+Keep partial work on its branch until it works end to end rather than merging something half-built onto `main`. A feature that changes the contract or adds migrations should use one `CONTRACT_VERSION` bump and collapse migrations not yet on `main` into as few files as it needs.
 
 In a stack of pull requests, CI runs only its Linux jobs on a layer that another open pull request builds on, and every job on the top layer, which holds the layers under it. Land a stack through its top layer.
 
