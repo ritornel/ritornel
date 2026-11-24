@@ -106,6 +106,7 @@ case "${1:-}" in
     check)
         bash "$root/scripts/tests/wait-for-server.sh"
         bash "$root/scripts/tests/hidden-display.sh"
+        bash "$root/scripts/tests/install.sh"
         gpui fmt --check
         gpui clippy --locked --all-targets -- -D warnings
         gpui test --locked
