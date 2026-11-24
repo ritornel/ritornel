@@ -928,10 +928,15 @@ pub(crate) fn derive_all(connection: &Connection, rule: PlayRule) -> Result<Vec<
 /// undoing a run of streams does, since a stream in force or out of it can
 /// move a track's length, and so any play of it.
 pub(crate) fn derive_every_play(write: &Write<'_>) -> Result<(), Error> {
+    derive_every_play_by(write, PlayRule::CURRENT)
+}
+
+/// Drops every play and derives each again by `rule`, in the write.
+fn derive_every_play_by(write: &Write<'_>, rule: PlayRule) -> Result<(), Error> {
     let connection = write.connection();
     connection.execute("DELETE FROM play_event_observation", [])?;
     connection.execute("DELETE FROM play_event", [])?;
-    insert_plays(write, &derive_all(connection, PlayRule::CURRENT)?)
+    insert_plays(write, &derive_all(connection, rule)?)
 }
 
 /// The derived tables, one line per play with its observations, in the
@@ -1709,9 +1714,7 @@ impl LibraryStore {
         let rebuild = move |write: &Write<'_>| -> Result<(Vec<String>, Vec<String>), Error> {
             let connection = write.connection();
             let before = derived(connection)?;
-            connection.execute("DELETE FROM play_event_observation", [])?;
-            connection.execute("DELETE FROM play_event", [])?;
-            insert_plays(write, &derive_all(connection, rule)?)?;
+            derive_every_play_by(write, rule)?;
             Ok((before, derived(connection)?))
         };
         if dry_run {
@@ -1820,9 +1823,7 @@ impl LibraryStore {
                 )?;
             }
             let before = derived(connection)?;
-            connection.execute("DELETE FROM play_event_observation", [])?;
-            connection.execute("DELETE FROM play_event", [])?;
-            insert_plays(write, &derive_all(connection, PlayRule::CURRENT)?)?;
+            derive_every_play(write)?;
             Ok(receipt(changed(&before, &derived(connection)?)))
         })?;
         Ok(written.result_json)
