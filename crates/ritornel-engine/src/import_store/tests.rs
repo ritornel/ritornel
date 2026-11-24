@@ -1167,9 +1167,9 @@ pub(crate) fn stream(
         offline: Some(false),
         offline_timestamp: None,
         incognito: Some(false),
-        platform: None,
-        device_kind: None,
-        via: None,
+        platform: Some(ritornel_contract::Platform::Mac),
+        device_kind: Some(ritornel_contract::DeviceKind::Computer),
+        via: Some(ritornel_contract::PlayedVia::App),
     }
 }
 
@@ -1226,4 +1226,285 @@ fn a_dry_run_offers_no_stream_a_scrobble_set_aside_and_writes_nothing() {
     assert_eq!(year.alone_counted, 1);
     assert_eq!(year.plays_after, year.plays_before + 1);
     assert_eq!(year.counted_after, year.counted_before + 1);
+}
+
+/// The streams in force: those that a run whose newest ledger entry is
+/// `applied` held.
+fn in_force(rig: &Rig) -> String {
+    rig.one(
+        "SELECT count(DISTINCT h.observation_id) FROM import_run_stream h
+         WHERE (SELECT state FROM import_run_event WHERE run_id = h.run_id
+                ORDER BY id DESC LIMIT 1) = 'applied'",
+    )
+}
+
+fn apply(rig: &Rig, run: u8, streams: Vec<ritornel_contract::SpotifyStream>) -> crate::StoredRun {
+    rig.library
+        .apply_streams(
+            WriteRequest {
+                method: crate::APPLY_METHOD,
+                command: None,
+                client: None,
+            },
+            Id::from_bytes([run; 16]),
+            streams,
+            "ritornelctl 0.1.0".to_owned(),
+            None,
+        )
+        .unwrap()
+        .0
+}
+
+fn undo(rig: &Rig, run: u8) -> crate::StoredRun {
+    rig.library
+        .undo_streams(
+            WriteRequest {
+                method: crate::UNDO_METHOD,
+                command: None,
+                client: None,
+            },
+            Id::from_bytes([run; 16]),
+        )
+        .unwrap()
+}
+
+#[test]
+fn an_apply_reports_what_it_did_as_the_dry_run_would_and_a_second_reports_nothing() {
+    let rig = rig();
+    rig.ingest(&first_batch());
+    let archive = vec![
+        stream(T0 - 3 * HOUR + 2000, 200_000, "Paper Kites"),
+        stream(T0 - 2 * HOUR, 180_000, "Lanternfish"),
+    ];
+    let mut before = rig.library.stream_dry_run(archive.clone()).unwrap();
+    let request = || WriteRequest {
+        method: crate::APPLY_METHOD,
+        command: None,
+        client: None,
+    };
+    let run = Id::from_bytes([1; 16]);
+    let (_, report) = rig
+        .library
+        .apply_streams(
+            request(),
+            run,
+            archive.clone(),
+            "ritornelctl 0.1.0".to_owned(),
+            None,
+        )
+        .unwrap();
+    let mut report = report.expect("an apply that writes reports what it did");
+    // Worked out as the dry run is, from the library as the write saw it,
+    // which nothing changed in between.
+    (before.made_at, report.made_at) = (0, 0);
+    assert_eq!(report, before);
+    let (_, again) = rig
+        .library
+        .apply_streams(
+            request(),
+            run,
+            archive,
+            "ritornelctl 0.1.0".to_owned(),
+            None,
+        )
+        .unwrap();
+    assert!(again.is_none(), "a run applied before reports nothing");
+}
+
+#[test]
+fn a_run_is_stored_once_in_one_write_and_undone_by_a_row_of_its_ledger() {
+    let rig = rig();
+    rig.ingest(&first_batch());
+    let plays = rig.library.derived_history().unwrap();
+    let archive = vec![
+        stream(T0 - 3 * HOUR + 2000, 200_000, "Paper Kites"),
+        stream(T0 - 2 * HOUR, 180_000, "Lanternfish"),
+        stream(T0 - 2 * HOUR, 180_000, "Lanternfish"),
+    ];
+    let observations = "SELECT count(*) FROM observation_import_stream";
+
+    // One revision stores the three, and changes no play.
+    let revision = rig.revision();
+    let first = apply(&rig, 1, archive.clone());
+    assert_eq!(rig.revision(), revision + 1);
+    assert_eq!(
+        (first.streams, first.new_streams, first.in_force),
+        (3, 3, true)
+    );
+    assert_eq!(rig.one(observations), "3");
+    assert_eq!(rig.library.derived_history().unwrap(), plays);
+    let rebuilt = rig
+        .library
+        .rebuild_history(
+            WriteRequest {
+                method: "history.rebuild",
+                command: None,
+                client: None,
+            },
+            true,
+            |rebuilt| rebuilt.changed.to_string(),
+        )
+        .unwrap();
+    assert_eq!(rebuilt, "0", "a rebuild finds nothing to change");
+
+    // The same run again writes nothing; the same archive in a new run
+    // stores no stream, and records the run.
+    assert_eq!(apply(&rig, 1, archive.clone()), first);
+    assert_eq!(rig.revision(), revision + 1);
+    let again = apply(&rig, 2, archive.clone());
+    assert_eq!((again.streams, again.new_streams), (3, 0));
+    assert_eq!(rig.one(observations), "3");
+    // A later archive stores only what this one lacked: a new track, and
+    // a third report of Lanternfish that sorts before the two stored.
+    let mut later = archive.clone();
+    later.push(stream(T0 - HOUR, 200_000, "Salt Road"));
+    let mut third_report = stream(T0 - 2 * HOUR, 180_000, "Lanternfish");
+    third_report.reason_end = Some("endplay".to_owned());
+    later.insert(0, third_report);
+    let third = apply(&rig, 3, later);
+    assert_eq!((third.streams, third.new_streams), (5, 2));
+    assert_eq!(rig.one(observations), "5");
+    assert_eq!(in_force(&rig), "5");
+
+    // Undoing the first of the runs leaves in force what the others held.
+    let revision = rig.revision();
+    let undone = undo(&rig, 1);
+    assert!(!undone.in_force);
+    assert_eq!(rig.revision(), revision + 1);
+    assert_eq!(in_force(&rig), "5");
+    // Undone again, nothing is written.
+    assert_eq!(undo(&rig, 1), undone);
+    assert_eq!(rig.revision(), revision + 1);
+    undo(&rig, 2);
+    undo(&rig, 3);
+    assert_eq!(in_force(&rig), "0");
+    assert_eq!(rig.one(observations), "5", "nothing is removed");
+    assert_eq!(rig.library.derived_history().unwrap(), plays);
+    assert_eq!(
+        rig.library
+            .stored_runs()
+            .unwrap()
+            .iter()
+            .map(|run| run.run)
+            .collect::<Vec<_>>(),
+        [3, 2, 1].map(|run| Id::from_bytes([run; 16]))
+    );
+
+    // The export carries each stream's own fields, the runs with their
+    // ledgers, and what each held.
+    let scratch = crate::testing::Scratch::new();
+    let exported = rig.library.export_record(scratch.path(), T0).unwrap();
+    assert_eq!((exported.runs, exported.run_streams), (3, 11));
+    let observations = std::fs::read_to_string(scratch.path().join("observations.jsonl")).unwrap();
+    let streams: Vec<serde_json::Value> = observations
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|line| line["import"]["stream"].is_object())
+        .collect();
+    assert_eq!(streams.len(), 5);
+    assert_eq!(streams[0]["import"]["stream"]["platform"], "mac");
+    assert_eq!(streams[0]["import"]["stream"]["deviceKind"], "computer");
+    let runs = std::fs::read_to_string(scratch.path().join("runs.jsonl")).unwrap();
+    let first_run: serde_json::Value = serde_json::from_str(runs.lines().next().unwrap()).unwrap();
+    assert_eq!(first_run["ledger"][0]["state"], "applied");
+    assert_eq!(first_run["ledger"][1]["state"], "undone");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(scratch.path().join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["version"], 3);
+}
+
+#[test]
+fn a_row_a_later_archive_spells_otherwise_keeps_the_record_it_was_stored_with() {
+    let rig = rig();
+    let first = stream(T0 - 3 * HOUR, 200_000, "Paper Kites");
+    apply(&rig, 1, vec![first.clone()]);
+    let stored = rig.one("SELECT payload_json FROM history_observation WHERE kind = 'import'");
+    let mut respelled = first.clone();
+    respelled.album = Some("Tin Weather (Deluxe)".to_owned());
+    let report = rig.library.stream_dry_run(vec![respelled.clone()]).unwrap();
+    assert_eq!(report.respelled, 1);
+    assert_eq!(report.years[0].already_stored, 1);
+    let again = apply(&rig, 2, vec![respelled]);
+    assert_eq!(again.new_streams, 0);
+    assert_eq!(
+        rig.one("SELECT payload_json FROM history_observation WHERE kind = 'import'"),
+        stored
+    );
+    assert_eq!(rig.one("SELECT count(*) FROM history_ingest_conflict"), "0");
+}
+
+#[test]
+fn a_later_reader_says_again_what_a_stream_played_on_and_stores_no_row() {
+    use ritornel_contract::{DeviceKind, PlayedVia};
+    let rig = rig();
+    let first = stream(T0 - 3 * HOUR, 200_000, "Paper Kites");
+    apply(&rig, 1, vec![first.clone()]);
+    let device = "SELECT coalesce(platform, '-') || ' ' || coalesce(device_kind, '-') || ' ' || \
+                  coalesce(via, '-') || ' ' || run_id FROM stream_device";
+    assert_eq!(rig.one(device), "mac computer app 1");
+    let payload = rig.one("SELECT payload_json FROM history_observation WHERE kind = 'import'");
+    assert!(!payload.contains("mac"), "{payload}");
+    let plays = "SELECT group_concat(hex(public_id), ',' ORDER BY public_id) FROM play_event";
+    let played = rig.one(plays);
+    // A later reader says the same row otherwise, and Spotify marks it
+    // skipped where it did not before: it is the same stream, which keeps
+    // its record and its plays, and is said to have played on what the
+    // later run says.
+    let mut later = first;
+    later.platform = None;
+    later.device_kind = Some(DeviceKind::Speaker);
+    later.via = Some(PlayedVia::Cast);
+    later.skipped = Some(true);
+    let again = apply(&rig, 2, vec![later.clone()]);
+    assert_eq!(again.new_streams, 0);
+    assert_eq!(rig.one(device), "- speaker cast 2");
+    assert_eq!(
+        rig.one("SELECT payload_json FROM history_observation WHERE kind = 'import'"),
+        payload
+    );
+    assert_eq!(
+        rig.one("SELECT count(*) FROM observation_import_stream"),
+        "1"
+    );
+    assert_eq!(rig.one(plays), played);
+    // Undone and the same archive applied again, by the same words: the run
+    // that said them now is the one named, and the archive has its hash.
+    undo(&rig, 2);
+    apply(&rig, 3, vec![later]);
+    assert_eq!(rig.one(device), "- speaker cast 3");
+    assert_eq!(
+        rig.one("SELECT count(DISTINCT records_hash) FROM import_run WHERE id IN (2, 3)"),
+        "1"
+    );
+}
+
+#[test]
+fn a_stored_stream_and_a_runs_rows_are_never_changed_or_removed() {
+    let rig = rig();
+    apply(&rig, 1, vec![stream(T0 - 3 * HOUR, 200_000, "Paper Kites")]);
+    for sql in [
+        "UPDATE observation_import_stream SET ms_played = 1",
+        "DELETE FROM observation_import_stream",
+        "UPDATE import_run SET streams = 9",
+        "DELETE FROM import_run",
+        "UPDATE import_run_event SET state = 'undone'",
+        "DELETE FROM import_run_event",
+        "UPDATE import_run_stream SET rev = 0",
+        "DELETE FROM import_run_stream",
+    ] {
+        let refused = rig.library.write(
+            WriteRequest {
+                method: "test.tamper",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(sql, [])?;
+                Ok(String::new())
+            },
+        );
+        assert!(refused.is_err(), "{sql}");
+    }
 }

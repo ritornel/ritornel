@@ -121,12 +121,16 @@ struct Server {
 }
 
 impl Server {
-    fn start(data_dir: &Path) -> Self {
+    /// Starts a server on `data_dir`, taking its backups into `backups`.
+    fn start(data_dir: &Path, backups: &Path) -> Self {
+        std::fs::create_dir_all(backups).unwrap();
         let mut child = Command::new(server_binary())
             .arg("serve")
             .arg("--data-dir")
             .arg(data_dir)
             .args(["--listen", "127.0.0.1:0", "--output", "none"])
+            .arg("--backup-dir")
+            .arg(backups)
             .env_remove("RITORNEL_DATA_DIR")
             .env_remove("RITORNEL_LISTEN")
             .env_remove("RITORNEL_BACKUP_DIR")
@@ -238,10 +242,11 @@ fn holds(folder: &Path, mark: &[u8]) -> Vec<PathBuf> {
 }
 
 #[test]
-fn an_import_is_staged_and_dry_run_and_writes_nothing_to_the_library() {
+fn an_import_is_dry_run_applied_and_undone_and_no_dropped_value_is_kept_anywhere() {
     let scratch = Scratch::new();
     let data_dir = scratch.data_dir();
-    let server = Server::start(&data_dir);
+    let backups = scratch.0.join("backups");
+    let server = Server::start(&data_dir, &backups);
     assert_eq!(ritornelctl(&data_dir, &["library", "create"]).0, Some(0));
     let revision = |data_dir: &Path| {
         let (code, out, _) = ritornelctl(data_dir, &["status", "--json"]);
@@ -260,7 +265,7 @@ fn an_import_is_staged_and_dry_run_and_writes_nothing_to_the_library() {
     for line in [
         "Streams of music  4\n",
         "Dry run\n",
-        "Listens           3 in 4 streams\n",
+        "Listens           3 in 4 streams; 0 stored already, 0 of whose rows this archive spells otherwise, which changes nothing\n",
         "A, at the start   0 joined, 0 second reports\n",
     ] {
         assert!(out.contains(line), "{line}{out}");
@@ -306,9 +311,66 @@ fn an_import_is_staged_and_dry_run_and_writes_nothing_to_the_library() {
             .is_some()
     );
 
+    // Applied, the run's four streams are stored in one revision.
+    let run = answer["run"]["runId"].as_str().unwrap().to_owned();
+    let before = revision(&data_dir).as_u64().unwrap();
+    let (code, out, err) = ritornelctl(&data_dir, &["spotify", "apply", &run]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(
+        out.contains("4 streams, 4 of them new to the library. It is in force."),
+        "{out}"
+    );
+    assert!(out.contains("What applying did"), "{out}");
+    assert_eq!(revision(&data_dir).as_u64().unwrap(), before + 1);
+    // The same archive again stores nothing new.
+    let (code, out, _) = ritornelctl(
+        &data_dir,
+        &[
+            "spotify",
+            "import",
+            archive_path.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(code, Some(0));
+    let again: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(again["run"]["report"]["years"][0]["alreadyStored"], 3);
+    let second = again["run"]["runId"].as_str().unwrap().to_owned();
+    let (code, out, _) = ritornelctl(&data_dir, &["spotify", "apply", &second, "--json"]);
+    assert_eq!(code, Some(0));
+    let applied: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(applied["run"]["applied"]["newStreams"], 0);
+    let (code, out, _) = ritornelctl(&data_dir, &["spotify", "runs"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(out.contains(&format!("{run}  applied ")), "{out}");
+    // Undone, the first is out of force and the second holds its streams.
+    let (code, out, _) = ritornelctl(&data_dir, &["spotify", "undo", &run]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("is out of force"), "{out}");
+    let (_, out, _) = ritornelctl(&data_dir, &["spotify", "runs", "--json"]);
+    let runs: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(runs["runs"][0]["inForce"], true);
+    assert_eq!(runs["runs"][1]["inForce"], false);
+
+    // Exported and backed up, the record holds no dropped value either.
+    let exports = scratch.0.join("exports");
+    std::fs::create_dir_all(&exports).unwrap();
+    assert_eq!(
+        ritornelctl(&data_dir, &["export", exports.to_str().unwrap()]).0,
+        Some(0)
+    );
+    assert_eq!(ritornelctl(&data_dir, &["backup"]).0, Some(0));
+    for folder in [&data_dir, &exports, &backups] {
+        let marked = holds(folder, b"MARKED");
+        assert!(marked.is_empty(), "{marked:?}");
+    }
+    let exported = holds(&exports, b"\"stream\":");
+    assert_eq!(exported.len(), 1, "the streams are in observations.jsonl");
+
     // A staged run does not outlive the server.
     server.stop(&data_dir);
-    let server = Server::start(&data_dir);
+    let server = Server::start(&data_dir, &backups);
     assert!(!data_dir.join("imports").exists());
     server.stop(&data_dir);
 }

@@ -12,7 +12,7 @@ mod rows;
 
 pub(crate) use self::archive::Error as ArchiveError;
 use self::archive::shown;
-pub(crate) use self::import::import;
+pub(crate) use self::import::{apply, import, runs, undo};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -174,7 +174,7 @@ pub(crate) fn read_command(args: &SpotifyReadArgs, out: &mut dyn Write) -> Resul
         .map_err(Error::Output)
 }
 
-fn day(ms: i64) -> String {
+pub(super) fn day(ms: i64) -> String {
     jiff::Timestamp::from_millisecond(ms)
         .map(|at| at.strftime("%Y-%m-%d").to_string())
         .unwrap_or_default()

@@ -468,6 +468,19 @@ impl ServerStore {
         })
     }
 
+    /// The job a command started before, if it did: what the command sent
+    /// again is answered with, whatever has become of what it started from.
+    /// The same ID with other params is [`Error::CommandMismatch`].
+    pub fn job_of_command(&self, command: Command) -> Result<Option<Job>, Error> {
+        self.read(move |connection| match receipt(connection, &command)? {
+            Some(result) => {
+                let id = result.parse().map_err(|_| Error::Corrupt("a receipt"))?;
+                job_by_id(connection, id)
+            }
+            None => Ok(None),
+        })
+    }
+
     /// The job with this ID.
     pub fn job(&self, id: Id) -> Result<Option<Job>, Error> {
         self.read(|connection| job_by_id(connection, id))

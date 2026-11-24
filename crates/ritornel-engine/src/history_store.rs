@@ -576,6 +576,12 @@ fn echoes_of(connection: &Connection, listen: i64) -> Result<Vec<i64>, Error> {
 const IMPORT_COLUMNS: &str = "o.id, o.endpoint_id, o.listener_id, o.source_item_id,
     i.played_at_utc_ms, i.artist, i.title";
 
+/// Leaves Spotify's streams out: derivation does not read them yet, so
+/// storing them changes no play ("Spotify streams" in
+/// docs/internals/history.md).
+const NOT_A_STREAM: &str =
+    "NOT EXISTS (SELECT 1 FROM observation_import_stream s WHERE s.observation_id = o.id)";
+
 /// The imports with these observation IDs, or every import, each with the
 /// listen it is the echo of.
 fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<Import>, Error> {
@@ -594,14 +600,16 @@ fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<
         None => {
             let mut statement = connection.prepare_cached(&format!(
                 "SELECT {IMPORT_COLUMNS} FROM history_observation o
-                 JOIN observation_import i ON i.observation_id = o.id ORDER BY o.id"
+                 JOIN observation_import i ON i.observation_id = o.id
+                 WHERE {NOT_A_STREAM} ORDER BY o.id"
             ))?;
             statement.query_map([], row)?.collect::<Result<_, _>>()?
         }
         Some(only) => {
             let mut one = connection.prepare_cached(&format!(
                 "SELECT {IMPORT_COLUMNS} FROM history_observation o
-                 JOIN observation_import i ON i.observation_id = o.id WHERE o.id = ?1"
+                 JOIN observation_import i ON i.observation_id = o.id
+                 WHERE o.id = ?1 AND {NOT_A_STREAM}"
             ))?;
             let mut found = Vec::with_capacity(only.len());
             for observation in only {

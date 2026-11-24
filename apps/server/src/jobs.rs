@@ -219,6 +219,12 @@ fn run(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, stop: &At
     if job.kind == crate::imports::DRY_RUN_JOB {
         return crate::imports::run_dry_run(core, job, stop);
     }
+    if job.kind == crate::imports::APPLY_JOB {
+        return crate::imports::run_apply(core, job, stop);
+    }
+    if job.kind == crate::imports::UNDO_JOB {
+        return crate::imports::run_undo(core, job, stop);
+    }
     scan(core, job, settings, stop);
 }
 

@@ -89,6 +89,11 @@ pub(crate) const LIBRARY: &[Migration] = &[
         name: "0007_delivery_sender",
         sql: include_str!("../migrations/library/0007_delivery_sender.sql"),
     },
+    Migration {
+        version: 8,
+        name: "0008_spotify_streams",
+        sql: include_str!("../migrations/library/0008_spotify_streams.sql"),
+    },
 ];
 
 /// What a run did.

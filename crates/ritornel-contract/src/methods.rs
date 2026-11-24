@@ -431,11 +431,29 @@ methods! {
     /// applying a staged run would do. A dry run of the run that is running
     /// already is returned.
     ImportsDryRun: "imports.dryRun", Command, needs_full: true,
-    ImportsDryRunParams => ImportsDryRunStarted;
+    ImportsRunParams => ImportsJobStarted;
 
-    /// `imports.get`: a staged run, with its last dry run's report.
+    /// `imports.apply`: starts a job that stores a staged run's streams
+    /// that are new and records the run, in one library write. It is
+    /// refused when the run is gone, or, applied for the first time, has no
+    /// dry run or one made before the matcher or the play rule changed. A
+    /// run applied already needs neither, and its job ends as done.
+    ImportsApply: "imports.apply", Command, needs_full: true,
+    ImportsRunParams => ImportsJobStarted;
+
+    /// `imports.undo`: starts a job that takes an applied run out of force,
+    /// in one library write. Its streams stay stored.
+    ImportsUndo: "imports.undo", Command, needs_full: true,
+    ImportsRunParams => ImportsJobStarted;
+
+    /// `imports.get`: a staged run, with its last report and, once applied,
+    /// the run as the library holds it.
     ImportsGet: "imports.get", Query, needs_full: true,
     ImportsGetParams => ImportRun;
+
+    /// `imports.list`: every run the library holds, newest first.
+    ImportsList: "imports.list", Query, needs_full: true,
+    NoParams => ImportRuns;
 
     /// `artists.importPictures`: adds a picture folder on this server as a
     /// named root, if it is not one, and takes each artist's portrait from
@@ -616,7 +634,10 @@ mod tests {
                 "lastfm.report",
                 "imports.stage",
                 "imports.dryRun",
+                "imports.apply",
+                "imports.undo",
                 "imports.get",
+                "imports.list",
                 "artists.importPictures",
                 "artists.pictureFolders",
                 "library.setWatching",
@@ -671,7 +692,10 @@ mod tests {
                 "lastfm.report",
                 "imports.stage",
                 "imports.dryRun",
+                "imports.apply",
+                "imports.undo",
                 "imports.get",
+                "imports.list",
                 "artists.importPictures",
                 "artists.pictureFolders",
                 "library.setWatching",

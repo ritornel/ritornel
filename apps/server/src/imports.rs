@@ -8,6 +8,7 @@
 //!   run.json        how many pieces, when it was begun, and each piece's count
 //!   piece-<n>.json  one piece's streams, as the contract's type
 //!   report.json     the last dry run's report
+//!   applied.json    the report of the apply, worked out in its write
 //! ```
 //!
 //! Everything here is readable by the OS user alone, holds the kept fields
@@ -20,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
-use ritornel_contract::{Id, ImportReport, ImportRun, MAX_STREAMS_PER_PIECE, SpotifyStream};
+use ritornel_contract::{
+    Id, ImportReport, ImportRun, MAX_CLIENT_TEXT, MAX_STREAMS_PER_PIECE, SpotifyStream,
+};
 use ritornel_engine::JobState;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -45,6 +48,8 @@ pub(crate) const MAX_PIECES: u32 = 2_000;
 struct Meta {
     pieces: u32,
     begun_at: i64,
+    /// What read the archive.
+    reader: String,
     /// Each piece held, by its number, with its count of streams.
     received: BTreeMap<u32, u64>,
 }
@@ -70,11 +75,29 @@ pub(crate) struct Staging {
     writing: Mutex<()>,
 }
 
-/// The dry run's job params.
+/// The kind of the job that applies a staged run.
+pub(crate) const APPLY_JOB: &str = "imports.apply";
+
+/// The kind of the job that undoes an applied run.
+pub(crate) const UNDO_JOB: &str = "imports.undo";
+
+/// A staged run as an apply reads it.
+#[derive(Debug)]
+pub(crate) struct Whole {
+    pub(crate) streams: Vec<SpotifyStream>,
+    pub(crate) begun_at: i64,
+    pub(crate) reader: String,
+    pub(crate) report: Option<ImportReport>,
+}
+
+/// The params of a run's job: the dry run, the apply or the undo.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct DryRunParams {
+pub(crate) struct RunJobParams {
     pub(crate) run_id: Id,
+    /// The session that asked, which an applied run records.
+    #[serde(default)]
+    pub(crate) session: Option<Id>,
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, Error> {
@@ -176,9 +199,18 @@ impl Staging {
         run: Id,
         piece: u32,
         pieces: u32,
+        reader: &str,
         streams: &[SpotifyStream],
         now: i64,
     ) -> Result<ImportRun, Refused> {
+        if reader.trim().is_empty()
+            || reader.chars().count() > MAX_CLIENT_TEXT
+            || reader.chars().any(char::is_control)
+        {
+            return Err(Refused::Invalid(
+                "a run names what read it, in at most a hundred characters and none a control",
+            ));
+        }
         if pieces == 0 || pieces > MAX_PIECES || piece >= pieces {
             return Err(Refused::Invalid(
                 "a piece's number is from 0 to one less than the run's pieces",
@@ -191,7 +223,8 @@ impl Staging {
         }
         if streams.iter().any(|stream| stream.plausible().is_err()) {
             return Err(Refused::Invalid(
-                "a stream ends outside 1970 to 2100, or played longer than a day",
+                "a stream names no track, artist or title, ends outside 1970 to 2100, or played \
+                 longer than a day",
             ));
         }
         let _writing = self
@@ -201,9 +234,9 @@ impl Staging {
         self.sweep_held(now);
         let dir = self.run_dir(run);
         let mut meta = match self.meta(run).map_err(Refused::Disk)? {
-            Some(meta) if meta.pieces != pieces => {
+            Some(meta) if meta.pieces != pieces || meta.reader != reader => {
                 return Err(Refused::Invalid(
-                    "a run's pieces are the same in every piece",
+                    "a run's pieces and reader are the same in every piece",
                 ));
             }
             Some(meta) => meta,
@@ -213,6 +246,7 @@ impl Staging {
                 Meta {
                     pieces,
                     begun_at: now,
+                    reader: reader.to_owned(),
                     received: BTreeMap::new(),
                 }
             }
@@ -244,6 +278,7 @@ impl Staging {
             report: read_json(&self.run_dir(run).join("report.json"))
                 .ok()
                 .flatten(),
+            applied: None,
         }
     }
 
@@ -255,6 +290,29 @@ impl Staging {
             .map(|meta| self.shown(run, &meta)))
     }
 
+    /// What an apply reads of a staged run, in one look under the lock:
+    /// every stream, when it was begun, what read it, and its report.
+    /// `None` when the run has expired or a piece is missing.
+    pub(crate) fn whole(&self, run: Id, now: i64) -> Result<Option<Whole>, Error> {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(meta) = self.meta(run)? else {
+            return Ok(None);
+        };
+        let Some((streams, begun_at)) = self.streams_held(run, now)? else {
+            return Ok(None);
+        };
+        let report = read_json(&self.run_dir(run).join("report.json"))?;
+        Ok(Some(Whole {
+            streams,
+            begun_at,
+            reader: meta.reader,
+            report,
+        }))
+    }
+
     /// Every stream of a run whose every piece is held, in the order of its
     /// pieces, with when the run was begun, which tells it from a run
     /// staged again under its ID. `None` when the run is gone or a piece is
@@ -264,6 +322,15 @@ impl Staging {
         run: Id,
         now: i64,
     ) -> Result<Option<(Vec<SpotifyStream>, i64)>, Error> {
+        let _writing = self
+            .writing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.streams_held(run, now)
+    }
+
+    /// [`Self::streams`], with the lock held by the caller.
+    fn streams_held(&self, run: Id, now: i64) -> Result<Option<(Vec<SpotifyStream>, i64)>, Error> {
         let Some(meta) = self
             .meta(run)?
             .filter(|meta| now.saturating_sub(meta.begun_at) <= KEEP_MS)
@@ -293,6 +360,35 @@ impl Staging {
         begun_at: i64,
         report: &ImportReport,
     ) -> Result<bool, Error> {
+        self.save(run, begun_at, report, "report.json")
+    }
+
+    /// Keeps the report of a run's apply beside it, as [`Self::save_report`]
+    /// keeps a dry run's, apart from it: an applied run shows this one, or
+    /// none.
+    pub(crate) fn save_applied(
+        &self,
+        run: Id,
+        begun_at: i64,
+        report: &ImportReport,
+    ) -> Result<bool, Error> {
+        self.save(run, begun_at, report, "applied.json")
+    }
+
+    /// The report of a run's apply, when one was kept.
+    pub(crate) fn applied_report(&self, run: Id) -> Option<ImportReport> {
+        read_json(&self.run_dir(run).join("applied.json"))
+            .ok()
+            .flatten()
+    }
+
+    fn save(
+        &self,
+        run: Id,
+        begun_at: i64,
+        report: &ImportReport,
+        name: &str,
+    ) -> Result<bool, Error> {
         let _writing = self
             .writing
             .lock()
@@ -301,7 +397,7 @@ impl Staging {
             Some(meta)
                 if meta.begun_at == begun_at && meta.received.len() == meta.pieces as usize =>
             {
-                write_json(&self.run_dir(run).join("report.json"), report)?;
+                write_json(&self.run_dir(run).join(name), report)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -326,47 +422,191 @@ pub(crate) async fn sweep(core: std::sync::Arc<Core>) {
 /// Carries a claimed dry run to its end: reads the run's streams, works
 /// out what applying them would do, and keeps the report beside the run.
 pub(crate) fn run_dry_run(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
+    info!(job_id = %job.public_id, "a dry run of an import is claimed");
+    let failed = |why: String| finish(core, &job, JobState::Failed, Some(why));
+    let Ok(params) = serde_json::from_str::<RunJobParams>(&job.params_json) else {
+        return failed("the job's params are not a run".to_owned());
+    };
+    // A run applied keeps the report it was applied with: one applied
+    // before this job began is not read at all, and one applied while it
+    // ran keeps nothing of it.
+    if let Some(Ok(Some(_))) = core.with_library(|_, library| library.stored_run(params.run_id)) {
+        return failed("the run is applied".to_owned());
+    }
+    let (streams, begun_at) = match core.staging().streams(params.run_id, core.now_ms()) {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return failed("the staged run is gone, or a piece of it is missing".to_owned());
+        }
+        Err(error) => return failed(error.to_string()),
+    };
+    let report = core.with_library(|_, library| {
+        let report = library.stream_dry_run(streams)?;
+        Ok::<_, ritornel_engine::Error>(
+            library
+                .stored_run(params.run_id)?
+                .is_none()
+                .then_some(report),
+        )
+    });
+    match report {
+        Some(Ok(None)) => failed("the run was applied while it was dry run".to_owned()),
+        Some(Ok(Some(report))) => {
+            match core.staging().save_report(params.run_id, begun_at, &report) {
+                Ok(true) => finish(core, &job, JobState::Succeeded, None),
+                Ok(false) => failed(
+                    "the staged run expired, or was staged again, while it was dry run".to_owned(),
+                ),
+                Err(error) => failed(error.to_string()),
+            }
+        }
+        Some(Err(error)) => failed(error.to_string()),
+        None => failed("this server holds no library".to_owned()),
+    }
+}
+
+/// Ends a run's job, and says so to its subscribers.
+fn finish(core: &Core, job: &ritornel_engine::Job, state: JobState, failure: Option<String>) {
     let (row, job_id) = (job.id, job.public_id);
-    info!(job_id = %job_id, "a dry run of an import is claimed");
-    let finish = |state: JobState, failure: Option<String>| match core
-        .with_stores(|stores| stores.server().finish_job(row, state, failure))
-    {
+    match core.with_stores(|stores| stores.server().finish_job(row, state, failure)) {
         Some(Ok(job)) => core.publish_job(&job),
         Some(Err(failed)) => {
             error!(job_id = %job_id, error = %failed, "a job's end could not be saved");
         }
         None => {}
-    };
-    let Ok(params) = serde_json::from_str::<DryRunParams>(&job.params_json) else {
+    }
+}
+
+/// The library write of a run's job: its one step, whose command a crash
+/// and a second claim of the job both find.
+fn step(
+    job: &ritornel_engine::Job,
+    method: &'static str,
+    run: Id,
+) -> ritornel_engine::WriteRequest {
+    ritornel_engine::WriteRequest {
+        method,
+        command: Some(ritornel_engine::Command {
+            id: ritornel_engine::step_command(job.public_id, 1),
+            fingerprint: ritornel_engine::Fingerprint::of(method, run.as_bytes()),
+        }),
+        client: None,
+    }
+}
+
+/// Why an apply cannot go ahead with the report it has, if it cannot: none
+/// was made, or the matcher or the play rule has changed since.
+pub(crate) fn stale(report: Option<&ImportReport>) -> Option<&'static str> {
+    match report {
+        None => Some("the run has no dry run: dry run it first"),
+        Some(report)
+            if report.grouper_version != ritornel_engine::GROUPER_VERSION
+                || report.play_rule_version != ritornel_engine::PLAY_RULE_VERSION =>
+        {
+            Some("the grouper or the play rule has changed since the dry run: dry run it again")
+        }
+        Some(_) => None,
+    }
+}
+
+/// Carries a claimed apply to its end: works out what applying the run does
+/// once more, as the library is now, stores what is new and records the
+/// run in one write, and keeps that report as the run's.
+pub(crate) fn run_apply(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
+    info!(job_id = %job.public_id, "an import is applied");
+    let Ok(params) = serde_json::from_str::<RunJobParams>(&job.params_json) else {
         return finish(
+            core,
+            &job,
             JobState::Failed,
             Some("the job's params are not a run".to_owned()),
         );
     };
-    let (streams, begun_at) = match core.staging().streams(params.run_id, core.now_ms()) {
-        Ok(Some(found)) => found,
+    let run = params.run_id;
+    // A run this job applied before the server stopped, its job not yet
+    // ended, is applied: its staged run is gone with the restart, and is
+    // not needed.
+    match core.with_library(|_, library| library.stored_run(run)) {
+        Some(Ok(Some(_))) => return finish(core, &job, JobState::Succeeded, None),
+        Some(Err(failed)) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
+        Some(Ok(None)) | None => {}
+    }
+    let staging = core.staging();
+    let whole = match staging.whole(run, core.now_ms()) {
+        Ok(Some(whole)) => whole,
         Ok(None) => {
             return finish(
+                core,
+                &job,
                 JobState::Failed,
                 Some("the staged run is gone, or a piece of it is missing".to_owned()),
             );
         }
-        Err(failed) => return finish(JobState::Failed, Some(failed.to_string())),
+        Err(failed) => return finish(core, &job, JobState::Failed, Some(failed.to_string())),
     };
-    let report = core.with_library(|_, library| library.stream_dry_run(streams));
-    match report {
-        Some(Ok(report)) => match core.staging().save_report(params.run_id, begun_at, &report) {
-            Ok(true) => finish(JobState::Succeeded, None),
-            Ok(false) => finish(
-                JobState::Failed,
-                Some(
-                    "the staged run expired, or was staged again, while it was dry run".to_owned(),
-                ),
-            ),
-            Err(failed) => finish(JobState::Failed, Some(failed.to_string())),
-        },
-        Some(Err(failed)) => finish(JobState::Failed, Some(failed.to_string())),
+    if let Some(why) = stale(whole.report.as_ref()) {
+        return finish(core, &job, JobState::Failed, Some(why.to_owned()));
+    }
+    let Whole {
+        streams,
+        begun_at,
+        reader,
+        ..
+    } = whole;
+    let applied = core.with_library(|_, library| {
+        library.apply_streams(
+            step(&job, ritornel_engine::APPLY_METHOD, run),
+            run,
+            streams,
+            reader,
+            params.session,
+        )
+    });
+    match applied {
+        Some(Ok((_, report))) => {
+            // The run is applied whatever becomes of its report: one that
+            // cannot be kept leaves the run with none to show.
+            if let Some(report) = report
+                && let Err(failed) = staging.save_applied(run, begun_at, &report)
+            {
+                warn!(error = %failed, "an applied run's report could not be kept");
+            }
+            finish(core, &job, JobState::Succeeded, None);
+        }
+        Some(Err(failed)) => finish(core, &job, JobState::Failed, Some(failed.to_string())),
         None => finish(
+            core,
+            &job,
+            JobState::Failed,
+            Some("this server holds no library".to_owned()),
+        ),
+    }
+}
+
+/// Carries a claimed undo to its end: takes the run out of force in one
+/// write.
+pub(crate) fn run_undo(core: &Core, job: ritornel_engine::Job, _stop: &AtomicBool) {
+    info!(job_id = %job.public_id, "an import is undone");
+    let Ok(params) = serde_json::from_str::<RunJobParams>(&job.params_json) else {
+        return finish(
+            core,
+            &job,
+            JobState::Failed,
+            Some("the job's params are not a run".to_owned()),
+        );
+    };
+    let undone = core.with_library(|_, library| {
+        library.undo_streams(
+            step(&job, ritornel_engine::UNDO_METHOD, params.run_id),
+            params.run_id,
+        )
+    });
+    match undone {
+        Some(Ok(_)) => finish(core, &job, JobState::Succeeded, None),
+        Some(Err(failed)) => finish(core, &job, JobState::Failed, Some(failed.to_string())),
+        None => finish(
+            core,
+            &job,
             JobState::Failed,
             Some("this server holds no library".to_owned()),
         ),
@@ -381,6 +621,8 @@ mod tests {
     use crate::testing::Scratch;
 
     const NOW: i64 = 1_794_776_400_000;
+
+    const READER: &str = "ritornelctl 0.1.0";
 
     fn stream(title: &str) -> SpotifyStream {
         SpotifyStream {
@@ -412,11 +654,11 @@ mod tests {
         let scratch = Scratch::new();
         let staging = Staging::start(scratch.path().join("imports")).unwrap();
         let second = vec![stream("Paper Lanterns")];
-        let shown = staging.stage(run(), 1, 2, &second, NOW).unwrap();
+        let shown = staging.stage(run(), 1, 2, READER, &second, NOW).unwrap();
         assert_eq!((shown.pieces, shown.received, shown.streams), (2, 1, 1));
         assert_eq!(staging.streams(run(), NOW).unwrap(), None);
         let first = vec![stream("Low Tide"), stream("Night Ferry")];
-        let shown = staging.stage(run(), 0, 2, &first, NOW).unwrap();
+        let shown = staging.stage(run(), 0, 2, READER, &first, NOW).unwrap();
         assert_eq!(
             (shown.received, shown.streams, shown.expires_at),
             (2, 3, NOW + KEEP_MS)
@@ -435,22 +677,22 @@ mod tests {
         let scratch = Scratch::new();
         let staging = Staging::start(scratch.path().join("imports")).unwrap();
         let piece = vec![stream("Low Tide")];
-        staging.stage(run(), 0, 1, &piece, NOW).unwrap();
-        let again = staging.stage(run(), 0, 1, &piece, NOW).unwrap();
+        staging.stage(run(), 0, 1, READER, &piece, NOW).unwrap();
+        let again = staging.stage(run(), 0, 1, READER, &piece, NOW).unwrap();
         assert_eq!((again.received, again.streams), (1, 1));
         assert!(matches!(
-            staging.stage(run(), 0, 1, &[stream("Night Ferry")], NOW),
+            staging.stage(run(), 0, 1, READER, &[stream("Night Ferry")], NOW),
             Err(Refused::Conflict)
         ));
         for (piece, pieces) in [(1, 1), (0, 0), (0, 2)] {
             assert!(matches!(
-                staging.stage(run(), piece, pieces, &[], NOW),
+                staging.stage(run(), piece, pieces, READER, &[], NOW),
                 Err(Refused::Invalid(_))
             ));
         }
         let many = vec![stream("Low Tide"); MAX_STREAMS_PER_PIECE + 1];
         assert!(matches!(
-            staging.stage(Id::from_bytes([1; 16]), 0, 1, &many, NOW),
+            staging.stage(Id::from_bytes([1; 16]), 0, 1, READER, &many, NOW),
             Err(Refused::Invalid(_))
         ));
     }
@@ -460,7 +702,7 @@ mod tests {
         let scratch = Scratch::new();
         let staging = Staging::start(scratch.path().join("imports")).unwrap();
         staging
-            .stage(run(), 0, 2, &[stream("Low Tide")], NOW)
+            .stage(run(), 0, 2, READER, &[stream("Low Tide")], NOW)
             .unwrap();
         // Piece 1 reached the disk and run.json did not, as when the disk
         // filled between the two.
@@ -468,7 +710,7 @@ mod tests {
         write_json(&dir.join("piece-1.json"), &vec![stream("Night Ferry")]).unwrap();
         assert_eq!(staging.run(run(), NOW).unwrap().unwrap().received, 1);
         let again = staging
-            .stage(run(), 1, 2, &[stream("Night Ferry")], NOW)
+            .stage(run(), 1, 2, READER, &[stream("Night Ferry")], NOW)
             .unwrap();
         assert_eq!((again.received, again.streams), (2, 2));
         assert!(staging.streams(run(), NOW).unwrap().is_some());
@@ -484,13 +726,24 @@ mod tests {
         late.ended_at = i64::MAX;
         for wrong in [long, late] {
             assert!(matches!(
-                staging.stage(run(), 0, 1, &[wrong], NOW),
+                staging.stage(run(), 0, 1, READER, &[wrong], NOW),
                 Err(Refused::Invalid(_))
             ));
         }
-        // A piece holds a stream at least.
+        // A piece holds a stream at least, and what read it is plain text.
         assert!(matches!(
-            staging.stage(run(), 0, 1, &[], NOW),
+            staging.stage(run(), 0, 1, READER, &[], NOW),
+            Err(Refused::Invalid(_))
+        ));
+        assert!(matches!(
+            staging.stage(
+                run(),
+                0,
+                1,
+                "ritornelctl\u{1b}[2J",
+                &[stream("Low Tide")],
+                NOW
+            ),
             Err(Refused::Invalid(_))
         ));
     }
@@ -500,7 +753,7 @@ mod tests {
         let scratch = Scratch::new();
         let staging = Staging::start(scratch.path().join("imports")).unwrap();
         staging
-            .stage(run(), 0, 1, &[stream("Low Tide")], NOW)
+            .stage(run(), 0, 1, READER, &[stream("Low Tide")], NOW)
             .unwrap();
         let (_, begun_at) = staging.streams(run(), NOW).unwrap().unwrap();
         assert!(staging.streams(run(), NOW + KEEP_MS + 1).unwrap().is_none());
@@ -508,13 +761,22 @@ mod tests {
         // of the first is not the second's.
         staging.sweep(NOW + KEEP_MS + 1);
         staging
-            .stage(run(), 0, 1, &[stream("Low Tide")], NOW + KEEP_MS + 2)
+            .stage(
+                run(),
+                0,
+                1,
+                READER,
+                &[stream("Low Tide")],
+                NOW + KEEP_MS + 2,
+            )
             .unwrap();
         let report = ImportReport {
             made_at: NOW,
             grouper_version: 1,
+            play_rule_version: 1,
             streams: 1,
             events: 1,
+            respelled: 0,
             scrobbles: 0,
             scrobbles_excluded: 0,
             scrobbles_echoes: 0,
@@ -533,6 +795,11 @@ mod tests {
         assert!(staging.run(run(), later).unwrap().unwrap().report.is_none());
         let (_, begun_again) = staging.streams(run(), later).unwrap().unwrap();
         assert!(staging.save_report(run(), begun_again, &report).unwrap());
+        assert!(staging.run(run(), later).unwrap().unwrap().report.is_some());
+        // An apply's report is kept apart from the dry run's.
+        assert!(staging.applied_report(run()).is_none());
+        assert!(staging.save_applied(run(), begun_again, &report).unwrap());
+        assert_eq!(staging.applied_report(run()), Some(report));
     }
 
     #[test]
@@ -541,14 +808,21 @@ mod tests {
         let folder = scratch.path().join("imports");
         let staging = Staging::start(folder.clone()).unwrap();
         staging
-            .stage(run(), 0, 1, &[stream("Low Tide")], NOW)
+            .stage(run(), 0, 1, READER, &[stream("Low Tide")], NOW)
             .unwrap();
         assert!(staging.run(run(), NOW + KEEP_MS).unwrap().is_some());
         assert!(staging.run(run(), NOW + KEEP_MS + 1).unwrap().is_none());
         // Staging another run a day later sweeps it away.
         let other = Id::from_bytes([2; 16]);
         staging
-            .stage(other, 0, 1, &[stream("Low Tide")], NOW + KEEP_MS + 1)
+            .stage(
+                other,
+                0,
+                1,
+                READER,
+                &[stream("Low Tide")],
+                NOW + KEEP_MS + 1,
+            )
             .unwrap();
         assert!(!folder.join(run().to_string()).exists());
         let staging = Staging::start(folder.clone()).unwrap();

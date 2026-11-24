@@ -10,8 +10,15 @@
 //! ratings.jsonl        every rating and love as it was said, a clearing included
 //! deliveries.jsonl     every play sent, or to be sent, to a service such as
 //!                      Last.fm: what was sent and what became of it
+//! runs.jsonl           every archive of streams applied, such as Spotify's,
+//!                      with its ledger: whether it is in force
+//! run_streams.jsonl    the streams each run's archive held
 //! plays.csv            the plays derived from them, as a plain table
 //! ```
+//!
+//! A stream is an import whose line has a `stream` object: what only a
+//! stream knows. It is in force while a run that held it is: one whose
+//! newest ledger entry in runs.jsonl is `applied`.
 //!
 //! An observation is named by its endpoint and its source key, never by
 //! the ID of a play, which a rebuild can change. The observations and the ratings are the record; the plays are derived
@@ -61,8 +68,9 @@ use crate::{Error, LibraryStore};
 pub const EXPORT_FORMAT: &str = "ritornel-record";
 
 /// The format's version. A change a reader of one version would misread is
-/// the next. Version 2 added `deliveries.jsonl`.
-pub const EXPORT_VERSION: u32 = 2;
+/// the next. Version 2 added `deliveries.jsonl`, and version 3 streams,
+/// `runs.jsonl` and `run_streams.jsonl`.
+pub const EXPORT_VERSION: u32 = 3;
 
 /// How many of each were written.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -70,6 +78,8 @@ pub struct Exported {
     pub observations: u64,
     pub ratings: u64,
     pub deliveries: u64,
+    pub runs: u64,
+    pub run_streams: u64,
     pub plays: u64,
 }
 
@@ -84,6 +94,8 @@ impl LibraryStore {
             observations: observations(&connection, &into.join("observations.jsonl"))?,
             ratings: ratings(&connection, &into.join("ratings.jsonl"))?,
             deliveries: deliveries(&connection, &into.join("deliveries.jsonl"))?,
+            runs: runs(&connection, &into.join("runs.jsonl"))?,
+            run_streams: run_streams(&connection, &into.join("run_streams.jsonl"))?,
             plays: plays(&connection, &into.join("plays.csv"))?,
         };
         let manifest = manifest(&connection, self.library_id(), now_ms, exported)?;
@@ -188,6 +200,8 @@ fn manifest(
             "observations.jsonl": { "lines": exported.observations },
             "ratings.jsonl": { "lines": exported.ratings },
             "deliveries.jsonl": { "lines": exported.deliveries },
+            "runs.jsonl": { "lines": exported.runs },
+            "run_streams.jsonl": { "lines": exported.run_streams },
             "plays.csv": {
                 "rows": exported.plays,
                 "playRuleVersions": versions("play_rule_version")?,
@@ -385,11 +399,17 @@ fn listen(connection: &Connection, observation: i64) -> Result<Value, Error> {
 
 fn import(connection: &Connection, observation: i64) -> Result<Value, Error> {
     let mut statement = connection.prepare_cached(
-        "SELECT played_at_utc_ms, artist, album, title, artist_mbid, album_mbid, track_mbid
-         FROM observation_import WHERE observation_id = ?1",
+        "SELECT i.played_at_utc_ms, i.artist, i.album, i.title, i.artist_mbid, i.album_mbid,
+                i.track_mbid, s.observation_id IS NOT NULL, s.ended_at_utc_ms, s.ms_played,
+                s.reason_start, s.reason_end, s.shuffle, s.skipped, s.offline,
+                s.offline_timestamp, s.incognito, d.platform, d.device_kind, d.via
+         FROM observation_import i
+         LEFT JOIN observation_import_stream s ON s.observation_id = i.observation_id
+         LEFT JOIN stream_device d ON d.observation_id = i.observation_id
+         WHERE i.observation_id = ?1",
     )?;
     Ok(statement.query_row([observation], |row| {
-        Ok(json!({
+        let mut import = json!({
             "playedAt": utc(row.get(0)?),
             "artist": row.get::<_, String>(1)?,
             "album": row.get::<_, Option<String>>(2)?,
@@ -397,7 +417,29 @@ fn import(connection: &Connection, observation: i64) -> Result<Value, Error> {
             "artistMbid": row.get::<_, Option<String>>(4)?,
             "albumMbid": row.get::<_, Option<String>>(5)?,
             "trackMbid": row.get::<_, Option<String>>(6)?,
-        }))
+        });
+        // A stream's playedAt is its end less the time it played.
+        if row.get::<_, bool>(7)? {
+            put(
+                &mut import,
+                "stream",
+                json!({
+                    "endedAt": utc(row.get(8)?),
+                    "msPlayed": row.get::<_, i64>(9)?,
+                    "reasonStart": row.get::<_, Option<String>>(10)?,
+                    "reasonEnd": row.get::<_, Option<String>>(11)?,
+                    "shuffle": row.get::<_, Option<bool>>(12)?,
+                    "skipped": row.get::<_, Option<bool>>(13)?,
+                    "offline": row.get::<_, Option<bool>>(14)?,
+                    "offlineTimestamp": row.get::<_, Option<i64>>(15)?,
+                    "incognito": row.get::<_, Option<bool>>(16)?,
+                    "platform": row.get::<_, Option<String>>(17)?,
+                    "deviceKind": row.get::<_, Option<String>>(18)?,
+                    "playedVia": row.get::<_, Option<String>>(19)?,
+                }),
+            );
+        }
+        Ok(import)
     })?)
 }
 
@@ -608,6 +650,77 @@ const PLAY_COLUMNS: [&str; 18] = [
     "source_key",
     "corroborated_by",
 ];
+
+/// Every run of streams applied, oldest first, with its ledger.
+fn runs(connection: &Connection, path: &Path) -> Result<u64, Error> {
+    let mut file = create(path)?;
+    let mut statement = connection.prepare(
+        "SELECT r.id, r.public_id, e.public_id, s.public_id, r.session_pid, r.reader,
+                r.records_hash, r.streams, r.new_streams, r.created_at_ms
+         FROM import_run r
+         JOIN history_endpoint e ON e.id = r.endpoint_id
+         JOIN server s ON s.id = r.applied_by_server_id
+         ORDER BY r.id",
+    )?;
+    let mut ledger = connection
+        .prepare("SELECT state, at_ms FROM import_run_event WHERE run_id = ?1 ORDER BY id")?;
+    let mut rows = statement.query([])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        let entries = ledger
+            .query_map([row.get::<_, i64>(0)?], |entry| {
+                Ok(json!({ "state": entry.get::<_, String>(0)?, "at": utc(entry.get(1)?) }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        line(
+            &mut file,
+            &json!({
+                "run": key(row.get(1)?),
+                "endpoint": key(row.get(2)?),
+                "appliedBy": key(row.get(3)?),
+                "session": key(row.get(4)?),
+                "reader": row.get::<_, String>(5)?,
+                "recordsHash": hex(&row.get::<_, Vec<u8>>(6)?),
+                "streams": row.get::<_, i64>(7)?,
+                "newStreams": row.get::<_, i64>(8)?,
+                "createdAt": utc(row.get(9)?),
+                "ledger": entries,
+            }),
+        )?;
+        count += 1;
+    }
+    finish(file)?;
+    Ok(count)
+}
+
+/// The streams each run's archive held, by run and then as
+/// observations.jsonl names them.
+fn run_streams(connection: &Connection, path: &Path) -> Result<u64, Error> {
+    let mut file = create(path)?;
+    let mut statement = connection.prepare(
+        "SELECT r.public_id, e.public_id, o.source_key
+         FROM import_run_stream h
+         JOIN import_run r ON r.id = h.run_id
+         JOIN history_observation o ON o.id = h.observation_id
+         JOIN history_endpoint e ON e.id = o.endpoint_id
+         ORDER BY h.run_id, h.observation_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        line(
+            &mut file,
+            &json!({
+                "run": key(row.get(0)?),
+                "endpoint": key(row.get(1)?),
+                "sourceKey": hex(&row.get::<_, Vec<u8>>(2)?),
+            }),
+        )?;
+        count += 1;
+    }
+    finish(file)?;
+    Ok(count)
+}
 
 fn plays(connection: &Connection, path: &Path) -> Result<u64, Error> {
     let mut file = create(path)?;

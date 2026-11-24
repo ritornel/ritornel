@@ -123,7 +123,10 @@ export const METHODS = {
   "lastfm.report": { kind: "query", needsFull: true },
   "imports.stage": { kind: "command", needsFull: true },
   "imports.dryRun": { kind: "command", needsFull: true },
+  "imports.apply": { kind: "command", needsFull: true },
+  "imports.undo": { kind: "command", needsFull: true },
   "imports.get": { kind: "query", needsFull: true },
+  "imports.list": { kind: "query", needsFull: true },
   "artists.importPictures": { kind: "command", needsFull: true },
   "artists.pictureFolders": { kind: "query", needsFull: true },
   "library.setWatching": { kind: "command", needsFull: true },
@@ -204,8 +207,11 @@ export type MethodMap = {
   "lastfm.setScrobbling": { params: ScrobblingParams; result: ScrobblingSet };
   "lastfm.report": { params: LastfmReportParams; result: LastfmReport };
   "imports.stage": { params: ImportsStageParams; result: ImportsStaged };
-  "imports.dryRun": { params: ImportsDryRunParams; result: ImportsDryRunStarted };
+  "imports.dryRun": { params: ImportsRunParams; result: ImportsJobStarted };
+  "imports.apply": { params: ImportsRunParams; result: ImportsJobStarted };
+  "imports.undo": { params: ImportsRunParams; result: ImportsJobStarted };
   "imports.get": { params: ImportsGetParams; result: ImportRun };
+  "imports.list": { params: NoParams; result: ImportRuns };
   "artists.importPictures": { params: ImportPicturesParams; result: PicturesImported };
   "artists.pictureFolders": { params: NoParams; result: PictureFolders };
   "library.setWatching": { params: WatchingParams; result: WatchingSet };
@@ -449,6 +455,41 @@ export type AlbumVersion = {
    * Whether it is the one the group is set to show.
    */
   shown: boolean,
+};
+
+/**
+ * A run the library holds: one archive applied.
+ */
+export type AppliedRun = {
+  /**
+   * The run.
+   */
+  runId: string,
+  /**
+   * The streams its archive held.
+   */
+  streams: number,
+  /**
+   * Of those, the ones it stored: an earlier run stored the rest.
+   */
+  newStreams: number,
+  /**
+   * Whether it is in force. A stream is in force while any run that
+   * held it is.
+   */
+  inForce: boolean,
+  /**
+   * When it was applied.
+   */
+  appliedAt: number,
+  /**
+   * When it was last undone.
+   */
+  undoneAt?: number,
+  /**
+   * What read its archive.
+   */
+  reader: string,
 };
 
 /**
@@ -1607,9 +1648,15 @@ export type ImportReport = {
    */
   madeAt: number,
   /**
-   * The grouper's version, which the stream matcher is part of.
+   * The grouper's version, which the stream matcher is part of. An
+   * apply is refused when it has changed since the dry run.
    */
   grouperVersion: number,
+  /**
+   * The play rule's version. An apply is refused when it has changed
+   * since the dry run.
+   */
+  playRuleVersion: number,
   /**
    * Streams in the run, repeats included.
    */
@@ -1618,6 +1665,11 @@ export type ImportReport = {
    * Listens they report: each repeat counted once.
    */
   events: number,
+  /**
+   * Streams stored already whose record this archive spells otherwise.
+   * The stored record is kept.
+   */
+  respelled: number,
   /**
    * Scrobbles offered to the streams: Last.fm's, less those set aside
    * and those that are this library's own listens come back.
@@ -1699,9 +1751,26 @@ export type ImportRun = {
    */
   expiresAt: number,
   /**
-   * The last dry run's report, once one has finished.
+   * The last report, once a dry run or an apply has finished: an
+   * apply works its report out again in the write that applies it, and
+   * that one is what applying did.
    */
   report?: ImportReport,
+  /**
+   * The run as the library holds it, once it has been applied.
+   */
+  applied?: AppliedRun,
+};
+
+/**
+ * The result of `imports.list`: every run the library holds, newest
+ * first.
+ */
+export type ImportRuns = {
+  /**
+   * The runs.
+   */
+  runs: Array<AppliedRun>,
 };
 
 /**
@@ -1750,6 +1819,10 @@ export type ImportYear = {
    * Listens Spotify reported: streams, each repeat counted once.
    */
   streams: number,
+  /**
+   * Of those, the ones an earlier run stored already.
+   */
+  alreadyStored: number,
   /**
    * Of those, the ones joined to a scrobble by tier A.
    */
@@ -1806,13 +1879,9 @@ export type ImportYear = {
 };
 
 /**
- * The params of `imports.dryRun`.
+ * The params of `imports.get`.
  */
-export type ImportsDryRunParams = {
-  /**
-   * The command's ID, made by the client.
-   */
-  idempotencyKey: string,
+export type ImportsGetParams = {
   /**
    * The run.
    */
@@ -1820,12 +1889,12 @@ export type ImportsDryRunParams = {
 };
 
 /**
- * The result of `imports.dryRun`.
+ * The result of `imports.dryRun`, `imports.apply` and `imports.undo`.
  */
-export type ImportsDryRunStarted = {
+export type ImportsJobStarted = {
   /**
-   * The job that works the dry run out. Its report is the run's, from
-   * `imports.get`, once the job has succeeded.
+   * The job that does it. A dry run's report, and an apply's, is the
+   * run's, from `imports.get`, once the job has succeeded.
    */
   job: Job,
   /**
@@ -1844,9 +1913,13 @@ export type ImportsDryRunStarted = {
 };
 
 /**
- * The params of `imports.get`.
+ * The params of `imports.dryRun`, `imports.apply` and `imports.undo`.
  */
-export type ImportsGetParams = {
+export type ImportsRunParams = {
+  /**
+   * The command's ID, made by the client.
+   */
+  idempotencyKey: string,
   /**
    * The run.
    */
@@ -1875,6 +1948,12 @@ export type ImportsStageParams = {
    * How many pieces the run has.
    */
   pieces: number,
+  /**
+   * What read the archive, by name and version, such as
+   * `ritornelctl 0.1.0`, at most [`MAX_CLIENT_TEXT`](crate::MAX_CLIENT_TEXT)
+   * characters. The same in every piece.
+   */
+  reader: string,
   /**
    * Its streams, at most [`MAX_STREAMS_PER_PIECE`].
    */

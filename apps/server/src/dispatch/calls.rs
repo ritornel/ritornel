@@ -56,7 +56,13 @@ pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
         target: job.target.map(|id| {
             if job.kind == crate::lastfm::SYNC_JOB {
                 JobTarget::Account { id }
-            } else if job.kind == crate::imports::DRY_RUN_JOB {
+            } else if [
+                crate::imports::DRY_RUN_JOB,
+                crate::imports::APPLY_JOB,
+                crate::imports::UNDO_JOB,
+            ]
+            .contains(&job.kind.as_str())
+            {
                 JobTarget::ImportRun { id }
             } else {
                 JobTarget::Source { id }

@@ -35,6 +35,8 @@
 //! ritornelctl settings awake <while-active [<minutes>] | always | never>
 //! ritornelctl spotify read <archive>
 //! ritornelctl spotify import <archive> [--samples]
+//! ritornelctl spotify apply | undo <run>
+//! ritornelctl spotify runs
 //! ```
 //!
 //! Every command takes `--json`, and every command that talks to a server
@@ -102,6 +104,8 @@ Usage:
                              [--data-dir <dir>] [--json]
   ritornelctl spotify read <archive> [--json]
   ritornelctl spotify import <archive> [--samples] [--data-dir <dir>] [--json]
+  ritornelctl spotify apply | undo <run> [--data-dir <dir>] [--json]
+  ritornelctl spotify runs [--data-dir <dir>] [--json]
 
 Commands:
   status           Show the running server's ID, name and role, the versions
@@ -249,6 +253,16 @@ Commands:
                    streams are the same listens as Last.fm's scrobbles,
                    how many of the rest count, and the plays by year
                    before and after. The hub keeps what was sent for a day
+  spotify apply <run>
+                   Import a run that `spotify import` sent: store its
+                   streams that the library does not have, and record the
+                   run, in one change. A run applied again changes nothing
+  spotify undo <run>
+                   Take an applied run out of force. Its streams stay
+                   stored, and those another run in force holds stay in
+                   force. Importing the archive again brings it back
+  spotify runs     List the runs applied to the library, and whether each
+                   is in force
 
 Options:
   --name <name>         scan, artists pictures: the name the folder is
@@ -450,6 +464,18 @@ enum Command {
 pub(crate) enum SpotifyCommand {
     Read(SpotifyReadArgs),
     Import(SpotifyImportArgs),
+    Apply(SpotifyRunArgs),
+    Undo(SpotifyRunArgs),
+    Runs(ServerArgs),
+}
+
+/// What `spotify apply` and `spotify undo` take.
+#[derive(Debug, Default, PartialEq, Eq, Args)]
+pub(crate) struct SpotifyRunArgs {
+    /// The run, by its ID.
+    pub(crate) run: String,
+    #[command(flatten)]
+    pub(crate) server: ServerArgs,
 }
 
 /// What `spotify import` takes.
@@ -927,6 +953,9 @@ fn try_run(
         Command::Settings(args) => settings::settings(&args, env, out),
         Command::Spotify(SpotifyCommand::Read(args)) => spotify::read_command(&args, out),
         Command::Spotify(SpotifyCommand::Import(args)) => spotify::import(&args, env, out),
+        Command::Spotify(SpotifyCommand::Apply(args)) => spotify::apply(&args, env, out),
+        Command::Spotify(SpotifyCommand::Undo(args)) => spotify::undo(&args, env, out),
+        Command::Spotify(SpotifyCommand::Runs(args)) => spotify::runs(&args, env, out),
     }
 }
 

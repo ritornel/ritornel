@@ -280,6 +280,18 @@ fn names(record: &SpotifyStream) -> (String, String) {
     (name_key(&record.artist), name_key(&record.title))
 }
 
+/// A stream's record as it is kept: what Spotify said of the listen,
+/// without what a reader said it was played on, which is kept apart.
+#[must_use]
+pub fn kept(record: &SpotifyStream) -> SpotifyStream {
+    SpotifyStream {
+        platform: None,
+        device_kind: None,
+        via: None,
+        ..record.clone()
+    }
+}
+
 /// A field that says something before one that says nothing.
 fn said<T: Ord>(field: Option<T>) -> (bool, Option<T>) {
     (field.is_none(), field)

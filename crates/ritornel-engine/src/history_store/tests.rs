@@ -1609,7 +1609,10 @@ fn an_export_gives_a_skipped_listen_with_what_it_was_played_from_an_imported_pla
             .unwrap();
     assert_eq!(
         (&manifest["format"], &manifest["version"]),
-        (&serde_json::json!("ritornel-record"), &serde_json::json!(2))
+        (
+            &serde_json::json!("ritornel-record"),
+            &serde_json::json!(crate::EXPORT_VERSION)
+        )
     );
     assert_eq!(
         manifest["zonePeriods"],

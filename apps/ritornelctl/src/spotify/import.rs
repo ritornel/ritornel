@@ -1,23 +1,32 @@
 //! `ritornelctl spotify import <archive>`: reads the archive here, sends
 //! its kept records to the hub as a staged run, and shows the dry run of
-//! that run. Nothing is written to the library. See "Spotify streams" in
+//! that run, writing nothing to the library. `spotify apply <run>` applies
+//! a staged run, `spotify undo <run>` takes an applied one out of force, and
+//! `spotify runs` lists the runs the library holds. See "Spotify streams" in
 //! docs/internals/history.md.
 
 use std::fmt::Write as _;
 use std::io::Write;
 use std::time::Duration;
 
-use ritornel_client::contract::methods::{ImportsDryRun, ImportsGet, ImportsStage};
+use ritornel_client::Client;
+use ritornel_client::contract::methods::{
+    ImportsApply, ImportsDryRun, ImportsGet, ImportsList, ImportsStage, ImportsUndo, Method,
+};
 use ritornel_client::contract::{
-    ImportProblem, ImportReport, ImportRun, ImportsDryRunParams, ImportsGetParams,
-    ImportsStageParams, Job, JobState, MAX_STREAMS_PER_PIECE, SpotifyStream, StreamTier,
+    AppliedRun, Id, ImportProblem, ImportReport, ImportRun, ImportsGetParams, ImportsJobStarted,
+    ImportsRunParams, ImportsStageParams, Job, JobState, MAX_STREAMS_PER_PIECE, NoParams,
+    SpotifyStream, StreamTier,
 };
 use ritornel_client::local;
 use serde_json::json;
 
-use super::{Tally, read, render_tally, to_json};
-use crate::cli::{Error, SpotifyImportArgs};
+use super::{Tally, day, read, render_tally, to_json};
+use crate::cli::{Error, ServerArgs, SpotifyImportArgs, SpotifyRunArgs};
 use crate::server;
+
+/// What read an archive, as a run records it.
+const READER: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"));
 
 /// How large one piece may be on the wire: half a message's limit, so that
 /// the envelope and any long names never take it over.
@@ -69,46 +78,212 @@ pub(crate) fn import(
                     run_id,
                     piece: u32::try_from(at).unwrap_or(u32::MAX),
                     pieces: count,
+                    reader: READER.to_owned(),
                     streams,
                 })
                 .await?;
         }
-        let started = client
-            .call::<ImportsDryRun>(&ImportsDryRunParams {
-                idempotency_key: ritornel_client::idempotency_key()?,
-                run_id,
-            })
-            .await?;
-        let mut job = started.job;
-        while !job.state.ended() {
-            tokio::time::sleep(LOOK_EVERY).await;
-            job = client.job(job.job_id).await?.job;
-        }
+        let job = run_job::<ImportsDryRun>(client, run_id).await?;
         let run = client
             .call::<ImportsGet>(&ImportsGetParams { run_id })
             .await?;
         Ok((job, run))
     })?;
     let (job, run) = run;
-    let text = if args.server.json {
-        let mut text = serde_json::to_string_pretty(&json!({
-            "read": to_json(&tally),
-            "run": run,
-            "job": job,
-        }))
-        .map_err(|error| Error::Output(error.into()))?;
-        text.push('\n');
-        text
-    } else {
-        rendered(&tally, &run, &job, args.samples)
-    };
-    out.write_all(text.as_bytes())
-        .and_then(|()| out.flush())
-        .map_err(Error::Output)?;
+    print(
+        &args.server,
+        out,
+        &json!({ "read": to_json(&tally), "run": run, "job": job }),
+        || rendered(&tally, &run, &job, args.samples),
+    )?;
     match job.state {
         JobState::Succeeded => Ok(()),
         state => Err(Error::Job(state.as_str())),
     }
+}
+
+/// Starts a run's job and waits for it to end.
+async fn run_job<M>(client: &Client, run_id: Id) -> Result<Job, ritornel_client::Error>
+where
+    M: Method<Params = ImportsRunParams, Result = ImportsJobStarted>,
+{
+    let started = client
+        .call::<M>(&ImportsRunParams {
+            idempotency_key: ritornel_client::idempotency_key()?,
+            run_id,
+        })
+        .await?;
+    let mut job = started.job;
+    while !job.state.ended() {
+        tokio::time::sleep(LOOK_EVERY).await;
+        job = client.job(job.job_id).await?.job;
+    }
+    Ok(job)
+}
+
+fn run_id(args: &SpotifyRunArgs) -> Result<Id, Error> {
+    args.run
+        .parse::<Id>()
+        .map_err(|_| Error::Usage("that is not a run's ID"))
+}
+
+/// Writes `text`, or `json` when asked for JSON.
+fn print(
+    args: &ServerArgs,
+    out: &mut dyn Write,
+    json: &serde_json::Value,
+    text: impl FnOnce() -> String,
+) -> Result<(), Error> {
+    let text = if args.json {
+        let mut text =
+            serde_json::to_string_pretty(json).map_err(|error| Error::Output(error.into()))?;
+        text.push('\n');
+        text
+    } else {
+        text()
+    };
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(Error::Output)
+}
+
+/// `spotify apply <run>`.
+pub(crate) fn apply(
+    args: &SpotifyRunArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let run_id = run_id(args)?;
+    let (job, run, applied) = server::ask_for(&args.server, env, None, async |client| {
+        let job = run_job::<ImportsApply>(client, run_id).await?;
+        // The staged run, with the report applying worked out, while the
+        // hub keeps it; the run as the library holds it in any case.
+        let run = client
+            .call::<ImportsGet>(&ImportsGetParams { run_id })
+            .await
+            .ok();
+        let applied = match run.as_ref().and_then(|run| run.applied.clone()) {
+            Some(applied) => Some(applied),
+            None => client
+                .call::<ImportsList>(&NoParams {})
+                .await?
+                .runs
+                .into_iter()
+                .find(|run| run.run_id == run_id),
+        };
+        Ok((job, run, applied))
+    })?;
+    print(
+        &args.server,
+        out,
+        &json!({ "run": run, "applied": applied, "job": job }),
+        || {
+            let mut text = String::new();
+            match (&job.state, &applied) {
+                (JobState::Succeeded, Some(applied)) => {
+                    let _ = writeln!(
+                        text,
+                        "Applied run {}: {} streams, {} of them new to the library. It is {}.",
+                        applied.run_id,
+                        applied.streams,
+                        applied.new_streams,
+                        if applied.in_force {
+                            "in force"
+                        } else {
+                            "out of force: it was undone, and importing its archive again \
+                             brings it back"
+                        }
+                    );
+                    if let Some(report) = run.as_ref().and_then(|run| run.report.as_ref()) {
+                        text.push_str(&report_text(
+                            report,
+                            "What applying did, as worked out in the write that applied it",
+                            false,
+                        ));
+                    }
+                }
+                _ => {
+                    let _ = writeln!(
+                        text,
+                        "The run was not applied: {}.",
+                        job.error.as_deref().unwrap_or("it did not finish")
+                    );
+                }
+            }
+            text
+        },
+    )?;
+    match job.state {
+        JobState::Succeeded => Ok(()),
+        state => Err(Error::Job(state.as_str())),
+    }
+}
+
+/// `spotify undo <run>`.
+pub(crate) fn undo(
+    args: &SpotifyRunArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let run_id = run_id(args)?;
+    let (job, runs) = server::ask_for(&args.server, env, None, async |client| {
+        let job = run_job::<ImportsUndo>(client, run_id).await?;
+        let runs = client.call::<ImportsList>(&NoParams {}).await?;
+        Ok((job, runs))
+    })?;
+    let run = runs.runs.into_iter().find(|run| run.run_id == run_id);
+    print(
+        &args.server,
+        out,
+        &json!({ "run": run, "job": job }),
+        || match (&job.state, &run) {
+            (JobState::Succeeded, Some(run)) => format!(
+                "Run {} is out of force. Its {} streams stay stored, and any that a run in \
+                 force holds too stay in force.\n",
+                run.run_id, run.streams
+            ),
+            _ => format!(
+                "The run was not undone: {}.\n",
+                job.error.as_deref().unwrap_or("it did not finish")
+            ),
+        },
+    )?;
+    match job.state {
+        JobState::Succeeded => Ok(()),
+        state => Err(Error::Job(state.as_str())),
+    }
+}
+
+fn run_line(run: &AppliedRun) -> String {
+    let state = match run.undone_at {
+        Some(undone) if !run.in_force => format!("undone {}", day(undone)),
+        _ => "in force".to_owned(),
+    };
+    format!(
+        "{}  applied {}  {state}  {} streams, {} new  {}\n",
+        run.run_id,
+        day(run.applied_at),
+        run.streams,
+        run.new_streams,
+        run.reader
+    )
+}
+
+/// `spotify runs`.
+pub(crate) fn runs(
+    args: &ServerArgs,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
+    let runs = server::ask(args, env, async |client| {
+        client.call::<ImportsList>(&NoParams {}).await
+    })?;
+    print(args, out, &json!(runs), || {
+        if runs.runs.is_empty() {
+            return "No Spotify history has been applied to this library.\n".to_owned();
+        }
+        runs.runs.iter().map(run_line).collect()
+    })
 }
 
 fn tier_name(tier: StreamTier) -> &'static str {
@@ -130,8 +305,8 @@ fn rendered(tally: &Tally, run: &ImportRun, job: &Job, samples: bool) -> String 
     let _ = writeln!(
         text,
         "\nSent {} streams to the hub as run {}, kept there for a day. Nothing was written to \
-         the library.",
-        run.streams, run.run_id
+         the library. To apply it: ritornelctl spotify apply {}",
+        run.streams, run.run_id, run.run_id
     );
     let Some(report) = &run.report else {
         let _ = writeln!(
@@ -141,16 +316,27 @@ fn rendered(tally: &Tally, run: &ImportRun, job: &Job, samples: bool) -> String 
         );
         return text;
     };
-    text.push_str(&report_text(report, samples));
+    text.push_str(&report_text(report, "Dry run", samples));
     text
 }
 
-fn report_text(report: &ImportReport, samples: bool) -> String {
-    let mut text = String::from("\nDry run\n");
+fn report_text(report: &ImportReport, heading: &str, samples: bool) -> String {
+    let mut text = format!("\n{heading}\n");
     let mut lines = vec![
         (
             "Listens",
-            format!("{} in {} streams", report.events, report.streams),
+            format!(
+                "{} in {} streams; {} stored already, {} of whose rows this archive spells \
+                 otherwise, which changes nothing",
+                report.events,
+                report.streams,
+                report
+                    .years
+                    .iter()
+                    .map(|year| year.already_stored)
+                    .sum::<u64>(),
+                report.respelled
+            ),
         ),
         (
             "Scrobbles offered",

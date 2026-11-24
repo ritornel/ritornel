@@ -12,7 +12,7 @@ use ritornel_contract::{
 
 use crate::history::{Outcome, ZonePeriod, assumed_zone};
 use crate::streams::{
-    Event, Matched, Pins, Scrobble, Stream, Tier, Tiers, judge_alone, lengths, match_streams,
+    Event, Matched, Pins, Scrobble, Stream, Tier, Tiers, judge_alone, kept, lengths, match_streams,
     name_key, repeat_order,
 };
 
@@ -43,6 +43,8 @@ pub struct DryRunInput<'a> {
     pub zone_periods: &'a [ZonePeriod],
     /// Pairs a correction has pinned.
     pub pins: &'a Pins,
+    /// The streams stored already, by key, as they were stored.
+    pub stored: &'a HashMap<Vec<u8>, SpotifyStream>,
     /// When the report is made.
     pub made_at: i64,
 }
@@ -78,45 +80,123 @@ fn first_record<'a>(streams: &'a [Stream], event: &Event) -> Option<&'a SpotifyS
         .map(|stream| &stream.record)
 }
 
-/// The keys of one stream: `sp1`, its end, its time played, its track's ID,
-/// and its place among the streams with the same three, which are ordered
-/// by their other kept fields. Made from the records alone, so the same
-/// archive gives the same keys, and a later one gives the rows it shares
-/// with an earlier one the same keys too.
-pub fn keyed(records: Vec<SpotifyStream>) -> Vec<Stream> {
-    let mut order: Vec<usize> = (0..records.len()).collect();
-    order.sort_by(|a, b| match (records.get(*a), records.get(*b)) {
-        (Some(a), Some(b)) => (
-            a.ended_at,
-            a.ms_played,
-            a.track_uri.as_str(),
-            repeat_order(a),
-        )
-            .cmp(&(
-                b.ended_at,
-                b.ms_played,
-                b.track_uri.as_str(),
-                repeat_order(b),
-            )),
-        _ => std::cmp::Ordering::Equal,
-    });
-    let mut places: HashMap<(i64, i64, &str), u32> = HashMap::new();
-    let mut keys: Vec<Vec<u8>> = vec![Vec::new(); records.len()];
-    for at in order {
-        let Some(r) = records.get(at) else {
-            continue;
-        };
-        let place = places
-            .entry((r.ended_at, r.ms_played, r.track_uri.as_str()))
-            .or_default();
-        let id = r
-            .track_uri
-            .strip_prefix("spotify:track:")
-            .unwrap_or(&r.track_uri);
-        if let Some(key) = keys.get_mut(at) {
-            *key = format!("sp1:{}:{}:{id}:{place}", r.ended_at, r.ms_played).into_bytes();
+/// The place a stream's key gives it: its last field.
+fn place_of(key: &[u8]) -> Option<u32> {
+    std::str::from_utf8(key)
+        .ok()?
+        .rsplit(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The key of a stream at a place: `sp1`, its end, its time played, its
+/// track's ID and its place among the streams with the same three.
+fn key_at(r: &SpotifyStream, place: u32) -> Vec<u8> {
+    let id = r
+        .track_uri
+        .strip_prefix("spotify:track:")
+        .unwrap_or(&r.track_uri);
+    format!("sp1:{}:{}:{id}:{place}", r.ended_at, r.ms_played).into_bytes()
+}
+
+/// How near a stored record a row of an archive must be to take its place.
+#[derive(Clone, Copy)]
+enum Pass {
+    /// The same record.
+    Same,
+    /// The same but for its names.
+    Respelled,
+    /// Any of its group.
+    Any,
+}
+
+/// A record without its names.
+fn unnamed(r: &SpotifyStream) -> SpotifyStream {
+    SpotifyStream {
+        title: String::new(),
+        artist: String::new(),
+        album: None,
+        ..r.clone()
+    }
+}
+
+/// The keys of an archive's streams, made from the records alone and from
+/// the streams stored already, never from a clock of ours.
+///
+/// The streams with the same end, time played and track are one group, in
+/// the order of their other kept fields. A stream takes the place of a
+/// stored stream of its group with the same record as it is kept; then one
+/// takes the place of a stored stream of its group that is left, first one
+/// that differs in its names alone, as a row a later archive gives
+/// otherwise, which keeps the record it was stored with; and the rest take
+/// places no stored stream has. So the same archive gives the
+/// same keys, and a later one gives the rows it shares with an earlier one
+/// their keys, whatever rows it adds and wherever they sort.
+pub fn keyed(records: Vec<SpotifyStream>, stored: &HashMap<Vec<u8>, SpotifyStream>) -> Vec<Stream> {
+    type Group<'a> = (i64, i64, &'a str);
+    let mut held: HashMap<Group<'_>, Vec<(u32, &SpotifyStream)>> = HashMap::new();
+    for (key, record) in stored {
+        if let Some(place) = place_of(key) {
+            held.entry((record.ended_at, record.ms_played, record.track_uri.as_str()))
+                .or_default()
+                .push((place, record));
         }
-        *place += 1;
+    }
+    for places in held.values_mut() {
+        places.sort_by_key(|(place, _)| *place);
+    }
+    let mut groups: BTreeMap<Group<'_>, Vec<usize>> = BTreeMap::new();
+    for (at, r) in records.iter().enumerate() {
+        groups
+            .entry((r.ended_at, r.ms_played, r.track_uri.as_str()))
+            .or_default()
+            .push(at);
+    }
+    let mut keys: Vec<Vec<u8>> = vec![Vec::new(); records.len()];
+    for (group, mut members) in groups {
+        members.sort_by(|a, b| match (records.get(*a), records.get(*b)) {
+            (Some(a), Some(b)) => repeat_order(a).cmp(&repeat_order(b)),
+            _ => std::cmp::Ordering::Equal,
+        });
+        let stored = held.get(&group).map(Vec::as_slice).unwrap_or_default();
+        let mut taken: HashSet<u32> = HashSet::new();
+        let mut place: Vec<Option<u32>> = vec![None; members.len()];
+        // The same record first, then one spelled otherwise in its names
+        // alone, then any left of the group.
+        for pass in [Pass::Same, Pass::Respelled, Pass::Any] {
+            for (slot, at) in place.iter_mut().zip(&members) {
+                if slot.is_some() {
+                    continue;
+                }
+                let Some(record) = records.get(*at) else {
+                    continue;
+                };
+                let record = kept(record);
+                let found = stored.iter().find(|(held_at, held)| {
+                    !taken.contains(held_at)
+                        && match pass {
+                            Pass::Same => kept(held) == record,
+                            Pass::Respelled => unnamed(&kept(held)) == unnamed(&record),
+                            Pass::Any => true,
+                        }
+                });
+                if let Some((held_at, _)) = found {
+                    taken.insert(*held_at);
+                    *slot = Some(*held_at);
+                }
+            }
+        }
+        let mut next = stored.iter().map(|(at, _)| at + 1).max().unwrap_or(0);
+        for (slot, at) in place.into_iter().zip(&members) {
+            let place = slot.unwrap_or_else(|| {
+                next += 1;
+                next - 1
+            });
+            if let (Some(record), Some(key)) = (records.get(*at), keys.get_mut(*at)) {
+                *key = key_at(record, place);
+            }
+        }
     }
     records
         .into_iter()
@@ -179,6 +259,10 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
     for (index, event) in in_force.events.iter().enumerate() {
         let row = row(&mut years, year(event.start_ms));
         row.streams += 1;
+        let first = event.streams.first().and_then(|at| input.streams.get(*at));
+        if first.is_some_and(|stream| input.stored.contains_key(&stream.key)) {
+            row.already_stored += 1;
+        }
         if assumed_zone(input.listener, event.start_ms, input.zone_periods).is_none() {
             row.no_zone += 1;
         }
@@ -246,8 +330,19 @@ pub fn dry_run(input: &DryRunInput<'_>) -> ImportReport {
     ImportReport {
         made_at: input.made_at,
         grouper_version: crate::history::GROUPER_VERSION,
+        play_rule_version: crate::history::PlayRule::CURRENT.version,
         streams: input.streams.len() as u64,
         events: in_force.events.len() as u64,
+        respelled: input
+            .streams
+            .iter()
+            .filter(|stream| {
+                input
+                    .stored
+                    .get(&stream.key)
+                    .is_some_and(|stored| *stored != kept(&stream.record))
+            })
+            .count() as u64,
         scrobbles: input.scrobbles.len() as u64,
         scrobbles_excluded: input.excluded,
         scrobbles_echoes: input.echoes,
@@ -437,7 +532,7 @@ mod tests {
         let mut other = low.clone();
         other.reason_end = Some("endplay".to_owned());
         let keys = |records: Vec<SpotifyStream>| -> Vec<String> {
-            let mut keys: Vec<String> = keyed(records)
+            let mut keys: Vec<String> = fresh(records)
                 .into_iter()
                 .map(|stream| String::from_utf8(stream.key).unwrap())
                 .collect();
@@ -455,7 +550,7 @@ mod tests {
         );
         // In any order the same records get the same keys: "endplay"
         // sorts first.
-        let keyed_other = keyed(vec![low.clone(), low.clone(), other.clone()]);
+        let keyed_other = fresh(vec![low.clone(), low.clone(), other.clone()]);
         let place_of_other = keyed_other
             .iter()
             .find(|stream| stream.record == other)
@@ -467,6 +562,39 @@ mod tests {
     }
 
     #[test]
+    fn a_later_archive_gives_the_rows_it_shares_their_keys_wherever_new_rows_sort() {
+        // The first archive has a row that ended with "trackdone"; the
+        // next adds a repeat of it that ended with "endplay", which sorts
+        // first, and spells the first's album otherwise.
+        let first = record(221, 221, "Low Tide", "trackdone");
+        let stored: HashMap<Vec<u8>, SpotifyStream> = fresh(vec![first.clone()])
+            .into_iter()
+            .map(|stream| (stream.key, stream.record))
+            .collect();
+        let mut added = first.clone();
+        added.reason_end = Some("endplay".to_owned());
+        let mut respelled = first.clone();
+        respelled.album = Some("Glasshouse (Deluxe)".to_owned());
+        let key_of = |streams: &[Stream], record: &SpotifyStream| {
+            streams
+                .iter()
+                .find(|stream| stream.record == *record)
+                .map(|stream| String::from_utf8(stream.key.clone()).unwrap())
+                .unwrap()
+        };
+        let next = keyed(vec![added.clone(), first.clone()], &stored);
+        assert_eq!(key_of(&next, &first), "sp1:1552683821000:221000:LowTide:0");
+        assert_eq!(key_of(&next, &added), "sp1:1552683821000:221000:LowTide:1");
+        // A row spelled otherwise takes the stored row's key, and keeps it.
+        let next = keyed(vec![added.clone(), respelled.clone()], &stored);
+        assert_eq!(
+            key_of(&next, &respelled),
+            "sp1:1552683821000:221000:LowTide:0"
+        );
+        assert_eq!(key_of(&next, &added), "sp1:1552683821000:221000:LowTide:1");
+    }
+
+    #[test]
     fn which_repeat_speaks_never_depends_on_the_order_rows_came_in() {
         // Two rows of one listen that differ only in their title: the same
         // record speaks for it, and has the same key, in either order.
@@ -474,7 +602,7 @@ mod tests {
         let mut renamed = low.clone();
         renamed.title = "Low Tide - Remastered".to_owned();
         let speaks = |records: Vec<SpotifyStream>| {
-            let streams = keyed(records);
+            let streams = fresh(records);
             let events = crate::streams::events(&streams);
             let first = &streams[events[0].streams[0]];
             (first.record.title.clone(), first.key.clone())
@@ -484,6 +612,15 @@ mod tests {
             speaks(vec![renamed, low])
         );
     }
+
+    /// The keys of an archive when nothing is stored yet.
+    fn fresh(records: Vec<SpotifyStream>) -> Vec<Stream> {
+        keyed(records, &EMPTY)
+    }
+
+    /// No stream stored yet.
+    static EMPTY: std::sync::LazyLock<HashMap<Vec<u8>, SpotifyStream>> =
+        std::sync::LazyLock::new(HashMap::new);
 
     fn input<'a>(
         streams: &'a [Stream],
@@ -500,13 +637,14 @@ mod tests {
             listener: 1,
             zone_periods: &[],
             pins,
+            stored: &EMPTY,
             made_at: 7,
         }
     }
 
     #[test]
     fn a_pause_is_counted_after_a_stream_before_and_each_scrobble_once() {
-        let streams = keyed(vec![
+        let streams = fresh(vec![
             record(100, 100, "Paper Lanterns", "trackdone"),
             // Two streams alone of one track, with the same worked-out
             // start, a minute after the stream before ended.
@@ -535,7 +673,7 @@ mod tests {
         let mut millis = record(900, 221, "Paper Lanterns", "trackdone");
         millis.offline = Some(true);
         millis.offline_timestamp = Some(EVENING + 899_000);
-        let streams = keyed(vec![far, seconds, millis]);
+        let streams = fresh(vec![far, seconds, millis]);
         let (plays, pins) = (BTreeMap::new(), Pins::default());
         let report = dry_run(&input(&streams, &[], &plays, &pins));
         assert_eq!(
@@ -551,7 +689,7 @@ mod tests {
 
     #[test]
     fn a_join_a_correction_pins_is_counted_as_pinned_and_in_no_tier() {
-        let streams = keyed(vec![record(221, 221, "Low Tide", "trackdone")]);
+        let streams = fresh(vec![record(221, 221, "Low Tide", "trackdone")]);
         // An hour on: no tier would join it.
         let scrobbles = [scrobble(3600, "Low Tide")];
         let pins = Pins {
@@ -567,7 +705,7 @@ mod tests {
 
     #[test]
     fn a_dry_run_counts_by_year_and_says_what_stands_in_the_way() {
-        let streams = keyed(vec![
+        let streams = fresh(vec![
             // Joined by tier A.
             record(221, 221, "Low Tide", "trackdone"),
             // Alone, and counts: its track's length is 3:41.
@@ -592,6 +730,7 @@ mod tests {
             listener: 1,
             zone_periods: &[],
             pins: &Pins::default(),
+            stored: &HashMap::new(),
             made_at: 7,
         });
         assert_eq!((report.streams, report.events, report.scrobbles), (4, 4, 2));
@@ -639,6 +778,7 @@ mod tests {
             listener: 1,
             zone_periods: &zones,
             pins: &Pins::default(),
+            stored: &HashMap::new(),
             made_at: 7,
         });
         assert_eq!(report.years[0].no_zone, 0);
