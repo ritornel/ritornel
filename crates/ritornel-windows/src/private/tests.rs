@@ -13,7 +13,9 @@ use std::process::Command;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
+use windows_sys::Win32::Security::{
+    SetKernelObjectSecurity, UNPROTECTED_DACL_SECURITY_INFORMATION,
+};
 use windows_sys::core::PWSTR;
 
 use super::*;
@@ -259,9 +261,11 @@ fn a_failed_freeze_leaves_the_folder_unclosed() {
     std::fs::create_dir(&inner).unwrap();
     let credential = inner.join("credential");
     std::fs::write(&credential, "x").unwrap();
-    // Leave inheritance on (`AI`), and replace implicit owner WRITE_DAC with
-    // OWNER RIGHTS allowing read and delete (for cleanup) but not WRITE_DAC.
-    let unfreezable = descriptor("O:MED:AI(A;;0x00130089;;;OW)");
+    // Leave inheritance on (`AI`), deny WRITE_DAC (`0x00040000`) to `ME`
+    // before the inherited full-control entry from `inner`, and replace
+    // implicit owner WRITE_DAC with OWNER RIGHTS allowing read and delete
+    // (for cleanup) but not WRITE_DAC.
+    let unfreezable = descriptor("O:MED:AI(D;;0x00040000;;;ME)(A;;0x00130089;;;OW)");
     let acl = unfreezable.dacl().unwrap().unwrap();
     let file = open(&credential, true).unwrap();
     // SAFETY: `file` is open with WRITE_DAC and `acl` lives as long as `unfreezable`.
@@ -328,20 +332,27 @@ fn a_null_dacl_file_stays_open_when_its_folder_is_closed() {
     let credential = inner.join("credential");
     std::fs::write(&credential, "x").unwrap();
     let file = open(&credential, true).unwrap();
-    // SAFETY: `file` is open with WRITE_DAC; passing a null ACL sets a NULL
-    // DACL without setting SE_DACL_PROTECTED.
-    let set = unsafe {
-        SetSecurityInfo(
+    // Write a raw security descriptor with a NULL DACL and SE_DACL_PROTECTED
+    // clear via SetKernelObjectSecurity (SetSecurityInfo auto-protects a
+    // NULL DACL).
+    // SAFETY: plain data, initialized below before use.
+    let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let ptr: PSECURITY_DESCRIPTOR = (&raw mut sd).cast();
+    // SAFETY: `ptr` points to `sd`, owned by this function.
+    let initialized = unsafe { InitializeSecurityDescriptor(ptr, SECURITY_DESCRIPTOR_REVISION) };
+    assert_ne!(initialized, 0);
+    // SAFETY: `ptr` is an initialized security descriptor; NULL sets a NULL DACL.
+    let dacl_set = unsafe { SetSecurityDescriptorDacl(ptr, 1, std::ptr::null(), 0) };
+    assert_ne!(dacl_set, 0);
+    // SAFETY: `file` is open with WRITE_DAC and `ptr` is a valid descriptor.
+    let applied = unsafe {
+        SetKernelObjectSecurity(
             file.as_raw_handle() as HANDLE,
-            SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
+            ptr,
         )
     };
-    assert_eq!(set, 0);
+    assert_ne!(applied, 0);
     drop(file);
     let before = Descriptor::of(
         &open(&credential, false).unwrap(),
@@ -362,6 +373,7 @@ fn a_null_dacl_file_stays_open_when_its_folder_is_closed() {
     )
     .unwrap();
     assert!(after.protected().unwrap());
+    assert!(after.dacl().unwrap().is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
