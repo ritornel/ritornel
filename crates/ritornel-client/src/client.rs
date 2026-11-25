@@ -459,6 +459,7 @@ mod tests {
         let (client, mut from_client, to_client) = pair();
         let call = tokio::spawn(async move {
             let hello = HelloParams {
+                presence: None,
                 name: "test".to_owned(),
                 kind: ClientKind::Cli,
                 version: "1.2.3".to_owned(),

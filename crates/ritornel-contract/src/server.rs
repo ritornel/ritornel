@@ -100,6 +100,82 @@ pub struct HelloParams {
     /// The [contract version](crate::CONTRACT_VERSION) the program was
     /// built with. A server refuses one that is not its own.
     pub contract_version: u32,
+    /// Present only on the satellite server's own link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub presence: Option<PresenceHello>,
+}
+
+/// What a satellite announces on its own connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PresenceHello {
+    /// Whether this satellite drives an output.
+    pub has_player: bool,
+    /// Whether it tells Last.fm what is playing itself.
+    pub sends_now_playing: bool,
+    /// Initial state when this satellite has a player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<PlayerSummary>,
+}
+
+/// The fields shown for a reachable player.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerSummary {
+    /// What the player is doing.
+    pub status: crate::PlaybackStatus,
+    /// The current track while playing, paused or buffering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub title: Option<String>,
+    /// The output once opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub output: Option<crate::OutputInfo>,
+}
+
+/// One place the library can play.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerInfo {
+    /// Stable ID for this place. Clients use the ID returned by the list.
+    pub player_id: Id,
+    /// Name of the place as shown to the listener.
+    pub name: String,
+    /// The server driving this output.
+    pub server_id: Id,
+    /// Whether this is the player on the server the client called.
+    pub is_local: bool,
+    /// Whether the player can be reached.
+    pub reachable: bool,
+    /// When this reachability was established, in Unix milliseconds.
+    pub since_ms: i64,
+    /// Current status, while reachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub status: Option<crate::PlaybackStatus>,
+    /// Current title, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub title: Option<String>,
+    /// Open output, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub output: Option<crate::OutputInfo>,
+}
+
+/// The result of `players.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PlayersList {
+    /// The places this library can play.
+    pub players: Vec<PlayerInfo>,
 }
 
 /// The longest a client's name or version may be, in characters. Both are
@@ -757,6 +833,7 @@ mod tests {
     #[test]
     fn fields_are_camel_case_and_enum_values_snake_case() {
         let hello = HelloParams {
+            presence: None,
             name: "ritornelctl".to_owned(),
             kind: ClientKind::Cli,
             version: "0.1.0".to_owned(),

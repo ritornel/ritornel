@@ -114,6 +114,7 @@ fn info(running: &Running, name: &str, revision: u64) -> ServerInfo {
 
 fn hello() -> HelloParams {
     HelloParams {
+        presence: None,
         name: "contract-test".to_owned(),
         kind: ClientKind::Cli,
         version: "1.2.3".to_owned(),

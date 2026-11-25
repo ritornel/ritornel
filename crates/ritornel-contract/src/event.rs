@@ -21,6 +21,8 @@ pub const EVENT_METHOD: &str = "event";
 pub enum Topic {
     /// One server's full status, whenever it changes.
     Servers,
+    /// A place to play changed. Read `players.list` again.
+    Players,
     /// One job's full summary, whenever it changes: at most four times a
     /// second for one job. Subscribing requires a full session.
     Jobs,
@@ -42,6 +44,7 @@ impl Topic {
     /// Every topic.
     pub const ALL: &[Self] = &[
         Self::Servers,
+        Self::Players,
         Self::Jobs,
         Self::Library,
         Self::List,
@@ -54,6 +57,7 @@ impl Topic {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Servers => "servers",
+            Self::Players => "players",
             Self::Jobs => "jobs",
             Self::Library => "library",
             Self::List => "list",
@@ -71,6 +75,8 @@ impl Topic {
 pub enum Event {
     /// One server's status changed.
     Servers(ServersEvent),
+    /// A hint to read the places to play again.
+    Players,
     /// One job changed.
     Jobs(Box<JobsEvent>),
     /// The library changed.
@@ -89,6 +95,7 @@ impl Event {
     /// The topic the event is on.
     pub const fn topic(&self) -> Topic {
         match self {
+            Self::Players => Topic::Players,
             Self::Servers(_) => Topic::Servers,
             Self::Jobs(_) => Topic::Jobs,
             Self::Library(_) => Topic::Library,

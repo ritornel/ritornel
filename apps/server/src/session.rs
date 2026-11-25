@@ -32,6 +32,8 @@ pub(crate) struct Session {
     /// Whether the session has closed, for whoever is waiting on something
     /// else and must stop when it does.
     shut: watch::Sender<bool>,
+    /// Last input on a presence connection, or None on any other session.
+    last_heard: watch::Sender<Option<tokio::time::Instant>>,
     /// The views it holds.
     views: Mutex<Views>,
 }
@@ -63,9 +65,11 @@ fn key(event: &Event) -> String {
         Event::Servers(event) => event.server.server_id.to_string(),
         Event::Jobs(event) => event.job.job_id.to_string(),
         // The library, the player and the queue are one resource each.
-        Event::Library(_) | Event::Playback(_) | Event::Progress(_) | Event::Queue(_) => {
-            String::new()
-        }
+        Event::Players
+        | Event::Library(_)
+        | Event::Playback(_)
+        | Event::Progress(_)
+        | Event::Queue(_) => String::new(),
         Event::List(event) => event.view.clone(),
     }
 }
@@ -118,6 +122,7 @@ impl Session {
     /// A session that is the link of the satellite `peer`, if there is one.
     pub(crate) fn linked(id: u64, kind: SessionKind, peer: Option<Id>) -> Self {
         Self {
+            last_heard: watch::Sender::new(None),
             id,
             kind,
             peer,
@@ -147,7 +152,29 @@ impl Session {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records that `server.hello` succeeded.
+    /// Starts the silence deadline on a satellite presence connection.
+    pub(crate) fn enable_heartbeat(&self) {
+        self.last_heard
+            .send_replace(Some(tokio::time::Instant::now()));
+    }
+
+    /// Extends the silence deadline when a transport receives a frame.
+    pub(crate) fn heard(&self) {
+        self.last_heard.send_if_modified(|last| {
+            if last.is_none() {
+                return false;
+            }
+            *last = Some(tokio::time::Instant::now());
+            true
+        });
+    }
+
+    /// Follows the silence deadline from the transport loop.
+    pub(crate) fn heartbeat(&self) -> watch::Receiver<Option<tokio::time::Instant>> {
+        self.last_heard.subscribe()
+    }
+
+    /// Records that the client has said hello.
     pub(crate) fn greet(&self) {
         self.state().greeted = true;
     }

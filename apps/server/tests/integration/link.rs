@@ -138,6 +138,7 @@ async fn client(scratch: &Scratch, name: &str, server: &Server) -> Client {
         .unwrap();
     client
         .hello(&HelloParams {
+            presence: None,
             name: "link-test".to_owned(),
             kind: ClientKind::Cli,
             version: "1".to_owned(),
@@ -493,6 +494,7 @@ async fn a_satellite_opens_a_socket_at_its_hub_with_its_link_session_and_no_tick
         let linked = Client::connect(hub.endpoint(), &credential).await.unwrap();
         linked
             .hello(&HelloParams {
+                presence: None,
                 name: "desk".to_owned(),
                 kind: ClientKind::Cli,
                 version: "1".to_owned(),
@@ -675,27 +677,7 @@ async fn while_the_hub_is_away_a_satellite_says_so_and_comes_back_with_it() {
 
         // The hub comes back where it was, and the satellite reads it
         // again, on the same session.
-        // The port was let go a moment ago, and another test's server, or
-        // the system, may hold it a little longer: it is tried until free.
-        let hub = loop {
-            let tried = Server::start(
-                HeldDir::take(scratch.data_dir("hub")).unwrap(),
-                Listen::on_port(port),
-                Arc::new(SystemClock),
-                Arc::new(OsEntropy),
-            )
-            .await;
-            match tried {
-                Ok(hub) => break hub,
-                Err(ritornel_server::Error::Listen { source, .. })
-                    if source.kind() == std::io::ErrorKind::AddrInUse =>
-                {
-                    // sleep: between tries; the test's WAIT bounds them.
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                Err(error) => panic!("the hub did not start again: {error}"),
-            }
-        };
+        let hub = restart_hub(&scratch, port).await;
         loop {
             match desk_client.call::<LibraryStats>(&NoParams {}).await {
                 Ok(_) => break,
@@ -708,6 +690,30 @@ async fn while_the_hub_is_away_a_satellite_says_so_and_comes_back_with_it() {
         drop(hub);
     })
     .await;
+}
+
+async fn restart_hub(scratch: &Scratch, port: u16) -> Server {
+    // The port was let go a moment ago, and another test's server, or
+    // the system, may hold it a little longer: it is tried until free.
+    loop {
+        let tried = Server::start(
+            HeldDir::take(scratch.data_dir("hub")).unwrap(),
+            Listen::on_port(port),
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+        )
+        .await;
+        match tried {
+            Ok(hub) => break hub,
+            Err(ritornel_server::Error::Listen { source, .. })
+                if source.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                // sleep: between tries; the test's WAIT bounds them.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => panic!("the hub did not start again: {error}"),
+        }
+    }
 }
 
 /// A hub with the album scanned, and a satellite with a player linked to
@@ -1245,6 +1251,7 @@ async fn a_listen_sent_again_is_taken_once_and_only_from_its_own_player() {
             .unwrap();
         linked
             .hello(&HelloParams {
+                presence: None,
                 name: "desk".to_owned(),
                 kind: ClientKind::Server,
                 version: "1".to_owned(),
@@ -1318,6 +1325,7 @@ async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_st
             .unwrap();
         linked
             .hello(&HelloParams {
+                presence: None,
                 name: "desk".to_owned(),
                 kind: ClientKind::Server,
                 version: "1".to_owned(),
@@ -1328,11 +1336,17 @@ async fn a_satellite_pings_its_hub_and_only_the_hubs_own_machine_says_when_it_st
         // Whether the hub is kept awake is the system's to grant, so only
         // the answer is looked for here; the rule has tests of its own.
         linked
-            .call::<LinkPing>(&LinkPingParams { playing: true })
+            .call::<LinkPing>(&LinkPingParams {
+                playing: true,
+                player: None,
+            })
             .await
             .unwrap();
         let refused = hub_client
-            .call::<LinkPing>(&LinkPingParams { playing: true })
+            .call::<LinkPing>(&LinkPingParams {
+                playing: true,
+                player: None,
+            })
             .await
             .unwrap_err();
         assert_eq!(code(&refused), Some(ErrorCode::Forbidden), "{refused}");
@@ -2174,4 +2188,204 @@ async fn a_streaming_download_survives_prune_and_releases_its_pin_at_shutdown() 
         let db = rusqlite::Connection::open(root.join("server.db")).unwrap();
         assert_eq!(db.query_row("SELECT count(*) FROM transcode_pin", [], |r| r.get::<_,i64>(0)).unwrap(),0);
     }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn players_are_listed_from_either_server_and_the_local_player_stays_available_offline() {
+    use ritornel_client::contract::methods::PlayersListCall;
+    bounded(async {
+        let scratch = Scratch::new();
+        let hub = start_playing_with(&scratch, "hub", 1, None).await;
+        let mut hub_client = client(&scratch, "hub", &hub).await;
+        hub_client.create_library(key()).await.unwrap();
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        let mut desk_client = client(&scratch, "desk", &desk).await;
+        assert!(
+            ritornel_client::descriptor(hub.endpoint())
+                .await
+                .unwrap()
+                .has(capability::PLAYERS)
+        );
+        assert!(
+            !ritornel_client::descriptor(desk.endpoint())
+                .await
+                .unwrap()
+                .has(capability::PLAYERS)
+        );
+        hub_client.subscribe(&[Topic::Players]).await.unwrap();
+        join(&desk_client, &invite(&hub, &hub_client).await)
+            .await
+            .unwrap();
+        assert!(matches!(
+            hub_client.next_event().await.unwrap(),
+            Event::Players
+        ));
+        let list = hub_client
+            .call::<PlayersListCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(list.players.len(), 2);
+        for p in &list.players {
+            assert!(p.reachable);
+            assert_eq!(p.is_local, p.server_id == hub.server_id());
+            assert_eq!(p.status, Some(PlaybackStatus::Stopped));
+            assert!(p.output.is_none());
+        }
+        assert!(
+            ritornel_client::descriptor(desk.endpoint())
+                .await
+                .unwrap()
+                .has(capability::PLAYERS)
+        );
+        let from_desk = desk_client
+            .call::<PlayersListCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(from_desk.players.len(), 2);
+        for p in from_desk.players {
+            let from_hub = list
+                .players
+                .iter()
+                .find(|q| q.player_id == p.player_id)
+                .unwrap();
+            assert_eq!(p.is_local, p.server_id == desk.server_id());
+            assert_eq!(p.since_ms, from_hub.since_ms);
+        }
+        desk_client.subscribe(&[Topic::Players]).await.unwrap();
+        hub.rename("Hall speakers").unwrap();
+        loop {
+            assert!(matches!(
+                desk_client.next_event().await.unwrap(),
+                Event::Players
+            ));
+            let rows = desk_client
+                .call::<PlayersListCall>(&NoParams {})
+                .await
+                .unwrap();
+            if rows
+                .players
+                .iter()
+                .any(|p| p.server_id == hub.server_id() && p.name == "Hall speakers")
+            {
+                break;
+            }
+        }
+        desk.rename("Desk speakers").unwrap();
+        loop {
+            assert!(matches!(
+                hub_client.next_event().await.unwrap(),
+                Event::Players
+            ));
+            let rows = hub_client
+                .call::<PlayersListCall>(&NoParams {})
+                .await
+                .unwrap();
+            let row = rows
+                .players
+                .iter()
+                .find(|p| p.server_id == desk.server_id())
+                .unwrap();
+            let before = list
+                .players
+                .iter()
+                .find(|p| p.server_id == desk.server_id())
+                .unwrap();
+            assert!(row.reachable);
+            assert_eq!(row.since_ms, before.since_ms);
+            if row.name == "Desk speakers" {
+                break;
+            }
+        }
+        let port = hub.endpoint().port();
+        hub.stop().await.unwrap();
+        let offline = desk_client
+            .call::<PlayersListCall>(&NoParams {})
+            .await
+            .unwrap();
+        assert_eq!(offline.players.len(), 1);
+        assert_eq!(offline.players[0].server_id, desk.server_id());
+        assert!(offline.players[0].is_local && offline.players[0].reachable);
+        desk.stop().await.unwrap();
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        assert!(
+            ritornel_client::descriptor(desk.endpoint())
+                .await
+                .unwrap()
+                .has(capability::PLAYERS)
+        );
+        let hub = restart_hub(&scratch, port).await;
+        let mut hub_client = client(&scratch, "hub", &hub).await;
+        hub_client.subscribe(&[Topic::Players]).await.unwrap();
+        loop {
+            let rows = hub_client
+                .call::<PlayersListCall>(&NoParams {})
+                .await
+                .unwrap();
+            let peer = rows
+                .players
+                .iter()
+                .find(|p| p.player_id == offline.players[0].player_id)
+                .expect("the hub remembers its player across restart");
+            if peer.reachable {
+                break;
+            }
+            assert!(matches!(
+                hub_client.next_event().await.unwrap(),
+                Event::Players
+            ));
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_hub_reports_what_plays_on_the_satellite_and_its_open_output() {
+    use ritornel_client::contract::methods::PlayersListCall;
+    bounded(async {
+        let scratch = Scratch::new();
+        let (_hub, mut hub_client, desk, desk_client) = linked_player_at(&scratch, 1).await;
+        let Row::Song(song) = desk_client.list_open(&songs()).await.unwrap().rows[0].clone() else {
+            panic!("the scanned track is missing");
+        };
+        let title = song.title.unwrap();
+        hub_client.subscribe(&[Topic::Players]).await.unwrap();
+        // The same track keeps playing while the hub receives its state.
+        desk_client
+            .call_raw(
+                "playback.set",
+                serde_json::json!({"idempotencyKey":key(),"repeat":"one"}),
+            )
+            .await
+            .unwrap();
+        desk_client
+            .call::<PlaybackPlay>(&PlaybackPlayParams {
+                idempotency_key: key(),
+                source: PlaySource::Tracks {
+                    ids: vec![song.appearance_id],
+                },
+                start: None,
+                context: None,
+                shuffle: None,
+            })
+            .await
+            .unwrap();
+        loop {
+            assert!(matches!(
+                hub_client.next_event().await.unwrap(),
+                Event::Players
+            ));
+            let list = hub_client
+                .call::<PlayersListCall>(&NoParams {})
+                .await
+                .unwrap();
+            if let Some(player) = list.players.iter().find(|p| {
+                p.server_id == desk.server_id() && p.status == Some(PlaybackStatus::Playing)
+            }) {
+                assert_eq!(player.title.as_ref(), Some(&title));
+                assert_eq!(player.output.as_ref().unwrap().name, "null");
+                break;
+            }
+        }
+    })
+    .await;
 }

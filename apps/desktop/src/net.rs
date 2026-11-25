@@ -88,6 +88,7 @@ impl Net {
         let mut client = server.connect().await?;
         let descriptor = client
             .hello(&HelloParams {
+                presence: None,
                 name: "ritornel-desktop-gpui".to_owned(),
                 kind: ClientKind::Desktop,
                 version: env!("CARGO_PKG_VERSION").to_owned(),
