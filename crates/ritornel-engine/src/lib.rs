@@ -92,6 +92,7 @@ mod stream_import;
 #[cfg(test)]
 mod testing;
 mod timekeeping;
+pub mod transcode;
 mod walk;
 
 /// The schema version of a freshly migrated `library.db`.

@@ -79,3 +79,29 @@ impl Draws {
         self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n.max(1)
     }
 }
+
+/// A WAV file of CD audio exactly `sectors` long, its samples made from
+/// `seed` so that no two seeds share audio.
+pub(crate) fn cd_wav(sectors: u32, seed: u32) -> Vec<u8> {
+    let frames = sectors * 588;
+    let data = frames * 4;
+    let mut bytes = Vec::with_capacity(44 + data as usize);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&44_100u32.to_le_bytes());
+    bytes.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
+    bytes.extend_from_slice(&4u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data.to_le_bytes());
+    for frame in 0..frames {
+        let sample = (frame.wrapping_mul(seed.wrapping_mul(2_654_435_761)) >> 16) as u16;
+        bytes.extend_from_slice(&sample.to_le_bytes());
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}

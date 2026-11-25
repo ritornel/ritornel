@@ -8,33 +8,8 @@ use ritornel_contract::{DiscsParams, LayoutMethod};
 use ritornel_domain::layout::Toc;
 
 use crate::scan_tests::Rig;
+use crate::testing::cd_wav;
 use crate::{Error, JobState, ScanSettings, WriteRequest};
-
-/// A WAV file of CD audio exactly `sectors` long, its samples made from
-/// `seed` so that no two seeds share audio.
-fn wav(sectors: u32, seed: u32) -> Vec<u8> {
-    let frames = sectors * 588;
-    let data = frames * 4;
-    let mut bytes = Vec::with_capacity(44 + data as usize);
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(36 + data).to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&16u32.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(&2u16.to_le_bytes());
-    bytes.extend_from_slice(&44_100u32.to_le_bytes());
-    bytes.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
-    bytes.extend_from_slice(&4u16.to_le_bytes());
-    bytes.extend_from_slice(&16u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&data.to_le_bytes());
-    for frame in 0..frames {
-        let sample = (frame.wrapping_mul(seed.wrapping_mul(2_654_435_761)) >> 16) as u16;
-        bytes.extend_from_slice(&sample.to_le_bytes());
-        bytes.extend_from_slice(&sample.to_le_bytes());
-    }
-    bytes
-}
 
 /// The lengths of the invented disc's three tracks, in sectors.
 const LENGTHS: [u32; 3] = [75, 120, 90];
@@ -73,7 +48,7 @@ fn disc(rig: &mut Rig, folder: &str, seed: u32) {
         write(
             rig,
             &format!("{folder}/{n:02} Track.wav"),
-            &wav(length, seed + n),
+            &cd_wav(length, seed + n),
         );
     }
 }
@@ -255,7 +230,7 @@ fn a_changed_sidecar_is_a_new_revision_and_a_removed_one_takes_its_layout_away()
 fn a_log_above_two_disc_folders_counts_for_the_disc_it_fits() {
     let mut rig = Rig::new();
     disc(&mut rig, "Set/CD1", 1);
-    write(&mut rig, "Set/CD2/01 Bonus.wav", &wav(300, 9));
+    write(&mut rig, "Set/CD2/01 Bonus.wav", &cd_wav(300, 9));
     write(&mut rig, "Set/Set.log", log().as_bytes());
     // A sidecar far from any audio is not kept.
     write(&mut rig, "Elsewhere/deep/x.cue", b"FILE \"x.wav\" WAVE");
@@ -436,7 +411,7 @@ fn a_disc_folder_that_cannot_be_read_keeps_the_log_above_it() {
     let mut rig = Rig::new();
     disc(&mut rig, "Set/CD1", 1);
     write(&mut rig, "Set/Set.log", log().as_bytes());
-    write(&mut rig, "Other/01 Track.wav", &wav(10, 7));
+    write(&mut rig, "Other/01 Track.wav", &cd_wav(10, 7));
     rig.scan();
     assert_eq!(
         rig.library
@@ -465,7 +440,7 @@ fn a_library_with_no_sidecars_never_derives_layouts() {
     let mut rig = Rig::new();
     disc(&mut rig, "a", 1);
     rig.scan();
-    write(&mut rig, "a/04 More.wav", &wav(20, 9));
+    write(&mut rig, "a/04 More.wav", &cd_wav(20, 9));
     rig.scan();
     assert_eq!(
         rig.one("SELECT count(*) FROM library_revision WHERE method = 'corrections.layouts'"),
