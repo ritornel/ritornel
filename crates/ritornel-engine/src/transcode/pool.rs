@@ -142,7 +142,7 @@ impl Drop for Lease {
             self.pin,
         );
         let error = self.context.release_error.clone();
-        self.context.workers.release(move || {
+        self.context.index.release(move || {
             if let Err(failed) = cache.release(&store, pin.id) {
                 error
                     .lock()
@@ -189,6 +189,7 @@ struct Context {
     cache: Arc<TranscodeCache>,
     keys: Arc<Keys>,
     workers: Workers,
+    index: Workers,
     release_error: Arc<Mutex<Option<Error>>>,
 }
 
@@ -216,7 +217,9 @@ impl Context {
             }
         };
         let mut current = slot.future.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(running) = current.as_ref().and_then(WeakShared::upgrade) {
+        if let Some(running) = current.as_ref().and_then(WeakShared::upgrade)
+            && !matches!(running.peek(), Some(Err(_)))
+        {
             return running;
         }
         let running = make(slot.clone()).boxed().shared();
@@ -232,6 +235,9 @@ impl Context {
     ) -> Shared<Pending> {
         let ctx = self.clone();
         self.flight(object.key, move |slot| async move {
+            if let Some(hit) = ctx.lookup(slot.clone(), object).await? {
+                return Ok(hit);
+            }
             ctx.ensure(slot, object, move |out, cancel| {
                 let pcm = Pcm::open(&master.path, Some(master.facts))?;
                 if encoding
@@ -278,16 +284,16 @@ impl Context {
                 hash,
                 scheme,
                 codec,
-                packaging.cover.as_ref().map(|c| c.hash),
+                packaging.cover.as_ref().map(|c| (c.hash, c.max_side)),
             )
             .map_err(Error::Io)?;
         let ctx = self.clone();
         self.flight(object.key, move |slot| async move {
+            // A package can outlive its derivative. Try it before opening the master.
+            if let Some(hit) = ctx.lookup(slot.clone(), object).await? {
+                return Ok(hit);
+            }
             let audio = if let Some((encoding, base)) = derivative {
-                // A package can outlive its derivative. Try the package before opening the master.
-                if let Some(hit) = ctx.lookup(slot.clone(), object).await? {
-                    return Ok(hit);
-                }
                 Some(ctx.derivative(master.clone(), encoding, base).await?)
             } else {
                 None
@@ -349,7 +355,7 @@ impl Context {
         object: Object,
     ) -> Result<Option<Arc<Lease>>, Error> {
         let ctx = self.clone();
-        self.workers
+        self.index
             .run(slot, move |_| {
                 let pin = ctx.pin()?;
                 let hit = ctx.cache.lookup(&ctx.store, object, pin)?;
@@ -377,10 +383,12 @@ impl fmt::Debug for Batch<'_> {
     }
 }
 
+/// Dropping the pool drains workers before the data directory can be unlocked.
+/// Async servers call `close` on a blocking thread during shutdown.
 pub struct TranscodePool {
     workers: NonZeroUsize,
     context: Arc<Context>,
-    _join: JoinWorkers,
+    _join: [JoinWorkers; 2],
 }
 
 impl fmt::Debug for TranscodePool {
@@ -406,17 +414,19 @@ impl TranscodePool {
         if workers.get() > tokio::sync::Semaphore::MAX_PERMITS {
             return Err(Error::Invalid("too many transcode workers"));
         }
-        let (threads, join) = Workers::new(workers.get());
+        let (threads, join) = Workers::new(workers.get(), "transcode");
+        let (index, join_index) = Workers::new(1, "transcode cache");
         Ok(Self {
             workers,
             context: Arc::new(Context {
                 workers: threads,
+                index,
                 store,
                 cache: Arc::new(cache),
                 release_error: Arc::default(),
                 keys: Arc::default(),
             }),
-            _join: join,
+            _join: [join, join_index],
         })
     }
 
@@ -450,15 +460,21 @@ impl TranscodePool {
             })
             .buffer_unordered(self.workers.get());
         let mut tick = tokio::time::interval(Duration::from_millis(20));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             cancel.check()?;
             tokio::select! {
                 _ = tick.tick() => {},
                 result = pending.next() => {
-                    let Some(result) = result else {break};
-                    let (index,entry) = result?;
-                    progress(BatchProgress {index,completed:entries.len()+1,total,size_bytes:entry.entry.size_bytes});
-                    entries.push((index,entry));
+                    let Some(result) = result else { break };
+                    let (index, entry) = result?;
+                    progress(BatchProgress {
+                        index,
+                        completed: entries.len() + 1,
+                        total,
+                        size_bytes: entry.entry.size_bytes,
+                    });
+                    entries.push((index, entry));
                 }
             }
         }

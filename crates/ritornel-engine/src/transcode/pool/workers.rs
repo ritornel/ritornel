@@ -16,6 +16,7 @@ pub(super) struct Workers {
     threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     permits: Arc<Semaphore>,
     limit: usize,
+    name: &'static str,
 }
 
 /// The pool drops its sender first. Threads drain outstanding work and pin
@@ -36,7 +37,7 @@ impl Drop for JoinWorkers {
 }
 
 impl Workers {
-    pub(super) fn new(limit: usize) -> (Self, JoinWorkers) {
+    pub(super) fn new(limit: usize, name: &'static str) -> (Self, JoinWorkers) {
         let (send, receive) = mpsc::channel();
         let threads = Arc::new(Mutex::new(Vec::new()));
         (
@@ -46,6 +47,7 @@ impl Workers {
                 threads: threads.clone(),
                 permits: Arc::new(Semaphore::new(limit)),
                 limit,
+                name,
             },
             JoinWorkers(threads),
         )
@@ -68,14 +70,14 @@ impl Workers {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| Error::WriterStopped)?;
+            .map_err(|_| Error::Io(std::io::Error::other("transcode pool is closed")))?;
         {
             let mut threads = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
             if threads.len() < self.limit - self.permits.available_permits() {
                 let receive = self.receive.clone();
                 threads.push(
                     thread::Builder::new()
-                        .name("transcode".into())
+                        .name(self.name.into())
                         .spawn(move || {
                             loop {
                                 let task = receive
@@ -103,9 +105,9 @@ impl Workers {
                     .and_then(|()| work(&stopped));
                 let _ = reply.send(outcome);
             }))
-            .map_err(|_| Error::WriterStopped)?;
+            .map_err(|_| Error::Io(std::io::Error::other("transcode pool is closed")))?;
         result
             .await
-            .map_err(|_| Error::Io(std::io::Error::other("transcode worker stopped")))?
+            .map_err(|_| Error::Io(std::io::Error::other("transcode task panicked")))?
     }
 }

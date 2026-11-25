@@ -420,28 +420,44 @@ impl TranscodeCache {
     // The publication lock excludes new pins while these rows are removed.
     // Keep a failed unlink indexed so a later eviction can retry it.
     fn prune_to(&self, store: &ServerStore, budget: u64) -> Result<(), Error> {
-        let victims = store.read(|db| victims(db, budget))?;
-        for row in victims {
-            match fs::remove_file(row.path(&self.root)?) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(Error::Io(e)),
-                _ => {}
+        let mut unavailable = 0;
+        let mut failure = None;
+        loop {
+            let (needed, victims) = store.read(|db| victims(db, budget, unavailable))?;
+            if needed == 0 {
+                return Ok(());
             }
-            store.transact(move |tx, _, _| {
-                tx.execute(
-                    "INSERT OR REPLACE INTO transcode_size_hint (cache_key, size_bytes)
+            if victims.is_empty() {
+                return failure.map_or(Ok(()), Err);
+            }
+            for row in victims {
+                match fs::remove_file(row.path(&self.root)?) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                        failure.get_or_insert(Error::Io(e));
+                        unavailable += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                store.transact(move |tx, _, _| {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO transcode_size_hint (cache_key, size_bytes)
                      SELECT cache_key, size_bytes FROM transcode_entry WHERE id=?1",
-                    [row.id],
-                )?;
-                tx.execute("DELETE FROM transcode_entry WHERE id=?1", [row.id])?;
-                // REPLACE assigns a fresh rowid, bounding both history and pruning cost.
-                tx.execute(
-                    "DELETE FROM transcode_size_hint WHERE id <= last_insert_rowid() - 65536",
-                    [],
-                )?;
-                Ok(())
-            })?;
+                        [row.id],
+                    )?;
+                    tx.execute("DELETE FROM transcode_entry WHERE id=?1", [row.id])?;
+                    // REPLACE assigns a fresh rowid, bounding both history and pruning cost.
+                    tx.execute(
+                        "DELETE FROM transcode_size_hint WHERE id <= last_insert_rowid() - 65536",
+                        [],
+                    )?;
+                    Ok(())
+                })?;
+            }
+            if failure.is_none() {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     pub fn size_hint(&self, store: &ServerStore, key: blake3::Hash) -> Result<Option<u64>, Error> {
@@ -558,21 +574,26 @@ impl IndexedFile {
     }
 }
 
-fn victims(db: &rusqlite::Connection, budget: u64) -> Result<Vec<IndexedFile>, Error> {
+fn victims(
+    db: &rusqlite::Connection,
+    budget: u64,
+    unavailable: i64,
+) -> Result<(u64, Vec<IndexedFile>), Error> {
     let mut total = db.query_row(
         "SELECT coalesce(sum(size_bytes),0) FROM transcode_entry",
         [],
         |r| size_column(r, 0),
     )?;
+    let needed = total.saturating_sub(budget);
     let mut victims = Vec::new();
     if total > budget {
         // The index orders 'packaged' ahead of 'derivative' within this closed enum.
         let mut oldest = db.prepare(
             "SELECT id, cache_key, layer, codec, size_bytes FROM transcode_entry e
              WHERE NOT EXISTS (SELECT 1 FROM transcode_pin p WHERE p.entry_id = e.id)
-             ORDER BY layer DESC, last_used_at_ms, id",
+             ORDER BY layer DESC, last_used_at_ms, id LIMIT -1 OFFSET ?1",
         )?;
-        for row in oldest.query_map([], IndexedFile::read)? {
+        for row in oldest.query_map([unavailable], IndexedFile::read)? {
             let row = row?;
             total -= row.size;
             victims.push(row);
@@ -581,7 +602,7 @@ fn victims(db: &rusqlite::Connection, budget: u64) -> Result<Vec<IndexedFile>, E
             }
         }
     }
-    Ok(victims)
+    Ok((needed, victims))
 }
 
 /// Hash short files once. Above two MiB the sample is the concatenation of

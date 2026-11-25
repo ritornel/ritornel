@@ -145,7 +145,7 @@ impl Package<'_> {
             source.hash(),
             scheme,
             source.codec(),
-            self.artwork.map(|a| blake3::hash(a.bytes)),
+            self.artwork.map(|a| (blake3::hash(a.bytes), a.max_side)),
         )
     }
 
@@ -154,18 +154,15 @@ impl Package<'_> {
         hash: blake3::Hash,
         scheme: Option<u32>,
         codec: Codec,
-        artwork_hash: Option<blake3::Hash>,
+        artwork: Option<(blake3::Hash, u32)>,
     ) -> io::Result<Object> {
         if self.id3v1 && codec != Codec::Mp3 {
             return Err(io::Error::other("ID3v1 requires MP3 audio"));
         }
-        if self.artwork.is_some_and(|art| art.max_side == 0) {
+        if artwork.is_some_and(|(_, max_side)| max_side == 0) {
             return Err(io::Error::other("cover size must be positive"));
         }
-        let art = self
-            .artwork
-            .zip(artwork_hash)
-            .map(|(art, hash)| (hash.to_hex().to_string(), art.max_side));
+        let art = artwork.map(|(hash, max_side)| (hash.to_hex().to_string(), max_side));
         // Version the tag writer, JPEG settings and metadata projection together.
         let bytes = serde_json::to_vec(&(
             "ritornel-package-v1",

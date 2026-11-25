@@ -89,6 +89,10 @@ default = ["audio-output"]
 # output, which discards what it is given.
 audio-output = ["dep:cpal"]
 
+[target.'cfg(unix)'.dev-dependencies]
+# Verify that a cancelled encoder has been reaped by its parent.
+rustix = { version = "1.1.6", features = ["process"] }
+
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["rt"] }
 
