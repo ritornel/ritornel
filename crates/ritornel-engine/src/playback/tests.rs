@@ -1919,6 +1919,7 @@ impl Rig {
     ) -> Result<super::Done, crate::Error> {
         let request = self.request("queue.add");
         let what = super::AddTracks {
+            known: false,
             tracks: vec![self.tracks[track]],
             place,
             context: (ContextKind::Manual, None),
@@ -2221,6 +2222,7 @@ fn a_replayed_edit_is_answered_from_its_receipt_and_adds_nothing_twice() {
     let request = rig.request("queue.add");
     let command = request.command;
     let what = super::AddTracks {
+        known: false,
         tracks: vec![rig.tracks[2]],
         place: super::Place::Next,
         context: (ContextKind::Manual, None),
@@ -2347,6 +2349,7 @@ fn adding_to_an_empty_queue_selects_the_first_entry_in_the_same_write_as_its_rec
         answer: Box::new(|summary| summary.queue_revision.to_string()),
     };
     let what = super::AddTracks {
+        known: false,
         tracks: vec![rig.tracks[2]],
         place: super::Place::Next,
         context: (ContextKind::Manual, None),
@@ -2991,6 +2994,7 @@ fn an_add_to_an_empty_queue_can_play_it_and_one_to_a_queue_never_replaces_it() {
     let add = |rig: &mut Rig, track: usize, play_if_empty: bool| {
         let request = rig.request("queue.add");
         let what = super::AddTracks {
+            known: false,
             tracks: vec![rig.tracks[track]],
             place: super::Place::Next,
             context: (ContextKind::Manual, None),

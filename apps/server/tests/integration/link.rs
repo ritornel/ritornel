@@ -2441,16 +2441,6 @@ async fn a_limited_controller_routes_to_a_linked_player_and_replays_its_receipt(
             .unwrap();
 
         let songs = limited.list_open(&songs()).await.unwrap();
-        for method in ["playback.play", "queue.add"] {
-            let params = json!({"idempotencyKey":key(), "player":id,
-                "source":{"type":"view", "view":songs.view}, "place":{"type":"end"}});
-            let Err(ritornel_client::Error::Call(error)) = limited.call_raw(method, params).await
-            else {
-                panic!("expected a remote view refusal");
-            };
-            assert_eq!(error.kind(), ErrorCode::Unsupported);
-            assert_eq!(error.data.details["reason"], "remote_view_unsupported");
-        }
         let Row::Song(song) = songs.rows[0].clone() else {
             panic!("no scanned track");
         };
@@ -2534,6 +2524,290 @@ async fn a_limited_controller_routes_to_a_linked_player_and_replays_its_receipt(
         assert_eq!(error.data.details["sinceMs"], away.since_ms);
     })
     .await;
+}
+
+/// Add reachable song rows to the scratch catalog without generating thousands of audio files.
+fn add_view_rows(scratch: &Scratch, count: u64) {
+    let mut db = rusqlite::Connection::open(scratch.data_dir("hub").join("library.db")).unwrap();
+    let tx = db.transaction().unwrap();
+    tx.execute(
+        "CREATE TEMP TABLE added AS
+         WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?1)
+         SELECT n + max((SELECT max(id) FROM source_item), (SELECT max(id) FROM track_appearance)) AS id FROM seq",
+        [i64::try_from(count).unwrap()],
+    ).unwrap();
+    tx.execute_batch(
+        "INSERT INTO track_appearance(id, public_id, recording_id, canonical_id, display_title, rev)
+           SELECT id, randomblob(16), (SELECT min(id) FROM recording), id, 'A fixture ' || id, 1 FROM added;
+         INSERT INTO source_item(id, public_id, source_instance_id, item_kind, provider_key, first_seen_at_ms, rev)
+           SELECT id, randomblob(16), (SELECT min(source_instance_id) FROM source_item), 'file', 'row-' || id, 1, 1 FROM added;
+         INSERT INTO assignment(source_item_id, recording_id, appearance_id, decision_id, effective_from_ms, rev)
+           SELECT id, (SELECT min(id) FROM recording), id, (SELECT min(id) FROM identity_decision), 1, 1 FROM added;",
+    ).unwrap();
+    tx.commit().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remote_view_over_twenty_thousand_rows_is_refused_before_loading_the_player() {
+    use serde_json::json;
+
+    bounded(async {
+        let scratch = Scratch::new();
+        let (_hub, mut controller, desk, local) = linked_player_at(&scratch, 1).await;
+        wait_for_player(&mut controller, desk.server_id()).await;
+        let original = controller.list_open(&songs()).await.unwrap();
+        add_view_rows(&scratch, 20_001 - original.total);
+        let opened = controller.list_open(&songs()).await.unwrap();
+        assert_eq!(opened.total, 20_001);
+        let error = controller
+            .call_raw(
+                "queue.add",
+                json!({
+                    "player":desk.server_id(), "idempotencyKey":key(),
+                    "source":{"type":"view","view":opened.view}, "place":{"type":"end"}
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code(&error), Some(ErrorCode::Invalid));
+        assert!(error.to_string().contains("20,000"));
+        assert_eq!(
+            local
+                .call::<PlaybackGet>(&PlaybackGetParams::default())
+                .await
+                .unwrap()
+                .queue_length,
+            0
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn routed_views_keep_their_order_context_and_receipt_after_close() {
+    use serde_json::json;
+
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, mut controller, desk, local) = linked_player_at(&scratch, 1).await;
+        let target = desk.server_id();
+        wait_for_player(&mut controller, target).await;
+        add_view_rows(&scratch, 2);
+        let opened = controller.list_open(&songs()).await.unwrap();
+        let mut tracks = song_ids(&opened.rows);
+        let fixtures: Vec<_> = opened
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let Row::Song(song) = row else { return None };
+                song.title
+                    .as_deref()?
+                    .starts_with("A fixture")
+                    .then_some((index, song.appearance_id))
+            })
+            .collect();
+        let [(gone, first), (_, second)] = fixtures[..] else {
+            panic!("expected two added rows")
+        };
+        let start = tracks.len() - 1;
+        assert!(gone < start);
+        let retire = |id: ritornel_contract::Id| {
+            let db =
+                rusqlite::Connection::open(scratch.data_dir("hub").join("library.db")).unwrap();
+            // The fixture uses the appearance's row key for its source item.
+            let changed = db
+                .execute(
+                    "UPDATE source_item SET retired_at_ms = 1
+                 WHERE id = (SELECT id FROM track_appearance WHERE public_id = ?1)",
+                    [id.as_bytes()],
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
+        };
+        retire(first);
+        tracks.remove(gone);
+        let source = json!({"type":"view","view":opened.view});
+        let refused = controller
+            .call_raw(
+                "playback.play",
+                json!({
+                    "player":target, "idempotencyKey":key(), "source":source, "start":gone
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code(&refused), Some(ErrorCode::NotFound));
+        let play = json!({"player":target,"idempotencyKey":key(),"source":source,"start":start});
+        let add = json!({
+            "player": target, "idempotencyKey": key(), "source": source,
+            "place": {"type":"end"}, "context": {"kind":"artist","ref":key()}
+        });
+        let played = controller
+            .call_raw("playback.play", play.clone())
+            .await
+            .unwrap();
+        let window = local
+            .call::<QueueWindow>(&QueueWindowParams {
+                player: None,
+                offset: 0,
+                limit: None,
+                order: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(played["entryId"], json!(window.entries[start - 1].entry_id));
+        assert_eq!(
+            window
+                .entries
+                .iter()
+                .map(|e| e.track.appearance_id)
+                .collect::<Vec<_>>(),
+            tracks
+        );
+        let added = controller.call_raw("queue.add", add.clone()).await.unwrap();
+        // Re-resolving the still-open view would now give a different queue.
+        retire(second);
+        assert_eq!(
+            controller.call_raw("queue.add", add.clone()).await.unwrap(),
+            added
+        );
+        assert!(controller.list_close(&opened.view).await.unwrap().closed);
+        assert_eq!(
+            controller
+                .call_raw("playback.play", play.clone())
+                .await
+                .unwrap(),
+            played
+        );
+        assert_eq!(
+            controller.call_raw("queue.add", add.clone()).await.unwrap(),
+            added
+        );
+        let contexts = {
+            let db =
+                rusqlite::Connection::open(scratch.data_dir("desk").join("server.db")).unwrap();
+            db.prepare("SELECT context_kind, context_ref FROM queue_entry ORDER BY position")
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<[u8; 16]>>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(contexts.len(), tracks.len() * 2);
+        assert!(
+            contexts[..tracks.len()]
+                .iter()
+                .all(|(kind, id)| kind == "query" && id.is_none())
+        );
+        let reference: ritornel_contract::Id =
+            serde_json::from_value(add["context"]["ref"].clone()).unwrap();
+        assert!(
+            contexts[tracks.len()..]
+                .iter()
+                .all(|(kind, id)| kind == "artist" && id.as_ref() == Some(reference.as_bytes()))
+        );
+        let stranger = client(&scratch, "hub", &hub).await;
+        assert_eq!(
+            code(
+                &stranger
+                    .call_raw("playback.play", play.clone())
+                    .await
+                    .unwrap_err()
+            ),
+            Some(ErrorCode::ViewExpired)
+        );
+        let mut changed = play;
+        changed["start"] = json!(0);
+        assert_eq!(
+            code(
+                &controller
+                    .call_raw("playback.play", changed)
+                    .await
+                    .unwrap_err()
+            ),
+            Some(ErrorCode::IdempotencyMismatch)
+        );
+
+        // A client cannot certify unknown tracks, even when asking through the hub.
+        for method in ["queue.add", "playback.play"] {
+            let invalid = json!({
+                "source":{"type":"tracks","ids":[key()]}, "idempotencyKey":key(),
+                "tracksKnown":true, "place":{"type":"end"}
+            });
+            assert_eq!(
+                code(&local.call_raw(method, invalid.clone()).await.unwrap_err()),
+                Some(ErrorCode::NotFound)
+            );
+            let mut routed = invalid;
+            routed["player"] = json!(target);
+            assert_eq!(
+                code(&controller.call_raw(method, routed).await.unwrap_err()),
+                Some(ErrorCode::NotFound)
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_player_loads_hub_checked_tracks_without_validation_round_trips() {
+    use serde_json::json;
+
+    bounded(async {
+        let scratch = Scratch::new();
+        let hub = start(&scratch, "hub").await;
+        let mut controller = client(&scratch, "hub", &hub).await;
+        controller.create_library(key()).await.unwrap();
+        scan(&scratch, &mut controller).await;
+        let relay = Relay::to(hub.endpoint()).await;
+        let link = controller
+            .call::<LinkInvite>(&LinkInviteParams {
+                routes: vec![relay.address.to_string()],
+            })
+            .await
+            .unwrap()
+            .link;
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        let local = client(&scratch, "desk", &desk).await;
+        join(&local, &link).await.unwrap();
+        wait_for_player(&mut controller, desk.server_id()).await;
+
+        let tracks = song_ids(&controller.list_open(&songs()).await.unwrap().rows);
+        let request = |ids| json!({"idempotencyKey":key(),"source":{"type":"tracks","ids":ids},"place":{"type":"end"}});
+        // Populate the stopped player's current entry (which reads its title once).
+        local
+            .call_raw("queue.add", request(vec![tracks[0]]))
+            .await
+            .unwrap();
+        let count = || {
+            let heard = relay.heard.lock().unwrap();
+            let reply = br#""tracks":[{"#;
+            heard.windows(reply.len()).filter(|w| *w == reply).count()
+        };
+        let before = count();
+        let ids = vec![tracks[0]; 1001];
+        let mut routed = request(ids.clone());
+        routed["player"] = json!(desk.server_id());
+        controller.call_raw("queue.add", routed).await.unwrap();
+        assert_eq!(count(), before);
+        local.call_raw("queue.add", request(ids)).await.unwrap();
+        assert_eq!(
+            count(),
+            before + 3,
+            "local validation reads batches of 500, 500 and 1"
+        );
+        assert_eq!(
+            local
+                .call::<PlaybackGet>(&PlaybackGetParams::default())
+                .await
+                .unwrap()
+                .queue_length,
+            2003
+        );
+    }).await;
 }
 
 async fn wait_for_player(observer: &mut Client, id: ritornel_contract::Id) {

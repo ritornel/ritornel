@@ -197,10 +197,13 @@ impl LibraryStore {
     /// in the order given: `None` for one the library no longer has.
     pub fn song_ids(&self, keys: &[i64]) -> Result<Vec<Option<Id>>, Error> {
         self.read(|connection| {
-            let mut found: std::collections::HashMap<i64, Id> =
-                std::collections::HashMap::with_capacity(keys.len());
+            // Even when scanning the catalog, keep only the requested view's keys.
+            let mut found: std::collections::HashMap<i64, Option<Id>> =
+                keys.iter().map(|&key| (key, None)).collect();
             let mut each = |row: &rusqlite::Row<'_>| {
-                found.insert(row.get(0)?, Id::from_bytes(row.get(1)?));
+                if let Some(song) = found.get_mut(&row.get::<_, i64>(0)?) {
+                    *song = Some(Id::from_bytes(row.get(1)?));
+                }
                 Ok(())
             };
             // A long view is most of the table, which one scan reads faster
@@ -227,7 +230,10 @@ impl LibraryStore {
                     each,
                 )?;
             }
-            Ok(keys.iter().map(|key| found.get(key).copied()).collect())
+            Ok(keys
+                .iter()
+                .map(|key| found.get(key).copied().flatten())
+                .collect())
         })
     }
 
