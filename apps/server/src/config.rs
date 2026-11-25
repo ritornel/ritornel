@@ -461,9 +461,14 @@ fn resolve(
         file.transcode_cache_size,
     ) {
         transcode.budget = text.as_deref().and_then(bytes).ok_or_else(|| {
-            ConfigError::Transcode(
-                "transcode cache size must be a positive whole number of MiB or GiB".into(),
-            )
+            ConfigError::Transcode(format!(
+                "{}: cache size must be a positive whole number of MiB or GiB",
+                origin.place(
+                    "--transcode-cache-size",
+                    "RITORNEL_TRANSCODE_CACHE_SIZE",
+                    "transcode_cache_size"
+                )
+            ))
         })?;
         origins.transcode_cache_size = Some(origin);
     }
@@ -474,11 +479,16 @@ fn resolve(
     ) {
         transcode.workers = text
             .and_then(|s| s.parse::<std::num::NonZeroUsize>().ok())
-            .filter(|n| {
-                n.get() <= tokio::sync::Semaphore::MAX_PERMITS && u32::try_from(n.get()).is_ok()
-            })
+            .filter(|n| n.get() <= 1024)
             .ok_or_else(|| {
-                ConfigError::Transcode("transcode workers must be a positive worker count".into())
+                ConfigError::Transcode(format!(
+                    "{}: worker count must be 1 to 1024",
+                    origin.place(
+                        "--transcode-workers",
+                        "RITORNEL_TRANSCODE_WORKERS",
+                        "transcode_workers"
+                    )
+                ))
             })?;
         origins.transcode_workers = Some(origin);
     }
@@ -490,14 +500,26 @@ fn resolve(
         origins.transcode_profiles = Some(origin);
         Some(
             serde_json::from_str(&text.unwrap_or_default()).map_err(|e| {
-                ConfigError::Transcode(format!("invalid transcode profiles JSON: {e}"))
+                ConfigError::Transcode(format!(
+                    "{}: invalid profiles JSON: {e}",
+                    origin.place(
+                        "--transcode-profiles",
+                        "RITORNEL_TRANSCODE_PROFILES",
+                        "transcode_profiles"
+                    )
+                ))
             })?,
         )
     } else {
         origins.transcode_profiles = file.transcode_profiles.as_ref().map(|_| Origin::File);
         file.transcode_profiles
     };
-    if let Some(profiles) = profiles {
+    if let (Some(profiles), Some(origin)) = (profiles, origins.transcode_profiles) {
+        let source = origin.place(
+            "--transcode-profiles",
+            "RITORNEL_TRANSCODE_PROFILES",
+            "transcode_profiles",
+        );
         for (name, profile) in profiles {
             if name.is_empty()
                 || name.len() > 64
@@ -505,14 +527,13 @@ fn resolve(
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
             {
-                return Err(ConfigError::Transcode(
-                    "profile names must contain 1 to 64 letters, digits, hyphens or underscores"
-                        .into(),
-                ));
+                return Err(ConfigError::Transcode(format!(
+                    "{source}: profile names must contain 1 to 64 letters, digits, hyphens or underscores"
+                )));
             }
-            profile
-                .validate()
-                .map_err(|e| ConfigError::Transcode(format!("transcode profile {name}: {e}")))?;
+            profile.validate().map_err(|e| {
+                ConfigError::Transcode(format!("{source}: transcode profile {name}: {e}"))
+            })?;
             transcode.profiles.insert(name, profile);
         }
     }
@@ -1199,6 +1220,18 @@ mod tests {
             .to_string();
             assert!(error.contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn invalid_profile_names_the_configuration_file_and_profile() {
+        let file = "[transcode_profiles.pocket.target]\ncodec='mp3'\nmode={cbr=7}";
+        let error = resolve(Path::new(ROOT), &Flags::default(), &env(&[]), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("config.toml") && error.contains("pocket"),
+            "{error}"
+        );
     }
 
     #[test]

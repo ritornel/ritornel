@@ -134,6 +134,7 @@ impl Core {
         let new = NewJob {
             kind,
             dedupe_key: params.run_id.to_string(),
+            target_kind: "import_run",
             target: params.run_id,
             params_json: serde_json::to_string(&RunJobParams {
                 run_id: params.run_id,

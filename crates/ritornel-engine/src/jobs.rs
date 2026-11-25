@@ -118,6 +118,8 @@ pub struct Job {
     pub kind: String,
     /// What its events invalidate: for a scan, the source.
     pub target: Option<Id>,
+    /// The kind of resource identified by the target.
+    pub target_kind: Option<String>,
     /// What it was asked to do.
     pub params_json: String,
     /// Where it is in its life.
@@ -160,6 +162,8 @@ pub struct NewJob {
     pub dedupe_key: String,
     /// What its events invalidate.
     pub target: Id,
+    /// Indexed resource kind for this job.
+    pub target_kind: &'static str,
     /// What it is asked to do.
     pub params_json: String,
     /// The session that asked, by its public ID.
@@ -190,7 +194,7 @@ pub struct Progress {
 
 const COLUMNS: &str = "id, public_id, kind, target_pid, params_json, state, step, checkpoint_json,
     cancel_requested_at_ms IS NOT NULL, done, total, bytes, failed_count, skipped_count,
-    current_label, error_json, created_at_ms, started_at_ms, finished_at_ms";
+    current_label, error_json, created_at_ms, started_at_ms, finished_at_ms, target_kind";
 
 fn job(row: &Row<'_>) -> rusqlite::Result<Job> {
     let state: String = row.get(5)?;
@@ -198,6 +202,7 @@ fn job(row: &Row<'_>) -> rusqlite::Result<Job> {
         id: row.get(0)?,
         public_id: Id::from_bytes(row.get(1)?),
         kind: row.get(2)?,
+        target_kind: row.get(19)?,
         target: row.get::<_, Option<[u8; 16]>>(3)?.map(Id::from_bytes),
         params_json: row.get(4)?,
         state: JobState::parse(&state).ok_or(rusqlite::Error::InvalidQuery)?,
@@ -368,11 +373,7 @@ impl ServerStore {
                             &new.params_json,
                             new.session.as_ref().map(Id::as_bytes),
                             now_ms,
-                            if new.kind.starts_with("transcode.") {
-                                "server"
-                            } else {
-                                "source"
-                            },
+                            new.target_kind,
                         ),
                     )?;
                     (transaction.last_insert_rowid(), true)
@@ -722,6 +723,7 @@ mod tests {
         NewJob {
             kind: "scan",
             dedupe_key: root.to_owned(),
+            target_kind: "source",
             target: id(0x50),
             params_json: "{}".to_owned(),
             session: None,

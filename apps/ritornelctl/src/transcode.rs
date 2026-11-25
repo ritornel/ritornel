@@ -55,9 +55,9 @@ pub(crate) fn run(
             }
             return server::print(args, out, &status, serde_json::to_string_pretty, |s| {
                 format!(
-                    "{} of {} bytes used, {} derivatives, {} packages\n{} workers\nProfiles: {}\n",
-                    s.used_bytes,
-                    s.budget_bytes.value,
+                    "{} of {} used, {} derivatives, {} packages\n{} workers\nProfiles: {}\n",
+                    crate::status::size(s.used_bytes),
+                    crate::status::size(s.budget_bytes.value),
                     s.derivatives,
                     s.packages,
                     s.workers.value,

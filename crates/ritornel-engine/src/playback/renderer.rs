@@ -122,7 +122,19 @@ pub struct Progress {
     pub lost: Option<&'static str>,
 }
 
-pub(crate) use ritornel_contract::transcode::ReplayGain;
+/// Which ReplayGain tag a track plays at. See "Audio pipeline" in
+/// docs/internals/playback.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayGain {
+    /// None: the samples as they are.
+    #[default]
+    Off,
+    /// The track's gain.
+    Track,
+    /// The album's gain, or the track's where the album has none.
+    Album,
+}
 
 /// Why a track could not be opened or moved in.
 #[derive(Debug, Clone, PartialEq, Eq)]

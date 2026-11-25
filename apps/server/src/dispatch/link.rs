@@ -77,10 +77,11 @@ pub(super) fn on_a_satellite(method: &str) -> Route {
         {
             Route::Here
         }
+        "transcode.start" | "transcode.prune" => {
+            Route::Refused("manage the transcode cache on the library hub")
+        }
         "library.create"
         | "sources.add"
-        | "transcode.start"
-        | "transcode.prune"
         | "scan.start"
         | "library.setWatching"
         | "artists.importPictures"

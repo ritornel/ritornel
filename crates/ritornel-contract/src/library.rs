@@ -220,7 +220,9 @@ impl JobState {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JobTarget {
+    /// The server whose cache the job changes.
     Server {
+        /// The server ID.
         id: Id,
     },
     /// A source.
@@ -367,6 +369,7 @@ pub struct JobItem {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct JobDetail {
+    /// Outputs from a successful materialization in request order. Job history does not pin them.
     #[serde(default)]
     pub artifacts: Vec<crate::transcode::TranscodeArtifact>,
     /// The job.

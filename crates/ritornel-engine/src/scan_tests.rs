@@ -152,6 +152,7 @@ impl Rig {
         let new = NewJob {
             kind: "scan",
             dedupe_key: source.name.clone(),
+            target_kind: "source",
             target: source.public_id,
             params_json: "{}".to_owned(),
             session: None,
@@ -1507,6 +1508,7 @@ fn walked(rig: &mut Rig) -> (crate::ScanRun, i64) {
     let new = NewJob {
         kind: "scan",
         dedupe_key: rig.main.name.clone(),
+        target_kind: "source",
         target: rig.main.public_id,
         params_json: "{}".to_owned(),
         session: None,

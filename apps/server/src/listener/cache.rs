@@ -8,18 +8,14 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 pub(super) async fn cached(
     State(core): State<Arc<Core>>,
     Extension(peer): Extension<Option<Peer>>,
-    Path((layer, key)): Path<(String, String)>,
+    Extension(layer): Extension<ArtifactLayer>,
+    Path(key): Path<String>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
     if peer.is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let layer = match layer.as_str() {
-        "derivative" => ArtifactLayer::Derivative,
-        "packaged" => ArtifactLayer::Packaged,
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
     let Some(key) = hex::decode_array::<32>(&key) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -41,10 +37,16 @@ pub(super) async fn cached(
         Codec::Opus => "audio/ogg",
         Codec::Flac => "audio/flac",
     };
+    let etag = format!("\"{}\"", entry.file_hash);
     let mut response = Response::builder()
+        .header(header::ETAG, &etag)
         .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes");
-    let (start, len) = if let Some(raw) = headers.get(header::RANGE) {
+    let (start, len) = if let Some(raw) = headers.get(header::RANGE)
+        && headers
+            .get(header::IF_RANGE)
+            .is_none_or(|validator| validator.as_bytes() == etag.as_bytes())
+    {
         let range = raw.to_str().ok().and_then(|value| byte_range(value, size));
         let Some((start, end)) =
             range.filter(|_| headers.get_all(header::RANGE).iter().count() == 1)

@@ -56,7 +56,7 @@ pub mod local;
 mod media;
 pub mod methods;
 pub mod transcode;
-pub use transcode::{TranscodeParams, TranscodePruneParams, TranscodeStarted};
+pub use transcode::{JobStarted, TranscodeParams, TranscodePruneParams};
 mod pages;
 mod platform;
 mod playback;

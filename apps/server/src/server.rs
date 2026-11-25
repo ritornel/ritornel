@@ -510,17 +510,19 @@ impl Server {
         let core = Arc::clone(&self.core);
         let transcodes = self.transcodes;
         tokio::task::spawn_blocking(move || {
-            let service = Arc::try_unwrap(transcodes).map_err(|_| {
-                Error::Runtime(std::io::Error::other("transcode service is still in use"))
-            })?;
-            let pool = Arc::try_unwrap(service.pool).map_err(|_| {
-                Error::Runtime(std::io::Error::other(
-                    "a transcode download is still in use",
-                ))
-            })?;
-            let released = pool.close();
-            core.close_store()?;
-            released.map_err(Error::Store)
+            let released = (|| {
+                let service = Arc::try_unwrap(transcodes).map_err(|_| {
+                    Error::Runtime(std::io::Error::other("transcode service is still in use"))
+                })?;
+                let pool = Arc::try_unwrap(service.pool).map_err(|_| {
+                    Error::Runtime(std::io::Error::other(
+                        "a transcode download is still in use",
+                    ))
+                })?;
+                pool.close().map_err(Error::Store)
+            })();
+            let closed = core.close_store();
+            released.and(closed)
         })
         .await
         .map_err(|failed| Error::Runtime(std::io::Error::other(failed)))??;

@@ -3,11 +3,14 @@
 use super::settings::set_by;
 use super::{Core, Stores};
 use ritornel_contract::methods::{Method, TranscodePrune, TranscodeStart};
-use ritornel_contract::transcode::*;
+use ritornel_contract::transcode::{
+    ArtifactLayer, EncoderCapability, JobStarted, TranscodeArtifact, TranscodeParams,
+    TranscodeStatus,
+};
 use ritornel_contract::{ErrorCode, Id, Receipt, ReceiptStatus, RpcError, Setting};
 use ritornel_engine::transcode::{
     BatchItem, Codec, Cover, Encoder, EncoderId, Encoding, LameEncoder, OpusEncoder, PackageAudio,
-    Packaging, Pcm, Tags, TranscodePool,
+    Packaging, Pcm, Profile, ReplayGain, Tags, Target, TranscodePool,
 };
 use ritornel_engine::{
     Command, Error, JobCancel, JobState, JobStop, LibraryStore, NewJob, Progress, ServerStore,
@@ -65,7 +68,12 @@ impl Core {
                 set_by: set_by(s.origins.transcode_workers),
             },
             profiles: Setting {
-                value: s.config.profiles.clone(),
+                value: s
+                    .config
+                    .profiles
+                    .iter()
+                    .map(|(name, profile)| (name.clone(), (*profile).into()))
+                    .collect(),
                 set_by: set_by(s.origins.transcode_profiles),
             },
             encoders: s
@@ -74,7 +82,11 @@ impl Core {
                 .map(|e| EncoderCapability {
                     family: e.family.into(),
                     version: e.version.clone(),
-                    formats: vec![if e.family == "lame" { "mp3" } else { "opus" }.into()],
+                    formats: match e.family {
+                        "lame" => vec!["mp3".into()],
+                        "opusenc" => vec!["opus".into()],
+                        _ => Vec::new(),
+                    },
                 })
                 .collect(),
         }))
@@ -84,7 +96,7 @@ impl Core {
         &self,
         stores: &Stores,
         p: TranscodeParams,
-    ) -> Result<TranscodeStarted, RpcError> {
+    ) -> Result<JobStarted, RpcError> {
         self.enqueue_transcode::<TranscodeStart>(stores, &p, p.idempotency_key, || {
             self.batch_request(&p)
         })
@@ -129,12 +141,12 @@ impl Core {
         p: &M::Params,
         key: Id,
         request: impl FnOnce() -> Result<String, RpcError>,
-    ) -> Result<TranscodeStarted, RpcError> {
+    ) -> Result<JobStarted, RpcError> {
         let command = Command {
             id: key,
             fingerprint: super::fingerprint::<M>(p)?,
         };
-        let response = |job: &ritornel_engine::Job| TranscodeStarted {
+        let response = |job: &ritornel_engine::Job| JobStarted {
             receipt: Receipt {
                 command_id: key,
                 status: ReceiptStatus::Accepted,
@@ -150,6 +162,7 @@ impl Core {
         {
             return Ok(response(&job));
         }
+        Self::library(stores, |_| Ok(()))?;
         let json = request()?;
         let (saved, created) = stores
             .server()
@@ -160,6 +173,7 @@ impl Core {
                     kind: M::NAME,
                     dedupe_key: key.to_string(),
                     params_json: json,
+                    target_kind: "server",
                     target: self.server_id,
                     session: self.local_credential.session(),
                 },
@@ -264,7 +278,7 @@ impl Transcodes {
             .iter()
             .map(|(n, p)| (n.clone(), PathBuf::from(p)))
             .collect();
-        let mut covers: HashMap<Id, Cover> = HashMap::new();
+        let mut covers: HashMap<Id, Option<Cover>> = HashMap::new();
         let backend: Option<(Arc<dyn Encoder>, &str)> = match request.profile.target {
             Target::Mp3 { .. } => Some((Arc::new(LameEncoder), "lame")),
             Target::Opus { .. } => Some((Arc::new(OpusEncoder), "opusenc")),
@@ -277,7 +291,11 @@ impl Transcodes {
             }
             let master = library
                 .transcode_master(*id, server, &paths, backend.is_none())?
-                .ok_or(Error::NotFound("no eligible local lossless master"))?;
+                .ok_or_else(|| {
+                    Error::Io(std::io::Error::other(format!(
+                        "appearance {id} has no eligible local lossless master"
+                    )))
+                })?;
             let audio = if let Some((backend, family)) = &backend {
                 let encoder = self
                     .encoders
@@ -311,12 +329,10 @@ impl Transcodes {
             let cover = match track.art {
                 Some(art) => {
                     if let std::collections::hash_map::Entry::Vacant(slot) = covers.entry(art) {
-                        let bytes = library
-                            .original_cover(art, &roots)?
-                            .ok_or(Error::NotFound("cover source unavailable"))?;
-                        slot.insert(Cover::new(bytes.into(), 500));
+                        let bytes = library.original_cover(art, &roots)?;
+                        slot.insert(bytes.map(|bytes| Cover::new(bytes.into(), 500)));
                     }
-                    covers.get(&art).cloned()
+                    covers.get(&art).cloned().flatten()
                 }
                 None => None,
             };

@@ -1,7 +1,6 @@
-//! The settings that determine the encoded audio bytes.
+//! Encoder capabilities, reported profiles, materialization jobs and download keys.
 
 use serde::{Deserialize, Serialize};
-use std::io;
 
 /// Which ReplayGain tag a track plays at. See "Audio pipeline" in
 /// docs/internals/playback.md.
@@ -18,39 +17,18 @@ pub enum ReplayGain {
     Album,
 }
 
+/// Sample processing applied before encoding.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(default, deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Dsp {
+    /// Gain tag applied to the samples.
     pub replay_gain: ReplayGain,
+    /// Sample-rate ceiling in Hz, or null to use the encoder default.
     pub max_rate_hz: Option<u32>,
 }
 
-impl Dsp {
-    pub fn validate(self) -> io::Result<()> {
-        if self.max_rate_hz.is_some_and(|hz| {
-            !matches!(
-                hz,
-                8000 | 11025
-                    | 12000
-                    | 16000
-                    | 22050
-                    | 24000
-                    | 32000
-                    | 44100
-                    | 48000
-                    | 88200
-                    | 96000
-                    | 176400
-                    | 192000
-            )
-        }) {
-            return Err(io::Error::other("unsupported sample-rate ceiling"));
-        }
-        Ok(())
-    }
-}
-
+/// Opus rate control mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +38,7 @@ pub enum Vbr {
     HardCbr,
 }
 
+/// LAME quality preset or constant bitrate in kbps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -69,127 +48,134 @@ pub enum Mp3 {
     Cbr(u16),
 }
 
+/// Output codec and its encoder options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(tag = "codec", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "codec", rename_all = "snake_case")]
 pub enum Target {
     Mp3 {
+        /// Quality preset or constant bitrate.
         mode: Mp3,
     },
     Opus {
+        /// Target bitrate in kbps.
+        #[serde(rename = "bitrateKbps")]
         bitrate_kbps: u16,
+        /// Encoder effort from 0 to 10.
         complexity: u8,
+        /// Bitrate control mode.
         vbr: Vbr,
     },
+    /// Package a FLAC master with unchanged audio packets.
     Flac {},
 }
 
+/// An effective profile as reported by the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
 pub struct Profile {
+    /// Output codec and encoder options.
     pub target: Target,
+    /// Sample processing for this profile.
     #[serde(default)]
     pub dsp: Dsp,
 }
 
-impl Profile {
-    pub fn validate(self) -> io::Result<()> {
-        self.dsp.validate()?;
-        match self.target {
-            Target::Mp3 {
-                mode: Mp3::Cbr(kbps),
-            } if !matches!(
-                kbps,
-                32 | 40 | 48 | 56 | 64 | 80 | 96 | 112 | 128 | 160 | 192 | 224 | 256 | 320
-            ) =>
-            {
-                Err(io::Error::other("unsupported MP3 CBR bitrate"))
-            }
-            Target::Opus {
-                bitrate_kbps,
-                complexity,
-                ..
-            } if !(6..=256).contains(&bitrate_kbps) || complexity > 10 => Err(io::Error::other(
-                "Opus requires 6–256 kbps and complexity 0–10",
-            )),
-            Target::Flac {} if self.dsp != Dsp::default() => Err(io::Error::other(
-                "FLAC pass-through requires unchanged audio",
-            )),
-            _ => Ok(()),
-        }
-    }
-
-    /// A normalized representation with defaults present and stable field order.
-    pub fn canonical_json(self) -> io::Result<String> {
-        self.validate()?;
-        Ok(serde_json::to_string(&self)?)
-    }
-}
-
+/// An external encoder detected at server startup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct EncoderCapability {
+    /// Encoder program name.
     pub family: String,
+    /// Detected encoder build.
     pub version: String,
+    /// Output formats supported by this encoder.
     pub formats: Vec<String>,
 }
 
+/// Effective encoder settings and the local cache index at the time of the call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodeStatus {
+    /// Available external encoders. Native FLAC pass-through needs no program.
     pub encoders: Vec<EncoderCapability>,
+    /// Built-ins overlaid by the winning profile table. The source identifies the overlay.
     pub profiles: crate::Setting<std::collections::BTreeMap<String, Profile>>,
+    /// Maximum number of simultaneous encode or package tasks.
     pub workers: crate::Setting<u32>,
+    /// Maximum cache size in bytes, subject to active pins.
     pub budget_bytes: crate::Setting<u64>,
+    /// Bytes occupied by indexed files across both layers.
     pub used_bytes: u64,
+    /// Number of encoded audio entries.
     pub derivatives: u64,
+    /// Number of tagged artifact entries.
     pub packages: u64,
 }
 
+/// The cache layer that holds the requested file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "lowercase")]
 pub enum ArtifactLayer {
+    /// Encoded audio without catalog tags or cover art.
     Derivative,
+    /// A file with the projected metadata and available artwork.
     Packaged,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TranscodeParams {
-    pub idempotency_key: crate::Id,
-    pub appearances: Vec<crate::Id>,
-    pub profile: String,
-    pub layer: ArtifactLayer,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TranscodePruneParams {
-    pub idempotency_key: crate::Id,
-}
-
+/// Materialize a batch on the library hub.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
-pub struct TranscodeStarted {
+pub struct TranscodeParams {
+    /// Client-generated command ID, reused on retry.
+    pub idempotency_key: crate::Id,
+    /// One to 128 track appearance IDs, in result order.
+    pub appearances: Vec<crate::Id>,
+    /// Name of the configured profile.
+    pub profile: String,
+    /// Which cache route serves the output.
+    pub layer: ArtifactLayer,
+}
+
+/// Evict all currently unpinned entries on the hub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct TranscodePruneParams {
+    /// Client-generated command ID, reused on retry.
+    pub idempotency_key: crate::Id,
+}
+
+/// Receipt and durable job for a materialization or prune request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct JobStarted {
+    /// Receipt for the submitted command.
     #[serde(flatten)]
     pub receipt: crate::Receipt,
+    /// The durable job to inspect with jobs.get.
     pub job: crate::Job,
 }
 
+/// One completed output. Its job retains the key after eviction, so a later download can return 404.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct TranscodeArtifact {
+    /// Appearance requested by the caller.
     pub appearance_id: crate::Id,
+    /// Which cache route serves the output.
     pub layer: ArtifactLayer,
+    /// BLAKE3 cache key, encoded as 64 hexadecimal digits.
     pub key: String,
+    /// Exact length of the published file.
     pub size_bytes: u64,
+    /// BLAKE3 digest of the entire file.
     pub file_hash: String,
+    /// BLAKE3 of the first and last MiB, counting overlapping bytes once.
     pub sampled_hash: String,
 }

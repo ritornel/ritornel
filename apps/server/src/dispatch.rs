@@ -1537,6 +1537,58 @@ mod tests {
     }
 
     #[test]
+    fn a_transcode_receipt_replays_after_cancellation_and_rejects_changed_params() {
+        use ritornel_engine::transcode::{TranscodeCache, TranscodePool};
+        let (core, scratch) = core();
+        let store = core.with_stores(|s| s.server.clone()).unwrap();
+        let config = crate::TranscodeConfig::default();
+        let cache = TranscodeCache::open(
+            &store,
+            &scratch.path().join("cache"),
+            Id::from_bytes([6; 16]),
+            config.budget,
+        )
+        .unwrap();
+        let service = Arc::new(Transcodes {
+            pool: Arc::new(TranscodePool::new(store, cache, config.workers).unwrap()),
+            config,
+            origins: Default::default(),
+            encoders: vec![],
+        });
+        core.attach_transcodes(&service);
+        let session = core.open_session(SessionKind::Full).unwrap();
+        call(&core, &session, "server.hello", Some(hello())).unwrap();
+        call(
+            &core,
+            &session,
+            "library.create",
+            Some(json!({"idempotencyKey": Id::from_bytes([9;16])})),
+        )
+        .unwrap();
+        let mut params = json!({"idempotencyKey": Id::from_bytes([8;16]), "profile":"passthrough-flac","appearances":[Id::from_bytes([7;16])],"layer":"packaged"});
+        let started = call(&core, &session, "transcode.start", Some(params.clone())).unwrap();
+        let id = &started["job"]["jobId"];
+        call(
+            &core,
+            &session,
+            "jobs.cancel",
+            Some(json!({"idempotencyKey":Id::from_bytes([4;16]),"jobId":id})),
+        )
+        .unwrap();
+        drop(service);
+        let replay = call(&core, &session, "transcode.start", Some(params.clone())).unwrap();
+        assert_eq!(&replay["job"]["jobId"], id);
+        assert_eq!(replay["job"]["state"], "cancelled");
+        params["profile"] = json!("missing");
+        assert_eq!(
+            call(&core, &session, "transcode.start", Some(params))
+                .unwrap_err()
+                .0,
+            ErrorCode::IdempotencyMismatch
+        );
+    }
+
+    #[test]
     fn hello_answers_with_the_descriptor_and_the_sessions_kind() {
         let (core, _scratch) = core();
         let session = core.open_session(SessionKind::Limited).unwrap();
@@ -2056,6 +2108,7 @@ mod tests {
                 let new = ritornel_engine::NewJob {
                     kind: "scan",
                     dedupe_key: "music".into(),
+                    target_kind: "source",
                     target: Id::from_bytes([1; 16]),
                     params_json: "{}".into(),
                     session: None,

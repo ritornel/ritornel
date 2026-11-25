@@ -511,7 +511,13 @@ async fn a_satellite_opens_a_socket_at_its_hub_with_its_link_session_and_no_tick
         assert_eq!(code(&refused), Some(ErrorCode::Forbidden));
         // Nor touch what is the hub's own machine's: its folders and its
         // backups.
-        for method in ["sources.add", "server.backup", "history.export"] {
+        for method in [
+            "sources.add",
+            "server.backup",
+            "history.export",
+            "transcode.start",
+            "transcode.prune",
+        ] {
             let refused = linked
                 .call_raw(method, serde_json::json!({}))
                 .await
@@ -614,6 +620,17 @@ async fn what_names_the_hubs_folders_is_done_on_the_hub() {
     bounded(async {
         let scratch = Scratch::new();
         let (_hub, _hub_client, _desk, desk_client) = linked(&scratch).await;
+        for method in ["transcode.start", "transcode.prune"] {
+            assert_eq!(
+                code(
+                    &desk_client
+                        .call_raw(method, serde_json::json!({}))
+                        .await
+                        .unwrap_err()
+                ),
+                Some(ErrorCode::Unsupported)
+            );
+        }
         let refused = desk_client
             .call::<SourcesAdd>(&SourcesAddParams {
                 idempotency_key: key(),
@@ -1943,7 +1960,11 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
             .unwrap();
         let local = std::fs::read_to_string(scratch.data_dir("hub").join("credential")).unwrap();
         let endpoint = hub.endpoint();
-        let fetch = async |method: &str, path: &str, token: Option<&str>, range: Option<&str>| {
+        let fetch = async |method: &str,
+                           path: &str,
+                           token: Option<&str>,
+                           range: Option<&str>,
+                           validator: Option<&str>| {
             let mut req =
                 format!("{method} {path} HTTP/1.1\r\nHost: {endpoint}\r\nConnection: close\r\n");
             if let Some(token) = token {
@@ -1951,6 +1972,9 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
             }
             if let Some(range) = range {
                 req.push_str(&format!("Range: {range}\r\n"));
+            }
+            if let Some(tag) = validator {
+                req.push_str(&format!("If-Range: {tag}\r\n"));
             }
             req.push_str("\r\n");
             let mut conn = tokio::net::TcpStream::connect(endpoint).await.unwrap();
@@ -2021,10 +2045,13 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
             let path = format!("/v1/cache/{layer}/{}", entry.key());
             let content = std::fs::read(entry.path()).unwrap();
             let size = content.len();
-            assert_eq!(fetch("GET", &path, None, None).await.0, 401);
-            assert_eq!(fetch("GET", &path, Some(local.trim()), None).await.0, 403);
+            assert_eq!(fetch("GET", &path, None, None, None).await.0, 401);
+            assert_eq!(
+                fetch("GET", &path, Some(local.trim()), None, None).await.0,
+                403
+            );
             for method in ["GET", "HEAD"] {
-                let (status, headers, body) = fetch(method, &path, Some(&link), None).await;
+                let (status, headers, body) = fetch(method, &path, Some(&link), None, None).await;
                 assert_eq!(status, 200);
                 assert!(
                     headers
@@ -2032,6 +2059,7 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
                         .any(|l| l == format!("content-length: {size}"))
                 );
                 assert!(headers.contains(&format!("content-type: {mime}")));
+                assert!(headers.contains(&format!("etag: \"{}\"", entry.file_hash)));
                 assert_eq!(
                     body.as_slice(),
                     if method == "GET" {
@@ -2046,7 +2074,8 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
                 ("bytes=9-", 9, size - 1),
                 ("bytes=-5", size - 5, size - 1),
             ] {
-                let (status, headers, body) = fetch("GET", &path, Some(&link), Some(range)).await;
+                let (status, headers, body) =
+                    fetch("GET", &path, Some(&link), Some(range), None).await;
                 assert_eq!(status, 206);
                 assert!(headers.contains(&format!("content-range: bytes {start}-{end}/{size}")));
                 assert!(
@@ -2056,15 +2085,31 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
                 );
                 assert_eq!(body, content[start..=end]);
             }
-            let (status, headers, _) = fetch("GET", &path, Some(&link), Some("bytes=4-2")).await;
+            let etag = format!("\"{}\"", entry.file_hash);
+            for (validator, status, bytes) in [
+                (etag.as_str(), 206, &content[..2]),
+                ("\"stale\"", 200, content.as_slice()),
+            ] {
+                let got = fetch(
+                    "GET",
+                    &path,
+                    Some(&link),
+                    Some("bytes=0-1"),
+                    Some(validator),
+                )
+                .await;
+                assert_eq!((got.0, got.2.as_slice()), (status, bytes));
+            }
+            let (status, headers, _) =
+                fetch("GET", &path, Some(&link), Some("bytes=4-2"), None).await;
             assert_eq!(status, 416);
             assert!(headers.contains(&format!("content-range: bytes */{size}")));
             for bad in ["abc", "%2E%2E%2Fsecret", &"g".repeat(64)] {
                 let path = format!("/v1/cache/{layer}/{bad}");
-                assert_eq!(fetch("GET", &path, Some(&link), None).await.0, 400);
+                assert_eq!(fetch("GET", &path, Some(&link), None, None).await.0, 400);
             }
             let missing = format!("/v1/cache/{layer}/{}", "0".repeat(64));
-            assert_eq!(fetch("GET", &missing, Some(&link), None).await.0, 404);
+            assert_eq!(fetch("GET", &missing, Some(&link), None, None).await.0, 404);
         }
         drop(batch);
         drop((hub_client, desk_client));
@@ -2072,4 +2117,61 @@ async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
         hub.stop().await.unwrap();
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streaming_download_survives_prune_and_releases_its_pin_at_shutdown() {
+    use ritornel_client::contract::methods::TranscodePrune;
+    use ritornel_client::contract::transcode::TranscodePruneParams;
+    use ritornel_engine::transcode::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, desk, desk_client) = two(&scratch).await;
+        join(&desk_client, &invite(&hub, &hub_client).await).await.unwrap();
+        let link: String = rusqlite::Connection::open(scratch.data_dir("desk").join("server.db"))
+            .unwrap().query_row("SELECT token FROM hub_link", [], |r| r.get(0)).unwrap();
+        drop((hub_client, desk_client));
+        desk.stop().await.unwrap();
+        hub.stop().await.unwrap();
+
+        // Publish a synthetic file larger than the socket buffers while the hub is offline.
+        let root = scratch.data_dir("hub");
+        let store = ritornel_engine::ServerStore::open(&root.join("server.db"), Arc::new(SystemClock), Arc::new(OsEntropy)).unwrap();
+        let cache = TranscodeCache::open(&store, &root.join("cache"), key(), TranscodeCache::DEFAULT_BUDGET).unwrap();
+        let pin = Pin { id: key(), owner: PinOwner::SyncBatch };
+        let entry = cache.derivative(&store, Derivative {
+            asset:AudioAsset { scheme:1, hash:[81;32].into() },
+            encoder: &FakeEncoder.probe().unwrap().unwrap(),
+            profile:Profile { target:Target::Mp3 {mode:Mp3::V2}, dsp:Default::default() },
+            gain_tags: Default::default()
+        }, pin, |path,_| std::fs::File::create(path)?.set_len(64 << 20)).unwrap();
+        cache.release(&store, pin.id).unwrap();
+        store.close().unwrap();
+
+        let hub = start(&scratch,"hub").await;
+        let mut c = client(&scratch,"hub",&hub).await;
+        let ep = hub.endpoint();
+        let mut socket = tokio::net::TcpStream::connect(ep).await.unwrap();
+        socket.write_all(format!("GET /v1/cache/derivative/{} HTTP/1.1\r\nHost: {ep}\r\nAuthorization: Bearer {link}\r\n\r\n",entry.key()).as_bytes()).await.unwrap();
+        let mut download = BufReader::new(socket);
+        let mut first = String::new();
+        download.read_line(&mut first).await.unwrap();
+        assert!(first.contains("200 OK"), "{first}");
+        c.subscribe(&[Topic::Jobs]).await.unwrap();
+        let job = c.call::<TranscodePrune>(&TranscodePruneParams {idempotency_key:key()}).await.unwrap().job;
+        loop {
+            if let Event::Jobs(event) = c.next_event().await.unwrap()
+                && event.job.job_id == job.job_id && event.job.state.ended() {
+                assert_eq!(event.job.state, ritornel_client::contract::JobState::Succeeded);
+                break;
+            }
+        }
+        assert!(entry.path().exists());
+        drop(c);
+        hub.stop().await.unwrap(); // The client still holds its end of the transfer.
+        assert!(!root.join("server.db-wal").exists());
+        let db = rusqlite::Connection::open(root.join("server.db")).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM transcode_pin", [], |r| r.get::<_,i64>(0)).unwrap(),0);
+    }).await;
 }

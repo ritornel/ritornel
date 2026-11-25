@@ -178,8 +178,8 @@ export type MethodMap = {
   "sources.list": { params: NoParams; result: SourcesList };
   "sources.add": { params: SourcesAddParams; result: SourceAdded };
   "scan.start": { params: ScanStartParams; result: ScanStarted };
-  "transcode.start": { params: TranscodeParams; result: TranscodeStarted };
-  "transcode.prune": { params: TranscodePruneParams; result: TranscodeStarted };
+  "transcode.start": { params: TranscodeParams; result: JobStarted };
+  "transcode.prune": { params: TranscodePruneParams; result: JobStarted };
   "jobs.list": { params: NoParams; result: JobsList };
   "jobs.get": { params: JobGetParams; result: JobDetail };
   "jobs.cancel": { params: JobCancelParams; result: JobCancelled };
@@ -851,6 +851,9 @@ export type ArtColor = {
   saturation: number,
 };
 
+/**
+ * The cache layer that holds the requested file.
+ */
 export type ArtifactLayer = "derivative" | "packaged";
 
 /**
@@ -1722,10 +1725,36 @@ export type DryRunParams = {
   detail: boolean,
 };
 
-export type Dsp = { replay_gain: ReplayGain, max_rate_hz: number | null,
+/**
+ * Sample processing applied before encoding.
+ */
+export type Dsp = {
+  /**
+   * Gain tag applied to the samples.
+   */
+  replayGain: ReplayGain,
+  /**
+   * Sample-rate ceiling in Hz, or null to use the encoder default.
+   */
+  maxRateHz: number | null,
 };
 
-export type EncoderCapability = { family: string, version: string, formats: Array<string>,
+/**
+ * An external encoder detected at server startup.
+ */
+export type EncoderCapability = {
+  /**
+   * Encoder program name.
+   */
+  family: string,
+  /**
+   * Detected encoder build.
+   */
+  version: string,
+  /**
+   * Output formats supported by this encoder.
+   */
+  formats: Array<string>,
 };
 
 /**
@@ -2940,7 +2969,11 @@ export type JobCancelled = {
 /**
  * The result of `jobs.get`.
  */
-export type JobDetail = { artifacts: Array<TranscodeArtifact>,
+export type JobDetail = {
+  /**
+   * Outputs from a successful materialization in request order. Job history does not pin them.
+   */
+  artifacts: Array<TranscodeArtifact>,
   /**
    * The job.
    */
@@ -2976,6 +3009,29 @@ export type JobItem = {
 };
 
 /**
+ * Receipt and durable job for a materialization or prune request.
+ */
+export type JobStarted = {
+  /**
+   * The durable job to inspect with jobs.get.
+   */
+  job: Job,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+/**
  * Where a job is in its life.
  */
 export type JobState = "queued" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
@@ -2983,7 +3039,11 @@ export type JobState = "queued" | "running" | "cancelling" | "succeeded" | "fail
 /**
  * What a job works on, and so what its events invalidate.
  */
-export type JobTarget = { "type": "server", id: string, } | { "type": "source",
+export type JobTarget = { "type": "server",
+  /**
+   * The server ID.
+   */
+  id: string, } | { "type": "source",
   /**
    * The source's ID.
    */
@@ -4057,6 +4117,9 @@ export type MediaToken = {
   token: string,
 };
 
+/**
+ * LAME quality preset or constant bitrate in kbps.
+ */
 export type Mp3 = "v0" | "v2" | { "cbr": number };
 
 /**
@@ -4954,7 +5017,18 @@ export type PreviewShown = {
   values: Array<FileValue>,
 };
 
-export type Profile = { target: Target, dsp: Dsp,
+/**
+ * An effective profile as reported by the server.
+ */
+export type Profile = {
+  /**
+   * Output codec and encoder options.
+   */
+  target: Target,
+  /**
+   * Sample processing for this profile.
+   */
+  dsp: Dsp,
 };
 
 /**
@@ -6002,7 +6076,11 @@ export type ServerRole = "unassigned" | "hub" | "satellite";
  * starts, by a flag, a `RITORNEL_*` variable or `config.toml`, and hold
  * until it starts again.
  */
-export type ServerSettings = { transcode?: TranscodeStatus,
+export type ServerSettings = {
+  /**
+   * Encoder capabilities, effective profiles and cache usage on this server.
+   */
+  transcode?: TranscodeStatus,
   /**
    * What the server is called. With no name given as it starts, it is
    * the default: the name it already had, which a new server takes
@@ -6062,7 +6140,11 @@ export type ServerSettingsSet = {
  * The result of `server.status`. See "Configuration and logging" in
  * docs/internals/server.md.
  */
-export type ServerStatus = { transcode?: TranscodeStatus,
+export type ServerStatus = {
+  /**
+   * Encoder capabilities, effective profiles and cache usage on this server.
+   */
+  transcode?: TranscodeStatus,
   /**
    * The server's ID.
    */
@@ -6728,7 +6810,26 @@ export type SyncSummary = {
   matchedAfter: number,
 };
 
-export type Target = { "codec": "mp3", mode: Mp3, } | { "codec": "opus", bitrate_kbps: number, complexity: number, vbr: Vbr, } | { "codec": "flac",
+/**
+ * Output codec and its encoder options.
+ */
+export type Target = { "codec": "mp3",
+  /**
+   * Quality preset or constant bitrate.
+   */
+  mode: Mp3, } | { "codec": "opus",
+  /**
+   * Target bitrate in kbps.
+   */
+  bitrateKbps: number,
+  /**
+   * Encoder effort from 0 to 10.
+   */
+  complexity: number,
+  /**
+   * Bitrate control mode.
+   */
+  vbr: Vbr, } | { "codec": "flac",
 };
 
 /**
@@ -6950,32 +7051,100 @@ export type TrackSummary = {
   loved: boolean,
 };
 
-export type TranscodeArtifact = { appearanceId: string, layer: ArtifactLayer, key: string, sizeBytes: number, fileHash: string, sampledHash: string,
-};
-
-export type TranscodeParams = { idempotencyKey: string, appearances: Array<string>, profile: string, layer: ArtifactLayer,
-};
-
-export type TranscodePruneParams = { idempotencyKey: string,
-};
-
-export type TranscodeStarted = { job: Job,
+/**
+ * One completed output. Its job retains the key after eviction, so a later download can return 404.
+ */
+export type TranscodeArtifact = {
   /**
-   * The command's ID: the idempotency key it was sent with.
+   * Appearance requested by the caller.
    */
-  commandId: string,
+  appearanceId: string,
   /**
-   * How far the command has got.
+   * Which cache route serves the output.
    */
-  status: ReceiptStatus,
+  layer: ArtifactLayer,
   /**
-   * The library revision the command was committed at. It is left out
-   * for a command that changes no library.
+   * BLAKE3 cache key, encoded as 64 hexadecimal digits.
    */
-  revision?: number,
+  key: string,
+  /**
+   * Exact length of the published file.
+   */
+  sizeBytes: number,
+  /**
+   * BLAKE3 digest of the entire file.
+   */
+  fileHash: string,
+  /**
+   * BLAKE3 of the first and last MiB, counting overlapping bytes once.
+   */
+  sampledHash: string,
 };
 
-export type TranscodeStatus = { encoders: Array<EncoderCapability>, profiles: Setting<{ [key in string]: Profile }>, workers: Setting<number>, budgetBytes: Setting<number>, usedBytes: number, derivatives: number, packages: number,
+/**
+ * Materialize a batch on the library hub.
+ */
+export type TranscodeParams = {
+  /**
+   * Client-generated command ID, reused on retry.
+   */
+  idempotencyKey: string,
+  /**
+   * One to 128 track appearance IDs, in result order.
+   */
+  appearances: Array<string>,
+  /**
+   * Name of the configured profile.
+   */
+  profile: string,
+  /**
+   * Which cache route serves the output.
+   */
+  layer: ArtifactLayer,
+};
+
+/**
+ * Evict all currently unpinned entries on the hub.
+ */
+export type TranscodePruneParams = {
+  /**
+   * Client-generated command ID, reused on retry.
+   */
+  idempotencyKey: string,
+};
+
+/**
+ * Effective encoder settings and the local cache index at the time of the call.
+ */
+export type TranscodeStatus = {
+  /**
+   * Available external encoders. Native FLAC pass-through needs no program.
+   */
+  encoders: Array<EncoderCapability>,
+  /**
+   * Built-ins overlaid by the winning profile table. The source identifies the overlay.
+   */
+  profiles: Setting<{ [key in string]: Profile }>,
+  /**
+   * Maximum number of simultaneous encode or package tasks.
+   */
+  workers: Setting<number>,
+  /**
+   * Maximum cache size in bytes, subject to active pins.
+   */
+  budgetBytes: Setting<number>,
+  /**
+   * Bytes occupied by indexed files across both layers.
+   */
+  usedBytes: number,
+  /**
+   * Number of encoded audio entries.
+   */
+  derivatives: number,
+  /**
+   * Number of tagged artifact entries.
+   */
+  packages: number,
 };
 
 /**
@@ -6992,6 +7161,9 @@ export type UndoParams = {
   answers: Array<string>,
 };
 
+/**
+ * Opus rate control mode.
+ */
 export type Vbr = "variable" | "constrained" | "hard_cbr";
 
 /**

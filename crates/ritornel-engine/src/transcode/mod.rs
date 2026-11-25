@@ -11,6 +11,7 @@ pub use pool::{
     TranscodePool, Transfer,
 };
 
+mod profile;
 mod selection;
 
 use std::io::{self, Write};
@@ -23,7 +24,7 @@ use crate::playback::{
     audio::decode::{self, Opened, Source},
 };
 pub use cli::{LameEncoder, OpusEncoder};
-pub use ritornel_contract::transcode::{Dsp, Mp3, Profile, ReplayGain, Target, Vbr};
+pub use profile::{Dsp, Mp3, Profile, ReplayGain, Target, Vbr};
 pub use selection::{SourceChoice, choose_source};
 
 /// One master held open read-only, ready to stream once. Sample blocks are

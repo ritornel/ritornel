@@ -361,6 +361,7 @@ mod enabled {
             let new = NewJob {
                 kind: SYNC_JOB,
                 dedupe_key: sync_key(session),
+                target_kind: "account",
                 target: session.account,
                 params_json: serde_json::to_string(params).unwrap_or_default(),
                 session: self.local_credential.session(),
