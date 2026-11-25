@@ -48,11 +48,45 @@ struct State {
     /// The unsent event behind each [`Queued::Event`].
     events: HashMap<(Topic, String), Event>,
     closed: bool,
+    next_request: i64,
+    pending: HashMap<i64, tokio::sync::oneshot::Sender<PlayerAnswer>>,
+}
+
+type PlayerAnswer = Result<serde_json::Value, ritornel_contract::RpcError>;
+
+/// A request to the connected player. Dropping it cancels the reply slot and
+/// any request still waiting to be sent.
+pub(crate) struct PlayerCall {
+    session: Arc<Session>,
+    id: i64,
+    response: tokio::sync::oneshot::Receiver<PlayerAnswer>,
+}
+
+impl PlayerCall {
+    pub(crate) async fn answer(mut self) -> Option<PlayerAnswer> {
+        tokio::time::timeout(crate::bounds::PLAYER_CALL_WAIT, &mut self.response)
+            .await
+            .ok()?
+            .ok()
+    }
+}
+
+impl Drop for PlayerCall {
+    fn drop(&mut self) {
+        let mut state = self.session.state();
+        if state.pending.remove(&self.id).is_some() {
+            let id = ritornel_contract::RequestId::Number(self.id);
+            state.queue.retain(|queued| match queued {
+                Queued::Frame(Frame::Request(request)) => request.id != id,
+                _ => true,
+            });
+        }
+    }
 }
 
 #[derive(Debug)]
 enum Queued {
-    Reply(Frame),
+    Frame(Frame),
     /// The unsent event with this topic and key. It keeps the place in the
     /// queue of the first event it was merged from.
     Event(Topic, String),
@@ -232,13 +266,51 @@ impl Session {
         self.wake.notify_one();
     }
 
+    /// Queues a hub request on this player's session, alongside ordinary responses.
+    pub(crate) fn queue_player_call(
+        self: &Arc<Self>,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Option<PlayerCall> {
+        use ritornel_contract::{Request, RequestId};
+        let mut state = self.state();
+        if state.closed {
+            return None;
+        }
+        state.next_request += 1;
+        let id = state.next_request;
+        let (send, response) = tokio::sync::oneshot::channel();
+        state.pending.insert(id, send);
+        state.queue.push_back(Queued::Frame(Frame::Request(Request {
+            id: RequestId::Number(id),
+            method: method.to_owned(),
+            params,
+        })));
+        drop(state);
+        self.wake.notify_one();
+        Some(PlayerCall {
+            session: Arc::clone(self),
+            id,
+            response,
+        })
+    }
+
+    /// Resolves only a call issued on this session. Late replies have no slot.
+    pub(crate) fn answered(&self, response: ritornel_contract::Response) {
+        if let Some(ritornel_contract::RequestId::Number(id)) = response.id
+            && let Some(send) = self.state().pending.remove(&id)
+        {
+            let _ = send.send(response.outcome);
+        }
+    }
+
     /// Queues the response to a call.
     pub(crate) fn reply(&self, frame: Frame) {
         let mut state = self.state();
         if state.closed {
             return;
         }
-        state.queue.push_back(Queued::Reply(frame));
+        state.queue.push_back(Queued::Frame(frame));
         drop(state);
         self.wake.notify_one();
     }
@@ -283,6 +355,7 @@ impl Session {
         state.closed = true;
         state.queue.clear();
         state.events.clear();
+        state.pending.clear();
         drop(state);
         self.wake.notify_one();
         self.shut.send_replace(true);
@@ -324,7 +397,7 @@ impl Session {
         }
         while let Some(queued) = state.queue.pop_front() {
             match queued {
-                Queued::Reply(frame) => return Ok(Some(frame)),
+                Queued::Frame(frame) => return Ok(Some(frame)),
                 Queued::Event(topic, key) => {
                     if let Some(event) = state.events.remove(&(topic, key)) {
                         match serde_json::to_value(&event) {

@@ -16,9 +16,9 @@ use ritornel_client::contract::{
     Awake, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, InviteLink,
     LinkInviteParams, LinkJoinParams, LinkListenParams, LinkPingParams, LinkRequest, LinkStatus,
     ListKind, ListOpenParams, ListenTaken, NoParams, PlaySource, PlaybackCommandParams,
-    PlaybackPlayParams, PlaybackStatus, Query, QueueWindowParams, RatingSetParams, Row, ServerRole,
-    SetBy, SetServerSettingsParams, SourcesAddParams, Topic, Window, capability, hex,
-    link_request_proof, route,
+    PlaybackGetParams, PlaybackPlayParams, PlaybackStatus, Query, QueueWindowParams,
+    RatingSetParams, Row, ServerRole, SetBy, SetServerSettingsParams, SourcesAddParams, Topic,
+    Window, capability, hex, link_request_proof, route,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -753,6 +753,7 @@ async fn play_to_the_end(client: &mut Client, source: PlaySource) -> bool {
     client.subscribe(&[Topic::Playback]).await.unwrap();
     client
         .call::<PlaybackPlay>(&PlaybackPlayParams {
+            player: None,
             idempotency_key: key(),
             source,
             start: None,
@@ -807,6 +808,7 @@ async fn a_satellite_keeps_no_more_of_the_hubs_music_than_its_cache_size() {
         // Each played, and only the last two are kept.
         let window = desk_client
             .call::<QueueWindow>(&QueueWindowParams {
+                player: None,
                 offset: 0,
                 limit: None,
                 order: None,
@@ -863,6 +865,7 @@ async fn a_satellite_answers_and_stops_while_a_slow_pull_is_under_way() {
         tokio::time::timeout(
             quick,
             desk_client.call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks { ids },
                 start: None,
@@ -873,14 +876,18 @@ async fn a_satellite_answers_and_stops_while_a_slow_pull_is_under_way() {
         .await
         .expect("play waited on the pull")
         .unwrap();
-        let state = tokio::time::timeout(quick, desk_client.call::<PlaybackGet>(&NoParams {}))
-            .await
-            .expect("the player's state waited on the pull")
-            .unwrap();
+        let state = tokio::time::timeout(
+            quick,
+            desk_client.call::<PlaybackGet>(&PlaybackGetParams::default()),
+        )
+        .await
+        .expect("the player's state waited on the pull")
+        .unwrap();
         assert_eq!(state.status, PlaybackStatus::Buffering);
         tokio::time::timeout(
             quick,
             desk_client.call::<PlaybackPause>(&PlaybackCommandParams {
+                player: None,
                 idempotency_key: key(),
             }),
         )
@@ -953,6 +960,7 @@ async fn a_satellites_stop_ends_its_pull_and_leaves_nothing_behind() {
         let ids = song_ids(&desk_client.list_open(&songs()).await.unwrap().rows);
         desk_client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks { ids },
                 start: None,
@@ -1016,6 +1024,7 @@ async fn a_satellite_plays_the_hubs_music_from_copies_it_pulls() {
         // And the queue shows what the hub says of each track.
         let window = desk_client
             .call::<QueueWindow>(&QueueWindowParams {
+                player: None,
                 offset: 0,
                 limit: None,
                 order: None,
@@ -1053,6 +1062,7 @@ async fn a_satellite_plays_the_hubs_music_from_copies_it_pulls() {
             .unwrap();
         let refused = desk_client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::View { view: albums.view },
                 start: None,
@@ -1178,6 +1188,7 @@ async fn listens_wait_while_the_hub_is_away_and_arrive_once_when_it_is_back() {
         desk_client.subscribe(&[Topic::Playback]).await.unwrap();
         desk_client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks { ids: vec![ids[0]] },
                 start: None,
@@ -1770,6 +1781,7 @@ async fn a_satellite_stops_in_time_while_its_hub_does_not_answer_and_its_listens
         desk_client.subscribe(&[Topic::Playback]).await.unwrap();
         desk_client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks {
                     ids: vec![ids[0], ids[0]],
@@ -2359,6 +2371,7 @@ async fn the_hub_reports_what_plays_on_the_satellite_and_its_open_output() {
             .unwrap();
         desk_client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks {
                     ids: vec![song.appearance_id],
@@ -2386,6 +2399,139 @@ async fn the_hub_reports_what_plays_on_the_satellite_and_its_open_output() {
                 break;
             }
         }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_limited_controller_routes_to_a_linked_player_and_replays_its_receipt() {
+    use ritornel_contract::{SessionKind, methods::PlayersListCall};
+    use serde_json::json;
+
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, mut observer, desk, desk_client) = linked_player_at(&scratch, 1).await;
+        let id = desk.server_id();
+        observer.subscribe(&[Topic::Players]).await.unwrap();
+        loop {
+            let list = observer
+                .call::<PlayersListCall>(&NoParams {})
+                .await
+                .unwrap();
+            if list
+                .players
+                .iter()
+                .any(|p| p.player_id == id && p.reachable)
+            {
+                break;
+            }
+            observer.next_event().await.unwrap();
+        }
+        let (tx, rx) = hub.connect_in_memory(SessionKind::Limited);
+        let limited = Client::over_memory(tx, rx);
+        limited
+            .hello(&HelloParams {
+                name: "controller".into(),
+                kind: ClientKind::Cli,
+                version: "1".into(),
+                contract_version: CONTRACT_VERSION,
+                presence: None,
+            })
+            .await
+            .unwrap();
+
+        let songs = limited.list_open(&songs()).await.unwrap();
+        for method in ["playback.play", "queue.add"] {
+            let params = json!({"idempotencyKey":key(), "player":id,
+                "source":{"type":"view", "view":songs.view}, "place":{"type":"end"}});
+            let Err(ritornel_client::Error::Call(error)) = limited.call_raw(method, params).await
+            else {
+                panic!("expected a remote view refusal");
+            };
+            assert_eq!(error.kind(), ErrorCode::Unsupported);
+            assert_eq!(error.data.details["reason"], "remote_view_unsupported");
+        }
+        let Row::Song(song) = songs.rows[0].clone() else {
+            panic!("no scanned track");
+        };
+        let source = PlaySource::Tracks {
+            ids: vec![song.appearance_id],
+        };
+        let request = json!({"idempotencyKey":key(), "source":source, "place":{"type":"end"}});
+        let mut routed = request.clone();
+        routed["player"] = json!(id);
+        let receipt = limited.call_raw("queue.add", routed.clone()).await.unwrap();
+        assert_eq!(receipt["commandId"], request["idempotencyKey"]);
+        assert_eq!(
+            limited.call_raw("queue.add", routed).await.unwrap(),
+            receipt
+        );
+        assert_eq!(
+            desk_client.call_raw("queue.add", request).await.unwrap(),
+            receipt
+        );
+
+        // A second satellite's controller goes up to the hub and down to the
+        // player, which must read the track's title back from the hub.
+        let other = start(&scratch, "other").await;
+        let other_client = client(&scratch, "other", &other).await;
+        join(&other_client, &invite(&hub, &observer).await)
+            .await
+            .unwrap();
+        let window = other_client
+            .call_raw("queue.window", json!({"player":id}))
+            .await
+            .unwrap();
+        assert_eq!(window["total"], 1);
+        assert_eq!(window["entries"][0]["track"]["title"], song.title.unwrap());
+        assert_eq!(
+            window,
+            desk_client
+                .call_raw("queue.window", json!({}))
+                .await
+                .unwrap()
+        );
+        let state = limited
+            .call_raw("playback.get", json!({"player":id}))
+            .await
+            .unwrap();
+        assert_eq!(state["queueLength"], 1);
+
+        for target in [hub.server_id(), other.server_id(), key()] {
+            let Err(ritornel_client::Error::Call(error)) = limited
+                .call_raw("playback.get", json!({"player":target}))
+                .await
+            else {
+                panic!("expected a no_player error");
+            };
+            assert_eq!(error.kind(), ErrorCode::Unsupported);
+            assert_eq!(error.data.details["reason"], "no_player");
+        }
+        desk.stop().await.unwrap();
+        let away = loop {
+            let list = observer
+                .call::<PlayersListCall>(&NoParams {})
+                .await
+                .unwrap();
+            if let Some(p) = list
+                .players
+                .into_iter()
+                .find(|p| p.player_id == id && !p.reachable)
+            {
+                break p;
+            }
+            observer.next_event().await.unwrap();
+        };
+        let Err(ritornel_client::Error::Call(error)) = other_client
+            .call_raw("playback.get", json!({"player":id}))
+            .await
+        else {
+            panic!("expected a player_unreachable error");
+        };
+        assert_eq!(error.kind(), ErrorCode::Unavailable);
+        assert_eq!(error.data.details["reason"], "player_unreachable");
+        assert_eq!(error.data.details["name"], away.name);
+        assert_eq!(error.data.details["sinceMs"], away.since_ms);
     })
     .await;
 }

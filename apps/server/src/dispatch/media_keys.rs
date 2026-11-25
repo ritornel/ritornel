@@ -45,7 +45,10 @@ impl Core {
             let state = self.playback_get(stores)?;
             let idempotency_key = ritornel_engine::new_id(self.clock.now_ms(), &*self.entropy)
                 .map_err(super::playback::refused)?;
-            let command = PlaybackCommandParams { idempotency_key };
+            let command = PlaybackCommandParams {
+                player: None,
+                idempotency_key,
+            };
             // Buffering is about to play, so the toggle pauses it.
             let playing = matches!(
                 state.status,
@@ -58,6 +61,7 @@ impl Core {
                 (Key::Volume(volume), _) => self.playback_set(
                     stores,
                     &PlaybackSetParams {
+                        player: None,
                         idempotency_key,
                         volume: Some(volume),
                         muted: Some(false),
@@ -69,6 +73,7 @@ impl Core {
                 | (Key::Next | Key::Previous, Some(from_entry_id)) => self.playback_skip(
                     stores,
                     &PlaybackSkipParams {
+                        player: None,
                         idempotency_key,
                         from_entry_id,
                         direction: if key == Key::Previous {
@@ -88,6 +93,7 @@ impl Core {
                 ) => self.playback_seek(
                     stores,
                     &PlaybackSeekParams {
+                        player: None,
                         idempotency_key,
                         entry_id,
                         position_ms,

@@ -25,6 +25,38 @@ use crate::error::transport;
 use crate::transport::{Lost, Transport};
 use crate::{Credential, Error};
 
+/// A full handler queue refuses just that call. The reader must still be able
+/// to deliver responses and events while the handler waits on another RPC.
+struct PeerRequests {
+    queue: mpsc::Sender<Request>,
+    replies: UnboundedSender<String>,
+}
+
+impl PeerRequests {
+    fn deliver(&self, request: Request) -> Result<(), Lost> {
+        match self.queue.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(Lost::Transport("the request handler closed".into()))
+            }
+            Err(mpsc::error::TrySendError::Full(request)) => {
+                let error = ritornel_contract::RpcError::new(
+                    ritornel_contract::ErrorCode::Unavailable,
+                    "the player is busy",
+                )
+                .with_detail("reason", "player_busy");
+                let reply = Response {
+                    id: Some(request.id),
+                    outcome: Err(error),
+                };
+                self.replies
+                    .send(Frame::Response(reply).encode())
+                    .map_err(|_| Lost::Transport("the connection closed".into()))
+            }
+        }
+    }
+}
+
 type Answer = oneshot::Sender<Result<Value, Error>>;
 
 #[derive(Debug, Default)]
@@ -69,6 +101,7 @@ pub struct Client {
     // A stalled writer cannot observe the call queue closing.
     _close_on_drop: oneshot::Sender<()>,
     events: UnboundedReceiver<Event>,
+    requests: Option<mpsc::Receiver<Request>>,
 }
 
 impl Client {
@@ -78,7 +111,10 @@ impl Client {
     /// It must be called on a Tokio runtime, and the connection runs on
     /// that runtime.
     pub async fn connect(endpoint: SocketAddr, credential: &Credential) -> Result<Self, Error> {
-        Ok(Self::start(Transport::connect(endpoint, credential).await?))
+        Ok(Self::start(
+            Transport::connect(endpoint, credential).await?,
+            None,
+        ))
     }
 
     /// As [`connect`](Self::connect), over a connection that is already
@@ -91,6 +127,7 @@ impl Client {
     ) -> Result<Self, Error> {
         Ok(Self::start(
             Transport::upgrade(stream, endpoint, credential).await?,
+            None,
         ))
     }
 
@@ -101,20 +138,55 @@ impl Client {
     ///
     /// It must be called on a Tokio runtime.
     pub fn over_memory(outgoing: mpsc::Sender<String>, incoming: mpsc::Receiver<String>) -> Self {
-        Self::start(Transport::Memory { outgoing, incoming })
+        Self::start(Transport::Memory { outgoing, incoming }, None)
     }
 
-    fn start(transport: Transport) -> Self {
+    /// Opens a satellite presence connection to a verified hub. Incoming calls
+    /// wait on a bounded queue independent of responses to outgoing calls.
+    pub async fn connect_peer(
+        endpoint: SocketAddr,
+        credential: &Credential,
+    ) -> Result<Self, Error> {
+        let (send, receive) = mpsc::channel(16);
+        let mut client = Self::start(Transport::connect(endpoint, credential).await?, Some(send));
+        client.requests = Some(receive);
+        Ok(client)
+    }
+
+    /// Takes the hub's requests from a presence connection.
+    pub fn take_requests(&mut self) -> Option<mpsc::Receiver<Request>> {
+        self.requests.take()
+    }
+
+    /// Sends a response on the same connection as its request.
+    pub fn respond(&self, response: Response) -> Result<(), Error> {
+        self.calls
+            .send(Frame::Response(response).encode())
+            .map_err(|_| transport("the connection closed"))
+    }
+
+    fn start(transport: Transport, requests: Option<mpsc::Sender<Request>>) -> Self {
         let (calls, queued) = mpsc::unbounded_channel();
         let (events, received) = mpsc::unbounded_channel();
         let waiting = Arc::new(Mutex::new(Waiting::default()));
         let (lifetime, dropped) = oneshot::channel();
-        tokio::spawn(run(transport, queued, events, waiting.clone(), dropped));
+        tokio::spawn(run(
+            transport,
+            queued,
+            events,
+            requests.map(|queue| PeerRequests {
+                queue,
+                replies: calls.clone(),
+            }),
+            waiting.clone(),
+            dropped,
+        ));
         Self {
             calls,
             waiting: Arc::downgrade(&waiting),
             _close_on_drop: lifetime,
             events: received,
+            requests: None,
         }
     }
 
@@ -340,6 +412,7 @@ async fn run(
     connection: Transport,
     mut calls: UnboundedReceiver<String>,
     events: UnboundedSender<Event>,
+    requests: Option<PeerRequests>,
     waiting: Arc<Mutex<Waiting>>,
     dropped: oneshot::Receiver<()>,
 ) {
@@ -368,6 +441,11 @@ async fn run(
                     return Err(Lost::Protocol(
                         "the server answered without a request ID".to_owned(),
                     ));
+                }
+                Frame::Request(request) => {
+                    if let Some(requests) = &requests {
+                        requests.deliver(request)?;
+                    }
                 }
                 Frame::Notification(note) if note.method == EVENT_METHOD => {
                     if let Some(event) = note.params.and_then(known) {
@@ -407,6 +485,30 @@ mod tests {
     use tokio::sync::mpsc::{Receiver, Sender};
 
     use super::*;
+
+    #[test]
+    fn a_full_peer_queue_refuses_just_the_new_call() {
+        let (queue, mut requests) = mpsc::channel(1);
+        let (replies, mut sent) = mpsc::unbounded_channel();
+        let peer = PeerRequests { queue, replies };
+        let request = |id| Request {
+            id: RequestId::Number(id),
+            method: "playback.get".into(),
+            params: None,
+        };
+        assert!(peer.deliver(request(1)).is_ok());
+        assert!(peer.deliver(request(2)).is_ok());
+        let Frame::Response(reply) = Frame::decode(&sent.try_recv().unwrap()).unwrap() else {
+            panic!("expected a refusal for the second call");
+        };
+        assert_eq!(reply.id, Some(RequestId::Number(2)));
+        let error = reply.outcome.unwrap_err();
+        assert_eq!(error.kind(), ErrorCode::Unavailable);
+        assert_eq!(error.data.details["reason"], "player_busy");
+        assert_eq!(requests.try_recv().unwrap(), request(1));
+        assert!(peer.deliver(request(3)).is_ok());
+        assert_eq!(requests.try_recv().unwrap(), request(3));
+    }
 
     /// A client, and the two ends a server would hold.
     fn pair() -> (Client, Receiver<String>, Sender<String>) {

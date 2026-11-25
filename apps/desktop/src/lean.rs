@@ -665,6 +665,7 @@ impl LeanBack {
         let call = net.rt().spawn(async move {
             client
                 .call::<ReadQueue>(&QueueWindowParams {
+                    player: None,
                     offset: 0,
                     limit: Some(1),
                     order: Some(QueueOrder::UpNext),

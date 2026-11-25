@@ -10,12 +10,13 @@ use std::time::Duration;
 use ritornel_client::Client;
 use ritornel_client::contract::methods::{
     PlaybackGet, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
-    PlaybackSkip, PlaybackStop, QueueWindow as QueueWindowMethod, SourcesTracks,
+    PlaybackSkip, PlaybackStop, PlayersListCall, QueueWindow as QueueWindowMethod, SourcesTracks,
 };
 use ritornel_client::contract::{
-    ContextKind, Id, NoParams, PlayContext, PlaySource, PlaybackCommandParams, PlaybackPlayParams,
-    PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState, PlaybackStatus,
-    QueueWindow, QueueWindowParams, Repeat, SkipDirection, SourcesTracksParams, TrackSummary,
+    ContextKind, Id, PlayContext, PlaySource, PlaybackCommandParams, PlaybackGetParams,
+    PlaybackPlayParams, PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState,
+    PlaybackStatus, QueueWindow, QueueWindowParams, Repeat, SkipDirection, SourcesTracksParams,
+    TrackSummary,
 };
 use ritornel_client::local;
 
@@ -172,8 +173,44 @@ fn render_queue(window: &QueueWindow) -> String {
         .collect()
 }
 
-async fn state(client: &Client) -> Result<PlaybackState, ritornel_client::Error> {
-    client.call::<PlaybackGet>(&NoParams {}).await
+/// Resolves the name once on the connection that will send the command.
+fn ask_player<T>(
+    args: &ServerArgs,
+    on: Option<&str>,
+    env: local::Env<'_>,
+    wait: Option<Duration>,
+    call: impl AsyncFnOnce(&Client, Option<Id>) -> Result<T, ritornel_client::Error>,
+) -> Result<T, Error> {
+    server::ask_for(args, env, wait, async |client| {
+        let player = if let Some(name) = on {
+            let list = client
+                .call::<PlayersListCall>(&ritornel_client::contract::NoParams {})
+                .await?;
+            let mut matches = list.players.iter().filter(|p| p.name == name);
+            let Some(place) = matches.next() else {
+                return Ok(Err(Error::Nothing("no player has that name")));
+            };
+            if matches.next().is_some() {
+                return Ok(Err(Error::Nothing("more than one player has that name")));
+            }
+            if !place.reachable {
+                return Ok(Err(Error::Nothing("the named player is away")));
+            }
+            Some(place.player_id)
+        } else {
+            None
+        };
+        Ok(Ok(call(client, player).await?))
+    })?
+}
+
+async fn state(
+    client: &Client,
+    player: Option<Id>,
+) -> Result<PlaybackState, ritornel_client::Error> {
+    client
+        .call::<PlaybackGet>(&PlaybackGetParams { player })
+        .await
 }
 
 fn key() -> Result<Id, ritornel_client::Error> {
@@ -213,12 +250,17 @@ fn target(args: &PlayArgs) -> Result<Target, Error> {
     }
 }
 
-pub(crate) fn play(args: &PlayArgs, env: local::Env<'_>, out: &mut dyn Write) -> Result<(), Error> {
+pub(crate) fn play(
+    args: &PlayArgs,
+    on: Option<&str>,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
     let target = target(args)?;
     let start = args.start.map(|start| start - 1);
     let (follow, quiet) = (args.follow, args.server.json);
     let limit = (!follow).then_some(server::ANSWER_WAIT);
-    let state = server::ask_for(&args.server, env, limit, async |client| {
+    let state = ask_player(&args.server, on, env, limit, async |client, player| {
         let (source, context) = match target {
             Target::Tracks(ids) => (PlaySource::Tracks { ids }, None),
             Target::Release(id) => (PlaySource::Release { id }, None),
@@ -249,6 +291,7 @@ pub(crate) fn play(args: &PlayArgs, env: local::Env<'_>, out: &mut dyn Write) ->
         };
         client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player,
                 idempotency_key: key()?,
                 source,
                 start,
@@ -256,7 +299,7 @@ pub(crate) fn play(args: &PlayArgs, env: local::Env<'_>, out: &mut dyn Write) ->
                 shuffle: None,
             })
             .await?;
-        let mut now = state(client).await?;
+        let mut now = state(client, player).await?;
         if !follow {
             return Ok(Some(now));
         }
@@ -276,7 +319,7 @@ pub(crate) fn play(args: &PlayArgs, env: local::Env<'_>, out: &mut dyn Write) ->
                 return Ok(Some(now));
             }
             tokio::time::sleep(LOOK_EVERY).await;
-            now = state(client).await?;
+            now = state(client, player).await?;
         }
     })?
     .ok_or(Error::Nothing(
@@ -295,20 +338,28 @@ pub(crate) fn play(args: &PlayArgs, env: local::Env<'_>, out: &mut dyn Write) ->
 pub(crate) fn transport(
     which: &'static str,
     args: &ServerArgs,
+    on: Option<&str>,
     env: local::Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    let state = server::ask(args, env, async |client| {
-        let params = PlaybackCommandParams {
-            idempotency_key: key()?,
-        };
-        match which {
-            "pause" => client.call::<PlaybackPause>(&params).await?,
-            "resume" => client.call::<PlaybackResume>(&params).await?,
-            _ => client.call::<PlaybackStop>(&params).await?,
-        };
-        state(client).await
-    })?;
+    let state = ask_player(
+        args,
+        on,
+        env,
+        Some(server::ANSWER_WAIT),
+        async |client, player| {
+            let params = PlaybackCommandParams {
+                player,
+                idempotency_key: key()?,
+            };
+            match which {
+                "pause" => client.call::<PlaybackPause>(&params).await?,
+                "resume" => client.call::<PlaybackResume>(&params).await?,
+                _ => client.call::<PlaybackStop>(&params).await?,
+            };
+            state(client, player).await
+        },
+    )?;
     server::print(args, out, &state, serde_json::to_string_pretty, render)
 }
 
@@ -316,22 +367,30 @@ pub(crate) fn transport(
 pub(crate) fn skip(
     direction: SkipDirection,
     args: &ServerArgs,
+    on: Option<&str>,
     env: local::Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    let state = server::ask(args, env, async |client| {
-        let now = state(client).await?;
-        if let Some(from_entry_id) = now.entry_id {
-            client
-                .call::<PlaybackSkip>(&PlaybackSkipParams {
-                    idempotency_key: key()?,
-                    from_entry_id,
-                    direction,
-                })
-                .await?;
-        }
-        state(client).await
-    })?;
+    let state = ask_player(
+        args,
+        on,
+        env,
+        Some(server::ANSWER_WAIT),
+        async |client, player| {
+            let now = state(client, player).await?;
+            if let Some(from_entry_id) = now.entry_id {
+                client
+                    .call::<PlaybackSkip>(&PlaybackSkipParams {
+                        player,
+                        idempotency_key: key()?,
+                        from_entry_id,
+                        direction,
+                    })
+                    .await?;
+            }
+            state(client, player).await
+        },
+    )?;
     server::print(args, out, &state, serde_json::to_string_pretty, render)
 }
 
@@ -350,22 +409,34 @@ fn position(text: &str) -> Option<u64> {
     seconds.checked_mul(1000)
 }
 
-pub(crate) fn seek(args: &SeekArgs, env: local::Env<'_>, out: &mut dyn Write) -> Result<(), Error> {
+pub(crate) fn seek(
+    args: &SeekArgs,
+    on: Option<&str>,
+    env: local::Env<'_>,
+    out: &mut dyn Write,
+) -> Result<(), Error> {
     let position_ms =
         position(&args.position).ok_or(Error::Usage("a position is seconds, or m:ss"))?;
-    let state = server::ask(&args.server, env, async |client| {
-        let now = state(client).await?;
-        if let Some(entry_id) = now.entry_id {
-            client
-                .call::<PlaybackSeek>(&PlaybackSeekParams {
-                    idempotency_key: key()?,
-                    entry_id,
-                    position_ms,
-                })
-                .await?;
-        }
-        state(client).await
-    })?;
+    let state = ask_player(
+        &args.server,
+        on,
+        env,
+        Some(server::ANSWER_WAIT),
+        async |client, player| {
+            let now = state(client, player).await?;
+            if let Some(entry_id) = now.entry_id {
+                client
+                    .call::<PlaybackSeek>(&PlaybackSeekParams {
+                        player,
+                        idempotency_key: key()?,
+                        entry_id,
+                        position_ms,
+                    })
+                    .await?;
+            }
+            state(client, player).await
+        },
+    )?;
     server::print(
         &args.server,
         out,
@@ -389,6 +460,7 @@ fn volume_change(level: &str) -> Option<(Option<f64>, Option<bool>)> {
 
 pub(crate) fn volume(
     args: &VolumeArgs,
+    on: Option<&str>,
     env: local::Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
@@ -398,20 +470,27 @@ pub(crate) fn volume(
         }
         None => None,
     };
-    let state = server::ask(&args.server, env, async |client| {
-        if let Some((volume, muted)) = change {
-            client
-                .call::<PlaybackSet>(&PlaybackSetParams {
-                    idempotency_key: key()?,
-                    volume,
-                    muted,
-                    shuffle: None,
-                    repeat: None,
-                })
-                .await?;
-        }
-        state(client).await
-    })?;
+    let state = ask_player(
+        &args.server,
+        on,
+        env,
+        Some(server::ANSWER_WAIT),
+        async |client, player| {
+            if let Some((volume, muted)) = change {
+                client
+                    .call::<PlaybackSet>(&PlaybackSetParams {
+                        player,
+                        idempotency_key: key()?,
+                        volume,
+                        muted,
+                        shuffle: None,
+                        repeat: None,
+                    })
+                    .await?;
+            }
+            state(client, player).await
+        },
+    )?;
     server::print(
         &args.server,
         out,
@@ -423,30 +502,45 @@ pub(crate) fn volume(
 
 pub(crate) fn now(
     args: &ServerArgs,
+    on: Option<&str>,
     env: local::Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    let state = server::ask(args, env, async |client| state(client).await)?;
+    let state = ask_player(
+        args,
+        on,
+        env,
+        Some(server::ANSWER_WAIT),
+        async |client, player| state(client, player).await,
+    )?;
     server::print(args, out, &state, serde_json::to_string_pretty, render)
 }
 
 pub(crate) fn queue(
     args: &ServerArgs,
+    on: Option<&str>,
     env: local::Env<'_>,
     out: &mut dyn Write,
 ) -> Result<(), Error> {
-    let window = server::ask(args, env, async |client| {
-        whole_queue(async |offset| {
-            client
-                .call::<QueueWindowMethod>(&QueueWindowParams {
-                    offset,
-                    limit: Some(500),
-                    order: None,
-                })
-                .await
-        })
-        .await
-    })?;
+    let window = ask_player(
+        args,
+        on,
+        env,
+        Some(server::ANSWER_WAIT),
+        async |client, player| {
+            whole_queue(async |offset| {
+                client
+                    .call::<QueueWindowMethod>(&QueueWindowParams {
+                        player,
+                        offset,
+                        limit: Some(500),
+                        order: None,
+                    })
+                    .await
+            })
+            .await
+        },
+    )?;
     server::print(
         args,
         out,

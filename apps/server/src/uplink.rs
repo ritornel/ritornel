@@ -313,7 +313,7 @@ impl Uplink {
 
     /// Opens a connection to the hub at `address`, once it has proved it
     /// holds the hub's key.
-    async fn open(&self, address: SocketAddr) -> Result<Client, String> {
+    async fn open(&self, address: SocketAddr, presence: bool) -> Result<Client, String> {
         link::reach(
             address,
             self.link.hub,
@@ -321,9 +321,13 @@ impl Uplink {
             &*self.entropy,
         )
         .await?;
-        Client::connect(address, &self.credential())
-            .await
-            .map_err(|error| error.to_string())
+        let credential = self.credential();
+        if presence {
+            Client::connect_peer(address, &credential).await
+        } else {
+            Client::connect(address, &credential).await
+        }
+        .map_err(|error| error.to_string())
     }
 
     async fn hello(&self, client: &Client, presence: Option<PresenceHello>) -> Result<(), String> {
@@ -359,7 +363,7 @@ impl Uplink {
         let (candidates, mut tried) = link::candidates(&self.link.routes).await;
         let ordinary = presence.is_none();
         match link::first_answer(candidates, |address| async move {
-            let client = self.open(address).await?;
+            let client = self.open(address, !ordinary).await?;
             if ordinary {
                 self.hello(&client, None).await?;
             }
@@ -785,9 +789,36 @@ async fn restore(uplink: &Arc<Uplink>) {
     let _ = tokio::task::spawn_blocking(move || uplink.restore()).await;
 }
 
+/// Handles incoming commands in order, independently of the presence socket's reader.
+async fn answer_player_calls(
+    core: &Arc<crate::dispatch::Core>,
+    client: &Client,
+    mut requests: tokio::sync::mpsc::Receiver<ritornel_contract::Request>,
+) {
+    // A hub gets the same playback access as a limited local controller.
+    // Its session has no library views or subscriptions from other clients.
+    let session = Arc::new(Session::linked(
+        0,
+        ritornel_contract::SessionKind::Limited,
+        None,
+    ));
+    session.greet();
+    while let Some(request) = requests.recv().await {
+        let (core, session) = (Arc::clone(core), Arc::clone(&session));
+        let Ok(response) =
+            tokio::task::spawn_blocking(move || core.answer_hub_call(&session, request)).await
+        else {
+            break;
+        };
+        if client.respond(response).is_err() {
+            break;
+        }
+    }
+}
+
 /// Owns the satellite's presence socket through reconnects. A separate socket
 /// carries library reads so a slow query cannot delay a heartbeat.
-async fn presence(core: &crate::dispatch::Core, uplink: &Uplink) {
+async fn presence(core: &Arc<crate::dispatch::Core>, uplink: &Uplink) {
     let run = async {
         let mut backoff = std::time::Duration::from_millis(250);
         let mut name = uplink.name.subscribe();
@@ -801,46 +832,54 @@ async fn presence(core: &crate::dispatch::Core, uplink: &Uplink) {
                 // Only a library hub sends Now Playing in this version.
                 sends_now_playing: false,
             };
-            if let Ok(mut client) = uplink.connect(Some(hello)).await {
+            if let Ok(mut client) = uplink.connect(Some(hello)).await
+                && let Some(requests) = client.take_requests()
+            {
                 backoff = std::time::Duration::from_millis(250);
                 let mut events = client.take_events();
-                loop {
-                    let player = updates
-                        .borrow_and_update()
-                        .as_ref()
-                        .map(|(_, state)| state.clone());
-                    let params = serde_json::json!({"playing":core.playing(), "player":player});
-                    match tokio::time::timeout(
-                        uplink.call_wait,
-                        client.call_raw("link.ping", params),
-                    )
-                    .await
-                    {
-                        Ok(Ok(_)) => uplink.answered(None),
-                        Ok(Err(ritornel_client::Error::Call(_))) => {
-                            // Even a refusal is an answer. Register again on a fresh socket.
-                            uplink.answered(None);
-                            break;
-                        }
-                        _ => {
-                            uplink.lost("the presence ping was not answered");
-                            break;
-                        }
-                    }
-                    tokio::select! {
-                        _ = name.changed() => {
-                            // A hello on the live link updates the name without interrupting playback presence.
-                            if !matches!(tokio::time::timeout(uplink.call_wait, uplink.hello(&client, None)).await, Ok(Ok(()))) {
+                let report = async {
+                    loop {
+                        let player = updates
+                            .borrow_and_update()
+                            .as_ref()
+                            .map(|(_, state)| state.clone());
+                        let params = serde_json::json!({"playing":core.playing(), "player":player});
+                        match tokio::time::timeout(
+                            uplink.call_wait,
+                            client.call_raw("link.ping", params),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => uplink.answered(None),
+                            Ok(Err(ritornel_client::Error::Call(_))) => {
+                                // Even a refusal is an answer. Register again on a fresh socket.
+                                uplink.answered(None);
+                                break;
+                            }
+                            _ => {
+                                uplink.lost("the presence ping was not answered");
                                 break;
                             }
                         }
-                        _ = events.recv() => {
-                            uplink.lost("the presence connection closed");
-                            break;
+                        tokio::select! {
+                            _ = name.changed() => {
+                                // A hello on the live link updates the name without interrupting playback presence.
+                                if !matches!(tokio::time::timeout(uplink.call_wait, uplink.hello(&client, None)).await, Ok(Ok(()))) {
+                                    break;
+                                }
+                            }
+                            _ = events.recv() => {
+                                uplink.lost("the presence connection closed");
+                                break;
+                            }
+                            _ = updates.changed() => (),
+                            () = tokio::time::sleep(CHECK_EVERY) => (),
                         }
-                        _ = updates.changed() => (),
-                        () = tokio::time::sleep(CHECK_EVERY) => (),
                     }
+                };
+                tokio::select! {
+                    () = report => (),
+                    () = answer_player_calls(core, &client, requests) => uplink.lost("the presence connection closed"),
                 }
             }
             tokio::time::sleep(backoff).await;

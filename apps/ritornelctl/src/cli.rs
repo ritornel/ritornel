@@ -383,6 +383,7 @@ Commands:
                    is in force
 
 Options:
+  --on <name>           playback and queue commands: choose a player by name
   --name <name>         scan, artists pictures: the name the folder is
                         added under. With none it is the folder's own name
   --no-wait             scan: start the scan and return at once
@@ -550,6 +551,8 @@ impl From<ritornel_client::Error> for Error {
 #[command(name = "ritornelctl", version, propagate_version = true)]
 #[command(disable_help_subcommand = true)]
 struct Cli {
+    #[arg(long, global = true, value_name = "name")]
+    on: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -1214,8 +1217,8 @@ fn try_run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<(), Error> {
-    let command = match parse(args) {
-        Ok(cli) => cli.command,
+    let cli = match parse(args) {
+        Ok(cli) => cli,
         // Help wins wherever it is, and it is the same help.
         Err(error) if error.kind() == ErrorKind::DisplayHelp => {
             return out.write_all(USAGE.as_bytes()).map_err(Error::Output);
@@ -1231,7 +1234,19 @@ fn try_run(
         }
         Err(error) => return Err(usage(&error)),
     };
-    match command {
+    let on = cli.on.as_deref();
+    match cli.command {
+        Command::Play(args) => playback::play(&args, on, env, out),
+        Command::Pause(args) => playback::transport("pause", &args, on, env, out),
+        Command::Resume(args) => playback::transport("resume", &args, on, env, out),
+        Command::Stop(args) => playback::transport("stop", &args, on, env, out),
+        Command::Next(args) => playback::skip(SkipDirection::Next, &args, on, env, out),
+        Command::Previous(args) => playback::skip(SkipDirection::Previous, &args, on, env, out),
+        Command::Seek(args) => playback::seek(&args, on, env, out),
+        Command::Volume(args) => playback::volume(&args, on, env, out),
+        Command::Now(args) => playback::now(&args, on, env, out),
+        Command::Queue(args) => playback::queue(&args, on, env, out),
+        _ if on.is_some() => Err(Error::Usage("--on needs a playback or queue command")),
         Command::Status(args) => status::status(&args, env, out),
         Command::Server(ServerCommand::Stop(args)) => crate::server::stop(&args, env, out),
         Command::Transcode(command) => crate::transcode::run(command, env, out),
@@ -1277,16 +1292,6 @@ fn try_run(
         Command::Corrections(CorrectionsCommand::Answers(args)) => {
             corrections::answers(&args, env, out)
         }
-        Command::Play(args) => playback::play(&args, env, out),
-        Command::Pause(args) => playback::transport("pause", &args, env, out),
-        Command::Resume(args) => playback::transport("resume", &args, env, out),
-        Command::Stop(args) => playback::transport("stop", &args, env, out),
-        Command::Next(args) => playback::skip(SkipDirection::Next, &args, env, out),
-        Command::Previous(args) => playback::skip(SkipDirection::Previous, &args, env, out),
-        Command::Seek(args) => playback::seek(&args, env, out),
-        Command::Volume(args) => playback::volume(&args, env, out),
-        Command::Now(args) => playback::now(&args, env, out),
-        Command::Queue(args) => playback::queue(&args, env, out),
         Command::History(args) => history::history(&args, env, out),
         Command::Show(args) => lastfm::show(&args, env, out),
         Command::Lastfm(command) => lastfm::lastfm(&command, env, out, err),

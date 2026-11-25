@@ -1160,9 +1160,9 @@ mod running {
     };
     use ritornel_client::contract::{
         AutoTrigger, CONTRACT_VERSION, ClientKind, Event, HelloParams, HistoryRecentParams, Id,
-        ImportPicturesParams, NoParams, PlaySource, PlaybackCommandParams, PlaybackPlayParams,
-        PlaybackStatus, QueueWindowParams, SessionKind, SourcesTracksParams, Topic, WatchState,
-        WatchedFolder, WatchedKind,
+        ImportPicturesParams, NoParams, PlaySource, PlaybackCommandParams, PlaybackGetParams,
+        PlaybackPlayParams, PlaybackStatus, QueueWindowParams, SessionKind, SourcesTracksParams,
+        Topic, WatchState, WatchedFolder, WatchedKind,
     };
     use ritornel_engine::playback::Output;
     use ritornel_engine::{OsEntropy, SystemClock};
@@ -1269,6 +1269,7 @@ mod running {
             // playing when the rescan has ended.
             client
                 .call::<PlaybackPlay>(&PlaybackPlayParams {
+                    player: None,
                     idempotency_key: key(),
                     source: PlaySource::Tracks {
                         ids: tracks.iter().map(|track| track.appearance_id).collect(),
@@ -1281,11 +1282,15 @@ mod running {
                 .unwrap();
             client
                 .call::<PlaybackPause>(&PlaybackCommandParams {
+                    player: None,
                     idempotency_key: key(),
                 })
                 .await
                 .unwrap();
-            let before = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+            let before = client
+                .call::<PlaybackGet>(&PlaybackGetParams::default())
+                .await
+                .unwrap();
             assert_eq!(before.status, PlaybackStatus::Paused);
             assert_eq!(before.index, Some(0));
 
@@ -1309,7 +1314,10 @@ mod running {
             assert_eq!((found.retired, found.new), (1, 0), "{found:?}");
 
             // The player is where it was, on the song it was playing.
-            let after = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+            let after = client
+                .call::<PlaybackGet>(&PlaybackGetParams::default())
+                .await
+                .unwrap();
             assert_eq!(after.status, PlaybackStatus::Paused);
             assert_eq!(
                 (after.index, after.entry_id),
@@ -1323,12 +1331,16 @@ mod running {
             // It plays on to the end, as it was, and is heard as it was.
             client
                 .call::<PlaybackResume>(&PlaybackCommandParams {
+                    player: None,
                     idempotency_key: key(),
                 })
                 .await
                 .unwrap();
             loop {
-                let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+                let state = client
+                    .call::<PlaybackGet>(&PlaybackGetParams::default())
+                    .await
+                    .unwrap();
                 if state.status == PlaybackStatus::Stopped {
                     break;
                 }
@@ -1336,6 +1348,7 @@ mod running {
             }
             let window = client
                 .call::<QueueWindow>(&QueueWindowParams {
+                    player: None,
                     offset: 0,
                     limit: None,
                     order: None,

@@ -17,11 +17,11 @@ use ritornel_client::contract::methods::{
 };
 use ritornel_client::contract::{
     AlbumGetParams, AlbumRef, CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams,
-    HistoryRecentParams, Id, ListKind, ListOpenParams, NoParams, PlaySource, PlaybackCommandParams,
-    PlaybackPlayParams, PlaybackSetParams, PlaybackSkipParams, PlaybackStatus, Query,
-    QueueAddParams, QueueClearParams, QueueOrder, QueuePlace, QueueRemoveParams, QueueWindowParams,
-    RatingSetParams, Repeat, Row, SessionKind, SkipDirection, SongRow, SourcesTracksParams, Topic,
-    ViewParams, Window, capability,
+    HistoryRecentParams, Id, ListKind, ListOpenParams, PlaySource, PlaybackCommandParams,
+    PlaybackGetParams, PlaybackPlayParams, PlaybackSetParams, PlaybackSkipParams, PlaybackStatus,
+    Query, QueueAddParams, QueueClearParams, QueueOrder, QueuePlace, QueueRemoveParams,
+    QueueWindowParams, RatingSetParams, Repeat, Row, SessionKind, SkipDirection, SongRow,
+    SourcesTracksParams, Topic, ViewParams, Window, capability,
 };
 use ritornel_engine::{OsEntropy, SystemClock};
 use ritornel_server::{Bounds, HeldDir, Listen, Output, PlaybackRun, Run, Server};
@@ -178,7 +178,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
         let folder = album(&scratch);
 
         // Nothing to play before there is a library.
-        let empty = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        let empty = client.call::<PlaybackGet>(&PlaybackGetParams::default()).await.unwrap();
         assert_eq!(empty.status, PlaybackStatus::Stopped);
         assert_eq!(empty.output.name, "null");
         scanned(&mut client, &folder).await;
@@ -217,6 +217,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
         let first = key();
         let played = client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: first,
                 source: PlaySource::Tracks {
                     ids: tracks.iter().map(|track| track.appearance_id).collect(),
@@ -231,6 +232,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
         assert_eq!(played.queue_revision, 1);
         let window = client
             .call::<QueueWindow>(&QueueWindowParams {
+                player: None,
                 offset: 0,
                 limit: None,
                 order: None,
@@ -277,6 +279,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
         // starts nothing.
         let again = client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: first,
                 source: PlaySource::Tracks {
                     ids: tracks.iter().map(|track| track.appearance_id).collect(),
@@ -288,12 +291,13 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
             .await
             .unwrap();
         assert_eq!(again, played);
-        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        let state = client.call::<PlaybackGet>(&PlaybackGetParams::default()).await.unwrap();
         assert_eq!(state.status, PlaybackStatus::Stopped);
 
         // A skip from an entry the player has left changes nothing.
         let skipped = client
             .call::<PlaybackSkip>(&PlaybackSkipParams {
+                player: None,
                 idempotency_key: key(),
                 from_entry_id: ids[0],
                 direction: SkipDirection::Next,
@@ -303,6 +307,7 @@ async fn an_album_plays_to_its_end_and_the_player_says_so_on_its_topics() {
         assert_eq!(skipped.entry_id, Some(ids[2]));
         client
             .call::<PlaybackPause>(&PlaybackCommandParams {
+                player: None,
                 idempotency_key: key(),
             })
             .await
@@ -381,6 +386,7 @@ async fn a_file_replaced_after_the_scan_is_not_played_under_the_identity_the_sca
 
         let played = client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks {
                     ids: tracks.iter().map(|track| track.appearance_id).collect(),
@@ -393,7 +399,10 @@ async fn a_file_replaced_after_the_scan_is_not_played_under_the_identity_the_sca
             .unwrap();
         assert_eq!(played.queue_revision, 1);
         loop {
-            let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+            let state = client
+                .call::<PlaybackGet>(&PlaybackGetParams::default())
+                .await
+                .unwrap();
             if state.status == PlaybackStatus::Stopped {
                 break;
             }
@@ -417,6 +426,7 @@ async fn a_file_replaced_after_the_scan_is_not_played_under_the_identity_the_sca
         // names the file the scan read there. The other two played.
         let window = client
             .call::<QueueWindow>(&QueueWindowParams {
+                player: None,
                 offset: 0,
                 limit: None,
                 order: None,
@@ -448,10 +458,11 @@ async fn the_volume_is_set_absolutely_kept_across_a_restart_and_refused_out_of_r
         let scratch = scratch();
         let (first, client) = server(&scratch).await;
         assert_eq!(
-            client.call::<PlaybackGet>(&NoParams {}).await.unwrap().volume,
+            client.call::<PlaybackGet>(&PlaybackGetParams::default()).await.unwrap().volume,
             1.0
         );
         let set = PlaybackSetParams {
+            player: None,
             idempotency_key: key(),
             volume: Some(0.25),
             muted: None,
@@ -463,6 +474,7 @@ async fn the_volume_is_set_absolutely_kept_across_a_restart_and_refused_out_of_r
         client.call::<PlaybackSet>(&set).await.unwrap();
         client
             .call::<PlaybackSet>(&PlaybackSetParams {
+                player: None,
                 idempotency_key: key(),
                 volume: None,
                 muted: Some(true),
@@ -471,10 +483,11 @@ async fn the_volume_is_set_absolutely_kept_across_a_restart_and_refused_out_of_r
             })
             .await
             .unwrap();
-        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        let state = client.call::<PlaybackGet>(&PlaybackGetParams::default()).await.unwrap();
         assert_eq!((state.volume, state.muted), (0.25, true));
         let refused = client
             .call::<PlaybackSet>(&PlaybackSetParams {
+                player: None,
                 idempotency_key: key(),
                 volume: Some(1.5),
                 muted: None,
@@ -490,7 +503,7 @@ async fn the_volume_is_set_absolutely_kept_across_a_restart_and_refused_out_of_r
         first.stop().await.unwrap();
 
         let (server, client) = server(&scratch).await;
-        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        let state = client.call::<PlaybackGet>(&PlaybackGetParams::default()).await.unwrap();
         assert_eq!((state.volume, state.muted), (0.25, true));
         server.stop().await.unwrap();
     })
@@ -544,6 +557,7 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
         let last = songs.len() - 1;
         let played = client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::View {
                     view: opened.view.clone(),
@@ -556,6 +570,7 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
             .unwrap();
         let in_order = client
             .call::<QueueWindow>(&QueueWindowParams {
+                player: None,
                 offset: 0,
                 limit: None,
                 order: None,
@@ -582,6 +597,7 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
             .tracks;
         let played = client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks {
                     ids: songs.iter().map(|song| song.appearance_id).collect(),
@@ -594,16 +610,21 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
             .unwrap();
         client
             .call::<PlaybackPause>(&PlaybackCommandParams {
+                player: None,
                 idempotency_key: key(),
             })
             .await
             .unwrap();
-        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        let state = client
+            .call::<PlaybackGet>(&PlaybackGetParams::default())
+            .await
+            .unwrap();
         assert_eq!(state.queue_length, 3);
 
         // Shuffle on and repeat all, said back in the state.
         let set = client
             .call::<PlaybackSet>(&PlaybackSetParams {
+                player: None,
                 idempotency_key: key(),
                 volume: None,
                 muted: None,
@@ -613,10 +634,14 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
             .await
             .unwrap();
         assert_eq!(set.queue_revision, played.queue_revision + 1);
-        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        let state = client
+            .call::<PlaybackGet>(&PlaybackGetParams::default())
+            .await
+            .unwrap();
         assert!(state.shuffle);
         assert_eq!(state.repeat, Repeat::All);
         let window = |order| QueueWindowParams {
+            player: None,
             offset: 0,
             limit: None,
             order: Some(order),
@@ -638,6 +663,7 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
         // revision there is.
         let stale = client
             .call::<QueueAdd>(&QueueAddParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks {
                     ids: vec![songs[0].appearance_id],
@@ -654,6 +680,7 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
         // On the revision there is, it goes straight after the one on.
         let added = client
             .call::<QueueAdd>(&QueueAddParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks {
                     ids: vec![songs[0].appearance_id],
@@ -677,6 +704,7 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
         );
         let removed = client
             .call::<QueueRemove>(&QueueRemoveParams {
+                player: None,
                 idempotency_key: key(),
                 entry_ids: vec![up_next.entries[0].entry_id],
                 expected_revision: None,
@@ -697,7 +725,10 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
             .unwrap();
         assert_eq!(rated.rating, Some(80));
         assert!(rated.receipt.revision.is_some());
-        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        let state = client
+            .call::<PlaybackGet>(&PlaybackGetParams::default())
+            .await
+            .unwrap();
         assert_eq!(state.track.as_ref().unwrap().rating, Some(80));
         let page = client
             .call::<AlbumGet>(&AlbumGetParams {
@@ -728,12 +759,16 @@ async fn shuffle_repeat_queue_edits_and_stars_go_through_the_contract() {
         // Clearing stops the player and empties the queue.
         client
             .call::<QueueClear>(&QueueClearParams {
+                player: None,
                 idempotency_key: key(),
                 expected_revision: None,
             })
             .await
             .unwrap();
-        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        let state = client
+            .call::<PlaybackGet>(&PlaybackGetParams::default())
+            .await
+            .unwrap();
         assert_eq!(
             (state.status, state.queue_length),
             (PlaybackStatus::Stopped, 0)
@@ -764,6 +799,7 @@ async fn a_command_from_a_view_sent_again_after_the_view_ended_is_answered_from_
             view: opened.view.clone(),
         };
         let play = PlaybackPlayParams {
+            player: None,
             idempotency_key: key(),
             source: view(),
             start: Some(0),
@@ -772,6 +808,7 @@ async fn a_command_from_a_view_sent_again_after_the_view_ended_is_answered_from_
         };
         let played = client.call::<PlaybackPlay>(&play).await.unwrap();
         let add = QueueAddParams {
+            player: None,
             idempotency_key: key(),
             source: view(),
             place: QueuePlace::End,

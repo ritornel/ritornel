@@ -130,6 +130,7 @@ fn no_player() -> RpcError {
         ErrorCode::Unsupported,
         "this server has no audio output, so it has no player",
     )
+    .with_detail("reason", "no_player")
 }
 
 /// A track as the contract shows it.

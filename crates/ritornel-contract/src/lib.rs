@@ -136,11 +136,11 @@ pub use pages::{
 };
 pub use playback::{
     ContextKind, CopyInUse, OutputInfo, OutputMode, OutputProblem, PlayContext, PlaySource,
-    PlaybackChanged, PlaybackCommandParams, PlaybackEvent, PlaybackJumpParams, PlaybackPlayParams,
-    PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState, PlaybackStatus,
-    ProgressEvent, QueueAddParams, QueueClearParams, QueueEntry, QueueEvent, QueueMoveParams,
-    QueueOrder, QueuePlace, QueueRemoveParams, QueueWindow, QueueWindowParams, Repeat,
-    SkipDirection, SourceTracks, SourcesTracksParams, TrackSummary,
+    PlaybackChanged, PlaybackCommandParams, PlaybackEvent, PlaybackGetParams, PlaybackJumpParams,
+    PlaybackPlayParams, PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState,
+    PlaybackStatus, ProgressEvent, QueueAddParams, QueueClearParams, QueueEntry, QueueEvent,
+    QueueMoveParams, QueueOrder, QueuePlace, QueueRemoveParams, QueueWindow, QueueWindowParams,
+    Repeat, SkipDirection, SourceTracks, SourcesTracksParams, TrackSummary,
 };
 pub use rating::{MAX_RATING, RatingSet, RatingSetParams};
 pub use search::{MAX_SEARCH_RESULTS, SearchParams, SearchResults, SongFound};

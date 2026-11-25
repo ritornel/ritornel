@@ -299,3 +299,93 @@ fn a_server_killed_just_after_a_join_keeps_both_listens_and_the_boundary_between
     );
     server.stop();
 }
+
+#[test]
+fn on_routes_playback_and_queue_commands_to_one_named_player() {
+    use ritornel_client::contract::local::{SERVER_JSON, ServerJson};
+    use ritornel_client::contract::{
+        CONTRACT_VERSION, ClientKind, HelloParams, NoParams, Topic, methods::PlayersListCall,
+    };
+
+    let scratch = scratch();
+    let hub = scratch.data_dir();
+    let desk = scratch.0.join("desk");
+    let _hub_server = start(&hub, &[("RITORNEL_NAME", "Hub")]);
+    let desk_server = start(&desk, &[("RITORNEL_NAME", "Desk")]);
+    ok(&hub, &["library", "create"]);
+    let named: ServerJson =
+        serde_json::from_slice(&std::fs::read(hub.join(SERVER_JSON)).unwrap()).unwrap();
+    let link = |data: &Path| {
+        let invite = json(
+            &hub,
+            &["link", "invite", "--route", &named.endpoint.to_string()],
+        );
+        ok(data, &["link", "join", invite["link"].as_str().unwrap()]);
+    };
+    link(&desk);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut observer = runtime.block_on(async {
+        let c = ritornel_client::local::find(&hub)
+            .await
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        c.hello(&HelloParams {
+            name: "cli-test".into(),
+            kind: ClientKind::Cli,
+            version: "1".into(),
+            contract_version: CONTRACT_VERSION,
+            presence: None,
+        })
+        .await
+        .unwrap();
+        c.subscribe(&[Topic::Players]).await.unwrap();
+        c
+    });
+    let wait_for = async |observer: &mut ritornel_client::Client, known: usize, online: usize| {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let list = observer
+                    .call::<PlayersListCall>(&NoParams {})
+                    .await
+                    .unwrap();
+                let desks: Vec<_> = list.players.iter().filter(|p| p.name == "Desk").collect();
+                if desks.len() == known && desks.iter().filter(|p| p.reachable).count() == online {
+                    break;
+                }
+                observer.next_event().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    };
+    runtime.block_on(wait_for(&mut observer, 1, 1));
+    let initial = json(&hub, &["now"])["volume"].clone();
+    json(&hub, &["--on", "Desk", "volume", "37"]);
+    assert_eq!(json(&desk, &["now"])["volume"], 0.37);
+    assert_eq!(json(&hub, &["now"])["volume"], initial);
+    assert_eq!(
+        json(&hub, &["queue", "--on", "Desk"]),
+        json(&desk, &["queue"])
+    );
+
+    let refuses = |name: &str, why: &str| {
+        let (code, _, stderr) = ritornelctl(&hub, &["now", "--on", name]);
+        assert_ne!(code, Some(0));
+        assert!(stderr.contains(why), "{stderr}");
+    };
+    refuses("Unknown", "no player has that name");
+    desk_server.stop();
+    runtime.block_on(wait_for(&mut observer, 1, 0));
+    refuses("Desk", "the named player is away");
+    let another = scratch.0.join("another");
+    let _another_server = start(&another, &[("RITORNEL_NAME", "Desk")]);
+    link(&another);
+    runtime.block_on(wait_for(&mut observer, 2, 1));
+    refuses("Desk", "more than one player has that name");
+}

@@ -7,6 +7,7 @@ use ritornel_contract::{
     ClientKind, ErrorCode, Event, HelloParams, Id, PlaybackState, PlaybackStatus, PlayerInfo,
     PlayerSummary, PlayersList, PresenceHello, RpcError,
 };
+use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{Core, Stores, link::untrusted_name, lock};
@@ -86,7 +87,113 @@ fn row(
     }
 }
 
+/// Only these known calls may cross a presence connection in either direction.
+pub(super) fn is_player_method(name: &str) -> bool {
+    use ritornel_contract::methods::*;
+    matches!(
+        name,
+        PlaybackGet::NAME
+            | PlaybackPlay::NAME
+            | PlaybackPause::NAME
+            | PlaybackResume::NAME
+            | PlaybackStop::NAME
+            | PlaybackSeek::NAME
+            | PlaybackSkip::NAME
+            | PlaybackJump::NAME
+            | PlaybackSet::NAME
+            | QueueWindow::NAME
+            | QueueAdd::NAME
+            | QueueRemove::NAME
+            | QueueMove::NAME
+            | QueueClear::NAME
+    )
+}
+
+fn unreachable(name: &str, since: i64, problem: &str) -> RpcError {
+    RpcError::new(ErrorCode::Unavailable, format!("{name} {problem}"))
+        .with_detail("reason", "player_unreachable")
+        .with_detail("name", name.to_owned())
+        .with_detail("sinceMs", since)
+}
+
 impl Core {
+    pub(super) async fn call_player(
+        &self,
+        target: Id,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, RpcError> {
+        let sent_at = self.clock.now_ms();
+        let (name, call) = {
+            let peers = lock(&self.players.peers);
+            let peer = peers.get(&target).filter(|p| p.has_player).ok_or_else(|| {
+                RpcError::new(
+                    ErrorCode::Unsupported,
+                    "no such player is linked to this hub",
+                )
+                .with_detail("reason", "no_player")
+            })?;
+            let session = peer
+                .online
+                .as_ref()
+                .ok_or_else(|| unreachable(&peer.name, peer.since_ms, "cannot be reached"))?;
+            if matches!(method, "playback.play" | "queue.add")
+                && params
+                    .as_ref()
+                    .and_then(|p| p.pointer("/source/type"))
+                    .and_then(Value::as_str)
+                    == Some("view")
+            {
+                return Err(RpcError::new(
+                    ErrorCode::Unsupported,
+                    "the view belongs to the controller. Send tracks or a release to this player",
+                )
+                .with_detail("reason", "remote_view_unsupported"));
+            }
+            let call = session
+                .queue_player_call(method, params)
+                .ok_or_else(|| unreachable(&peer.name, sent_at, "cannot be reached"))?;
+            (peer.name.clone(), call)
+        };
+        call.answer().await.unwrap_or_else(|| {
+            let peers = lock(&self.players.peers);
+            if let Some(away) = peers.get(&target).filter(|p| p.online.is_none()) {
+                Err(unreachable(&away.name, away.since_ms, "cannot be reached"))
+            } else {
+                Err(unreachable(&name, sent_at, "did not answer the call"))
+            }
+        })
+    }
+
+    /// Answers a request received on this satellite's verified hub connection.
+    pub(crate) fn answer_hub_call(
+        &self,
+        session: &Session,
+        request: ritornel_contract::Request,
+    ) -> ritornel_contract::Response {
+        let outcome = if !is_player_method(&request.method) {
+            Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "the hub may only call this player and its queue",
+            ))
+        } else if request
+            .params
+            .as_ref()
+            .is_some_and(|p| p.get("player").is_some())
+        {
+            Err(RpcError::new(
+                ErrorCode::Invalid,
+                "a forwarded call cannot name another player",
+            ))
+        } else {
+            self.call(session, &request.method, request.params)
+        };
+        ritornel_contract::Response {
+            id: Some(request.id),
+            outcome,
+        }
+    }
+
     pub(crate) fn player_updates(&self) -> watch::Receiver<Option<(u64, PlayerSummary)>> {
         self.players.local.subscribe()
     }
@@ -444,6 +551,142 @@ mod tests {
         let away = &core.players_list().unwrap().players[0];
         assert!(!away.reachable);
         assert!(away.status.is_none());
+    }
+
+    #[test]
+    fn the_satellite_refuses_other_methods_and_nested_player_targets() {
+        use ritornel_contract::{Request, RequestId};
+        use serde_json::json;
+
+        let (core, _scratch) = crate::testing::core();
+        let session = Session::new(0, SessionKind::Limited);
+        session.greet();
+        for (method, params, code) in [
+            ("server.status", json!({}), ErrorCode::Forbidden),
+            ("list.open", json!({}), ErrorCode::Forbidden),
+            ("queue.unknown", json!({}), ErrorCode::Forbidden),
+            ("queue.window", json!({"player":null}), ErrorCode::Invalid),
+            (
+                "playback.get",
+                json!({"player":core.server_id}),
+                ErrorCode::Invalid,
+            ),
+        ] {
+            let request = Request {
+                id: RequestId::Number(1),
+                method: method.into(),
+                params: Some(params),
+            };
+            assert_eq!(
+                core.answer_hub_call(&session, request)
+                    .outcome
+                    .unwrap_err()
+                    .kind(),
+                code
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replaced_player_releases_the_controller_and_only_its_successor_can_answer() {
+        use ritornel_contract::{Frame, Request, RequestId, Response};
+        use serde_json::json;
+
+        let (core, _scratch) = crate::testing::core();
+        let core = Arc::new(core);
+        let peer = Id::from_bytes([8; 16]);
+        let first = peer_session(&core, peer);
+        announce(&core, &first, "Desk");
+        let controller = core.open_session(SessionKind::Limited).unwrap();
+        controller.greet();
+        let read = || {
+            let (core, controller) = (Arc::clone(&core), Arc::clone(&controller));
+            tokio::task::spawn_blocking(move || {
+                let request = Request {
+                    id: RequestId::Number(7),
+                    method: "queue.window".into(),
+                    params: Some(json!({"player":peer})),
+                };
+                let Some(Frame::Response(answer)) =
+                    core.dispatch(&controller, Frame::Request(request))
+                else {
+                    panic!("expected the controller's answer")
+                };
+                answer.outcome
+            })
+        };
+
+        let pending = read();
+        let Some(Frame::Request(old)) = first.next().await else {
+            panic!("expected a request")
+        };
+        assert!(
+            core.stores.try_write().is_ok(),
+            "the hub holds its stores while waiting"
+        );
+        let second = peer_session(&core, peer);
+        announce(&core, &second, "Desk");
+        assert_eq!(
+            pending.await.unwrap().unwrap_err().data.details["reason"],
+            "player_unreachable"
+        );
+
+        let pending = read();
+        let Some(Frame::Request(new)) = second.next().await else {
+            panic!("expected a request")
+        };
+        // Both sessions start their own request numbering at one.
+        assert_eq!(new.id, old.id);
+        assert_eq!(new.params, Some(json!({})));
+        first.answered(Response {
+            id: Some(old.id),
+            outcome: Ok(json!("old")),
+        });
+        second.answered(Response {
+            id: Some(new.id),
+            outcome: Ok(json!("new")),
+        });
+        assert_eq!(pending.await.unwrap().unwrap(), "new");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_player_has_four_seconds_to_answer_and_only_on_its_own_session() {
+        use ritornel_contract::{Frame, Response};
+        use serde_json::json;
+        use std::time::Duration;
+
+        let (core, _scratch) = crate::testing::core();
+        let peer = Id::from_bytes([8; 16]);
+        let desk = peer_session(&core, peer);
+        let other = peer_session(&core, Id::from_bytes([7; 16]));
+        announce(&core, &desk, "Desk");
+        let start = tokio::time::Instant::now();
+        let earliest = core.clock.now_ms();
+        let call = core.call_player(peer, "queue.window", Some(json!({})));
+        let read = async {
+            let Some(Frame::Request(request)) = desk.next().await else {
+                panic!("expected a request")
+            };
+            let reply = Response {
+                id: Some(request.id),
+                outcome: Ok(json!({})),
+            };
+            other.answered(reply.clone());
+            reply
+        };
+        let (error, late) = tokio::join!(call, read);
+        let error = error.unwrap_err();
+        assert_eq!(start.elapsed(), Duration::from_secs(4));
+        assert_eq!(error.message, "Desk did not answer the call");
+        assert_eq!(error.kind(), ErrorCode::Unavailable);
+        assert_eq!(error.data.details["reason"], "player_unreachable");
+        assert_eq!(error.data.details["name"], "Desk");
+        assert!(
+            (earliest..=core.clock.now_ms())
+                .contains(&error.data.details["sinceMs"].as_i64().unwrap())
+        );
+        desk.answered(late);
+        assert!(!desk.is_closed());
     }
 
     #[derive(Default)]
