@@ -200,20 +200,20 @@ impl Lastfm {
         self.wake.wake();
     }
 
-    /// Keeps a pending start only while the player is still on that appearance.
+    /// Records the displayed track for comparison after the library resolves redirects.
     #[cfg(feature = "lastfm")]
     pub(crate) fn still_playing(
         &self,
         player: ritornel_contract::Id,
-        appearance: Option<ritornel_contract::Id>,
+        appearance: ritornel_contract::Id,
     ) {
-        self.playing.keep(player, appearance);
+        self.playing.report(player, appearance);
     }
 
     /// A presence connection ended or was replaced.
     #[cfg(feature = "lastfm")]
     pub(crate) fn cancel_now_playing(&self, player: ritornel_contract::Id) {
-        self.playing.keep(player, None);
+        self.playing.cancel(player);
     }
 
     /// Drops every start made under the old account or scrobbling setting.
@@ -390,20 +390,35 @@ mod enabled {
         Show(Arc<Began>),
     }
 
+    #[derive(Debug)]
+    struct Pending {
+        began: Arc<Began>,
+        // A playing snapshot can name the canonical appearance instead of the queue entry's ID.
+        displayed: Option<Id>,
+    }
+
     /// Starts in arrival order. A repeat replaces even an identical track on the same player.
     #[derive(Debug, Default)]
-    pub(crate) struct Slots(std::sync::Mutex<VecDeque<Arc<Began>>>);
+    pub(crate) struct Slots(std::sync::Mutex<VecDeque<Pending>>);
 
     impl Slots {
         pub(crate) fn put(&self, began: Began) {
             let mut slots = lock(&self.0);
-            slots.retain(|held| held.player != began.player);
-            slots.push_back(Arc::new(began));
+            slots.retain(|pending| pending.began.player != began.player);
+            slots.push_back(Pending {
+                began: Arc::new(began),
+                displayed: None,
+            });
         }
 
-        pub(crate) fn keep(&self, player: Id, appearance: Option<Id>) {
-            lock(&self.0)
-                .retain(|held| held.player != player || Some(held.appearance) == appearance);
+        pub(super) fn report(&self, player: Id, appearance: Id) {
+            if let Some(pending) = lock(&self.0).iter_mut().find(|p| p.began.player == player) {
+                pending.displayed = Some(appearance);
+            }
+        }
+
+        pub(super) fn cancel(&self, player: Id) {
+            lock(&self.0).retain(|pending| pending.began.player != player);
         }
 
         pub(super) fn clear_all(&self) {
@@ -413,12 +428,12 @@ mod enabled {
         fn next(&self, now: Instant) -> Taken {
             let mut slots = lock(&self.0);
             while let Some(first) = slots.front() {
-                let age = now.saturating_duration_since(first.at);
+                let age = now.saturating_duration_since(first.began.at);
                 if age < SETTLE {
                     return Taken::Wait(SETTLE - age);
                 }
                 if age <= STALE {
-                    return Taken::Show(Arc::clone(first));
+                    return Taken::Show(Arc::clone(&first.began));
                 }
                 slots.pop_front();
             }
@@ -426,10 +441,14 @@ mod enabled {
         }
 
         // Keep the item cancellable while looking up its session and track.
-        fn finish(&self, began: &Arc<Began>) -> bool {
+        fn finish(&self, began: &Arc<Began>, canonical: Option<Id>) -> bool {
             lock(&self.0)
-                .pop_front_if(|first| Arc::ptr_eq(first, began))
-                .is_some()
+                .pop_front_if(|first| Arc::ptr_eq(&first.began, began))
+                .is_some_and(|pending| {
+                    pending
+                        .displayed
+                        .is_none_or(|id| id == began.appearance || Some(id) == canonical)
+                })
         }
     }
 
@@ -497,8 +516,9 @@ mod enabled {
         core: &Core,
         lastfm: &Lastfm,
         now: impl Fn() -> Instant,
+        stop: &AtomicBool,
     ) -> Option<std::time::Duration> {
-        loop {
+        while !stop.load(Ordering::SeqCst) {
             let began = match lastfm.playing.next(now()) {
                 Taken::Nothing => return None,
                 Taken::Wait(wait) => return Some(wait),
@@ -509,18 +529,22 @@ mod enabled {
                 return Some(SETTLE);
             };
             let outgoing = lastfm.client().ok().and_then(|client| {
-                playing_for(core, &began).map(|(session, playing)| (client, session, playing))
+                playing_for(core, &began)
+                    .map(|(appearance, session, playing)| (appearance, client, session, playing))
             });
-            if lastfm.playing.finish(&began)
+            let canonical = outgoing.as_ref().map(|(id, ..)| *id);
+            if lastfm.playing.finish(&began, canonical)
+                && !stop.load(Ordering::SeqCst)
                 && now().saturating_duration_since(began.at) <= STALE
-                && let Some((client, session, playing)) = outgoing
+                && let Some((_, client, session, playing)) = outgoing
             {
                 show(core, client, &session, &playing);
             }
         }
+        None
     }
 
-    fn playing_for(core: &Core, began: &Began) -> Option<(ServiceSession, Playing)> {
+    fn playing_for(core: &Core, began: &Began) -> Option<(Id, ServiceSession, Playing)> {
         let session = core.with_stores(|stores| stores.server().service_session(SERVICE));
         let Some(Ok(Some(session))) = session else {
             return None;
@@ -555,7 +579,7 @@ mod enabled {
             track_number: names.track_number.and_then(|n| u32::try_from(n).ok()),
             duration_ms: i64::try_from(began.duration_ms).ok().filter(|ms| *ms > 0),
         };
-        Some((session, playing))
+        Some((names.appearance, session, playing))
     }
 
     fn show(
@@ -1502,19 +1526,19 @@ mod enabled {
                 panic!("second player settled")
             };
             assert_eq!(*second, start(2, 2, 100));
-            slots.keep(id(2), None);
-            assert!(!slots.finish(&second));
+            slots.cancel(id(2));
+            assert!(!slots.finish(&second, Some(second.appearance)));
             let Taken::Show(first) = slots.next(ready) else {
                 panic!("first player still pending")
             };
             // Even a repeat at the same clock tick supersedes metadata being prepared.
             slots.put(*first);
-            assert!(!slots.finish(&first));
+            assert!(!slots.finish(&first, Some(first.appearance)));
             let Taken::Show(repeat) = slots.next(ready) else {
                 panic!("repeat settled")
             };
             assert_eq!(*repeat, start(1, 3, 200));
-            assert!(slots.finish(&repeat));
+            assert!(slots.finish(&repeat, Some(repeat.appearance)));
             assert_eq!(slots.next(ready), Taken::Nothing);
             slots.put(start(1, 4, 0));
             slots.put(start(2, 5, 100));
@@ -1980,7 +2004,7 @@ fn scrobble(core: &Core, stop: &AtomicBool) {
         #[cfg(feature = "lastfm")]
         if let Some(lastfm) = core.lastfm() {
             // First, as it is about now and the rest can wait.
-            if let Some(settling) = show_settled(core, lastfm, std::time::Instant::now) {
+            if let Some(settling) = show_settled(core, lastfm, std::time::Instant::now, stop) {
                 wait = settling;
             }
             import_tick(core, lastfm, first);

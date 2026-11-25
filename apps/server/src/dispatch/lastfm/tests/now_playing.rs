@@ -3,6 +3,7 @@
 //! fall exactly between a start and the end of its settling delay.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use ritornel_contract::{CONTRACT_VERSION, Id, SessionKind};
@@ -120,7 +121,15 @@ impl Hub {
 
     fn settle(&self) {
         let settled = Instant::now() + Duration::from_secs(2);
-        assert!(show_settled(&self.core, self.core.lastfm().unwrap(), || settled).is_none());
+        assert!(
+            show_settled(
+                &self.core,
+                self.core.lastfm().unwrap(),
+                || settled,
+                &AtomicBool::new(false)
+            )
+            .is_none()
+        );
     }
 
     fn titles(&self) -> Vec<String> {
@@ -192,10 +201,15 @@ fn a_satellite_start_requires_an_enabled_session_and_a_restored_library_must_imp
     let desk = h.peer(10, false);
     h.began(&desk, 0);
     h.settle();
+    h.began(&desk, 0);
     h.sign_in();
     h.began(&desk, 0);
     h.settle();
     h.switch(6, true);
+    h.began(&desk, 0);
+    h.sign_in();
+    h.settle();
+    assert!(h.titles().is_empty());
     h.began(&desk, 0);
     h.switch(7, false);
     h.switch(8, true);
@@ -240,7 +254,7 @@ fn a_start_waits_through_a_busy_session_but_buffering_sign_out_and_refusal_suppr
     h.began(&desk, 0);
     let change = lastfm.hold();
     let settled = Instant::now() + Duration::from_secs(2);
-    assert!(show_settled(&h.core, lastfm, || settled).is_some());
+    assert!(show_settled(&h.core, lastfm, || settled, &AtomicBool::new(false)).is_some());
     assert!(h.titles().is_empty());
     drop(change);
     h.settle();
@@ -264,4 +278,72 @@ fn a_start_waits_through_a_busy_session_but_buffering_sign_out_and_refusal_suppr
         .unwrap();
     h.settle();
     assert_eq!(h.titles().len(), 1);
+}
+
+#[test]
+fn a_playing_snapshot_can_omit_the_track_or_name_its_canonical_appearance() {
+    let h = Hub::new();
+    h.sign_in();
+    h.switch(6, true);
+    let desk = h.peer(10, false);
+    let id =
+        |i: usize, field: &str| serde_json::from_value::<Id>(h.songs[i][field].clone()).unwrap();
+    let db = rusqlite::Connection::open(h.dir.path().join("data/library.db")).unwrap();
+    // An old queue still names the redirected appearance. The canonical
+    // appearance in turn takes its display names from a redirected recording.
+    db.execute(
+        "UPDATE track_appearance SET (redirect_to_id,canonical_id) =
+        (SELECT id,id FROM track_appearance WHERE public_id = ?1) WHERE public_id = ?2",
+        (
+            id(0, "appearanceId").as_bytes(),
+            id(1, "appearanceId").as_bytes(),
+        ),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE recording SET (redirect_to_id,canonical_id) =
+        (SELECT id,id FROM recording WHERE public_id = ?1) WHERE public_id = ?2",
+        (
+            id(1, "recordingId").as_bytes(),
+            id(0, "recordingId").as_bytes(),
+        ),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE track_appearance SET display_title=NULL, display_artist_credit_id=NULL
+        WHERE public_id=?1",
+        [id(0, "appearanceId").as_bytes()],
+    )
+    .unwrap();
+    for snapshot in [Some(0), None] {
+        h.began(&desk, 1);
+        h.state(&desk, "playing", snapshot);
+        h.settle();
+    }
+    let canonical = h.songs[1]["title"].as_str().unwrap();
+    assert_eq!(h.titles(), [canonical, canonical]);
+    for update in h.fake.now_playing() {
+        assert_eq!(update["artist"], h.songs[1]["artistCredit"]["text"]);
+    }
+}
+
+#[test]
+fn shutdown_of_the_local_player_cancels_only_its_start() {
+    let h = Hub::new();
+    h.sign_in();
+    h.switch(6, true);
+    let desk = h.peer(10, false);
+    h.began(&desk, 0);
+    let lastfm = h.core.lastfm().unwrap();
+    lastfm.began(
+        h.core.server_id(),
+        serde_json::from_value(h.songs[1]["appearanceId"].clone()).unwrap(),
+        40_000,
+    );
+    let settled = Instant::now() + Duration::from_secs(2);
+    assert!(show_settled(&h.core, lastfm, || settled, &AtomicBool::new(true)).is_none());
+    assert!(h.titles().is_empty());
+    h.core.shutdown_player();
+    h.settle();
+    assert_eq!(h.titles(), [h.songs[0]["title"].as_str().unwrap()]);
 }

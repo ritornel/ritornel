@@ -44,15 +44,13 @@ impl Core {
                 appearance_id,
                 duration_ms,
             } => lastfm.began(player, *appearance_id, *duration_ms),
+            LinkPlayerEvent::Playback(e) if e.state.status != PlaybackStatus::Playing => {
+                lastfm.cancel_now_playing(player);
+            }
             LinkPlayerEvent::Playback(e) => {
-                // A fresh snapshot after report loss can invalidate a start, but cannot invent one.
-                let appearance = e
-                    .state
-                    .track
-                    .as_ref()
-                    .filter(|_| e.state.status == PlaybackStatus::Playing)
-                    .map(|track| track.appearance_id);
-                lastfm.still_playing(player, appearance);
+                if let Some(track) = &e.state.track {
+                    lastfm.still_playing(player, track.appearance_id);
+                }
             }
             _ => {}
         }

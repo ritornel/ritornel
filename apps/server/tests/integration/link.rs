@@ -3515,6 +3515,10 @@ async fn a_move_to_a_satellite_and_repeat_one_each_show_a_new_now_playing() {
             json!({"idempotencyKey": key(), "entryId": state["entryId"], "positionMs": 39_950});
         d.call_raw("playback.seek", near_end).await.unwrap();
         shown(&fake, 3).await;
+        // Force the playing satellite to reconnect. Its new presence takes
+        // over this socket and reports a snapshot of the track already heard.
+        let (mut replacement, _requests) = scripted_peer(&scratch, &hub).await;
+        assert!(replacement.next_event().await.is_none());
         // A later settled start on the hub gives the sender a chance to deliver
         // any extra report from the move or repeat before the final assertion.
         move_track(&h, appearance("River Stones")).await;
