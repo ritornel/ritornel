@@ -849,10 +849,10 @@ impl Core {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, RpcError> {
-        self.call_with_tracks(session, method, params, false)
+        self.call_with_known_tracks(session, method, params, false)
     }
 
-    fn call_with_tracks(
+    fn call_with_known_tracks(
         &self,
         session: &Session,
         method: &str,

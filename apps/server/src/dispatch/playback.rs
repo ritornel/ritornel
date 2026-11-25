@@ -669,10 +669,12 @@ impl Core {
                 "only a list of songs can be played",
             ));
         }
-        if max_rows.is_some_and(|max| resolved.ids.len() > max) {
+        if let Some(max) = max_rows
+            && resolved.ids.len() > max
+        {
             return Err(RpcError::new(
                 ErrorCode::Invalid,
-                "a remote player accepts at most 20,000 view rows",
+                format!("a remote player accepts at most {max} view rows"),
             ));
         }
         let ids = Self::library(stores, |library| {

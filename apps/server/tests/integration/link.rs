@@ -2570,7 +2570,7 @@ async fn a_remote_view_over_twenty_thousand_rows_is_refused_before_loading_the_p
             .await
             .unwrap_err();
         assert_eq!(code(&error), Some(ErrorCode::Invalid));
-        assert!(error.to_string().contains("20,000"));
+        assert!(error.to_string().contains("20000"));
         assert_eq!(
             local
                 .call::<PlaybackGet>(&PlaybackGetParams::default())
@@ -2753,6 +2753,58 @@ async fn routed_views_keep_their_order_context_and_receipt_after_close() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_satellite_controller_can_play_its_song_view_on_another_satellite() {
+    use serde_json::json;
+
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, mut observer, desk, local) = linked_player_at(&scratch, 1).await;
+        wait_for_player(&mut observer, desk.server_id()).await;
+        let other = start(&scratch, "other").await;
+        let controller = client(&scratch, "other", &other).await;
+        join(&controller, &invite(&hub, &observer).await)
+            .await
+            .unwrap();
+        let play = |view| {
+            json!({
+                "player": desk.server_id(), "idempotencyKey": key(),
+                "source": {"type":"view", "view":view}, "shuffle":true
+            })
+        };
+        let albums = controller
+            .list_open(&ListOpenParams {
+                kind: ListKind::Albums,
+                ..songs()
+            })
+            .await
+            .unwrap();
+        let error = controller
+            .call_raw("playback.play", play(albums.view))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&error), Some(ErrorCode::Invalid));
+        let view = controller.list_open(&songs()).await.unwrap();
+        let request = play(view.view.clone());
+        let played = controller
+            .call_raw("playback.play", request.clone())
+            .await
+            .unwrap();
+        let state = local
+            .call::<PlaybackGet>(&PlaybackGetParams::default())
+            .await
+            .unwrap();
+        assert!(state.shuffle);
+        assert_eq!(state.queue_length, view.total);
+        assert!(controller.list_close(&view.view).await.unwrap().closed);
+        assert_eq!(
+            controller.call_raw("playback.play", request).await.unwrap(),
+            played
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_player_loads_hub_checked_tracks_without_validation_round_trips() {
     use serde_json::json;
 
@@ -2775,20 +2827,26 @@ async fn the_player_loads_hub_checked_tracks_without_validation_round_trips() {
         join(&local, &link).await.unwrap();
         wait_for_player(&mut controller, desk.server_id()).await;
 
-        let tracks = song_ids(&controller.list_open(&songs()).await.unwrap().rows);
+        let current = song_ids(&controller.list_open(&songs()).await.unwrap().rows)[0];
+        add_view_rows(&scratch, 1);
+        let probe = song_ids(&controller.list_open(&songs()).await.unwrap().rows)
+            .into_iter().find(|id| *id != current).unwrap();
         let request = |ids| json!({"idempotencyKey":key(),"source":{"type":"tracks","ids":ids},"place":{"type":"end"}});
         // Populate the stopped player's current entry (which reads its title once).
         local
-            .call_raw("queue.add", request(vec![tracks[0]]))
+            .call_raw("queue.add", request(vec![current]))
             .await
             .unwrap();
+        // Count only summaries of a song other than the current entry, so a
+        // background read of the current song cannot affect the measurement.
+        let reply = format!(r#""appearanceId":"{probe}""#);
         let count = || {
             let heard = relay.heard.lock().unwrap();
-            let reply = br#""tracks":[{"#;
-            heard.windows(reply.len()).filter(|w| *w == reply).count()
+
+            heard.windows(reply.len()).filter(|w| *w == reply.as_bytes()).count()
         };
         let before = count();
-        let ids = vec![tracks[0]; 1001];
+        let ids = vec![probe; 1001];
         let mut routed = request(ids.clone());
         routed["player"] = json!(desk.server_id());
         controller.call_raw("queue.add", routed).await.unwrap();
@@ -2796,8 +2854,8 @@ async fn the_player_loads_hub_checked_tracks_without_validation_round_trips() {
         local.call_raw("queue.add", request(ids)).await.unwrap();
         assert_eq!(
             count(),
-            before + 3,
-            "local validation reads batches of 500, 500 and 1"
+            before + 1001,
+            "local validation reads a summary for each submitted ID"
         );
         assert_eq!(
             local

@@ -70,6 +70,8 @@ Every `playback.*` and `queue.*` method accepts an optional `player` ID from `pl
 
 For a remote `playback.play` or `queue.add` from a song view, the hub resolves the calling session's view in order. It omits gone songs, adjusts the start index and returns `not_found` if the selected song is gone. The context defaults to `query`. A view over 20,000 rows or a rewritten request over the 1 MiB message limit returns `invalid` before anything is sent. The hub keeps the rewritten params for three minutes per session, player and idempotency key, up to 32 rewrites and 2 MiB per session. Retrying within that cache returns the player's receipt even after the view closes. Reusing the key with different params returns `idempotency_mismatch`.
 
+The hub marks a resolved or validated track list with `tracksKnown: true` on its authenticated call to the satellite. Clients cannot supply this assurance.
+
 The hub releases its stores before waiting up to four seconds for the player's answer, within the satellite's eight-second wait for its hub. The satellite handles the request separately from its socket reader so it can read track details back from the hub while answering. It accepts only the playback and queue methods declared in the contract and rejects a forwarded call containing `player`. A missing player returns `unsupported` with reason `no_player`. An away player or a missed answer returns `unavailable` with reason `player_unreachable`, its `name` and `sinceMs`. A missed answer leaves the outcome unknown. Retry a command with the same idempotency key. A full request queue refuses the call with `unavailable` and reason `player_busy`.
 
 ### Transport-neutral dispatcher

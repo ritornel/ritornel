@@ -202,7 +202,7 @@ impl Core {
             // Only this authenticated direction may vouch for a resolved track list.
             let known = request.params.as_ref().and_then(|p| p.get("tracksKnown"))
                 == Some(&Value::Bool(true));
-            self.call_with_tracks(session, &request.method, request.params, known)
+            self.call_with_known_tracks(session, &request.method, request.params, known)
         };
         ritornel_contract::Response {
             id: Some(request.id),

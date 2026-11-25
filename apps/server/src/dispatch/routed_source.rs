@@ -126,7 +126,7 @@ impl Core {
                             stores,
                             session,
                             &view,
-                            start.map(|n| n as usize),
+                            start.map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
                             Some(MAX_VIEW_FROM_HUB),
                         )
                     })
@@ -150,6 +150,7 @@ impl Core {
                 });
             }
             PlaySource::Tracks { ids } => {
+                drop(rewrites);
                 // If a row has gone since a first attempt, the player can
                 // still replay its receipt before validating the IDs afresh.
                 if self
@@ -158,8 +159,8 @@ impl Core {
                     .map_err(refused)?
                     == Some(None)
                 {
+                    // The removed player ID leaves room for this flag and the link's request ID.
                     fields.insert("tracksKnown".into(), Value::Bool(true));
-                    written_params(method, &params)?;
                 }
             }
             PlaySource::Release { .. } => {}
