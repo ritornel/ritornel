@@ -3564,3 +3564,115 @@ fn a_late_failure_for_an_entry_taken_out_does_not_hold_back_another_of_its_track
     assert_eq!(wanted.appearance, next.appearance);
     assert_ne!(wanted.entry, next.entry);
 }
+
+#[test]
+fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_listen() {
+    use ritornel_contract::{HandoffResult, LinkHandoffParams, PlaybackMoveParams};
+    let mut src = Rig::new();
+    let mut dst = Rig::new();
+    src.play(1);
+    src.pass(12_000);
+    src.set(Some(true), Some(super::Repeat::All));
+    dst.play(0);
+    dst.pass(1000);
+    let replaced = dst.player.open_listen().unwrap();
+    let source_listen = src.player.open_listen().unwrap();
+    let movement = PlaybackMoveParams {
+        idempotency_key: id(0xd0),
+        from: id(0xa0),
+        to: id(0xa2),
+        entry_id: src.entry(),
+    };
+    let take = LinkHandoffParams::Take { movement };
+    let (taken, _) = src.player.handoff(take.clone(), &src.server).unwrap();
+    let HandoffResult::Taken { snapshot } = taken.clone() else {
+        panic!("expected snapshot")
+    };
+    assert_eq!(snapshot.listen, Some(source_listen));
+    assert_eq!(snapshot.position_ms, 12_000);
+    assert_eq!(src.player.handoff(take, &src.server).unwrap().0, taken);
+    let retired = id(0xb3);
+    let probe = LinkHandoffParams::Load {
+        movement,
+        attempt: retired,
+        snapshot: None,
+    };
+    assert_eq!(
+        dst.player.handoff(probe, &dst.server).unwrap().0,
+        HandoffResult::Pending
+    );
+    let late = LinkHandoffParams::Load {
+        movement,
+        attempt: retired,
+        snapshot: Some(snapshot.clone()),
+    };
+    assert_eq!(
+        dst.player.handoff(late, &dst.server).unwrap().0,
+        HandoffResult::Pending
+    );
+    assert_eq!(dst.player.open_listen(), Some(replaced));
+    let load = LinkHandoffParams::Load {
+        movement,
+        attempt: id(0xb4),
+        snapshot: Some(snapshot),
+    };
+    dst.player.handoff(load.clone(), &dst.server).unwrap();
+    assert_eq!(dst.player.status(), Status::Buffering);
+    assert_eq!(
+        dst.staged()
+            .iter()
+            .find(|s| s.started.listen_id == replaced)
+            .unwrap()
+            .ended
+            .as_ref()
+            .unwrap()
+            .end_reason
+            .as_str(),
+        "replaced"
+    );
+    dst.tick();
+    dst.pass(1000);
+    let continued = dst.player.open_listen().unwrap();
+    let staged = dst
+        .staged()
+        .into_iter()
+        .find(|s| s.started.listen_id == continued)
+        .unwrap();
+    assert_eq!(staged.started.continues, Some(source_listen));
+    assert_eq!(staged.started.start_reason.as_str(), "resume");
+    assert_eq!(staged.started.start_position_ms, 12_000);
+    dst.player.handoff(load, &dst.server).unwrap();
+    assert_eq!(dst.player.open_listen(), Some(continued));
+    let paused_at = src.clock.now_ms();
+    src.wait(120_000);
+    let release = LinkHandoffParams::Release { movement };
+    src.player.handoff(release.clone(), &src.server).unwrap();
+    src.player.handoff(release, &src.server).unwrap();
+    assert_eq!(src.player.state().queue_length, 0);
+    let end = src.staged().pop().unwrap().ended.unwrap();
+    assert_eq!(end.end_reason.as_str(), "stopped");
+    assert_eq!(end.ended_at_ms, paused_at);
+}
+
+#[test]
+fn a_delayed_release_leaves_music_the_listener_resumed_in_place() {
+    use ritornel_contract::{LinkHandoffParams, PlaybackMoveParams};
+    let mut rig = Rig::new();
+    rig.play(1);
+    let movement = PlaybackMoveParams {
+        idempotency_key: id(0xc0),
+        from: id(1),
+        to: id(2),
+        entry_id: rig.entry(),
+    };
+    rig.player
+        .handoff(LinkHandoffParams::Take { movement }, &rig.server)
+        .unwrap();
+    rig.resume();
+    rig.pause();
+    rig.player
+        .handoff(LinkHandoffParams::Release { movement }, &rig.server)
+        .unwrap();
+    assert_eq!(rig.entry(), movement.entry_id);
+    assert_eq!(rig.player.status(), Status::Paused);
+}

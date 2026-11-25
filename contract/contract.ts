@@ -95,6 +95,7 @@ export const METHODS = {
   "artist.get": { kind: "query", needsFull: false },
   "media.token": { kind: "session", needsFull: false },
   "playback.get": { kind: "query", needsFull: false },
+  "playback.move": { kind: "command", needsFull: false },
   "playback.play": { kind: "command", needsFull: false },
   "playback.pause": { kind: "command", needsFull: false },
   "playback.resume": { kind: "command", needsFull: false },
@@ -150,6 +151,7 @@ export const METHODS = {
   "link.copies": { kind: "query", needsFull: true },
   "link.listen": { kind: "command", needsFull: true },
   "link.event": { kind: "session", needsFull: true },
+  "link.handoff": { kind: "session", needsFull: true },
   "link.ping": { kind: "session", needsFull: true },
   "server.settings": { kind: "query", needsFull: true },
   "server.setSettings": { kind: "command", needsFull: true },
@@ -200,6 +202,7 @@ export type MethodMap = {
   "artist.get": { params: ArtistGetParams; result: ArtistPage };
   "media.token": { params: NoParams; result: MediaToken };
   "playback.get": { params: PlaybackGetParams; result: PlaybackState };
+  "playback.move": { params: PlaybackMoveParams; result: Receipt };
   "playback.play": { params: PlaybackPlayParams; result: PlaybackChanged };
   "playback.pause": { params: PlaybackCommandParams; result: PlaybackChanged };
   "playback.resume": { params: PlaybackCommandParams; result: PlaybackChanged };
@@ -255,6 +258,7 @@ export type MethodMap = {
   "link.copies": { params: LinkCopiesParams; result: LinkCopies };
   "link.listen": { params: LinkListenParams; result: LinkListened };
   "link.event": { params: LinkPlayerEvent; result: NoParams };
+  "link.handoff": { params: LinkHandoffParams; result: HandoffResult };
   "link.ping": { params: LinkPingParams; result: LinkPinged };
   "server.settings": { params: NoParams; result: ServerSettings };
   "server.setSettings": { params: SetServerSettingsParams; result: ServerSettingsSet };
@@ -1958,6 +1962,23 @@ export type GoneRow = {
 };
 
 /**
+ * An entry in queue order. Shuffle positions preserve the separate play order.
+ */
+export type HandoffEntry = { entryId: string, appearanceId: string, context: PlayContext, shufflePosition: number | null,
+};
+
+/**
+ * The durable outcome of a step, or a load whose receipt is still absent.
+ */
+export type HandoffResult = { "step": "taken", snapshot: HandoffSnapshot, } | { "step": "loaded" } | { "step": "pending" } | { "step": "released" };
+
+/**
+ * The source at the instant it paused. The listen key follows the music.
+ */
+export type HandoffSnapshot = { entries: Array<HandoffEntry>, entryId: string, positionMs: number, playing: boolean, shuffle: boolean, repeat: Repeat, listen: string | null, listener: string | null, queueRevision: number,
+};
+
+/**
  * The body of [`HEALTH`].
  */
 export type Health = {
@@ -3640,6 +3661,12 @@ export type LinkGranted = {
 };
 
 /**
+ * A request on the player's authenticated connection to its hub.
+ */
+export type LinkHandoffParams = { "step": "take", movement: PlaybackMoveParams, } | { "step": "load", movement: PlaybackMoveParams, attempt: string, snapshot: HandoffSnapshot | null, } | { "step": "release", movement: PlaybackMoveParams,
+};
+
+/**
  * The result of `link.invite`.
  */
 export type LinkInvite = {
@@ -4610,6 +4637,12 @@ export type PlaybackJumpParams = {
    * The entry to play now, from its beginning.
    */
   entryId: string,
+};
+
+/**
+ * A move of one current queue entry between two places from `players.list`.
+ */
+export type PlaybackMoveParams = { idempotencyKey: string, from: string, to: string, entryId: string,
 };
 
 /**

@@ -45,7 +45,8 @@ use jiff::tz::{TimeZone, TimeZoneDatabase};
 /// and refuses a dry run made before it. Version 4 pairs same-second
 /// returning echoes 1-to-1 per `(endpoint, listen)` across distinct
 /// delivered listens.
-pub const GROUPER_VERSION: i64 = 4;
+/// Version 5 joins explicit continuations between players.
+pub const GROUPER_VERSION: i64 = 5;
 
 /// How long after the end of a listen one that continues it may start and
 /// still be joined to it.
@@ -390,7 +391,7 @@ pub struct Listen {
     pub ended_mono_ms: Option<i64>,
     /// The boot of the machine that clock counts from.
     pub boot: [u8; 16],
-    /// The key of the listen on the same endpoint that this one resumes.
+    /// The key of the listen this one resumes, possibly on another player.
     pub continues: Option<Vec<u8>>,
     /// Audio actually rendered.
     pub ms_played: i64,
@@ -948,7 +949,8 @@ fn span(listen: &Listen) -> (i64, i64) {
 /// first kept its end, which is exact; otherwise the time between their
 /// spans, which is as good as their dates.
 fn gap(earlier: &Listen, later: &Listen) -> (i64, i64) {
-    if earlier.boot == later.boot
+    if earlier.endpoint == later.endpoint
+        && earlier.boot == later.boot
         && let Some(end) = earlier.ended_mono_ms
     {
         return (later.started_mono_ms.saturating_sub(end), 0);
@@ -967,8 +969,8 @@ fn order(listen: &Listen) -> (i64, &[u8]) {
 /// listen first. Chains are in the order of their first listen's
 /// observation.
 ///
-/// A listen joins the one it continues when that one is here, on the same
-/// endpoint, and ended no later than it began and at most
+/// A listen joins the one it continues when that one is here for the same listener
+/// and ended no later than it began and at most
 /// [`CHAIN_WINDOW_MS`] before: by the monotonic clock when both were heard
 /// in one boot, and otherwise by their dates, within what those dates can
 /// be out. The sender's wall clock decides none of it, so a clock set back
@@ -984,6 +986,15 @@ pub fn chains(listens: &[Listen]) -> Vec<Vec<usize>> {
         .enumerate()
         .map(|(index, listen)| ((listen.endpoint, listen.source_key.as_slice()), index))
         .collect();
+    // IDs are minted by players. Keep endpoint-local identity when available,
+    // and only follow a key across endpoints when its owner is unambiguous.
+    let mut across = HashMap::new();
+    for (index, listen) in listens.iter().enumerate() {
+        across
+            .entry((listen.listener, listen.source_key.as_slice()))
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(Some(index));
+    }
     // The successor each listen keeps, by the earliest claimant.
     let mut next: BTreeMap<usize, usize> = BTreeMap::new();
     let mut has_previous = vec![false; listens.len()];
@@ -992,10 +1003,16 @@ pub fn chains(listens: &[Listen]) -> Vec<Vec<usize>> {
         .enumerate()
         .filter_map(|(index, listen)| {
             let key = listen.continues.as_deref()?;
-            let &previous = by_key.get(&(listen.endpoint, key))?;
+            let previous = by_key
+                .get(&(listen.endpoint, key))
+                .copied()
+                .or_else(|| across.get(&(listen.listener, key)).copied().flatten())?;
             let earlier = listens.get(previous)?;
             let (after, slack) = gap(earlier, listen);
-            let joins = previous != index && after >= -slack && after <= CHAIN_WINDOW_MS;
+            let joins = earlier.listener == listen.listener
+                && previous != index
+                && after >= -slack
+                && after <= CHAIN_WINDOW_MS;
             joins.then_some((previous, index))
         })
         .collect();

@@ -210,6 +210,7 @@ impl Player {
             // The new order and the entry that opens it are saved together.
             let opens = self.queue.get(first).map(|entry| entry.row);
             let change = Change {
+                listener: None,
                 command: None,
                 expected: None,
                 queue: self.queue.shuffle(Some(first), &mut random)?,
@@ -320,6 +321,7 @@ impl Player {
         };
         let reordered = write.is_some();
         let change = Change {
+            listener: None,
             command: None,
             expected: None,
             queue: write.unwrap_or_default(),
@@ -442,6 +444,7 @@ impl Player {
             (self.here(), self.entry().map(|entry| entry.entry_id))
         };
         let change = Change {
+            listener: None,
             command: None,
             expected,
             queue: write,
@@ -516,6 +519,7 @@ impl Player {
         }
         let indexes: Vec<usize> = gone.into_iter().collect();
         let change = Change {
+            listener: None,
             command: None,
             expected,
             queue: self.queue.remove(&indexes),
@@ -595,6 +599,7 @@ impl Player {
             Place::Next | Place::After(_) => self.queue.move_after(&moving, anchor),
         };
         let change = Change {
+            listener: None,
             command: None,
             expected,
             queue: write,
@@ -626,14 +631,25 @@ impl Player {
         expected: Option<i64>,
         server: &ServerStore,
     ) -> Result<Done, Error> {
+        self.clear_for(request, expected, server, EndReason::Removed)
+    }
+
+    pub(super) fn clear_for(
+        &mut self,
+        request: Request,
+        expected: Option<i64>,
+        server: &ServerStore,
+        reason: EndReason,
+    ) -> Result<Done, Error> {
         if let Some(done) = Self::replayed(server, &request)? {
             return Ok(done);
         }
         self.fresh_enough(expected)?;
         let mut events = Vec::new();
         self.sync(server, &mut events);
-        self.leave(server, EndReason::Removed, &mut events);
+        self.leave(server, reason, &mut events);
         let change = Change {
+            listener: None,
             command: None,
             expected,
             queue: QueueWrite {

@@ -70,7 +70,7 @@ pub struct ListenRecord {
     pub boot: Id,
     /// Why it began.
     pub start_reason: String,
-    /// The listen it resumes after a restart.
+    /// The previous listen after a restart or a move between players.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continues: Option<Id>,
     /// Where in the track it began.
@@ -764,11 +764,13 @@ fn neighbours(connection: &Connection, at: i64) -> Result<Vec<i64>, Error> {
         for sql in [
             "SELECT p.id FROM history_observation o
              JOIN observation_listen l ON l.observation_id = o.id
-             JOIN history_observation p ON p.endpoint_id = o.endpoint_id
+             JOIN history_endpoint ep ON ep.kind = 'player'
+             JOIN history_observation p ON p.endpoint_id = ep.id
+                                       AND p.kind = 'listen' AND p.listener_id = o.listener_id
                                        AND p.source_key = l.continues_source_key
              WHERE o.id = ?1",
             "SELECT n.observation_id FROM history_observation o
-             JOIN history_observation m ON m.endpoint_id = o.endpoint_id
+             JOIN history_observation m ON m.listener_id = o.listener_id
              JOIN observation_listen n ON n.observation_id = m.id
              WHERE o.id = ?1 AND n.continues_source_key = o.source_key",
         ] {

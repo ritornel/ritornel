@@ -13,6 +13,7 @@
 pub(crate) mod audio;
 pub(crate) mod catalog;
 pub(crate) mod listen;
+mod move_store;
 mod outbox;
 pub(crate) mod player;
 pub(crate) mod queue;
@@ -23,6 +24,7 @@ pub(crate) mod tests;
 
 pub use audio::{AudioRenderer, OnDemand, Output};
 pub use catalog::{Catalog, Copy, TrackDisplay};
+pub use move_store::PendingMove;
 pub use outbox::{
     Delivered, Ingest, MAX_BACKOFF_MS, SendStamps, deliver_listens, deliver_listens_to,
 };

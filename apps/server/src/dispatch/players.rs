@@ -159,6 +159,17 @@ impl Core {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, RpcError> {
+        self.call_player_within(target, method, params, crate::bounds::PLAYER_CALL_WAIT)
+            .await
+    }
+
+    pub(super) async fn call_player_within(
+        &self,
+        target: Id,
+        method: &str,
+        params: Option<Value>,
+        within: std::time::Duration,
+    ) -> Result<Value, RpcError> {
         let sent_at = self.clock.now_ms();
         let (name, call) = {
             let peers = lock(&self.players.peers);
@@ -168,7 +179,7 @@ impl Core {
                 .ok_or_else(|| unreachable(name, sent_at, "cannot be reached"))?;
             (name.to_owned(), call)
         };
-        call.answer().await.unwrap_or_else(|| {
+        call.answer_within(within).await.unwrap_or_else(|| {
             let peers = lock(&self.players.peers);
             if let Some(away) = peers.get(&target).filter(|p| p.online.is_none()) {
                 Err(unreachable(&away.name, away.since_ms, "cannot be reached"))
@@ -184,7 +195,11 @@ impl Core {
         session: &Session,
         request: ritornel_contract::Request,
     ) -> ritornel_contract::Response {
-        let outcome = if !is_player_method(&request.method) {
+        let outcome = if request.method == "link.handoff" {
+            super::run::<ritornel_contract::methods::LinkHandoff>(request.params, |p| {
+                self.local_handoff(p)
+            })
+        } else if !is_player_method(&request.method) {
             Err(RpcError::new(
                 ErrorCode::Forbidden,
                 "the hub may only call this player and its queue",

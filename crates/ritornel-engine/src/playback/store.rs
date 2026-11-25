@@ -7,7 +7,7 @@
 use ritornel_domain::history::{ContextKind, EndReason, StartReason};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 
-use crate::jobs::{receipt, record_receipt};
+use crate::jobs::receipt;
 use crate::playback::queue::{QueueWrite, Repeat};
 use crate::{Command, Error, Id, ServerStore};
 
@@ -171,6 +171,7 @@ pub(crate) struct Change {
     pub(crate) bump: bool,
     /// Repeat, where it changes.
     pub(crate) repeat: Option<Repeat>,
+    pub(crate) listener: Option<Id>,
     /// The volume and whether it is muted, where they change.
     pub(crate) volume: Option<(f64, bool)>,
     /// The entry, by row, and the position the player is at after it, and
@@ -531,7 +532,7 @@ impl ServerStore {
             if let Some((current, position_ms, resume)) = place {
                 save_place(transaction, current, position_ms, resume, now_ms)?;
             }
-            record_receipt(transaction, &command, method, &result, now_ms)
+            super::move_store::record_player_receipt(transaction, &command, method, &result, now_ms)
         })
     }
 
@@ -613,6 +614,12 @@ impl ServerStore {
                     [repeat.as_str()],
                 )?;
             }
+            if let Some(listener) = change.listener {
+                transaction.execute(
+                    "UPDATE playback_session SET listener_pid=?1 WHERE id=1",
+                    [listener.as_bytes()],
+                )?;
+            }
             if let Some((volume, muted)) = change.volume {
                 transaction.execute(
                     "UPDATE playback_session SET volume = ?1, muted = ?2 WHERE id = 1",
@@ -628,7 +635,13 @@ impl ServerStore {
             save_place(transaction, entry, position_ms, resume, now_ms)?;
             let answer = answer(revision);
             if let Some((command, method)) = &change.command {
-                record_receipt(transaction, command, method, &answer, now_ms)?;
+                super::move_store::record_player_receipt(
+                    transaction,
+                    command,
+                    method,
+                    &answer,
+                    now_ms,
+                )?;
             }
             Ok(Wrote::Done {
                 revision,
@@ -915,6 +928,7 @@ mod tests {
             .unwrap();
         let first = write.insert.first().map(|entry| entry.row);
         let change = Change {
+            listener: None,
             command: Some((
                 Command {
                     id: Id::from_bytes([key; 16]),

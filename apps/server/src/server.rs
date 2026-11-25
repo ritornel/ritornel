@@ -103,6 +103,7 @@ pub struct Server {
     awake: Task,
     /// Removes the staged imports that have expired.
     sweep: Task,
+    moves: Task,
     transports: Transports,
     listening: Listening,
     bounds: Bounds,
@@ -318,6 +319,7 @@ impl Server {
             origins: run.origins,
         });
         core.attach_transcodes(&transcodes);
+        let moves = Task(core.start_moves());
         let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         if listen.is_private() {
@@ -356,6 +358,7 @@ impl Server {
             hub,
             awake,
             sweep,
+            moves,
             core,
             listening,
             bounds,
@@ -480,7 +483,10 @@ impl Server {
         drop(self.hub);
         drop(self.awake);
         drop(self.sweep);
+        self.core.stop_moves();
         self.core.close_sessions();
+        let mut moves = self.moves;
+        let _ = (&mut moves.0).await;
         self.listening.stop().await;
         self.core.end_transports(self.bounds.stop_grace).await;
         drop(self.transports);

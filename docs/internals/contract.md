@@ -66,13 +66,21 @@ The satellite's presence connection identifies itself in `server.hello` with `pr
 
 ### Routing playback and queue calls
 
-Every `playback.*` and `queue.*` method accepts an optional `player` ID from `players.list`. Omitting it uses the player on the server the client connects to. A satellite sends calls for another player up to the hub. The hub handles its own target locally. For a linked satellite with a player, it removes `player` and sends the call with its original idempotency key on that player's current presence connection. Receipts belong to the player, so a retry there returns the same receipt. Both full and limited sessions may route these calls.
+Single-player playback and queue methods accept an optional `player` ID from `players.list`. Omitting it uses the player on the server the client connects to. A satellite sends calls for another player up to the hub. The hub handles its own target locally. For a linked satellite with a player, it removes `player` and sends the call with its original idempotency key on that player's current presence connection. Receipts belong to the player, so a retry there returns the same receipt. Both full and limited sessions may route these calls.
 
 For a remote `playback.play` or `queue.add` from a song view, the hub resolves the calling session's view in order. It omits gone songs, adjusts the start index and returns `not_found` if the selected song is gone. The context defaults to `query`. A view over 20,000 rows or a rewritten request over the 1 MiB message limit returns `invalid` before anything is sent. The hub keeps the rewritten params for three minutes per session, player and idempotency key, up to 32 rewrites and 2 MiB per session. Retrying within that cache returns the player's receipt even after the view closes. Reusing the key with different params returns `idempotency_mismatch`.
 
 The hub marks a resolved or validated track list with `tracksKnown: true` on its authenticated call to the satellite. Clients cannot supply this assurance.
 
-The hub releases its stores before waiting up to four seconds for the player's answer, within the satellite's eight-second wait for its hub. The satellite handles the request separately from its socket reader so it can read track details back from the hub while answering. It accepts only the playback and queue methods declared in the contract and rejects a forwarded call containing `player`. A missing player returns `unsupported` with reason `no_player`. An away player or a missed answer returns `unavailable` with reason `player_unreachable`, its `name` and `sinceMs`. A missed answer leaves the outcome unknown. Retry a command with the same idempotency key. A full request queue refuses the call with `unavailable` and reason `player_busy`.
+The hub releases its stores before waiting up to four seconds for the player's answer, within the satellite's eight-second wait for its hub. The satellite handles the request separately from its socket reader so it can read track details back from the hub while answering. It accepts the declared single-player playback and queue methods and rejects a forwarded call containing `player`. A missing player returns `unsupported` with reason `no_player`. An away player or a missed answer returns `unavailable` with reason `player_unreachable`, its `name` and `sinceMs`. A missed answer leaves the outcome unknown. Retry a command with the same idempotency key. A full request queue refuses the call with `unavailable` and reason `player_busy`.
+
+### Moving playback
+
+`playback.move` takes `from` and `to` IDs from `players.list`, the current `entryId` at the source, and an `idempotencyKey`. Either server accepts it from a full or limited client. The hub coordinates it even when both players are satellites. Equal targets, a stopped source, a stale entry or a snapshot too large for a single frame return `invalid`. An overlapping move may return `unavailable`. Retry with the original key.
+
+The hub gives the source three seconds to pause and the destination three seconds to accept the queue. The `done` receipt means the destination has written the queue. Sound can start later. The hub then releases the source in the background, including after a reconnect or hub restart. A refused load leaves the source paused with its queue. If the load answer was lost, the hub checks the destination's receipt before releasing anything.
+
+`link.handoff` carries the internal `take`, `load` and `release` steps on the satellite's verified connection to its hub. Ordinary client calls are forbidden. The hub calls its own player directly. See [Queue and session](playback.md#queue-and-session) for the snapshot and listen recording.
 
 ### Transport-neutral dispatcher
 
@@ -190,7 +198,7 @@ The methods registered in `crates/ritornel-contract/src/methods.rs`, by area (se
 | Library & sources | `library.create`, `sources.list`, `sources.add`, `sources.tracks`, `scan.start`, `library.stats`, `library.setWatching`, `library.settings`, `library.setSettings`, `artists.importPictures`, `artists.pictureFolders` |
 | Jobs & identity | `jobs.list`, `jobs.get`, `jobs.cancel`, `identity.dryRun`, `identity.review` |
 | Browse & media | `list.open`, `list.window`, `list.sections`, `list.locate`, `list.close`, `library.search`, `album.get`, `artist.get`, `tracks.get`, `media.token` |
-| Playback & queue | `playback.get`, `playback.play`, `playback.pause`, `playback.resume`, `playback.stop`, `playback.seek`, `playback.skip`, `playback.jump`, `playback.set`, `queue.window`, `queue.add`, `queue.remove`, `queue.move`, `queue.clear` |
+| Playback & queue | `playback.get`, `playback.play`, `playback.pause`, `playback.resume`, `playback.stop`, `playback.seek`, `playback.skip`, `playback.jump`, `playback.set`, `playback.move`, `queue.window`, `queue.add`, `queue.remove`, `queue.move`, `queue.clear` |
 | History & ratings | `history.recent`, `history.onThisDay`, `history.artist`, `history.album`, `history.artists`, `history.albums`, `history.track`, `history.stream`, `history.rebuild`, `history.zones`, `history.setZones`, `history.export`, `ratings.set` |
 | Last.fm | `lastfm.status`, `lastfm.signInStart`, `lastfm.signInFinish`, `lastfm.signOut`, `lastfm.sync`, `lastfm.setScrobbling`, `lastfm.report` |
 | Imports | `imports.stage`, `imports.dryRun`, `imports.apply`, `imports.undo`, `imports.get`, `imports.list` |

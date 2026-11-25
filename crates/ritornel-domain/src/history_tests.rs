@@ -286,14 +286,38 @@ fn a_resume_stays_in_the_window_when_its_senders_wall_clock_jumped_two_days_ahea
 }
 
 #[test]
-fn a_continuation_from_another_endpoint_or_of_a_listen_not_there_joins_nothing() {
+fn a_move_joins_across_endpoints_and_a_missing_predecessor_stands_alone() {
     let first = listen(1, 1, 100_000);
     let mut elsewhere = listen(2, 2, 100_000);
     elsewhere.endpoint = 2;
     elsewhere.continues = Some(first.source_key.clone());
     let mut orphan = listen(3, 3, 100_000);
     orphan.continues = Some(vec![0xee; 16]);
-    assert_eq!(plays(&[first, elsewhere, orphan]).len(), 3);
+    assert_eq!(plays(&[first, elsewhere, orphan]).len(), 2);
+}
+
+#[test]
+fn a_move_uses_dates_across_players_and_requires_an_unambiguous_predecessor() {
+    let source = listen(1, 1, 100_000);
+    let mut dest = listen(2, 2, 100_000);
+    dest.endpoint = 2;
+    dest.continues = Some(source.source_key.clone());
+    let gap = dest.started_at_ms - source.ended_at_ms;
+    for (offset, count) in [
+        (-SKEW_TOLERANCE_MS - 1, 2),
+        (-SKEW_TOLERANCE_MS, 1),
+        (CHAIN_WINDOW_MS, 1),
+        (CHAIN_WINDOW_MS + 1, 2),
+    ] {
+        let moved = later(&dest, offset - gap);
+        assert_eq!(chains(&[source.clone(), moved]).len(), count);
+    }
+    let mut same_key = source.clone();
+    same_key.endpoint = 3;
+    same_key.observation = 3;
+    assert_eq!(chains(&[source.clone(), same_key, dest.clone()]).len(), 3);
+    dest.listener += 1;
+    assert_eq!(chains(&[source, dest]).len(), 2);
 }
 
 #[test]

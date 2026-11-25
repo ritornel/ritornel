@@ -43,6 +43,7 @@ mod device;
 mod error;
 mod event;
 mod frame;
+mod handoff;
 pub mod hex;
 mod history;
 mod id;
@@ -59,6 +60,9 @@ pub mod transcode;
 pub use transcode::{JobStarted, TranscodeParams, TranscodePruneParams};
 mod pages;
 mod platform;
+pub use handoff::{
+    HandoffEntry, HandoffResult, HandoffSnapshot, LinkHandoffParams, PlaybackMoveParams,
+};
 mod playback;
 mod rating;
 mod search;
