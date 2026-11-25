@@ -911,7 +911,8 @@ impl Wall {
                 .child(letter);
             match start {
                 Some(start) => button
-                    .hover(|style| style.bg(theme::fill()).text_color(theme::ink()))
+                    .hover(|style| theme::hovered_ink(theme::hovered(style)))
+                    .active(theme::pressed)
                     .on_click(cx.listener(move |wall, _, _, cx| {
                         wall.index_at = None;
                         wall.jump(start);
@@ -2200,6 +2201,7 @@ impl Wall {
                                 .left(px(gutter))
                                 .top(px(y))
                                 .cursor_pointer()
+                                .active(theme::pressed)
                                 .on_click(cx.listener(move |wall, _, _, cx| {
                                     wall.index_at = Some(at);
                                     cx.notify();
@@ -2228,7 +2230,8 @@ impl Wall {
                                 .line_height(px(22.))
                                 .font_weight(FontWeight(650.))
                                 .text_color(theme::dim())
-                                .hover(|style| style.text_color(theme::ink()))
+                                .hover(theme::hovered_ink)
+                                .active(theme::pressed)
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |wall, _, _, cx| {
                                     wall.index_at = Some(at);
@@ -2678,7 +2681,8 @@ impl Wall {
             } else {
                 base.text_color(theme::dim())
                     .font_weight(FontWeight(500.))
-                    .hover(|style| style.text_color(theme::ink()))
+                    .hover(theme::hovered_ink)
+                    .active(theme::pressed)
                     .child(label)
             }
         };
@@ -2707,7 +2711,8 @@ impl Wall {
                         .pl(px(12.))
                         .rounded(px(8.))
                         .bg(theme::fill())
-                        .hover(|style| style.bg(theme::fill2()))
+                        .hover(theme::hovered_on_fill)
+                        .active(theme::pressed)
                         .text_color(theme::ink())
                         .font_weight(FontWeight(600.))
                         .on_click(cx.listener(move |_, event: &gpui::ClickEvent, window, cx| {
@@ -2845,12 +2850,14 @@ fn tile(
     let radius = if row.round { side / 2. } else { 10. };
     let group: SharedString = format!("tile-{index}").into();
     let mut art = div()
+        .id("art")
         .relative()
         .size(px(side))
         .m(px(-spill))
         .rounded(px(radius))
-        // Under the pointer the art rises 2 points.
-        .group_hover(group.clone(), |style| style.top(px(-2.)));
+        // Under the pointer the art rises, and pressed it settles.
+        .group_hover(group.clone(), theme::lifted)
+        .group_active(group.clone(), theme::settled);
     if !away {
         art = art
             .bg(linear_gradient(

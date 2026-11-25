@@ -289,7 +289,9 @@ impl Banner {
                 .child(icon("back", 14., dim))
                 .child(self.up_label.clone())
                 .when(live, |button| {
-                    button.on_click(cx.listener(move |view, _, _, cx| up(view, cx)))
+                    button
+                        .active(theme::pressed)
+                        .on_click(cx.listener(move |view, _, _, cx| up(view, cx)))
                 })
         };
         let play = Rc::clone(&actions.play);
@@ -317,7 +319,11 @@ impl Banner {
                 if !self.playable {
                     pill.opacity(0.45)
                 } else if live {
-                    pill.on_click(cx.listener(move |view, _, _, cx| play(view, !primary, cx)))
+                    // The pills sit on the banner's own picture, so they
+                    // lighten as a solid control does rather than take a fill.
+                    pill.hover(theme::hovered_solid)
+                        .active(theme::pressed)
+                        .on_click(cx.listener(move |view, _, _, cx| play(view, !primary, cx)))
                 } else {
                     pill
                 }

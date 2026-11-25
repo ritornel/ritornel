@@ -857,9 +857,7 @@ impl Render for SearchBox {
             } else {
                 theme::fill()
             })
-            .when(!focused, |field| {
-                field.hover(|style| style.bg(theme::fill2()))
-            })
+            .when(!focused, |field| field.hover(theme::hovered_on_fill))
             .when(focused, |field| {
                 field.shadow(vec![
                     BoxShadow::new(

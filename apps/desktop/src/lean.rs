@@ -1552,7 +1552,8 @@ impl Render for LeanBack {
             .text_color(theme::dim())
             .text_size(px(12.5))
             .font_weight(FontWeight(500.))
-            .hover(|style| style.text_color(theme::ink()))
+            .hover(theme::hovered_ink)
+            .active(theme::pressed)
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, _, cx| {
                 let _ = lean.update(cx, |lean, cx| lean.close(cx));
@@ -1769,7 +1770,9 @@ impl Render for LeanBack {
                     .flex()
                     .items_center()
                     .justify_center()
+                    // Over the picture, a ground of the ink's own.
                     .hover(|style| style.bg(with(theme::ink(), 0.12)))
+                    .active(theme::pressed)
                     .child(icon(name, 16., ink))
             };
             let foot_width = width - 2. * edge;
@@ -1841,6 +1844,8 @@ impl Render for LeanBack {
                         .items_center()
                         .justify_center()
                         .child(icon(if playing { "pause" } else { "play" }, 16., bg))
+                        .hover(theme::hovered_solid)
+                        .active(theme::pressed)
                         .on_click(act(|player, cx| player.toggle(cx))),
                 )
                 .child(skip("lean-next", "next").on_click(act(|player, cx| {

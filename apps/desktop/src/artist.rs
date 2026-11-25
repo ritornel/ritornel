@@ -1526,7 +1526,8 @@ impl Artist {
                     .items_center()
                     .gap(px(10.))
                     .text_size(px(13.5))
-                    .hover(|style| style.bg(theme::fill()))
+                    .hover(theme::hovered)
+                    .active(theme::pressed)
                     .when(shown > 0., |row| row.bg(crate::menu::fill(shown)))
                     .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                         cx.stop_propagation();

@@ -229,7 +229,7 @@ pub(crate) fn push(
         .child(face)
         .child(div().relative().child(label.into()));
     if enabled {
-        base.active(|style| style.opacity(0.8))
+        base.active(theme::pressed)
             .on_click(on_click)
             .into_any_element()
     } else {
@@ -253,6 +253,9 @@ pub(crate) fn clickable(
             .bottom_0()
             .left_0()
             .right_0()
+            // Pressed, the row takes the ground a row takes under the
+            // pointer elsewhere: the layer is all that is pressed.
+            .active(theme::hovered)
             .on_click(on_click),
     )
 }
@@ -448,6 +451,7 @@ pub(crate) fn pop_up(
                 )
                 .child(icon("chevron", 9., control_text(true))),
         )
+        .active(theme::pressed)
         .on_click(on_click)
 }
 
@@ -503,7 +507,8 @@ pub(crate) fn edit(
         .text_size(px(15.))
         .line_height(px(15.));
     if enabled {
-        base.hover(|style| style.bg(theme::fill2()))
+        base.hover(theme::hovered_on_fill)
+            .active(theme::pressed)
             .on_click(on_click)
             .child(glyph)
             .into_any_element()

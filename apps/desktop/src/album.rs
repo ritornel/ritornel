@@ -895,6 +895,7 @@ impl Album {
                     .text_color(theme::ink())
                     .font_weight(FontWeight(550.))
                     .hover(|style| style.underline())
+                    .active(theme::pressed)
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.emit(AlbumEvent::Open(Arc::clone(&row), None));
                     }))
@@ -989,7 +990,8 @@ impl Album {
                         .text_size(px(15.))
                         .font_weight(FontWeight(650.))
                         .text_color(theme::dim())
-                        .hover(|style| style.text_color(theme::ink()))
+                        .hover(theme::hovered_ink)
+                        .active(theme::pressed)
                         .on_click(cx.listener(|page, _, _, cx| page.up_to_artist(cx)))
                         .child(format!("More by {artist}"))
                         .child(div().text_color(theme::faint()).child("›")),

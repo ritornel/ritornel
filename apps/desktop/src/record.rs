@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use gpui::{
     Bounds, Div, ElementId, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement,
-    Pixels, RenderImage, SharedString, Stateful, Styled, StyledImage, Window, canvas, div, img,
-    prelude::FluentBuilder, px,
+    Pixels, RenderImage, SharedString, Stateful, StatefulInteractiveElement, Styled, StyledImage,
+    Window, canvas, div, img, prelude::FluentBuilder, px,
 };
 use ritornel_contract::{ArtColor, Id, YearPlays, YearSpan};
 
@@ -164,13 +164,15 @@ pub(crate) fn card(id: impl Into<ElementId>, card: Card, window: &Window) -> Sta
         .flex_col()
         .child(
             div()
+                .id("art")
                 .relative()
                 .size(px(side))
                 .rounded(px(10.))
                 // While its cover travels, nothing of it is left here: not
                 // its ground nor its hairline (the slot is hidden whole).
                 .when(!away, |art| art.bg(theme::fill()))
-                .group_hover(group, |style| style.top(px(-2.)))
+                .group_hover(group.clone(), theme::lifted)
+                .group_active(group, theme::settled)
                 .when(!away, |art| {
                     art.children(crate::frost::piece(
                         crate::frost::Fill::Solid(theme::fill()),
