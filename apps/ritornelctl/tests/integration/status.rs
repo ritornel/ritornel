@@ -106,7 +106,16 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
     // For a program: the status as the server sent it.
     let printed = status(&data_dir, &["--json"]);
     assert_eq!((printed.code, printed.stderr.as_str()), (Some(0), ""));
-    let json: Value = serde_json::from_str(&printed.stdout).unwrap();
+    let mut json: Value = serde_json::from_str(&printed.stdout).unwrap();
+    let transcode = json.as_object_mut().unwrap().remove("transcode").unwrap();
+    assert_eq!(
+        transcode["budgetBytes"],
+        serde_json::json!({"value":10_u64 << 30, "setBy":"default"})
+    );
+    assert_eq!(transcode["usedBytes"], 0);
+    assert!(transcode["workers"]["value"].as_u64().unwrap() >= 1);
+    assert!(transcode["encoders"].is_array());
+    assert!(transcode["profiles"]["value"]["mp3-v0"].is_object());
     let free = json["freeDisk"]["dataBytes"].as_u64().unwrap();
     assert!(free > 0);
     assert_eq!(

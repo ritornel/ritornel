@@ -86,8 +86,7 @@ impl Drop for Task {
 #[derive(Debug)]
 pub struct Server {
     core: Arc<Core>,
-    encoders: Vec<EncoderId>,
-    transcode_pool: TranscodePool,
+    transcodes: Arc<crate::dispatch::Transcodes>,
     /// The thread that runs jobs.
     worker: Worker,
     /// The player's control loop and the delivery of listens.
@@ -271,17 +270,10 @@ impl Server {
 
         let listener = listener::bind(listen).await?;
         let store = Arc::new(store);
-        let transcode_cache = TranscodeCache::open(
-            &store,
-            &dir.cache()?,
-            boot_id,
-            TranscodeCache::DEFAULT_BUDGET,
-        )?;
-        let transcode_pool = TranscodePool::new(
-            store.clone(),
-            transcode_cache,
-            TranscodePool::default_workers(),
-        )?;
+        let transcode_cache =
+            TranscodeCache::open(&store, &dir.cache()?, boot_id, run.transcode.budget)?;
+        let transcode_pool =
+            TranscodePool::new(store.clone(), transcode_cache, run.transcode.workers)?;
         let stores = Stores::new(store, library);
         let core = Arc::new(Core::new(
             stores, &identity, dir, verifier, clock, entropy, bounds,
@@ -303,7 +295,13 @@ impl Server {
             log_level: run.log_level.unwrap_or(tracing::Level::INFO),
             origins: run.origins,
         });
-        let encoders = probe_encoders().await;
+        let transcodes = Arc::new(crate::dispatch::Transcodes {
+            pool: Arc::new(transcode_pool),
+            config: run.transcode,
+            encoders: probe_encoders().await,
+            origins: run.origins,
+        });
+        core.attach_transcodes(&transcodes);
         let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         if listen.is_private() {
@@ -333,8 +331,7 @@ impl Server {
         )?;
         drop(steps);
         Ok(Self {
-            encoders,
-            transcode_pool,
+            transcodes,
             transports: Transports(Arc::clone(&core)),
             worker,
             playback,
@@ -353,17 +350,17 @@ impl Server {
 
     /// Machine-local audio and package cache for this run.
     pub fn transcode_cache(&self) -> &TranscodeCache {
-        self.transcode_pool.cache()
+        self.transcodes.pool.cache()
     }
 
     /// Batch encoder and packager shared by callers on this server.
     pub fn transcode_pool(&self) -> &TranscodePool {
-        &self.transcode_pool
+        &self.transcodes.pool
     }
 
     /// Encoder programs discovered on this machine at startup.
     pub fn encoders(&self) -> &[EncoderId] {
-        &self.encoders
+        &self.transcodes.encoders
     }
 
     /// The server's ID.
@@ -511,8 +508,16 @@ impl Server {
         // Closing waits for calls that are using the database, and then
         // empties its log, so it is not done on an async worker either.
         let core = Arc::clone(&self.core);
-        let pool = self.transcode_pool;
+        let transcodes = self.transcodes;
         tokio::task::spawn_blocking(move || {
+            let service = Arc::try_unwrap(transcodes).map_err(|_| {
+                Error::Runtime(std::io::Error::other("transcode service is still in use"))
+            })?;
+            let pool = Arc::try_unwrap(service.pool).map_err(|_| {
+                Error::Runtime(std::io::Error::other(
+                    "a transcode download is still in use",
+                ))
+            })?;
             let released = pool.close();
             core.close_store()?;
             released.map_err(Error::Store)

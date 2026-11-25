@@ -3,9 +3,23 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 
-pub use crate::playback::renderer::ReplayGain;
+/// Which ReplayGain tag a track plays at. See "Audio pipeline" in
+/// docs/internals/playback.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayGain {
+    /// None: the samples as they are.
+    #[default]
+    Off,
+    /// The track's gain.
+    Track,
+    /// The album's gain, or the track's where the album has none.
+    Album,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(default, deny_unknown_fields)]
 pub struct Dsp {
     pub replay_gain: ReplayGain,
@@ -13,7 +27,7 @@ pub struct Dsp {
 }
 
 impl Dsp {
-    pub(super) fn validate(self) -> io::Result<()> {
+    pub fn validate(self) -> io::Result<()> {
         if self.max_rate_hz.is_some_and(|hz| {
             !matches!(
                 hz,
@@ -38,6 +52,7 @@ impl Dsp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Vbr {
     Variable,
@@ -46,6 +61,7 @@ pub enum Vbr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Mp3 {
     V0,
@@ -54,6 +70,7 @@ pub enum Mp3 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "codec", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Target {
     Mp3 {
@@ -68,6 +85,7 @@ pub enum Target {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub target: Target,
@@ -107,4 +125,71 @@ impl Profile {
         self.validate()?;
         Ok(serde_json::to_string(&self)?)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+pub struct EncoderCapability {
+    pub family: String,
+    pub version: String,
+    pub formats: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct TranscodeStatus {
+    pub encoders: Vec<EncoderCapability>,
+    pub profiles: crate::Setting<std::collections::BTreeMap<String, Profile>>,
+    pub workers: crate::Setting<u32>,
+    pub budget_bytes: crate::Setting<u64>,
+    pub used_bytes: u64,
+    pub derivatives: u64,
+    pub packages: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactLayer {
+    Derivative,
+    Packaged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TranscodeParams {
+    pub idempotency_key: crate::Id,
+    pub appearances: Vec<crate::Id>,
+    pub profile: String,
+    pub layer: ArtifactLayer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TranscodePruneParams {
+    pub idempotency_key: crate::Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct TranscodeStarted {
+    #[serde(flatten)]
+    pub receipt: crate::Receipt,
+    pub job: crate::Job,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct TranscodeArtifact {
+    pub appearance_id: crate::Id,
+    pub layer: ArtifactLayer,
+    pub key: String,
+    pub size_bytes: u64,
+    pub file_hash: String,
+    pub sampled_hash: String,
 }

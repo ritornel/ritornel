@@ -31,6 +31,7 @@ mod server;
 mod settings;
 mod spotify;
 mod status;
+mod transcode;
 
 use std::process::ExitCode;
 

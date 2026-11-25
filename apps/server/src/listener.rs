@@ -36,6 +36,8 @@
 //! dispatcher, and each frame queued on the session goes out as one text
 //! message.
 
+mod cache;
+
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -288,6 +290,7 @@ fn router(core: Arc<Core>, tickets: Arc<Tickets>) -> Router {
         .route(route::TICKET, post(ticket))
         .route(route::LINK, post(join))
         .route(route::WS, get(socket))
+        .route("/v1/cache/{layer}/{key}", get(cache::cached))
         .route(&format!("{}/{{art}}/{{size}}", route::ART), get(art))
         .route(
             &format!("{}/{{appearance}}/{{item}}/{{revision}}", route::AUDIO),

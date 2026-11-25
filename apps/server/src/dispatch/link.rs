@@ -79,6 +79,8 @@ pub(super) fn on_a_satellite(method: &str) -> Route {
         }
         "library.create"
         | "sources.add"
+        | "transcode.start"
+        | "transcode.prune"
         | "scan.start"
         | "library.setWatching"
         | "artists.importPictures"
@@ -107,6 +109,8 @@ pub(super) fn kept_from_a_link(method: &str) -> bool {
         method,
         "library.create"
             | "sources.add"
+            | "transcode.start"
+            | "transcode.prune"
             | "scan.start"
             | "library.setWatching"
             | "artists.importPictures"

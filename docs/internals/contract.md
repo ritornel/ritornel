@@ -12,6 +12,8 @@ Every RPC call is defined once in `crates/ritornel-contract/src/methods.rs` as a
 - **TypeScript generation:** `crates/ritornel-contract/src/typescript.rs` uses `ts-rs` (test-only dev-dependency, never linked into production binaries) and `visit_methods` to generate `contract/contract.ts`—constants (`CONTRACT_VERSION`, `ROUTES`, `CAPABILITIES`, `METHODS`, `TOPICS`, `ART_SIZES`, `FILTER_VERSION`), frame types, `MethodMap`, `EventMap`, and every reachable wire type. A unit test fails CI if `contract/contract.ts` is stale; `mise run contract` regenerates it. Another test verifies every `skip_serializing_if` field also carries `#[cfg_attr(test, ts(optional))]` so omitted fields are never typed as `null`.
 - **Decoupled from engine types:** Contract types live in `ritornel-contract` (which has zero workspace dependencies) rather than exposing `ritornel-engine` structs directly, so internal refactors do not break wire compatibility.
 
+Version 5 adds a `transcode` snapshot to `server.status` and `server.settings`, and full-session commands to materialize or prune cached audio on the hub. The profile field names follow the encoder configuration. Command receipts identify durable jobs, and `jobs.get` returns the completed artifact keys and hashes. See [Transcoding](transcoding.md).
+
 ## Transport, routes, and authentication
 
 The server exposes a single HTTP/1.1 listener (`apps/server/src/listener.rs`), on loopback or, with `--listen private:<port>`, on the private network (see ["Process lifecycle" in `docs/internals/server.md`](server.md#process-lifecycle)), with bounded concurrent connections (`Bounds::max_connections`), header read timeout (`Bounds::header_wait`), and a 16 KiB request header cap (`MAX_HEAD_BYTES`).
@@ -24,9 +26,13 @@ The server exposes a single HTTP/1.1 listener (`apps/server/src/listener.rs`), o
 | `/v1/ws` | `GET` | Bearer or `?ticket=` | WebSocket upgrade carrying JSON-RPC 2.0 text frames. |
 | `/v1/art/{artId}/{size}` | `GET` | Bearer or `?token=` | Immutable JPEG cover art at a fixed size bucket. |
 | `/v1/audio/{appearanceId}/{sourceItemId}/{revision}` | `GET` | Bearer, link session only | A master, for a satellite to play, as `link.copies` named it. |
+| `/v1/cache/derivative/{key}` | `GET`, `HEAD` | Bearer, link session only | Encoded audio with its exact byte count. |
+| `/v1/cache/packaged/{key}` | `GET`, `HEAD` | Bearer, link session only | Tagged audio with its cover and exact byte count. |
 | `/v1/link` | `POST` | Invite secret in the body (no `Origin`) | A server joining this hub as a satellite: trades a `LinkRequest` for a `LinkGranted` link-session token. |
 
 All routes except `GET /v1/descriptor` and `POST /v1/link` require authentication (`401 Unauthorized` with `WWW-Authenticate: Bearer` on failure, including unknown paths so unauthenticated callers learn nothing about what exists). Credentials are checked in memory against loaded verifiers in constant time (`subtle::ConstantTimeEq`), never touching disk or SQLite on async worker threads.
+
+On both cache routes the key is a 64-digit hexadecimal digest. A valid link receives `400` for a malformed key and `404` for a missing entry in that layer. A valid local credential receives `403`. A single satisfiable byte range returns `206` with `Content-Range` and the selected `Content-Length`. An invalid or unsatisfiable range returns `416` with `Content-Range: bytes */<size>`.
 
 ### Query-string credentials and origin checks
 
@@ -113,7 +119,7 @@ Every mutating call (`MethodKind::Command`) carries a client-generated UUID `ide
 - **Idempotency:** Library commands (`library_command` in `library.db`) and server/job/playback commands (`command_receipt` in `server.db` or the player's recent-command buffer) replay the original receipt when retried with the same key and request fingerprint, and fail with `idempotency_mismatch` if the same key is reused with different parameters. Five commands intentionally return a fresh non-stored receipt instead: `server.backup` and `history.export` (each invocation writes a new timestamped folder), `lastfm.signInFinish` (deduplicated by its sign-in token), `record.dismiss` (idempotent by current library revision), and `imports.stage` (idempotent by its run, piece number and streams).
 - **Optimistic concurrency:** Queue mutation calls (`queue.add`, `queue.remove`, `queue.move`, `queue.clear`) accept optional `expectedRevision` and return `conflict` with `details.currentRevision` if the queue moved.
 - **Retry-safe playback:** There is no play/pause toggle; `playback.set` takes absolute `volume` (0–1), `muted`, `shuffle`, and `repeat`; `playback.seek` and `playback.skip` name the target `entryId` / `fromEntryId` so late retries cannot seek or skip a different track; queue mutations address entries by `entryId`, never by index. `playback.play` and `queue.add` accept `PlaySource` (`tracks`, `release`, or `view`, copying IDs out of the view snapshot into the queue); `queue.add` supports `playIfEmpty`. A server without an audio output omits the `playback` capability and refuses playback/queue calls with `unsupported`.
-- **Durable jobs:** Long-running work (`scan.start`, `lastfm.sync`, `imports.dryRun`, `imports.apply`, `imports.undo`) creates or returns a durable `Job` in `server.db` (`queued`, `running`, `cancelling`, `succeeded`, `failed`, `cancelled`) with counters (`done`, `total`, `bytes`, `failed`, `skipped`), `label`, `error`, and kind-specific summaries (`scan`, `sync`). Starting a scan for a root already being scanned returns the running job. `jobs.list` returns up to 100 recent jobs; `jobs.get` returns a job plus up to 100 failed `JobItem` rows; `jobs.cancel` requests cooperative cancellation before the next library transaction begins, and once acknowledged the job never ends `succeeded` (ending `cancelled` even if a transaction already in flight committed, or `failed` if an in-flight step errored), so clients read what was applied from the library or import run rather than inferring it from the job's terminal state.
+- **Durable jobs:** Long-running work (`scan.start`, `transcode.start`, `transcode.prune`, `lastfm.sync`, `imports.dryRun`, `imports.apply`, `imports.undo`) creates or returns a durable `Job` in `server.db` (`queued`, `running`, `cancelling`, `succeeded`, `failed`, `cancelled`) with counters (`done`, `total`, `bytes`, `failed`, `skipped`), `label`, `error`, and kind-specific summaries (`scan`, `sync`). Starting a scan for a root already being scanned returns the running job. `jobs.list` returns up to 100 recent jobs; `jobs.get` returns a job plus up to 100 failed `JobItem` rows; `jobs.cancel` requests cooperative cancellation before the next library transaction begins, and once acknowledged the job never ends `succeeded` (ending `cancelled` even if a transaction already in flight committed, or `failed` if an in-flight step errored), so clients read what was applied from the library or import run rather than inferring it from the job's terminal state.
 
 ## Media
 
@@ -156,6 +162,7 @@ The methods registered in `crates/ritornel-contract/src/methods.rs`, by area (se
 
 | Area | Methods |
 |---|---|
+| Transcoding | `transcode.start`, `transcode.prune` |
 | Session & server | `server.hello`, `server.status`, `servers.list`, `events.subscribe`, `events.unsubscribe`, `server.backup`, `record.dismiss`, `server.settings`, `server.setSettings` |
 | Linking | `link.invite`, `link.join`, `link.status`, `link.tracks`, `link.copies`, `link.listen`, `link.ping` |
 | Library & sources | `library.create`, `sources.list`, `sources.add`, `sources.tracks`, `scan.start`, `library.stats`, `library.setWatching`, `library.settings`, `library.setSettings`, `artists.importPictures`, `artists.pictureFolders` |

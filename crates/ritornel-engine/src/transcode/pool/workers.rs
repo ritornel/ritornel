@@ -4,7 +4,7 @@
 use crate::Error;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::{self, JoinHandle};
-use tokio::sync::{OwnedMutexGuard, Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot};
 
 use super::{CancelOnDrop, KeyWork};
 
@@ -59,12 +59,15 @@ impl Workers {
 
     pub(super) async fn run<T: Send + 'static>(
         &self,
-        key: Arc<KeyWork>,
+        key: Option<Arc<KeyWork>>,
         work: impl FnOnce(&std::sync::atomic::AtomicBool) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
         // A replacement flight waits for an abandoned encoder to unwind
         // before it takes a worker. Distinct keys never share this lock.
-        let gate: OwnedMutexGuard<()> = key.gate.clone().lock_owned().await;
+        let gate = match &key {
+            Some(key) => Some(key.gate.clone().lock_owned().await),
+            None => None,
+        };
         let permit = self
             .permits
             .clone()

@@ -193,6 +193,7 @@ mod tests {
     #[test]
     fn each_setting_is_shown_with_what_gave_it() {
         let settings = ServerSettings {
+            transcode: None,
             name: Setting {
                 value: "Kitchen Speakers".to_owned(),
                 set_by: SetBy::Environment,

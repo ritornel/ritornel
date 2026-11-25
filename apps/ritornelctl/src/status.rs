@@ -226,6 +226,7 @@ mod tests {
 
     fn example() -> ServerStatus {
         ServerStatus {
+            transcode: None,
             server_id: Id::from_bytes([0x11; 16]),
             name: "desk".to_owned(),
             role: ServerRole::Unassigned,

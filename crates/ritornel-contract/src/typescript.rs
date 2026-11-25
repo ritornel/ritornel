@@ -53,6 +53,8 @@ const ROUTES: &[(&str, &str)] = &[
     ("art", route::ART),
     ("link", route::LINK),
     ("audio", route::AUDIO),
+    ("cacheDerivative", route::CACHE_DERIVATIVE),
+    ("cachePackaged", route::CACHE_PACKAGED),
 ];
 
 /// The capability flags, by the name each has in `CAPABILITIES`. A flag

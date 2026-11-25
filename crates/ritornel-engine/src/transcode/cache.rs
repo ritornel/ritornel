@@ -629,5 +629,72 @@ fn hashes(file: &mut File, cancel: &AtomicBool) -> io::Result<(u64, blake3::Hash
     Ok((size, full, sampled))
 }
 
+impl TranscodeCache {
+    /// Occupied bytes and entry counts in each layer, in one index snapshot.
+    pub fn usage(&self, store: &ServerStore) -> Result<(u64, u64, u64), Error> {
+        store.read(|db| {
+            Ok(db.query_row(
+                "SELECT coalesce(sum(size_bytes),0), count(*) FILTER (WHERE layer='derivative'),
+             count(*) FILTER (WHERE layer='packaged') FROM transcode_entry",
+                [],
+                |r| Ok((size_column(r, 0)?, size_column(r, 1)?, size_column(r, 2)?)),
+            )?)
+        })
+    }
+
+    pub fn prune_unpinned(&self, store: &ServerStore) -> Result<(), Error> {
+        let _lock = self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.prune_to(store, 0)
+    }
+
+    pub(super) fn transfer(
+        &self,
+        store: &ServerStore,
+        key: blake3::Hash,
+        layer: ritornel_contract::transcode::ArtifactLayer,
+        pin: Pin,
+    ) -> Result<Option<CacheEntry>, Error> {
+        use ritornel_contract::transcode::ArtifactLayer;
+        let layer = match layer {
+            ArtifactLayer::Derivative => Layer::Derivative,
+            ArtifactLayer::Packaged => Layer::Packaged,
+        };
+        let _lock = self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let codec: Option<String> = store.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT codec FROM transcode_entry WHERE cache_key=?1 AND layer=?2",
+                    params![key.to_hex().as_str(), layer.name()],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })?;
+        let codec = match codec.as_deref() {
+            Some("mp3") => Codec::Mp3,
+            Some("opus") => Codec::Opus,
+            Some("flac") => Codec::Flac,
+            None => return Ok(None),
+            _ => return Err(Error::Corrupt("bad transcode codec")),
+        };
+        self.hit(
+            store,
+            Object {
+                key,
+                layer,
+                codec,
+                source: None,
+                master_scheme: None,
+            },
+            pin,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests;

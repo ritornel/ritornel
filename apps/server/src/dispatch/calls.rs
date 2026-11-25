@@ -56,6 +56,8 @@ pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
         target: job.target.map(|id| {
             if job.kind == crate::lastfm::SYNC_JOB {
                 JobTarget::Account { id }
+            } else if job.kind.starts_with("transcode.") {
+                JobTarget::Server { id }
             } else if [
                 crate::imports::DRY_RUN_JOB,
                 crate::imports::APPLY_JOB,
@@ -533,6 +535,21 @@ impl Core {
             .failed_job_items(found.id, LISTED)
             .map_err(stored)?;
         Ok(JobDetail {
+            artifacts: if found.kind == "transcode.start"
+                && found.state == ritornel_engine::JobState::Succeeded
+            {
+                found
+                    .checkpoint_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|_| {
+                        RpcError::new(ErrorCode::Internal, "invalid transcode job result")
+                    })?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
             job: job(&found),
             failed_items: items
                 .into_iter()

@@ -10,7 +10,7 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 4;
+export const CONTRACT_VERSION = 5;
 
 /** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
@@ -21,6 +21,8 @@ export const ROUTES = {
   art: "/v1/art",
   link: "/v1/link",
   audio: "/v1/audio",
+  cacheDerivative: "/v1/cache/derivative",
+  cachePackaged: "/v1/cache/packaged",
 } as const;
 
 /**
@@ -73,6 +75,8 @@ export const METHODS = {
   "sources.list": { kind: "query", needsFull: true },
   "sources.add": { kind: "command", needsFull: true },
   "scan.start": { kind: "command", needsFull: true },
+  "transcode.start": { kind: "command", needsFull: true },
+  "transcode.prune": { kind: "command", needsFull: true },
   "jobs.list": { kind: "query", needsFull: true },
   "jobs.get": { kind: "query", needsFull: true },
   "jobs.cancel": { kind: "command", needsFull: true },
@@ -174,6 +178,8 @@ export type MethodMap = {
   "sources.list": { params: NoParams; result: SourcesList };
   "sources.add": { params: SourcesAddParams; result: SourceAdded };
   "scan.start": { params: ScanStartParams; result: ScanStarted };
+  "transcode.start": { params: TranscodeParams; result: TranscodeStarted };
+  "transcode.prune": { params: TranscodePruneParams; result: TranscodeStarted };
   "jobs.list": { params: NoParams; result: JobsList };
   "jobs.get": { params: JobGetParams; result: JobDetail };
   "jobs.cancel": { params: JobCancelParams; result: JobCancelled };
@@ -844,6 +850,8 @@ export type ArtColor = {
    */
   saturation: number,
 };
+
+export type ArtifactLayer = "derivative" | "packaged";
 
 /**
  * The params of `artist.get`.
@@ -1712,6 +1720,12 @@ export type DryRunParams = {
    * answer is counts alone.
    */
   detail: boolean,
+};
+
+export type Dsp = { replay_gain: ReplayGain, max_rate_hz: number | null,
+};
+
+export type EncoderCapability = { family: string, version: string, formats: Array<string>,
 };
 
 /**
@@ -2926,7 +2940,7 @@ export type JobCancelled = {
 /**
  * The result of `jobs.get`.
  */
-export type JobDetail = {
+export type JobDetail = { artifacts: Array<TranscodeArtifact>,
   /**
    * The job.
    */
@@ -2969,7 +2983,7 @@ export type JobState = "queued" | "running" | "cancelling" | "succeeded" | "fail
 /**
  * What a job works on, and so what its events invalidate.
  */
-export type JobTarget = { "type": "source",
+export type JobTarget = { "type": "server", id: string, } | { "type": "source",
   /**
    * The source's ID.
    */
@@ -4043,6 +4057,8 @@ export type MediaToken = {
   token: string,
 };
 
+export type Mp3 = "v0" | "v2" | { "cbr": number };
+
 /**
  * The candidate an item was nearest to.
  */
@@ -4938,6 +4954,9 @@ export type PreviewShown = {
   values: Array<FileValue>,
 };
 
+export type Profile = { target: Target, dsp: Dsp,
+};
+
 /**
  * What an event on the `progress` topic carries: where the playing entry
  * is, about once a second and at once on a change. The client carries
@@ -5620,6 +5639,12 @@ export type Replaces = {
 };
 
 /**
+ * Which ReplayGain tag a track plays at. See "Audio pipeline" in
+ * docs/internals/playback.md.
+ */
+export type ReplayGain = "off" | "track" | "album";
+
+/**
  * One decision marked for review.
  */
 export type Review = {
@@ -5977,7 +6002,7 @@ export type ServerRole = "unassigned" | "hub" | "satellite";
  * starts, by a flag, a `RITORNEL_*` variable or `config.toml`, and hold
  * until it starts again.
  */
-export type ServerSettings = {
+export type ServerSettings = { transcode?: TranscodeStatus,
   /**
    * What the server is called. With no name given as it starts, it is
    * the default: the name it already had, which a new server takes
@@ -6037,7 +6062,7 @@ export type ServerSettingsSet = {
  * The result of `server.status`. See "Configuration and logging" in
  * docs/internals/server.md.
  */
-export type ServerStatus = {
+export type ServerStatus = { transcode?: TranscodeStatus,
   /**
    * The server's ID.
    */
@@ -6703,6 +6728,9 @@ export type SyncSummary = {
   matchedAfter: number,
 };
 
+export type Target = { "codec": "mp3", mode: Mp3, } | { "codec": "opus", bitrate_kbps: number, complexity: number, vbr: Vbr, } | { "codec": "flac",
+};
+
 /**
  * What a tier joins.
  */
@@ -6922,6 +6950,34 @@ export type TrackSummary = {
   loved: boolean,
 };
 
+export type TranscodeArtifact = { appearanceId: string, layer: ArtifactLayer, key: string, sizeBytes: number, fileHash: string, sampledHash: string,
+};
+
+export type TranscodeParams = { idempotencyKey: string, appearances: Array<string>, profile: string, layer: ArtifactLayer,
+};
+
+export type TranscodePruneParams = { idempotencyKey: string,
+};
+
+export type TranscodeStarted = { job: Job,
+  /**
+   * The command's ID: the idempotency key it was sent with.
+   */
+  commandId: string,
+  /**
+   * How far the command has got.
+   */
+  status: ReceiptStatus,
+  /**
+   * The library revision the command was committed at. It is left out
+   * for a command that changes no library.
+   */
+  revision?: number,
+};
+
+export type TranscodeStatus = { encoders: Array<EncoderCapability>, profiles: Setting<{ [key in string]: Profile }>, workers: Setting<number>, budgetBytes: Setting<number>, usedBytes: number, derivatives: number, packages: number,
+};
+
 /**
  * The params of `corrections.undo`.
  */
@@ -6935,6 +6991,8 @@ export type UndoParams = {
    */
   answers: Array<string>,
 };
+
+export type Vbr = "variable" | "constrained" | "hard_cbr";
 
 /**
  * The versions a status reports.

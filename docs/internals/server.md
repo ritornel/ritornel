@@ -95,6 +95,8 @@ Each database copy runs `VACUUM INTO` on its own read-only SQLite connection (`c
 
 ## Transcode cache
 
+See [Transcoding](transcoding.md) for profile configuration, verification commands and download routes.
+
 `TranscodeCache` keeps encoded audio in `cache/transcodes/` and tagged copies in `cache/packaged/`. Each file lives under the first two hex digits of its BLAKE3 key. The derivative key identifies the audio hash scheme and digest, encoder build, profile, and applied DSP inputs. A package key identifies its derivative or master, projected tags, original artwork digest and target size, packaging version and target options. Changing the title or cover reuses the encoded audio.
 
 A producer works in a private `.part` directory under `cache/tmp/`. It finishes and syncs the file before the cache writer renames it and records its exact byte count, full BLAKE3 digest and sampled digest. The sample covers up to one MiB at each end, hashing overlapping bytes only once. The index and pins live in `server.db`. Opening the cache under the data-directory lock removes abandoned staging files and pins from previous runs, forgets missing files, and removes unindexed files left by an interrupted publication.
@@ -179,6 +181,9 @@ Settings resolve in order: **CLI flag → `RITORNEL_*` environment variable → 
 | Log level | `--log-level` | `RITORNEL_LOG_LEVEL` | `info` |
 | Backup folder | `--backup-dir` | `RITORNEL_BACKUP_DIR` | None (backups disabled until set) |
 | Server name | `--name` | `RITORNEL_NAME` | None (the stored name, or the computer's in place of the default) |
+| Transcode workers | `--transcode-workers` | `RITORNEL_TRANSCODE_WORKERS` | Available cores minus one, minimum one |
+| Transcode cache budget | `--transcode-cache-size` | `RITORNEL_TRANSCODE_CACHE_SIZE` | `10 GiB` |
+| Named encoder profiles | `--transcode-profiles` | `RITORNEL_TRANSCODE_PROFILES` | Built-in profiles |
 | Cache of masters a satellite pulls | `--cache-size` | `RITORNEL_CACHE_SIZE` | `2 GiB` |
 
 The name setting is described under "Server name" above.

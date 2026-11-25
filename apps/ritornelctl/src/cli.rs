@@ -82,6 +82,8 @@ running on a data directory, and never starts one.
 Usage:
   ritornelctl status [--dismiss] [--data-dir <dir>] [--json]
   ritornelctl server stop [--data-dir <dir>] [--json]
+  ritornelctl transcode encoders | stats | prune [--data-dir <dir>] [--json]
+  ritornelctl transcode run --profile <name> [--derivative] <appearance>... [--data-dir <dir>] [--json]
   ritornelctl backup [--data-dir <dir>] [--json]
   ritornelctl export <folder> [--data-dir <dir>] [--json]
   ritornelctl library create [--data-dir <dir>] [--json]
@@ -184,6 +186,11 @@ Commands:
                    folder is added as a root, and the server only ever
                    reads it. Run it again after the folder changes: what it
                    no longer chooses is dropped
+  transcode encoders, transcode stats
+                   Show detected encoders or cache usage, workers and profiles
+  transcode run    Build a package for each appearance ID with --profile.
+                   Use --derivative for encoded audio without tags or a cover
+  transcode prune  Remove unpinned derivatives and packages
   jobs [<job>]     List the server's jobs, newest first, or show one with
                    what its scan found and what could not be read
   identity re-resolve --dry-run
@@ -551,6 +558,8 @@ struct Cli {
 enum Command {
     Status(StatusArgs),
     Backup(ServerArgs),
+    #[command(subcommand)]
+    Transcode(crate::transcode::TranscodeCommand),
     Export(ExportArgs),
     #[command(subcommand)]
     Library(LibraryCommand),
@@ -1225,6 +1234,7 @@ fn try_run(
     match command {
         Command::Status(args) => status::status(&args, env, out),
         Command::Server(ServerCommand::Stop(args)) => crate::server::stop(&args, env, out),
+        Command::Transcode(command) => crate::transcode::run(command, env, out),
         Command::Backup(args) => backup::backup(&args, env, out),
         Command::Export(args) => export::export(&args, env, out),
         Command::Library(LibraryCommand::Create(args)) => library::create(&args, env, out),

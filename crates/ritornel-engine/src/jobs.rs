@@ -358,7 +358,7 @@ impl ServerStore {
                         "INSERT INTO job
                            (public_id, kind, dedupe_key, target_kind, target_pid, params_json,
                             created_by_session_id, created_at_ms)
-                         VALUES (?1, ?2, ?3, 'source', ?4, ?5,
+                         VALUES (?1, ?2, ?3, ?8, ?4, ?5,
                                  (SELECT id FROM session WHERE public_id = ?6), ?7)",
                         (
                             public_id.as_bytes(),
@@ -368,6 +368,11 @@ impl ServerStore {
                             &new.params_json,
                             new.session.as_ref().map(Id::as_bytes),
                             now_ms,
+                            if new.kind.starts_with("transcode.") {
+                                "server"
+                            } else {
+                                "source"
+                            },
                         ),
                     )?;
                     (transaction.last_insert_rowid(), true)

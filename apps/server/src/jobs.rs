@@ -21,7 +21,7 @@ use crate::dispatch::Core;
 
 /// How often a job's counters are saved, and sent to subscribers, while it
 /// reads files. Each step's end is saved and sent as well.
-const SAVE_EVERY: Duration = Duration::from_secs(1);
+pub(crate) const SAVE_EVERY: Duration = Duration::from_secs(1);
 
 /// What wakes the worker: a job was queued, or the server is stopping.
 #[derive(Debug, Default)]
@@ -53,6 +53,7 @@ impl Wake {
 /// How this run does its jobs.
 #[derive(Debug, Clone, Default)]
 pub struct Run {
+    pub transcode: crate::TranscodeConfig,
     /// What names this run of the server on every job it claims. A job
     /// claimed under another is one a dead run left.
     pub boot_id: Option<Id>,
@@ -225,6 +226,9 @@ pub(crate) fn caught(
 
 /// Carries one claimed job to its end, or until the server stops.
 fn run(core: &Core, job: ritornel_engine::Job, settings: ScanSettings, shutdown: &Arc<AtomicBool>) {
+    if matches!(job.kind.as_str(), "transcode.start" | "transcode.prune") {
+        return core.run_transcode(job, shutdown);
+    }
     if job.kind == crate::lastfm::SYNC_JOB {
         return sync(core, job, shutdown);
     }

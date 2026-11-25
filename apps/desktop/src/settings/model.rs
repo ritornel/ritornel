@@ -1417,6 +1417,7 @@ mod tests {
                 let server_id = Id::from_bytes([0x10; 16]);
                 let library_id = Id::from_bytes([0x20; 16]);
                 ServerStatus {
+                    transcode: None,
                     server_id,
                     name: "Test Server".to_owned(),
                     role: if has_library {

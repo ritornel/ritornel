@@ -182,6 +182,10 @@ methods! {
     /// job. A source that is being scanned returns the job that is running.
     ScanStart: "scan.start", Command, needs_full: true,
     ScanStartParams => ScanStarted;
+    TranscodeStart: "transcode.start", Command, needs_full: true,
+    TranscodeParams => TranscodeStarted;
+    TranscodePrune: "transcode.prune", Command, needs_full: true,
+    TranscodePruneParams => TranscodeStarted;
 
     /// `jobs.list`: the newest jobs, newest first.
     JobsList: "jobs.list", Query, needs_full: true,
@@ -672,6 +676,8 @@ mod tests {
                 "sources.list",
                 "sources.add",
                 "scan.start",
+                "transcode.start",
+                "transcode.prune",
                 "jobs.list",
                 "jobs.get",
                 "jobs.cancel",
@@ -778,6 +784,8 @@ mod tests {
                 "sources.list",
                 "sources.add",
                 "scan.start",
+                "transcode.start",
+                "transcode.prune",
                 "jobs.list",
                 "jobs.get",
                 "jobs.cancel",

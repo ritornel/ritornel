@@ -111,6 +111,9 @@ impl LogLevel {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub transcode: Option<crate::transcode::TranscodeStatus>,
     /// What the server is called. With no name given as it starts, it is
     /// the default: the name it already had, which a new server takes
     /// from its computer.

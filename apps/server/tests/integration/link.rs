@@ -1924,3 +1924,152 @@ async fn a_satellites_client_that_unsubscribes_is_unsubscribed_at_the_hub() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_routes_require_a_link_and_serve_the_exact_pinned_bytes() {
+    use ritornel_engine::playback::FileFacts;
+    use ritornel_engine::transcode::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    bounded(async {
+        let scratch = Scratch::new();
+        let (hub, hub_client, desk, desk_client) = two(&scratch).await;
+        join(&desk_client, &invite(&hub, &hub_client).await)
+            .await
+            .unwrap();
+        let link: String = rusqlite::Connection::open(scratch.data_dir("desk").join("server.db"))
+            .unwrap()
+            .query_row("SELECT token FROM hub_link", [], |r| r.get(0))
+            .unwrap();
+        let local = std::fs::read_to_string(scratch.data_dir("hub").join("credential")).unwrap();
+        let endpoint = hub.endpoint();
+        let fetch = async |method: &str, path: &str, token: Option<&str>, range: Option<&str>| {
+            let mut req =
+                format!("{method} {path} HTTP/1.1\r\nHost: {endpoint}\r\nConnection: close\r\n");
+            if let Some(token) = token {
+                req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            }
+            if let Some(range) = range {
+                req.push_str(&format!("Range: {range}\r\n"));
+            }
+            req.push_str("\r\n");
+            let mut conn = tokio::net::TcpStream::connect(endpoint).await.unwrap();
+            conn.write_all(req.as_bytes()).await.unwrap();
+            let mut bytes = Vec::new();
+            conn.read_to_end(&mut bytes).await.unwrap();
+            let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let headers = std::str::from_utf8(&bytes[..end])
+                .unwrap()
+                .to_ascii_lowercase();
+            let status = headers
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .parse::<u16>()
+                .unwrap();
+            (status, headers, bytes[end + 4..].to_vec())
+        };
+
+        // Seed both cache layers with the production pool, independent of PATH.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio/a.flac");
+        let master = Master {
+            asset: AudioAsset {
+                scheme: 1,
+                hash: [42; 32].into(),
+            },
+            facts: FileFacts::of(&path.metadata().unwrap()),
+            path,
+        };
+        let jobs = ritornel_engine::ServerStore::open_in_memory(
+            Arc::new(SystemClock),
+            Arc::new(OsEntropy),
+        )
+        .unwrap();
+        let cancel = jobs.job_cancel(1, Arc::default()).unwrap();
+        let items = vec![
+            BatchItem::Derivative {
+                master: master.clone(),
+                encoding: Encoding {
+                    backend: Arc::new(FakeEncoder),
+                    id: FakeEncoder.probe().unwrap().unwrap(),
+                    profile: Profile {
+                        target: Target::Mp3 { mode: Mp3::V2 },
+                        dsp: Dsp::default(),
+                    },
+                    gain_tags: GainTags::default(),
+                },
+            },
+            BatchItem::Package {
+                master,
+                audio: PackageAudio::PassThrough(Codec::Flac),
+                packaging: Arc::new(Packaging {
+                    tags: Tags::default(),
+                    cover: None,
+                    id3v1: false,
+                }),
+            },
+        ];
+        let batch = hub
+            .transcode_pool()
+            .ensure_batch(items, &cancel, |_| {})
+            .await
+            .unwrap();
+        for (entry, (layer, mime)) in batch
+            .entries()
+            .zip([("derivative", "audio/mpeg"), ("packaged", "audio/flac")])
+        {
+            let path = format!("/v1/cache/{layer}/{}", entry.key());
+            let content = std::fs::read(entry.path()).unwrap();
+            let size = content.len();
+            assert_eq!(fetch("GET", &path, None, None).await.0, 401);
+            assert_eq!(fetch("GET", &path, Some(local.trim()), None).await.0, 403);
+            for method in ["GET", "HEAD"] {
+                let (status, headers, body) = fetch(method, &path, Some(&link), None).await;
+                assert_eq!(status, 200);
+                assert!(
+                    headers
+                        .lines()
+                        .any(|l| l == format!("content-length: {size}"))
+                );
+                assert!(headers.contains(&format!("content-type: {mime}")));
+                assert_eq!(
+                    body.as_slice(),
+                    if method == "GET" {
+                        content.as_slice()
+                    } else {
+                        &[]
+                    }
+                );
+            }
+            for (range, start, end) in [
+                ("bytes=1-8", 1, 8),
+                ("bytes=9-", 9, size - 1),
+                ("bytes=-5", size - 5, size - 1),
+            ] {
+                let (status, headers, body) = fetch("GET", &path, Some(&link), Some(range)).await;
+                assert_eq!(status, 206);
+                assert!(headers.contains(&format!("content-range: bytes {start}-{end}/{size}")));
+                assert!(
+                    headers
+                        .lines()
+                        .any(|l| l == format!("content-length: {}", end - start + 1))
+                );
+                assert_eq!(body, content[start..=end]);
+            }
+            let (status, headers, _) = fetch("GET", &path, Some(&link), Some("bytes=4-2")).await;
+            assert_eq!(status, 416);
+            assert!(headers.contains(&format!("content-range: bytes */{size}")));
+            for bad in ["abc", "%2E%2E%2Fsecret", &"g".repeat(64)] {
+                let path = format!("/v1/cache/{layer}/{bad}");
+                assert_eq!(fetch("GET", &path, Some(&link), None).await.0, 400);
+            }
+            let missing = format!("/v1/cache/{layer}/{}", "0".repeat(64));
+            assert_eq!(fetch("GET", &missing, Some(&link), None).await.0, 404);
+        }
+        drop(batch);
+        drop((hub_client, desk_client));
+        desk.stop().await.unwrap();
+        hub.stop().await.unwrap();
+    })
+    .await;
+}

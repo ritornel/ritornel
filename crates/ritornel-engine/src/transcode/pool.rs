@@ -339,7 +339,7 @@ impl Context {
         let ctx = self.clone();
         Ok(self
             .workers
-            .run(slot, move |cancel| {
+            .run(Some(slot), move |cancel| {
                 let pin = ctx.pin()?;
                 let entry = ctx
                     .cache
@@ -356,12 +356,29 @@ impl Context {
     ) -> Result<Option<Arc<Lease>>, Error> {
         let ctx = self.clone();
         self.index
-            .run(slot, move |_| {
+            .run(Some(slot), move |_| {
                 let pin = ctx.pin()?;
                 let hit = ctx.cache.lookup(&ctx.store, object, pin)?;
                 Ok(hit.map(|entry| ctx.lease(pin, entry)))
             })
             .await
+    }
+}
+
+/// Keeps a cached object pinned while a response is being sent.
+pub struct Transfer {
+    lease: Arc<Lease>,
+    // A response owns its body. Release the pin before the last owner can join the index thread.
+    _pool: Arc<TranscodePool>,
+}
+impl Transfer {
+    pub fn entry(&self) -> &CacheEntry {
+        &self.lease.entry
+    }
+}
+impl fmt::Debug for Transfer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.entry().fmt(f)
     }
 }
 
@@ -428,6 +445,33 @@ impl TranscodePool {
             }),
             _join: [join, join_index],
         })
+    }
+
+    /// Pin a published file until its response body is dropped, including on disconnect.
+    pub async fn transfer(
+        self: &Arc<Self>,
+        key: blake3::Hash,
+        layer: ritornel_contract::transcode::ArtifactLayer,
+    ) -> Result<Option<Transfer>, Error> {
+        let ctx = self.context.clone();
+        let lease = self
+            .context
+            .index
+            .run(None, move |_| {
+                let pin = Pin {
+                    id: ctx.store.new_id()?,
+                    owner: PinOwner::HttpTransfer,
+                };
+                Ok(ctx
+                    .cache
+                    .transfer(&ctx.store, key, layer, pin)?
+                    .map(|entry| ctx.lease(pin, entry)))
+            })
+            .await?;
+        Ok(lease.map(|lease| Transfer {
+            lease,
+            _pool: self.clone(),
+        }))
     }
 
     pub fn cache(&self) -> &TranscodeCache {
