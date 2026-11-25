@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ritornel_contract::local::Preparing;
 use ritornel_contract::{Id, SessionKind};
-use ritornel_engine::transcode::{Encoder, EncoderId, LameEncoder, OpusEncoder};
+use ritornel_engine::transcode::{Encoder, EncoderId, LameEncoder, OpusEncoder, TranscodeCache};
 use ritornel_engine::{Clock, Entropy, SQLITE_VERSION, ServerStore};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{info, warn};
@@ -85,6 +85,7 @@ impl Drop for Task {
 pub struct Server {
     core: Arc<Core>,
     encoders: Vec<EncoderId>,
+    transcode_cache: TranscodeCache,
     /// The thread that runs jobs.
     worker: Worker,
     /// The player's control loop and the delivery of listens.
@@ -267,6 +268,12 @@ impl Server {
         )?;
 
         let listener = listener::bind(listen).await?;
+        let transcode_cache = TranscodeCache::open(
+            &store,
+            &dir.cache()?,
+            boot_id,
+            TranscodeCache::DEFAULT_BUDGET,
+        )?;
         let stores = Stores::new(store, library);
         let core = Arc::new(Core::new(
             stores, &identity, dir, verifier, clock, entropy, bounds,
@@ -319,6 +326,7 @@ impl Server {
         drop(steps);
         Ok(Self {
             encoders,
+            transcode_cache,
             transports: Transports(Arc::clone(&core)),
             worker,
             playback,
@@ -333,6 +341,11 @@ impl Server {
             server_json,
             _held: held,
         })
+    }
+
+    /// Machine-local audio and package cache for this run.
+    pub fn transcode_cache(&self) -> &TranscodeCache {
+        &self.transcode_cache
     }
 
     /// Encoder programs discovered on this machine at startup.

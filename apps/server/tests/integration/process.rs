@@ -497,8 +497,8 @@ fn every_log_line_is_json_with_the_runs_boot_id_and_no_secret() {
     assert_ne!(first[0]["boot_id"], second[0]["boot_id"]);
 
     assert_eq!(lines[1]["sqlite"], "3.54.1");
-    assert_eq!(lines[1]["schema_version"], 2);
-    assert_eq!(lines[1]["migrations_applied"], 2);
+    assert_eq!(lines[1]["schema_version"], 3);
+    assert_eq!(lines[1]["migrations_applied"], 3);
     assert_eq!(lines[10]["migrations_applied"], 0);
     assert_eq!(lines[3]["name"], "Invented Desk");
     assert_eq!(lines[4]["credential"], "issued");

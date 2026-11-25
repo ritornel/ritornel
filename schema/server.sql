@@ -6,6 +6,7 @@
 -- that changes here means a migration that has shipped was edited.
 --   0001_server  dcd8fce9c43a2974357d2bcb8f016bde876f16f86ec8437e2786de62803ae0c7
 --   0002_hub_link  dd4608c7904bfdcf0e97bd4fef1a83f0f77051bb90189b6a7e9dccd467984cdb
+--   0003_transcode_cache  cb5c28feb5cb870112ef52b06f4ab1795b3a735018039835713c77cf45f1e87a
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -204,4 +205,38 @@ CREATE TABLE hub_link (
   routes_json        TEXT NOT NULL CHECK (json_valid(routes_json)),       -- ["192.168.1.20:4747", ...], tried in order
   token              TEXT NOT NULL,                                       -- the link session's token at the hub: a secret, never logged
   linked_at_ms       INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE transcode_entry (
+  id INTEGER PRIMARY KEY,
+  cache_key TEXT NOT NULL UNIQUE CHECK (length(cache_key) = 64 AND cache_key NOT GLOB '*[^0-9a-f]*'),
+  layer TEXT NOT NULL CHECK (layer IN ('derivative', 'packaged')),
+  codec TEXT NOT NULL CHECK (codec IN ('mp3', 'opus', 'flac')),
+  source_key TEXT, -- derivative key or master audio hash used to package the file
+  size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+  file_hash BLOB NOT NULL CHECK (length(file_hash) = 32),
+  sampled_hash BLOB NOT NULL CHECK (length(sampled_hash) = 32),
+  created_at_ms INTEGER NOT NULL,
+  last_used_at_ms INTEGER NOT NULL,
+  CHECK ((source_key IS NULL) = (layer = 'derivative'))
+) STRICT;
+
+CREATE INDEX transcode_lru ON transcode_entry(layer DESC, last_used_at_ms, id);
+
+CREATE TABLE transcode_pin (
+  id INTEGER PRIMARY KEY,
+  entry_id INTEGER NOT NULL REFERENCES transcode_entry(id) ON DELETE CASCADE,
+  pin_id BLOB NOT NULL CHECK (length(pin_id) = 16),
+  boot_id BLOB NOT NULL CHECK (length(boot_id) = 16),
+  owner_kind TEXT NOT NULL CHECK (owner_kind IN ('sync_batch', 'http_transfer', 'ab_session')),
+  created_at_ms INTEGER NOT NULL,
+  UNIQUE(entry_id, pin_id)
+) STRICT;
+
+CREATE INDEX transcode_pin_owner ON transcode_pin(pin_id);
+
+CREATE TABLE transcode_size_hint (
+  id INTEGER PRIMARY KEY,
+  cache_key TEXT NOT NULL UNIQUE,
+  size_bytes INTEGER NOT NULL CHECK (size_bytes > 0)
 ) STRICT;
