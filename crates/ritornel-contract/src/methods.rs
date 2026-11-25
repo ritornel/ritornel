@@ -570,6 +570,10 @@ methods! {
     LinkListen: "link.listen", Command, needs_full: true,
     LinkListenParams => LinkListened;
 
+    /// `link.event`: a live player event from a satellite's presence connection.
+    LinkEvent: "link.event", Session, needs_full: true,
+    LinkPlayerEvent => NoParams;
+
     /// `link.ping`: on a hub, a satellite's word, every few seconds, that
     /// it is there and whether it plays. A satellite that plays keeps the
     /// hub's machine awake; the ping alone does not.
@@ -755,6 +759,7 @@ mod tests {
                 "link.tracks",
                 "link.copies",
                 "link.listen",
+                "link.event",
                 "link.ping",
                 "server.settings",
                 "server.setSettings",
@@ -829,6 +834,7 @@ mod tests {
                 "link.tracks",
                 "link.copies",
                 "link.listen",
+                "link.event",
                 "link.ping",
                 "server.settings",
                 "server.setSettings",

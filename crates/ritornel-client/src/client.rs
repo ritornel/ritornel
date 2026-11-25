@@ -255,7 +255,11 @@ impl Client {
     /// returns every topic the session then has.
     pub async fn subscribe(&self, topics: &[Topic]) -> Result<Subscriptions, Error> {
         let topics = topics.to_vec();
-        self.call::<EventsSubscribe>(&TopicsParams { topics }).await
+        self.call::<EventsSubscribe>(&TopicsParams {
+            player: None,
+            topics,
+        })
+        .await
     }
 
     /// `events.unsubscribe`: asks for no more events on these topics, and
@@ -263,8 +267,11 @@ impl Client {
     /// the response.
     pub async fn unsubscribe(&self, topics: &[Topic]) -> Result<Subscriptions, Error> {
         let topics = topics.to_vec();
-        self.call::<EventsUnsubscribe>(&TopicsParams { topics })
-            .await
+        self.call::<EventsUnsubscribe>(&TopicsParams {
+            player: None,
+            topics,
+        })
+        .await
     }
 
     /// `library.create`: creates a library on the server and makes the

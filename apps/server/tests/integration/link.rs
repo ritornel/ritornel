@@ -2535,3 +2535,132 @@ async fn a_limited_controller_routes_to_a_linked_player_and_replays_its_receipt(
     })
     .await;
 }
+
+async fn wait_for_player(observer: &mut Client, id: ritornel_contract::Id) {
+    observer.subscribe(&[Topic::Players]).await.unwrap();
+    loop {
+        let rows = observer
+            .call::<ritornel_contract::methods::PlayersListCall>(&NoParams {})
+            .await
+            .unwrap();
+        if rows
+            .players
+            .iter()
+            .any(|p| p.player_id == id && p.reachable)
+        {
+            break;
+        }
+        observer.next_event().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn player_subscriptions_follow_their_target_through_the_hub_and_a_restart() {
+    use ritornel_contract::Id;
+    use serde_json::json;
+
+    let set = async |c: &Client, volume: f64| {
+        c.call_raw(
+            "playback.set",
+            json!({"idempotencyKey":key(),"volume":volume}),
+        )
+        .await
+        .unwrap();
+    };
+    let volume = async |c: &mut Client, player: Option<Id>, volume: f64| {
+        loop {
+            if let Event::Playback(e) = c.next_event().await.unwrap() {
+                assert_eq!(e.player, player);
+                if (e.state.volume - volume).abs() < 0.0001 {
+                    break;
+                }
+            }
+        }
+    };
+    bounded(async {
+        let scratch = Scratch::new();
+        let hub = start_playing_with(&scratch, "hub", 1, None).await;
+        let h = client(&scratch, "hub", &hub).await;
+        h.create_library(key()).await.unwrap();
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        let mut d = client(&scratch, "desk", &desk).await;
+        join(&d, &invite(&hub, &h).await).await.unwrap();
+        let other = start(&scratch, "other").await;
+        let mut o = client(&scratch, "other", &other).await;
+        join(&o, &invite(&hub, &h).await).await.unwrap();
+        let id = desk.server_id();
+        let hub_id = hub.server_id();
+        let target = json!({"player":id,"topics":["playback"]});
+        let hub_target = json!({"player":hub_id,"topics":["playback"]});
+        // Wait for the presence hello before changing the remote player.
+        let mut observer = client(&scratch, "hub", &hub).await;
+        wait_for_player(&mut observer, id).await;
+        assert_eq!(
+            o.call_raw("events.subscribe", target.clone())
+                .await
+                .unwrap(),
+            target
+        );
+        o.subscribe(&[Topic::Servers]).await.unwrap();
+        d.subscribe(&[Topic::Playback]).await.unwrap();
+        assert_eq!(
+            d.call_raw("events.subscribe", hub_target.clone())
+                .await
+                .unwrap(),
+            hub_target
+        );
+        set(&d, 0.31).await;
+        volume(&mut d, None, 0.31).await;
+        volume(&mut o, Some(id), 0.31).await;
+        set(&h, 0.42).await;
+        volume(&mut d, Some(hub_id), 0.42).await;
+        assert_eq!(
+            d.call_raw("events.unsubscribe", hub_target).await.unwrap(),
+            json!({"player":hub_id,"topics":[]})
+        );
+        set(&h, 0.69).await;
+        set(&d, 0.53).await;
+        volume(&mut d, None, 0.53).await;
+        volume(&mut o, Some(id), 0.53).await;
+
+        let port = hub.endpoint().port();
+        hub.stop().await.unwrap();
+        hub_answers(&mut o, false).await;
+        let restarted = start_on(&scratch, "hub", Listen::on_port(port)).await;
+        hub_answers(&mut o, true).await;
+        let mut observer = client(&scratch, "hub", &restarted).await;
+        wait_for_player(&mut observer, id).await;
+        set(&d, 0.64).await;
+        volume(&mut o, Some(id), 0.64).await;
+        // Keep the controller and its hub connection. A restarted player that
+        // stays stopped must still refresh both playback and queue watchers.
+        o.call_raw("events.subscribe", json!({"player":id,"topics":["queue"]}))
+            .await
+            .unwrap();
+        desk.stop().await.unwrap();
+        let _desk = start_playing_with(&scratch, "desk", 1, None).await;
+        let mut seen_state = false;
+        let mut seen_queue = false;
+        while !(seen_state && seen_queue) {
+            match o.next_event().await.unwrap() {
+                Event::Playback(e) if e.player == Some(id) => {
+                    assert_eq!(e.state.status, PlaybackStatus::Stopped);
+                    seen_state = true;
+                }
+                Event::Queue(e) if e.player == Some(id) => seen_queue = true,
+                _ => {}
+            }
+        }
+        o.call_raw(
+            "events.unsubscribe",
+            json!({"player":id,"topics":["queue"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            o.call_raw("events.unsubscribe", target).await.unwrap(),
+            json!({"player":id,"topics":[]})
+        );
+    })
+    .await;
+}

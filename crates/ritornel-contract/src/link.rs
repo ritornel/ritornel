@@ -275,6 +275,31 @@ pub struct LinkListened {
     pub taken: ListenTaken,
 }
 
+/// One live report on a player's presence connection. The hub identifies
+/// the player from that connection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(
+    tag = "topic",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum LinkPlayerEvent {
+    /// A complete player state.
+    Playback(Box<crate::PlaybackEvent>),
+    /// The current entry's position.
+    Progress(crate::ProgressEvent),
+    /// The queue revision.
+    Queue(crate::QueueEvent),
+    /// The player started hearing a track, including a new play of the same entry.
+    Began {
+        /// The appearance being heard.
+        appearance_id: Id,
+        /// Length of the track in milliseconds.
+        duration_ms: u64,
+    },
+}
+
 /// What a satellite tells its hub every few seconds with `link.ping`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]

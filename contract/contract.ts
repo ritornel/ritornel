@@ -149,6 +149,7 @@ export const METHODS = {
   "link.tracks": { kind: "query", needsFull: true },
   "link.copies": { kind: "query", needsFull: true },
   "link.listen": { kind: "command", needsFull: true },
+  "link.event": { kind: "session", needsFull: true },
   "link.ping": { kind: "session", needsFull: true },
   "server.settings": { kind: "query", needsFull: true },
   "server.setSettings": { kind: "command", needsFull: true },
@@ -253,6 +254,7 @@ export type MethodMap = {
   "link.tracks": { params: LinkTracksParams; result: LinkTracks };
   "link.copies": { params: LinkCopiesParams; result: LinkCopies };
   "link.listen": { params: LinkListenParams; result: LinkListened };
+  "link.event": { params: LinkPlayerEvent; result: NoParams };
   "link.ping": { params: LinkPingParams; result: LinkPinged };
   "server.settings": { params: NoParams; result: ServerSettings };
   "server.setSettings": { params: SetServerSettingsParams; result: ServerSettingsSet };
@@ -3743,6 +3745,21 @@ export type LinkPinged = {
 };
 
 /**
+ * One live report on a player's presence connection. The hub identifies
+ * the player from that connection.
+ */
+export type LinkPlayerEvent = { "topic": "playback" } & PlaybackEvent | { "topic": "progress" } & ProgressEvent | { "topic": "queue" } & QueueEvent | { "topic": "began",
+  /**
+   * The appearance being heard.
+   */
+  appearanceId: string,
+  /**
+   * Length of the track in milliseconds.
+   */
+  durationMs: number,
+};
+
+/**
  * What a satellite sends to `POST /v1/link` to join: the invite's secret
  * and who it is.
  */
@@ -4558,6 +4575,10 @@ export type PlaybackCommandParams = {
  */
 export type PlaybackEvent = {
   /**
+   * The selected player. Omitted for this server's own player.
+   */
+  player?: string,
+  /**
    * The state.
    */
   state: PlaybackState,
@@ -5172,6 +5193,10 @@ export type Profile = {
  */
 export type ProgressEvent = {
   /**
+   * The selected player. Omitted for this server's own player.
+   */
+  player?: string,
+  /**
    * The entry.
    */
   entryId: string,
@@ -5528,6 +5553,10 @@ export type QueueEntry = {
  * again.
  */
 export type QueueEvent = {
+  /**
+   * The selected player. Omitted for this server's own player.
+   */
+  player?: string,
   /**
    * The queue's revision after the change.
    */
@@ -6924,7 +6953,11 @@ export type StreamTier = "start" | "during" | "renamed";
  */
 export type Subscriptions = {
   /**
-   * Every topic the session is subscribed to after the call.
+   * The player ID from the request, if supplied.
+   */
+  player?: string,
+  /**
+   * Topics held for the requested player, or local topics when the request omitted the player.
    */
   topics: Array<Topic>,
 };
@@ -7013,6 +7046,10 @@ export type Topic = "servers" | "players" | "jobs" | "library" | "list" | "playb
  * The params of `events.subscribe` and `events.unsubscribe`.
  */
 export type TopicsParams = {
+  /**
+   * The selected player. Omitted for this server's own player.
+   */
+  player?: string,
   /**
    * The topics to add or to remove. Naming one twice, adding one the
    * session has, or removing one it has not, changes nothing.
