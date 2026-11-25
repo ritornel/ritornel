@@ -34,9 +34,9 @@ impl Player {
         &mut self,
         params: LinkHandoffParams,
         server: &ServerStore,
-    ) -> Result<(HandoffResult, Vec<PlayerEvent>), Error> {
-        let mut events = Vec::new();
-        self.sync(server, &mut events);
+        events: &mut Vec<PlayerEvent>,
+    ) -> Result<HandoffResult, Error> {
+        self.sync(server, events);
         let result = match params {
             LinkHandoffParams::Take { movement } => {
                 let command = step(movement, 1, "link.handoff.take")?;
@@ -48,7 +48,7 @@ impl Player {
                         _ => return Err(Error::Invalid("the source changed after it was taken")),
                     }
                 } else {
-                    self.take(movement, command, server, &mut events)?
+                    self.take(movement, command, server, events)?
                 }
             }
             LinkHandoffParams::Load {
@@ -72,7 +72,7 @@ impl Player {
                     if server.stored_result(probe)?.is_some() {
                         HandoffResult::Pending
                     } else if let Some(snapshot) = snapshot {
-                        self.load(movement, command, snapshot, server, &mut events)?;
+                        self.load(movement, command, snapshot, server, events)?;
                         HandoffResult::Loaded
                     } else {
                         server.record_command(
@@ -105,7 +105,7 @@ impl Player {
                 HandoffResult::Released
             }
         };
-        Ok((result, events))
+        Ok(result)
     }
 
     fn still_taken(&self, s: &HandoffSnapshot) -> bool {
@@ -174,16 +174,7 @@ impl Player {
                 "the queue exceeds the handoff message limit",
             ));
         }
-        self.pause_output(server, events);
-        if self.entry().is_none_or(|e| e.entry_id != m.entry_id) {
-            // A gapless transition can land between checking the entry and
-            // pausing the renderer. Leave that new entry playing.
-            if snapshot.playing && self.loaded.is_some() {
-                self.renderer.play();
-                self.status = Status::Playing;
-            }
-            return Err(Error::Invalid("the source advanced while pausing"));
-        }
+        self.pause_output(server, events, Some(m.entry_id))?;
         snapshot.position_ms = self.position();
         snapshot.listen = self.open_listen().or(self.resume_listen);
         let result = HandoffResult::Taken { snapshot };

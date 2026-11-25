@@ -3106,7 +3106,16 @@ async fn moving_music_between_three_players_keeps_queue_order_position_and_one_r
         d.call_raw("playback.pause", json!({"idempotencyKey":key()}))
             .await
             .unwrap();
+        // Seeking while paused gives the source a known position after the
+        // last output callback has given up the playing span.
+        d.call_raw(
+            "playback.seek",
+            json!({"idempotencyKey": key(), "entryId": original["entryId"], "positionMs": 12_000}),
+        )
+        .await
+        .unwrap();
         let paused = d.call_raw("playback.get", json!({})).await.unwrap();
+        assert_eq!(paused["positionMs"], 12_000);
         let second = move_to(
             desk.server_id(),
             other.server_id(),
@@ -3262,6 +3271,15 @@ async fn refused_load_preserves_the_source_and_an_unanswered_release_retries_on_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lost_load_answer_is_confirmed_before_the_hub_releases_the_source() {
+    recover_lost_load(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_player_retires_the_load_attempt_and_leaves_the_source_intact() {
+    recover_lost_load(false).await;
+}
+
+async fn recover_lost_load(destination_kept_queue: bool) {
     use ritornel_contract::Response;
     use serde_json::json;
     bounded(async {
@@ -3300,12 +3318,40 @@ async fn a_lost_load_answer_is_confirmed_before_the_hub_releases_the_source() {
         let params = probe.params.unwrap();
         assert_eq!(params["attempt"], attempt);
         assert!(params["snapshot"].is_null());
+        let outcome = if destination_kept_queue {
+            Ok(json!({"step": "loaded"}))
+        } else {
+            Err(
+                ritornel_contract::RpcError::new(ErrorCode::Unsupported, "the player was removed")
+                    .with_detail("reason", "no_player"),
+            )
+        };
         again
             .respond(Response {
                 id: Some(probe.id),
-                outcome: Ok(json!({"step": "loaded"})),
+                outcome,
             })
             .unwrap();
+        if !destination_kept_queue {
+            let db = rusqlite::Connection::open(scratch.data_dir("hub").join("server.db")).unwrap();
+            while db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM server_setting WHERE key GLOB 'move.*')",
+                    [],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+            let source = controller
+                .call::<PlaybackGet>(&PlaybackGetParams::default())
+                .await
+                .unwrap();
+            assert_eq!(source.queue_length, paused.queue_length);
+            assert_eq!(source.status, paused.status);
+            return;
+        }
         wait_empty(&controller).await;
         assert_eq!(
             controller

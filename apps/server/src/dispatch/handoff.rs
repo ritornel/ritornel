@@ -133,8 +133,14 @@ impl Core {
                 "handoff names another player",
             ));
         }
-        self.with_stores(|s| self.with_player(s, |player, server, _| player.handoff(p, server)))
-            .ok_or_else(stopping)?
+        self.with_stores(|s| {
+            self.with_player(s, |player, server, _| {
+                let mut events = Vec::new();
+                let result = player.handoff(p, server, &mut events).map_err(refused);
+                Ok((result, events))
+            })
+        })
+        .ok_or_else(stopping)??
     }
 
     fn handoff_step(&self, id: Id, p: LinkHandoffParams) -> Result<HandoffResult, RpcError> {
@@ -175,7 +181,11 @@ impl Core {
                 "choose two different players",
             ));
         }
-        let receipt = self.move_receipt(m)?;
+        let command = Command {
+            id: m.idempotency_key,
+            fingerprint: fingerprint::<PlaybackMove>(&m)?,
+        };
+        let receipt = self.move_store(|s| s.begin_move(command))?;
         if receipt.status == ReceiptStatus::Done {
             return Ok(receipt);
         }
@@ -215,7 +225,9 @@ impl Core {
             id: m.idempotency_key,
             fingerprint: fingerprint::<PlaybackMove>(&m)?,
         };
-        self.move_store(|s| s.begin_move(command))
+        self.move_store(|s| s.stored_result(command))?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .ok_or_else(unexpected)
     }
 
     fn transfer(&self, m: PlaybackMoveParams) -> Result<Receipt, RpcError> {
@@ -297,7 +309,18 @@ impl Core {
                 self.move_store(|s| s.forget_release(journal))?;
                 Ok(())
             })();
-            pending |= result.is_err();
+            // A missing player or a definitive rejection ends this obligation.
+            // An offline player can return: retain its journal until then.
+            if let Err(e) = result {
+                if matches!(
+                    e.kind(),
+                    ErrorCode::Unsupported | ErrorCode::Invalid | ErrorCode::Forbidden
+                ) {
+                    pending |= self.move_store(|s| s.forget_release(journal)).is_err();
+                } else {
+                    pending = true;
+                }
+            }
         }
         pending
     }

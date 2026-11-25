@@ -1145,14 +1145,24 @@ impl Player {
         }
         let mut events = Vec::new();
         self.sync(server, &mut events);
-        self.pause_output(server, &mut events);
+        self.pause_output(server, &mut events, None)?;
         self.receipt(server, request, events)
     }
 
-    fn pause_output(&mut self, server: &ServerStore, events: &mut Vec<PlayerEvent>) {
+    fn pause_output(
+        &mut self,
+        server: &ServerStore,
+        events: &mut Vec<PlayerEvent>,
+        expected: Option<Id>,
+    ) -> Result<(), Error> {
         match self.status {
             Status::Playing => {
                 self.renderer.pause();
+                self.take_in(events);
+                if expected.is_some_and(|id| self.entry().is_none_or(|e| e.entry_id != id)) {
+                    self.renderer.play();
+                    return Err(Error::Invalid("the source advanced while pausing"));
+                }
                 self.recorder.paused();
                 self.status = Status::Paused;
                 self.sync(server, events);
@@ -1167,6 +1177,7 @@ impl Player {
             }
             Status::Paused | Status::Stopped => {}
         }
+        Ok(())
     }
 
     /// Plays again after a pause, or after a stop from the entry's
@@ -1376,7 +1387,7 @@ impl Player {
     ) -> Result<Vec<PlayerEvent>, Error> {
         let mut events = Vec::new();
         self.sync(server, &mut events);
-        if std::mem::take(&mut self.start_handoff) {
+        if self.start_handoff {
             match self.status {
                 Status::Buffering => {
                     let library = library.ok_or(no_library())?;
@@ -1390,6 +1401,7 @@ impl Player {
                 }
                 _ => {}
             }
+            self.start_handoff = false;
         }
         if let Some(limit) = self.setup.fail_at_position_ms
             && self.status == Status::Playing

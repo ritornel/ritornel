@@ -86,7 +86,7 @@ impl ServerStore {
         self.transact(move |tx, _, _| {
             tx.execute(
                 "DELETE FROM server_setting WHERE key=?1 AND json_extract(value_json,'$.attempt')=?2",
-                (format!("move.{}", pending.movement.idempotency_key),pending.attempt.to_string()),
+                (format!("move.{}", pending.movement.idempotency_key), pending.attempt.to_string()),
             )?;
             Ok(())
         })
@@ -125,15 +125,7 @@ pub(super) fn record_player_receipt(
     // A deferred release must still leave that playback alone.
     let takes = method == "link.handoff.take";
     if takes
-        || matches!(
-            method,
-            "playback.play"
-                | "playback.resume"
-                | "playback.seek"
-                | "playback.skip"
-                | "playback.jump"
-                | "playback.stop"
-        )
+        || (method.starts_with("playback.") && !matches!(method, "playback.pause" | "playback.set"))
         || method.starts_with("queue.")
         || method == "link.handoff.load"
     {

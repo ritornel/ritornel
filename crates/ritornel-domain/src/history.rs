@@ -969,8 +969,8 @@ fn order(listen: &Listen) -> (i64, &[u8]) {
 /// listen first. Chains are in the order of their first listen's
 /// observation.
 ///
-/// A listen joins the one it continues when that one is here for the same listener
-/// and ended no later than it began and at most
+/// A listen joins the one it continues on the same endpoint, or on a different
+/// endpoint for the same listener, when the earlier listen ended no later than it began and at most
 /// [`CHAIN_WINDOW_MS`] before: by the monotonic clock when both were heard
 /// in one boot, and otherwise by their dates, within what those dates can
 /// be out. The sender's wall clock decides none of it, so a clock set back
@@ -1009,10 +1009,7 @@ pub fn chains(listens: &[Listen]) -> Vec<Vec<usize>> {
                 .or_else(|| across.get(&(listen.listener, key)).copied().flatten())?;
             let earlier = listens.get(previous)?;
             let (after, slack) = gap(earlier, listen);
-            let joins = earlier.listener == listen.listener
-                && previous != index
-                && after >= -slack
-                && after <= CHAIN_WINDOW_MS;
+            let joins = previous != index && after >= -slack && after <= CHAIN_WINDOW_MS;
             joins.then_some((previous, index))
         })
         .collect();

@@ -3584,13 +3584,21 @@ fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_li
         entry_id: src.entry(),
     };
     let take = LinkHandoffParams::Take { movement };
-    let (taken, _) = src.player.handoff(take.clone(), &src.server).unwrap();
+    let taken = src
+        .player
+        .handoff(take.clone(), &src.server, &mut Vec::new())
+        .unwrap();
     let HandoffResult::Taken { snapshot } = taken.clone() else {
         panic!("expected snapshot")
     };
     assert_eq!(snapshot.listen, Some(source_listen));
     assert_eq!(snapshot.position_ms, 12_000);
-    assert_eq!(src.player.handoff(take, &src.server).unwrap().0, taken);
+    assert_eq!(
+        src.player
+            .handoff(take, &src.server, &mut Vec::new())
+            .unwrap(),
+        taken
+    );
     let retired = id(0xb3);
     let probe = LinkHandoffParams::Load {
         movement,
@@ -3598,7 +3606,9 @@ fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_li
         snapshot: None,
     };
     assert_eq!(
-        dst.player.handoff(probe, &dst.server).unwrap().0,
+        dst.player
+            .handoff(probe, &dst.server, &mut Vec::new())
+            .unwrap(),
         HandoffResult::Pending
     );
     let late = LinkHandoffParams::Load {
@@ -3607,7 +3617,9 @@ fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_li
         snapshot: Some(snapshot.clone()),
     };
     assert_eq!(
-        dst.player.handoff(late, &dst.server).unwrap().0,
+        dst.player
+            .handoff(late, &dst.server, &mut Vec::new())
+            .unwrap(),
         HandoffResult::Pending
     );
     assert_eq!(dst.player.open_listen(), Some(replaced));
@@ -3616,7 +3628,9 @@ fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_li
         attempt: id(0xb4),
         snapshot: Some(snapshot),
     };
-    dst.player.handoff(load.clone(), &dst.server).unwrap();
+    dst.player
+        .handoff(load.clone(), &dst.server, &mut Vec::new())
+        .unwrap();
     assert_eq!(dst.player.status(), Status::Buffering);
     assert_eq!(
         dst.staged()
@@ -3630,6 +3644,7 @@ fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_li
             .as_str(),
         "replaced"
     );
+    assert!(dst.player.tick(&dst.server, None).is_err());
     dst.tick();
     dst.pass(1000);
     let continued = dst.player.open_listen().unwrap();
@@ -3641,13 +3656,19 @@ fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_li
     assert_eq!(staged.started.continues, Some(source_listen));
     assert_eq!(staged.started.start_reason.as_str(), "resume");
     assert_eq!(staged.started.start_position_ms, 12_000);
-    dst.player.handoff(load, &dst.server).unwrap();
+    dst.player
+        .handoff(load, &dst.server, &mut Vec::new())
+        .unwrap();
     assert_eq!(dst.player.open_listen(), Some(continued));
     let paused_at = src.clock.now_ms();
     src.wait(120_000);
     let release = LinkHandoffParams::Release { movement };
-    src.player.handoff(release.clone(), &src.server).unwrap();
-    src.player.handoff(release, &src.server).unwrap();
+    src.player
+        .handoff(release.clone(), &src.server, &mut Vec::new())
+        .unwrap();
+    src.player
+        .handoff(release, &src.server, &mut Vec::new())
+        .unwrap();
     assert_eq!(src.player.state().queue_length, 0);
     let end = src.staged().pop().unwrap().ended.unwrap();
     assert_eq!(end.end_reason.as_str(), "stopped");
@@ -3666,13 +3687,61 @@ fn a_delayed_release_leaves_music_the_listener_resumed_in_place() {
         entry_id: rig.entry(),
     };
     rig.player
-        .handoff(LinkHandoffParams::Take { movement }, &rig.server)
+        .handoff(
+            LinkHandoffParams::Take { movement },
+            &rig.server,
+            &mut Vec::new(),
+        )
         .unwrap();
     rig.resume();
     rig.pause();
     rig.player
-        .handoff(LinkHandoffParams::Release { movement }, &rig.server)
+        .handoff(
+            LinkHandoffParams::Release { movement },
+            &rig.server,
+            &mut Vec::new(),
+        )
         .unwrap();
     assert_eq!(rig.entry(), movement.entry_id);
     assert_eq!(rig.player.status(), Status::Paused);
+}
+
+#[test]
+fn a_gapless_join_during_take_reports_the_next_track_and_leaves_it_playing() {
+    use ritornel_contract::{LinkHandoffParams, PlaybackMoveParams};
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(2);
+    rig.pass(ALBUM[2].length_ms - 1);
+    let movement = PlaybackMoveParams {
+        idempotency_key: id(0xc3),
+        from: id(1),
+        to: id(2),
+        entry_id: rig.entry(),
+    };
+    rig.busy(2);
+    let mut events = Vec::new();
+    assert!(
+        rig.player
+            .handoff(
+                LinkHandoffParams::Take { movement },
+                &rig.server,
+                &mut events
+            )
+            .is_err()
+    );
+    assert_ne!(rig.entry(), movement.entry_id);
+    assert_eq!(rig.player.status(), Status::Playing);
+    assert!(events.iter().any(|e| matches!(e, super::PlayerEvent::Began { appearance, .. } if *appearance == rig.tracks[3])));
+    rig.pass(1000);
+    let open = rig.player.open_listen().unwrap();
+    assert_eq!(
+        rig.staged()
+            .iter()
+            .find(|s| s.started.listen_id == open)
+            .unwrap()
+            .heard
+            .pause_count,
+        0
+    );
 }
