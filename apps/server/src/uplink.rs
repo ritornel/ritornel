@@ -917,7 +917,7 @@ async fn presence(core: &Arc<crate::dispatch::Core>, uplink: &Uplink) {
             let hello = PresenceHello {
                 has_player: player.is_some(),
                 player,
-                // Only a library hub sends Now Playing in this version.
+                // This player relies on its hub for Now Playing.
                 sends_now_playing: false,
             };
             if let Ok(mut client) = uplink.connect(Some(hello)).await

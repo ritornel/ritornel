@@ -252,9 +252,6 @@ impl Core {
                         );
                         #[cfg(feature = "media-session")]
                         self.show_in_media_session(state);
-                        if state.status != Status::Playing {
-                            self.nothing_playing();
-                        }
                     }
                 }
                 PlayerEvent::Began {
@@ -268,7 +265,6 @@ impl Core {
                             duration_ms: unsigned(duration_ms),
                         },
                     );
-                    self.now_playing(appearance, duration_ms);
                 }
                 PlayerEvent::Progress {
                     entry,

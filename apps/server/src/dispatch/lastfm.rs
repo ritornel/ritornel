@@ -30,20 +30,30 @@ impl Core {
         }
     }
 
-    /// Says a track began to be heard, or was heard again after a pause,
-    /// for Last.fm's "now playing". It only puts it where the scrobbler
-    /// takes it from, so the player never waits on Last.fm.
-    pub(crate) fn now_playing(&self, appearance: ritornel_contract::Id, duration_ms: i64) {
-        if let Some(lastfm) = self.lastfm() {
-            lastfm.began(appearance, duration_ms);
-        }
-    }
-
-    /// Says the player paused or stopped: a track not yet shown as playing
-    /// is not shown.
-    pub(crate) fn nothing_playing(&self) {
-        if let Some(lastfm) = self.lastfm() {
-            lastfm.stopped();
+    #[cfg(feature = "lastfm")]
+    pub(super) fn observe_now_playing(
+        &self,
+        player: ritornel_contract::Id,
+        report: &ritornel_contract::LinkPlayerEvent,
+    ) {
+        use ritornel_contract::{LinkPlayerEvent, PlaybackStatus};
+        let Some(lastfm) = self.lastfm() else { return };
+        match report {
+            LinkPlayerEvent::Began {
+                appearance_id,
+                duration_ms,
+            } => lastfm.began(player, *appearance_id, *duration_ms),
+            LinkPlayerEvent::Playback(e) => {
+                // A fresh snapshot after report loss can invalidate a start, but cannot invent one.
+                let appearance = e
+                    .state
+                    .track
+                    .as_ref()
+                    .filter(|_| e.state.status == PlaybackStatus::Playing)
+                    .map(|track| track.appearance_id);
+                lastfm.still_playing(player, appearance);
+            }
+            _ => {}
         }
     }
 }
@@ -424,7 +434,7 @@ mod enabled {
                 Self::library(stores, |library| {
                     keep_session(stores.server(), library, account).map_err(refused)
                 })
-                .map(|_| ())
+                .map(|_| lastfm.forget_now_playing())
             })?;
             // Signed in again to the same account, the plays waiting go.
             if account.is_some() {
@@ -455,7 +465,7 @@ mod enabled {
             // Once this answers, nothing more is sent as the session ended.
             // Sent again after a newer sign-in, it signs nothing out.
             let change = self.lastfm().map(Lastfm::hold);
-            let was_signed_in = stores
+            let changed = stores
                 .server()
                 .change_once(
                     command,
@@ -464,12 +474,16 @@ mod enabled {
                         service: SERVICE.to_owned(),
                     },
                 )
-                .map_err(refused)?
-                .found;
+                .map_err(refused)?;
+            if changed.now
+                && let Some(lastfm) = self.lastfm()
+            {
+                lastfm.forget_now_playing();
+            }
             drop(change);
             Ok(SignedOut {
                 receipt: receipt(params.idempotency_key, ReceiptStatus::Done),
-                was_signed_in,
+                was_signed_in: changed.found,
             })
         }
 
@@ -511,6 +525,11 @@ mod enabled {
             // after a newer change, a sign-out included, it changes nothing,
             // and answers with scrobbling as it is.
             let change = self.lastfm().map(Lastfm::hold);
+            let was_on = stores
+                .server()
+                .service_session(SERVICE)
+                .map_err(refused)?
+                .is_some_and(|s| s.scrobble_from_ms.is_some());
             let changed = stores
                 .server()
                 .change_once(
@@ -525,6 +544,12 @@ mod enabled {
                     ritornel_engine::Error::NotFound(_) => not_signed_in(),
                     other => refused(other),
                 })?;
+            if changed.now
+                && was_on != params.on
+                && let Some(lastfm) = self.lastfm()
+            {
+                lastfm.forget_now_playing();
+            }
             drop(change);
             if changed.now {
                 self.wake_scrobbler();
@@ -590,6 +615,8 @@ mod enabled {
 /// runs: these look at which jobs are queued, and end them by hand.
 #[cfg(all(test, feature = "lastfm"))]
 mod tests {
+    mod now_playing;
+
     use std::sync::Arc;
 
     use ritornel_contract::{CONTRACT_VERSION, ErrorCode, Frame, Request, RequestId, SessionKind};
@@ -612,6 +639,10 @@ mod tests {
     /// A server with Last.fm set up and nothing to reach: nothing here
     /// sends a request.
     fn server(clock: &Arc<SetClock>) -> (Core, Scratch) {
+        server_at(clock, "http://127.0.0.1:9/2.0/".to_owned())
+    }
+
+    fn server_at(clock: &Arc<SetClock>, base_url: String) -> (Core, Scratch) {
         let scratch = Scratch::new();
         let dir = DataDir::prepare(scratch.path().join("data")).unwrap();
         let store = ServerStore::open_in_memory(clock.clone(), Arc::new(OsEntropy)).unwrap();
@@ -630,7 +661,7 @@ mod tests {
         core.set_lastfm(Lastfm::new(
             LastfmRun {
                 credentials: Some(ritornel_lastfm::ApiCredentials::new(API_KEY, API_SECRET)),
-                base_url: Some("http://127.0.0.1:9/2.0/".to_owned()),
+                base_url: Some(base_url),
                 ..LastfmRun::default()
             },
             dir.root(),

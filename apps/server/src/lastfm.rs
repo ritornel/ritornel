@@ -72,9 +72,9 @@ pub(crate) struct Lastfm {
     /// Sign-ins in progress, by the ID handed out for each.
     #[cfg(feature = "lastfm")]
     sign_ins: std::sync::Mutex<std::collections::HashMap<ritornel_contract::Id, SignIn>>,
-    /// The track to show as playing now, until the scrobbler takes it.
+    /// One pending track per player, in the order their starts were reported.
     #[cfg(feature = "lastfm")]
-    playing: Slot,
+    playing: Slots,
     /// The account nothing is scrobbled for until then, on the monotonic
     /// clock, because Last.fm said its daily limit was reached, refused a
     /// request or left a batch unanswered: the plays held back go first
@@ -159,7 +159,7 @@ impl Lastfm {
                 client,
                 problem,
                 sign_ins: std::sync::Mutex::default(),
-                playing: Slot::default(),
+                playing: Slots::default(),
                 paused: std::sync::Mutex::default(),
                 turn: Turn::default(),
             }
@@ -183,27 +183,35 @@ impl Lastfm {
         self.wake.wake();
     }
 
-    /// Says a track began to be heard, or was heard again after a pause: it
-    /// replaces any not yet shown as playing, and the scrobbler is woken to
-    /// show it once it has settled.
-    #[cfg_attr(not(feature = "lastfm"), allow(unused_variables))]
-    pub(crate) fn began(&self, appearance: ritornel_contract::Id, duration_ms: i64) {
-        #[cfg(feature = "lastfm")]
-        {
-            self.playing.put(Began {
-                appearance,
-                duration_ms,
-                at: std::time::Instant::now(),
-            });
-            self.wake.wake();
-        }
+    /// The newest start replaces only this player's pending send.
+    #[cfg(feature = "lastfm")]
+    pub(crate) fn began(
+        &self,
+        player: ritornel_contract::Id,
+        appearance: ritornel_contract::Id,
+        duration_ms: u64,
+    ) {
+        self.playing.put(Began {
+            player,
+            appearance,
+            duration_ms,
+            at: std::time::Instant::now(),
+        });
+        self.wake.wake();
     }
 
-    /// Says the player paused or stopped: a track not yet shown as playing
-    /// is let go.
-    pub(crate) fn stopped(&self) {
-        #[cfg(feature = "lastfm")]
-        self.playing.clear();
+    #[cfg(feature = "lastfm")]
+    pub(crate) fn still_playing(
+        &self,
+        player: ritornel_contract::Id,
+        appearance: Option<ritornel_contract::Id>,
+    ) {
+        self.playing.keep(player, appearance);
+    }
+
+    #[cfg(feature = "lastfm")]
+    pub(crate) fn forget_now_playing(&self) {
+        self.playing.clear_all();
     }
 
     /// For the crash test: how many batches of a sync are committed before
@@ -219,6 +227,8 @@ pub(crate) use enabled::*;
 
 #[cfg(feature = "lastfm")]
 mod enabled {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
     use std::time::Instant;
 
     use ritornel_contract::{ErrorCode, Id, RpcError, SyncSummary};
@@ -355,53 +365,63 @@ mod enabled {
     /// A track that began to be heard.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) struct Began {
+        pub(crate) player: Id,
         pub(crate) appearance: Id,
-        pub(crate) duration_ms: i64,
+        pub(crate) duration_ms: u64,
         pub(crate) at: Instant,
     }
 
     /// What there is to show as playing.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, PartialEq, Eq)]
     pub(crate) enum Taken {
         /// Nothing.
         Nothing,
         /// A track that has not settled yet: look again after this long.
         Wait(std::time::Duration),
         /// This track.
-        Show(Began),
+        Show(Arc<Began>),
     }
 
-    /// The one track to show as playing: the latest that began wins, and
-    /// it is never kept anywhere else nor sent twice.
+    /// Starts in arrival order. A repeat replaces even an identical track on the same player.
     #[derive(Debug, Default)]
-    pub(crate) struct Slot(std::sync::Mutex<Option<Began>>);
+    pub(crate) struct Slots(std::sync::Mutex<VecDeque<Arc<Began>>>);
 
-    impl Slot {
+    impl Slots {
         pub(crate) fn put(&self, began: Began) {
-            *lock(&self.0) = Some(began);
+            let mut slots = lock(&self.0);
+            slots.retain(|held| held.player != began.player);
+            slots.push_back(Arc::new(began));
         }
 
-        pub(crate) fn clear(&self) {
-            *lock(&self.0) = None;
+        pub(crate) fn keep(&self, player: Id, appearance: Option<Id>) {
+            lock(&self.0)
+                .retain(|held| held.player != player || Some(held.appearance) == appearance);
         }
 
-        /// Takes the track waiting, once it has been heard for [`SETTLE`];
-        /// one older than [`STALE`] is let go.
-        pub(crate) fn take(&self, now: Instant) -> Taken {
-            let mut slot = lock(&self.0);
-            let Some(began) = *slot else {
-                return Taken::Nothing;
-            };
-            let age = now.saturating_duration_since(began.at);
-            if age < SETTLE {
-                return Taken::Wait(SETTLE - age);
+        pub(super) fn clear_all(&self) {
+            lock(&self.0).clear();
+        }
+
+        fn next(&self, now: Instant) -> Taken {
+            let mut slots = lock(&self.0);
+            while let Some(first) = slots.front() {
+                let age = now.saturating_duration_since(first.at);
+                if age < SETTLE {
+                    return Taken::Wait(SETTLE - age);
+                }
+                if age <= STALE {
+                    return Taken::Show(Arc::clone(first));
+                }
+                slots.pop_front();
             }
-            *slot = None;
-            if age > STALE {
-                debug!("a track that began too long ago is not shown as playing at Last.fm");
-                return Taken::Nothing;
-            }
-            Taken::Show(began)
+            Taken::Nothing
+        }
+
+        // Keep the item cancellable while looking up its session and track.
+        fn finish(&self, began: &Arc<Began>) -> bool {
+            lock(&self.0)
+                .pop_front_if(|first| Arc::ptr_eq(first, began))
+                .is_some()
         }
     }
 
@@ -467,16 +487,35 @@ mod enabled {
     /// Tells Last.fm what began to play, once it has settled, when
     /// scrobbling is on: once, never kept and never sent again. Returns
     /// how long until a track waiting has settled.
-    pub(crate) fn now_playing_once(core: &Core, lastfm: &Lastfm) -> Option<std::time::Duration> {
-        let began = match lastfm.playing.take(Instant::now()) {
+    pub(crate) fn now_playing_once(
+        core: &Core,
+        lastfm: &Lastfm,
+        now: impl Fn() -> Instant,
+    ) -> Option<std::time::Duration> {
+        let began = match lastfm.playing.next(now()) {
             Taken::Nothing => return None,
             Taken::Wait(wait) => return Some(wait),
             Taken::Show(began) => began,
         };
-        let client = lastfm.client().ok()?;
-        // As a batch of scrobbles is: never as a session that has changed
-        // by the time it is sent, nor while a restored library waits.
-        let _turn = lastfm.turn.batch()?;
+        // A session change and a send take turns, as for a batch of scrobbles.
+        let turn = lastfm.turn.batch();
+        let outgoing = turn
+            .as_ref()
+            .and_then(|_| Some((lastfm.client().ok()?, playing_for(core, &began)?)));
+        if lastfm.playing.finish(&began)
+            && now().saturating_duration_since(began.at) <= STALE
+            && let Some((client, (session, playing))) = outgoing
+        {
+            show(core, client, &session, &playing);
+        }
+        match lastfm.playing.next(now()) {
+            Taken::Nothing => None,
+            Taken::Wait(wait) => Some(wait),
+            Taken::Show(_) => Some(std::time::Duration::ZERO),
+        }
+    }
+
+    fn playing_for(core: &Core, began: &Began) -> Option<(ServiceSession, Playing)> {
         let session = core.with_stores(|stores| stores.server().service_session(SERVICE));
         let Some(Ok(Some(session))) = session else {
             return None;
@@ -509,9 +548,18 @@ mod enabled {
             album: names.album,
             album_artist: names.album_artist,
             track_number: names.track_number.and_then(|n| u32::try_from(n).ok()),
-            duration_ms: Some(began.duration_ms).filter(|ms| *ms > 0),
+            duration_ms: i64::try_from(began.duration_ms).ok().filter(|ms| *ms > 0),
         };
-        match client.now_playing(&SessionKey::new(session.key.expose()), &playing) {
+        Some((session, playing))
+    }
+
+    fn show(
+        core: &Core,
+        client: &ritornel_lastfm::Lastfm,
+        session: &ServiceSession,
+        playing: &Playing,
+    ) {
+        match client.now_playing(&SessionKey::new(session.key.expose()), playing) {
             Ok(()) => debug!("Last.fm is told what is playing"),
             Err(NotShown::SignInAgain(_)) => {
                 warn!("Last.fm refused the session: nothing is scrobbled until a new sign-in");
@@ -527,7 +575,6 @@ mod enabled {
                 debug!(error = %detail, "Last.fm could not be told what is playing");
             }
         }
-        None
     }
 
     /// How often a sync's counters are saved and sent to subscribers.
@@ -1205,7 +1252,7 @@ mod enabled {
 
         use super::{
             Began, DAILY_LIMIT_RETRY_MS, DAILY_LIMIT_WAIT, Instant, JobSink, Lastfm, REFUSED_WAIT,
-            SETTLE, STALE, Sending, Sink, Slot, Taken, UNANSWERED_WAIT, send_due,
+            SETTLE, STALE, Sending, Sink, Slots, Taken, UNANSWERED_WAIT, send_due,
         };
 
         #[test]
@@ -1419,31 +1466,42 @@ mod enabled {
 
         #[test]
         fn of_tracks_skipped_through_only_the_last_is_shown_once_it_settles() {
-            let t0 = std::time::Instant::now();
+            let t0 = Instant::now();
             let ms = std::time::Duration::from_millis;
-            let began = |byte: u8, after: u64| Began {
-                appearance: Id::from_bytes([byte; 16]),
+            let id = |n| Id::from_bytes([n; 16]);
+            let start = |player, appearance, after| Began {
+                player: id(player),
+                appearance: id(appearance),
                 duration_ms: 200_000,
                 at: t0 + ms(after),
             };
-            let slot = Slot::default();
-            assert_eq!(slot.take(t0), Taken::Nothing);
-            // Three in quick succession: the last wins, once it settles.
-            for (byte, after) in [(1, 0), (2, 300), (3, 600)] {
-                slot.put(began(byte, after));
-            }
-            assert_eq!(slot.take(t0 + ms(700)), Taken::Wait(SETTLE - ms(100)));
-            assert_eq!(slot.take(t0 + ms(600) + SETTLE), Taken::Show(began(3, 600)));
-            // Taken once, it is gone.
-            assert_eq!(slot.take(t0 + ms(5_000)), Taken::Nothing);
-            // A pause before it settles lets it go.
-            slot.put(began(4, 0));
-            slot.clear();
-            assert_eq!(slot.take(t0 + SETTLE), Taken::Nothing);
-            // One kept back too long is let go.
-            slot.put(began(5, 0));
-            assert_eq!(slot.take(t0 + STALE + ms(1)), Taken::Nothing);
-            assert_eq!(slot.take(t0 + STALE + ms(2)), Taken::Nothing);
+            let slots = Slots::default();
+            slots.put(start(1, 1, 0));
+            slots.put(start(2, 2, 100));
+            slots.put(start(1, 3, 200));
+            assert_eq!(slots.next(t0 + ms(200)), Taken::Wait(SETTLE - ms(100)));
+            let ready = t0 + SETTLE + ms(300);
+            let Taken::Show(second) = slots.next(ready) else {
+                panic!("second player settled")
+            };
+            assert_eq!(*second, start(2, 2, 100));
+            slots.keep(id(2), None);
+            assert!(!slots.finish(&second));
+            let Taken::Show(first) = slots.next(ready) else {
+                panic!("first player still pending")
+            };
+            // Even a repeat at the same clock tick supersedes metadata being prepared.
+            slots.put(*first);
+            assert!(!slots.finish(&first));
+            let Taken::Show(repeat) = slots.next(ready) else {
+                panic!("repeat settled")
+            };
+            assert_eq!(*repeat, start(1, 3, 200));
+            assert!(slots.finish(&repeat));
+            assert_eq!(slots.next(ready), Taken::Nothing);
+            slots.put(start(1, 4, 0));
+            slots.put(start(2, 5, 100));
+            assert_eq!(slots.next(t0 + STALE + ms(200)), Taken::Nothing);
         }
 
         fn session(key: &str, on: bool) -> ServiceSession {
@@ -1905,7 +1963,7 @@ fn scrobble(core: &Core, stop: &AtomicBool) {
         #[cfg(feature = "lastfm")]
         if let Some(lastfm) = core.lastfm() {
             // First, as it is about now and the rest can wait.
-            if let Some(settling) = now_playing_once(core, lastfm) {
+            if let Some(settling) = now_playing_once(core, lastfm, std::time::Instant::now) {
                 wait = settling;
             }
             import_tick(core, lastfm, first);
