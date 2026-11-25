@@ -299,6 +299,16 @@ impl Render for PlayerBar {
             0.
         };
         let live = on && duration > 0;
+        // While the player waits for its audio (`Buffering`), after a moment
+        // the seek bar's empty part breathes, and after a while the line
+        // under the title says where it is coming from. The clock and the
+        // moving bars hold already: they move only while it plays.
+        let waited = player.buffering();
+        let breath = waited.map_or(0., crate::player::breath);
+        let getting = waited
+            .filter(|waited| *waited >= crate::player::BUFFER_SAY)
+            .map(|_| crate::player::getting_from(player.hub_name()));
+        let breathing = waited.is_some_and(|waited| waited >= crate::player::BUFFER_QUIET);
         // While the sound output isn't working, the words under the title
         // say so in place of the artist, or of the hint with nothing on.
         let trouble = state.as_ref().and_then(|state| {
@@ -318,7 +328,7 @@ impl Render for PlayerBar {
         }
         self.want_cover(track.as_ref().and_then(|track| track.art_id), window, cx);
         crate::covers::flush_dropped(window, cx);
-        let mut animating = false;
+        let mut animating = breathing;
 
         // What is playing: the cover, the words, and the rating in a place
         // of its own at the end, which does not move with the length of a title.
@@ -536,9 +546,18 @@ impl Render for PlayerBar {
                             .flex()
                             .flex_col()
                             .child(div().truncate().font_weight(FontWeight(600.)).child(title))
-                            .map(|words| match trouble {
-                                Some(trouble) => words.children(trouble_lines(trouble)),
-                                None => words.child(
+                            // While it waits, the output is not yet tried
+                            // again: where the audio is coming from is the truer word.
+                            .map(|words| match (trouble, getting) {
+                                (_, Some(getting)) => words.child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(13.))
+                                        .text_color(theme::dim())
+                                        .child(getting),
+                                ),
+                                (Some(trouble), None) => words.children(trouble_lines(trouble)),
+                                (None, None) => words.child(
                                     div()
                                         .truncate()
                                         .text_size(px(13.))
@@ -685,7 +704,7 @@ impl Render for PlayerBar {
                     .h(px(3.))
                     .rounded(px(2.))
                     .overflow_hidden()
-                    .bg(theme::fill2())
+                    .bg(theme::mix(theme::fill2(), theme::faint(), 0.5 * breath))
                     .when(live, |track| {
                         track.child(
                             div()
