@@ -7,6 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Async admission and shared results for the dedicated transcode threads.
+tokio = { version = "1.54.1", features = ["sync", "time", "macros"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 # Private staging for seekable encoder output.
 tempfile = "3.27.0"
 # The public ID type: an ID is what a client sees, so the contract owns it.
@@ -85,6 +88,9 @@ default = ["audio-output"]
 # (macOS, Linux and Windows). Without it, a server can still play into the null
 # output, which discards what it is given.
 audio-output = ["dep:cpal"]
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["rt"] }
 
 [lints]
 workspace = true

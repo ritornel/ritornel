@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::playback::FileFacts;
 
-use super::{AudioAsset, CacheEntry};
+use super::{AudioAsset, CacheEntry, cache::Object};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -133,33 +133,58 @@ impl PackageSource<'_> {
 
 impl Package<'_> {
     pub fn key(&self, source: PackageSource<'_>) -> io::Result<blake3::Hash> {
-        if self.id3v1 && source.codec() != Codec::Mp3 {
+        Ok(self.object(source)?.key)
+    }
+
+    pub(super) fn object(&self, source: PackageSource<'_>) -> io::Result<Object> {
+        let scheme = match source {
+            PackageSource::Master { asset, .. } => Some(asset.scheme),
+            PackageSource::Derivative(_) => None,
+        };
+        self.object_for(
+            source.hash(),
+            scheme,
+            source.codec(),
+            self.artwork.map(|a| blake3::hash(a.bytes)),
+        )
+    }
+
+    pub(super) fn object_for(
+        &self,
+        hash: blake3::Hash,
+        scheme: Option<u32>,
+        codec: Codec,
+        artwork_hash: Option<blake3::Hash>,
+    ) -> io::Result<Object> {
+        if self.id3v1 && codec != Codec::Mp3 {
             return Err(io::Error::other("ID3v1 requires MP3 audio"));
         }
         if self.artwork.is_some_and(|art| art.max_side == 0) {
             return Err(io::Error::other("cover size must be positive"));
         }
-        let scheme = match source {
-            PackageSource::Master { asset, .. } => Some(asset.scheme),
-            PackageSource::Derivative(_) => None,
-        };
         let art = self
             .artwork
-            .map(|art| (blake3::hash(art.bytes).to_hex().to_string(), art.max_side));
+            .zip(artwork_hash)
+            .map(|(art, hash)| (hash.to_hex().to_string(), art.max_side));
         // Version the tag writer, JPEG settings and metadata projection together.
         let bytes = serde_json::to_vec(&(
             "ritornel-package-v1",
             scheme,
-            source.hash().to_hex().as_str(),
-            source.codec(),
+            hash.to_hex().as_str(),
+            codec,
             self.tags,
             art,
             self.id3v1,
         ))?;
-        Ok(blake3::hash(&bytes))
+        Ok(Object::package(blake3::hash(&bytes), codec, hash, scheme))
     }
 
-    pub(super) fn write(&self, source: PackageSource<'_>, staged: &Path) -> io::Result<()> {
+    pub(super) fn write(
+        &self,
+        source: PackageSource<'_>,
+        staged: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<()> {
         let mut input = File::open(source.path())?;
         source.verify(&input)?;
         let codec = source.codec();
@@ -187,7 +212,7 @@ impl Package<'_> {
             Codec::Mp3 | Codec::Flac => crate::media::audio_end(&mut input)?,
             Codec::Opus => input.metadata()?.len(),
         };
-        io::copy(&mut (&mut input).take(end), &mut output)?;
+        super::copy(&mut (&mut input).take(end), &mut output, cancel)?;
         source.verify(&input)?;
         output.rewind()?;
         let mut tag = self.tags.tag(expected.primary_tag_type());
@@ -201,6 +226,7 @@ impl Package<'_> {
                     .build(),
             );
         }
+        super::check_cancel(cancel)?;
         let options = WriteOptions::new()
             .use_id3v23(true)
             .respect_read_only(false);

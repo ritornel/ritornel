@@ -2121,6 +2121,7 @@ dependencies = [
  "blake3",
  "cpal",
  "ed25519-dalek",
+ "futures-util",
  "getrandom 0.4.3",
  "image",
  "jiff",
@@ -2138,6 +2139,7 @@ dependencies = [
  "sha2",
  "symphonia",
  "tempfile",
+ "tokio",
  "unicode-normalization",
 ]
 

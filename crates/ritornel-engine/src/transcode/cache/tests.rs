@@ -335,7 +335,7 @@ fn sampled_hash_uses_each_end_once() {
     use std::io::Write;
     file.write_all(&bytes).unwrap();
     file.rewind().unwrap();
-    let (length, full, sampled) = hashes(&mut file).unwrap();
+    let (length, full, sampled) = hashes(&mut file, &AtomicBool::new(false)).unwrap();
     assert_eq!(length, size as u64);
     assert_eq!(full, blake3::hash(&bytes));
     let mut ends = blake3::Hasher::new();

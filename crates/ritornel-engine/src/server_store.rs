@@ -538,6 +538,10 @@ impl ServerStore {
         })
     }
 
+    pub(crate) fn new_id(&self) -> Result<Id, Error> {
+        new_id(self.clock.now_ms(), &*self.entropy)
+    }
+
     /// Runs a short read on the read-only connection.
     pub(crate) fn read<T>(
         &self,
