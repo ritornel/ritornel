@@ -1,4 +1,5 @@
-//! Linux: everything is the fallback's but the server the app starts.
+//! Linux: everything is the fallback's but the server the app starts and
+//! the accent, which the desktop portal names.
 //!
 //! Closing the window ends the app here, as it does on Linux, and must not
 //! stop what is playing. So the server is not held by a pipe, as the
@@ -28,6 +29,46 @@ pub(crate) use super::fallback::{
 
 /// The server outlives the app.
 pub(crate) const SERVER_APART: bool = true;
+
+/// Where the desktop portal keeps the accent.
+const APPEARANCE: (&str, &str) = ("org.freedesktop.appearance", "accent-color");
+
+/// The accent the desktop names through its portal's settings (GNOME's and
+/// KDE's do), read now and again as it changes. Without a portal, or with
+/// one that has no accent, the app keeps its own, and nothing is said.
+/// The portal is listened to on GPUI's background executor, as GPUI
+/// listens to it for light and dark, until this is let go.
+pub(crate) fn accents(cx: &gpui::App) -> super::Accents {
+    let (sender, readings) = futures::channel::mpsc::unbounded();
+    let listening = cx.background_executor().spawn(async move {
+        // Any failure leaves the accent as it is.
+        let _ = listen(sender).await;
+    });
+    super::Accents::new(readings, listening)
+}
+
+async fn listen(
+    sender: futures::channel::mpsc::UnboundedSender<Option<gpui::Rgba>>,
+) -> ashpd::Result<()> {
+    use futures::StreamExt;
+
+    let settings = ashpd::desktop::settings::Settings::new().await?;
+    let (namespace, key) = APPEARANCE;
+    // Read once listening, so no change is missed between the two.
+    let mut changes = settings
+        .receive_setting_changed_with_args::<(f64, f64, f64)>(namespace, key)
+        .await?;
+    if let Ok(accent) = settings.read(namespace, key).await {
+        let _ = sender.unbounded_send(crate::accent::from_portal(accent));
+    }
+    while let Some(change) = changes.next().await {
+        let accent = change.ok().and_then(crate::accent::from_portal);
+        if sender.unbounded_send(accent).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
 
 /// The mark in a server's environment that says the app started it.
 const MARK: (&str, &str) = ("RITORNEL_STARTED_BY_APP", "1");

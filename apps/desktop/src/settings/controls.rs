@@ -47,11 +47,6 @@ pub(crate) fn folder() -> Rgba {
     theme::mix(theme::dim(), theme::acc(), 0.7)
 }
 
-/// The system's accent, as the switch and the progress bar wear it.
-fn accent() -> Rgba {
-    rgba(0x027affff)
-}
-
 /// A control's label: AppKit's control text.
 fn control_text(enabled: bool) -> Rgba {
     match (theme::dark(), enabled) {
@@ -285,7 +280,7 @@ pub(crate) fn switch_row(
 fn switch(on: bool, enabled: bool, window_active: bool) -> impl IntoElement {
     let dark = theme::dark();
     let track = match (on && window_active, dark) {
-        (true, _) => accent(),
+        (true, _) => theme::system_accent(),
         (false, true) if on => rgba(0x3d3d3dff),
         (false, true) => rgba(0xffffff26),
         (false, false) if on => rgba(0xd9d9d9ff),
@@ -332,7 +327,7 @@ pub(crate) fn progress(id: impl Into<ElementId>, of: Option<(u64, u64)>) -> impl
         .top_0()
         .bottom_0()
         .rounded(px(2.5))
-        .bg(accent());
+        .bg(theme::system_accent());
     let inner = match of {
         Some((done, total)) => {
             let share = if total == 0 {

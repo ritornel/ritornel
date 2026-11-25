@@ -6,6 +6,7 @@
 // prints them only where its output is redirected.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod accent;
 mod album;
 mod artist;
 mod away;
@@ -153,6 +154,20 @@ fn main() {
         // Whatever the system needs set up: on a Mac, reading what a
         // touchpad's scroll says that GPUI does not pass on.
         platform::start();
+        // The accent follows the system's: its first reading before the
+        // first frame where the system gives one at once (and an accent
+        // held for testing even where it gives none), and each change as it
+        // comes, every window drawn again for it.
+        let mut accents = platform::accents(cx);
+        theme::follow_accent(accents.now().flatten());
+        cx.spawn(async move |cx| {
+            while let Some(accent) = accents.next().await {
+                if theme::follow_accent(accent) {
+                    cx.update(|cx| cx.refresh_windows());
+                }
+            }
+        })
+        .detach();
         let link = link::new(args.data_dir.as_deref(), cx);
         // How the app looks, as remembered, for every window to follow.
         cx.set_global(remember::Looks {

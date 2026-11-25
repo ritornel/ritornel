@@ -30,7 +30,7 @@ use mac as system;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-use windows as system;
+use self::windows as system;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -41,7 +41,7 @@ use linux as system;
 use fallback as system;
 
 pub(crate) use system::{
-    CHROME, FEEL, FITTING_SHOWS, KEYS, SERVER_APART, SHOW_FOLDER, bring_forward_quietly,
+    CHROME, FEEL, FITTING_SHOWS, KEYS, SERVER_APART, SHOW_FOLDER, accents, bring_forward_quietly,
     choose_folder, dismiss_menu, fit_window, footprint, forget_main_window, give_back,
     hold_appearance, keep_out_of_the_dock, key_text, locale, main_window, memory_line, pop_up_menu,
     screenshot, scroll_details, settings_dir, start, start_server, started_here, stop_server,
@@ -154,6 +154,45 @@ pub(crate) struct ScrollDetails {
     pub unaccelerated_dy: f32,
     /// Seconds, by the system's steady clock.
     pub timestamp: f64,
+}
+
+/// The accent colour the system names: its first reading, then each
+/// change, for as long as this is held. `None` is no accent, which leaves
+/// the app its own. Readings may be sent from any thread.
+pub(crate) struct Accents {
+    readings: futures::channel::mpsc::UnboundedReceiver<Option<gpui::Rgba>>,
+    /// What watches the system for changes, let go with this.
+    _watch: Box<dyn std::any::Any>,
+}
+
+impl Accents {
+    #[allow(dead_code, reason = "each system makes its own")]
+    fn new(
+        readings: futures::channel::mpsc::UnboundedReceiver<Option<gpui::Rgba>>,
+        watch: impl std::any::Any,
+    ) -> Self {
+        Self {
+            readings,
+            _watch: Box::new(watch),
+        }
+    }
+
+    /// A reading already made, without waiting for one: on a system that
+    /// reads its accent at once, the first, so the first frame has it.
+    pub(crate) fn now(&mut self) -> Option<Option<gpui::Rgba>> {
+        self.readings.try_recv().ok()
+    }
+
+    /// The next reading, or `None` once the system has stopped saying.
+    pub(crate) async fn next(&mut self) -> Option<Option<gpui::Rgba>> {
+        futures::StreamExt::next(&mut self.readings).await
+    }
+}
+
+impl std::fmt::Debug for Accents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Accents").finish_non_exhaustive()
+    }
 }
 
 /// The plain behaviour, for what a system has no code of its own for.
@@ -334,6 +373,12 @@ mod fallback {
             .or_else(|| std::env::var("LANG").ok())?;
         let tag = lang.split('.').next()?.replace('_', "-");
         (!tag.is_empty() && tag != "C" && tag != "POSIX").then_some(tag)
+    }
+
+    /// No accent of the system's: the app keeps its own.
+    pub(crate) fn accents(_cx: &gpui::App) -> super::Accents {
+        let (_, readings) = futures::channel::mpsc::unbounded();
+        super::Accents::new(readings, ())
     }
 
     /// Dresses the window light or dark: nothing here, where the app's

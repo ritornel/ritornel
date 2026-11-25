@@ -4788,6 +4788,7 @@ dependencies = [
 name = "ritornel-desktop-gpui"
 version = "0.1.0"
 dependencies = [
+ "ashpd",
  "block2 0.6.2",
  "futures",
  "gpui-pre",
@@ -4808,6 +4809,7 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "unicode-segmentation",
+ "windows 0.62.2",
  "windows-sys 0.61.2",
 ]
 
