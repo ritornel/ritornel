@@ -6,7 +6,7 @@
 -- that changes here means a migration that has shipped was edited.
 --   0001_server  dcd8fce9c43a2974357d2bcb8f016bde876f16f86ec8437e2786de62803ae0c7
 --   0002_hub_link  dd4608c7904bfdcf0e97bd4fef1a83f0f77051bb90189b6a7e9dccd467984cdb
---   0003_transcode_cache  cb5c28feb5cb870112ef52b06f4ab1795b3a735018039835713c77cf45f1e87a
+--   0003_transcode_cache  6d3ebee8a3899432d24eb529c7e10fa14a0945e4a3259a65d030c64443a44dab
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -212,7 +212,8 @@ CREATE TABLE transcode_entry (
   cache_key TEXT NOT NULL UNIQUE CHECK (length(cache_key) = 64 AND cache_key NOT GLOB '*[^0-9a-f]*'),
   layer TEXT NOT NULL CHECK (layer IN ('derivative', 'packaged')),
   codec TEXT NOT NULL CHECK (codec IN ('mp3', 'opus', 'flac')),
-  source_key TEXT, -- derivative key or master audio hash used to package the file
+  master_scheme INTEGER CHECK (master_scheme IS NULL OR (source_key IS NOT NULL AND master_scheme >= 0)),
+  source_key TEXT CHECK (source_key IS NULL OR (length(source_key) = 64 AND source_key NOT GLOB '*[^0-9a-f]*')), -- derivative key or master audio hash used to package the file
   size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
   file_hash BLOB NOT NULL CHECK (length(file_hash) = 32),
   sampled_hash BLOB NOT NULL CHECK (length(sampled_hash) = 32),
@@ -237,6 +238,6 @@ CREATE INDEX transcode_pin_owner ON transcode_pin(pin_id);
 
 CREATE TABLE transcode_size_hint (
   id INTEGER PRIMARY KEY,
-  cache_key TEXT NOT NULL UNIQUE,
+  cache_key TEXT NOT NULL UNIQUE CHECK (length(cache_key) = 64 AND cache_key NOT GLOB '*[^0-9a-f]*'),
   size_bytes INTEGER NOT NULL CHECK (size_bytes > 0)
 ) STRICT;

@@ -57,6 +57,7 @@ struct Object {
     layer: Layer,
     codec: Codec,
     source: Option<blake3::Hash>,
+    master_scheme: Option<u32>,
 }
 
 impl Object {
@@ -111,18 +112,14 @@ impl TranscodeCache {
         }
         for entry in fs::read_dir(root.join("tmp")).map_err(Error::Io)? {
             let entry = entry.map_err(Error::Io)?;
-            if entry.path().extension().is_none_or(|ext| ext != "part") {
-                continue;
-            }
             if entry.file_type().map_err(Error::Io)?.is_dir()
+                && entry.path().extension().is_some_and(|ext| ext == "part")
                 && entry
                     .file_name()
                     .to_string_lossy()
                     .starts_with("transcode-")
             {
                 fs::remove_dir_all(entry.path()).map_err(Error::Io)?;
-            } else if entry.file_type().map_err(Error::Io)?.is_file() {
-                fs::remove_file(entry.path()).map_err(Error::Io)?;
             }
         }
         let cache = Self {
@@ -181,7 +178,7 @@ impl TranscodeCache {
         store: &ServerStore,
         spec: Derivative<'_>,
         pin: Pin,
-        produce: impl FnOnce(&Path) -> io::Result<()>,
+        produce: impl FnOnce(&Path, blake3::Hash) -> io::Result<()>,
     ) -> Result<CacheEntry, Error> {
         let codec = match spec.profile.target {
             Target::Mp3 { .. } => Codec::Mp3,
@@ -201,9 +198,10 @@ impl TranscodeCache {
                 layer: Layer::Derivative,
                 codec,
                 source: None,
+                master_scheme: None,
             },
             pin,
-            produce,
+            |path| produce(path, key),
         )
     }
 
@@ -229,6 +227,10 @@ impl TranscodeCache {
                 layer: Layer::Packaged,
                 codec: source.codec(),
                 source: Some(source.hash()),
+                master_scheme: match source {
+                    PackageSource::Master { asset, .. } => Some(asset.scheme),
+                    _ => None,
+                },
             },
             pin,
             |path| package.write(source, path),
@@ -275,26 +277,38 @@ impl TranscodeCache {
             if let Some(hit) = hit(tx, now, boot, pin, object, &path)? {
                 return Ok(hit);
             }
-            let parent = path.parent().ok_or(Error::Invalid("missing cache parent"))?;
+            let parent = path
+                .parent()
+                .ok_or(Error::Invalid("missing cache parent"))?;
             ensure_directory(parent)?;
             fs::rename(&part, &path).map_err(Error::Io)?;
             let key = object.key.to_hex().to_string();
             tx.execute(
                 "INSERT INTO transcode_entry
-                 (cache_key, layer, codec, source_key, size_bytes, file_hash, sampled_hash, created_at_ms, last_used_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-                params![key, object.layer.name(), object.codec.extension(),
-                    object.source.map(|hash| hash.to_hex().to_string()), sql_size,
-                    file_hash.as_bytes(), sampled_hash.as_bytes(), now],
+                 (cache_key, layer, codec, source_key, master_scheme, size_bytes,
+                  file_hash, sampled_hash, created_at_ms, last_used_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                params![
+                    key,
+                    object.layer.name(),
+                    object.codec.extension(),
+                    object.source.map(|hash| hash.to_hex().to_string()),
+                    object.master_scheme,
+                    sql_size,
+                    file_hash.as_bytes(),
+                    sampled_hash.as_bytes(),
+                    now,
+                ],
             )?;
             hold(tx, tx.last_insert_rowid(), boot, pin, now)?;
-            tx.execute(
-                "INSERT INTO transcode_size_hint (cache_key, size_bytes) VALUES (?1, ?2)
-                 ON CONFLICT(cache_key) DO UPDATE SET size_bytes = excluded.size_bytes",
-                params![key, sql_size],
-            )?;
             prune(tx, &root, budget)?;
-            Ok(CacheEntry {object, path, size_bytes, file_hash, sampled_hash})
+            Ok(CacheEntry {
+                object,
+                path,
+                size_bytes,
+                file_hash,
+                sampled_hash,
+            })
         })
     }
 
@@ -315,7 +329,8 @@ impl TranscodeCache {
         store.read(|db| {
             Ok(db
                 .query_row(
-                    "SELECT size_bytes FROM transcode_size_hint WHERE cache_key=?1",
+                    "SELECT size_bytes FROM transcode_entry WHERE cache_key=?1
+                     UNION ALL SELECT size_bytes FROM transcode_size_hint WHERE cache_key=?1 LIMIT 1",
                     [key.to_hex().as_str()],
                     |row| size_column(row, 0),
                 )
@@ -461,6 +476,7 @@ impl IndexedFile {
             layer,
             codec,
             source: None,
+            master_scheme: None,
         }
         .path(root))
     }
@@ -475,6 +491,7 @@ fn prune(tx: &Transaction<'_>, root: &Path, budget: u64) -> Result<(), Error> {
     if total <= budget {
         return Ok(());
     }
+    // The index orders 'packaged' ahead of 'derivative' within this closed enum.
     let mut oldest = tx.prepare(
         "SELECT id, cache_key, layer, codec, size_bytes FROM transcode_entry e
          WHERE NOT EXISTS (SELECT 1 FROM transcode_pin p WHERE p.entry_id = e.id)
@@ -489,6 +506,19 @@ fn prune(tx: &Transaction<'_>, root: &Path, budget: u64) -> Result<(), Error> {
             _ => {}
         }
         tx.execute("DELETE FROM transcode_entry WHERE id=?1", [row.id])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO transcode_size_hint (cache_key, size_bytes) VALUES (?1, ?2)",
+            params![
+                row.key,
+                i64::try_from(row.size).map_err(|_| Error::Corrupt("invalid cached size"))?
+            ],
+        )?;
+        // REPLACE assigns a fresh rowid, so the rowid window bounds both
+        // history and the cost of dropping old hints.
+        tx.execute(
+            "DELETE FROM transcode_size_hint WHERE id <= last_insert_rowid() - 65536",
+            [],
+        )?;
         total -= row.size;
     }
     Ok(())

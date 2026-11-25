@@ -1,5 +1,6 @@
 -- Machine-local files and the runs using them. See "Transcode cache" in
--- docs/internals/server.md.
+-- docs/internals/server.md. Once shipped, this migration is immutable.
+-- The server verifies its checksum before opening the database.
 
 -- [media|rebuildable] One completely published file. Its content key,
 -- layer and codec determine its relative path in the cache.
@@ -8,7 +9,8 @@ CREATE TABLE transcode_entry (
   cache_key TEXT NOT NULL UNIQUE CHECK (length(cache_key) = 64 AND cache_key NOT GLOB '*[^0-9a-f]*'),
   layer TEXT NOT NULL CHECK (layer IN ('derivative', 'packaged')),
   codec TEXT NOT NULL CHECK (codec IN ('mp3', 'opus', 'flac')),
-  source_key TEXT, -- derivative key or master audio hash used to package the file
+  master_scheme INTEGER CHECK (master_scheme IS NULL OR (source_key IS NOT NULL AND master_scheme >= 0)),
+  source_key TEXT CHECK (source_key IS NULL OR (length(source_key) = 64 AND source_key NOT GLOB '*[^0-9a-f]*')), -- derivative key or master audio hash used to package the file
   size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
   file_hash BLOB NOT NULL CHECK (length(file_hash) = 32),
   sampled_hash BLOB NOT NULL CHECK (length(sampled_hash) = 32),
@@ -33,6 +35,6 @@ CREATE INDEX transcode_pin_owner ON transcode_pin(pin_id);
 -- [media|rebuildable] The last exact length survives eviction.
 CREATE TABLE transcode_size_hint (
   id INTEGER PRIMARY KEY,
-  cache_key TEXT NOT NULL UNIQUE,
+  cache_key TEXT NOT NULL UNIQUE CHECK (length(cache_key) = 64 AND cache_key NOT GLOB '*[^0-9a-f]*'),
   size_bytes INTEGER NOT NULL CHECK (size_bytes > 0)
 ) STRICT;

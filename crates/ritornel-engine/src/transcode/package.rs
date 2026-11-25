@@ -2,13 +2,14 @@
 
 use lofty::config::WriteOptions;
 use lofty::file::FileType;
+use lofty::id3::v2::Id3v2Tag;
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::{Accessor, ItemKey, TagExt};
 use lofty::probe::Probe;
 use lofty::tag::{Tag, TagType};
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek};
+use std::io::{self, Read, Seek};
 use std::path::Path;
 
 use crate::playback::FileFacts;
@@ -84,6 +85,7 @@ pub struct Artwork<'a> {
 #[derive(Debug)]
 pub struct Package<'a> {
     pub tags: &'a Tags,
+    /// A supplied cover must decode successfully for this package to be published.
     pub artwork: Option<Artwork<'a>>,
     /// Also write an ID3v1 trailer for older MP3 players.
     pub id3v1: bool,
@@ -179,7 +181,13 @@ impl Package<'_> {
             .write(true)
             .create_new(true)
             .open(staged)?;
-        io::copy(&mut input, &mut output)?;
+        // Trailing ID3v1, APE or lyrics may exist even on FLAC masters.
+        // The projection owns these tags. Copy only through the audio end.
+        let end = match codec {
+            Codec::Mp3 | Codec::Flac => crate::media::audio_end(&mut input)?,
+            Codec::Opus => input.metadata()?.len(),
+        };
+        io::copy(&mut (&mut input).take(end), &mut output)?;
         source.verify(&input)?;
         output.rewind()?;
         let mut tag = self.tags.tag(expected.primary_tag_type());
@@ -196,8 +204,20 @@ impl Package<'_> {
         let options = WriteOptions::new()
             .use_id3v23(true)
             .respect_read_only(false);
-        tag.save_to(&mut output, options.remove_others(true))
-            .map_err(io::Error::other)?;
+        if codec == Codec::Mp3 {
+            // Conversion groups fields by frame ID in a hash map. The projection
+            // has at most one frame per ID, so sorting makes rebuilds byte-stable.
+            let mut frames: Vec<_> = Id3v2Tag::from(tag).into_iter().collect();
+            frames.sort_unstable_by(|a, b| a.id().as_str().cmp(b.id().as_str()));
+            let mut ordered = Id3v2Tag::new();
+            for frame in frames {
+                ordered.insert(frame);
+            }
+            ordered.save_to(&mut output, options.remove_others(true))
+        } else {
+            tag.save_to(&mut output, options.remove_others(true))
+        }
+        .map_err(io::Error::other)?;
         if self.id3v1 {
             output.rewind()?;
             self.tags

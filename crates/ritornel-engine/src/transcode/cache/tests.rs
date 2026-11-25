@@ -51,14 +51,17 @@ fn store() -> ServerStore {
 fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
     let dir = tempfile::tempdir().unwrap();
     let db = store();
-    let cache = TranscodeCache::open(&db, dir.path(), pin(1).id, u64::MAX).unwrap();
+    let cache = TranscodeCache::open(&db, dir.path(), pin(1).id, 0).unwrap();
     let cover = picture(221);
     let tags = Tags {
-        title: Some("Cloud Orchard".into()),
+        title: Some("Cloud Orchard 雪".into()),
         artist: Some("Invented Trio".into()),
         album: Some("Winter Branches".into()),
         track: Some(9),
-        ..Tags::default()
+        album_artist: Some("Winter Trio".into()),
+        disc: Some(2),
+        year: Some(2024),
+        genre: Some("Folk".into()),
     };
     for codec in [Codec::Flac, Codec::Mp3, Codec::Opus] {
         let master = fixture(codec);
@@ -84,10 +87,20 @@ fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
         let entry = cache.package(&db, source, &package, pin(2)).unwrap();
         let parsed = lofty::read_from_path(entry.path()).unwrap();
         let tag = parsed.primary_tag().unwrap();
-        assert_eq!(tag.title().as_deref(), Some("Cloud Orchard"));
+        assert_eq!(tag.title().as_deref(), Some("Cloud Orchard 雪"));
         assert_eq!(tag.artist().as_deref(), Some("Invented Trio"));
         assert_eq!(tag.album().as_deref(), Some("Winter Branches"));
         assert_eq!(tag.track(), Some(9));
+        assert_eq!(tag.disk(), Some(2));
+        assert_eq!(tag.genre().as_deref(), Some("Folk"));
+        assert_eq!(
+            tag.get_string(lofty::tag::ItemKey::AlbumArtist),
+            Some("Winter Trio")
+        );
+        assert_eq!(
+            tag.get_string(lofty::tag::ItemKey::RecordingDate),
+            Some("2024")
+        );
         assert_eq!(tag.pictures().len(), 1);
         let data = tag.pictures()[0].data();
         assert!(data.starts_with(&[0xff, 0xd8]) && data.windows(2).any(|m| m == [0xff, 0xc0]));
@@ -95,7 +108,7 @@ fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
         if codec == Codec::Mp3 {
             assert_eq!(
                 parsed.tag(TagType::Id3v1).unwrap().title().as_deref(),
-                Some("Cloud Orchard")
+                Some("Cloud Orchard ?")
             );
         }
         assert_eq!(audio_hash(entry.path()), audio);
@@ -104,6 +117,23 @@ fn all_three_formats_round_trip_projected_tags_and_baseline_front_cover() {
         assert_eq!(entry.size_bytes, bytes.len() as u64);
         assert_eq!(entry.file_hash, blake3::hash(&bytes));
         assert_eq!(entry.sampled_hash, entry.file_hash);
+        cache.release(&db, pin(2).id).unwrap();
+        assert!(!entry.path().exists());
+        let rebuilt = cache.package(&db, source, &package, pin(2)).unwrap();
+        assert_eq!(
+            fs::read(rebuilt.path()).unwrap(),
+            bytes,
+            "{codec:?} rebuild"
+        );
+        let bad_art = Package {
+            tags: &tags,
+            artwork: Some(Artwork {
+                bytes: b"invalid",
+                max_side: 10,
+            }),
+            id3v1: false,
+        };
+        assert!(cache.package(&db, source, &bad_art, pin(3)).is_err());
         let removed = Package {
             tags: &Tags::default(),
             artwork: None,
@@ -146,7 +176,7 @@ fn retag_and_cover_changes_reuse_audio_and_hits_only_touch_the_index() {
     let cache = TranscodeCache::open(&db, dir.path(), pin(1).id, u64::MAX).unwrap();
     let id = encoder();
     let original = cache
-        .derivative(&db, spec(&id, 1), pin(2), |out| {
+        .derivative(&db, spec(&id, 1), pin(2), |out, _| {
             fs::copy(fixture(Codec::Mp3), out).map(|_| ())
         })
         .unwrap();
@@ -159,7 +189,7 @@ fn retag_and_cover_changes_reuse_audio_and_hits_only_touch_the_index() {
         ("Two", 10, 10),
     ] {
         let derivative = cache
-            .derivative(&db, spec(&id, 1), pin(3), |_| {
+            .derivative(&db, spec(&id, 1), pin(3), |_, _| {
                 panic!("cache hit encoded again")
             })
             .unwrap();
@@ -203,7 +233,7 @@ fn eviction_favors_derivatives_over_packages_and_respects_every_pin() {
     let mut cache = TranscodeCache::open(&db, temp.path(), pin(1).id, u64::MAX).unwrap();
     let id = encoder();
     let base = cache
-        .derivative(&db, spec(&id, 1), pin(2), |p| {
+        .derivative(&db, spec(&id, 1), pin(2), |p, _| {
             fs::copy(fixture(Codec::Mp3), p).map(|_| ())
         })
         .unwrap();
@@ -220,7 +250,7 @@ fn eviction_favors_derivatives_over_packages_and_respects_every_pin() {
         .package(&db, PackageSource::Derivative(&base), &package, pin(3))
         .unwrap();
     cache
-        .derivative(&db, spec(&id, 1), pin(4), |_| panic!())
+        .derivative(&db, spec(&id, 1), pin(4), |_, _| panic!())
         .unwrap();
     cache.release(&db, pin(2).id).unwrap();
     cache.release(&db, pin(3).id).unwrap();
@@ -235,7 +265,7 @@ fn eviction_favors_derivatives_over_packages_and_respects_every_pin() {
     cache.budget = 0;
     for n in [5, 6] {
         cache
-            .derivative(&db, spec(&id, 1), pin(n), |_| panic!())
+            .derivative(&db, spec(&id, 1), pin(n), |_, _| panic!())
             .unwrap();
     }
     cache.release(&db, pin(5).id).unwrap();
@@ -252,7 +282,7 @@ fn failed_production_and_restart_clear_partials_orphans_missing_rows_and_old_pin
     let id = encoder();
     assert!(
         cache
-            .derivative(&db, spec(&id, 1), pin(2), |p| {
+            .derivative(&db, spec(&id, 1), pin(2), |p, _| {
                 fs::write(p, b"incomplete")?;
                 Err(io::Error::other("encoder failed"))
             })
@@ -260,10 +290,10 @@ fn failed_production_and_restart_clear_partials_orphans_missing_rows_and_old_pin
     );
     assert_eq!(temp.path().join("tmp").read_dir().unwrap().count(), 0);
     let entry = cache
-        .derivative(&db, spec(&id, 1), pin(2), |p| fs::write(p, b"pinned"))
+        .derivative(&db, spec(&id, 1), pin(2), |p, _| fs::write(p, b"pinned"))
         .unwrap();
     let missing = cache
-        .derivative(&db, spec(&id, 2), pin(2), |p| fs::write(p, b"missing"))
+        .derivative(&db, spec(&id, 2), pin(2), |p, _| fs::write(p, b"missing"))
         .unwrap();
     fs::remove_file(missing.path()).unwrap();
     let orphan = temp
@@ -278,10 +308,10 @@ fn failed_production_and_restart_clear_partials_orphans_missing_rows_and_old_pin
     let loose = temp.path().join("tmp/lost.part");
     fs::write(&loose, b"part").unwrap();
     TranscodeCache::open(&db, temp.path(), pin(3).id, 0).unwrap();
+    assert!([entry.path(), &stale, &orphan].iter().all(|p| !p.exists()));
     assert!(
-        [entry.path(), &stale, &loose, &orphan]
-            .iter()
-            .all(|p| !p.exists())
+        loose.exists(),
+        "the cover cache owns its loose staging files"
     );
     let count = db
         .read(|c| {
@@ -324,7 +354,7 @@ fn a_hit_protects_the_recently_used_derivative_at_eviction() {
     let id = encoder();
     let build = |n| {
         cache
-            .derivative(&db, spec(&id, n), pin(2), |path| fs::write(path, [n]))
+            .derivative(&db, spec(&id, n), pin(2), |path, _| fs::write(path, [n]))
             .unwrap()
     };
     let first = build(1);
@@ -334,7 +364,7 @@ fn a_hit_protects_the_recently_used_derivative_at_eviction() {
     cache.release(&db, pin(2).id).unwrap();
     clock.set(30);
     cache
-        .derivative(&db, spec(&id, 1), pin(2), |_| panic!())
+        .derivative(&db, spec(&id, 1), pin(2), |_, _| panic!())
         .unwrap();
     cache.release(&db, pin(2).id).unwrap();
     clock.set(40);
@@ -352,7 +382,7 @@ fn competing_producers_return_the_same_published_bytes_and_both_hold_pins() {
     let ready = std::sync::Barrier::new(2);
     let produce = |n| {
         cache
-            .derivative(&db, spec(&id, 1), pin(n), |path| {
+            .derivative(&db, spec(&id, 1), pin(n), |path, _| {
                 fs::write(path, [n])?;
                 ready.wait();
                 Ok(())

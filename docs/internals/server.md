@@ -99,7 +99,7 @@ Each database copy runs `VACUUM INTO` on its own read-only SQLite connection (`c
 
 A producer works in a private `.part` directory under `cache/tmp/`. It finishes and syncs the file before the cache writer renames it and records its exact byte count, full BLAKE3 digest and sampled digest. The sample covers up to one MiB at each end, hashing overlapping bytes only once. The index and pins live in `server.db`. Opening the cache under the data-directory lock removes abandoned staging files and pins from previous runs, forgets missing files, and removes unindexed files left by an interrupted publication.
 
-A hit updates the index and acquires the caller’s pin in one transaction. The cache leaves file modification times alone. Above its byte budget (10 GiB by default), it removes unpinned packages first, then unpinned derivatives, in least-recently-used order within each layer. Releasing a pin retries eviction. An exact size hint survives eviction.
+A hit updates the index and acquires the caller’s pin in one transaction. The cache leaves file modification times alone. Above its byte budget (10 GiB by default), it removes unpinned packages first, then unpinned derivatives, in least-recently-used order within each layer. Releasing a pin retries eviction. The byte budget applies separately from `cacheBytes`, which covers pulled masters. The cache keeps the last measured size for up to 65,536 recently evicted keys.
 
 ## Storage split
 

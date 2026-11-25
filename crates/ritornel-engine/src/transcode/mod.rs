@@ -136,10 +136,12 @@ impl EncoderId {
 pub trait Encoder: Send + Sync {
     fn probe(&self) -> io::Result<Option<EncoderId>>;
     fn supports(&self, profile: Profile) -> bool;
+    /// Encode one file using its derivative key for reproducible container framing.
     fn encode(
         &self,
         pcm: Pcm,
         profile: Profile,
+        key: blake3::Hash,
         output: &Path,
         cancel: &AtomicBool,
     ) -> io::Result<()>;
@@ -165,6 +167,7 @@ impl Encoder for FakeEncoder {
         &self,
         pcm: Pcm,
         profile: Profile,
+        _key: blake3::Hash,
         output: &Path,
         cancel: &AtomicBool,
     ) -> io::Result<()> {

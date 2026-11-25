@@ -85,7 +85,13 @@ fn fake_encoding_and_key_track_the_inputs_and_preserve_existing_files() {
     let path = dir.path().join("encoded");
     let encode = |p| {
         FakeEncoder
-            .encode(pcm(), p, &path, &AtomicBool::new(false))
+            .encode(
+                pcm(),
+                p,
+                blake3::hash(b"test"),
+                &path,
+                &AtomicBool::new(false),
+            )
             .unwrap();
         let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
@@ -111,7 +117,13 @@ fn fake_encoding_and_key_track_the_inputs_and_preserve_existing_files() {
     );
     assert_eq!(
         FakeEncoder
-            .encode(pcm(), mp3(), &path, &AtomicBool::new(true))
+            .encode(
+                pcm(),
+                mp3(),
+                blake3::hash(b"test"),
+                &path,
+                &AtomicBool::new(true)
+            )
             .unwrap_err()
             .kind(),
         io::ErrorKind::Interrupted
@@ -120,7 +132,13 @@ fn fake_encoding_and_key_track_the_inputs_and_preserve_existing_files() {
     std::fs::write(&path, b"master").unwrap();
     assert!(
         FakeEncoder
-            .encode(pcm(), mp3(), &path, &AtomicBool::new(false))
+            .encode(
+                pcm(),
+                mp3(),
+                blake3::hash(b"test"),
+                &path,
+                &AtomicBool::new(false)
+            )
             .is_err()
     );
     assert_eq!(std::fs::read(path).unwrap(), b"master");
@@ -238,7 +256,13 @@ fn installed_encoders_write_gapless_audio() {
         ] {
             let path = dir.path().join(format!("encoded.{suffix}"));
             backend
-                .encode(input, profile, &path, &AtomicBool::new(false))
+                .encode(
+                    input,
+                    profile,
+                    blake3::hash(b"test"),
+                    &path,
+                    &AtomicBool::new(false),
+                )
                 .unwrap();
             let bytes = std::fs::read(&path).unwrap();
             if suffix == "mp3" {
@@ -261,7 +285,25 @@ fn installed_encoders_write_gapless_audio() {
                 let granule = u64::from_le_bytes(bytes[last + 6..last + 14].try_into().unwrap());
                 assert_eq!(granule - u64::from(skip), u64::from(ms) * 48);
             }
-            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            if suffix == "opus" {
+                let input = if channels == 1 {
+                    pcm()
+                } else {
+                    Pcm::open(&stereo, None).unwrap()
+                };
+                backend
+                    .encode(
+                        input,
+                        profile,
+                        blake3::hash(b"test"),
+                        &path,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                assert_eq!(bytes, std::fs::read(&path).unwrap());
+                std::fs::remove_file(path).unwrap();
+            }
         }
     }
 }
