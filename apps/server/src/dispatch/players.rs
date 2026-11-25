@@ -272,12 +272,13 @@ impl Core {
             RpcError::new(ErrorCode::Forbidden, "link.event needs a satellite link")
         })?;
         let peers = lock(&self.players.peers);
-        let _presence = peers
+        #[cfg_attr(not(feature = "lastfm"), allow(unused_variables))]
+        let presence = peers
             .get(&peer)
             .filter(|p| p.is_current(session))
             .ok_or_else(stale)?;
         #[cfg(feature = "lastfm")]
-        if !_presence.sends_now_playing {
+        if !presence.sends_now_playing {
             self.observe_now_playing(peer, &report);
         }
         // Order publication against replacement so a stale socket cannot publish after its successor.
@@ -419,7 +420,7 @@ impl Core {
         {
             p.sends_now_playing = presence.sends_now_playing;
             if let Some(lastfm) = self.lastfm() {
-                lastfm.still_playing(peer, None);
+                lastfm.cancel_now_playing(peer);
             }
         }
         p.newest_session = session.id();
@@ -451,7 +452,7 @@ impl Core {
         {
             #[cfg(feature = "lastfm")]
             if let Some(lastfm) = self.lastfm() {
-                lastfm.still_playing(peer, None);
+                lastfm.cancel_now_playing(peer);
             }
             p.since_ms = self.clock.now_ms();
             p.summary = None;

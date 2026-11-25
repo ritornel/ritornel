@@ -11,7 +11,7 @@ use ritornel_lastfm::fake::FakeLastfm;
 use serde_json::{Value, json};
 
 use super::{Core, Scratch, Session, SetClock, T0, call, hello, key, server_at};
-use crate::lastfm::now_playing_once;
+use crate::lastfm::show_settled;
 
 struct Hub {
     core: Core,
@@ -120,7 +120,7 @@ impl Hub {
 
     fn settle(&self) {
         let settled = Instant::now() + Duration::from_secs(2);
-        while now_playing_once(&self.core, self.core.lastfm().unwrap(), || settled).is_some() {}
+        assert!(show_settled(&self.core, self.core.lastfm().unwrap(), || settled).is_none());
     }
 
     fn titles(&self) -> Vec<String> {
@@ -143,6 +143,8 @@ fn the_hub_sends_in_start_order_and_cancels_only_the_affected_player() {
     let second = h.songs[1]["title"].as_str().unwrap();
     h.began(&a, 0);
     h.began(&b, 1);
+    h.settle();
+    assert_eq!(h.titles(), [first, second]);
     h.settle();
     assert_eq!(h.titles(), [first, second]);
     let sent = &h.fake.now_playing()[0];
@@ -225,4 +227,41 @@ fn a_satellite_start_requires_an_enabled_session_and_a_restored_library_must_imp
     h.settle();
     assert_eq!(h.titles(), [h.songs[1]["title"].as_str().unwrap()]);
     assert!(h.fake.scrobbled().is_empty());
+}
+
+#[test]
+fn a_start_waits_through_a_busy_session_but_buffering_sign_out_and_refusal_suppress_it() {
+    use ritornel_lastfm::fake::SESSION_KEY;
+    let h = Hub::new();
+    h.sign_in();
+    h.switch(6, true);
+    let desk = h.peer(10, false);
+    let lastfm = h.core.lastfm().unwrap();
+    h.began(&desk, 0);
+    let change = lastfm.hold();
+    let settled = Instant::now() + Duration::from_secs(2);
+    assert!(show_settled(&h.core, lastfm, || settled).is_some());
+    assert!(h.titles().is_empty());
+    drop(change);
+    h.settle();
+    assert_eq!(h.titles().len(), 1);
+    h.began(&desk, 0);
+    h.state(&desk, "buffering", Some(0));
+    h.settle();
+    h.began(&desk, 0);
+    call(&h.core, &h.cli, "lastfm.signOut", key(12)).unwrap();
+    h.settle();
+    h.sign_in();
+    h.switch(13, true);
+    h.began(&desk, 1);
+    h.core
+        .with_stores(|stores| {
+            stores
+                .server()
+                .refuse_service_session("lastfm", SESSION_KEY)
+                .unwrap()
+        })
+        .unwrap();
+    h.settle();
+    assert_eq!(h.titles().len(), 1);
 }

@@ -200,6 +200,7 @@ impl Lastfm {
         self.wake.wake();
     }
 
+    /// Keeps a pending start only while the player is still on that appearance.
     #[cfg(feature = "lastfm")]
     pub(crate) fn still_playing(
         &self,
@@ -209,6 +210,13 @@ impl Lastfm {
         self.playing.keep(player, appearance);
     }
 
+    /// A presence connection ended or was replaced.
+    #[cfg(feature = "lastfm")]
+    pub(crate) fn cancel_now_playing(&self, player: ritornel_contract::Id) {
+        self.playing.keep(player, None);
+    }
+
+    /// Drops every start made under the old account or scrobbling setting.
     #[cfg(feature = "lastfm")]
     pub(crate) fn forget_now_playing(&self) {
         self.playing.clear_all();
@@ -478,40 +486,37 @@ mod enabled {
             (!waiting()).then_some(held)
         }
 
-        #[cfg(test)]
         fn changing(&self) -> bool {
             self.changes.load(Ordering::SeqCst) > 0
         }
     }
 
-    /// Tells Last.fm what began to play, once it has settled, when
-    /// scrobbling is on: once, never kept and never sent again. Returns
-    /// how long until a track waiting has settled.
-    pub(crate) fn now_playing_once(
+    /// Sends each settled start in arrival order. Returns the time until the
+    /// next start settles, or until a busy account can be checked again.
+    pub(crate) fn show_settled(
         core: &Core,
         lastfm: &Lastfm,
         now: impl Fn() -> Instant,
     ) -> Option<std::time::Duration> {
-        let began = match lastfm.playing.next(now()) {
-            Taken::Nothing => return None,
-            Taken::Wait(wait) => return Some(wait),
-            Taken::Show(began) => began,
-        };
-        // A session change and a send take turns, as for a batch of scrobbles.
-        let turn = lastfm.turn.batch();
-        let outgoing = turn
-            .as_ref()
-            .and_then(|_| Some((lastfm.client().ok()?, playing_for(core, &began)?)));
-        if lastfm.playing.finish(&began)
-            && now().saturating_duration_since(began.at) <= STALE
-            && let Some((client, (session, playing))) = outgoing
-        {
-            show(core, client, &session, &playing);
-        }
-        match lastfm.playing.next(now()) {
-            Taken::Nothing => None,
-            Taken::Wait(wait) => Some(wait),
-            Taken::Show(_) => Some(std::time::Duration::ZERO),
+        loop {
+            let began = match lastfm.playing.next(now()) {
+                Taken::Nothing => return None,
+                Taken::Wait(wait) => return Some(wait),
+                Taken::Show(began) => began,
+            };
+            // A real change clears the old starts. A replay may leave them pending.
+            let Some(_turn) = lastfm.turn.batch() else {
+                return Some(SETTLE);
+            };
+            let outgoing = lastfm.client().ok().and_then(|client| {
+                playing_for(core, &began).map(|(session, playing)| (client, session, playing))
+            });
+            if lastfm.playing.finish(&began)
+                && now().saturating_duration_since(began.at) <= STALE
+                && let Some((client, session, playing)) = outgoing
+            {
+                show(core, client, &session, &playing);
+            }
         }
     }
 
@@ -996,7 +1001,19 @@ mod enabled {
                 Some(Ok(session)) => session,
                 _ => None,
             },
-            stopping: &|| stop.load(Ordering::SeqCst),
+            stopping: &|| {
+                if stop.load(Ordering::SeqCst) {
+                    return true;
+                }
+                // Give starts that settled during a backlog the next turn between batches.
+                if !lastfm.turn.changing()
+                    && matches!(lastfm.playing.next(Instant::now()), Taken::Show(_))
+                {
+                    lastfm.wake();
+                    return true;
+                }
+                false
+            },
             held: &|account| match core.with_library(|_, library| library.held_for_import(account))
             {
                 Some(Ok(held)) => held.is_some(),
@@ -1963,7 +1980,7 @@ fn scrobble(core: &Core, stop: &AtomicBool) {
         #[cfg(feature = "lastfm")]
         if let Some(lastfm) = core.lastfm() {
             // First, as it is about now and the rest can wait.
-            if let Some(settling) = now_playing_once(core, lastfm, std::time::Instant::now) {
+            if let Some(settling) = show_settled(core, lastfm, std::time::Instant::now) {
                 wait = settling;
             }
             import_tick(core, lastfm, first);

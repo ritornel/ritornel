@@ -3468,9 +3468,19 @@ async fn a_move_to_a_satellite_and_repeat_one_each_show_a_new_now_playing() {
         let folder = scratch.data_dir("music");
         std::fs::create_dir_all(&folder).unwrap();
         tone::write_aiff(&folder.join("01.aiff"), "Paper Kites", "1", 440.0, 40);
+        tone::write_aiff(&folder.join("02.aiff"), "River Stones", "2", 660.0, 40);
         scan_folder(&mut h, &folder).await;
-        let Row::Song(tone) = h.list_open(&songs()).await.unwrap().rows.remove(0) else {
-            panic!("expected a song")
+        let tracks = h.list_open(&songs()).await.unwrap().rows;
+        let appearance = |title| {
+            tracks
+                .iter()
+                .find_map(|row| match row {
+                    Row::Song(song) if song.title.as_deref() == Some(title) => {
+                        Some(song.appearance_id)
+                    }
+                    _ => None,
+                })
+                .unwrap()
         };
         fake.approve_after(0);
         let login = h.call_raw("lastfm.signInStart", json!({})).await.unwrap();
@@ -3487,7 +3497,7 @@ async fn a_move_to_a_satellite_and_repeat_one_each_show_a_new_now_playing() {
         join(&d, &invite(&hub, &h).await).await.unwrap();
         wait_for_player(&mut h, desk.server_id()).await;
 
-        let state = move_track(&h, tone.appearance_id).await;
+        let state = move_track(&h, appearance("Paper Kites")).await;
         h.call_raw(
             "playback.set",
             json!({"idempotencyKey": key(), "repeat": "one"}),
@@ -3505,8 +3515,19 @@ async fn a_move_to_a_satellite_and_repeat_one_each_show_a_new_now_playing() {
             json!({"idempotencyKey": key(), "entryId": state["entryId"], "positionMs": 39_950});
         d.call_raw("playback.seek", near_end).await.unwrap();
         shown(&fake, 3).await;
-        for fields in fake.now_playing() {
-            assert_eq!(fields["track"], "Paper Kites");
+        // A later settled start on the hub gives the sender a chance to deliver
+        // any extra report from the move or repeat before the final assertion.
+        move_track(&h, appearance("River Stones")).await;
+        shown(&fake, 4).await;
+        let updates = fake.now_playing();
+        assert_eq!(
+            updates
+                .iter()
+                .map(|p| p["track"].as_str())
+                .collect::<Vec<_>>(),
+            ["Paper Kites", "Paper Kites", "Paper Kites", "River Stones"]
+        );
+        for fields in updates {
             assert_eq!(fields["artist"], "Invented Artist");
             assert_eq!(fields["album"], "Invented Album");
             assert_eq!(fields["duration"], "40");

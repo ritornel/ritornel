@@ -30,6 +30,7 @@ impl Core {
         }
     }
 
+    /// Only an audible start schedules a send. State snapshots can cancel it.
     #[cfg(feature = "lastfm")]
     pub(super) fn observe_now_playing(
         &self,
