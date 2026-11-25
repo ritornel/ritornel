@@ -612,7 +612,7 @@ fn import(observation: i64, at_ms: i64) -> Import {
         listener: 1,
         source_item: 9,
         played_at_ms: at_ms,
-        echo_of: None,
+        echo_of: Vec::new(),
         key: observation.to_be_bytes().to_vec(),
         artist: "Calla Brandt".to_owned(),
         title: "Low Tide".to_owned(),
@@ -687,9 +687,9 @@ fn an_import_counts_by_its_sources_verdict_and_is_dated_in_the_listeners_zone_th
 fn our_own_scrobble_coming_back_joins_its_listen_and_counts_once() {
     let heard = listen(1, 1, 200_000);
     let mut echo = import(7, heard.started_at_ms);
-    echo.echo_of = Some(1);
+    echo.echo_of = vec![1];
     let mut again = import(8, heard.started_at_ms);
-    again.echo_of = Some(1);
+    again.echo_of = vec![1];
     let plays = derive_all(
         std::slice::from_ref(&heard),
         &[again, echo.clone()],
@@ -946,7 +946,7 @@ fn a_recording_correction_moves_a_listen_chain_and_its_echo() {
     let mut second = listen(2, 2, 100_000);
     second.continues = Some(first.source_key.clone());
     let mut echo = import(3, first.started_at_ms);
-    echo.echo_of = Some(1);
+    echo.echo_of = vec![1];
 
     let on_chain = Correction {
         observation: 30,
@@ -1043,4 +1043,117 @@ fn a_listeners_stream_is_offered_that_listeners_scrobbles_alone() {
     let plays = derive_one(&[import(5, T0)]);
     assert_eq!(plays.len(), 1);
     assert_eq!(plays[0].joined.len(), 1);
+}
+
+#[test]
+fn equal_second_returning_echoes_pair_one_to_one_deterministically() {
+    let first = listen(1, 1, 200_000);
+    let mut second = listen(2, 2, 200_000);
+    second.started_at_ms = first.started_at_ms + 400;
+    second.ended_at_ms = second.started_at_ms + 200_000;
+
+    // Two returning echoes that both match both equal-second deliveries:
+    // they pair 1-to-1 regardless of input order, leaving two plays total.
+    let mut echo_a = import(10, first.started_at_ms);
+    echo_a.echo_of = vec![2, 1];
+    let mut echo_b = import(11, first.started_at_ms);
+    echo_b.echo_of = vec![1, 2];
+
+    let forward = derive_all(
+        &[first.clone(), second.clone()],
+        &[echo_a.clone(), echo_b.clone()],
+        &[],
+        &[],
+    );
+    let reversed = derive_all(
+        &[second.clone(), first.clone()],
+        &[echo_b.clone(), echo_a.clone()],
+        &[],
+        &[],
+    );
+    assert_eq!(forward, reversed);
+    assert_eq!(forward.len(), 2);
+    assert_eq!(
+        forward[0].observations,
+        vec![(1, Role::Primary), (10, Role::Corroborating)]
+    );
+    assert_eq!(
+        forward[1].observations,
+        vec![(2, Role::Primary), (11, Role::Corroborating)]
+    );
+
+    // A third import in the same second exceeds the two delivered listens
+    // and stands as a play of its own.
+    let mut extra = import(12, first.started_at_ms);
+    extra.echo_of = vec![1, 2];
+    let three = derive_all(
+        &[first.clone(), second.clone()],
+        &[echo_a.clone(), echo_b.clone(), extra],
+        &[],
+        &[],
+    );
+    assert_eq!(three.len(), 3);
+    assert_eq!(three[2].observations, vec![(12, Role::Primary)]);
+
+    // Asymmetric match (e.g. Last.fm corrected one delivery's title so echo_b
+    // matches only listen 1 while echo_a matches both 1 and 2): augmenting
+    // paths still pair both listens without dropping either to a third play.
+    let mut broad = import(20, first.started_at_ms);
+    broad.echo_of = vec![1, 2];
+    let mut narrow = import(21, first.started_at_ms);
+    narrow.echo_of = vec![1];
+    let asymmetric = derive_all(&[first.clone(), second.clone()], &[broad, narrow], &[], &[]);
+    assert_eq!(asymmetric.len(), 2);
+    assert_eq!(
+        asymmetric[0].observations,
+        vec![(1, Role::Primary), (21, Role::Corroborating)]
+    );
+    assert_eq!(
+        asymmetric[1].observations,
+        vec![(2, Role::Primary), (20, Role::Corroborating)]
+    );
+
+    // One listen echoed on two different service endpoints receives both
+    // echoes without creating a duplicate play.
+    let mut from_a = import(30, first.started_at_ms);
+    from_a.endpoint = 2;
+    from_a.echo_of = vec![1];
+    let mut from_b = import(31, first.started_at_ms);
+    from_b.endpoint = 3;
+    from_b.echo_of = vec![1];
+    let both_accounts = derive_all(std::slice::from_ref(&first), &[from_a, from_b], &[], &[]);
+    assert_eq!(both_accounts.len(), 1);
+    assert_eq!(
+        both_accounts[0].observations,
+        vec![
+            (1, Role::Primary),
+            (30, Role::Corroborating),
+            (31, Role::Corroborating)
+        ]
+    );
+
+    // When an excluded duplicate import (earlier observation) and an active
+    // scrobble (later observation) both match the same delivered listen, the
+    // active scrobble wins the echo pairing so the duplicate does not exclude
+    // the listen's play.
+    let mut dup = import(40, first.started_at_ms);
+    dup.echo_of = vec![1];
+    let mut live = import(41, first.started_at_ms);
+    live.echo_of = vec![1];
+    let exclude_dup = Correction {
+        observation: 50,
+        verb: Verb::Exclude,
+        targets: vec![40],
+        window: None,
+        recording: None,
+    };
+    let with_dup = derive_all(&[first], &[dup, live], &[exclude_dup], &[]);
+    assert_eq!(with_dup.len(), 2);
+    assert_eq!(
+        with_dup[0].observations,
+        vec![(1, Role::Primary), (41, Role::Corroborating)]
+    );
+    assert!(!with_dup[0].excluded);
+    assert_eq!(with_dup[1].observations, vec![(40, Role::Primary)]);
+    assert!(with_dup[1].excluded);
 }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use ritornel_domain::history::PlayRule;
 
 use super::*;
+use crate::Clock;
 use crate::playback::tests::{ALBUM, catalog};
 use crate::testing::{CountingEntropy, FixedClock};
 use crate::{ServerIdentity, ServerStore};
@@ -2472,6 +2473,7 @@ fn recording_correction_accepts_merged_recording_appearance_and_exports_now_appe
 
 #[test]
 fn pending_delivery_is_withdrawn_when_its_listen_is_corrected_or_unbound() {
+    use crate::Settled;
     let at = library();
     let account = at
         .library
@@ -2480,10 +2482,48 @@ fn pending_delivery_is_withdrawn_when_its_listen_is_corrected_or_unbound() {
     let start = T0 - 5 * MINUTE;
     let listen1 = at.listen(0x41, 0, start, 180_000);
     let listen2 = at.listen(0x42, 0, start + 10_000, 180_000);
+    let listen3 = at.listen(0x43, 0, start + 20_000, 180_000);
     at.send(&listen1, PlayRule::CURRENT);
     at.send(&listen2, PlayRule::CURRENT);
+    at.send(&listen3, PlayRule::CURRENT);
     let queued = at.library.plan_deliveries(account, start - MINUTE).unwrap();
-    assert_eq!(queued, 2);
+    assert_eq!(queued, 3);
+
+    // Put listen3 through one transient attempt (attempts == 1, back to pending).
+    let attempt = at
+        .library
+        .take_due_deliveries(account, start - MINUTE, 3)
+        .unwrap();
+    assert_eq!(attempt.len(), 3);
+    at.library
+        .settle_deliveries(vec![(
+            attempt[2].delivery,
+            Settled::Later {
+                detail: "temporary error".to_owned(),
+                at_ms: at.clock.now_ms(),
+            },
+        )])
+        .unwrap();
+    // Reset listen1 and listen2 back to never-attempted pending for this check.
+    let (d0, d1) = (attempt[0].delivery, attempt[1].delivery);
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.reset",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "UPDATE history_delivery
+                     SET state = 'pending', attempts = 0, sent_by_server_id = NULL
+                     WHERE id IN (?1, ?2)",
+                    (d0, d1),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
 
     let listen_obs: Vec<(Id, Vec<u8>)> = at
         .library
@@ -2499,7 +2539,8 @@ fn pending_delivery_is_withdrawn_when_its_listen_is_corrected_or_unbound() {
         })
         .unwrap();
 
-    // Unbind listen1, and move listen2 to track 1's recording.
+    // Unbind listen1, and move both listen2 (never attempted) and listen3
+    // (already attempted once) to track 1's recording.
     let rec_b = recording_of_track(&at, 1);
     at.library
         .set_observation_recording(
@@ -2514,26 +2555,32 @@ fn pending_delivery_is_withdrawn_when_its_listen_is_corrected_or_unbound() {
             None,
         )
         .unwrap();
-    at.library
-        .set_observation_recording(
-            WriteRequest {
-                method: "history.setRecording",
-                command: None,
-                client: None,
-            },
-            CorrectionTargets::Observations(vec![listen_obs[1].clone()]),
-            Some(rec_b),
-            None,
-            None,
-        )
-        .unwrap();
+    for target in [&listen_obs[1], &listen_obs[2]] {
+        at.library
+            .set_observation_recording(
+                WriteRequest {
+                    method: "history.setRecording",
+                    command: None,
+                    client: None,
+                },
+                CorrectionTargets::Observations(vec![target.clone()]),
+                Some(rec_b),
+                None,
+                None,
+            )
+            .unwrap();
+    }
 
-    // Neither stale delivery may be sent.
+    // Unbound listen1 and already-attempted listen3 are withdrawn; never-attempted
+    // listen2 refreshes to track 1's names and is taken to send.
     let due = at
         .library
         .take_due_deliveries(account, start - MINUTE, 10)
         .unwrap();
-    assert!(due.is_empty());
+    assert_eq!(due.len(), 1, "{due:?}");
+    assert_eq!(due[0].delivery, attempt[1].delivery);
+    assert_eq!(due[0].title, ALBUM[1].title);
+    assert_eq!(due[0].artist, "Moss Arcade");
     let states: Vec<String> = at
         .library
         .read(|connection| {
@@ -2542,7 +2589,12 @@ fn pending_delivery_is_withdrawn_when_its_listen_is_corrected_or_unbound() {
             Ok(rows.collect::<Result<_, _>>()?)
         })
         .unwrap();
-    assert_eq!(states, ["withdrawn", "withdrawn"]);
+    assert_eq!(states, ["withdrawn", "sending", "withdrawn"]);
+    // Withdrawn listen3 is never re-planned.
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -3201,4 +3253,1322 @@ fn an_outside_reader_joins_an_echo_under_corrected_names_to_its_play_from_the_ex
         )
     );
     assert_eq!(of(&imports[1]["sourceKey"])["corroborated_by"], "");
+}
+
+fn scrobble_keyed(
+    at: &Library,
+    account: Id,
+    source_key: &[u8],
+    at_s: i64,
+    artist: &str,
+    title: &str,
+) {
+    let batch = ritornel_source::Batch {
+        records: vec![ritornel_source::ImportRecord {
+            source_key: source_key.to_vec(),
+            played_at_ms: at_s * 1000,
+            track: ritornel_source::TrackText {
+                artist: artist.to_owned(),
+                album: Some("Tin Weather".to_owned()),
+                title: title.to_owned(),
+            },
+            ids: ritornel_source::Identifiers::default(),
+            payload_json: "{}".to_owned(),
+        }],
+        span: ritornel_source::Span {
+            from_ms: at_s * 1000,
+            to_ms: at_s * 1000 + 1000,
+        },
+        cursor: "{}".to_owned(),
+    };
+    at.library
+        .ingest(Observations::Imports {
+            account,
+            batch: &batch,
+            full: false,
+        })
+        .unwrap();
+}
+
+fn seed_metadata_claims(at: &Library) {
+    let tracks: Vec<(Id, &'static str)> = at
+        .tracks
+        .iter()
+        .zip(ALBUM.iter())
+        .map(|((_, source_item, _), track)| (*source_item, track.title))
+        .collect();
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.claims",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                let c = write.connection();
+                let src_id: i64 = c.query_row(
+                    "SELECT id FROM metadata_source WHERE kind = 'file_tags'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                for (source_item, title) in &tracks {
+                    let (item, rev_id): (i64, i64) = c.query_row(
+                        "SELECT id, current_revision_id FROM source_item WHERE public_id = ?1",
+                        [source_item.as_bytes().as_slice()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    for (scope, field, value) in [
+                        ("recording", "artist", "Moss Arcade"),
+                        ("recording", "title", *title),
+                        ("release", "album", "Tin Weather"),
+                    ] {
+                        c.execute(
+                            "INSERT INTO metadata_claim
+                               (source_item_id, revision_id, extractor_version, scope, field,
+                                value, ordinal, metadata_source_id, rev)
+                             VALUES (?1, ?2, 1, ?3, ?4, ?5, 0, ?6, ?7)",
+                            (item, rev_id, scope, field, value, src_id, write.rev()),
+                        )?;
+                    }
+                }
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn metadata_edit_refreshes_never_attempted_delivery_but_withdraws_attempted_delivery() {
+    use crate::Settled;
+    use ritornel_domain::library::Kind;
+
+    let at = library();
+    seed_metadata_claims(&at);
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+    let first = at.listen(0x61, 0, start, 200_000);
+    let second = at.listen(0x62, 0, start + 5_000, 200_000);
+    at.send(&first, PlayRule::CURRENT);
+    at.send(&second, PlayRule::CURRENT);
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        2
+    );
+
+    // Attempt only the first play and return it to pending via transient failure;
+    // the second remains pending with attempts == 0.
+    let attempted = at
+        .library
+        .take_due_deliveries(account, start - MINUTE, 1)
+        .unwrap();
+    assert_eq!(attempted.len(), 1);
+    at.library
+        .settle_deliveries(vec![(
+            attempted[0].delivery,
+            Settled::Later {
+                detail: "service busy".to_owned(),
+                at_ms: at.clock.now_ms(),
+            },
+        )])
+        .unwrap();
+
+    // Edit both the track appearance title and the release album.
+    let appearance = at.tracks[0].0;
+    let rel: Id = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT rel.public_id FROM track_appearance ta
+                 JOIN release rel ON rel.id = ta.release_id
+                 WHERE ta.public_id = ?1",
+                [appearance.as_bytes().as_slice()],
+                |row| Ok(Id::from_bytes(row.get(0)?)),
+            )?)
+        })
+        .unwrap();
+    at.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "catalog.edit",
+                command: None,
+                client: None,
+            },
+            Kind::TrackAppearance,
+            appearance,
+            "title",
+            "Paper Kites (Edited)",
+        )
+        .unwrap();
+    at.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "catalog.edit",
+                command: None,
+                client: None,
+            },
+            Kind::Release,
+            rel,
+            "album",
+            "Tin Weather (Deluxe)",
+        )
+        .unwrap();
+
+    // The already-attempted delivery is withdrawn (prior attempt may have
+    // reached Last.fm); the never-attempted delivery refreshes in place and
+    // is sent under the edited names.
+    let due = at
+        .library
+        .take_due_deliveries(account, start - MINUTE, 10)
+        .unwrap();
+    assert_eq!(due.len(), 1, "{due:?}");
+    assert_eq!(due[0].timestamp_s, (start + 5_000) / 1000);
+    assert_eq!(due[0].title, "Paper Kites (Edited)");
+    assert_eq!(due[0].album.as_deref(), Some("Tin Weather (Deluxe)"));
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [("sending".to_owned(), 1), ("withdrawn".to_owned(), 1)]
+    );
+    // Withdrawn play is never re-planned.
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        0
+    );
+
+    // Settling the refreshed delivery and importing its echo joins cleanly.
+    at.library
+        .settle_deliveries(vec![(
+            due[0].delivery,
+            Settled::Accepted {
+                artist: due[0].artist.clone(),
+                title: due[0].title.clone(),
+            },
+        )])
+        .unwrap();
+    scrobble_of(
+        &at,
+        account,
+        due[0].timestamp_s,
+        "Moss Arcade",
+        "Paper Kites (Edited)",
+    );
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
+        2
+    );
+    let incremental = at.library.derived_history().unwrap();
+    let dry = at.rebuild(PlayRule::CURRENT, true);
+    assert_eq!(dry.changed, 0);
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn restore_reconciliation_covers_unplanned_listens_outbox_arrivals_interrupted_sends_and_plan_while_held()
+ {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+
+    // Listen E was mid-send (`sending`) when the backup was taken.
+    let listen_e = at.listen(0x75, 0, start, 200_000);
+    at.send(&listen_e, PlayRule::CURRENT);
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        1
+    );
+    let in_flight = at
+        .library
+        .take_due_deliveries(account, start - MINUTE, 1)
+        .unwrap();
+    assert_eq!(in_flight.len(), 1);
+
+    // Listens A, B, D are already in library.db BEFORE the backup, unplanned
+    // (zero pending `history_delivery` rows at backup time).
+    let listen_a = at.listen(0x71, 0, start + 10_000, 200_000);
+    let listen_b = at.listen(0x72, 1, start + 20_000, 250_000);
+    let listen_d = at.listen(0x74, 1, start + 40_000, 250_000);
+    at.send(&listen_a, PlayRule::CURRENT);
+    at.send(&listen_b, PlayRule::CURRENT);
+    at.send(&listen_d, PlayRule::CURRENT);
+
+    // Simulate backup hold creation: succeeds even with zero pending rows.
+    let backup_at = at.clock.now_ms();
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.backup",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                assert!(crate::delivery_store::hold_sending(
+                    write.connection(),
+                    backup_at
+                )?);
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // Startup on the restored library abandons in-flight sends and stamps holds.
+    assert_eq!(at.library.abandon_sending().unwrap(), 1);
+    assert!(at.library.opened_restored(Some(account)).unwrap().is_some());
+
+    // Listen C arrives from a local staged listen or satellite outbox while
+    // the hold is active (before `release_hold`).
+    let listen_c = at.listen(0x73, 0, start + 30_000, 200_000);
+    at.send(&listen_c, PlayRule::CURRENT);
+
+    // While held, nothing may be taken to send.
+    assert!(
+        at.library
+            .take_due_deliveries(account, start - MINUTE, 50)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Last.fm import returns A, B, C, and interrupted E (but NOT D).
+    scrobble_keyed(
+        &at,
+        account,
+        b"imp-e",
+        start / 1000,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"imp-a",
+        (start + 10_000) / 1000,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"imp-b",
+        (start + 20_000) / 1000,
+        "Moss Arcade",
+        "Lanternfish",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"imp-c",
+        (start + 30_000) / 1000,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+
+    // If the scrobbler calls `plan_deliveries` after an import batch commits
+    // while the hold is still active, plays must stay pending (NOT withdrawn
+    // as `ALREADY_SCROBBLED`) so `release_hold` reconciles them as accepted.
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        4
+    );
+    assert!(
+        at.library
+            .take_due_deliveries(account, start - MINUTE, 50)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Releasing the hold reconciles A, B, C to `accepted`; E's echo already
+    // joined via `unknown`; D stays pending to be sent.
+    assert!(at.library.release_hold(account).unwrap());
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
+        5
+    );
+    assert_eq!(
+        at.library.lost_scrobbles(0, Some("someone")).unwrap(),
+        crate::LostScrobbles::default()
+    );
+    let due = at
+        .library
+        .take_due_deliveries(account, start - MINUTE, 50)
+        .unwrap();
+    assert_eq!(
+        due.iter().map(|d| d.timestamp_s).collect::<Vec<_>>(),
+        [(start + 40_000) / 1000]
+    );
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [
+            ("accepted".to_owned(), 3),
+            ("sending".to_owned(), 1),
+            ("unknown".to_owned(), 1),
+        ]
+    );
+    let incremental = at.library.derived_history().unwrap();
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn restore_reconciliation_matches_unplanned_without_prior_plan_and_edited_never_attempted_pending()
+{
+    use ritornel_domain::library::Kind;
+
+    let at = library();
+    seed_metadata_claims(&at);
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+
+    // Listen 1: planned pending (`attempts == 0`), then title edited before backup.
+    let listen1 = at.listen(0x81, 0, start, 200_000);
+    at.send(&listen1, PlayRule::CURRENT);
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        1
+    );
+    at.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "catalog.edit",
+                command: None,
+                client: None,
+            },
+            Kind::TrackAppearance,
+            at.tracks[0].0,
+            "title",
+            "Paper Kites (Edited)",
+        )
+        .unwrap();
+
+    // Listen 2: unplanned listen (never planned before `release_hold`).
+    let listen2 = at.listen(0x82, 1, start + 10_000, 250_000);
+    at.send(&listen2, PlayRule::CURRENT);
+
+    let backup_at = at.clock.now_ms();
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.backup",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                crate::delivery_store::hold_sending(write.connection(), backup_at)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // Pre-restore server refreshed Listen 1 to "Paper Kites (Edited)" and sent
+    // both Listen 1 and Listen 2 before the restore.
+    scrobble_keyed(
+        &at,
+        account,
+        b"imp-1",
+        start / 1000,
+        "Moss Arcade",
+        "Paper Kites (Edited)",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"imp-2",
+        (start + 10_000) / 1000,
+        "Moss Arcade",
+        "Lanternfish",
+    );
+
+    // Without calling `plan_deliveries` first, `release_hold` reconciles both.
+    assert!(at.library.release_hold(account).unwrap());
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
+        2
+    );
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [("accepted".to_owned(), 2)]
+    );
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        0
+    );
+    assert!(
+        at.library
+            .take_due_deliveries(account, start - MINUTE, 50)
+            .unwrap()
+            .is_empty()
+    );
+    let incremental = at.library.derived_history().unwrap();
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn equal_second_distinct_listens_pair_echoes_one_to_one_without_duplicates() {
+    use crate::Settled;
+
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start_s = (T0 + 10 * MINUTE) / 1000;
+    let start = start_s * 1000;
+
+    // Part 1: Two distinct listens in the exact same second, both sent and
+    // settled (one with an asymmetric service-corrected title), plus a third
+    // pair in the next second where one is `unknown` after an interrupted send.
+    let listen_a = at.listen(0x91, 0, start, 200_000);
+    let listen_b = at.listen(0x92, 0, start + 250, 200_000);
+    let listen_c = at.listen(0x93, 0, start + 5_000, 200_000);
+    let listen_d = at.listen(0x94, 0, start + 5_300, 200_000);
+    at.send(&listen_a, PlayRule::CURRENT);
+    at.send(&listen_b, PlayRule::CURRENT);
+    at.send(&listen_c, PlayRule::CURRENT);
+    at.send(&listen_d, PlayRule::CURRENT);
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        4
+    );
+
+    // Same-second plays go out in separate batches.
+    let batch1 = at.library.take_due_deliveries(account, 0, 50).unwrap();
+    assert_eq!(batch1.len(), 2);
+    at.library
+        .settle_deliveries(vec![
+            (
+                batch1[0].delivery,
+                Settled::Accepted {
+                    artist: "Moss Arcade".to_owned(),
+                    title: "Paper Kites".to_owned(),
+                },
+            ),
+            (batch1[1].delivery, Settled::Unknown("timed out".to_owned())),
+        ])
+        .unwrap();
+    let batch2 = at.library.take_due_deliveries(account, 0, 50).unwrap();
+    assert_eq!(batch2.len(), 2);
+    at.library
+        .settle_deliveries(vec![
+            (
+                batch2[0].delivery,
+                Settled::Accepted {
+                    artist: "Moss Arcade".to_owned(),
+                    title: "Paper Kites (Remastered)".to_owned(),
+                },
+            ),
+            (
+                batch2[1].delivery,
+                Settled::Accepted {
+                    artist: "Moss Arcade".to_owned(),
+                    title: "Paper Kites".to_owned(),
+                },
+            ),
+        ])
+        .unwrap();
+
+    // All four echoes return from Last.fm (asymmetric corrected title arrives
+    // second on `start_s`, forcing augmenting-path pairing).
+    scrobble_keyed(&at, account, b"eq-1", start_s, "Moss Arcade", "Paper Kites");
+    scrobble_keyed(
+        &at,
+        account,
+        b"eq-2",
+        start_s,
+        "Moss Arcade",
+        "Paper Kites (Remastered)",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"eq-3",
+        start_s + 5,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"eq-4",
+        start_s + 5,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+
+    // Exactly 4 plays total, all 4 imports counted as echoes, and the `unknown`
+    // delivery is cleared from `lost_scrobbles`.
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
+        4
+    );
+    assert_eq!(at.library.import_report(account, 10).unwrap().echoes, 4);
+    assert_eq!(
+        at.library.lost_scrobbles(0, Some("someone")).unwrap(),
+        crate::LostScrobbles::default()
+    );
+
+    // Part 2: Restore reconciliation of two equal-second listens where Last.fm
+    // accepted both after the backup.
+    let restore_s = start_s + 20;
+    let listen_e = at.listen(0x95, 1, restore_s * 1000, 250_000);
+    let listen_f = at.listen(0x96, 1, restore_s * 1000 + 400, 250_000);
+    at.send(&listen_e, PlayRule::CURRENT);
+    at.send(&listen_f, PlayRule::CURRENT);
+    let backup_at = at.clock.now_ms();
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.backup",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                crate::delivery_store::hold_sending(write.connection(), backup_at)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    scrobble_keyed(
+        &at,
+        account,
+        b"eq-5",
+        restore_s,
+        "Moss Arcade",
+        "Lanternfish",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"eq-6",
+        restore_s,
+        "Moss Arcade",
+        "Lanternfish",
+    );
+    assert!(at.library.release_hold(account).unwrap());
+
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
+        6
+    );
+    assert_eq!(at.library.import_report(account, 10).unwrap().echoes, 6);
+    assert!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    let incremental = at.library.derived_history().unwrap();
+    let dry = at.rebuild(PlayRule::CURRENT, true);
+    assert_eq!(dry.changed, 0);
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn restore_holds_are_isolated_per_account_and_expand_legacy_global_hold() {
+    let at = library();
+    let first = at
+        .library
+        .ensure_service_account("lastfm", "first")
+        .unwrap();
+    let second = at
+        .library
+        .ensure_service_account("lastfm", "second")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+    let listen1 = at.listen(0xa1, 0, start, 200_000);
+    let listen2 = at.listen(0xa2, 1, start + 10_000, 250_000);
+    at.send(&listen1, PlayRule::CURRENT);
+    at.send(&listen2, PlayRule::CURRENT);
+    assert_eq!(
+        at.library.plan_deliveries(first, start - MINUTE).unwrap(),
+        2
+    );
+    assert_eq!(
+        at.library.plan_deliveries(second, start - MINUTE).unwrap(),
+        2
+    );
+
+    // Seed a legacy global hold row from an older backup.
+    let backup_at = at.clock.now_ms();
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.legacy_hold",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                write.connection().execute(
+                    "INSERT INTO library_setting (key, value_json, rev)
+                     VALUES ('scrobbling.held_until_import', json_object('takenAtMs', ?1), ?2)",
+                    (backup_at, write.rev()),
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+    assert!(at.library.held_for_import(first).unwrap().is_some());
+    assert!(at.library.held_for_import(second).unwrap().is_some());
+
+    // Opening the restored library expands the legacy key into per-account holds.
+    let opened = at.library.opened_restored(Some(first)).unwrap().unwrap();
+    assert_eq!(opened.taken_at_ms, backup_at);
+    assert!(opened.since_ms.is_some());
+    assert_eq!(
+        at.count("SELECT count(*) FROM library_setting WHERE key = 'scrobbling.held_until_import'"),
+        0
+    );
+
+    // Both accounts are held back initially.
+    assert!(
+        at.library
+            .take_due_deliveries(first, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        at.library
+            .take_due_deliveries(second, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Account 1 imports listen1 and releases its hold: only Account 1 unlocks.
+    scrobble_keyed(
+        &at,
+        first,
+        b"first-1",
+        start / 1000,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+    assert!(at.library.release_hold(first).unwrap());
+    assert_eq!(at.library.held_for_import(first).unwrap(), None);
+    assert!(at.library.held_for_import(second).unwrap().is_some());
+
+    // Account 1 now sends its remaining unsent play (listen2), while Account 2
+    // remains held and sends nothing.
+    let due_first = at.library.take_due_deliveries(first, 0, 50).unwrap();
+    assert_eq!(
+        due_first.iter().map(|d| d.timestamp_s).collect::<Vec<_>>(),
+        [(start + 10_000) / 1000]
+    );
+    assert!(
+        at.library
+            .take_due_deliveries(second, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Account 2 imports listen2 and releases its hold: listen2 reconciles and
+    // only listen1 remains to send for Account 2.
+    scrobble_keyed(
+        &at,
+        second,
+        b"second-2",
+        (start + 10_000) / 1000,
+        "Moss Arcade",
+        "Lanternfish",
+    );
+    assert!(at.library.release_hold(second).unwrap());
+    assert_eq!(at.library.held_for_import(second).unwrap(), None);
+    let due_second = at.library.take_due_deliveries(second, 0, 50).unwrap();
+    assert_eq!(
+        due_second.iter().map(|d| d.timestamp_s).collect::<Vec<_>>(),
+        [start / 1000]
+    );
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
+        2
+    );
+    let incremental = at.library.derived_history().unwrap();
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn restore_reconciliation_reconciles_staged_and_outbox_listens_even_across_a_reboot() {
+    let at = library();
+    let servers =
+        ServerStore::open_in_memory(at.clock.clone(), Arc::new(CountingEntropy::default()))
+            .unwrap();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start_s = (T0 + 10 * MINUTE) / 1000;
+    let start = start_s * 1000;
+    let open_id = Id::from_bytes([0xb1; 16]);
+    let outbox_id = Id::from_bytes([0xb2; 16]);
+    let (app0, item0, asset0) = at.tracks[0];
+    let (app1, item1, asset1) = at.tracks[1];
+    let (listener, server) = (at.listener, at.server.server_id);
+    let old_boot = Id::from_bytes([0xb0; 16]);
+    let new_boot = Id::from_bytes([0xb9; 16]);
+
+    // Backup snapshot: one listen still open in `listen_staging` (heard long
+    // enough to count), one finished listen sitting in `outbox`, and zero
+    // rows in `library.db` (`history_observation` / `history_delivery`).
+    servers
+        .transact(move |tx, _, _| {
+            tx.execute(
+                "INSERT INTO listen_staging (
+                   listen_id, queue_entry_pid, listener_pid, played_on_server_pid,
+                   appearance_pid, asset_pid, copy_kind, source_item_pid,
+                   source_revision_no, started_at_utc_ms, zone_name, started_mono_ms,
+                   boot_id, start_reason, continues_listen_id, start_position_ms,
+                   track_duration_ms, ms_played, heard_ranges_json, max_position_ms,
+                   context_kind, shuffle, checkpoint_position_ms, checkpoint_at_ms,
+                   checkpoint_mono_ms, end_position_ms, end_reason, ended_at_utc_ms,
+                   ended_mono_ms)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, 'master', ?6, 1, ?7, 'America/New_York',
+                   1000, ?8, 'user_pick', NULL, 0, ?9, 180000, '[[0,180000]]', 180000,
+                   'album', 0, 180000, ?10, NULL, NULL, NULL, NULL, NULL)",
+                rusqlite::params![
+                    open_id.as_bytes(),
+                    listener.as_bytes(),
+                    server.as_bytes(),
+                    app0.as_bytes(),
+                    asset0.as_bytes(),
+                    item0.as_bytes(),
+                    start,
+                    old_boot.as_bytes(),
+                    ALBUM[0].length_ms,
+                    start + 180_000,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO listen_staging (
+                   listen_id, queue_entry_pid, listener_pid, played_on_server_pid,
+                   appearance_pid, asset_pid, copy_kind, source_item_pid,
+                   source_revision_no, started_at_utc_ms, zone_name, started_mono_ms,
+                   boot_id, start_reason, continues_listen_id, start_position_ms,
+                   track_duration_ms, ms_played, heard_ranges_json, max_position_ms,
+                   context_kind, shuffle, checkpoint_position_ms, checkpoint_at_ms,
+                   checkpoint_mono_ms, end_position_ms, end_reason, ended_at_utc_ms,
+                   ended_mono_ms)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?5, 'master', ?6, 1, ?7, 'America/New_York',
+                   20000, ?8, 'user_pick', NULL, 0, ?9, 200000, '[[0,200000]]', 200000,
+                   'album', 0, 200000, ?10, NULL, 200000, 'finished', ?10, NULL)",
+                rusqlite::params![
+                    outbox_id.as_bytes(),
+                    listener.as_bytes(),
+                    server.as_bytes(),
+                    app1.as_bytes(),
+                    asset1.as_bytes(),
+                    item1.as_bytes(),
+                    start + 20_000,
+                    old_boot.as_bytes(),
+                    ALBUM[1].length_ms,
+                    start + 220_000,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO outbox (kind, dedupe_key, next_attempt_at_ms, created_at_ms)
+                 VALUES ('history.ingest', ?1, ?2, ?2)",
+                (outbox_id.as_bytes(), start + 220_000),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Backup creates per-account hold even with zero library observations.
+    let backup_at = start + 230_000;
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.backup",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                assert!(crate::delivery_store::hold_sending(
+                    write.connection(),
+                    backup_at
+                )?);
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // Restore after a reboot (`new_boot != old_boot`) with a +3s sender wall
+    // clock skew (within `SKEW_TOLERANCE_MS`): close crashed listens and drain
+    // outbox before Last.fm import runs. Both listens land as `server_wall`,
+    // with `open_id` shifted 3 seconds off Last.fm's original `hub_age` second.
+    let restored_at = start + 300_000;
+    at.clock.set(restored_at);
+    assert!(at.library.opened_restored(Some(account)).unwrap().is_some());
+    assert_eq!(servers.close_crashed_listens().unwrap(), [open_id]);
+    let delivered = crate::playback::deliver_listens(
+        &servers,
+        &at.library,
+        &*at.clock,
+        &|| SendStamps {
+            sent_at_ms: restored_at + 3_000,
+            sent_mono_ms: 5_000,
+            sent_boot: new_boot,
+        },
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(delivered.delivered.len(), 2);
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE clock_basis = 'server_wall'"),
+        2
+    );
+
+    // Pre-restore server (still on `old_boot`, dated by `hub_age`) had
+    // scrobbled `open_id` at `start_s - 3` (3 seconds earlier than the skewed
+    // wall clock) and `outbox_id` at `start_s + 20`. `release_hold` reconciles
+    // both `server_wall` plays within their `time_precision_ms` window instead
+    // of leaving duplicates.
+    scrobble_keyed(
+        &at,
+        account,
+        b"rb-1",
+        start_s - 3,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"rb-2",
+        start_s + 20,
+        "Moss Arcade",
+        "Lanternfish",
+    );
+    assert!(at.library.release_hold(account).unwrap());
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
+        2
+    );
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [("accepted".to_owned(), 2)]
+    );
+    let incremental = at.library.derived_history().unwrap();
+    let dry = at.rebuild(PlayRule::CURRENT, true);
+    assert_eq!(dry.changed, 0);
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn attempted_pending_delivery_is_still_sent_when_only_duration_changes() {
+    use crate::Settled;
+
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start = (T0 + 10 * MINUTE) / 1000 * 1000;
+    let listen = at.listen(0xc1, 0, start, 200_000);
+    at.send(&listen, PlayRule::CURRENT);
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        1
+    );
+    let first_try = at.library.take_due_deliveries(account, 0, 10).unwrap();
+    assert_eq!(first_try.len(), 1);
+    at.library
+        .settle_deliveries(vec![(
+            first_try[0].delivery,
+            Settled::Later {
+                detail: "daily limit".to_owned(),
+                at_ms: at.clock.now_ms(),
+            },
+        )])
+        .unwrap();
+
+    // Simulate a duration-only change on the derived play while track names
+    // stay identical: the retried delivery must still be sent, not withdrawn.
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.duration",
+                command: None,
+                client: None,
+            },
+            |write| {
+                write.connection().execute(
+                    "UPDATE play_event SET track_duration_ms = track_duration_ms + 1000",
+                    [],
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    let retry = at.library.take_due_deliveries(account, 0, 10).unwrap();
+    assert_eq!(retry.len(), 1, "{retry:?}");
+    assert_eq!(retry[0].delivery, first_try[0].delivery);
+}
+
+#[test]
+fn restore_matching_maximizes_equal_second_pairs_when_one_pending_delivery_was_edited() {
+    use ritornel_domain::library::Kind;
+
+    let at = library();
+    seed_metadata_claims(&at);
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start_s = (T0 + 10 * MINUTE) / 1000;
+    let start = start_s * 1000;
+
+    // Two pending deliveries at the exact same second:
+    // D1 queued as "Paper Kites" (track 0), then track 0's title is edited to
+    // "Lanternfish"; D2 queued as "Lanternfish" (track 1).
+    let d1_listen = at.listen(0xc2, 0, start, 200_000);
+    let d2_listen = at.listen(0xc3, 1, start + 200, 250_000);
+    at.send(&d1_listen, PlayRule::CURRENT);
+    at.send(&d2_listen, PlayRule::CURRENT);
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        2
+    );
+    at.library
+        .set_metadata_edit(
+            WriteRequest {
+                method: "catalog.edit",
+                command: None,
+                client: None,
+            },
+            Kind::TrackAppearance,
+            at.tracks[0].0,
+            "title",
+            "Lanternfish",
+        )
+        .unwrap();
+
+    let backup_at = at.clock.now_ms();
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.backup",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                crate::delivery_store::hold_sending(write.connection(), backup_at)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // Last.fm returns both "Paper Kites" (D1 sent before edit) and
+    // "Lanternfish" (D2). Unified matching must pair D1 -> "Paper Kites" and
+    // D2 -> "Lanternfish" so neither is resent or duplicated.
+    scrobble_keyed(
+        &at,
+        account,
+        b"max-1",
+        start_s,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"max-2",
+        start_s,
+        "Moss Arcade",
+        "Lanternfish",
+    );
+    assert!(at.library.release_hold(account).unwrap());
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
+        2
+    );
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [("accepted".to_owned(), 2)]
+    );
+    assert!(
+        at.library
+            .take_due_deliveries(account, 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    let incremental = at.library.derived_history().unwrap();
+    let dry = at.rebuild(PlayRule::CURRENT, true);
+    assert_eq!(dry.changed, 0);
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn satellite_listen_arriving_after_release_hold_reconciles_without_duplicates() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start_s = (T0 + 10 * MINUTE) / 1000;
+    let start = start_s * 1000;
+
+    // Backup taken while offline satellite holds listens in its outbox.
+    let backup_at = start + 60_000;
+    at.clock.set(backup_at);
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.backup",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                assert!(crate::delivery_store::hold_sending(
+                    write.connection(),
+                    backup_at
+                )?);
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // Hub starts, syncs from Last.fm, and releases its hold BEFORE the
+    // satellite reconnects. Last.fm already has two scrobbles that the
+    // pre-restore hub sent from that satellite.
+    let reconciled_at = start + 120_000;
+    at.clock.set(reconciled_at);
+    assert!(at.library.opened_restored(Some(account)).unwrap().is_some());
+    scrobble_keyed(
+        &at,
+        account,
+        b"sat-1",
+        start_s,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+    scrobble_keyed(
+        &at,
+        account,
+        b"sat-2",
+        start_s + 20,
+        "Moss Arcade",
+        "Lanternfish",
+    );
+    assert!(at.library.release_hold(account).unwrap());
+    assert_eq!(at.library.held_for_import(account).unwrap(), None);
+
+    // Satellite reconnects later and delivers:
+    // 1. `sat_exact` (hub_age, exact second match with `sat-1`)
+    // 2. `sat_skewed` (rebooted satellite -> server_wall +3s skew matching `sat-2`)
+    // 3. `sat_unsent` (before backup, never reached Last.fm -> must still scrobble)
+    // 4. `sat_new` (played AFTER `reconciled_at` -> outside restore window)
+    let sat_exact = at.listen(0xd1, 0, start, 200_000);
+    at.clock.set(reconciled_at + 5 * MINUTE);
+    at.library
+        .ingest_listen_by(
+            &sat_exact,
+            SendStamps {
+                sent_at_ms: reconciled_at + 5 * MINUTE,
+                sent_mono_ms: sat_exact.started_mono_ms + (reconciled_at + 5 * MINUTE - start),
+                sent_boot: BOOT,
+            },
+            PlayRule::CURRENT,
+        )
+        .unwrap();
+
+    let sat_skewed = at.listen(0xd2, 1, (start_s + 23) * 1000, 250_000);
+    at.library
+        .ingest_listen_by(
+            &sat_skewed,
+            SendStamps {
+                sent_at_ms: reconciled_at + 5 * MINUTE + 3_000,
+                sent_mono_ms: 10_000,
+                sent_boot: Id::from_bytes([0xde; 16]),
+            },
+            PlayRule::CURRENT,
+        )
+        .unwrap();
+
+    let sat_unsent = at.listen(0xd3, 0, start + 40_000, 200_000);
+    at.library
+        .ingest_listen_by(
+            &sat_unsent,
+            SendStamps {
+                sent_at_ms: reconciled_at + 5 * MINUTE,
+                sent_mono_ms: sat_unsent.started_mono_ms
+                    + (reconciled_at + 5 * MINUTE - (start + 40_000)),
+                sent_boot: BOOT,
+            },
+            PlayRule::CURRENT,
+        )
+        .unwrap();
+
+    let sat_new = at.listen(0xd4, 1, reconciled_at + 60_000, 250_000);
+    at.clock.set(reconciled_at + 6 * MINUTE);
+    at.library
+        .ingest_listen_by(
+            &sat_new,
+            SendStamps {
+                sent_at_ms: reconciled_at + 6 * MINUTE,
+                sent_mono_ms: sat_new.started_mono_ms + 5 * MINUTE,
+                sent_boot: BOOT,
+            },
+            PlayRule::CURRENT,
+        )
+        .unwrap();
+
+    // `sat_exact` and `sat_skewed` reconciled immediately on ingest -> 4 plays
+    // total (not 6!), and only `sat_unsent` and `sat_new` are planned/sent.
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1"),
+        4
+    );
+    assert_eq!(
+        at.library.delivery_counts(account).unwrap(),
+        [("accepted".to_owned(), 2)]
+    );
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        2
+    );
+    let due = at
+        .library
+        .take_due_deliveries(account, start - MINUTE, 50)
+        .unwrap();
+    assert_eq!(
+        due.iter().map(|d| d.timestamp_s).collect::<Vec<_>>(),
+        [(start + 40_000) / 1000, (reconciled_at + 60_000) / 1000]
+    );
+    let incremental = at.library.derived_history().unwrap();
+    let dry = at.rebuild(PlayRule::CURRENT, true);
+    assert_eq!(dry.changed, 0);
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
+}
+
+#[test]
+fn excluded_shifted_read_import_cannot_hijack_restore_or_suppress_scrobbling() {
+    let at = library();
+    let account = at
+        .library
+        .ensure_service_account("lastfm", "someone")
+        .unwrap();
+    let start_s = (T0 + 10 * MINUTE) / 1000;
+    let start = start_s * 1000;
+
+    // A scrobble previously set aside as a `shifted_read` duplicate sits at `start_s`.
+    scrobble_keyed(
+        &at,
+        account,
+        b"dup-1",
+        start_s,
+        "Moss Arcade",
+        "Paper Kites",
+    );
+    let dup_obs: i64 = at
+        .library
+        .read(|connection| {
+            Ok(connection.query_row(
+                "SELECT id FROM history_observation WHERE kind = 'import'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.exclude_dup",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                exclude(
+                    write,
+                    &[dup_obs],
+                    "shifted duplicate",
+                    Some("shifted_read"),
+                    PlayRule::CURRENT,
+                )?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // A real local listen at the same second is backed up and restored.
+    let listen = at.listen(0xe1, 0, start, 200_000);
+    at.send(&listen, PlayRule::CURRENT);
+    let backup_at = at.clock.now_ms();
+    at.library
+        .write(
+            WriteRequest {
+                method: "test.backup",
+                command: None,
+                client: None,
+            },
+            move |write| {
+                crate::delivery_store::hold_sending(write.connection(), backup_at)?;
+                Ok(String::new())
+            },
+        )
+        .unwrap();
+
+    // Releasing the hold must NOT match the excluded duplicate (which would
+    // falsely mark the delivery accepted and propagate `excluded = 1` onto
+    // the local listen).
+    assert!(at.library.release_hold(account).unwrap());
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1 AND excluded = 0"),
+        1
+    );
+    assert!(at.library.delivery_counts(account).unwrap().is_empty());
+
+    // Planning and taking deliveries must NOT suppress the listen via
+    // `already_scrobbled` against the excluded duplicate either.
+    assert_eq!(
+        at.library.plan_deliveries(account, start - MINUTE).unwrap(),
+        1
+    );
+    let due = at
+        .library
+        .take_due_deliveries(account, start - MINUTE, 10)
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].timestamp_s, start_s);
+
+    // Transitioning the delivery to `sending` (and later `accepted`) triggers
+    // `rederive_delivery`: the `shifted_read` duplicate must NOT pair as its
+    // echo or propagate `excluded = 1` onto the genuine local listen.
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1 AND excluded = 0"),
+        1
+    );
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE excluded = 1"),
+        1
+    );
+    at.library
+        .settle_deliveries(vec![(
+            due[0].delivery,
+            crate::Settled::Accepted {
+                artist: "Moss Arcade".to_owned(),
+                title: "Paper Kites".to_owned(),
+            },
+        )])
+        .unwrap();
+    assert_eq!(
+        at.count("SELECT count(*) FROM play_event WHERE counts = 1 AND excluded = 0"),
+        1
+    );
+    let incremental = at.library.derived_history().unwrap();
+    let dry = at.rebuild(PlayRule::CURRENT, true);
+    assert_eq!(dry.changed, 0);
+    at.rebuild(PlayRule::CURRENT, false);
+    assert_eq!(at.library.derived_history().unwrap(), incremental);
 }

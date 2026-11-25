@@ -485,7 +485,7 @@ mod enabled {
             return None;
         }
         if !matches!(
-            core.with_library(|_, library| library.held_for_import()),
+            core.with_library(|_, library| library.held_for_import(session.account)),
             Some(Ok(None))
         ) {
             return None;
@@ -950,7 +950,8 @@ mod enabled {
                 _ => None,
             },
             stopping: &|| stop.load(Ordering::SeqCst),
-            held: &|| match core.with_library(|_, library| library.held_for_import()) {
+            held: &|account| match core.with_library(|_, library| library.held_for_import(account))
+            {
                 Some(Ok(held)) => held.is_some(),
                 Some(Err(failed)) => {
                     error!(error = %failed, "whether scrobbling waits for an import could not be read");
@@ -1021,10 +1022,10 @@ mod enabled {
         pub(crate) session: &'a dyn Fn() -> Option<ServiceSession>,
         /// Whether the server is stopping.
         pub(crate) stopping: &'a dyn Fn() -> bool,
-        /// Whether nothing is sent until an import has run, as in a library
-        /// restored from a backup: Last.fm may already have plays it holds
-        /// waiting, and the import brings them back first.
-        pub(crate) held: &'a dyn Fn() -> bool,
+        /// Whether nothing is sent for this account until an import has run,
+        /// as in a library restored from a backup: Last.fm may already have
+        /// plays it holds waiting, and the import brings them back first.
+        pub(crate) held: &'a dyn Fn(Id) -> bool,
         /// Takes the next batch for an account, checked against the time
         /// scrobbling was turned on; `None` when it could not.
         pub(crate) take: &'a dyn Fn(Id, i64) -> Option<Vec<Due>>,
@@ -1069,7 +1070,7 @@ mod enabled {
             // until the wait is over, and then the plays held back go first,
             // being the oldest due. Another account signed in since is not
             // held back.
-            if (sending.paused)(session.account) || (sending.held)() {
+            if (sending.paused)(session.account) || (sending.held)(session.account) {
                 return;
             }
             let key = SessionKey::new(session.key.expose());
@@ -1489,7 +1490,7 @@ mod enabled {
                     sessions(reads.get() - 1)
                 },
                 stopping: &|| sent.borrow().len() >= stop_after,
-                held: &|| false,
+                held: &|_| false,
                 take: &|_, _| {
                     taken.set(taken.get() + 1);
                     (taken.get() <= 3).then(|| batch(taken.get() * 100))
@@ -1525,7 +1526,7 @@ mod enabled {
                 turn: &turn,
                 session: &|| Some(session("KEY_A", true)),
                 stopping: &|| false,
-                held: &|| false,
+                held: &|_| false,
                 take: &|_, _| Some(batch(100)),
                 send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
                     sent.set(sent.get() + 1);
@@ -1579,7 +1580,7 @@ mod enabled {
                 turn: &turn,
                 session: &|| Some(session("KEY_B", true)),
                 stopping: &|| sent.get() >= 1,
-                held: &|| false,
+                held: &|_| false,
                 take: &|_, _| Some(batch(100)),
                 send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
                     sent.set(sent.get() + 1);
@@ -1610,7 +1611,7 @@ mod enabled {
                 turn: &turn,
                 session: &|| Some(session("KEY_A", true)),
                 stopping: &|| false,
-                held: &|| false,
+                held: &|_| false,
                 take: &|_, _| Some(batch(100)),
                 send: &|_: &SessionKey, _: &[ToScrobble]| -> Result<Sent, Unsent> {
                     sent.set(sent.get() + 1);
@@ -1638,7 +1639,7 @@ mod enabled {
                 turn: &turn,
                 session: &|| Some(session("KEY_A", true)),
                 stopping: &|| false,
-                held: &|| false,
+                held: &|_| false,
                 take: &|_, _| {
                     taken.set(taken.get() + 1);
                     (taken.get() <= 3).then(|| batch(taken.get() * 100))
@@ -1678,7 +1679,7 @@ mod enabled {
                 turn: &turn,
                 session: &|| Some(session("KEY_A", true)),
                 stopping: &|| false,
-                held: &|| !imported.get(),
+                held: &|_| !imported.get(),
                 take: &|_, _| {
                     taken.set(taken.get() + 1);
                     (taken.get() == 1).then(|| batch(100))
@@ -1709,6 +1710,36 @@ mod enabled {
         }
 
         #[test]
+        fn one_accounts_restore_hold_does_not_hold_back_another() {
+            let sent = Cell::new(0);
+            let held_account = Id::from_bytes([8; 16]);
+            let turn = super::Turn::default();
+            send_due(&Sending {
+                turn: &turn,
+                session: &|| Some(session("KEY_A", true)),
+                stopping: &|| sent.get() >= 1,
+                held: &|account| account == held_account,
+                take: &|_, _| Some(batch(100)),
+                send: &|_: &SessionKey, plays: &[ToScrobble]| -> Result<Sent, Unsent> {
+                    sent.set(sent.get() + 1);
+                    Ok(plays
+                        .iter()
+                        .map(|play| Outcome::Accepted {
+                            artist: play.artist.clone(),
+                            title: play.title.clone(),
+                        })
+                        .collect())
+                },
+                settle: &|_| true,
+                refuse: &|_| {},
+                now: &|| 1_000,
+                paused: &|_| false,
+                pause: &|_, _| {},
+            });
+            assert_eq!(sent.get(), 1);
+        }
+
+        #[test]
         fn a_sign_out_waits_for_the_batch_on_its_way_and_nothing_leaves_after_it() {
             use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
             use std::sync::{Arc, Barrier};
@@ -1732,7 +1763,7 @@ mod enabled {
                                 .then(|| session("KEY_A", true))
                         },
                         stopping: &|| false,
-                        held: &|| false,
+                        held: &|_| false,
                         take: &|_, _| {
                             taken.set(taken.get() + 1);
                             (taken.get() <= 3).then(|| batch(taken.get() * 100))

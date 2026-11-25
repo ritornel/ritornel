@@ -507,19 +507,36 @@ pub(crate) fn zone_periods(connection: &Connection) -> Result<Vec<ZonePeriod>, E
 /// can come back from it as an echo.
 const MAY_HAVE_ARRIVED: &str = "('sending', 'accepted', 'unknown')";
 
-/// The listen whose play an import is the echo of: a delivery of that
-/// listen to the import's own endpoint, which may have arrived, sent with
-/// the import's time to the second and naming the same track, as sent or as
-/// the service took it. Of several, the earliest listen.
-pub(crate) fn echo_of(
+/// Whether an import naming `(artist, title)` matches a delivery's track,
+/// either as sent or as the service took it.
+fn matches_delivery(
+    artist: &str,
+    title: &str,
+    sent_artist: &str,
+    sent_title: &str,
+    took_artist: Option<&str>,
+    took_title: Option<&str>,
+) -> bool {
+    let took = match (took_artist, took_title) {
+        (Some(a), Some(t)) => same_track(artist, title, a, t),
+        _ => false,
+    };
+    took || same_track(artist, title, sent_artist, sent_title)
+}
+
+/// Every listen whose play an import may be the echo of: deliveries to the
+/// import's own endpoint, which may have arrived, sent with the import's
+/// time to the second and naming the same track, as sent or as the service
+/// took it, ordered by listen observation.
+pub(crate) fn echo_candidates(
     connection: &Connection,
     endpoint: i64,
     played_at_ms: i64,
     artist: &str,
     title: &str,
-) -> Result<Option<i64>, Error> {
+) -> Result<Vec<i64>, Error> {
     if played_at_ms % 1000 != 0 {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut sent = connection.prepare_cached(&format!(
         "SELECT observation_id, artist, title, accepted_artist, accepted_title
@@ -536,27 +553,42 @@ pub(crate) fn echo_of(
             row.get::<_, Option<String>>(4)?,
         ))
     })?;
+    let mut matched = Vec::new();
     for row in rows {
         let (listen, sent_artist, sent_title, took_artist, took_title) = row?;
-        let took = match (&took_artist, &took_title) {
-            (Some(a), Some(t)) => same_track(artist, title, a, t),
-            _ => false,
-        };
-        if took || same_track(artist, title, &sent_artist, &sent_title) {
-            return Ok(Some(listen));
+        if matches_delivery(
+            artist,
+            title,
+            &sent_artist,
+            &sent_title,
+            took_artist.as_deref(),
+            took_title.as_deref(),
+        ) {
+            matched.push(listen);
         }
     }
-    Ok(None)
+    Ok(matched)
 }
 
-/// The imports that are echoes of this listen's deliveries.
+/// The imports that may echo any of this listen's deliveries.
 fn echoes_of(connection: &Connection, listen: i64) -> Result<Vec<i64>, Error> {
+    type DeliveryRow = (i64, i64, String, String, Option<String>, Option<String>);
     let mut deliveries = connection.prepare_cached(&format!(
-        "SELECT endpoint_id, sent_timestamp_s FROM history_delivery
+        "SELECT endpoint_id, sent_timestamp_s, artist, title, accepted_artist, accepted_title
+         FROM history_delivery
          WHERE observation_id = ?1 AND state IN {MAY_HAVE_ARRIVED}"
     ))?;
-    let sent: Vec<(i64, i64)> = deliveries
-        .query_map([listen], |row| Ok((row.get(0)?, row.get(1)?)))?
+    let sent: Vec<DeliveryRow> = deliveries
+        .query_map([listen], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
         .collect::<Result<_, _>>()?;
     let mut found = Vec::new();
     let mut at = connection.prepare_cached(
@@ -564,14 +596,24 @@ fn echoes_of(connection: &Connection, listen: i64) -> Result<Vec<i64>, Error> {
          JOIN history_observation o ON o.id = i.observation_id
          WHERE i.played_at_utc_ms = ?2 AND o.endpoint_id = ?1",
     )?;
-    for (endpoint, seconds) in sent {
+    for (endpoint, seconds, sent_artist, sent_title, took_artist, took_title) in sent {
+        let Some(at_ms) = seconds.checked_mul(1000) else {
+            continue;
+        };
         let candidates: Vec<(i64, String, String)> = at
-            .query_map((endpoint, seconds * 1000), |row| {
+            .query_map((endpoint, at_ms), |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<Result<_, _>>()?;
         for (import, artist, title) in candidates {
-            if echo_of(connection, endpoint, seconds * 1000, &artist, &title)? == Some(listen) {
+            if matches_delivery(
+                &artist,
+                &title,
+                &sent_artist,
+                &sent_title,
+                took_artist.as_deref(),
+                took_title.as_deref(),
+            ) {
                 found.push(import);
             }
         }
@@ -587,8 +629,33 @@ const IMPORT_COLUMNS: &str = "o.id, o.endpoint_id, o.listener_id, o.source_item_
 const NOT_A_STREAM: &str =
     "NOT EXISTS (SELECT 1 FROM observation_import_stream s WHERE s.observation_id = o.id)";
 
+/// Observations currently excluded by an active `shifted_read` correction
+/// (phantom duplicates from an earlier shifted paged read). These are never
+/// real echoes of a local listen and must not pair with a delivered listen.
+fn shifted_read_excluded(connection: &Connection) -> Result<BTreeSet<i64>, Error> {
+    let mut statement = connection.prepare_cached(
+        "SELECT c.observation_id
+         FROM observation_correction c
+         JOIN history_observation o ON o.id = c.observation_id
+         WHERE c.verb = 'exclude' AND json_extract(o.payload_json, '$.reason') = 'shifted_read'",
+    )?;
+    let shifted_ids: BTreeSet<i64> = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if shifted_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let relevant: Vec<Correction> = corrections(connection)?
+        .into_iter()
+        .filter(|correction| {
+            correction.verb == Verb::Revoke || shifted_ids.contains(&correction.observation)
+        })
+        .collect();
+    Ok(derive::excluded(&relevant))
+}
+
 /// The imports with these observation IDs, or every import, each with the
-/// listen it is the echo of.
+/// listens it may be the echo of.
 fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<Import>, Error> {
     type Found = (i64, i64, i64, i64, i64, String, String, Vec<u8>);
     let row = |row: &Row<'_>| -> rusqlite::Result<Found> {
@@ -627,17 +694,27 @@ fn imports(connection: &Connection, only: Option<&BTreeSet<i64>>) -> Result<Vec<
             found
         }
     };
+    let shifted_excluded = if found.is_empty() {
+        BTreeSet::new()
+    } else {
+        shifted_read_excluded(connection)?
+    };
     found
         .into_iter()
         .map(
             |(observation, endpoint, listener, source_item, played_at_ms, artist, title, key)| {
+                let echo_of = if shifted_excluded.contains(&observation) {
+                    Vec::new()
+                } else {
+                    echo_candidates(connection, endpoint, played_at_ms, &artist, &title)?
+                };
                 Ok(Import {
                     observation,
                     endpoint,
                     listener,
                     source_item,
                     played_at_ms,
-                    echo_of: echo_of(connection, endpoint, played_at_ms, &artist, &title)?,
+                    echo_of,
                     key,
                     artist,
                     title,
@@ -678,7 +755,9 @@ fn neighbours(connection: &Connection, at: i64) -> Result<Vec<i64>, Error> {
     let mut near = Vec::new();
     if what == "import" {
         if let (Some(played_at), Some(artist), Some(title)) = (played_at, artist, title) {
-            near.extend(echo_of(connection, endpoint, played_at, &artist, &title)?);
+            near.extend(echo_candidates(
+                connection, endpoint, played_at, &artist, &title,
+            )?);
         }
         near.extend(crate::history_streams::neighbours(connection, at)?);
     } else {
@@ -858,6 +937,15 @@ fn link_plays(
 /// names the service took it under. With no import of that second on that
 /// account there is nothing to move.
 pub(crate) fn rederive_delivery(write: &Write<'_>, delivery: i64) -> Result<(), Error> {
+    rederive_delivery_by(write, delivery, PlayRule::CURRENT)
+}
+
+/// As [`rederive_delivery`], under `rule`.
+pub(crate) fn rederive_delivery_by(
+    write: &Write<'_>,
+    delivery: i64,
+    rule: PlayRule,
+) -> Result<(), Error> {
     let connection = write.connection();
     let (listen, endpoint, seconds): (i64, i64, i64) = connection
         .prepare_cached(
@@ -880,7 +968,7 @@ pub(crate) fn rederive_delivery(write: &Write<'_>, delivery: i64) -> Result<(), 
     }
     let mut affected: BTreeSet<i64> = imports.into_iter().collect();
     affected.insert(listen);
-    rederive(write, &affected, PlayRule::CURRENT)
+    rederive(write, &affected, rule)
 }
 
 /// Derives again the plays of these observations, and of everything chained
@@ -1547,6 +1635,7 @@ fn ingest(
         ],
     )?;
     rederive(write, &BTreeSet::from([observation]), rule)?;
+    crate::delivery_store::reconcile_late_listen(write, observation, rule)?;
     Ok(Ingested::Stored(write.rev()))
 }
 

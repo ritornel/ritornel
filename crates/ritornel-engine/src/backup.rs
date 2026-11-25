@@ -110,11 +110,13 @@ pub fn copy_database(from: &Path, to: &Path) -> Result<(), Error> {
     }
 }
 
-/// Holds back scrobbling in `copy`, a backup's copy of a library taken at
-/// `taken_at_ms`, if it has plays waiting to be sent: a server that opens
-/// it sends nothing until an import has brought back what the service took
-/// after the backup. The library copied is not changed. The copy is synced
-/// again, as [`copy_database`] leaves it. Whether it was held.
+/// Holds back scrobbling per account in `copy`, a backup's copy of a library
+/// taken at `taken_at_ms`, when the library has any service account: a server
+/// that opens it sends nothing for an account until an import has brought
+/// back what the service took after the backup (covering pending deliveries,
+/// unplanned listens, staged listens, and satellite outboxes). The library
+/// copied is not changed. The copy is synced again, as [`copy_database`]
+/// leaves it. Returns whether any hold was written.
 pub fn hold_sending(copy: &Path, taken_at_ms: i64) -> Result<bool, Error> {
     let connection = Location::File(copy.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let held = crate::delivery_store::hold_sending(&connection, taken_at_ms)?;
@@ -225,31 +227,27 @@ mod tests {
             Arc::new(OsEntropy),
         )
         .unwrap();
-        // With nothing waiting to be sent, a copy is not held.
+        // With no service accounts, a copy is not held.
         let idle = scratch.0.join("idle.db");
         copy_database(&path, &idle).unwrap();
         assert!(!hold_sending(&idle, 1_762_000_000_000).unwrap());
-        // A play waiting to be sent, written straight into the file: what
-        // made it does not matter here.
-        let raw = rusqlite::Connection::open(&path).unwrap();
-        raw.pragma_update(None, "foreign_keys", false).unwrap();
-        raw.execute(
-            "INSERT INTO history_delivery (observation_id, endpoint_id, state, sent_timestamp_s,
-                                           artist, title, created_at_ms, updated_at_ms, rev)
-             VALUES (1, 1, 'pending', 1762000000, 'Invented Artist', 'Invented Song', 0, 0, 0)",
-            [],
-        )
-        .unwrap();
-        drop(raw);
+
+        // With two service accounts and zero pending deliveries (e.g. only
+        // unplanned, staged, or satellite outbox plays may exist), the copy
+        // holds each account independently.
+        let first = library.ensure_service_account("lastfm", "someone").unwrap();
+        let second = library.ensure_service_account("lastfm", "another").unwrap();
         let copy = scratch.0.join("copy.db");
         copy_database(&path, &copy).unwrap();
         assert!(hold_sending(&copy, 1_762_000_000_000).unwrap());
         // The library copied is not held.
-        assert_eq!(library.held_for_import().unwrap(), None);
+        assert_eq!(library.held_for_import(first).unwrap(), None);
+        assert_eq!(library.held_for_import(second).unwrap(), None);
+        assert_eq!(library.any_held_for_import().unwrap(), None);
         drop(library);
 
-        // Put back and opened, it is held from then on, and opened again
-        // it keeps that time.
+        // Put back and opened, each account is held from then on, and opened
+        // again it keeps that time.
         let restored = LibraryStore::open(
             &copy,
             identity.server_id,
@@ -257,21 +255,45 @@ mod tests {
             Arc::new(OsEntropy),
         )
         .unwrap();
+        // The backup copy also keeps the legacy global key for downgrade/revert
+        // safety; opening on this binary expands and removes the global key.
+        let has_legacy = || {
+            restored
+                .read(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM library_setting WHERE key = ?1)",
+                        [crate::delivery_store::HELD_SETTING],
+                        |row| row.get::<_, bool>(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        assert!(has_legacy());
         let held = Some(Held {
             taken_at_ms: 1_762_000_000_000,
             since_ms: Some(1_763_000_000_000),
         });
-        assert_eq!(restored.opened_restored().unwrap(), held);
+        assert_eq!(restored.opened_restored(Some(first)).unwrap(), held);
+        assert!(!has_legacy());
         clock.set(1_763_000_500_000);
-        assert_eq!(restored.opened_restored().unwrap(), held);
-        assert_eq!(restored.held_for_import().unwrap(), held);
-        // An import lifts it, once.
-        let account = restored
-            .ensure_service_account("lastfm", "someone")
-            .unwrap();
-        assert!(restored.release_hold(account).unwrap());
-        assert!(!restored.release_hold(account).unwrap());
-        assert_eq!(restored.opened_restored().unwrap(), None);
+        assert_eq!(restored.opened_restored(Some(first)).unwrap(), held);
+        assert_eq!(restored.held_for_import(first).unwrap(), held);
+        assert_eq!(restored.held_for_import(second).unwrap(), held);
+        // An import for the first account lifts only its hold, leaving the
+        // second account held until it syncs too. Once the active account is
+        // released (or when signed out after first open), a dormant orphan
+        // hold stays persisted without re-reporting a restore on later starts.
+        assert!(restored.release_hold(first).unwrap());
+        assert!(!restored.release_hold(first).unwrap());
+        assert_eq!(restored.held_for_import(first).unwrap(), None);
+        assert_eq!(restored.held_for_import(second).unwrap(), held);
+        assert_eq!(restored.opened_restored(Some(first)).unwrap(), None);
+        assert_eq!(restored.opened_restored(None).unwrap(), None);
+        assert_eq!(restored.opened_restored(Some(second)).unwrap(), held);
+        assert!(restored.release_hold(second).unwrap());
+        assert!(!restored.release_hold(second).unwrap());
+        assert_eq!(restored.held_for_import(second).unwrap(), None);
+        assert_eq!(restored.opened_restored(Some(second)).unwrap(), None);
     }
 
     #[test]

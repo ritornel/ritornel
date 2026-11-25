@@ -42,8 +42,10 @@ use jiff::tz::{TimeZone, TimeZoneDatabase};
 /// Version 3 reads Spotify's streams, and joins a scrobble to the stream it
 /// is the report of by the stream matcher, which is part of the grouper: a
 /// change to the matcher is a new version, which derives every play again
-/// and refuses a dry run made before it.
-pub const GROUPER_VERSION: i64 = 3;
+/// and refuses a dry run made before it. Version 4 pairs same-second
+/// returning echoes 1-to-1 per `(endpoint, listen)` across distinct
+/// delivered listens.
+pub const GROUPER_VERSION: i64 = 4;
 
 /// How long after the end of a listen one that continues it may start and
 /// still be joined to it.
@@ -418,10 +420,11 @@ pub struct Import {
     pub source_item: i64,
     /// When the source dates it, in UTC.
     pub played_at_ms: i64,
-    /// The listen whose play this is the echo of: a play this library sent
-    /// to the source, recorded before it was sent, and matched exactly on
-    /// its time and names. `None` for a play of the source's own.
-    pub echo_of: Option<i64>,
+    /// The listens whose play this may be the echo of: deliveries this
+    /// library sent to the source, recorded before they were sent, and
+    /// matched exactly on their time and names, ordered by listen
+    /// observation. Empty for a play of the source's own.
+    pub echo_of: Vec<i64>,
     /// Its key at its endpoint, which orders it among ties.
     pub key: Vec<u8>,
     /// The artist and the title, as the source spelled them.
@@ -1082,13 +1085,105 @@ pub fn judge(rule: &PlayRule, ms_played: i64, track_ms: i64, ended: EndReason) -
     (counts, outcome)
 }
 
+/// Pairs returning echo imports with their delivered listens 1-to-1 per
+/// `(endpoint, listen)`, deterministically.
+///
+/// Non-excluded imports are visited before excluded imports (each group in
+/// ascending observation order) so an active scrobble takes precedence over
+/// an excluded duplicate (such as a `shifted_read` exclusion) competing for
+/// the same listen, while an exclude targeting a listen's only echo still
+/// joins and excludes that play. Each import's candidate listens are visited
+/// in ascending observation order, taking a free candidate directly before
+/// trying an augmenting path so earlier imports keep their earliest listen
+/// whenever a distinct listen is free while asymmetric name matches still
+/// achieve a maximum pairing.
+fn pair_echoes(
+    imports: &[&Import],
+    by_listen: &HashMap<i64, usize>,
+    excluded: &BTreeSet<i64>,
+) -> HashMap<i64, usize> {
+    let candidates: Vec<Vec<(i64, i64)>> = imports
+        .iter()
+        .map(|import| {
+            let mut list: Vec<(i64, i64)> = import
+                .echo_of
+                .iter()
+                .copied()
+                .filter(|listen| by_listen.contains_key(listen))
+                .map(|listen| (import.endpoint, listen))
+                .collect();
+            list.sort_unstable();
+            list.dedup();
+            list
+        })
+        .collect();
+
+    let mut matched_left: HashMap<(i64, i64), usize> = HashMap::new();
+
+    fn augment(
+        u: usize,
+        candidates: &[Vec<(i64, i64)>],
+        seen: &mut BTreeSet<(i64, i64)>,
+        matched_left: &mut HashMap<(i64, i64), usize>,
+    ) -> bool {
+        let Some(adj) = candidates.get(u) else {
+            return false;
+        };
+        for &right in adj {
+            if !matched_left.contains_key(&right) && seen.insert(right) {
+                matched_left.insert(right, u);
+                return true;
+            }
+        }
+        for &right in adj {
+            if !seen.insert(right) {
+                continue;
+            }
+            if let Some(prev) = matched_left.get(&right).copied()
+                && augment(prev, candidates, seen, matched_left)
+            {
+                matched_left.insert(right, u);
+                return true;
+            }
+        }
+        false
+    }
+
+    let order = (0..imports.len())
+        .filter(|&u| {
+            imports
+                .get(u)
+                .is_some_and(|i| !excluded.contains(&i.observation))
+        })
+        .chain((0..imports.len()).filter(|&u| {
+            imports
+                .get(u)
+                .is_some_and(|i| excluded.contains(&i.observation))
+        }));
+    for u in order {
+        if candidates.get(u).is_some_and(|list| !list.is_empty()) {
+            let mut seen = BTreeSet::new();
+            augment(u, &candidates, &mut seen, &mut matched_left);
+        }
+    }
+
+    matched_left
+        .into_iter()
+        .filter_map(|((_, listen), u)| {
+            let import = imports.get(u)?;
+            let play = *by_listen.get(&listen)?;
+            Some((import.observation, play))
+        })
+        .collect()
+}
+
 /// Derives the plays of these listens and imports: one play for each chain,
 /// in the order of each chain's first observation, then one for each import
 /// that is not an echo of one of those plays, in the order of their
-/// observations. An echo joins the play of the listen it echoes as a
-/// corroborating observation; of two imports that echo one listen, which
-/// only a repeated scrobble can make, the first joins and the other stands
-/// as a play of its own.
+/// observations. Returning echoes are paired 1-to-1 with their delivered
+/// listens as corroborating observations; any extra import beyond the
+/// matching delivered listens, which only a repeated scrobble can make,
+/// stands as a play of its own.
 pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
     let excluded = excluded(inputs.corrections);
     let overrides = RecordingOverrides::build(inputs.corrections);
@@ -1100,23 +1195,20 @@ pub fn derive(inputs: &Inputs<'_>) -> Vec<Play> {
         .collect();
     let mut imports: Vec<&Import> = inputs.imports.iter().collect();
     imports.sort_by_key(|import| import.observation);
-    let mut echoed = BTreeSet::new();
     let taken = derive_streams(inputs, &excluded, &overrides, &mut plays);
-    for import in imports {
-        if taken.contains(&import.observation) {
-            continue;
-        }
+    let remaining: Vec<&Import> = imports
+        .into_iter()
+        .filter(|import| !taken.contains(&import.observation))
+        .collect();
+    let paired = pair_echoes(&remaining, &by_listen, &excluded);
+    for import in remaining {
         let import_override = overrides.for_observation(
             import.observation,
             import.endpoint,
             import.source_item,
             import.played_at_ms,
         );
-        let joins = import
-            .echo_of
-            .and_then(|listen| by_listen.get(&listen).map(|at| (listen, *at)))
-            .filter(|(listen, _)| echoed.insert(*listen));
-        if let Some((_, at)) = joins
+        if let Some(&at) = paired.get(&import.observation)
             && let Some(play) = plays.get_mut(at)
         {
             play.observations
@@ -1226,7 +1318,7 @@ fn derive_streams(
             .iter()
             .filter(|import| {
                 import.listener == listener
-                    && import.echo_of.is_none()
+                    && import.echo_of.is_empty()
                     && !excluded.contains(&import.observation)
             })
             .collect();
