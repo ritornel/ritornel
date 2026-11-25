@@ -100,6 +100,9 @@ pub struct ListenRecord {
     /// only by a listen staged before the clock was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_mono_ms: Option<i64>,
+    /// The pause for a handoff whose release had not arrived at shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_mono_ms: Option<i64>,
     /// Why the track was queued.
     pub context_kind: String,
     /// What it was queued from.
@@ -301,7 +304,8 @@ const LISTEN_COLUMNS: &str = "o.id, o.endpoint_id, o.source_key, o.listener_id, 
     o.received_at_utc_ms, o.sent_mono_ms, o.sent_boot_id, o.clock_skew_ms, o.zone_name,
     l.started_at_utc_ms, l.ended_at_utc_ms, l.started_mono_ms, l.boot_id,
     l.continues_source_key, l.ms_played, l.track_duration_ms, l.end_reason, l.context_kind,
-    l.context_ref, l.shuffle, l.ended_mono_ms";
+    l.context_ref, l.shuffle, l.ended_mono_ms,
+    CASE WHEN l.end_reason='shutdown' THEN json_extract(o.payload_json,'$.handoffMonoMs') END";
 
 fn listen(row: &Row<'_>) -> rusqlite::Result<Listen> {
     let text = |column: usize| -> rusqlite::Result<String> { row.get(column) };
@@ -322,6 +326,7 @@ fn listen(row: &Row<'_>) -> rusqlite::Result<Listen> {
         ended_at_ms: row.get(11)?,
         started_mono_ms: row.get(12)?,
         ended_mono_ms: row.get(21)?,
+        handoff_mono_ms: row.get(22)?,
         boot: row.get(13)?,
         continues: row.get(14)?,
         ms_played: row.get(15)?,

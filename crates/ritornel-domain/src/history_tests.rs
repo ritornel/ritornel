@@ -34,6 +34,7 @@ fn listen(observation: i64, key: u8, ms_played: i64) -> Listen {
         started_at_ms,
         ended_at_ms,
         started_mono_ms: 5_000_000 + (started_at_ms - T0),
+        handoff_mono_ms: None,
         ended_mono_ms: Some(5_000_000 + (ended_at_ms - T0)),
         boot: BOOT,
         continues: None,
@@ -1180,4 +1181,22 @@ fn equal_second_returning_echoes_pair_one_to_one_deterministically() {
     assert!(!with_dup[0].excluded);
     assert_eq!(with_dup[1].observations, vec![(40, Role::Primary)]);
     assert!(with_dup[1].excluded);
+}
+
+#[test]
+fn a_move_and_a_local_restart_use_different_ends_of_a_listen_held_through_shutdown() {
+    let mut source = listen(1, 1, 100_000);
+    source.end_reason = EndReason::Shutdown;
+    source.handoff_mono_ms = source.ended_mono_ms;
+    source.ended_mono_ms = source.ended_mono_ms.map(|m| m + 2 * CHAIN_WINDOW_MS);
+    source.ended_at_ms += 2 * CHAIN_WINDOW_MS;
+    let mut next = listen(2, 2, 100_000);
+    next.continues = Some(source.source_key.clone());
+    next.endpoint = 2;
+    assert_eq!(chains(&[source.clone(), next.clone()]).len(), 1);
+    let delay = source.ended_at_ms - next.started_at_ms;
+    let mut after_shutdown = later(&next, delay + 1_000);
+    assert_eq!(chains(&[source.clone(), after_shutdown.clone()]).len(), 2);
+    after_shutdown.endpoint = source.endpoint;
+    assert_eq!(chains(&[source, after_shutdown]).len(), 1);
 }

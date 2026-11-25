@@ -8,9 +8,13 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackMoveParams {
+    /// Retry this move using the same key.
     pub idempotency_key: Id,
+    /// Player currently holding the queue.
     pub from: Id,
+    /// Player that should receive the queue.
     pub to: Id,
+    /// Stable ID of the current entry.
     pub entry_id: Id,
 }
 
@@ -19,9 +23,13 @@ pub struct PlaybackMoveParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffEntry {
+    /// Stable ID of the current entry.
     pub entry_id: Id,
+    /// Track appearance to play.
     pub appearance_id: Id,
+    /// How this track was queued.
     pub context: PlayContext,
+    /// Position in the shuffled play order, when enabled.
     pub shuffle_position: Option<i64>,
 }
 
@@ -30,15 +38,24 @@ pub struct HandoffEntry {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct HandoffSnapshot {
+    /// All entries in ordinary queue order.
     pub entries: Vec<HandoffEntry>,
+    /// Stable ID of the current entry.
     pub entry_id: Id,
-    pub position_ms: i64,
+    /// Playback position within the current entry.
+    pub position_ms: u64,
+    /// Whether to start playback when the queue arrives.
     pub playing: bool,
+    /// Whether to use the stored shuffle positions.
     pub shuffle: bool,
+    /// Repeat mode to carry with the queue.
     pub repeat: Repeat,
+    /// Source listen to continue when audio starts.
     pub listen: Option<Id>,
+    /// Library listener for the continued listen.
     pub listener: Option<Id>,
-    pub queue_revision: i64,
+    /// Source revision used to guard a delayed release.
+    pub queue_revision: u64,
 }
 
 /// A request on the player's authenticated connection to its hub.
@@ -65,8 +82,12 @@ pub enum LinkHandoffParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(tag = "step", rename_all = "camelCase")]
 pub enum HandoffResult {
+    /// The source is paused and still owns the queue.
     Taken { snapshot: HandoffSnapshot },
+    /// The destination committed its queue and receipt.
     Loaded,
-    Pending,
+    /// The destination retired this load attempt without accepting it.
+    NotLoaded,
+    /// The source handled the release.
     Released,
 }

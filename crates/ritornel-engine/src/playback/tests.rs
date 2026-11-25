@@ -3609,7 +3609,7 @@ fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_li
         dst.player
             .handoff(probe, &dst.server, &mut Vec::new())
             .unwrap(),
-        HandoffResult::Pending
+        HandoffResult::NotLoaded
     );
     let late = LinkHandoffParams::Load {
         movement,
@@ -3620,7 +3620,7 @@ fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_li
         dst.player
             .handoff(late, &dst.server, &mut Vec::new())
             .unwrap(),
-        HandoffResult::Pending
+        HandoffResult::NotLoaded
     );
     assert_eq!(dst.player.open_listen(), Some(replaced));
     let load = LinkHandoffParams::Load {
@@ -3744,4 +3744,61 @@ fn a_gapless_join_during_take_reports_the_next_track_and_leaves_it_playing() {
             .pause_count,
         0
     );
+}
+
+#[test]
+fn taking_an_entry_that_already_drained_leaves_its_successor_on_the_source() {
+    use ritornel_contract::{LinkHandoffParams, PlaybackMoveParams};
+    let mut rig = Rig::new();
+    rig.play(2);
+    let movement = PlaybackMoveParams {
+        idempotency_key: id(0xc4),
+        from: id(1),
+        to: id(2),
+        entry_id: rig.entry(),
+    };
+    rig.fake.advance(ALBUM[2].length_ms.unsigned_abs());
+    assert!(
+        rig.player
+            .handoff(
+                LinkHandoffParams::Take { movement },
+                &rig.server,
+                &mut Vec::new()
+            )
+            .is_err()
+    );
+    rig.tick();
+    assert_ne!(rig.entry(), movement.entry_id);
+    assert_eq!(rig.player.status(), Status::Playing);
+}
+
+#[test]
+fn a_shutdown_before_release_delivers_both_the_pause_and_the_actual_close() {
+    use ritornel_contract::{LinkHandoffParams, PlaybackMoveParams};
+    let mut rig = Rig::new();
+    rig.play(1);
+    rig.pass(1000);
+    let listen = rig.player.open_listen().unwrap();
+    let mono = rig.stamps().sent_mono_ms;
+    let movement = PlaybackMoveParams {
+        idempotency_key: id(0xce),
+        from: id(3),
+        to: id(4),
+        entry_id: rig.entry(),
+    };
+    rig.player
+        .handoff(
+            LinkHandoffParams::Take { movement },
+            &rig.server,
+            &mut Vec::new(),
+        )
+        .unwrap();
+    rig.wait(90_000);
+    rig.player.shutdown(&rig.server).unwrap();
+    assert_eq!(rig.deliver().delivered, [listen]);
+    let (pause, ended): (i64,i64) = rig.library.read(|db| Ok(db.query_row(
+        "SELECT json_extract(payload_json,'$.handoffMonoMs'), json_extract(payload_json,'$.endedMonoMs')
+         FROM history_observation WHERE source_key=?1", [listen.as_bytes()], |r| Ok((r.get(0)?,r.get(1)?)))?)).unwrap();
+    assert_eq!((pause, ended), (mono, mono + 90_000));
+    assert_eq!(rig.server.handoff_pause(listen).unwrap(), None);
 }

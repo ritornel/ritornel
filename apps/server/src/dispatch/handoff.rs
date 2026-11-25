@@ -1,9 +1,9 @@
 //! Hub coordination for moving a queue. See "Queue and session" in docs/internals/playback.md.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use ritornel_contract::{
     ErrorCode, HandoffResult, Id, LinkHandoffParams, PlaybackMoveParams, Receipt, ReceiptStatus,
@@ -23,22 +23,24 @@ const RELEASE_RETRY: Duration = Duration::from_secs(2);
 #[derive(Debug, Default)]
 pub(super) struct Moves {
     core: OnceLock<Weak<Core>>,
-    using: Mutex<HashSet<Id>>,
+    using: Mutex<HashMap<Id, Id>>,
+    finished: Condvar,
     wake: Notify,
     stopped: AtomicBool,
 }
 
-struct InUse<'a> {
+struct InUse<'a, const N: usize> {
     moves: &'a Moves,
-    places: [Id; 2],
+    places: [Id; N],
 }
 
-impl Drop for InUse<'_> {
+impl<const N: usize> Drop for InUse<'_, N> {
     fn drop(&mut self) {
         let mut using = lock(&self.moves.using);
         for id in self.places {
             using.remove(&id);
         }
+        self.moves.finished.notify_all();
     }
 }
 
@@ -50,18 +52,57 @@ fn busy() -> RpcError {
 }
 
 impl Moves {
-    fn claim(&self, m: PlaybackMoveParams) -> Option<InUse<'_>> {
-        let places = [m.from, m.to];
-        let mut using = lock(&self.using);
-        if places.iter().any(|p| using.contains(p)) {
+    /// Wait only for another invocation of this same command. Unrelated
+    /// controllers get a busy reply immediately when their players overlap.
+    fn claim<const N: usize>(
+        &self,
+        places: [Id; N],
+        key: Id,
+        wait: Duration,
+    ) -> Option<InUse<'_, N>> {
+        let using = lock(&self.using);
+        let (mut using, _) = self
+            .finished
+            .wait_timeout_while(using, wait, |using| {
+                !wait.is_zero()
+                    && places
+                        .iter()
+                        .filter_map(|p| using.get(p))
+                        .any(|k| *k == key)
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if places.iter().any(|p| using.contains_key(p)) {
             return None;
         }
-        using.extend(places);
+        using.extend(places.map(|p| (p, key)));
         Some(InUse {
             moves: self,
             places,
         })
     }
+
+    pub(super) fn player_available(&self) {
+        self.wake.notify_one();
+    }
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, RpcError> {
+    let time = deadline.saturating_duration_since(Instant::now());
+    if time.is_zero() {
+        Err(busy())
+    } else {
+        Ok(time.min(STEP_WAIT))
+    }
+}
+
+fn permanent(error: &RpcError) -> bool {
+    matches!(
+        error.kind(),
+        ErrorCode::Invalid
+            | ErrorCode::Forbidden
+            | ErrorCode::Unsupported
+            | ErrorCode::IdempotencyMismatch
+    )
 }
 
 fn stopping() -> RpcError {
@@ -143,7 +184,12 @@ impl Core {
         .ok_or_else(stopping)??
     }
 
-    fn handoff_step(&self, id: Id, p: LinkHandoffParams) -> Result<HandoffResult, RpcError> {
+    fn handoff_step(
+        &self,
+        id: Id,
+        p: LinkHandoffParams,
+        within: Duration,
+    ) -> Result<HandoffResult, RpcError> {
         let rt = self.runtime.as_ref().ok_or_else(stopping)?;
         if id == self.server_id {
             let core = self
@@ -154,7 +200,7 @@ impl Core {
                 .ok_or_else(stopping)?;
             rt.block_on(async {
                 tokio::time::timeout(
-                    STEP_WAIT,
+                    within,
                     tokio::task::spawn_blocking(move || core.local_handoff(p)),
                 )
                 .await
@@ -169,7 +215,7 @@ impl Core {
         } else {
             let wire = serde_json::to_value(p).map_err(|_| unexpected())?;
             let answer =
-                rt.block_on(self.call_player_within(id, "link.handoff", Some(wire), STEP_WAIT))?;
+                rt.block_on(self.call_player_within(id, "link.handoff", Some(wire), within))?;
             serde_json::from_value(answer).map_err(|_| unexpected())
         }
     }
@@ -189,7 +235,17 @@ impl Core {
         if receipt.status == ReceiptStatus::Done {
             return Ok(receipt);
         }
-        let claim = self.moves.claim(m).ok_or_else(busy)?;
+        // Leave a full second inside the uplink timeout. A resend may
+        // have to wait for a probe and then replay the two player steps.
+        let deadline = Instant::now() + Duration::from_secs(7);
+        let claim = self
+            .moves
+            .claim(
+                [m.from, m.to],
+                m.idempotency_key,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .ok_or_else(busy)?;
         // A pending source may still be released. Nor may a late load
         // overwrite another move on a destination whose answer was lost.
         for pending in self.move_store(ServerStore::pending_moves)? {
@@ -197,8 +253,16 @@ impl Core {
             if prior.from == m.from || prior.from == m.to || prior.to == m.from || prior.to == m.to
             {
                 let status = self.move_receipt(prior)?;
-                if prior == m && status.status == ReceiptStatus::Done {
-                    return Ok(status);
+                if prior == m {
+                    if status.status == ReceiptStatus::Done {
+                        return Ok(status);
+                    }
+                    if let Some(done) = self.probe_load(pending, remaining(deadline)?)? {
+                        drop(claim);
+                        self.moves.wake.notify_one();
+                        return Ok(done);
+                    }
+                    continue;
                 }
                 if prior.from == m.from
                     || prior.from == m.to
@@ -214,7 +278,7 @@ impl Core {
         if saved.status == ReceiptStatus::Done {
             return Ok(saved);
         }
-        let result = self.transfer(m);
+        let result = self.transfer(m, deadline);
         drop(claim);
         self.moves.wake.notify_one();
         result
@@ -230,10 +294,13 @@ impl Core {
             .ok_or_else(unexpected)
     }
 
-    fn transfer(&self, m: PlaybackMoveParams) -> Result<Receipt, RpcError> {
+    fn transfer(&self, m: PlaybackMoveParams, deadline: Instant) -> Result<Receipt, RpcError> {
         self.check_place(m.to)?;
-        let HandoffResult::Taken { snapshot } =
-            self.handoff_step(m.from, LinkHandoffParams::Take { movement: m })?
+        let HandoffResult::Taken { snapshot } = self.handoff_step(
+            m.from,
+            LinkHandoffParams::Take { movement: m },
+            remaining(deadline)?,
+        )?
         else {
             return Err(unexpected());
         };
@@ -250,20 +317,40 @@ impl Core {
                 attempt,
                 snapshot: Some(snapshot),
             },
+            remaining(deadline)?,
         );
         match reply {
             Ok(HandoffResult::Loaded) => self.move_store(|s| s.accepted_load(m)),
             Ok(_) => Err(unexpected()),
             Err(e) => {
-                if matches!(
-                    e.kind(),
-                    ErrorCode::Invalid | ErrorCode::Forbidden | ErrorCode::Unsupported
-                ) || e.data.details.get("reason").and_then(|v| v.as_str()) == Some("player_busy")
+                if permanent(&e)
+                    || e.data.details.get("reason").and_then(|v| v.as_str()) == Some("player_busy")
                 {
-                    self.move_store(|s| s.forget_release(pending))?;
+                    self.move_store(|s| s.forget_move(pending))?;
                 }
                 Err(e)
             }
+        }
+    }
+
+    fn probe_load(
+        &self,
+        journal: PendingMove,
+        within: Duration,
+    ) -> Result<Option<Receipt>, RpcError> {
+        let m = journal.movement;
+        let check = LinkHandoffParams::Load {
+            movement: m,
+            attempt: journal.attempt,
+            snapshot: None,
+        };
+        match self.handoff_step(m.to, check, within)? {
+            HandoffResult::Loaded => self.move_store(|s| s.accepted_load(m)).map(Some),
+            HandoffResult::NotLoaded => {
+                self.move_store(|s| s.forget_move(journal))?;
+                Ok(None)
+            }
+            _ => Err(unexpected()),
         }
     }
 
@@ -279,44 +366,39 @@ impl Core {
                 break;
             }
             let m = journal.movement;
-            let Some(_claim) = self.moves.claim(m) else {
-                pending = true;
-                continue;
-            };
             let result = (|| {
                 if self.move_receipt(m)?.status != ReceiptStatus::Done {
-                    let check = LinkHandoffParams::Load {
-                        movement: m,
-                        attempt: journal.attempt,
-                        snapshot: None,
-                    };
-                    match self.handoff_step(m.to, check)? {
-                        HandoffResult::Loaded => {
-                            self.move_store(|s| s.accepted_load(m))?;
-                        }
-                        HandoffResult::Pending => {
-                            self.move_store(|s| s.forget_release(journal))?;
-                            return Ok(());
-                        }
-                        _ => return Err(unexpected()),
+                    let _claim = self
+                        .moves
+                        .claim([m.from, m.to], m.idempotency_key, Duration::ZERO)
+                        .ok_or_else(busy)?;
+                    if self.move_receipt(m)?.status != ReceiptStatus::Done
+                        && self.probe_load(journal, STEP_WAIT)?.is_none()
+                    {
+                        return Ok(());
                     }
                 }
-                if self.handoff_step(m.from, LinkHandoffParams::Release { movement: m })?
-                    != HandoffResult::Released
+                let _source = self
+                    .moves
+                    .claim([m.from], m.idempotency_key, Duration::ZERO)
+                    .ok_or_else(busy)?;
+                if self.handoff_step(
+                    m.from,
+                    LinkHandoffParams::Release { movement: m },
+                    STEP_WAIT,
+                )? != HandoffResult::Released
                 {
                     return Err(unexpected());
                 }
-                self.move_store(|s| s.forget_release(journal))?;
+                self.move_store(|s| s.forget_move(journal))?;
                 Ok(())
             })();
             // A missing player or a definitive rejection ends this obligation.
             // An offline player can return: retain its journal until then.
             if let Err(e) = result {
-                if matches!(
-                    e.kind(),
-                    ErrorCode::Unsupported | ErrorCode::Invalid | ErrorCode::Forbidden
-                ) {
-                    pending |= self.move_store(|s| s.forget_release(journal)).is_err();
+                if permanent(&e) {
+                    tracing::warn!(movement = %m.idempotency_key, reason = %e.message, "ending a refused handoff");
+                    pending |= self.move_store(|s| s.forget_move(journal)).is_err();
                 } else {
                     pending = true;
                 }

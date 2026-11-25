@@ -1964,18 +1964,70 @@ export type GoneRow = {
 /**
  * An entry in queue order. Shuffle positions preserve the separate play order.
  */
-export type HandoffEntry = { entryId: string, appearanceId: string, context: PlayContext, shufflePosition: number | null,
+export type HandoffEntry = {
+  /**
+   * Stable ID of the current entry.
+   */
+  entryId: string,
+  /**
+   * Track appearance to play.
+   */
+  appearanceId: string,
+  /**
+   * How this track was queued.
+   */
+  context: PlayContext,
+  /**
+   * Position in the shuffled play order, when enabled.
+   */
+  shufflePosition: number | null,
 };
 
 /**
  * The durable outcome of a step, or a load whose receipt is still absent.
  */
-export type HandoffResult = { "step": "taken", snapshot: HandoffSnapshot, } | { "step": "loaded" } | { "step": "pending" } | { "step": "released" };
+export type HandoffResult = { "step": "taken", snapshot: HandoffSnapshot, } | { "step": "loaded" } | { "step": "notLoaded" } | { "step": "released" };
 
 /**
  * The source at the instant it paused. The listen key follows the music.
  */
-export type HandoffSnapshot = { entries: Array<HandoffEntry>, entryId: string, positionMs: number, playing: boolean, shuffle: boolean, repeat: Repeat, listen: string | null, listener: string | null, queueRevision: number,
+export type HandoffSnapshot = {
+  /**
+   * All entries in ordinary queue order.
+   */
+  entries: Array<HandoffEntry>,
+  /**
+   * Stable ID of the current entry.
+   */
+  entryId: string,
+  /**
+   * Playback position within the current entry.
+   */
+  positionMs: number,
+  /**
+   * Whether to start playback when the queue arrives.
+   */
+  playing: boolean,
+  /**
+   * Whether to use the stored shuffle positions.
+   */
+  shuffle: boolean,
+  /**
+   * Repeat mode to carry with the queue.
+   */
+  repeat: Repeat,
+  /**
+   * Source listen to continue when audio starts.
+   */
+  listen: string | null,
+  /**
+   * Library listener for the continued listen.
+   */
+  listener: string | null,
+  /**
+   * Source revision used to guard a delayed release.
+   */
+  queueRevision: number,
 };
 
 /**
@@ -4642,7 +4694,23 @@ export type PlaybackJumpParams = {
 /**
  * A move of one current queue entry between two places from `players.list`.
  */
-export type PlaybackMoveParams = { idempotencyKey: string, from: string, to: string, entryId: string,
+export type PlaybackMoveParams = {
+  /**
+   * Retry this move using the same key.
+   */
+  idempotencyKey: string,
+  /**
+   * Player currently holding the queue.
+   */
+  from: string,
+  /**
+   * Player that should receive the queue.
+   */
+  to: string,
+  /**
+   * Stable ID of the current entry.
+   */
+  entryId: string,
 };
 
 /**

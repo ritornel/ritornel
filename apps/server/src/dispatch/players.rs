@@ -415,6 +415,7 @@ impl Core {
             p.since_ms = now;
         }
         drop(peers);
+        self.moves.player_available();
         if known || presence.has_player {
             self.publish(&Event::Players);
         }

@@ -3095,13 +3095,20 @@ async fn moving_music_between_three_players_keeps_queue_order_position_and_one_r
         assert_eq!(receipt["status"], "done");
         assert_eq!(h.call_raw("playback.move", first).await.unwrap(), receipt);
         wait_empty(&h).await;
-        loop {
-            let state = d.call_raw("playback.get", json!({})).await.unwrap();
-            if state["status"] == "playing"
-                && state["positionMs"].as_u64().unwrap() > original["positionMs"].as_u64().unwrap()
-            {
-                break;
-            }
+        // A transferred position alone does not prove the destination has
+        // rendered a frame. Wait for the continued listen to open there.
+        let desk_db =
+            rusqlite::Connection::open(scratch.data_dir("desk").join("server.db")).unwrap();
+        while !desk_db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM listen_staging WHERE continues_listen_id IS NOT NULL
+             AND ended_at_utc_ms IS NULL)",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+        {
+            tokio::task::yield_now().await;
         }
         d.call_raw("playback.pause", json!({"idempotencyKey":key()}))
             .await
@@ -3148,6 +3155,38 @@ async fn moving_music_between_three_players_keeps_queue_order_position_and_one_r
             )
             .unwrap();
         assert_eq!(query, 3);
+
+        // Both the hub and Desk have released their part of the moved
+        // listen. Desk also closed the listen it was playing beforehand.
+        let history =
+            rusqlite::Connection::open(scratch.data_dir("hub").join("library.db")).unwrap();
+        while history
+            .query_row("SELECT count(*) FROM observation_listen", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+            < 3
+        {
+            tokio::task::yield_now().await;
+        }
+        let joined: i64 = history
+            .query_row(
+                "SELECT count(*) FROM (SELECT p.play_event_id FROM play_event_observation p
+             JOIN history_observation o ON o.id=p.observation_id GROUP BY p.play_event_id
+             HAVING count(DISTINCT o.endpoint_id)=2 AND count(*)=2)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(joined, 1);
+        let replaced: i64 = history
+            .query_row(
+                "SELECT count(*) FROM observation_listen WHERE end_reason='replaced'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(replaced, 1);
     })
     .await;
 }
@@ -3237,7 +3276,7 @@ async fn refused_load_preserves_the_source_and_an_unanswered_release_retries_on_
                     respond(&peer, r, Ok(json!({"step":"taken","snapshot":snapshot})));
                     break;
                 }
-                respond(&peer, r, Ok(json!({"step":"pending"})));
+                respond(&peer, r, Ok(json!({"step":"notLoaded"})));
             }
         });
         let receipt = receipt.unwrap();
@@ -3246,7 +3285,7 @@ async fn refused_load_preserves_the_source_and_an_unanswered_release_retries_on_
             if r.params.as_ref().unwrap()["step"] == "release" {
                 break;
             }
-            respond(&peer, r, Ok(json!({"step":"pending"})));
+            respond(&peer, r, Ok(json!({"step":"notLoaded"})));
         }
         drop(peer);
         drop(db);
@@ -3262,7 +3301,7 @@ async fn refused_load_preserves_the_source_and_an_unanswered_release_retries_on_
                 respond(&again, r, Ok(json!({"step":"released"})));
                 break;
             }
-            respond(&again, r, Ok(json!({"step":"pending"})));
+            respond(&again, r, Ok(json!({"step":"notLoaded"})));
         }
         assert_eq!(h.call_raw("playback.move", inbound).await.unwrap(), receipt);
     })
@@ -3326,13 +3365,21 @@ async fn recover_lost_load(destination_kept_queue: bool) {
                     .with_detail("reason", "no_player"),
             )
         };
-        again
-            .respond(Response {
-                id: Some(probe.id),
-                outcome,
-            })
-            .unwrap();
-        if !destination_kept_queue {
+        let answer = Response {
+            id: Some(probe.id),
+            outcome,
+        };
+        if destination_kept_queue {
+            let (retry, ()) = tokio::join!(
+                controller.call_raw("playback.move", movement.clone()),
+                async {
+                    tokio::task::yield_now().await;
+                    again.respond(answer).unwrap();
+                }
+            );
+            assert_eq!(retry.unwrap()["status"], "done");
+        } else {
+            again.respond(answer).unwrap();
             let db = rusqlite::Connection::open(scratch.data_dir("hub").join("server.db")).unwrap();
             while db
                 .query_row(

@@ -70,7 +70,7 @@ impl Player {
                         ),
                     };
                     if server.stored_result(probe)?.is_some() {
-                        HandoffResult::Pending
+                        HandoffResult::NotLoaded
                     } else if let Some(snapshot) = snapshot {
                         self.load(movement, command, snapshot, server, events)?;
                         HandoffResult::Loaded
@@ -78,10 +78,10 @@ impl Player {
                         server.record_command(
                             probe,
                             "link.handoff.probe",
-                            serde_json::to_string(&HandoffResult::Pending)?,
+                            serde_json::to_string(&HandoffResult::NotLoaded)?,
                             None,
                         )?;
-                        HandoffResult::Pending
+                        HandoffResult::NotLoaded
                     }
                 }
             }
@@ -96,12 +96,14 @@ impl Player {
                         receipt_request(command, "link.handoff.release", &HandoffResult::Released)?;
                     if matches!(server.taken(take)?, Some(HandoffResult::Taken { snapshot }) if self.still_taken(&snapshot))
                     {
+                        self.recorder.handoff_end = self.taken_at.take();
                         let done = self.clear_for(request, None, server, EndReason::Stopped)?;
                         events.extend(done.events);
                     } else {
                         self.receipt(server, request, Vec::new())?;
                     }
                 }
+                server.forget_take(take)?;
                 HandoffResult::Released
             }
         };
@@ -110,7 +112,7 @@ impl Player {
 
     fn still_taken(&self, s: &HandoffSnapshot) -> bool {
         self.status == Status::Paused
-            && self.queue_revision == s.queue_revision
+            && u64::try_from(self.queue_revision).ok() == Some(s.queue_revision)
             && self.entry().is_some_and(|e| e.entry_id == s.entry_id)
     }
 
@@ -121,7 +123,10 @@ impl Player {
         server: &ServerStore,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<HandoffResult, Error> {
-        if self.status == Status::Stopped || self.entry().is_none_or(|e| e.entry_id != m.entry_id) {
+        if self.ran_out.is_some()
+            || self.status == Status::Stopped
+            || self.entry().is_none_or(|e| e.entry_id != m.entry_id)
+        {
             return Err(Error::Invalid(
                 "that entry is no longer active at the source",
             ));
@@ -156,7 +161,7 @@ impl Player {
         let mut snapshot = HandoffSnapshot {
             entries,
             entry_id: m.entry_id,
-            position_ms: self.position(),
+            position_ms: self.position().unsigned_abs(),
             playing: self.status != Status::Paused,
             shuffle: self.queue.shuffled(),
             repeat: match self.repeat {
@@ -166,7 +171,7 @@ impl Player {
             },
             listen: self.open_listen().or(self.resume_listen),
             listener: self.listener,
-            queue_revision: self.queue_revision,
+            queue_revision: self.queue_revision.unsigned_abs(),
         };
         // Leave room for the load envelope, IDs, and the final position.
         if serde_json::to_vec(&snapshot)?.len() > (1 << 20) - 1024 {
@@ -175,7 +180,7 @@ impl Player {
             ));
         }
         self.pause_output(server, events, Some(m.entry_id))?;
-        snapshot.position_ms = self.position();
+        snapshot.position_ms = self.position().unsigned_abs();
         snapshot.listen = self.open_listen().or(self.resume_listen);
         let result = HandoffResult::Taken { snapshot };
         self.receipt(
@@ -183,7 +188,7 @@ impl Player {
             receipt_request(command, "link.handoff.take", &result)?,
             Vec::new(),
         )?;
-        self.recorder.handoff_end = self.open_listen().map(|id| {
+        self.taken_at = self.open_listen().map(|id| {
             (
                 id,
                 (self.setup.clock.now_ms(), self.setup.timekeeper.mono_ms()),
@@ -201,10 +206,11 @@ impl Player {
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
         use std::collections::HashSet;
+        let position =
+            i64::try_from(s.position_ms).map_err(|_| Error::Invalid("invalid handoff position"))?;
         let mut ids = HashSet::new();
         let mut positions = HashSet::new();
         if s.entry_id != m.entry_id
-            || s.position_ms < 0
             || s.entries.iter().any(|e| {
                 !ids.insert(e.entry_id)
                     || e.shuffle_position.is_some() != s.shuffle
@@ -256,7 +262,7 @@ impl Player {
             repeat: Some(repeat),
             volume: None,
             bump: true,
-            place: (current, s.position_ms, s.listen),
+            place: (current, position, s.listen),
             queue: QueueWrite {
                 clear: true,
                 insert: entries,
@@ -269,7 +275,7 @@ impl Player {
         self.listener = s.listener.or(self.listener);
         self.repeat = repeat;
         self.resume_listen = s.listen;
-        self.position_ms = s.position_ms;
+        self.position_ms = position;
         self.display = None;
         self.fetching = None;
         self.start_reason = StartReason::Resume;

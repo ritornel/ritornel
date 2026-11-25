@@ -82,11 +82,46 @@ impl ServerStore {
         })
     }
 
-    pub fn forget_release(&self, pending: PendingMove) -> Result<(), Error> {
+    pub fn forget_move(&self, pending: PendingMove) -> Result<(), Error> {
         self.transact(move |tx, _, _| {
             tx.execute(
                 "DELETE FROM server_setting WHERE key=?1 AND json_extract(value_json,'$.attempt')=?2",
                 (format!("move.{}", pending.movement.idempotency_key), pending.attempt.to_string()),
+            )?;
+            Ok(())
+        })
+    }
+
+    // A delayed release and a shutdown can race. Keep both instants so the
+    // local restart and the moved listen can each use the relevant one.
+    pub(super) fn save_handoff_pause(&self, id: Id, mono: i64) -> Result<(), Error> {
+        self.transact(move |tx, _, _| {
+            tx.execute(
+                "INSERT OR REPLACE INTO server_setting(key,value_json) VALUES(?1,?2)",
+                (format!("handoff.shutdown.{id}"), mono.to_string()),
+            )?;
+            Ok(())
+        })
+    }
+
+    pub(super) fn handoff_pause(&self, id: Id) -> Result<Option<i64>, Error> {
+        use rusqlite::OptionalExtension;
+        self.read(|db| {
+            Ok(db
+                .query_row(
+                    "SELECT CAST(value_json AS INTEGER) FROM server_setting WHERE key=?1",
+                    [format!("handoff.shutdown.{id}")],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
+    pub(super) fn forget_take(&self, take: Command) -> Result<(), Error> {
+        self.transact(move |tx, _, _| {
+            tx.execute(
+                "DELETE FROM server_setting WHERE key=?1",
+                [format!("handoff.take.{}", take.id)],
             )?;
             Ok(())
         })

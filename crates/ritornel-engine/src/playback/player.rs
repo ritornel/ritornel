@@ -383,6 +383,7 @@ pub struct Player {
     /// The listen a resume of the current entry continues.
     resume_listen: Option<Id>,
     start_handoff: bool,
+    taken_at: Option<(Id, (i64, i64))>,
     /// Why the next track loaded starts.
     start_reason: StartReason,
     listener: Option<Id>,
@@ -496,6 +497,7 @@ impl Player {
             output_failing: None,
             resume_listen: session.resume_listen,
             start_handoff: false,
+            taken_at: None,
             start_reason: StartReason::UserPick,
             listener,
             queue_revision: session.queue_revision,
@@ -1159,7 +1161,9 @@ impl Player {
             Status::Playing => {
                 self.renderer.pause();
                 self.take_in(events);
-                if expected.is_some_and(|id| self.entry().is_none_or(|e| e.entry_id != id)) {
+                if expected.is_some_and(|id| {
+                    self.ran_out.is_some() || self.entry().is_none_or(|e| e.entry_id != id)
+                }) {
                     self.renderer.play();
                     return Err(Error::Invalid("the source advanced while pausing"));
                 }
@@ -1194,7 +1198,7 @@ impl Player {
         }
         let mut events = Vec::new();
         self.sync(server, &mut events);
-        self.recorder.handoff_end = None;
+        self.taken_at = None;
         match (self.status, &self.loaded) {
             (Status::Playing | Status::Buffering, _) => {}
             (Status::Paused, Some(_)) => {
@@ -1281,6 +1285,7 @@ impl Player {
         library: Option<&dyn Catalog>,
         events: &mut Vec<PlayerEvent>,
     ) -> Result<(), Error> {
+        self.taken_at = None;
         self.seeks += 1;
         let Some(loaded) = self.loaded.clone() else {
             // Nothing is open to say how long it is, but the library may
@@ -1881,6 +1886,12 @@ impl Player {
         let mut events = Vec::new();
         self.sync(server, &mut events);
         self.renderer.pause();
+        if let Some((id, (_, mono))) = self
+            .taken_at
+            .filter(|(id, _)| Some(*id) == self.open_listen())
+        {
+            server.save_handoff_pause(id, mono)?;
+        }
         self.leave(server, EndReason::Shutdown, &mut events);
         if self.current.is_some() {
             self.status = Status::Paused;

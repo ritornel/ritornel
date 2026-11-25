@@ -389,6 +389,8 @@ pub struct Listen {
     pub started_mono_ms: i64,
     /// The same clock at the end, when the listen kept it.
     pub ended_mono_ms: Option<i64>,
+    /// When this player paused for a move, if shutdown preceded its release.
+    pub handoff_mono_ms: Option<i64>,
     /// The boot of the machine that clock counts from.
     pub boot: [u8; 16],
     /// The key of the listen this one resumes, possibly on another player.
@@ -955,7 +957,15 @@ fn gap(earlier: &Listen, later: &Listen) -> (i64, i64) {
     {
         return (later.started_mono_ms.saturating_sub(end), 0);
     }
-    let ((_, ended), (began, _)) = (span(earlier), span(later));
+    let ((started, mut ended), (began, _)) = (span(earlier), span(later));
+    if earlier.endpoint != later.endpoint
+        && earlier.end_reason == EndReason::Shutdown
+        && let Some(pause) = earlier.handoff_mono_ms
+        && let Some(end) = earlier.ended_mono_ms
+        && (earlier.started_mono_ms..=end).contains(&pause)
+    {
+        ended = started.saturating_add(pause.saturating_sub(earlier.started_mono_ms));
+    }
     (began.saturating_sub(ended), SKEW_TOLERANCE_MS)
 }
 

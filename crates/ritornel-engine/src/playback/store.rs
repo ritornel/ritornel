@@ -846,6 +846,10 @@ impl ServerStore {
                 "DELETE FROM listen_staging WHERE listen_id = ?1 AND ended_at_utc_ms IS NOT NULL",
                 [listen_id.as_bytes()],
             )?;
+            transaction.execute(
+                "DELETE FROM server_setting WHERE key=?1",
+                [format!("handoff.shutdown.{listen_id}")],
+            )?;
             Ok(())
         })
     }
