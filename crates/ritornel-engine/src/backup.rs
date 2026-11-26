@@ -10,11 +10,11 @@
 
 use std::path::Path;
 
-use rusqlite::OpenFlags;
+use rusqlite::{OpenFlags, OptionalExtension};
 
-use crate::Error;
 use crate::migrate::{self, Migration};
 use crate::sqlite::Location;
+use crate::{Error, Id};
 
 /// One of the two databases a data directory can hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,48 @@ pub fn pending_migrations(path: &Path, database: Database) -> Result<Option<Pend
     }
     let connection = Location::File(path.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     pending_in(&connection, database.migrations())
+}
+
+/// The ID the database at `path` records for itself: the server's in
+/// `server.db`, the library's in `library.db`. It is read before the file
+/// is opened to be migrated, so that a backup taken then says whose it is.
+/// A file that is missing or empty records none, as does one without the
+/// table or its row.
+///
+/// The file is only read.
+pub fn recorded_id(path: &Path, database: Database) -> Result<Option<Id>, Error> {
+    match std::fs::metadata(path) {
+        Ok(file) if file.len() == 0 => return Ok(None),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::Io(error)),
+    }
+    let (table, query) = match database {
+        Database::Server => (
+            "server_identity",
+            "SELECT server_id FROM server_identity WHERE id = 1",
+        ),
+        Database::Library => (
+            "library_meta",
+            "SELECT library_id FROM library_meta WHERE id = 1",
+        ),
+    };
+    let connection = Location::File(path.to_owned()).open(OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let made: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )?;
+    if !made {
+        return Ok(None);
+    }
+    let bytes = connection
+        .query_row(query, [], |row| row.get::<_, Option<Vec<u8>>>(0))
+        .optional()?
+        .flatten();
+    Ok(bytes
+        .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+        .map(Id::from_bytes))
 }
 
 fn pending_in(
@@ -294,6 +336,71 @@ mod tests {
         assert!(!restored.release_hold(second).unwrap());
         assert_eq!(restored.held_for_import(second).unwrap(), None);
         assert_eq!(restored.opened_restored(Some(second)).unwrap(), None);
+    }
+
+    #[test]
+    fn the_ids_a_database_records_are_read_without_changing_it() {
+        let scratch = Scratch::new("recorded");
+        let server = scratch.0.join("server.db");
+        let library = scratch.0.join("library.db");
+        // Missing, then empty: none.
+        assert_eq!(recorded_id(&server, Database::Server).unwrap(), None);
+        std::fs::write(&server, b"").unwrap();
+        assert_eq!(recorded_id(&server, Database::Server).unwrap(), None);
+        std::fs::remove_file(&server).unwrap();
+
+        // A database with none of the table: none.
+        rusqlite::Connection::open(&library)
+            .unwrap()
+            .execute_batch("CREATE TABLE other (id INTEGER)")
+            .unwrap();
+        assert_eq!(recorded_id(&library, Database::Library).unwrap(), None);
+        std::fs::remove_file(&library).unwrap();
+
+        // The table, but no row yet: none.
+        let mut db = rusqlite::Connection::open(&server).unwrap();
+        migrate::run(
+            &mut db,
+            &migrate::SERVER[..1],
+            &FixedClock::at(1_763_000_000_000),
+        )
+        .unwrap();
+        drop(db);
+        assert_eq!(recorded_id(&server, Database::Server).unwrap(), None);
+        std::fs::remove_file(&server).unwrap();
+
+        // A server that knows itself.
+        let store = open(&server);
+        let (identity, _) = store.ensure_identity("desk").unwrap();
+        drop(store);
+        assert_eq!(
+            recorded_id(&server, Database::Server).unwrap(),
+            Some(identity.server_id)
+        );
+
+        // A library at an older schema, which opening would migrate, and
+        // which reading leaves as it was.
+        let mut db = rusqlite::Connection::open(&library).unwrap();
+        migrate::run(
+            &mut db,
+            &migrate::LIBRARY[..2],
+            &FixedClock::at(1_763_000_000_000),
+        )
+        .unwrap();
+        db.execute_batch(include_str!("../saved/library/0002.sql"))
+            .unwrap();
+        drop(db);
+        let before = std::fs::read(&library).unwrap();
+        assert_eq!(
+            recorded_id(&library, Database::Library).unwrap(),
+            Some(Id::from_bytes([0x02; 16]))
+        );
+        assert!(
+            pending_migrations(&library, Database::Library)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(std::fs::read(&library).unwrap(), before);
     }
 
     #[test]
