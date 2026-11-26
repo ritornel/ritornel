@@ -146,7 +146,13 @@ fn run(
     if media_session {
         server.start_media_session(runtime.handle())?;
     }
-    info!(server_id = %server.server_id(), name = %server.name(), "ready");
+    let encoders = server
+        .encoders()
+        .iter()
+        .map(|id| format!("{} {}", id.family, id.version))
+        .collect::<Vec<_>>()
+        .join(", ");
+    info!(server_id = %server.server_id(), name = %server.name(), encoders, "ready");
     let ready = writeln!(
         out,
         "{} pid={} server_id={}",

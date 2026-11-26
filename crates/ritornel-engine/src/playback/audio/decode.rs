@@ -33,9 +33,9 @@ use crate::playback::renderer::{FileFacts, Format, RenderError, ReplayGain};
 
 /// What the output takes: its rate and its channels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OutputSpec {
-    pub(crate) rate: u32,
-    pub(crate) channels: usize,
+pub struct OutputSpec {
+    pub rate: u32,
+    pub channels: usize,
 }
 
 /// The input frames the resampler takes at a time.
@@ -70,6 +70,8 @@ pub(crate) struct Source {
     pub(crate) bad_packets: u64,
     /// Whether any packet decoded to frames.
     decoded: bool,
+    /// The first packet was read to discover the channel count.
+    buffered: bool,
     samples: Vec<f32>,
     /// Where in `samples` the frames to hand on begin.
     skip: usize,
@@ -93,16 +95,16 @@ const PEAK_HEADROOM: f32 = 0.891;
 /// A ReplayGain tag pair: the gain in decibels and the peak it was
 /// measured with, as a fraction of full scale.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct GainTag {
-    pub(crate) gain_db: Option<f32>,
-    pub(crate) peak: Option<f32>,
+pub struct GainTag {
+    pub gain_db: Option<f32>,
+    pub peak: Option<f32>,
 }
 
 /// A file's ReplayGain tags.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct GainTags {
-    pub(crate) track: GainTag,
-    pub(crate) album: GainTag,
+pub struct GainTags {
+    pub track: GainTag,
+    pub album: GainTag,
 }
 
 impl GainTag {
@@ -122,17 +124,20 @@ impl GainTags {
         }
     }
 
+    pub(crate) fn selected(&self, mode: ReplayGain) -> GainTag {
+        match mode {
+            ReplayGain::Off => GainTag::default(),
+            ReplayGain::Track => self.track,
+            ReplayGain::Album => self.album.or(self.track),
+        }
+    }
+
     /// The factor a track plays at for `mode`. Limited by the peak, less a
     /// decibel for what resampling adds between the samples, and with no
     /// peak tag never above unity, since then nothing says how far it may
     /// go. An untagged file plays unchanged.
     pub(crate) fn factor(&self, mode: ReplayGain) -> f32 {
-        let tag = match mode {
-            ReplayGain::Off => return 1.0,
-            ReplayGain::Track => self.track,
-            ReplayGain::Album if self.album.gain_db.is_some() => self.album,
-            ReplayGain::Album => self.track,
-        };
+        let tag = self.selected(mode);
         let Some(db) = tag.gain_db.filter(|db| db.is_finite()) else {
             return 1.0;
         };
@@ -445,6 +450,7 @@ impl Source {
             },
             bad_packets: 0,
             decoded: false,
+            buffered: false,
             #[cfg(test)]
             fails: opened
                 .path
@@ -512,6 +518,14 @@ impl Source {
         }
     }
 
+    /// Some containers declare their channel count only in the first packet.
+    pub(crate) fn discover_channels(&mut self) -> Result<(), RenderError> {
+        if self.channels == 0 {
+            self.buffered = self.next()?;
+        }
+        Ok(())
+    }
+
     /// The track's own rate and channels.
     pub(crate) fn spec(&self) -> (u32, usize) {
         (self.rate, self.channels)
@@ -531,6 +545,9 @@ impl Source {
         #[cfg(test)]
         if self.fails {
             return Err(RenderError::new("unreadable", "the test made it so"));
+        }
+        if std::mem::take(&mut self.buffered) {
+            return Ok(true);
         }
         if self.at_end {
             return Ok(false);
@@ -846,10 +863,8 @@ pub(crate) trait Stream {
 }
 
 /// A stream that is a sink and nothing more.
-#[cfg(test)]
 struct Sink<'a>(&'a mut dyn FnMut(&[f32]) -> bool);
 
-#[cfg(test)]
 impl Stream for Sink<'_> {
     fn write(&mut self, frames: &[f32]) -> bool {
         (self.0)(frames)
@@ -860,7 +875,6 @@ impl Stream for Sink<'_> {
 /// `sink`, until the track ends, `sink` returns false, or `stop` is set.
 /// The file is opened by the caller, so that an error in opening it is the
 /// caller's to report.
-#[cfg(test)]
 pub(crate) fn run(
     source: Source,
     to: OutputSpec,
@@ -951,4 +965,24 @@ pub(crate) fn run_joined(
         convert.finish(&mut |frames| stream.write(frames))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod channel_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn discovering_channels_preserves_the_first_packet() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio/a.flac");
+        let mut source = Source::open(&path, 0).unwrap();
+        source.channels = 0;
+        source.discover_channels().unwrap();
+        assert_eq!(source.spec(), (16_000, 1));
+        let first = source.frames().to_owned();
+        let packets = source.packets;
+        assert!(!first.is_empty());
+        assert!(source.next().unwrap());
+        assert_eq!(source.frames(), first);
+        assert_eq!(source.packets, packets);
+    }
 }

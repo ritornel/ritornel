@@ -501,6 +501,29 @@ fn with_gain_and_resampling_left_out_the_output_is_handed_the_decoded_samples_un
 }
 
 #[test]
+fn standalone_pcm_matches_the_player_with_each_dsp_stage() {
+    use crate::transcode::{Dsp, Pcm};
+    for gain in [ReplayGain::Off, ReplayGain::Track, ReplayGain::Album] {
+        for rate in [16_000, 12_000] {
+            let spec = OutputSpec { rate, channels: 1 };
+            let (played, _) = played(spec, gain, &["rg.flac"]);
+            let mut samples = Vec::new();
+            let dsp = Dsp {
+                replay_gain: gain,
+                max_rate_hz: Some(rate),
+            };
+            let pcm = Pcm::open(&fixture("rg.flac"), None).unwrap();
+            pcm.stream(dsp, &AtomicBool::new(false), &mut |block| {
+                samples.extend_from_slice(block);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(samples, played);
+        }
+    }
+}
+
+#[test]
 fn a_gapless_pair_of_flacs_joins_to_the_frame_into_the_whole_tone() {
     let (samples, counts) = played(AS_IS, ReplayGain::Off, &["g1.flac", "g2.flac"]);
     // Each track counts its own frames, and the join is where the cut was.

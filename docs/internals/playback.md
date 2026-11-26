@@ -30,6 +30,14 @@ output callback      rtrb ring → 20 ms fade, volume → cpal device (or null o
 - **Output loss and recovery:** If the output device cannot be opened, disappears mid-track, or stalls (`Progress::lost`), the player pauses in place without blaming or skipping tracks, ends the listen as `output_lost`, records `output.problem` (`since`, `detail`) in `PlaybackState`, and retries opening the output on demand (`OnDemand`) when play/resume is next requested. The output that failed is dropped, so a device that comes back is never played through by itself. Only the system default output is opened today; selecting a device or automatically following default-device changes is not yet built.
 - **Stalled output:** An output told to play that asks for no frames for `STALL` (5 s) counts as lost, with the detail "the output stopped taking sound". The callback stamps `Shared::asked_until` each time it runs, and `AudioRenderer` compares it with the time it was last told to play, so a slow decoder, which still gets callbacks that write silence, is never blamed on the output. A paused output is never counted as stalled. The listen ends with the frames the output took, at the time the last of them was done rather than when the stall was noticed; `output.problem.since` is when it was noticed.
 
+## Transcoding
+
+The engine's `transcode::Pcm` opens a master read-only and streams interleaved float samples through the same decoder, ReplayGain and resampler as playback. A profile can bake the track or album gain into the audio and cap its sample rate. `EncoderId::derivative_key` includes the audio hash, encoder family and version, adapter epoch, canonical profile and the selected ReplayGain tag values. Editing those tags can change a baked derivative’s key while the master’s audio hash stays the same.
+
+`LameEncoder` and `OpusEncoder` feed mono or stereo 24-bit PCM to the installed programs through stdin. Each encoder writes a seekable staged file so it can finalize gapless metadata. Successful encoding publishes a new file. Cancellation interrupts a stalled encoder. The caller owns crash cleanup of staging files and any durable sync it needs. The server probes the optional programs at startup and logs their versions. `FakeEncoder` hashes the stream for tests.
+
+`choose_source` ranks present masters in playback order. A lossless target can use an existing FLAC directly. Encoding uses the best lossless copy when available. For an all-lossy recording the target can accept a copy as-is or explicitly allow another encode. Otherwise selection returns `Blocked`.
+
 ## Copy selection
 
 Choosing which file to play for a track appearance is a pure function in `crates/ritornel-domain/src/selection.rs` (`select`):

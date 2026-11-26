@@ -124,7 +124,8 @@ pub struct Progress {
 
 /// Which ReplayGain tag a track plays at. See "Audio pipeline" in
 /// docs/internals/playback.md.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReplayGain {
     /// None: the samples as they are.
     #[default]

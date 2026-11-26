@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use ritornel_contract::local::Preparing;
 use ritornel_contract::{Id, SessionKind};
+use ritornel_engine::transcode::{Encoder, EncoderId, LameEncoder, OpusEncoder};
 use ritornel_engine::{Clock, Entropy, SQLITE_VERSION, ServerStore};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{info, warn};
@@ -21,6 +22,28 @@ use crate::preparing::Steps;
 use crate::server_json::ServerJson;
 use crate::ticket::Tickets;
 use crate::{Bounds, Error, Listen, Run, library, memory};
+
+async fn probe_encoders() -> Vec<EncoderId> {
+    let (lame, opus) = tokio::join!(
+        tokio::task::spawn_blocking(|| LameEncoder.probe()),
+        tokio::task::spawn_blocking(|| OpusEncoder.probe())
+    );
+    [("lame", lame), ("opusenc", opus)]
+        .into_iter()
+        .filter_map(|(family, result)| {
+            match result
+                .map_err(std::io::Error::other)
+                .and_then(|probe| probe)
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    warn!(family, %error, "audio encoder probe failed");
+                    None
+                }
+            }
+        })
+        .collect()
+}
 
 /// The name a new server gets. The owner renames it when there is a call to
 /// do that with.
@@ -61,6 +84,7 @@ impl Drop for Task {
 #[derive(Debug)]
 pub struct Server {
     core: Arc<Core>,
+    encoders: Vec<EncoderId>,
     /// The thread that runs jobs.
     worker: Worker,
     /// The player's control loop and the delivery of listens.
@@ -280,6 +304,7 @@ impl Server {
             log_level: run.log_level.unwrap_or(tracing::Level::INFO),
             origins: run.origins,
         });
+        let encoders = probe_encoders().await;
         let listening = Listening::start(Arc::clone(&core), tickets, listener, listen, bounds)?;
         info!(endpoint = %listening.endpoint(), "listening");
         if listen.is_private() {
@@ -309,6 +334,7 @@ impl Server {
         )?;
         drop(steps);
         Ok(Self {
+            encoders,
             transports: Transports(Arc::clone(&core)),
             worker,
             playback,
@@ -323,6 +349,11 @@ impl Server {
             server_json,
             _held: held,
         })
+    }
+
+    /// Encoder programs discovered on this machine at startup.
+    pub fn encoders(&self) -> &[EncoderId] {
+        &self.encoders
     }
 
     /// The server's ID.

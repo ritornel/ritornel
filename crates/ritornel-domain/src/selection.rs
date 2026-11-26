@@ -34,16 +34,19 @@ pub fn select(candidates: &[Candidate]) -> Vec<Candidate> {
         .filter(|candidate| !candidate.missing)
         .cloned()
         .collect();
-    chosen.sort_by(|a, b| {
-        b.lossless
-            .cmp(&a.lossless)
-            .then(b.sample_rate_hz.cmp(&a.sample_rate_hz))
-            .then(b.bit_depth.cmp(&a.bit_depth))
-            .then(b.bitrate_kbps.cmp(&a.bitrate_kbps))
-            .then(a.asset.cmp(&b.asset))
-            .then(a.source_item.cmp(&b.source_item))
-    });
+    chosen.sort_by(preference);
     chosen
+}
+
+/// How two present masters rank, best first, for playback or encoding.
+pub fn preference(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    b.lossless
+        .cmp(&a.lossless)
+        .then(b.sample_rate_hz.cmp(&a.sample_rate_hz))
+        .then(b.bit_depth.cmp(&a.bit_depth))
+        .then(b.bitrate_kbps.cmp(&a.bitrate_kbps))
+        .then(a.asset.cmp(&b.asset))
+        .then(a.source_item.cmp(&b.source_item))
 }
 
 #[cfg(test)]

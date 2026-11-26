@@ -7,6 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Private staging for seekable encoder output.
+tempfile = "3.27.0"
 # The public ID type: an ID is what a client sees, so the contract owns it.
 ritornel-contract.workspace = true
 ritornel-domain.workspace = true
@@ -81,11 +83,6 @@ default = ["audio-output"]
 # (macOS, Linux and Windows). Without it, a server can still play into the null
 # output, which discards what it is given.
 audio-output = ["dep:cpal"]
-
-[dev-dependencies]
-# A folder of its own for each test, named at random and created only if
-# it is new, so no test finds another's.
-tempfile = "3.27.0"
 
 [lints]
 workspace = true
