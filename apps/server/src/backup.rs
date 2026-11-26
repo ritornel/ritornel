@@ -869,7 +869,7 @@ fn fill(
         "takenAt": crate::logs::utc(at_ms),
         "takenAtMs": at_ms,
         "reason": reason.as_str(),
-        "serverVersion": env!("CARGO_PKG_VERSION"),
+        "serverVersion": env!("RITORNEL_VERSION_DISPLAY"),
         "serverId": about.server_id,
         "libraryId": about.library_id,
         "schemas": { "server": about.server_schema, "library": about.library_schema },
@@ -965,6 +965,7 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(first.path.join("backup.json")).unwrap())
                 .unwrap();
+        assert_eq!(manifest["serverVersion"], env!("RITORNEL_VERSION_DISPLAY"));
         assert_eq!(manifest["reason"], "on_demand");
         // The two databases are copied one after the other, and the README
         // says what that means for a listen heard meanwhile.

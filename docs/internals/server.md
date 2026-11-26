@@ -215,12 +215,24 @@ The name setting is described under "Server name" above.
 
 Logs (`apps/server/src/logs.rs`) write daily-rotated JSON lines under `<data-dir>/logs/`, stamped with `boot_id` and correlation IDs where applicable, without logging secrets. `ritornelctl status` reports server/contract/SQLite/schema versions, role, library revision, job counts, outbox depth and oldest age, free disk space, log path, backup configuration, watch state, and record health.
 
+## Build identity
+
+The server, `ritornelctl`, and the desktop app each run `crates/ritornel-build` from their Cargo build script. A clean checkout tagged `v0.1.0` reports `0.1.0` when that is the package version. Three commits later it reports, for example, `0.1.0+dev.3.a1b2c3d4`. These SemVer build metadata leave version precedence unchanged. Tracked edits append `.dirty`, including on the tag itself (`0.1.0+dev.0.a1b2c3d4.dirty`). Untracked files do not count.
+
+A development build omits the distance if the package tag is missing or unreachable, if a shallow checkout cannot supply full history, or if any other `v*` tag points at HEAD. The commit is the first eight lowercase hex digits of the SHA, or `unknown` if the SHA is unavailable or invalid.
+
+For sandboxed builds, a nonempty `RITORNEL_BUILD_COMMIT` supplies the SHA and disables Git discovery. `RITORNEL_BUILD_TAG` names the release tag, and `RITORNEL_BUILD_DISTANCE` gives the number of commits since that tag. A matching tag with no distance means an exact tag. A commit alone gives `0.1.0+dev.a1b2c3d4`. Set `RITORNEL_BUILD_DIRTY` to `1` for tracked edits or `0` for a clean tree (the default). With an empty or unset commit, Git supplies all inputs.
+
+The helper emits `RITORNEL_VERSION_DISPLAY`, `RITORNEL_VERSION_COMMIT`, and `RITORNEL_VERSION_DIRTY` (`0` or `1`). The display version appears in both command-line programs' `--version`, the server's startup log, `server.hello` from each client or satellite, the backup manifest's `serverVersion`, and the desktop About panel. The server reports it in `server.status`, which supplies the server version shown by clients. Last.fm and MusicBrainz HTTP user agents and the Spotify import reader identifier use the plain package version.
+
+Cargo watches all four build inputs. In Git mode it also watches the worktree's HEAD reflog and the common repository's packed refs and tags directory when they exist. Editing a tracked file alone can leave the cached dirty flag stale. Fresh builds read the current tree, and install or CI scripts can pass explicit build inputs for a reproducible stamp. `mise run build-version`, part of `mise run check`, requires the root workspace and desktop package versions to match and checks every exact `v*` tag against that version.
+
 ## Workspace and tooling
 
 - **One-way dependencies:** Enforced by `scripts/check-deps.py` in `mise run deps` (see [`ARCHITECTURE.md`](../../ARCHITECTURE.md)).
 - **Thin binary over library:** `apps/server` exposes a library crate (`ritornel-server`) beneath a minimal `main.rs`, allowing integration and contract tests to run a real listener in-process with injected clocks, entropy, and fake media sessions.
 - **Authoritative toolchain pins:** `rust-toolchain.toml` pins the Rust toolchain; `mise.toml` enables `idiomatic_version_file_enable_tools = ["rust"]` so `mise` reads `rust-toolchain.toml` without overriding it, and pins `python`, `conda:ffmpeg`, `aqua:EmbarkStudios/cargo-deny` and `aqua:nextest-rs/nextest/cargo-nextest`.
-- **One `mise run check` on every system:** The checks that are not Cargo's (`scripts/check-deps.py`, `scripts/check-test-sleeps.py`, `scripts/check-contract.py` with its own test `scripts/check-contract-tests.py`, and `scripts/check-docs.py`) are Python scripts run with the Python `mise.toml` pins, so `mise run check` runs the same code on macOS, Linux and Windows, where `mise` runs tasks through `cmd.exe`. Only `desktop:check` has a Windows form of its own (`run_windows`, `scripts/desktop.ps1`), since building the desktop app differs there. The scripts read files and Git's output as UTF-8 and report paths with `/` on every system.
+- **One `mise run check` on every system:** The checks that are not Cargo's (`scripts/check-deps.py`, `scripts/check-test-sleeps.py`, `scripts/check-build-version.py`, `scripts/check-contract.py` with its own test `scripts/check-contract-tests.py`, and `scripts/check-docs.py`) are Python scripts run with the Python `mise.toml` pins, so `mise run check` runs the same code on macOS, Linux and Windows, where `mise` runs tasks through `cmd.exe`. Only `desktop:check` has a Windows form of its own (`run_windows`, `scripts/desktop.ps1`), since building the desktop app differs there. The scripts read files and Git's output as UTF-8 and report paths with `/` on every system.
 
 ## Testing
 

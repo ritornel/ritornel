@@ -121,7 +121,7 @@ Exit codes:
 
 /// The command line, as clap reads it.
 #[derive(Debug, PartialEq, Parser)]
-#[command(name = "ritornel-server", version, propagate_version = true)]
+#[command(name = "ritornel-server", version = env!("RITORNEL_VERSION_DISPLAY"), propagate_version = true)]
 #[command(disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
@@ -280,7 +280,7 @@ fn try_run(
             out,
             "{} {}",
             env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION")
+            env!("RITORNEL_VERSION_DISPLAY")
         )
         .map_err(Error::Output),
         Err(error) => Err(usage(&error)),
@@ -482,7 +482,7 @@ mod tests {
             assert_eq!(code, 0, "{line:?}");
             assert_eq!(
                 out,
-                concat!("ritornel-server ", env!("CARGO_PKG_VERSION"), "\n")
+                concat!("ritornel-server ", env!("RITORNEL_VERSION_DISPLAY"), "\n")
             );
         }
     }

@@ -94,7 +94,7 @@ impl Net {
                 presence: None,
                 name: "ritornel-desktop-gpui".to_owned(),
                 kind: ClientKind::Desktop,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
+                version: env!("RITORNEL_VERSION_DISPLAY").to_owned(),
                 contract_version: CONTRACT_VERSION,
             })
             .await?;

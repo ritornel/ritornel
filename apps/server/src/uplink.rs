@@ -344,7 +344,7 @@ impl Uplink {
                 presence,
                 name,
                 kind: ClientKind::Server,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
+                version: env!("RITORNEL_VERSION_DISPLAY").to_owned(),
                 contract_version: CONTRACT_VERSION,
             })
             .await

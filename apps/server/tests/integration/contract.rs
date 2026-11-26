@@ -258,7 +258,7 @@ async fn the_status_reports_versions_role_and_server_id(via: Via) {
     assert_eq!(status.server_id, running.server.server_id());
     assert_eq!(status.name, "Ritornel server");
     assert_eq!(status.role, ServerRole::Unassigned);
-    assert_eq!(status.versions.server, env!("CARGO_PKG_VERSION"));
+    assert_eq!(status.versions.server, env!("RITORNEL_VERSION_DISPLAY"));
     assert_eq!(status.versions.contract, CONTRACT_VERSION);
     assert_eq!(status.versions.sqlite, "3.54.1");
     assert_eq!(

@@ -80,7 +80,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             ("Server ID", server_id.as_str()),
             ("Name", "Invented Desk"),
             ("Role", "unassigned"),
-            ("Server version", env!("CARGO_PKG_VERSION")),
+            ("Server version", env!("RITORNEL_VERSION_DISPLAY")),
             ("Contract version", contract.as_str()),
             ("SQLite version", "3.54.1"),
             ("Server schema", "3"),
@@ -125,7 +125,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             "name": "Invented Desk",
             "role": "unassigned",
             "versions": {
-                "server": env!("CARGO_PKG_VERSION"),
+                "server": env!("RITORNEL_VERSION_DISPLAY"),
                 "contract": ritornel_client::contract::CONTRACT_VERSION,
                 "sqlite": "3.54.1",
                 "serverSchema": 3,

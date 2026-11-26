@@ -66,7 +66,7 @@ pub(crate) fn serve(args: &ServeArgs, env: Env<'_>, out: &mut dyn Write) -> Resu
         Arc::clone(&clock),
     )?;
     info!(
-        version = env!("CARGO_PKG_VERSION"),
+        version = env!("RITORNEL_VERSION_DISPLAY"),
         pid = std::process::id(),
         data_dir = %held.dir().root().display(),
         owned = args.owned,

@@ -1392,7 +1392,7 @@ impl Core {
             name,
             role,
             versions: Versions {
-                server: env!("CARGO_PKG_VERSION").to_owned(),
+                server: env!("RITORNEL_VERSION_DISPLAY").to_owned(),
                 contract: CONTRACT_VERSION,
                 sqlite: SQLITE_VERSION.to_owned(),
                 server_schema: self.schema_version,
@@ -1903,7 +1903,7 @@ mod tests {
                 "name": "desk",
                 "role": "unassigned",
                 "versions": {
-                    "server": env!("CARGO_PKG_VERSION"),
+                    "server": env!("RITORNEL_VERSION_DISPLAY"),
                     "contract": CONTRACT_VERSION,
                     "sqlite": "3.54.1",
                     "serverSchema": ritornel_engine::SERVER_SCHEMA_VERSION,
@@ -2046,7 +2046,7 @@ mod tests {
         assert_eq!(
             status["versions"],
             json!({
-                "server": env!("CARGO_PKG_VERSION"),
+                "server": env!("RITORNEL_VERSION_DISPLAY"),
                 "contract": CONTRACT_VERSION,
                 "sqlite": "3.54.1",
                 "serverSchema": ritornel_engine::SERVER_SCHEMA_VERSION,

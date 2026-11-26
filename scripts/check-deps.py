@@ -66,6 +66,7 @@ forbid("ritornelctl", "ritornel-engine", "rusqlite")
 forbid("ritornel-client", "ritornel-engine", "rusqlite")
 forbid("ritornel-desktop-gpui", "ritornel-engine", "rusqlite", manifest="apps/desktop/Cargo.toml")
 
+only("ritornel-build")
 only("ritornel-contract")
 only("ritornel-domain", "ritornel-contract")
 forbid("ritornel-domain", "rusqlite")

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/ritornel-build",
     "crates/ritornel-contract",
     "crates/ritornel-domain",
     "crates/ritornel-engine",
@@ -28,6 +29,7 @@ publish = false
 # source <- engine, and source <- each plugin <- server, and no plugin
 # depends on the engine. `scripts/check-deps.py` enforces it. See "Workspace and tooling" in docs/internals/server.md.
 [workspace.dependencies]
+ritornel-build = { path = "crates/ritornel-build" }
 ritornel-contract = { path = "crates/ritornel-contract" }
 ritornel-domain = { path = "crates/ritornel-domain" }
 ritornel-engine = { path = "crates/ritornel-engine" }

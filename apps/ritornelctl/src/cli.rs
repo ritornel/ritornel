@@ -548,7 +548,7 @@ impl From<ritornel_client::Error> for Error {
 
 /// The command line, as clap reads it.
 #[derive(Debug, PartialEq, Eq, Parser)]
-#[command(name = "ritornelctl", version, propagate_version = true)]
+#[command(name = "ritornelctl", version = env!("RITORNEL_VERSION_DISPLAY"), propagate_version = true)]
 #[command(disable_help_subcommand = true)]
 struct Cli {
     #[arg(long, global = true, value_name = "name")]
@@ -1228,7 +1228,7 @@ fn try_run(
                 out,
                 "{} {}",
                 env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
+                env!("RITORNEL_VERSION_DISPLAY")
             )
             .map_err(Error::Output);
         }
@@ -1874,7 +1874,7 @@ mod tests {
             assert_eq!(code, 0, "{line:?}");
             assert_eq!(
                 out,
-                concat!("ritornelctl ", env!("CARGO_PKG_VERSION"), "\n")
+                concat!("ritornelctl ", env!("RITORNEL_VERSION_DISPLAY"), "\n")
             );
         }
     }

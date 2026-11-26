@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -89,6 +90,7 @@ jobs:
       - run: mise run fmt
       - run: mise run deps
       - run: mise run sleeps
+      - run: mise run build-version
       # A pull request's contract version is checked against main's, where the
       # pull request leaves it. origin/main was fetched in the step above.
       - if: github.event_name == 'pull_request'
