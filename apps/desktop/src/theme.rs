@@ -114,18 +114,43 @@ pub(crate) fn cover_shadow() -> Rgba {
     pick((0x00000061, 0x28261e38))
 }
 
-/// The share of the accent in a lit button's ground (`bar.rs`).
+/// The share of the accent in the ground of what is lit: a button of the
+/// player bar (`bar.rs`), the title bar's tab (`frame.rs`).
 pub(crate) const LIT_TINT: f32 = 0.14;
 
-/// The grounds the accent is read on, in each appearance.
-const DARK_LOOK: Look = Look {
+/// The ground of what is lit: the accent at `LIT_TINT`, over whatever
+/// ground it is on.
+pub(crate) fn lit() -> Rgba {
+    Rgba {
+        a: LIT_TINT,
+        ..acc()
+    }
+}
+
+/// The words of what is lit among words in `dim`, as the title bar's tab
+/// is: the accent, or the ink where the accent is a grey, which would not
+/// stand out from them.
+pub(crate) fn lit_words() -> Rgba {
+    let accent = acc();
+    if accent::has_hue(accent) {
+        accent
+    } else {
+        ink()
+    }
+}
+
+/// How each appearance wears the system's accent, and the grounds it is
+/// read on. In the dark the chroma is about the most that every hue can
+/// show in sRGB at that lightness, so a green keeps as much of itself as a
+/// blue and no accent is louder than another.
+pub(crate) const DARK_LOOK: Look = Look {
     lightness: 0.76,
-    chroma: 0.07,
+    chroma: 0.12,
     toward: 1.,
     grounds: &[BG.0, BAR_BG.0, SURF.0, RAISED.0],
     tint: LIT_TINT,
 };
-const LIGHT_LOOK: Look = Look {
+pub(crate) const LIGHT_LOOK: Look = Look {
     lightness: 0.55,
     chroma: 0.18,
     toward: 0.,
@@ -556,6 +581,8 @@ mod tests {
     #[test]
     fn with_no_system_accent_the_palette_keeps_its_own() {
         assert_eq!(accents(None), ACC);
+        // And its own has a hue for what is lit to wear.
+        assert!(accent::has_hue(rgba(ACC.0)) && accent::has_hue(rgba(ACC.1)));
     }
 
     #[test]

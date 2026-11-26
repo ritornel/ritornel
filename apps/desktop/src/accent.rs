@@ -3,13 +3,13 @@
 //! docs/internals/desktop.md).
 //!
 //! The accent marks what is lit: a star, the seek bar held, the song
-//! playing, a switch's label. It is read as text and lines on the app's
-//! grounds, so it keeps the system's hue and little else. Its lightness is
-//! the palette's own, its chroma at most the palette's, and it is moved
-//! away from the grounds until it reads at `CONTRAST` on each. A grey
-//! accent, as a Mac's Graphite, stays grey. The work is done in Oklab,
-//! where lightness and chroma are what the eye sees, and contrast is
-//! WCAG 2's.
+//! playing, the tab open, a switch's label. It is read as text and lines
+//! on the app's grounds, so it keeps the system's hue and as much of its
+//! chroma as the appearance allows. Its lightness is the palette's own,
+//! and it is moved away from the grounds until it reads at `CONTRAST` on
+//! each. A grey accent, as a Mac's Graphite, stays grey. The work is done
+//! in Oklab, where lightness and chroma are what the eye sees, and
+//! contrast is WCAG 2's.
 
 use gpui::{Rgba, rgba};
 
@@ -61,6 +61,16 @@ pub(crate) fn control(accent: Rgba) -> Rgba {
     readable(Rgba { a: 1., ..accent }, 0., |color| {
         contrast(color, rgba(0xffffffff)) >= CONTROL_CONTRAST
     })
+}
+
+/// The chroma under which a colour reads as a grey, as a Mac's Graphite
+/// does and GNOME's slate.
+const GREY: f32 = 0.04;
+
+/// Whether `color` has a hue to be told by, beside words in greys.
+pub(crate) fn has_hue(color: Rgba) -> bool {
+    let [_, chroma, _] = oklch(color);
+    chroma >= GREY
 }
 
 /// `color`, its lightness moved step by step toward `toward` until `reads`
@@ -210,31 +220,21 @@ pub(crate) fn from_portal((r, g, b): (f64, f64, f64)) -> Option<Rgba> {
 mod tests {
     use super::*;
 
-    const DARK_GROUNDS: &[u32] = &[0x1b1c1fff, 0x202125ff, 0x232428ff, 0x2d2e33ff];
-    const LIGHT_GROUNDS: &[u32] = &[0xf7f8faff, 0xf1f3f6ff, 0xedeff3ff, 0xffffffff];
-    const DARK: Look = Look {
-        lightness: 0.76,
-        chroma: 0.07,
-        toward: 1.,
-        grounds: DARK_GROUNDS,
-        tint: 0.14,
-    };
-    const LIGHT: Look = Look {
-        lightness: 0.55,
-        chroma: 0.18,
-        toward: 0.,
-        grounds: LIGHT_GROUNDS,
-        tint: 0.14,
-    };
+    // The palette's own looks: what is checked is what the app wears.
+    use crate::theme::{DARK_LOOK as DARK, LIGHT_LOOK as LIGHT};
 
     /// Accents the systems offer, bright and pale ones among them.
     const ACCENTS: &[u32] = &[
         0x007affff, // a Mac's blue
-        0xffc600ff, // a Mac's yellow
-        0xff5257ff, // a Mac's red
-        0x62ba46ff, // a Mac's green
+        0xa550a7ff, // a Mac's purple
         0xf74f9eff, // a Mac's pink
+        0xff5257ff, // a Mac's red
+        0xf7821bff, // a Mac's orange
+        0xffc600ff, // a Mac's yellow
+        0x62ba46ff, // a Mac's green
         0x8c8c8cff, // a Mac's Graphite
+        0x28c840ff, // a bright green
+        0xff2d55ff, // a bright pink
         0x0078d4ff, // Windows' default
         0xffff00ff, // pure yellow
         0x00ffffff, // pure cyan
@@ -298,17 +298,80 @@ mod tests {
         assert!(hex(yellow) != 0xffc600ff && chroma > 0.05);
     }
 
+    /// The systems' vivid accents, one of each hue.
+    const VIVID: &[u32] = &[
+        0x007affff, // blue
+        0xaf52deff, // purple
+        0xff2d55ff, // pink
+        0xff5257ff, // red
+        0xff9500ff, // orange
+        0xffc600ff, // yellow
+        0x28c840ff, // green
+    ];
+
+    /// What rounding a colour to bytes can add to its chroma or its
+    /// lightness, or take away.
+    const ROUNDING: f32 = 3e-3;
+
+    /// How far apart two hues are, in radians.
+    fn turned(a: f32, b: f32) -> f32 {
+        let turned = (a - b).rem_euclid(std::f32::consts::TAU);
+        turned.min(std::f32::consts::TAU - turned)
+    }
+
     #[test]
     fn an_accent_keeps_its_hue_and_is_calmed() {
         for look in [DARK, LIGHT] {
-            for accent in [0x007affff, 0xff5257ff, 0x62ba46ff] {
-                let [_, system_chroma, system_hue] = oklch(rgba(accent));
-                let [_, chroma, hue] = oklch(derive(rgba(accent), &look));
-                assert!(chroma <= look.chroma.min(system_chroma) + 1e-3);
-                let turned = (hue - system_hue).rem_euclid(std::f32::consts::TAU);
-                let turned = turned.min(std::f32::consts::TAU - turned);
+            for accent in VIVID {
+                let [_, system_chroma, system_hue] = oklch(rgba(*accent));
+                let [_, chroma, hue] = oklch(derive(rgba(*accent), &look));
+                // Never more than the look's, but for the rounding to bytes.
+                assert!(chroma <= look.chroma.min(system_chroma) + ROUNDING);
+                let turned = turned(hue, system_hue);
                 assert!(turned < 0.05, "{accent:08x} turned by {turned}");
             }
+        }
+    }
+
+    #[test]
+    fn a_vivid_accent_stays_vivid_in_the_dark() {
+        for accent in VIVID {
+            let [_, chroma, _] = oklch(derive(rgba(*accent), &DARK));
+            // All of what the look allows, which is well clear of a pastel.
+            assert!(
+                (chroma - DARK.chroma).abs() < ROUNDING && chroma > 0.1,
+                "{accent:08x} kept {chroma}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_hue_is_louder_than_another_in_the_dark() {
+        // Round the wheel, each hue as vivid as sRGB shows it: every one
+        // keeps the look's chroma at the look's lightness, so none had to
+        // be lightened, and paled, to be read.
+        for degrees in (0..360).step_by(5) {
+            let hue = (degrees as f32).to_radians();
+            let [lightness, chroma, _] = oklch(derive(shown(0.7, 0.4, hue), &DARK));
+            assert!(
+                (chroma - DARK.chroma).abs() < ROUNDING,
+                "{degrees}°: {chroma}"
+            );
+            assert!(
+                (lightness - DARK.lightness).abs() < ROUNDING,
+                "{degrees}°: {lightness}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pale_accent_is_given_no_chroma_it_did_not_have() {
+        // A slate, as GNOME's: quieter than the look allows, and left so.
+        let [_, system_chroma, _] = oklch(rgba(0x6f8396ff));
+        for look in [DARK, LIGHT] {
+            let [_, chroma, _] = oklch(derive(rgba(0x6f8396ff), &look));
+            assert!(system_chroma < look.chroma);
+            assert!((chroma - system_chroma).abs() < ROUNDING);
         }
     }
 
@@ -317,6 +380,18 @@ mod tests {
         for look in [DARK, LIGHT] {
             let [_, chroma, _] = oklch(derive(rgba(0x8c8c8cff), &look));
             assert!(chroma < 1e-3);
+        }
+    }
+
+    #[test]
+    fn a_grey_accent_has_no_hue_to_be_told_by() {
+        for look in [DARK, LIGHT] {
+            // A Mac's Graphite and GNOME's slate, and every vivid accent.
+            assert!(!has_hue(derive(rgba(0x8c8c8cff), &look)));
+            assert!(!has_hue(derive(rgba(0x6f8396ff), &look)));
+            for accent in VIVID {
+                assert!(has_hue(derive(rgba(*accent), &look)), "{accent:08x}");
+            }
         }
     }
 

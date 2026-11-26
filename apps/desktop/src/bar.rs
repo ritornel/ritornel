@@ -621,10 +621,6 @@ impl Render for PlayerBar {
                 .into_any_element(),
         };
 
-        let accent_back = |share: f32| gpui::Rgba {
-            a: share,
-            ..theme::acc()
-        };
         // Pointed at, a control that works turns to the ink.
         let toggle = |id: &'static str, name: &'static str, lit: bool| {
             div()
@@ -636,7 +632,7 @@ impl Render for PlayerBar {
                 .flex()
                 .items_center()
                 .justify_center()
-                .when(lit, |button| button.bg(accent_back(theme::LIT_TINT)))
+                .when(lit, |button| button.bg(theme::lit()))
                 .child(
                     icon(name, 16., if lit { theme::acc() } else { theme::faint() })
                         .when(on, |icon| icon.group_hover(id, theme::hovered_ink)),

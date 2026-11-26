@@ -2099,6 +2099,7 @@ impl Render for Shell {
                     .child(frame::title_bar(
                         self.pages.can_go_back(),
                         self.pages.current().tab(),
+                        Shown::of(self.pages.current()).bannered(),
                         server,
                         unconnected,
                         self.search.clone().into_any_element(),

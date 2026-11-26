@@ -173,9 +173,15 @@ pub(crate) struct Server {
 /// Told whether the pointer is on something.
 pub(crate) type OnHover = Rc<dyn Fn(bool, &mut gpui::Window, &mut App)>;
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the title bar's parts, as the shell has them"
+)]
 pub(crate) fn title_bar(
     can_go_back: bool,
     lit: Tab,
+    // Whether the bar lies over a banner's picture, not the page's ground.
+    over_picture: bool,
     // The connection, or `None` when there is none.
     server: Option<Server>,
     // What is said while there is none.
@@ -184,6 +190,15 @@ pub(crate) fn title_bar(
     on_back: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut App) + 'static,
     on_tab: OnTab,
 ) -> impl IntoElement {
+    // The lit tab wears the accent on its own tint, as a lit button of the
+    // player bar does, and the ink where the accent is a grey. Over a
+    // banner's picture, whose colours the accent was never worked out
+    // against, it keeps the ink on `fill`.
+    let (lit_ground, lit_words) = if over_picture {
+        (theme::fill(), theme::ink())
+    } else {
+        (theme::lit(), theme::lit_words())
+    };
     // Each tab keeps room for its name at the lit weight, so lighting one
     // does not nudge the others: the name at 600, unseen, sets the width.
     let tab = |tab: Tab| {
@@ -200,7 +215,7 @@ pub(crate) fn title_bar(
             .py(px(5.))
             .rounded(px(8.))
             .whitespace_nowrap();
-        let base = if on { base.bg(theme::fill()) } else { base };
+        let base = if on { base.bg(lit_ground) } else { base };
         base.text_color(theme::dim())
             .child(div().font_weight(FontWeight(600.)).invisible().child(label))
             .child(
@@ -214,7 +229,7 @@ pub(crate) fn title_bar(
                     .items_center()
                     .justify_center()
                     .font_weight(FontWeight(if on { 600. } else { 500. }))
-                    .when(on, |label| label.text_color(theme::ink()))
+                    .when(on, |label| label.text_color(lit_words))
                     .child(label),
             )
     };
