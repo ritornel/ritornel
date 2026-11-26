@@ -23,8 +23,10 @@ env:
 
 # Every PR runs a fast `checks` job and one job per system (`linux`, `macos`,
 # `windows`), unless every file changed since merge-base(origin/main, HEAD) is
-# documentation or a licence file. Release desktop builds, the arm64 player,
-# and cache pruning run after merge on `push: main`.
+# documentation, an agent skill or a licence file. Release desktop builds and
+# the arm64 player run after merge in post-merge.yml, and prune-caches.yml
+# prunes caches each time this workflow or that one finishes a push run on
+# main.
 jobs:
   checks:
     name: Formatting, dependencies, test sleeps, docs and licences
@@ -44,7 +46,8 @@ jobs:
           disable-tools: conda:ffmpeg,aqua:nextest-rs/nextest/cargo-nextest
           rust-cache: none
       # Skip the three OS jobs only for a PR whose cumulative changes since
-      # origin/main are strictly documentation or licence files. A push to main
+      # origin/main are strictly documentation, Markdown under .agents/ (the
+      # agent skills) or licence files. A push to main
       # always runs every job so its caches stay warm. Uses NUL-delimited raw
       # paths and fails closed on empty diffs or git errors.
       - id: docs_only
@@ -67,7 +70,7 @@ jobs:
                   ["git", "diff", "-z", "--name-only", "--no-renames", base, "HEAD"]
               )
               paths = [p.decode("utf-8", errors="surrogateescape") for p in raw.split(b"\0") if p]
-              doc_re = re.compile(r"^(?:docs/.*|[^/]*\.md|LICENSE|LICENSES/.*)\Z", re.DOTALL)
+              doc_re = re.compile(r"^(?:docs/.*|[^/]*\.md|\.agents/.*\.md|LICENSE|LICENSES/.*)\Z", re.DOTALL)
               docs_only = bool(paths) and all(
                   ("\n" not in p and "\r" not in p) and doc_re.match(p) is not None
                   for p in paths
@@ -146,7 +149,7 @@ jobs:
     name: macOS
     needs: checks
     if: needs.checks.outputs.docs_only != 'true'
-    runs-on: macos-latest
+    runs-on: macos-26
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -215,89 +218,3 @@ jobs:
           ) ||
           contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: exit 1
-
-  desktop-release:
-    # Post-merge release build of the desktop app (thin LTO, single CGU) on
-    # each system, using its own cache key so PRs never download release
-    # artifacts.
-    name: Desktop release on ${{ matrix.name }}
-    if: github.ref == 'refs/heads/main'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux
-            runner: ubuntu-26.04
-          - name: macOS
-            runner: macos-latest
-          - name: Windows
-            runner: windows-latest
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup
-        with:
-          packages: >-
-            ${{ matrix.name == 'Linux' && 'pkg-config libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev' || '' }}
-          workspaces: apps/desktop
-          shared-key: desktop-release
-          disable-tools: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny,aqua:nextest-rs/nextest/cargo-nextest
-      - run: mise run desktop:release
-
-  player-arm64:
-    # Post-merge native arm64 build, tests, release build, and footprint check
-    # for the headless player (audio-output alone, linking ALSA).
-    name: Player on arm64 Linux
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup
-        with:
-          packages: pkg-config libasound2-dev
-          rust-cache: crates
-      - run: cargo clippy --locked --package ritornel-server --no-default-features --features audio-output --all-targets -- -D warnings
-      - run: cargo nextest run --locked --package ritornel-engine --package ritornel-server --no-default-features --features ritornel-server/audio-output
-      - run: cargo test --locked --package ritornel-engine --package ritornel-server --no-default-features --features ritornel-server/audio-output --doc
-      - run: cargo build --locked --release --package ritornel-server --no-default-features --features audio-output
-      - run: cargo build --locked --release --package ritornelctl
-      - run: scripts/player-footprint.sh target/release
-
-  prune-caches:
-    # On main, once every job has saved its cache: deletes each cache on main
-    # that a newer one of the same kind replaced, such as the whole set saved
-    # before Cargo.lock last changed. A PR restores the newest of a kind
-    # when its own key is not found, so nothing restores the older ones, and
-    # left to the quota they would evict newer caches instead.
-    name: Prune replaced caches
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
-    needs: [checks, linux, macos, windows, desktop-release, player-arm64]
-    runs-on: ubuntu-26.04
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          declare -A kept
-          gh api --paginate "repos/$GH_REPO/actions/caches?ref=refs/heads/main&per_page=100" \
-            --jq '.actions_caches[] | "\(.created_at) \(.id) \(.key)"' |
-            sort -r |
-            while read -r created id key; do
-              # The key without the hashes at its end: the kind of cache.
-              kind=$(sed -E 's/(-p[0-9]+)?(-[0-9a-f]{8,})+$//' <<<"$key")
-              if [[ -n ${kept[$kind]:-} ]]; then
-                echo "deleting $key, saved $created: ${kept[$kind]} replaced it"
-                gh api --method DELETE "repos/$GH_REPO/actions/caches/$id" > /dev/null
-              else
-                kept[$kind]=$key
-              fi
-            done

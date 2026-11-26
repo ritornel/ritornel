@@ -1,0 +1,71 @@
+name: Post-merge
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# The same build settings as CI, so each job's Rust cache key is the same as
+# when these jobs ran there.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  NEXTEST_PROFILE: ci
+
+# Builds that run only after merge, on `push: main`, apart from pull-request
+# CI: the desktop app in release on each system and the headless player on
+# arm64 Linux. No run is cancelled, so each one saves its caches.
+# prune-caches.yml prunes caches each time this workflow or CI finishes a
+# push run on main.
+jobs:
+  desktop-release:
+    # Release build of the desktop app (thin LTO, single CGU) on each system,
+    # using its own cache key so PRs never download release artifacts.
+    name: Desktop release on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-26.04
+          - name: macOS
+            runner: macos-26
+          - name: Windows
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          packages: >-
+            ${{ matrix.name == 'Linux' && 'pkg-config libfontconfig-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev' || '' }}
+          workspaces: apps/desktop
+          shared-key: desktop-release
+          disable-tools: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny,aqua:nextest-rs/nextest/cargo-nextest
+      - run: mise run desktop:release
+
+  player-arm64:
+    # Native arm64 build, tests, release build, and footprint check for the
+    # headless player (audio-output alone, linking ALSA).
+    name: Player on arm64 Linux
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          packages: pkg-config libasound2-dev
+          rust-cache: crates
+      - run: cargo clippy --locked --package ritornel-server --no-default-features --features audio-output --all-targets -- -D warnings
+      - run: cargo nextest run --locked --package ritornel-engine --package ritornel-server --no-default-features --features ritornel-server/audio-output
+      - run: cargo test --locked --package ritornel-engine --package ritornel-server --no-default-features --features ritornel-server/audio-output --doc
+      - run: cargo build --locked --release --package ritornel-server --no-default-features --features audio-output
+      - run: cargo build --locked --release --package ritornelctl
+      - run: scripts/player-footprint.sh target/release

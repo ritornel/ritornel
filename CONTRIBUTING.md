@@ -20,7 +20,7 @@ A change to the database schema is a new numbered migration plus `mise run schem
 
 Keep partial work on its branch until it works end to end rather than merging something half-built onto `main`. A feature that changes the contract or adds migrations should use one `CONTRACT_VERSION` bump and collapse migrations not yet on `main` into as few files as it needs.
 
-Every pull request runs the full CI check across Linux, macOS, and Windows (skipping platform builds only when every change since `main` is documentation or a licence file).
+Every pull request runs the full CI check across Linux, macOS, and Windows (skipping platform builds only when every change since `main` is documentation, an agent skill or a licence file).
 
 ## Using AI
 
