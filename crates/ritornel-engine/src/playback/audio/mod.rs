@@ -51,6 +51,14 @@ const OUTPUT_WAIT: Duration = Duration::from_secs(2);
 /// See "Audio pipeline" in docs/internals/playback.md.
 const STALL: Duration = Duration::from_secs(5);
 
+/// How long an output may ask for no frames, while not told to play or
+/// since it was told to, before its stream counts as stale. A device asks
+/// every few milliseconds whether anything plays or not, so a second of
+/// nothing is a stream that will not ask again, as an ALSA stream left
+/// behind by a restarted PipeWire is. See "Audio pipeline" in
+/// docs/internals/playback.md.
+const STALE: Duration = Duration::from_secs(1);
+
 /// What the player is told when the output went away, by a stream error.
 const WENT_AWAY: &str = "the output went away";
 
@@ -306,9 +314,16 @@ pub struct AudioRenderer {
     playing: bool,
     /// When it was, on the output's clock.
     played_at: u64,
+    /// `Play` messages sent to the callback.
+    plays: u64,
     /// How long it may ask for no frames while playing: [`STALL`], but for
     /// a test.
     stall_after: Duration,
+    /// When it was opened, on its clock.
+    opened_at: u64,
+    /// How long it may ask for no frames while not playing before it is
+    /// stale: [`STALE`], but for a test.
+    stale_after: Duration,
     /// What the output said, as the renderer has read it, and what the
     /// renderer says itself, in order, until drained.
     said: Vec<Event>,
@@ -431,7 +446,10 @@ impl AudioRenderer {
             gain: ReplayGain::Off,
             playing: false,
             played_at: 0,
+            plays: 0,
             stall_after: STALL,
+            opened_at: output::now(),
+            stale_after: STALE,
             said: Vec::new(),
             given: Vec::new(),
             failed: None,
@@ -464,14 +482,16 @@ impl AudioRenderer {
     /// [`stall_after`](Self::stall_after): since it last asked, or since it
     /// was told to play if that was later.
     fn stalled(&self) -> bool {
-        if !self.playing {
-            return false;
-        }
+        self.playing && self.silent_since(self.played_at) >= self.stall_after
+    }
+
+    /// How long the output has asked for no frames: since it last asked,
+    /// or since `since` if that was later.
+    fn silent_since(&self, since: u64) -> Duration {
         // Now first: a callback that runs between the two reads then counts.
         let now = output::now();
         let asked = self.shared.asked_until.load(Ordering::SeqCst);
-        let since = asked.max(self.played_at);
-        Duration::from_nanos(now.saturating_sub(since)) >= self.stall_after
+        Duration::from_nanos(now.saturating_sub(asked.max(since)))
     }
 
     /// When the output last took frames, on its clock: when the last it
@@ -794,7 +814,9 @@ impl Renderer for AudioRenderer {
         if let Some(decoding) = &mut self.decoding {
             decoding.decoder.start();
         }
-        self.send(Message::Play);
+        if self.send(Message::Play) {
+            self.plays += 1;
+        }
     }
 
     fn pause(&mut self) {
@@ -828,8 +850,8 @@ impl Renderer for AudioRenderer {
     fn unload(&mut self) {
         self.collect();
         // Read before the output is told it plays no more, which a stall
-        // is measured against.
-        let lost = self.lost().is_some();
+        // is measured against. A stale output would never take the change.
+        let lost = self.lost().is_some() || self.stale();
         // With nothing loaded, nothing plays, so nothing can stall.
         self.playing = false;
         let Some(old) = self.decoding.take() else {
@@ -863,6 +885,23 @@ impl Renderer for AudioRenderer {
 
     fn now(&self) -> u64 {
         output::now()
+    }
+
+    fn stale(&self) -> bool {
+        if self.running.is_none() {
+            return false;
+        }
+        if self.playing {
+            // Now first: a callback that takes the play between the two
+            // reads then counts. One that ran as the play was sent, but
+            // before it arrived, does not.
+            let now = output::now();
+            let taken = self.shared.plays.load(Ordering::SeqCst);
+            taken < self.plays
+                && Duration::from_nanos(now.saturating_sub(self.played_at)) >= self.stale_after
+        } else {
+            self.silent_since(self.opened_at) >= self.stale_after
+        }
     }
 
     fn set_replay_gain(&mut self, gain: ReplayGain) {
@@ -943,8 +982,8 @@ impl Drop for AudioRenderer {
 
 /// An output that is opened the first time a track is loaded, so that a
 /// server restored paused, or one that is never asked to play, never opens
-/// a device. One that goes away is let go, and the next load opens the
-/// system's output again.
+/// a device. One that goes away, or that the player closes while nothing
+/// plays, is let go, and the next load opens the system's output again.
 #[derive(Debug)]
 pub struct OnDemand {
     output: Output,
@@ -953,6 +992,9 @@ pub struct OnDemand {
     volume: f32,
     /// What an output let go of said last.
     said: Vec<Event>,
+    /// The name, rate and channels of the output closed last, said until
+    /// one is opened again.
+    closed: Option<(String, u32, u32)>,
 }
 
 impl OnDemand {
@@ -964,32 +1006,48 @@ impl OnDemand {
             gain: ReplayGain::Off,
             volume: 1.0,
             said: Vec::new(),
+            closed: None,
         }
     }
 
+    /// Lets an output go that went away, or whose stream went stale, which
+    /// would never take a track loaded.
     fn let_go_if_lost(&mut self) {
-        if let Some(mut lost) = self.opened.take_if(|opened| opened.lost().is_some()) {
+        if let Some(mut lost) = self
+            .opened
+            .take_if(|opened| opened.lost().is_some() || opened.stale())
+        {
             lost.unload();
             self.said.extend(lost.drain());
+            self.closed = None;
         }
     }
 }
 
 impl Renderer for OnDemand {
     fn rate(&self) -> u32 {
-        self.opened.as_ref().map_or(0, Renderer::rate)
+        match (&self.opened, &self.closed) {
+            (Some(opened), _) => opened.rate(),
+            (None, Some((_, rate, _))) => *rate,
+            (None, None) => 0,
+        }
     }
 
     fn name(&self) -> String {
-        match (&self.opened, self.output) {
-            (Some(opened), _) => opened.name(),
-            (None, Output::Default) => "default".to_owned(),
-            (None, Output::Null { .. }) => "null".to_owned(),
+        match (&self.opened, &self.closed, self.output) {
+            (Some(opened), ..) => opened.name(),
+            (None, Some((name, ..)), _) => name.clone(),
+            (None, None, Output::Default) => "default".to_owned(),
+            (None, None, Output::Null { .. }) => "null".to_owned(),
         }
     }
 
     fn channels(&self) -> u32 {
-        self.opened.as_ref().map_or(0, Renderer::channels)
+        match (&self.opened, &self.closed) {
+            (Some(opened), _) => opened.channels(),
+            (None, Some((.., channels))) => *channels,
+            (None, None) => 0,
+        }
     }
 
     fn load(
@@ -1054,6 +1112,19 @@ impl Renderer for OnDemand {
 
     fn now(&self) -> u64 {
         output::now()
+    }
+
+    fn close(&mut self) -> bool {
+        if let Some(mut opened) = self.opened.take() {
+            self.closed = Some((opened.name(), opened.rate(), opened.channels()));
+            opened.unload();
+            self.said.extend(opened.drain());
+        }
+        true
+    }
+
+    fn stale(&self) -> bool {
+        self.opened.as_ref().is_some_and(Renderer::stale)
     }
 
     fn set_replay_gain(&mut self, gain: ReplayGain) {

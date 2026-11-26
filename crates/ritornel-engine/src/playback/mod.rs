@@ -29,9 +29,9 @@ pub use outbox::{
     Delivered, Ingest, MAX_BACKOFF_MS, SendStamps, deliver_listens, deliver_listens_to,
 };
 pub use player::{
-    AddTracks, CHECKPOINT_EVERY_MS, Direction, Done, Fetch, NowPlaying, Order, OutputFailing,
-    Place, PlayTracks, Player, PlayerEvent, PlayerSetup, PlayerState, QueuePage, Request, Settings,
-    Status, Summary,
+    AddTracks, CHECKPOINT_EVERY_MS, CLOSE_OUTPUT_AFTER_MS, Direction, Done, Fetch, NowPlaying,
+    Order, OutputFailing, Place, PlayTracks, Player, PlayerEvent, PlayerSetup, PlayerState,
+    QueuePage, Request, Settings, Status, Summary,
 };
 pub use queue::Repeat;
 pub use renderer::{End, Event, FileFacts, Format, Progress, RenderError, Renderer};

@@ -49,6 +49,7 @@ What differs between systems sits in a `platform` module in each crate that need
 
 - **The arm64 player is built natively in CI, not cross-compiled.** The `player-arm64` job in `.github/workflows/post-merge.yml` builds and tests the headless player on GitHub's arm64 Linux runner on pushes to `main`, linking ALSA as any Linux machine does. Cross-compiling would need an aarch64 sysroot with ALSA's development files. Every code pull request still lints the `--no-default-features --features audio-output` configuration in the Linux job.
 - **Sound goes through ALSA's `default` device, not `cpal`'s PipeWire or PulseAudio hosts.** ALSA needs only `libasound`, and on a desktop with a sound server, `default` routes to that server. The output opens as 32-bit float at the device's own rate and channels, as on macOS.
+- **A PipeWire restart is met with a fresh stream.** An ALSA stream opened through PipeWire stops calling back, with no error, when PipeWire restarts under it. While the player is paused or stopped, the stale-output rule ("Audio pipeline" in `docs/internals/playback.md`) closes that stream within about a second, and the idle close lets the device go after 30 s either way, so the next play opens `default` afresh. A stream that stops just before a resume is replaced a second after the resume, once, and plays on. During playback that had been under way, the stall rule still applies: the player pauses after 5 s, and the first play opens a fresh stream.
 - **MPRIS is served with `zbus` directly, not through `souvlaki`.** `souvlaki`'s Linux backend wakes every 10 ms while a player is registered, panics when there is no session bus, does not advance reported position between updates, and never emits `Seeked`. The `zbus` implementation avoids all four:
   - it wakes only for a change or a call;
   - with no session bus there is simply no media session, logged only at debug, as on a hub, in a container, or in a login with no desktop;
@@ -106,7 +107,7 @@ What differs between systems sits in a `platform` module in each crate that need
 - `ritornel-server` is 18 MiB as built and 13 MiB stripped, and links `libasound` and libc only.
 - The server holds 11 MB resident at idle with an empty data directory, 2 MB of it its own memory and the rest its mapped program.
 
-**Not yet verified on hardware:** hardware media keys or desktop media widgets, the systemd service across logout/login, real Bluetooth or HDMI output changes, headphone unplug/device loss on Windows, the headless player on a Raspberry Pi, and a USB output unplugged behind PipeWire, which the stall rule ("Audio pipeline" in `docs/internals/playback.md`) is there to catch.
+**Not yet verified on hardware:** hardware media keys or desktop media widgets, the systemd service across logout/login, real Bluetooth or HDMI output changes, headphone unplug/device loss on Windows, the headless player on a Raspberry Pi, a USB output unplugged behind PipeWire, which the stall rule ("Audio pipeline" in `docs/internals/playback.md`) is there to catch, and a PipeWire restart while paused, which the stale-output rule there handles.
 
 ## Later
 

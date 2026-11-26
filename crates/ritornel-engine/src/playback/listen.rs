@@ -124,8 +124,11 @@ pub(crate) struct Listen {
     pub(crate) started: Started,
     /// The output's rate, which frames are counted at.
     rate: u32,
-    /// Frames of its spans that have ended.
+    /// Frames of its spans that have ended, at that rate.
     frames: u64,
+    /// The time its spans played at another rate, before the output was
+    /// opened again at this one.
+    before_ms: i64,
     /// The ranges closed so far.
     ranges: Ranges,
     /// Where the range being heard now began, and where it has reached.
@@ -147,6 +150,7 @@ impl Listen {
             started,
             rate: rate.max(1),
             frames: 0,
+            before_ms: 0,
             ranges: Ranges::default(),
             range_from: from,
             position_ms: from,
@@ -185,7 +189,17 @@ impl Listen {
 
     /// The played time, with `live` frames of the span playing it.
     pub(crate) fn ms_played(&self, live: u64) -> i64 {
-        self.ms(self.frames + live)
+        self.before_ms.saturating_add(self.ms(self.frames + live))
+    }
+
+    /// Its frames are counted at `rate` from now on: the output was opened
+    /// again at another.
+    fn counted_at(&mut self, rate: u32) {
+        let rate = rate.max(1);
+        if rate != self.rate {
+            self.before_ms = self.ms_played(0);
+            (self.frames, self.rate) = (0, rate);
+        }
     }
 
     /// Where the track is, with `live` frames of the span playing it.
@@ -230,6 +244,10 @@ pub(crate) struct Recorder {
     fresh: bool,
     /// The listen closed last, and why.
     last: Option<(Id, EndReason)>,
+    /// The open listen, paused, whose output was closed: the end of the span
+    /// playing it leaves it open, for a span that carries it on once the
+    /// output is opened again.
+    held: Option<Id>,
     /// A delayed release closes the listen at the pause that handed it off.
     pub(super) handoff_end: Option<(Id, (i64, i64))>,
 }
@@ -268,6 +286,41 @@ impl Recorder {
         }
     }
 
+    /// The output is closed under the open listen, paused: it stays open
+    /// as the span playing it ends.
+    pub(crate) fn hold(&mut self) {
+        self.held = self.open.as_ref().map(|listen| listen.started.listen_id);
+    }
+
+    /// What the held listen records, while one is held.
+    pub(crate) fn held(&self) -> Option<&Started> {
+        let open = self.open.as_ref()?;
+        (Some(open.started.listen_id) == self.held).then_some(&open.started)
+    }
+
+    /// The listener moved the held listen to `to_ms` while its output was
+    /// closed.
+    pub(crate) fn seek_held(&mut self, to_ms: i64) {
+        if let Some(open) = self
+            .open
+            .as_mut()
+            .filter(|open| Some(open.started.listen_id) == self.held)
+        {
+            open.seek(to_ms);
+            self.changed = true;
+        }
+    }
+
+    /// The player left the held listen, for `reason`, at `time`, as the
+    /// wall and monotonic clocks read it.
+    pub(crate) fn close_held(&mut self, reason: EndReason, time: (i64, i64)) {
+        if let Some(held) = self.held.take()
+            && self.open.as_ref().map(|open| open.started.listen_id) == Some(held)
+        {
+            self.close(reason, time);
+        }
+    }
+
     /// The listener paused.
     pub(crate) fn paused(&mut self) {
         if let Some(listen) = &mut self.open {
@@ -296,7 +349,9 @@ impl Recorder {
         };
         if let Some(open) = &mut self.open {
             if open.live.is_none() && spec.continues == Some(open.started.listen_id) {
+                open.counted_at(spec.rate);
                 open.live = Some(span);
+                self.held = None;
                 return;
             }
             // A span begins only once the one before has ended; were one
@@ -345,6 +400,11 @@ impl Recorder {
             self.changed = true;
             return;
         }
+        // Its output was closed while it was paused: it carries on once
+        // the output is opened again.
+        if matches!(end, End::Replaced) && self.held == Some(id) {
+            return;
+        }
         let reason = match end {
             End::Joined { .. } | End::Drained => EndReason::Finished,
             End::Failed(_) => EndReason::Error,
@@ -354,6 +414,7 @@ impl Recorder {
     }
 
     fn close(&mut self, reason: EndReason, (wall, mono): (i64, i64)) {
+        self.held = None;
         if let Some(mut listen) = self.open.take() {
             let (wall, mono) = self
                 .handoff_end
@@ -656,5 +717,90 @@ mod tests {
         }
         // Listens were carried on across seeks, not only opened and closed.
         assert!(sought > 100, "{sought} listens carried across a seek");
+    }
+
+    #[test]
+    fn a_listen_held_across_a_closed_output_carries_on_at_the_rate_it_is_opened_again_at() {
+        let mut recorder = Recorder::default();
+        let time = |at: u64| (i64::try_from(at).unwrap(), i64::try_from(at).unwrap());
+        let span = |from_ms, rate, continues| Span {
+            listen: started(1),
+            continues,
+            from_ms,
+            rate,
+            end: None,
+        };
+        // A second heard at 48 kHz, then paused, and the output closed.
+        recorder.register(1, span(0, 48_000, None));
+        recorder.fold(&Event::Began { span: 1, at: 0 }, &time);
+        recorder.paused();
+        recorder.hold();
+        let replaced = |span, frames, at| Event::Ended {
+            span,
+            frames,
+            at,
+            end: End::Replaced,
+        };
+        recorder.fold(&replaced(1, 48_000, 1_000), &time);
+        let id = recorder.open().unwrap().started.listen_id;
+        // Opened again at 44.1 kHz from where it was: half a second more.
+        recorder.register(2, span(1_000, 44_100, Some(id)));
+        recorder.fold(
+            &Event::Began {
+                span: 2,
+                at: 60_000,
+            },
+            &time,
+        );
+        assert_eq!(recorder.open().unwrap().position_ms(22_050), 1_500);
+        recorder.note(EndReason::Stopped);
+        recorder.fold(&replaced(2, 22_050, 60_500), &time);
+        let [saved] = recorder.unsaved(0).try_into().unwrap();
+        assert_eq!(saved.started.listen_id, id);
+        assert_eq!(
+            (
+                saved.heard.ms_played,
+                saved.heard.ranges_json.as_str(),
+                saved.heard.seek_count,
+                saved.ended.unwrap().end_reason
+            ),
+            (1_500, "[[0,1500]]", 0, EndReason::Stopped)
+        );
+    }
+
+    #[test]
+    fn a_held_listen_the_player_leaves_closes_then_for_its_reason() {
+        let mut recorder = Recorder::default();
+        let time = |at: u64| (i64::try_from(at).unwrap(), i64::try_from(at).unwrap());
+        recorder.register(
+            1,
+            Span {
+                listen: started(1),
+                continues: None,
+                from_ms: 0,
+                rate: 1000,
+                end: None,
+            },
+        );
+        recorder.fold(&Event::Began { span: 1, at: 0 }, &time);
+        recorder.hold();
+        recorder.note(EndReason::Next);
+        let ended = Event::Ended {
+            span: 1,
+            frames: 2_000,
+            at: 2_000,
+            end: End::Replaced,
+        };
+        recorder.fold(&ended, &time);
+        recorder.seek_held(5_000);
+        assert!(recorder.open().is_some());
+        recorder.close_held(EndReason::Next, (9_000, 9_000));
+        let [saved] = recorder.unsaved(0).try_into().unwrap();
+        let ended = saved.ended.unwrap();
+        assert_eq!(
+            (ended.end_reason, ended.end_position_ms, ended.ended_at_ms),
+            (EndReason::Next, 5_000, 9_000)
+        );
+        assert_eq!((saved.heard.ms_played, saved.heard.seek_count), (2_000, 1));
     }
 }

@@ -206,6 +206,24 @@ pub trait Renderer: Debug + Send {
     /// Now, on the clock events are stamped with.
     fn now(&self) -> u64;
 
+    /// Lets the output go, so that its device can sleep and other programs
+    /// can have it, with what was loaded let go as `unload` lets it go. The
+    /// next load opens the output again, and until then its name, rate and
+    /// channels stay those it had. Whether the output is closed now: one
+    /// that cannot be closed keeps what it has loaded.
+    fn close(&mut self) -> bool {
+        false
+    }
+
+    /// Whether the output's stream is stale, as one is that a sound server
+    /// restarted under: not told to play, it has stopped asking for frames,
+    /// or told to play, it has not asked once since. Playing on through it
+    /// would be heard as a stall, so the player closes it and opens it
+    /// afresh.
+    fn stale(&self) -> bool {
+        false
+    }
+
     /// The ReplayGain the tracks loaded or queued from now on play at.
     fn set_replay_gain(&mut self, _gain: ReplayGain) {}
 
@@ -340,6 +358,15 @@ pub(crate) mod fake {
         /// Whether the output went away and was let go: it then has no rate,
         /// as an output not yet opened again has none.
         gone: bool,
+        /// When the output stopped asking for frames, if it did, and whether
+        /// each output opened from now on stops at once too.
+        stale_at: Option<i64>,
+        stays_stale: bool,
+        /// When it was last told to play.
+        played_at: i64,
+        /// Whether the output is open, and how often it was closed.
+        open: bool,
+        closes: usize,
         /// What the player has not drained yet, and all that was ever said.
         said: Vec<Event>,
         history: Vec<Event>,
@@ -362,6 +389,18 @@ pub(crate) mod fake {
     impl State {
         fn now_ms(&self) -> i64 {
             self.clock.as_ref().map_or(0, |clock| clock.mono_ms())
+        }
+
+        /// How long a stale output has asked for nothing: since it stopped,
+        /// or since it was told to play if that was later.
+        fn silent_for(&self) -> Option<i64> {
+            let since = self.stale_at?;
+            let since = if self.playing {
+                since.max(self.played_at)
+            } else {
+                since
+            };
+            Some(self.now_ms() - since)
         }
 
         fn say(&mut self, event: Event) {
@@ -499,6 +538,27 @@ pub(crate) mod fake {
             state.playing = false;
         }
 
+        /// The output stops asking for frames, with no error, as a stream
+        /// does that a sound server restarted under: until it is opened
+        /// again, nothing is heard, it is stale a second later, and played,
+        /// it stalls five seconds after it was told to.
+        pub(crate) fn go_stale(&self) {
+            let mut state = self.state();
+            state.stale_at = Some(state.now_ms());
+        }
+
+        /// As [`go_stale`](Self::go_stale), and every output opened from now
+        /// on stops as it opens.
+        pub(crate) fn stay_stale(&self) {
+            self.go_stale();
+            self.state().stays_stale = true;
+        }
+
+        /// How often the output was closed.
+        pub(crate) fn closes(&self) -> usize {
+            self.state().closes
+        }
+
         /// The output cannot be opened while `refused`: every load fails
         /// as the output's fault.
         pub(crate) fn refuse_output(&self, refused: bool) {
@@ -529,7 +589,7 @@ pub(crate) mod fake {
             let base = state.now_ms();
             let at = |elapsed: u64| stamp(base + i64::try_from(elapsed).unwrap_or(0));
             let mut elapsed = 0;
-            while state.playing && !state.lost && elapsed < ms {
+            while state.playing && !state.lost && state.stale_at.is_none() && elapsed < ms {
                 let Some(mut span) = state.loaded.clone().filter(|span| !span.ended) else {
                     break;
                 };
@@ -673,6 +733,8 @@ pub(crate) mod fake {
             state.let_go(now);
             state.rewritten = false;
             (state.lost, state.gone) = (false, false);
+            state.stale_at = state.stays_stale.then(|| state.now_ms());
+            state.open = true;
             state.playing = false;
             state.give(span, path, start_ms, None);
             state.install(span, path, start_ms, false);
@@ -686,6 +748,7 @@ pub(crate) mod fake {
             self.plays_on();
             let mut state = self.state();
             state.playing = true;
+            state.played_at = state.now_ms();
             if let Some(span) = &mut state.loaded {
                 span.started = true;
             }
@@ -704,6 +767,9 @@ pub(crate) mod fake {
                 return Err(RenderError::new("output", "the output stopped answering"));
             }
             let mut state = self.state();
+            if state.stale_at.is_some() {
+                return Err(RenderError::new("output", "the output stopped answering"));
+            }
             if state.rewritten {
                 return Err(RenderError::new("file_changed", "it was written to"));
             }
@@ -732,6 +798,19 @@ pub(crate) mod fake {
             std::mem::take(&mut self.state().said)
         }
 
+        fn close(&mut self) -> bool {
+            self.unload();
+            let mut state = self.state();
+            if std::mem::take(&mut state.open) {
+                state.closes += 1;
+            }
+            true
+        }
+
+        fn stale(&self) -> bool {
+            self.state().silent_for() >= Some(1_000)
+        }
+
         fn progress(&self) -> Progress {
             let state = self.state();
             let (span, frames) = state
@@ -739,10 +818,15 @@ pub(crate) mod fake {
                 .as_ref()
                 .filter(|span| !span.ended)
                 .map_or((0, 0), |span| (span.span, span.frames));
+            let stalled = state.silent_for() >= Some(5_000) && state.playing;
             Progress {
                 span,
                 frames,
-                lost: state.lost.then_some("the output went away"),
+                lost: if state.lost {
+                    Some("the output went away")
+                } else {
+                    stalled.then_some("the output stopped taking sound")
+                },
             }
         }
 

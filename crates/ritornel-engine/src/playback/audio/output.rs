@@ -121,6 +121,9 @@ pub(crate) struct Shared {
     /// Callbacks run, so that the control side can tell the output is
     /// alive.
     pub(crate) callbacks: AtomicU64,
+    /// `Play` messages the callback has taken: a stream that has not taken
+    /// the last one sent has not run since it was told to play.
+    pub(crate) plays: AtomicU64,
     /// When the frames the output last asked for are done playing, on the
     /// output's clock: 0 until it first asks. An output that stops asking
     /// has stalled, and the frames it took end there.
@@ -349,6 +352,7 @@ impl Callback {
                 }
                 Message::Play => {
                     self.target = 1.0;
+                    self.shared.plays.fetch_add(1, Ordering::SeqCst);
                 }
                 Message::Pause => {
                     self.target = 0.0;
