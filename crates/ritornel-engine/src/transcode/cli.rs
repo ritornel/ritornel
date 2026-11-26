@@ -25,6 +25,7 @@ impl Encoder for LameEncoder {
         &self,
         pcm: Pcm,
         profile: Profile,
+        _key: blake3::Hash,
         output: &Path,
         cancel: &AtomicBool,
     ) -> io::Result<()> {
@@ -104,10 +105,15 @@ impl Encoder for OpusEncoder {
         &self,
         pcm: Pcm,
         profile: Profile,
+        key: blake3::Hash,
         output: &Path,
         cancel: &AtomicBool,
     ) -> io::Result<()> {
-        let args = opus_args(pcm.spec(profile.dsp)?, profile)?;
+        // opusenc chooses a random stream serial by default. Each derivative
+        // is a single Ogg logical stream, with a reproducible serial.
+        let [a, b, c, d, ..] = *key.as_bytes();
+        let serial = u32::from_le_bytes([a, b, c, d]) & 0x7fff_ffff;
+        let args = opus_args(pcm.spec(profile.dsp)?, profile, serial)?;
         encode(
             Command::new("opusenc").args(args),
             pcm,
@@ -118,7 +124,7 @@ impl Encoder for OpusEncoder {
     }
 }
 
-fn opus_args(spec: PcmSpec, profile: Profile) -> io::Result<Vec<String>> {
+fn opus_args(spec: PcmSpec, profile: Profile, serial: u32) -> io::Result<Vec<String>> {
     profile.validate()?;
     let Target::Opus {
         bitrate_kbps,
@@ -139,6 +145,8 @@ fn opus_args(spec: PcmSpec, profile: Profile) -> io::Result<Vec<String>> {
     };
     Ok(vec![
         "--quiet".into(),
+        "--serial".into(),
+        serial.to_string(),
         "--raw".into(),
         "--raw-bits".into(),
         "24".into(),
@@ -361,9 +369,11 @@ mod tests {
                 ..opus()
             };
             assert_eq!(
-                opus_args(spec, p).unwrap(),
+                opus_args(spec, p, 257).unwrap(),
                 [
                     "--quiet",
+                    "--serial",
+                    "257",
                     "--raw",
                     "--raw-bits",
                     "24",

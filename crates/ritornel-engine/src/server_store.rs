@@ -917,6 +917,24 @@ mod tests {
     }
 
     #[test]
+    fn adding_the_cache_to_schema_two_preserves_settings_and_roots() {
+        let scratch = Scratch::new();
+        let path = scratch.path().join("server.db");
+        let mut db = Connection::open(&path).unwrap();
+        migrate::run(&mut db, &migrate::SERVER[..2], &FixedClock::at(T0)).unwrap();
+        db.execute_batch(include_str!("../saved/server/0002.sql"))
+            .unwrap();
+        drop(db);
+        let store = on_disk(&path).unwrap();
+        assert_eq!(store.migrations_applied(), migrate::SERVER.len() - 2);
+        assert_eq!(
+            store.roots().unwrap(),
+            [("Invented music".into(), "/invented/music".into())]
+        );
+        assert!(!store.watching().unwrap());
+    }
+
+    #[test]
     fn the_identity_and_the_credential_survive_a_restart() {
         let scratch = Scratch::new();
         let path = scratch.path().join("server.db");
@@ -987,11 +1005,11 @@ mod tests {
         on_disk(&path).unwrap().close().unwrap();
         tamper(
             &path,
-            "INSERT INTO schema_migration VALUES (3, '0003_from_the_future', x'00', 0)",
+            "INSERT INTO schema_migration SELECT max(version) + 1, 'from_the_future', x'00', 0 FROM schema_migration",
         );
         let refused = on_disk(&path);
         assert!(
-            matches!(refused, Err(Error::NewerSchema { found: 3, known: 2 })),
+            matches!(refused, Err(Error::NewerSchema { found, known }) if known == crate::SERVER_SCHEMA_VERSION && found == known + 1),
             "{refused:?}"
         );
     }

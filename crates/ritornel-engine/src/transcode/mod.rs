@@ -1,6 +1,10 @@
 //! File decoding and encoder backends. See "Transcoding" in docs/internals/playback.md.
 
+mod cache;
 mod cli;
+mod package;
+pub use cache::{CacheEntry, Derivative, Pin, PinOwner, TranscodeCache};
+pub use package::{Artwork, Codec, Package, PackageSource, Tags};
 mod profile;
 mod selection;
 
@@ -93,12 +97,19 @@ pub struct EncoderId {
     pub version: String,
 }
 
+/// Scheme and digest recorded for the audio packets by the scanner.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioAsset {
+    pub scheme: u32,
+    pub hash: blake3::Hash,
+}
+
 impl EncoderId {
     /// Inputs are length-delimited by JSON. Bump the epoch when changing DSP,
     /// sample packing or adapter defaults in ways that alter encoded audio.
     pub fn derivative_key(
         &self,
-        audio_hash: blake3::Hash,
+        asset: AudioAsset,
         profile: Profile,
         tags: GainTags,
     ) -> io::Result<blake3::Hash> {
@@ -106,7 +117,9 @@ impl EncoderId {
         const EPOCH: u32 = 1;
         let gain = tags.selected(profile.dsp.replay_gain);
         let bytes = serde_json::to_vec(&(
-            audio_hash.to_hex().as_str(),
+            "ritornel-derivative-v1",
+            asset.scheme,
+            asset.hash.to_hex().as_str(),
             self.family,
             &self.version,
             EPOCH,
@@ -123,10 +136,12 @@ impl EncoderId {
 pub trait Encoder: Send + Sync {
     fn probe(&self) -> io::Result<Option<EncoderId>>;
     fn supports(&self, profile: Profile) -> bool;
+    /// Encode one file using its derivative key for reproducible container framing.
     fn encode(
         &self,
         pcm: Pcm,
         profile: Profile,
+        key: blake3::Hash,
         output: &Path,
         cancel: &AtomicBool,
     ) -> io::Result<()>;
@@ -152,6 +167,7 @@ impl Encoder for FakeEncoder {
         &self,
         pcm: Pcm,
         profile: Profile,
+        _key: blake3::Hash,
         output: &Path,
         cancel: &AtomicBool,
     ) -> io::Result<()> {

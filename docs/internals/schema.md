@@ -28,6 +28,8 @@ Holds everything private to one `ritornel-server` installation:
 - **Background work:** `job`, `job_item`, `outbox`.
 - **Playback and external sessions:** `queue_entry`, `playback_session` (singleton row), `listen_staging` (at most one open listen per server via partial unique index `listen_staging_open`), `service_session` (stores external service session secrets such as Last.fm's `session_key`).
 
+The machine-local transcode cache uses three tables in `server.db`. `transcode_entry` indexes completed files, `transcode_pin` records which boot and consumer hold each file, and `transcode_size_hint` retains the last exact byte count after eviction. See [the transcode cache](server.md#transcode-cache).
+
 ## Durable and rebuildable tables
 
 Tables in `library.db` fall into two classes:

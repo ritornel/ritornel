@@ -65,7 +65,7 @@ A sleeping hub is one its satellites cannot reach, but a satellite or a player s
   server.db      server-local SQLite database (every server)
   library.db     library SQLite database (hub only)
   logs/          daily JSON-line log files
-  cache/         covers/ (extracted on demand) and tmp/ (atomic writes before rename)
+  cache/         covers/, transcodes/, packaged/, and tmp/ for staging
   backups/       pre-migration rollback copy, created only when no backup folder is configured
   imports/       runs of streams staged for a dry run, owner-only, removed at every start
 ```
@@ -74,7 +74,7 @@ The data directory must sit on a local filesystem because SQLite WAL shared memo
 
 `DataDir::prepare` creates private directories (`0700` on Unix, owner-only ACL on Windows) and tightens permissions on `server.db` and `library.db` at startup (protecting restored databases that may arrive world-readable).
 
-Cache files are written in `cache/tmp/`, synced, and renamed into `cache/covers/` before being indexed. Cover art bytes remain in the audio/folder files and are extracted into `cache/covers/` on demand; nothing in `cache/`, `logs/`, `backups/`, `imports/`, `server.json`, `preparing.json`, or `server.lock` needs to be backed up.
+Cover files are written in `cache/tmp/`, synced, and renamed into `cache/covers/`. Cover art bytes remain in the audio/folder files and are extracted into `cache/covers/` on demand; nothing in `cache/`, `logs/`, `backups/`, `imports/`, `server.json`, `preparing.json`, or `server.lock` needs to be backed up.
 
 ### Backups and pre-migration snapshots
 
@@ -92,6 +92,14 @@ Each backup—taken on demand (`ritornelctl backup` / `server.backup`) or automa
 ```
 
 Each database copy runs `VACUUM INTO` on its own read-only SQLite connection (`crates/ritornel-engine/src/backup.rs`), followed by `sync_all()` and `PRAGMA quick_check`. Because it runs beside the writer, playback and recording continue while a backup runs, and the output is a single self-contained file with no WAL sidecar. The two databases are copied sequentially rather than at a single cross-file instant, and `README.txt` records the data directory the backup came from. When the backed-up library has a Last.fm account, the backup writes a per-account hold on the copy so scrobbling for each account waits for an import after restore (after draining local staged/outbox listens) and plays accepted after the backup are reconciled instead of sent twice. If a migration runs with no `--backup-dir` configured, the server still saves a pre-migration rollback copy inside `<data-dir>/backups/` (explicitly distinguished from a backup in `ritornelctl status`).
+
+## Transcode cache
+
+`TranscodeCache` keeps encoded audio in `cache/transcodes/` and tagged copies in `cache/packaged/`. Each file lives under the first two hex digits of its BLAKE3 key. The derivative key identifies the audio hash scheme and digest, encoder build, profile, and applied DSP inputs. A package key identifies its derivative or master, projected tags, original artwork digest and target size, packaging version and target options. Changing the title or cover reuses the encoded audio.
+
+A producer works in a private `.part` directory under `cache/tmp/`. It finishes and syncs the file before the cache writer renames it and records its exact byte count, full BLAKE3 digest and sampled digest. The sample covers up to one MiB at each end, hashing overlapping bytes only once. The index and pins live in `server.db`. Opening the cache under the data-directory lock removes abandoned staging files and pins from previous runs, forgets missing files, and removes unindexed files left by an interrupted publication.
+
+A hit updates the index and acquires the caller’s pin in one transaction. The cache leaves file modification times alone. Above its byte budget (10 GiB by default), it removes unpinned packages first, then unpinned derivatives, in least-recently-used order within each layer. Releasing a pin retries eviction. The byte budget applies separately from `cacheBytes`, which covers pulled masters. The cache keeps the last measured size for up to 65,536 recently evicted keys.
 
 ## Storage split
 

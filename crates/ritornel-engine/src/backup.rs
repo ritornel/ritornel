@@ -314,14 +314,18 @@ mod tests {
             .open(OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
         let mut newer = migrate::SERVER.to_vec();
+        let current = crate::SERVER_SCHEMA_VERSION;
         newer.push(Migration {
-            version: 3,
-            name: "0003_next",
+            version: current + 1,
+            name: "next",
             sql: "",
         });
         assert_eq!(
             pending_in(&connection, &newer).unwrap(),
-            Some(Pending { from: 2, to: 3 })
+            Some(Pending {
+                from: current,
+                to: current + 1
+            })
         );
         // And one that knows fewer would refuse to open it, so there is
         // nothing to copy for.

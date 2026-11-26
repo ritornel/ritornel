@@ -382,7 +382,7 @@ fn hls(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
 }
 
 /// The image scaled to fit `size` on its longer side, never up, as a JPEG.
-fn scale(decoded: &image::DynamicImage, size: u32) -> Result<Vec<u8>, CoverError> {
+pub(crate) fn scale(decoded: &image::DynamicImage, size: u32) -> Result<Vec<u8>, CoverError> {
     let longer = decoded.width().max(decoded.height());
     let scaled = if longer > size {
         // Triangle is a bilinear filter: plenty for scaling down a cover,

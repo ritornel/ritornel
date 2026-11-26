@@ -54,6 +54,8 @@ image = { version = "=0.25.10", default-features = false, features = ["jpeg", "p
 # Decomposes text so that a list can be ordered and searched ignoring accents.
 # The version the domain's normaliser pins.
 unicode-normalization = "=0.1.25"
+# Writes projected tags and pictures into a staged audio copy.
+lofty = "=0.25.5"
 
 # The monotonic clock that keeps counting while the machine sleeps, which
 # every listen is stamped with: the standard library's does not on macOS.
