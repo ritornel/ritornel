@@ -41,11 +41,11 @@ use linux as system;
 use fallback as system;
 
 pub(crate) use system::{
-    CHROME, FEEL, FITTING_SHOWS, KEYS, SERVER_APART, SHOW_FOLDER, accents, bring_forward_quietly,
-    choose_folder, dismiss_menu, fit_window, footprint, forget_main_window, give_back,
-    hold_appearance, keep_out_of_the_dock, key_text, locale, main_window, memory_line, pop_up_menu,
-    screenshot, scroll_details, settings_dir, start, start_server, started_here, stop_server,
-    swiped_back,
+    CHROME, FEEL, FITTING_SHOWS, KEYS, SERVER_APART, SHOW_FOLDER, THIS_COMPUTER, accents,
+    bring_forward_quietly, choose_folder, dismiss_menu, fit_window, footprint, forget_main_window,
+    give_back, hold_appearance, keep_out_of_the_dock, key_text, locale, main_window, memory_line,
+    pop_up_menu, screenshot, scroll_details, settings_dir, start, start_server, started_here,
+    stop_server, swiped_back,
 };
 
 /// One line of the system's context menu. Its actions are numbered in
@@ -330,6 +330,9 @@ mod fallback {
 
     /// What a button that shows a folder in the system's file manager says.
     pub(crate) const SHOW_FOLDER: &str = "Show in File Manager";
+
+    /// What the picker calls the computer the app runs on.
+    pub(crate) const THIS_COMPUTER: &str = "This computer";
 
     /// Makes the window's content `height` points tall.
     pub(crate) fn fit_window(window: &mut gpui::Window, height: f32, _quietly: bool) {

@@ -1,6 +1,7 @@
 //! What the app remembers on this computer between runs: which wall and
 //! which order the Library shows, whether the large letters stand beside the
-//! walls, and the section Settings was last left on. It is the app's own,
+//! walls, the section Settings was last left on, the place the music was
+//! sent to, and how the bar shows volume. It is the app's own,
 //! not the server's, and lives in the system's place for an app's settings.
 //! Remembering is a convenience: a file that cannot be read or written is
 //! the defaults.
@@ -25,6 +26,13 @@ pub(crate) struct Remembered {
     /// The section Settings was last left on: "library", "appearance",
     /// "lastfm" or "about".
     pub settings_section: String,
+    /// The place the music was last sent to, other than this computer, by
+    /// its ID in `players.list`. A restart goes back to it only if it is
+    /// still playing (`places.rs`).
+    pub play_on: Option<String>,
+    /// When the bar shows a volume slider: "remote", "always" or "never".
+    /// Settings does not offer it yet.
+    pub volume_control: String,
 }
 
 impl Default for Remembered {
@@ -34,6 +42,8 @@ impl Default for Remembered {
             albums_sort: "artist".to_owned(),
             letters: true,
             settings_section: "library".to_owned(),
+            play_on: None,
+            volume_control: "remote".to_owned(),
         }
     }
 }
@@ -77,6 +87,17 @@ pub(crate) fn load() -> Remembered {
     {
         remembered.settings_section = section.to_owned();
     }
+    remembered.play_on = read
+        .get("playOn")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(control) = read
+        .get("volumeControl")
+        .and_then(Value::as_str)
+        .filter(|control| ["remote", "always", "never"].contains(control))
+    {
+        remembered.volume_control = control.to_owned();
+    }
     remembered
 }
 
@@ -87,6 +108,8 @@ pub(crate) fn save(remembered: &Remembered) {
         "albumsSort": remembered.albums_sort,
         "letters": remembered.letters,
         "settingsSection": remembered.settings_section,
+        "playOn": remembered.play_on,
+        "volumeControl": remembered.volume_control,
     });
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -118,4 +141,14 @@ pub(crate) fn set_letters(on: bool, cx: &mut App) {
     let mut remembered = load();
     remembered.letters = on;
     save(&remembered);
+}
+
+/// Remembers the place the music was sent to, or that it is on this
+/// computer again.
+pub(crate) fn set_play_on(place: Option<String>) {
+    let mut remembered = load();
+    if remembered.play_on != place {
+        remembered.play_on = place;
+        save(&remembered);
+    }
 }

@@ -662,10 +662,12 @@ impl LeanBack {
     fn read_next(&mut self, cx: &mut Context<Self>) {
         let Some(net) = self.net.clone() else { return };
         let client = Arc::clone(&net.client);
+        // Lean back follows the place played on.
+        let target = self.player.read(cx).target();
         let call = net.rt().spawn(async move {
             client
                 .call::<ReadQueue>(&QueueWindowParams {
-                    player: None,
+                    player: target,
                     offset: 0,
                     limit: Some(1),
                     order: Some(QueueOrder::UpNext),

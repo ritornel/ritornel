@@ -1,6 +1,6 @@
 //! The player bar: what is playing and its rating, the transport and the
-//! seek bar, Up next and Lean back. There is no volume control, by design
-//! ("Frame and navigation" in docs/internals/desktop.md).
+//! seek bar, where it plays and how loud (`speaker.rs`), Up next and Lean
+//! back ("Frame and navigation" in docs/internals/desktop.md).
 //!
 //! A new song's cover settles into place. The seek bar follows the pointer
 //! while it is held, anywhere in the window, and the song moves when it is
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    Bounds, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    AppContext, Bounds, Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Render,
     RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task,
     Window, canvas, div, img, prelude::FluentBuilder, px,
@@ -22,8 +22,10 @@ use ritornel_contract::{Id, OutputProblem, Repeat, SkipDirection};
 use crate::icons::icon;
 use crate::link::{Link, LinkEvent};
 use crate::net::NoArt;
+use crate::places::Places;
 use crate::player::{Player, stars_of};
 use crate::settings::words::{Clock, Style, when};
+use crate::speaker::Speaker;
 use crate::theme;
 use crate::wall::PLAYER_BAR;
 
@@ -80,6 +82,8 @@ impl SeekDrag {
 pub(crate) struct PlayerBar {
     link: Entity<Link>,
     player: Entity<Player>,
+    places: Entity<Places>,
+    speaker: Entity<Speaker>,
     /// The cover of the song playing, by its art, and when it came.
     cover: Option<(Id, Arc<RenderImage>, Instant)>,
     /// The art being read, so that it is read once.
@@ -106,12 +110,20 @@ pub(crate) struct PlayerBar {
     /// How the locale writes a time, for when the output stopped working.
     style: Style,
     _player: Subscription,
+    _places: Subscription,
     _link: Subscription,
 }
 
 impl PlayerBar {
-    pub(crate) fn new(link: Entity<Link>, player: Entity<Player>, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        link: Entity<Link>,
+        player: Entity<Player>,
+        places: Entity<Places>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let followed = cx.observe(&player, |_, _, cx| cx.notify());
+        let placed = cx.observe(&places, |_, _, cx| cx.notify());
+        let speaker = cx.new(|cx| Speaker::new(places.clone(), player.clone(), cx));
         // A new session: the cover is asked for again at once, and a read
         // through the session before is let go.
         let session = cx.subscribe(&link, |bar: &mut Self, _, event: &LinkEvent, cx| {
@@ -130,6 +142,8 @@ impl PlayerBar {
         Self {
             link,
             player,
+            places,
+            speaker,
             cover: None,
             reading: None,
             missing: None,
@@ -145,6 +159,7 @@ impl PlayerBar {
                 &crate::platform::locale().unwrap_or_else(|| "en-US".to_owned()),
             ),
             _player: followed,
+            _places: placed,
             _link: session,
         }
     }
@@ -298,6 +313,10 @@ impl Render for PlayerBar {
         } else {
             0.
         };
+        // Another place out of reach: the transport dims, and the clock holds.
+        let there = self.places.read(cx).chosen(cx).cloned();
+        let reachable = there.as_ref().is_none_or(|row| row.reachable);
+        let on = on && reachable;
         let live = on && duration > 0;
         // While the player waits for its audio (`Buffering`), after a moment
         // the seek bar's empty part breathes, and after a while the line
@@ -310,15 +329,22 @@ impl Render for PlayerBar {
             .map(|_| crate::player::getting_from(player.hub_name()));
         let breathing = waited.is_some_and(|waited| waited >= crate::player::BUFFER_QUIET);
         // While the sound output isn't working, the words under the title
-        // say so in place of the artist, or of the hint with nothing on.
-        let trouble = state.as_ref().and_then(|state| {
-            let problem = state.output.problem.as_ref()?;
-            let clock = Clock {
-                now: now_ms(),
-                zone: jiff::tz::TimeZone::system(),
-                style: self.style,
-            };
-            Some(output_trouble(&state.output.name, problem, on, &clock))
+        // say so in place of the artist, or of the hint with nothing on;
+        // for another place, briefly, since the widget names it.
+        let remote_trouble = there.as_ref().and_then(|row| {
+            let trouble = crate::places::trouble(row, state.as_ref())?;
+            Some(trouble.lines(&crate::away::clock()))
+        });
+        let trouble = remote_trouble.or_else(|| {
+            state.as_ref().and_then(|state| {
+                let problem = state.output.problem.as_ref()?;
+                let clock = Clock {
+                    now: now_ms(),
+                    zone: jiff::tz::TimeZone::system(),
+                    style: self.style,
+                };
+                Some(output_trouble(&state.output.name, problem, on, &clock))
+            })
         });
 
         if let Some(entry) = entry
@@ -872,8 +898,10 @@ impl Render for PlayerBar {
                     .flex_1()
                     .min_w(px(240.))
                     .flex()
+                    .items_center()
                     .justify_end()
                     .gap(px(6.))
+                    .child(self.speaker.clone())
                     .child(self.up_next_button(cx))
                     .child(side_button("lean-back", "leanBack", on).when(on, |button| {
                         button
