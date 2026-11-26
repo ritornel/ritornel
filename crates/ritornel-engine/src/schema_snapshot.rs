@@ -116,7 +116,7 @@ fn names(connection: &Connection, sql: &str) -> Vec<String> {
 /// The tables that do not carry the library revision they last changed at:
 /// a `rev` column that is an integer and never null. The migration ledger
 /// is exempt, because the runner writes it outside any revision. See
-/// "Migrations" and "Testing and CI" in docs/internals/server.md.
+/// "Migrations" and "Testing" in docs/internals/server.md.
 fn tables_without_rev(connection: &Connection) -> Vec<String> {
     names(
         connection,
