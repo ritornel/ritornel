@@ -130,6 +130,10 @@ pub(super) fn start(
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     callback.render(data);
                 },
+                // Only an error that ends the stream loses the output. On
+                // Windows, cpal also says so here when its thread could not
+                // be given audio scheduling or a time-critical priority,
+                // and plays on at normal priority.
                 move |error: cpal::Error| {
                     errors.stream_errors.fetch_add(1, Ordering::Relaxed);
                     if matches!(
