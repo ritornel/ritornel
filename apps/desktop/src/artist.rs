@@ -1383,14 +1383,18 @@ impl Artist {
                 let shelf_rows = records.len().div_ceil(columns);
                 line_min = line_min.max(heading_h + shelf_rows as f32 * min_step);
                 line_max = line_max.max(heading_h + shelf_rows as f32 * max_step);
-                let mut cards = div()
-                    .w(px(wide))
-                    .flex()
-                    .flex_wrap()
-                    .gap_x(px(gap))
-                    .gap_y(px(row_gap));
+                // The rows are made here, `columns` to a row, rather than
+                // left to wrapping: the gap is rounded to the screen's
+                // pixels, and a row rounded a hair wider than `wide` would
+                // wrap its last record and leave a hole where it stood.
+                let mut cards = div().w(px(wide)).flex().flex_col().gap(px(row_gap));
+                let mut cards_row = div().flex().gap(px(gap));
                 let appears = *shelf == Shelf::AppearsOn;
                 for (index, tile) in records.iter().enumerate() {
+                    if index > 0 && index % columns == 0 {
+                        cards = cards.child(cards_row);
+                        cards_row = div().flex().gap(px(gap));
+                    }
                     let near = if use_measured
                         && let Some(bounds) = self.landings.bounds(tile.album.id())
                     {
@@ -1403,7 +1407,7 @@ impl Artist {
                         let row_bottom_max = y_max + heading_h + (row_index + 1.) * max_step;
                         row_bottom_max >= view_min && row_top_min <= view_max
                     };
-                    cards = cards.child(self.card(
+                    cards_row = cards_row.child(self.card(
                         (shelf_id(*shelf), index),
                         tile,
                         track,
@@ -1414,6 +1418,7 @@ impl Artist {
                         cx,
                     ));
                 }
+                cards = cards.child(cards_row);
                 row = row.child(
                     div()
                         .w(px(wide))
@@ -2274,5 +2279,109 @@ mod tests {
             );
             assert!(page.covers.len() <= 3);
         });
+    }
+
+    /// An invented album of theirs, the `n`th, with no cover.
+    fn album(n: usize) -> AlbumTile {
+        let mut id = [0xA0; 16];
+        id[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        AlbumTile {
+            album: ritornel_contract::AlbumRef::ReleaseGroup {
+                id: Id::from_bytes(id),
+            },
+            title: Some(format!("Invented Album {n}")),
+            artist_credit: None,
+            year: Some(2000),
+            track_count: 10,
+            duration_ms: 0,
+            version_count: 1,
+            art_id: None,
+            quality: None,
+        }
+    }
+
+    /// Where each of `albums` has its cover with the page `width` points wide.
+    fn covers_at(
+        page: &Entity<Artist>,
+        albums: &[AlbumTile],
+        width: f32,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<gpui::Bounds<gpui::Pixels>> {
+        cx.simulate_resize(gpui::size(px(width), px(900.)));
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            albums
+                .iter()
+                .map(|tile| {
+                    let bounds = page.landings.bounds(tile.album.id());
+                    assert!(bounds.is_some(), "no cover drawn at {width}");
+                    bounds.unwrap_or_default()
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn a_shelf_fills_each_row_at_every_width(cx: &mut gpui::TestAppContext) {
+        let (_pictures, address) = Pictures::start();
+        let (page, _link, cx) = open(session(NONE, true, address), cx);
+        until(&page, cx, "was read", |page| page.page.is_some());
+        let step = FIRST_CARD + 20.;
+        // Every width from 800 to 1,300 points, where the leftover room
+        // between four to six albums seldom comes to whole pixels, and
+        // the widest windows; one or three albums never fill a row.
+        let every: Vec<f32> = (800..=1300)
+            .chain([2000, 2600, 3400])
+            .map(|width| width as f32)
+            .collect();
+        let few = vec![700., 1100., 2000., 3400.];
+        for (count, widths) in [(1, &few), (3, &few), (9, &every), (20, &every)] {
+            let albums: Vec<AlbumTile> = (0..count).map(album).collect();
+            page.update(cx, |page, cx| {
+                page.shelves = vec![(Shelf::Albums, albums.clone())];
+                page.measured_area = 0.;
+                cx.notify();
+            });
+            for &width in widths {
+                let covers = covers_at(&page, &albums, width, cx);
+                // With no history beside them, the albums have the page's
+                // whole measure.
+                let wide = width - 2. * gutter(width);
+                let top = covers.first().map(|at| at.origin.y);
+                let columns = covers
+                    .iter()
+                    .take_while(|at| Some(at.origin.y) == top)
+                    .count();
+                // A row holds the exact number of albums that fit.
+                let expected = (((wide + 20.) / step).floor() as usize).max(1).min(count);
+                assert_eq!(
+                    columns, expected,
+                    "{count} albums at {width}: expected {expected} in the first row, got {columns}",
+                );
+                // Each row lies level, its albums under the first row's.
+                let first: Vec<_> = covers.iter().take(columns).map(|at| at.origin.x).collect();
+                for (at, row) in covers.chunks(columns).enumerate() {
+                    let xs: Vec<_> = row.iter().map(|cover| cover.origin.x).collect();
+                    assert_eq!(
+                        xs,
+                        first.get(..row.len()).unwrap_or_default(),
+                        "{count} albums at {width}: row {at} out of the columns",
+                    );
+                    let level = row.first().map(|cover| cover.origin.y);
+                    assert!(
+                        row.iter().all(|cover| Some(cover.origin.y) == level),
+                        "{count} albums at {width}: row {at} not level",
+                    );
+                }
+                // Albums that leave room over sit at their natural spacing.
+                if let [one, two, ..] = covers.as_slice()
+                    && count as f32 * step - 20. <= wide
+                {
+                    let spacing = f32::from(two.origin.x - one.origin.x);
+                    assert_eq!(spacing, step, "{count} albums at {width}");
+                }
+            }
+        }
     }
 }
