@@ -2337,6 +2337,7 @@ mod tests {
                     timekeeper: Arc::new(ritornel_engine::SystemTimekeeper),
                     entropy: Arc::new(OsEntropy),
                     checkpoint_every_ms: ritornel_engine::playback::CHECKPOINT_EVERY_MS,
+                    close_output_after_ms: ritornel_engine::playback::CLOSE_OUTPUT_AFTER_MS,
                     fail_at_position_ms: None,
                     fail_saves_after_ms: None,
                 };

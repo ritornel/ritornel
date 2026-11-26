@@ -295,6 +295,7 @@ fn setup(
         timekeeper: keeper.clone(),
         entropy: entropy.clone(),
         checkpoint_every_ms: super::CHECKPOINT_EVERY_MS,
+        close_output_after_ms: super::CLOSE_OUTPUT_AFTER_MS,
         fail_at_position_ms: None,
         fail_saves_after_ms: None,
     }
@@ -1886,6 +1887,267 @@ fn a_pause_at_the_very_end_of_a_track_starts_the_next_listen_when_it_is_heard() 
     assert_eq!(first.ended.unwrap().ended_at_ms, T0 + 240_000);
     assert_eq!(next.started.started_at_ms, T0 + 242_000);
     assert_eq!(rig.player.state().position_ms, 1_000);
+}
+
+// ---------------------------------------------------------------- the output closed while nothing plays
+
+impl Rig {
+    /// Pauses at `at_ms` into the first track, and waits until the output
+    /// has been closed under it.
+    fn paused_with_output_closed(&mut self, at_ms: i64) {
+        self.play(0);
+        self.pass(at_ms);
+        self.pause();
+        self.wait(super::CLOSE_OUTPUT_AFTER_MS);
+        assert_eq!(self.fake.closes(), 1);
+    }
+}
+
+#[test]
+fn a_pause_closes_the_output_after_thirty_seconds_and_resume_carries_the_listen_on() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(60_000);
+    rig.pause();
+    let paused = rig.player.state();
+    rig.wait(29_999);
+    assert_eq!(rig.fake.closes(), 0);
+    rig.wait(1);
+    assert_eq!(rig.fake.closes(), 1);
+    // Nothing the state says changes: the track, its format, the place
+    // and the output are as they were, and the listen is still open.
+    let closed = rig.player.state();
+    assert_eq!(closed.revision, paused.revision);
+    assert_eq!(closed.status, Status::Paused);
+    assert_eq!(closed.position_ms, 60_000);
+    assert_eq!(closed.current, paused.current);
+    assert_eq!(closed.output, paused.output);
+    let [open] = rig.staged().try_into().unwrap();
+    assert_eq!(open.ended, None);
+    // Play opens it again and loads the track where it was paused: the
+    // same listen plays on to the end, one play.
+    rig.resume();
+    assert_eq!(rig.fake.loads(), [(file(0), 0), (file(0), 60_000)]);
+    assert_eq!(rig.player.state().status, Status::Playing);
+    rig.pass(180_000);
+    let [listen] = rig.staged().try_into().unwrap();
+    let ended = listen.ended.unwrap();
+    assert_eq!(
+        (
+            ended.end_reason.as_str(),
+            listen.heard.ms_played,
+            listen.heard.ranges_json.as_str(),
+            listen.heard.seek_count,
+            listen.heard.pause_count,
+        ),
+        ("finished", 240_000, "[[0,240000]]", 0, 1)
+    );
+    assert_eq!(ended.ended_at_ms, T0 + 270_000);
+    rig.deliver();
+    assert_eq!(rig.plays().len(), 1);
+}
+
+#[test]
+fn a_pause_shorter_than_thirty_seconds_keeps_the_output_and_each_pause_counts_afresh() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(10_000);
+    rig.pause();
+    rig.wait(29_000);
+    rig.resume();
+    rig.pass(10_000);
+    rig.pause();
+    rig.wait(29_000);
+    assert_eq!(rig.fake.closes(), 0);
+    assert_eq!(rig.fake.loads().len(), 1);
+    rig.wait(1_000);
+    assert_eq!(rig.fake.closes(), 1);
+}
+
+#[test]
+fn a_seek_while_the_output_is_closed_is_heard_from_there_as_the_same_listen() {
+    let mut rig = Rig::new();
+    rig.paused_with_output_closed(60_000);
+    rig.seek(100_000);
+    // Nothing is opened for it until play.
+    assert_eq!(rig.fake.loads().len(), 1);
+    let state = rig.player.state();
+    assert_eq!((state.status, state.position_ms), (Status::Paused, 100_000));
+    assert_eq!(rig.session_position(), 100_000);
+    rig.resume();
+    assert_eq!(rig.fake.loads().last(), Some(&(file(0), 100_000)));
+    rig.pass(140_000);
+    let [listen] = rig.staged().try_into().unwrap();
+    assert_eq!(
+        (
+            listen.ended.unwrap().end_reason.as_str(),
+            listen.heard.ms_played,
+            listen.heard.ranges_json.as_str(),
+            listen.heard.seek_count,
+        ),
+        ("finished", 200_000, "[[0,60000],[100000,240000]]", 1)
+    );
+}
+
+#[test]
+fn leaving_a_track_whose_output_is_closed_ends_its_listen_then() {
+    let mut rig = Rig::new();
+    rig.paused_with_output_closed(60_000);
+    rig.wait(10_000);
+    rig.stop();
+    let [listen] = rig.staged().try_into().unwrap();
+    let ended = listen.ended.unwrap();
+    assert_eq!(
+        (
+            ended.end_reason.as_str(),
+            ended.end_position_ms,
+            ended.ended_at_ms,
+            listen.heard.ms_played
+        ),
+        ("stopped", 60_000, T0 + 100_000, 60_000)
+    );
+    // A skip does the same, and waits on the next, paused, until play.
+    let mut rig = Rig::new();
+    rig.paused_with_output_closed(60_000);
+    rig.skip(Direction::Next);
+    let [first] = rig.staged().try_into().unwrap();
+    assert_eq!(first.ended.unwrap().end_reason.as_str(), "next");
+    assert_eq!(rig.player.state().status, Status::Paused);
+    rig.resume();
+    rig.pass(1_000);
+    let [_, second] = rig.staged().try_into().unwrap();
+    assert_eq!(second.started.appearance, rig.tracks[1]);
+    assert_eq!(rig.fake.loads().last(), Some(&(file(1), 0)));
+}
+
+#[test]
+fn stopping_or_reaching_the_end_of_the_queue_closes_the_output_after_thirty_seconds() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(10_000);
+    rig.stop();
+    rig.wait(29_000);
+    assert_eq!(rig.fake.closes(), 0);
+    rig.wait(1_000);
+    assert_eq!(rig.fake.closes(), 1);
+    // Play opens it again, from the entry's beginning.
+    rig.resume();
+    assert_eq!(rig.fake.loads().last(), Some(&(file(0), 0)));
+    assert_eq!(rig.player.state().status, Status::Playing);
+
+    let mut rig = Rig::new();
+    rig.play(3);
+    rig.pass(200_000);
+    assert_eq!(rig.player.state().status, Status::Stopped);
+    rig.wait(30_000);
+    assert_eq!(rig.fake.closes(), 1);
+}
+
+#[test]
+fn the_track_after_one_whose_output_was_closed_is_joined_again_once_it_plays() {
+    let mut rig = Rig::new();
+    rig.fake.gapless();
+    rig.play(0);
+    assert_eq!(rig.fake.queued(), Some(file(1)));
+    rig.pass(200_000);
+    rig.pause();
+    rig.wait(30_000);
+    assert_eq!(rig.fake.queued(), None);
+    // Ticks while it is closed prepare nothing.
+    rig.wait(1_000);
+    assert_eq!(rig.fake.queued(), None);
+    rig.resume();
+    assert_eq!(rig.fake.queued(), Some(file(1)));
+    rig.pass(41_000);
+    let state = rig.player.state();
+    assert_eq!(state.current.unwrap().index, 1);
+    assert_eq!(state.position_ms, 1_000);
+    assert_eq!(rig.fake.loads().len(), 2);
+}
+
+#[test]
+fn a_stale_output_is_closed_at_once_while_paused_and_the_first_resume_plays_on_a_fresh_one() {
+    // Noticed by a tick.
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(60_000);
+    rig.pause();
+    rig.wait(1_000);
+    rig.fake.go_stale();
+    rig.tick();
+    assert_eq!(rig.fake.closes(), 1);
+    rig.resume();
+    rig.pass(1_000);
+    let state = rig.player.state();
+    assert_eq!((state.status, state.position_ms), (Status::Playing, 61_000));
+    assert_eq!(state.output_failing, None);
+
+    // Noticed by the resume itself, before any tick.
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(60_000);
+    rig.pause();
+    rig.fake.go_stale();
+    rig.resume();
+    assert_eq!(rig.fake.closes(), 1);
+    rig.pass(1_000);
+    assert_eq!(rig.player.state().position_ms, 61_000);
+    rig.pass(179_000);
+    let [listen] = rig.staged().try_into().unwrap();
+    assert_eq!(
+        (
+            listen.ended.unwrap().end_reason.as_str(),
+            listen.heard.ms_played
+        ),
+        ("finished", 240_000)
+    );
+}
+
+#[test]
+fn an_output_that_cannot_be_opened_again_on_resume_leaves_the_player_paused_where_it_was() {
+    let mut rig = Rig::new();
+    rig.paused_with_output_closed(60_000);
+    rig.fake.refuse_output(true);
+    rig.resume();
+    let state = rig.player.state();
+    assert_eq!((state.status, state.position_ms), (Status::Paused, 60_000));
+    assert!(state.output_failing.is_some());
+    let [lost] = rig.staged().try_into().unwrap();
+    assert_eq!(
+        lost.ended.as_ref().unwrap().end_reason.as_str(),
+        "output_lost"
+    );
+    // Nothing is tried again by itself.
+    rig.wait(60_000);
+    assert_eq!(rig.fake.loads().len(), 1);
+    // Once the output is back, play carries the listen on.
+    rig.fake.refuse_output(false);
+    rig.resume();
+    assert_eq!(rig.fake.loads().last(), Some(&(file(0), 60_000)));
+    assert_eq!(rig.player.state().output_failing, None);
+    rig.pass(1_000);
+    let [_, resumed] = rig.staged().try_into().unwrap();
+    assert_eq!(resumed.started.continues, Some(lost.started.listen_id));
+}
+
+#[test]
+fn a_file_changed_while_its_output_was_closed_is_not_played_and_the_player_moves_on() {
+    let mut rig = Rig::new();
+    rig.paused_with_output_closed(60_000);
+    rig.fake.replace(
+        file(0),
+        super::FileFacts {
+            size_bytes: 2_000,
+            mtime_ms: 1,
+        },
+    );
+    rig.resume();
+    let queue = rig.queue();
+    assert_eq!(queue[0].2.as_deref(), Some("file_changed"));
+    assert_eq!(queue[1].2, None);
+    assert_eq!(rig.fake.loads().last(), Some(&(file(1), 0)));
+    let [listen] = rig.staged().try_into().unwrap();
+    assert_eq!(listen.ended.unwrap().end_reason.as_str(), "error");
 }
 
 // ---------------------------------------------------------------- the queue's orders and edits

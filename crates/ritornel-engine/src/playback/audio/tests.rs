@@ -1406,6 +1406,16 @@ struct Pipeline {
 
 impl Pipeline {
     fn new(lengths_ms: &[i64], renderer: Box<dyn Renderer>) -> Self {
+        Self::closing_after(lengths_ms, renderer, crate::playback::CLOSE_OUTPUT_AFTER_MS)
+    }
+
+    /// As [`new`](Self::new), with the player closing the output once it
+    /// has wanted no sound for `close_output_after_ms`.
+    fn closing_after(
+        lengths_ms: &[i64],
+        renderer: Box<dyn Renderer>,
+        close_output_after_ms: i64,
+    ) -> Self {
         use std::sync::Arc;
 
         use crate::playback::player::{Player, PlayerSetup};
@@ -1477,6 +1487,7 @@ impl Pipeline {
             timekeeper: Arc::new(SystemTimekeeper),
             entropy,
             checkpoint_every_ms: crate::playback::CHECKPOINT_EVERY_MS,
+            close_output_after_ms,
             fail_at_position_ms: None,
             fail_saves_after_ms: None,
         };
@@ -1681,6 +1692,7 @@ fn an_output_that_goes_away_mid_track_saves_where_it_was_heard_and_play_goes_on_
         gain: ReplayGain::Off,
         volume: 1.0,
         said: Vec::new(),
+        closed: None,
     };
     let mut rig = Pipeline::new(&[2_000], Box::new(renderer));
     rig.play();
@@ -1732,6 +1744,7 @@ fn on_demand_held(
         gain: ReplayGain::Off,
         volume: 1.0,
         said: Vec::new(),
+        closed: None,
     };
     (renderer, tap, hold)
 }
@@ -1848,34 +1861,90 @@ fn an_output_that_stops_taking_sound_while_playing_is_lost_where_it_stopped_and_
 }
 
 #[test]
-fn an_output_that_asks_for_nothing_while_paused_is_not_lost() {
+fn an_output_that_asks_for_nothing_while_paused_is_closed_and_the_first_resume_plays_on_a_fresh_one()
+ {
+    use std::sync::Arc;
+
     use crate::playback::Status;
-    // Long enough that the moments between the hold and the pause, on a
-    // busy machine, are no stall.
+    // Held, the output asks for nothing more, with no error, as an ALSA
+    // stream does once PipeWire restarts under it.
     let stall_after = Duration::from_secs(3);
-    let (renderer, _tap, hold) = on_demand_held(500, stall_after);
+    let (mut renderer, _tap, hold) = on_demand_held(500, stall_after);
+    let held = renderer.opened.as_mut().unwrap();
+    held.stale_after = Duration::from_millis(100);
+    let device = Arc::clone(&held.shared);
     let mut rig = Pipeline::new(&[1_000], Box::new(renderer));
     rig.play();
     rig.until(|_| hold.waiting().is_some());
     let request = rig.request("playback.pause");
     rig.player.pause(request, &rig.server).unwrap();
-    // sleep: held still for longer than a stall while paused.
-    std::thread::sleep(stall_after + Duration::from_millis(500));
-    rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    // Paused, it is not lost: it is closed, long before the player would
+    // close an output it waits on.
+    rig.until(|_| Arc::strong_count(&device) == 1);
     let state = rig.player.state();
     assert_eq!((state.status, state.output_failing), (Status::Paused, None));
-    // It asks again, and play goes on through the same output to the end.
-    hold.let_go();
+    // The first play opens a fresh output, never let go of the hold, and
+    // the listen plays on through it to the end.
     let request = rig.request("playback.resume");
     let (server, library): (_, Option<&dyn Catalog>) = (&rig.server, Some(&rig.library));
     rig.player.resume(request, server, library).unwrap();
     rig.until(|state| state.status == Status::Stopped);
+    assert_eq!(rig.player.state().output_failing, None);
     let [listen] = rig.staged().try_into().unwrap();
-    let ended = listen.ended.unwrap();
+    let ended = listen.ended.as_ref().unwrap();
+    assert_eq!(ended.end_reason.as_str(), "finished");
+    assert!((listen.heard.ms_played - 1_000).abs() <= 1, "{listen:?}");
+}
+
+#[test]
+fn an_output_closed_while_paused_is_let_go_and_play_carries_the_listen_on_through_a_new_one() {
+    use std::sync::Arc;
+
+    use crate::playback::Status;
+    // An output at 16 kHz mono; the one opened again is the null output's
+    // own, at 48 kHz stereo, so the listen is counted across two rates.
+    let (opened, _tap) = AudioRenderer::tapped(AS_IS, 4).unwrap();
+    let device = Arc::clone(&opened.shared);
+    let renderer = super::OnDemand {
+        output: Output::Null { speed: 4 },
+        opened: Some(opened),
+        gain: ReplayGain::Off,
+        volume: 1.0,
+        said: Vec::new(),
+        closed: None,
+    };
+    let mut rig = Pipeline::closing_after(&[2_000], Box::new(renderer), 0);
+    rig.play();
+    rig.until(|state| state.position_ms >= 500);
+    let request = rig.request("playback.pause");
+    rig.player.pause(request, &rig.server).unwrap();
+    let paused = rig.player.state();
+    // The next tick closes it: the output is let go, and the state says
+    // nothing new.
+    rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
+    assert_eq!(Arc::strong_count(&device), 1);
+    let closed = rig.player.state();
     assert_eq!(
-        (ended.end_reason.as_str(), listen.heard.ms_played),
-        ("finished", 1_000)
+        (closed.revision, closed.status, closed.output),
+        (
+            paused.revision,
+            Status::Paused,
+            ("null".to_owned(), 16_000, 1)
+        )
     );
+    let request = rig.request("playback.resume");
+    let (server, library): (_, Option<&dyn Catalog>) = (&rig.server, Some(&rig.library));
+    rig.player.resume(request, server, library).unwrap();
+    assert_eq!(rig.player.state().output, ("null".to_owned(), 48_000, 2));
+    rig.until(|state| state.status == Status::Stopped);
+    let [listen] = rig.staged().try_into().unwrap();
+    let ended = listen.ended.as_ref().unwrap();
+    assert_eq!(
+        (ended.end_reason.as_str(), listen.heard.pause_count),
+        ("finished", 1)
+    );
+    assert!((listen.heard.ms_played - 2_000).abs() <= 1, "{listen:?}");
+    assert_eq!(listen.heard.ranges_json, "[[0,2000]]");
 }
 
 #[test]

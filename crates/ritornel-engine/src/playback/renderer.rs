@@ -206,6 +206,20 @@ pub trait Renderer: Debug + Send {
     /// Now, on the clock events are stamped with.
     fn now(&self) -> u64;
 
+    /// Lets the output go, so that its device can sleep and other programs
+    /// can have it, with what was loaded let go as `unload` lets it go. The
+    /// next load opens the output again, and until then its name, rate and
+    /// channels stay those it had.
+    fn close(&mut self) {}
+
+    /// Whether the output, not told to play, has stopped asking for frames:
+    /// its stream is stale, as one is that a sound server restarted under,
+    /// and playing through it again would be heard as a stall. The player
+    /// closes it instead, and play opens it afresh.
+    fn stale(&self) -> bool {
+        false
+    }
+
     /// The ReplayGain the tracks loaded or queued from now on play at.
     fn set_replay_gain(&mut self, _gain: ReplayGain) {}
 
@@ -340,6 +354,11 @@ pub(crate) mod fake {
         /// Whether the output went away and was let go: it then has no rate,
         /// as an output not yet opened again has none.
         gone: bool,
+        /// Whether the output has stopped asking for frames while paused.
+        stale: bool,
+        /// Whether the output is open, and how often it was closed.
+        open: bool,
+        closes: usize,
         /// What the player has not drained yet, and all that was ever said.
         said: Vec<Event>,
         history: Vec<Event>,
@@ -499,6 +518,18 @@ pub(crate) mod fake {
             state.playing = false;
         }
 
+        /// The output stops asking for frames, with no error, as a stream
+        /// does that a sound server restarted under: until it is opened
+        /// again, it is stale while paused and stalls when played.
+        pub(crate) fn go_stale(&self) {
+            self.state().stale = true;
+        }
+
+        /// How often the output was closed.
+        pub(crate) fn closes(&self) -> usize {
+            self.state().closes
+        }
+
         /// The output cannot be opened while `refused`: every load fails
         /// as the output's fault.
         pub(crate) fn refuse_output(&self, refused: bool) {
@@ -529,7 +560,7 @@ pub(crate) mod fake {
             let base = state.now_ms();
             let at = |elapsed: u64| stamp(base + i64::try_from(elapsed).unwrap_or(0));
             let mut elapsed = 0;
-            while state.playing && !state.lost && elapsed < ms {
+            while state.playing && !state.lost && !state.stale && elapsed < ms {
                 let Some(mut span) = state.loaded.clone().filter(|span| !span.ended) else {
                     break;
                 };
@@ -672,7 +703,8 @@ pub(crate) mod fake {
             let now = stamp(state.now_ms());
             state.let_go(now);
             state.rewritten = false;
-            (state.lost, state.gone) = (false, false);
+            (state.lost, state.gone, state.stale) = (false, false, false);
+            state.open = true;
             state.playing = false;
             state.give(span, path, start_ms, None);
             state.install(span, path, start_ms, false);
@@ -730,6 +762,19 @@ pub(crate) mod fake {
 
         fn drain(&mut self) -> Vec<Event> {
             std::mem::take(&mut self.state().said)
+        }
+
+        fn close(&mut self) {
+            self.unload();
+            let mut state = self.state();
+            if std::mem::take(&mut state.open) {
+                state.closes += 1;
+            }
+        }
+
+        fn stale(&self) -> bool {
+            let state = self.state();
+            state.stale && !state.playing
         }
 
         fn progress(&self) -> Progress {

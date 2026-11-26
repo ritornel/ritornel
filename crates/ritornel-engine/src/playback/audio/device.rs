@@ -3,8 +3,9 @@
 //! The stream lives on a thread of its own, which holds it until the
 //! output is dropped. See "Audio pipeline" in docs/internals/playback.md.
 //!
-//! Only the default device is used, and a stream that errors or a default
-//! that changes is not rebuilt yet: that arrives with the full player.
+//! Only the default device is used. A stream that errors, or a default
+//! that changes, is not followed while the stream is open; the player
+//! closes an idle or stale output, and play opens the default again.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

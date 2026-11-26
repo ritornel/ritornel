@@ -14,7 +14,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ritornel_engine::playback::{
-    CHECKPOINT_EVERY_MS, OnDemand, Output, Player, PlayerSetup, deliver_listens,
+    CHECKPOINT_EVERY_MS, CLOSE_OUTPUT_AFTER_MS, OnDemand, Output, Player, PlayerSetup,
+    deliver_listens,
 };
 use ritornel_engine::{
     Clock, Entropy, Error as EngineError, Id, LibraryStore, SendStamps, ServerStore,
@@ -115,6 +116,7 @@ pub(crate) fn restore(
         timekeeper: Arc::new(SystemTimekeeper),
         entropy: Arc::clone(entropy),
         checkpoint_every_ms: CHECKPOINT_EVERY_MS,
+        close_output_after_ms: CLOSE_OUTPUT_AFTER_MS,
         fail_at_position_ms: run.fail_at_position_ms,
         fail_saves_after_ms: run.fail_saves_after_ms,
     };
