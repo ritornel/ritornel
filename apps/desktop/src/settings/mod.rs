@@ -386,7 +386,9 @@ impl Settings {
                 .line_height(px(controls::SMALL_LINE))
                 .text_color(theme::dim())
                 .when(on, |tab| tab.bg(theme::fill()))
-                .when(!on, |tab| tab.hover(|style| style.text_color(theme::ink())))
+                .when(!on, |tab| {
+                    tab.hover(theme::hovered_ink).active(theme::pressed)
+                })
                 // The press must not start a window drag.
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |settings, _: &ClickEvent, _, cx| {
@@ -398,9 +400,7 @@ impl Settings {
                         .size(px(22.))
                         .flex_none()
                         .text_color(if on { theme::acc() } else { theme::dim() })
-                        .when(!on, |icon| {
-                            icon.group_hover(group, |style| style.text_color(theme::ink()))
-                        }),
+                        .when(!on, |icon| icon.group_hover(group, theme::hovered_ink)),
                 )
                 .child(
                     div()

@@ -194,7 +194,7 @@ pub(crate) fn title_bar(
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(move |_, window, cx| go(tab, window, cx))
             .when(!on, |base| {
-                base.hover(|style| style.text_color(theme::ink()))
+                base.hover(theme::hovered_ink).active(theme::pressed)
             })
             .px(px(11.))
             .py(px(5.))
@@ -265,7 +265,7 @@ pub(crate) fn title_bar(
                         .text_color(theme::dim())
                         .when(!can_go_back, |back| back.opacity(0.35))
                         .when(can_go_back, |back| {
-                            back.hover(|style| style.text_color(theme::ink()))
+                            back.hover(theme::hovered).active(theme::pressed)
                         })
                         // The press must not start a window drag.
                         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -370,7 +370,8 @@ fn menu_button() -> impl IntoElement {
         .flex()
         .items_center()
         .justify_center()
-        .hover(|style| style.bg(theme::fill()))
+        .hover(theme::hovered)
+        .active(theme::pressed)
         .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
             // The press must not start a window drag.
             cx.stop_propagation();
@@ -408,9 +409,10 @@ fn caption_buttons() -> impl IntoElement {
                         .bg(gpui::rgb(0xc42b1c))
                         .text_color(gpui::rgb(0xffffff))
                 } else {
-                    style.bg(theme::fill()).text_color(theme::ink())
+                    theme::hovered_ink(theme::hovered(style))
                 }
             })
+            .active(theme::pressed)
             .child(glyph)
     };
     div()

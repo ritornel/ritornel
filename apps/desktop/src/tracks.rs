@@ -318,8 +318,9 @@ impl Tracks {
             .when(!added, |plus| {
                 plus.invisible()
                     .group_hover(group.clone(), |style| style.visible())
-                    .hover(|style| style.bg(theme::fill2()))
+                    .hover(theme::hovered_on_fill)
             })
+            .active(theme::pressed)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |list, _, _, cx| list.play_next(at, cx)))
             .child(if added {
@@ -350,8 +351,7 @@ impl Tracks {
             .border_b_1()
             .border_color(theme::mix(theme::line(), gpui::rgba(0xffffff00), 0.3))
             .hover(|style| {
-                style
-                    .bg(theme::fill())
+                theme::hovered(style)
                     .rounded(px(9.))
                     .border_color(gpui::rgba(0xffffff00))
             })

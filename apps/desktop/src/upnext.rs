@@ -622,7 +622,7 @@ impl UpNextCard {
             .items_center()
             .gap(px(10.))
             .rounded(px(9.))
-            .hover(|style| style.bg(theme::fill()))
+            .hover(theme::hovered)
             .when(menu > 0., |row| row.bg(crate::menu::fill(menu)))
             .when_some(line, |row, line| row.shadow(line))
             .on_drag(carried, carry::lift)
@@ -700,15 +700,15 @@ impl UpNextCard {
                     .justify_center()
                     .opacity(0.)
                     .group_hover(group, |style| style.opacity(1.))
-                    .hover(|style| style.bg(theme::fill2()))
+                    .hover(theme::hovered_on_fill)
+                    .active(theme::pressed)
                     // Not a double-click on the row, nor a drag of it.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |card, _, _, cx| {
                         card.player.update(cx, |player, cx| player.remove(id, cx));
                     }))
                     .child(
-                        icon("close", 9., theme::dim())
-                            .group_hover(rm_group, |style| style.text_color(theme::ink())),
+                        icon("close", 9., theme::dim()).group_hover(rm_group, theme::hovered_ink),
                     ),
             )
     }
@@ -1082,14 +1082,15 @@ impl UpNextCard {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .hover(|style| style.bg(theme::fill()))
+                    .hover(theme::hovered)
+                    .active(theme::pressed)
                     .on_click(cx.listener(|card, _, _, cx| {
                         card.player
                             .update(cx, |player, cx| player.toggle_card(Some(false), cx));
                     }))
                     .child(
                         icon("close", 10., theme::dim())
-                            .group_hover("up-next-close", |style| style.text_color(theme::ink())),
+                            .group_hover("up-next-close", theme::hovered_ink),
                     ),
             )
     }

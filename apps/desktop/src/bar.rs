@@ -256,6 +256,7 @@ impl PlayerBar {
                     style.bg(gpui::Rgba { a: 0.3, ..acc }).shadow(ring(1.))
                 })
             })
+            .active(theme::pressed)
             .on_click(cx.listener(|bar, _, _, cx| {
                 bar.player
                     .update(cx, |player, cx| player.toggle_card(None, cx));
@@ -265,10 +266,7 @@ impl PlayerBar {
                     crate::carry::drop(carried, ritornel_contract::QueuePlace::End, &player, cx);
                 }
             })
-            .child(
-                icon("upNext", 15., color)
-                    .group_hover("up-next", |style| style.text_color(theme::ink())),
-            )
+            .child(icon("upNext", 15., color).group_hover("up-next", theme::hovered_ink))
     }
 }
 
@@ -524,9 +522,11 @@ impl Render for PlayerBar {
                             .child(cover)
                             .when(self.cover_away, |button| button.invisible())
                             .when_some(opens, |button, row| {
-                                button.on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.emit(BarEvent::OpenAlbum(Arc::clone(&row)));
-                                }))
+                                button.active(theme::pressed).on_click(cx.listener(
+                                    move |_, _, _, cx| {
+                                        cx.emit(BarEvent::OpenAlbum(Arc::clone(&row)));
+                                    },
+                                ))
                             }),
                     )
                     .child(
@@ -592,9 +592,7 @@ impl Render for PlayerBar {
                 .when(lit, |button| button.bg(accent_back(theme::LIT_TINT)))
                 .child(
                     icon(name, 16., if lit { theme::acc() } else { theme::faint() })
-                        .when(on, |icon| {
-                            icon.group_hover(id, |style| style.text_color(theme::ink()))
-                        }),
+                        .when(on, |icon| icon.group_hover(id, theme::hovered_ink)),
                 )
         };
         let player = self.player.clone();
@@ -621,9 +619,13 @@ impl Render for PlayerBar {
                 )
             },
         );
+        // Already in the ink, a step lightens under the pointer like Play
+        // (no hover pill), keeping a 28-pt hit target without changing row spacing.
         let step = |id: &'static str, name: &'static str| {
             div()
                 .id(id)
+                .size(px(28.))
+                .mx(px(-5.5))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -645,6 +647,11 @@ impl Render for PlayerBar {
                 theme::bg(),
             ));
         if on {
+            shuffle_button = shuffle_button.active(theme::pressed);
+            repeat_button = repeat_button.active(theme::pressed);
+            previous = previous.hover(theme::hovered_solid).active(theme::pressed);
+            next = next.hover(theme::hovered_solid).active(theme::pressed);
+            play = play.hover(theme::hovered_solid).active(theme::pressed);
             shuffle_button = shuffle_button.on_click(act(|player, cx| {
                 let shuffle = player.state.as_ref().is_some_and(|state| state.shuffle);
                 player.set_shuffle(!shuffle, cx);
@@ -763,9 +770,10 @@ impl Render for PlayerBar {
                 .items_center()
                 .justify_center()
                 .when(!enabled, |button| button.opacity(0.35))
-                .child(icon(name, 15., theme::dim()).when(enabled, |icon| {
-                    icon.group_hover(id, |style| style.text_color(theme::ink()))
-                }))
+                .child(
+                    icon(name, 15., theme::dim())
+                        .when(enabled, |icon| icon.group_hover(id, theme::hovered_ink)),
+                )
         };
         if animating {
             window.request_animation_frame();
@@ -849,7 +857,9 @@ impl Render for PlayerBar {
                     .gap(px(6.))
                     .child(self.up_next_button(cx))
                     .child(side_button("lean-back", "leanBack", on).when(on, |button| {
-                        button.on_click(cx.listener(|_, _, _, cx| cx.emit(BarEvent::LeanBack)))
+                        button
+                            .active(theme::pressed)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(BarEvent::LeanBack)))
                     })),
             )
     }

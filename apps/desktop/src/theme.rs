@@ -10,7 +10,7 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use gpui::{Hsla, Rgba, WindowAppearance, hsla, rgba};
+use gpui::{Hsla, Rgba, StyleRefinement, Styled, WindowAppearance, hsla, px, rgba};
 
 use crate::accent::{self, Look};
 
@@ -76,14 +76,18 @@ pub(crate) fn fill2() -> Rgba {
 pub(crate) fn line() -> Rgba {
     pick((0xffffff17, 0x1c22301a))
 }
+const INK: Token = (0xe9e9ecff, 0x1c2230ff);
+const DIM: Token = (0xa8a9b0ff, 0x5a6273ff);
+const FAINT: Token = (0x8d8e97ff, 0x616979ff);
+
 pub(crate) fn ink() -> Rgba {
-    pick((0xe9e9ecff, 0x1c2230ff))
+    pick(INK)
 }
 pub(crate) fn dim() -> Rgba {
-    pick((0xa8a9b0ff, 0x5a6273ff))
+    pick(DIM)
 }
 pub(crate) fn faint() -> Rgba {
-    pick((0x8d8e97ff, 0x616979ff))
+    pick(FAINT)
 }
 /// What went wrong: `--warn`.
 pub(crate) fn warn() -> Rgba {
@@ -169,6 +173,58 @@ pub(crate) fn follow_accent(system: Option<Rgba>) -> bool {
         SYSTEM_ACCENT.swap(control, Ordering::Relaxed) != control,
     ];
     changed.contains(&true)
+}
+
+// ---- How a control answers the pointer ("Frame and navigation" in
+// docs/internals/desktop.md). Under the pointer, a control steps up by what
+// it is: one with no ground of its own takes `fill` as one (`hovered`), one
+// that rests on `fill` takes `fill2` (`hovered_on_fill`), words or an icon
+// alone turn to the ink (`hovered_ink`), and one solid with the ink lightens
+// a little (`hovered_solid`). Pressed, every control dims (`pressed`), and a
+// cover that rose under the pointer settles (`lifted`, `settled`). Each is a
+// style, for `.hover(theme::hovered)` and `.active(theme::pressed)` or for
+// more than one change at once in a closure of its own.
+
+/// How much a control pressed keeps of itself, its ground and what is on it
+/// alike: as AppKit's push button dims, and no further than keeps the
+/// faintest words at 3:1 on the palette's grounds (WCAG 2's for what is not
+/// text). A control on a tint of its own, as a lit toggle, dips a little
+/// below that for as long as the press lasts.
+const PRESSED: f32 = 0.8;
+/// How much a control solid with the ink keeps of itself under the pointer.
+const SOLID_HOVER: f32 = 0.88;
+// A press shows past a hover.
+const _: () = assert!(SOLID_HOVER > PRESSED);
+/// How far a cover rises under the pointer, in points.
+const LIFT: f32 = 2.;
+
+/// A control with no ground of its own, under the pointer.
+pub(crate) fn hovered(style: StyleRefinement) -> StyleRefinement {
+    style.bg(fill())
+}
+/// A control that rests on `fill`, or in a row that does, under the pointer.
+pub(crate) fn hovered_on_fill(style: StyleRefinement) -> StyleRefinement {
+    style.bg(fill2())
+}
+/// Words or an icon alone, under the pointer.
+pub(crate) fn hovered_ink(style: StyleRefinement) -> StyleRefinement {
+    style.text_color(ink())
+}
+/// A control solid with the ink, under the pointer.
+pub(crate) fn hovered_solid(style: StyleRefinement) -> StyleRefinement {
+    style.opacity(SOLID_HOVER)
+}
+/// Any control, pressed.
+pub(crate) fn pressed(style: StyleRefinement) -> StyleRefinement {
+    style.opacity(PRESSED)
+}
+/// A cover, under the pointer: it rises.
+pub(crate) fn lifted(style: StyleRefinement) -> StyleRefinement {
+    style.top(px(-LIFT))
+}
+/// A cover, pressed: it settles back.
+pub(crate) fn settled(style: StyleRefinement) -> StyleRefinement {
+    style.top(px(0.))
 }
 
 /// `a` and `b` mixed, `t` of the way to `b`.
@@ -471,6 +527,31 @@ pub(crate) fn css_shadow(y: f32, blur: f32, color: impl Into<gpui::Hsla>) -> gpu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pressed_control_s_words_still_show_on_the_palette_s_grounds() {
+        let side = |token: Token, dark: bool| rgba(if dark { token.0 } else { token.1 });
+        for dark in [true, false] {
+            for words in [INK, DIM, FAINT] {
+                for ground in [BG, BAR_BG, SURF, RAISED] {
+                    let ground = side(ground, dark);
+                    let pressed = mix(ground, side(words, dark), PRESSED);
+                    let ratio = accent::contrast(pressed, ground);
+                    assert!(ratio >= 3., "dark {dark}: {words:08x?} pressed: {ratio:.2}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hover_and_press_are_the_palette_s_own() {
+        let style =
+            |refine: fn(StyleRefinement) -> StyleRefinement| refine(StyleRefinement::default());
+        assert_eq!(style(pressed).opacity, Some(PRESSED));
+        assert_eq!(style(hovered_solid).opacity, Some(SOLID_HOVER));
+        assert_eq!(style(lifted).inset.top, Some(px(-LIFT).into()));
+        assert_eq!(style(settled).inset.top, Some(px(0.).into()));
+    }
 
     #[test]
     fn with_no_system_accent_the_palette_keeps_its_own() {
