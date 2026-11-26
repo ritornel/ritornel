@@ -457,9 +457,15 @@ pub(crate) fn embedded_picture(path: &Path, hash: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// A folder's own image, read whole to hash it.
-pub(crate) fn read_folder_image(path: &Path, name: &str, mtime_ms: i64) -> Option<FolderImage> {
-    let bytes = std::fs::read(path).ok()?;
+/// A folder's own image, the file at `rel` under `root`, read whole to hash
+/// it, as [`open_under`](crate::walk::open_under) opens it.
+pub(crate) fn read_folder_image(root: &Path, rel: &str, mtime_ms: i64) -> Option<FolderImage> {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let mut bytes = Vec::new();
+    crate::walk::open_under(root, rel)
+        .ok()?
+        .read_to_end(&mut bytes)
+        .ok()?;
     Some(FolderImage {
         name: name.to_owned(),
         mtime_ms,
@@ -467,14 +473,21 @@ pub(crate) fn read_folder_image(path: &Path, name: &str, mtime_ms: i64) -> Optio
     })
 }
 
-/// Reads the audio of an open file into `payload`: the container, the
-/// tags, the pictures and the audio with its hash.
-fn read_audio(path: &Path, payload: &mut Payload) -> Result<(), ReadError> {
+/// Reads the audio of the file at `rel` under `root` into `payload`: the
+/// container, the tags, the pictures and the audio with its hash. A file
+/// that cannot be opened, as [`open_under`](crate::walk::open_under) opens
+/// it, is unavailable: it was not reached, so nothing is known of it.
+fn read_audio(root: &Path, rel: &str, payload: &mut Payload) -> Result<(), ReadError> {
     let mut hint = Hint::new();
-    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+    if let Some(extension) = Path::new(rel)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
         hint.with_extension(extension);
     }
-    let open = || File::open(path).map_err(|error| io_failed(&error));
+    let open = || {
+        crate::walk::open_under(root, rel).map_err(|error| failed(UNAVAILABLE, error.to_string()))
+    };
     let mut format = probe(Box::new(open()?), &hint).map_err(|error| read_error(&error))?;
     payload.container = Some(format.format_info().short_name.to_owned());
     (payload.tags, payload.pictures) = metadata(format.as_mut());
@@ -629,8 +642,7 @@ pub(crate) fn read_file(
         folder_images,
         error: None,
     };
-    let path = crate::walk::under(root, rel_path);
-    payload.error = caught(&mut payload, |payload| read_audio(&path, payload)).err();
+    payload.error = caught(&mut payload, |payload| read_audio(root, rel_path, payload)).err();
     if payload
         .error
         .as_ref()
@@ -676,8 +688,8 @@ mod tests {
     #[test]
     fn a_reader_that_panics_leaves_the_file_unreadable_and_nothing_half_read() {
         let mut payload = read_file(
-            Path::new(env!("CARGO_MANIFEST_DIR")),
-            "../../fixtures/audio/a.flac",
+            &crate::media_fixtures::fixtures(),
+            "a.flac",
             0,
             0,
             Vec::new(),

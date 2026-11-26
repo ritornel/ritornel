@@ -34,9 +34,32 @@ use windows as system;
 ))]
 use other_unix as system;
 
-pub(crate) use system::{file_id, met_a_link, mono_ms, open_inside, read_at, read_boot};
+pub(crate) use system::{
+    Folder, file_id, met_a_link, mono_ms, open_folder, open_inside, read_at, read_boot,
+};
 #[cfg(test)]
 pub(crate) use system::{link_file, link_folder, mode_of, seal, set_listable};
+
+/// What a folder's listing says one of its entries is, without following
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Folder,
+    /// A symbolic link, or on Windows a junction too.
+    Link,
+    /// A file, or anything else that is not a folder.
+    Other,
+}
+
+/// What the system says of a file in a folder, following a link to it:
+/// whether it is a regular file, its size, and when it was last modified,
+/// in milliseconds since the epoch and 0 before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Described {
+    pub(crate) is_file: bool,
+    pub(crate) len: u64,
+    pub(crate) mtime_ms: i64,
+}
 
 /// Any other Unix: its monotonic clock, and no boot ID.
 #[cfg(all(

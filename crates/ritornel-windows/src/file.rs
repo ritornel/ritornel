@@ -1,6 +1,6 @@
-//! What a handle says about the file it is open on: which file it is, and
-//! the path it really has; the room left on a disk; and a rename written
-//! through to it.
+//! What a handle says about the file it is open on: which file it is, the
+//! path it really has, and whether it is a link; the room left on a disk;
+//! and a rename written through to it.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FileAttributeTagInfo,
+    GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileInformationByHandleEx,
     GetFinalPathNameByHandleW, MOVEFILE_WRITE_THROUGH, MoveFileExW, VOLUME_NAME_DOS,
 };
 
@@ -60,6 +61,33 @@ pub fn final_path(file: &File) -> io::Result<PathBuf> {
         use std::os::windows::ffi::OsStringExt;
         return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer)));
     }
+}
+
+/// Whether `file`, opened without following it, is a link: a symbolic link,
+/// a junction, or another reparse point that names somewhere else (a name
+/// surrogate). A reparse point that does not, as a cloud file's placeholder
+/// is, is the file or folder itself.
+pub fn is_link(file: &File) -> io::Result<bool> {
+    // IsReparseTagNameSurrogate: bit 29 of the tag.
+    const NAME_SURROGATE: u32 = 0x2000_0000;
+    // SAFETY: plain data, for which all zeroes is valid.
+    let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>()).unwrap_or(u32::MAX);
+    // SAFETY: the handle is open for the call, and `info` is as large as
+    // `size` says and written by it.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileAttributeTagInfo,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && info.ReparseTag & NAME_SURROGATE != 0)
 }
 
 /// The bytes this user may still write on the disk that holds `path`.
@@ -130,6 +158,30 @@ mod tests {
         let real = final_path(&opened).unwrap();
         assert_eq!(real.file_name().unwrap(), "Mixed.flac");
         assert!(real.to_string_lossy().starts_with(r"\\?\"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_junction_is_a_link_and_the_folder_it_names_is_not() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        let dir = scratch("link");
+        std::fs::create_dir(dir.join("real")).unwrap();
+        let done = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.join("junction"))
+            .arg(dir.join("real"))
+            .output()
+            .unwrap();
+        assert!(done.status.success(), "{done:?}");
+        let open = |name: &str| {
+            OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(dir.join(name))
+                .unwrap()
+        };
+        assert!(is_link(&open("junction")).unwrap());
+        assert!(!is_link(&open("real")).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
