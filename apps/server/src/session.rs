@@ -36,6 +36,7 @@ pub(crate) struct Session {
     last_heard: watch::Sender<Option<tokio::time::Instant>>,
     /// The views it holds.
     views: Mutex<Views>,
+    pub(crate) rewrites: Mutex<crate::dispatch::routed_source::Rewrites>,
     /// Only the uplink takes this lock, to order connection and subscription changes for this session.
     pub(crate) upstream: Mutex<()>,
 }
@@ -166,6 +167,7 @@ impl Session {
             wake: Notify::new(),
             shut: watch::Sender::new(false),
             views: Mutex::default(),
+            rewrites: Mutex::default(),
             upstream: Mutex::default(),
         }
     }

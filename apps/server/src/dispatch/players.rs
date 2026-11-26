@@ -128,7 +128,31 @@ fn unreachable(name: &str, since: i64, problem: &str) -> RpcError {
         .with_detail("sinceMs", since)
 }
 
+fn online_player(
+    peers: &BTreeMap<Id, PeerPlayer>,
+    target: Id,
+) -> Result<(&str, &Arc<Session>), RpcError> {
+    let peer = peers.get(&target).filter(|p| p.has_player).ok_or_else(|| {
+        RpcError::new(
+            ErrorCode::Unsupported,
+            "no such player is linked to this hub",
+        )
+        .with_detail("reason", "no_player")
+    })?;
+    let session = peer
+        .online
+        .as_ref()
+        .ok_or_else(|| unreachable(&peer.name, peer.since_ms, "cannot be reached"))?;
+    Ok((&peer.name, session))
+}
+
 impl Core {
+    /// Refuse an absent target before doing library work. Sending the call
+    /// checks the current presence session again after the resolution.
+    pub(super) fn require_online_player(&self, target: Id) -> Result<(), RpcError> {
+        online_player(&lock(&self.players.peers), target).map(|_| ())
+    }
+
     pub(super) async fn call_player(
         &self,
         target: Id,
@@ -138,34 +162,11 @@ impl Core {
         let sent_at = self.clock.now_ms();
         let (name, call) = {
             let peers = lock(&self.players.peers);
-            let peer = peers.get(&target).filter(|p| p.has_player).ok_or_else(|| {
-                RpcError::new(
-                    ErrorCode::Unsupported,
-                    "no such player is linked to this hub",
-                )
-                .with_detail("reason", "no_player")
-            })?;
-            let session = peer
-                .online
-                .as_ref()
-                .ok_or_else(|| unreachable(&peer.name, peer.since_ms, "cannot be reached"))?;
-            if matches!(method, "playback.play" | "queue.add")
-                && params
-                    .as_ref()
-                    .and_then(|p| p.pointer("/source/type"))
-                    .and_then(Value::as_str)
-                    == Some("view")
-            {
-                return Err(RpcError::new(
-                    ErrorCode::Unsupported,
-                    "the view belongs to the controller. Send tracks or a release to this player",
-                )
-                .with_detail("reason", "remote_view_unsupported"));
-            }
+            let (name, session) = online_player(&peers, target)?;
             let call = session
                 .queue_player_call(method, params)
-                .ok_or_else(|| unreachable(&peer.name, sent_at, "cannot be reached"))?;
-            (peer.name.clone(), call)
+                .ok_or_else(|| unreachable(name, sent_at, "cannot be reached"))?;
+            (name.to_owned(), call)
         };
         call.answer().await.unwrap_or_else(|| {
             let peers = lock(&self.players.peers);
@@ -198,7 +199,10 @@ impl Core {
                 "a forwarded call cannot name another player",
             ))
         } else {
-            self.call(session, &request.method, request.params)
+            // Only this authenticated direction may vouch for a resolved track list.
+            let known = request.params.as_ref().and_then(|p| p.get("tracksKnown"))
+                == Some(&Value::Bool(true));
+            self.call_with_known_tracks(session, &request.method, request.params, known)
         };
         ritornel_contract::Response {
             id: Some(request.id),

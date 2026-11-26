@@ -49,7 +49,7 @@ fn catalog<'a>(
 }
 
 /// The most rows a view read from the hub to be played may have.
-const MAX_VIEW_FROM_HUB: usize = 20_000;
+pub(super) const MAX_VIEW_FROM_HUB: usize = 20_000;
 
 /// The rows one window of a view read from the hub asks for: the most the
 /// contract sends at once.
@@ -651,32 +651,48 @@ impl Core {
                 let moved = start.map(|start| start.min(ids.len()));
                 Ok((ids, (ContextKind::Query, None), moved))
             }
-            PlaySource::View { view } => {
-                let resolved = session.view(view).ok_or_else(|| expired(view))?;
-                if resolved.kind != ListKind::Songs {
-                    return Err(RpcError::new(
-                        ErrorCode::Invalid,
-                        "only a list of songs can be played",
-                    ));
-                }
-                let ids = Self::library(stores, |library| {
-                    library.song_ids(&resolved.ids).map_err(refused)
-                })?;
-                if let Some(start) = start
-                    && ids.get(start).is_some_and(Option::is_none)
-                {
-                    return Err(RpcError::new(ErrorCode::NotFound, "that song is gone"));
-                }
-                let moved = start.map(|start| {
-                    ids.iter()
-                        .take(start)
-                        .filter(|found| found.is_some())
-                        .count()
-                });
-                let tracks = ids.into_iter().flatten().collect();
-                Ok((tracks, (ContextKind::Query, None), moved))
-            }
+            PlaySource::View { view } => Self::songs_from_view(stores, session, view, start, None),
         }
+    }
+
+    pub(super) fn songs_from_view(
+        stores: &Stores,
+        session: &Session,
+        view: &str,
+        start: Option<usize>,
+        max_rows: Option<usize>,
+    ) -> Result<Resolved, RpcError> {
+        let resolved = session.view(view).ok_or_else(|| expired(view))?;
+        if resolved.kind != ListKind::Songs {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                "only a list of songs can be played",
+            ));
+        }
+        if let Some(max) = max_rows
+            && resolved.ids.len() > max
+        {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                format!("a remote player accepts at most {max} view rows"),
+            ));
+        }
+        let ids = Self::library(stores, |library| {
+            library.song_ids(&resolved.ids).map_err(refused)
+        })?;
+        if let Some(start) = start
+            && ids.get(start).is_some_and(Option::is_none)
+        {
+            return Err(RpcError::new(ErrorCode::NotFound, "that song is gone"));
+        }
+        let moved = start.map(|start| {
+            ids.iter()
+                .take(start)
+                .filter(|found| found.is_some())
+                .count()
+        });
+        let tracks = ids.into_iter().flatten().collect();
+        Ok((tracks, (ContextKind::Query, None), moved))
     }
 
     pub(super) fn playback_play(
@@ -684,6 +700,7 @@ impl Core {
         stores: &Stores,
         session: &Session,
         params: &PlaybackPlayParams,
+        tracks_known: bool,
     ) -> Result<PlaybackChanged, RpcError> {
         if !self.has_player() {
             return Err(no_player());
@@ -704,7 +721,7 @@ impl Core {
             context: (context_kind(context.0), context.1),
             actor: self.local_credential.session(),
             shuffle: params.shuffle,
-            known: matches!(params.source, PlaySource::View { .. }),
+            known: tracks_known || matches!(params.source, PlaySource::View { .. }),
         };
         let request = self.request::<PlaybackPlay>(params.idempotency_key, params)?;
         let done = self.with_player(stores, |player, server, library| {
@@ -921,6 +938,7 @@ impl Core {
         stores: &Stores,
         session: &Session,
         params: &QueueAddParams,
+        tracks_known: bool,
     ) -> Result<PlaybackChanged, RpcError> {
         if !self.has_player() {
             return Err(no_player());
@@ -936,6 +954,7 @@ impl Core {
             .context
             .map_or(default_context, |context| (context.kind, context.reference));
         let what = AddTracks {
+            known: tracks_known || matches!(params.source, PlaySource::View { .. }),
             tracks,
             place: match params.place {
                 QueuePlace::Next => Place::Next,

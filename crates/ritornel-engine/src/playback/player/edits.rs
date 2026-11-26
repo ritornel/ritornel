@@ -34,6 +34,8 @@ pub enum Place {
 /// What to add to the queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddTracks {
+    /// The library has already resolved these appearances.
+    pub known: bool,
     /// The track appearances, in the order they go in.
     pub tracks: Vec<Id>,
     /// Where.
@@ -404,7 +406,7 @@ impl Player {
         if what.tracks.is_empty() {
             return Err(Error::Invalid("there is nothing to add"));
         }
-        if library.unknown_appearance(&what.tracks)?.is_some() {
+        if !what.known && library.unknown_appearance(&what.tracks)?.is_some() {
             return Err(Error::NotFound("no such track"));
         }
         let mut events = Vec::new();

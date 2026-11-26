@@ -69,6 +69,7 @@ mod playback;
 mod players;
 mod ratings;
 mod record;
+pub(crate) mod routed_source;
 mod settings;
 mod transcode;
 mod watch;
@@ -846,7 +847,17 @@ impl Core {
         &self,
         session: &Session,
         method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, RpcError> {
+        self.call_with_known_tracks(session, method, params, false)
+    }
+
+    fn call_with_known_tracks(
+        &self,
+        session: &Session,
+        method: &str,
         mut params: Option<Value>,
+        tracks_known: bool,
     ) -> Result<Value, RpcError> {
         let Some(row) = methods::method(method) else {
             return Err(RpcError::new(
@@ -901,6 +912,7 @@ impl Core {
                 let rt = self.runtime.as_ref().ok_or_else(|| {
                     RpcError::new(ErrorCode::Unavailable, "the server is stopping")
                 })?;
+                let params = self.prepare_player_call(session, target, method, params)?;
                 return rt.block_on(self.call_player(target, method, params));
             }
         }
@@ -1061,7 +1073,7 @@ impl Core {
             MediaTokenCall::NAME => run::<MediaTokenCall>(params, |_| self.media_token(session)),
             PlaybackGet::NAME => run::<PlaybackGet>(params, |_| self.playback_get(stores)),
             PlaybackPlay::NAME => run::<PlaybackPlay>(params, |params| {
-                self.playback_play(stores, session, &params)
+                self.playback_play(stores, session, &params, tracks_known)
             }),
             PlaybackPause::NAME => {
                 run::<PlaybackPause>(params, |params| self.playback_pause(stores, &params))
@@ -1087,9 +1099,9 @@ impl Core {
             QueueWindow::NAME => {
                 run::<QueueWindow>(params, |params| self.queue_window(stores, &params))
             }
-            QueueAdd::NAME => {
-                run::<QueueAdd>(params, |params| self.queue_add(stores, session, &params))
-            }
+            QueueAdd::NAME => run::<QueueAdd>(params, |params| {
+                self.queue_add(stores, session, &params, tracks_known)
+            }),
             QueueRemove::NAME => {
                 run::<QueueRemove>(params, |params| self.queue_remove(stores, &params))
             }
@@ -1545,6 +1557,15 @@ fn run<M: Method>(
     params: Option<Value>,
     handler: impl FnOnce(M::Params) -> Result<M::Result, RpcError>,
 ) -> Result<Value, RpcError> {
+    serde_json::to_value(handler(read_params::<M>(params)?)?).map_err(|error| {
+        RpcError::new(
+            ErrorCode::Internal,
+            format!("the result of {} could not be written: {error}", M::NAME),
+        )
+    })
+}
+
+fn read_params<M: Method>(params: Option<Value>) -> Result<M::Params, RpcError> {
     // Params are by name. A frame may leave out an empty object.
     let params = match params {
         None => Value::Object(Map::new()),
@@ -1556,7 +1577,7 @@ fn run<M: Method>(
             ));
         }
     };
-    let params = serde_json::from_value(params).map_err(|error| {
+    serde_json::from_value(params).map_err(|error| {
         // A staged stream's values are a listener's history, and serde's
         // message can quote one: that call is told only that one is wrong.
         let why = if M::NAME == ImportsStage::NAME {
@@ -1567,12 +1588,6 @@ fn run<M: Method>(
         RpcError::new(
             ErrorCode::Invalid,
             format!("the params of {} are wrong: {why}", M::NAME),
-        )
-    })?;
-    serde_json::to_value(handler(params)?).map_err(|error| {
-        RpcError::new(
-            ErrorCode::Internal,
-            format!("the result of {} could not be written: {error}", M::NAME),
         )
     })
 }
