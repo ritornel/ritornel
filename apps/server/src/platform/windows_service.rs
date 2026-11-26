@@ -25,11 +25,10 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use super::windows::plain_path as plain;
-
 use ritornel_windows::window::{self, Window};
 
 use super::service::{installed, prepare};
+use super::windows::plain_path as plain;
 use super::{close_to_others, create_owner_only};
 use crate::data_dir::{self, DataDir};
 use crate::error::io_error;

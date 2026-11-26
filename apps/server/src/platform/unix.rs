@@ -44,6 +44,16 @@ pub(crate) fn plain_path(path: &Path) -> PathBuf {
     path.to_owned()
 }
 
+/// Puts the whole file at `from` at `to` too, only if nothing is at `to`,
+/// and at once: a hard link, which no one sees half made, and which fails
+/// if something is there. The name `from` is then let go. A caller that
+/// needs the new name to survive a loss of power syncs the folder after.
+pub(crate) fn rename_new_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
 /// Renames the folder at `from` to `to`, and nothing more: a caller that
 /// needs the new name to survive a loss of power syncs the folder that
 /// holds it after ([`sync_dir`]), as `backup::publish` does.

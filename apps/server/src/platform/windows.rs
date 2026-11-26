@@ -131,6 +131,12 @@ pub(crate) fn plain_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Renames the whole file at `from` to `to`, only if nothing is at `to`,
+/// and asks for the rename to be written through to the disk.
+pub(crate) fn rename_new_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    ritornel_windows::file::rename_through(from, to)
+}
+
 /// Renames the folder at `from` to `to`, asking for the rename to be
 /// written through to the disk before this returns. It fails if something
 /// is at `to`.

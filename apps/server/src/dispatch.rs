@@ -1984,6 +1984,18 @@ mod tests {
                 .contains("holds the backups of the data directory"),
             "{backup}"
         );
+
+        // A folder whose owner is in doubt: refused, and said.
+        std::fs::write(place.join(crate::backup::OWNER_FILE), "relative/data\n").unwrap();
+        let refused = call(&core, &session, "server.backup", Some(key(0xb4))).unwrap_err();
+        assert_eq!(refused.0, ErrorCode::Unavailable);
+        assert_eq!(refused.1["reason"], "backup_place_unclear");
+        assert!(
+            status()["backup"]["failed"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot tell whose backups"),
+        );
     }
 
     #[test]

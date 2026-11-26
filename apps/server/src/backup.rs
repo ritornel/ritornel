@@ -51,9 +51,10 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::data_dir::DataDir;
+use crate::error::io_error;
 use crate::platform::{
     close_to_others, create_new_private_dir, create_private_dir, create_private_file, plain_path,
-    rename_dir, sync_dir,
+    rename_dir, rename_new_file, sync_dir,
 };
 
 /// The version of `backup.json`.
@@ -291,7 +292,8 @@ fn to_place(
     let claimed = claim(place, &resolved(dir.root()))?;
     write(dir, place, at_ms, reason, about).inspect_err(|_| {
         if claimed {
-            // The place is left as it was found: no one's.
+            // The place is left as it was found, with no file naming
+            // whose it is.
             let _ = std::fs::remove_file(place.join(OWNER_FILE));
             let _ = sync_dir(place);
         }
@@ -362,7 +364,7 @@ fn owner(place: &Path) -> Result<Owner, BackupError> {
         // A link, even one that leads nowhere, or a folder.
         Ok(_) => return Err(unclear(place, format!("{OWNER_FILE} is not a plain file"))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io("read", &file)(error)),
+        Err(error) => return Err(unclear(place, format!("cannot read {OWNER_FILE}: {error}"))),
     }
     inferred(place)
 }
@@ -370,7 +372,8 @@ fn owner(place: &Path) -> Result<Owner, BackupError> {
 /// The data directory on the first line of [`OWNER_FILE`], as an editor
 /// may leave it: after a byte-order mark, and ending in `\r\n`.
 fn named(place: &Path, file: &Path) -> Result<PathBuf, BackupError> {
-    let bytes = std::fs::read(file).map_err(io("read", file))?;
+    let bytes = std::fs::read(file)
+        .map_err(|error| unclear(place, format!("cannot read {OWNER_FILE}: {error}")))?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| unclear(place, format!("{OWNER_FILE} is not UTF-8 text")))?;
     let first = text
@@ -397,15 +400,22 @@ fn named(place: &Path, file: &Path) -> Result<PathBuf, BackupError> {
 /// The data directory of the earliest backup in `place`, by when each was
 /// taken, for a place older versions wrote to without [`OWNER_FILE`].
 fn inferred(place: &Path) -> Result<Owner, BackupError> {
+    let cannot_list = |error: std::io::Error| unclear(place, format!("cannot list it: {error}"));
     let mut found = Vec::new();
-    for entry in std::fs::read_dir(place).map_err(io("read", place))? {
-        let entry = entry.map_err(io("read", place))?;
-        let path = entry.path();
-        let is_backup = entry
+    for entry in std::fs::read_dir(place).map_err(cannot_list)? {
+        let path = entry.map_err(cannot_list)?.path();
+        let is_backup = path
             .file_name()
-            .to_str()
+            .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("ritornel-backup-"));
-        if !is_backup || !path.is_dir() {
+        if !is_backup {
+            continue;
+        }
+        // What a link leads to, and one that leads nowhere is in doubt.
+        let is_dir = std::fs::metadata(&path)
+            .map(|found| found.is_dir())
+            .map_err(|error| unclear(place, format!("{}: {error}", plain_path(&path).display())))?;
+        if !is_dir {
             continue;
         }
         let (at_ms, from) = taken_from(&path)
@@ -456,31 +466,79 @@ fn same_dir(path: &Path, ours: &Path) -> bool {
     resolved(path) == ours
 }
 
-/// Writes [`OWNER_FILE`] in `place`, naming `ours`, if there is none: it
-/// is made only if it is not there, and never written over. On an error
-/// nothing of it is left but one another writer made.
+/// Writes [`OWNER_FILE`] in `place`, naming `ours`, if there is none. It
+/// is written whole under a dotted name first, then given its own name
+/// only if nothing has it, so no reader sees it half written and none is
+/// written over. On an error nothing of it is left.
 fn name_owner(place: &Path, ours: &Path) -> Result<(), BackupError> {
-    use std::io::Write;
+    // Checked before it is made plain, which on Windows reads it lossily.
+    let one_line = ours
+        .to_str()
+        .is_some_and(|line| !line.contains(['\n', '\r']));
     let shown = plain_path(ours);
-    let Some(line) = shown.to_str().filter(|line| !line.contains(['\n', '\r'])) else {
-        return Err(unclear(
+    let line = shown.to_str().filter(|_| one_line).ok_or_else(|| {
+        unclear(
             place,
             format!(
                 "this data directory's path, {}, cannot be written on one line of {OWNER_FILE}",
                 shown.display()
             ),
-        ));
-    };
+        )
+    })?;
+    let text = format!("{line}\n{OWNER_NOTE}");
     let file = place.join(OWNER_FILE);
-    let mut made = create_private_file(&file).map_err(io("create", &file))?;
-    let written = made
-        .write_all(format!("{line}\n{OWNER_NOTE}").as_bytes())
-        .and_then(|()| made.sync_all())
-        .and_then(|()| sync_dir(place));
-    drop(made);
-    written.map_err(|error| {
+    let partial = reserve_file(place, OWNER_FILE, text.as_bytes())?;
+    match rename_new_file(&partial, &file) {
+        Ok(()) => {}
+        // A disk without hard links, such as FAT or exFAT: the file is
+        // made in place, still only if it is not there, and a reader may
+        // find it empty for as long as it takes to write.
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::CrossesDevices
+            ) =>
+        {
+            let _ = std::fs::remove_file(&partial);
+            write_synced(&file, text.as_bytes()).inspect_err(|error| {
+                if !matches!(error, BackupError::Io { source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists)
+                {
+                    let _ = std::fs::remove_file(&file);
+                }
+            })?;
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(io("create", &file)(error));
+        }
+    }
+    sync_dir(place).map_err(|error| {
         let _ = std::fs::remove_file(&file);
-        io("write", &file)(error)
+        io("sync", place)(error)
+    })
+}
+
+/// Writes `bytes` to a new file in `place` under a dotted name made from
+/// `name` that no other writer has, and answers it.
+fn reserve_file(place: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, BackupError> {
+    for n in 1..=SAME_SECOND {
+        let partial = place.join(format!(".{name}.{n}.partial"));
+        match write_synced(&partial, bytes) {
+            Ok(()) => return Ok(partial),
+            Err(BackupError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                let _ = std::fs::remove_file(&partial);
+                return Err(error);
+            }
+        }
+    }
+    Err(BackupError::Io {
+        doing: "name a new file in",
+        path: place.to_owned(),
+        source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
     })
 }
 
@@ -548,10 +606,13 @@ pub(crate) fn before_migrations(
     let leads_out = || crate::Error::Io {
         doing: "copy the databases before migrating them into",
         path: rollback.clone(),
-        source: std::io::Error::other("it leads out of the data directory"),
+        source: std::io::Error::other("it is a link, or leads out of the data directory"),
     };
-    if !is_inside(&rollback, dir.root()) {
-        return Err(leads_out());
+    match std::fs::symlink_metadata(&rollback) {
+        Ok(found) if found.file_type().is_symlink() => return Err(leads_out()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("read", &rollback)(error)),
     }
     create_private_dir(&rollback)?;
     if !is_inside(&rollback, dir.root()) {
@@ -1041,11 +1102,9 @@ mod tests {
         let scratch = Scratch::new();
         let place = scratch.path().join("shared");
         std::fs::create_dir(&place).unwrap();
-        // Two writers backing up one data directory, as servers on it
-        // one after the other do, into a place that is already its.
+        // Two writers backing up one data directory into a place that is
+        // no one's yet: both claim it, and both have it.
         let dir = data(&scratch);
-        let first = backup(&dir, &place, About::default()).unwrap();
-        std::fs::remove_dir_all(first.path).unwrap();
         let taken: Vec<_> = (0..2)
             .map(|n| {
                 let dir = dir.clone();
@@ -1291,7 +1350,7 @@ mod tests {
         let marker = std::fs::read_to_string(place.join(OWNER_FILE)).unwrap();
         assert_eq!(
             marker.lines().next().unwrap(),
-            resolved(original.root()).to_string_lossy()
+            plain_path(&resolved(original.root())).to_string_lossy()
         );
         assert!(crate::platform::path_is_private(&place.join(OWNER_FILE)));
 
@@ -1424,13 +1483,7 @@ mod tests {
             assert_eq!(won.len(), 1, "{done:?}");
             let (winner, _) = won[0];
             for (_, lost) in done.iter().filter(|(_, done)| done.is_err()) {
-                assert!(
-                    matches!(
-                        lost,
-                        Err(BackupError::Foreign { .. } | BackupError::Unclear { .. })
-                    ),
-                    "{lost:?}"
-                );
+                assert!(matches!(lost, Err(BackupError::Foreign { .. })), "{lost:?}");
             }
             // Only the winner's backup is there, and the folder is its.
             let backups = finished(&place);
@@ -1590,6 +1643,19 @@ mod tests {
         );
         assert!(finished(&place).is_empty());
         assert!(!scratch.path().join("nowhere").exists());
+
+        // Nor, with no such file, one whose backup is a link that leads
+        // nowhere.
+        let older = Scratch::new();
+        let place = elsewhere(&older);
+        std::os::unix::fs::symlink(
+            older.path().join("nowhere"),
+            place.join("ritornel-backup-2025-01-01-000000"),
+        )
+        .unwrap();
+        let refused = backup(&dir, &place, About::default()).unwrap_err();
+        assert!(matches!(refused, BackupError::Unclear { .. }), "{refused}");
+        assert!(!place.join(OWNER_FILE).exists());
     }
 
     // A link is made differently on each system, and on Windows only with
@@ -1618,6 +1684,13 @@ mod tests {
         assert_eq!(finished(&place).len(), 1);
         assert!(before_migrations(&copy, None, AT, server_pending(), &|_| {}).is_err());
         assert_eq!(finished(&place).len(), 1);
+
+        // Nor one that leads nowhere, which would be made where it leads.
+        let nowhere = other.path().join("nowhere");
+        std::fs::remove_file(copy.backups()).unwrap();
+        std::os::unix::fs::symlink(&nowhere, copy.backups()).unwrap();
+        assert!(before_migrations(&copy, None, AT, server_pending(), &|_| {}).is_err());
+        assert!(!nowhere.exists());
     }
 
     #[test]
