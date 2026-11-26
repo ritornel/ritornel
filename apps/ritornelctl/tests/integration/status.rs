@@ -83,7 +83,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
             ("Server version", env!("CARGO_PKG_VERSION")),
             ("Contract version", contract.as_str()),
             ("SQLite version", "3.54.1"),
-            ("Server schema", "3"),
+            ("Server schema", "4"),
         ]
     );
     assert_eq!(facts[7], ("Library", "none"));
@@ -128,7 +128,7 @@ fn status_prints_what_the_running_server_reports_and_fails_once_it_has_stopped()
                 "server": env!("CARGO_PKG_VERSION"),
                 "contract": ritornel_client::contract::CONTRACT_VERSION,
                 "sqlite": "3.54.1",
-                "serverSchema": 3,
+                "serverSchema": 4,
             },
             "freeDisk": { "dataBytes": free },
             "logPath": logs_dir.to_str().unwrap(),
@@ -242,7 +242,7 @@ fn library_create_makes_the_running_server_a_hub_and_a_second_one_is_refused() {
     assert_eq!(
         shown[6..10],
         [
-            ("Server schema", "3"),
+            ("Server schema", "4"),
             ("Library schema", library_schema_text.as_str()),
             ("Library ID", library_id),
             ("Library revision", "1"),

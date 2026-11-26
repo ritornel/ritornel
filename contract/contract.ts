@@ -10,7 +10,7 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 6;
+export const CONTRACT_VERSION = 7;
 
 /** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
@@ -62,111 +62,123 @@ export const ART_SIZES = [64, 96, 128, 192, 256, 384, 512, 768, 1024] as const;
 /** The version of the filter language a filter is written in. */
 export const FILTER_VERSION = 1;
 
+/** Every permission a token may hold, in canonical order. */
+export const PERMISSIONS = ["library:read", "library:write", "playback:control", "status:read", "folders:manage", "server:manage", "services:connect", "access:manage"] as const;
+
+/** Default permission sets for each named token role. */
+export const TOKEN_ROLES = {
+  "owner": ["library:read", "library:write", "playback:control", "status:read", "folders:manage", "server:manage", "services:connect", "access:manage"],
+  "personal": ["library:read", "library:write", "playback:control", "status:read"],
+  "player": ["library:read", "status:read"],
+  "guest": ["library:read", "playback:control"],
+  "monitor": ["status:read"],
+} as const;
+
 /**
  * Every method, in the order of the method table: what kind of call it is,
- * and whether it needs a `full` session.
+ * which permissions it needs, and whether it is restricted to link sessions.
  */
 export const METHODS = {
-  "server.hello": { kind: "session", needsFull: false },
-  "server.status": { kind: "query", needsFull: true },
-  "servers.list": { kind: "query", needsFull: false },
-  "players.list": { kind: "query", needsFull: false },
-  "events.subscribe": { kind: "session", needsFull: false },
-  "events.unsubscribe": { kind: "session", needsFull: false },
-  "library.create": { kind: "command", needsFull: true },
-  "sources.list": { kind: "query", needsFull: true },
-  "sources.add": { kind: "command", needsFull: true },
-  "scan.start": { kind: "command", needsFull: true },
-  "transcode.start": { kind: "command", needsFull: true },
-  "transcode.prune": { kind: "command", needsFull: true },
-  "jobs.list": { kind: "query", needsFull: true },
-  "jobs.get": { kind: "query", needsFull: true },
-  "jobs.cancel": { kind: "command", needsFull: true },
-  "library.stats": { kind: "query", needsFull: false },
-  "identity.dryRun": { kind: "query", needsFull: true },
-  "identity.review": { kind: "query", needsFull: true },
-  "list.open": { kind: "session", needsFull: false },
-  "list.window": { kind: "query", needsFull: false },
-  "list.sections": { kind: "query", needsFull: false },
-  "list.locate": { kind: "query", needsFull: false },
-  "list.close": { kind: "session", needsFull: false },
-  "library.search": { kind: "query", needsFull: false },
-  "album.get": { kind: "query", needsFull: false },
-  "artist.get": { kind: "query", needsFull: false },
-  "media.token": { kind: "session", needsFull: false },
-  "playback.get": { kind: "query", needsFull: false },
-  "playback.move": { kind: "command", needsFull: false },
-  "playback.play": { kind: "command", needsFull: false },
-  "playback.pause": { kind: "command", needsFull: false },
-  "playback.resume": { kind: "command", needsFull: false },
-  "playback.stop": { kind: "command", needsFull: false },
-  "playback.seek": { kind: "command", needsFull: false },
-  "playback.skip": { kind: "command", needsFull: false },
-  "playback.jump": { kind: "command", needsFull: false },
-  "playback.set": { kind: "command", needsFull: false },
-  "queue.window": { kind: "query", needsFull: false },
-  "queue.add": { kind: "command", needsFull: false },
-  "queue.remove": { kind: "command", needsFull: false },
-  "queue.move": { kind: "command", needsFull: false },
-  "queue.clear": { kind: "command", needsFull: false },
-  "sources.tracks": { kind: "query", needsFull: true },
-  "history.recent": { kind: "query", needsFull: false },
-  "history.onThisDay": { kind: "query", needsFull: false },
-  "history.artist": { kind: "query", needsFull: false },
-  "history.album": { kind: "query", needsFull: false },
-  "history.artists": { kind: "query", needsFull: false },
-  "history.albums": { kind: "query", needsFull: false },
-  "history.track": { kind: "query", needsFull: false },
-  "history.stream": { kind: "query", needsFull: false },
-  "history.rebuild": { kind: "command", needsFull: true },
-  "history.zones": { kind: "query", needsFull: false },
-  "history.setZones": { kind: "command", needsFull: true },
-  "tracks.get": { kind: "query", needsFull: false },
-  "ratings.set": { kind: "command", needsFull: true },
-  "lastfm.status": { kind: "query", needsFull: true },
-  "lastfm.signInStart": { kind: "session", needsFull: true },
-  "lastfm.signInFinish": { kind: "command", needsFull: true },
-  "lastfm.signOut": { kind: "command", needsFull: true },
-  "lastfm.sync": { kind: "command", needsFull: true },
-  "lastfm.setScrobbling": { kind: "command", needsFull: true },
-  "lastfm.report": { kind: "query", needsFull: true },
-  "imports.stage": { kind: "command", needsFull: true },
-  "imports.dryRun": { kind: "command", needsFull: true },
-  "imports.apply": { kind: "command", needsFull: true },
-  "imports.undo": { kind: "command", needsFull: true },
-  "imports.get": { kind: "query", needsFull: true },
-  "imports.list": { kind: "query", needsFull: true },
-  "artists.importPictures": { kind: "command", needsFull: true },
-  "artists.pictureFolders": { kind: "query", needsFull: true },
-  "library.setWatching": { kind: "command", needsFull: true },
-  "library.settings": { kind: "query", needsFull: true },
-  "library.setSettings": { kind: "command", needsFull: true },
-  "server.backup": { kind: "command", needsFull: true },
-  "history.export": { kind: "command", needsFull: true },
-  "record.dismiss": { kind: "command", needsFull: true },
-  "link.invite": { kind: "session", needsFull: true },
-  "link.join": { kind: "command", needsFull: true },
-  "link.status": { kind: "query", needsFull: true },
-  "link.tracks": { kind: "query", needsFull: true },
-  "link.copies": { kind: "query", needsFull: true },
-  "link.listen": { kind: "command", needsFull: true },
-  "link.event": { kind: "session", needsFull: true },
-  "link.handoff": { kind: "session", needsFull: true },
-  "link.ping": { kind: "session", needsFull: true },
-  "server.settings": { kind: "query", needsFull: true },
-  "server.setSettings": { kind: "command", needsFull: true },
-  "corrections.discs": { kind: "query", needsFull: true },
-  "corrections.lookup": { kind: "command", needsFull: true },
-  "corrections.summary": { kind: "query", needsFull: true },
-  "corrections.list": { kind: "query", needsFull: true },
-  "corrections.get": { kind: "query", needsFull: true },
-  "corrections.preview": { kind: "query", needsFull: true },
-  "corrections.confirm": { kind: "command", needsFull: true },
-  "corrections.undo": { kind: "command", needsFull: true },
-  "corrections.decline": { kind: "command", needsFull: true },
-  "corrections.keepApart": { kind: "command", needsFull: true },
-  "corrections.answers": { kind: "query", needsFull: true },
-  "corrections.answer": { kind: "query", needsFull: true },
+  "server.hello": { kind: "session", needs: [], linkOnly: false },
+  "server.status": { kind: "query", needs: ["status:read"], linkOnly: false },
+  "servers.list": { kind: "query", needs: [], linkOnly: false },
+  "players.list": { kind: "query", needs: [], linkOnly: false },
+  "events.subscribe": { kind: "session", needs: [], linkOnly: false },
+  "events.unsubscribe": { kind: "session", needs: [], linkOnly: false },
+  "library.create": { kind: "command", needs: ["server:manage"], linkOnly: false },
+  "sources.list": { kind: "query", needs: ["status:read"], linkOnly: false },
+  "sources.add": { kind: "command", needs: ["folders:manage"], linkOnly: false },
+  "scan.start": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "transcode.start": { kind: "command", needs: ["server:manage"], linkOnly: false },
+  "transcode.prune": { kind: "command", needs: ["server:manage"], linkOnly: false },
+  "jobs.list": { kind: "query", needs: ["status:read"], linkOnly: false },
+  "jobs.get": { kind: "query", needs: ["status:read"], linkOnly: false },
+  "jobs.cancel": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "library.stats": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "identity.dryRun": { kind: "query", needs: ["folders:manage"], linkOnly: false },
+  "identity.review": { kind: "query", needs: ["folders:manage"], linkOnly: false },
+  "list.open": { kind: "session", needs: ["library:read"], linkOnly: false },
+  "list.window": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "list.sections": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "list.locate": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "list.close": { kind: "session", needs: ["library:read"], linkOnly: false },
+  "library.search": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "album.get": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "artist.get": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "media.token": { kind: "session", needs: ["library:read"], linkOnly: false },
+  "playback.get": { kind: "query", needs: ["playback:control"], linkOnly: false },
+  "playback.move": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "playback.play": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "playback.pause": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "playback.resume": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "playback.stop": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "playback.seek": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "playback.skip": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "playback.jump": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "playback.set": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "queue.window": { kind: "query", needs: ["playback:control"], linkOnly: false },
+  "queue.add": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "queue.remove": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "queue.move": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "queue.clear": { kind: "command", needs: ["playback:control"], linkOnly: false },
+  "sources.tracks": { kind: "query", needs: ["folders:manage"], linkOnly: false },
+  "history.recent": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "history.onThisDay": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "history.artist": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "history.album": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "history.artists": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "history.albums": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "history.track": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "history.stream": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "history.rebuild": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "history.zones": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "history.setZones": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "tracks.get": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "ratings.set": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "lastfm.status": { kind: "query", needs: ["status:read"], linkOnly: false },
+  "lastfm.signInStart": { kind: "session", needs: ["services:connect"], linkOnly: false },
+  "lastfm.signInFinish": { kind: "command", needs: ["services:connect"], linkOnly: false },
+  "lastfm.signOut": { kind: "command", needs: ["services:connect"], linkOnly: false },
+  "lastfm.sync": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "lastfm.setScrobbling": { kind: "command", needs: ["services:connect"], linkOnly: false },
+  "lastfm.report": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "imports.stage": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "imports.dryRun": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "imports.apply": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "imports.undo": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "imports.get": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "imports.list": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "artists.importPictures": { kind: "command", needs: ["folders:manage"], linkOnly: false },
+  "artists.pictureFolders": { kind: "query", needs: ["folders:manage"], linkOnly: false },
+  "library.setWatching": { kind: "command", needs: ["folders:manage"], linkOnly: false },
+  "library.settings": { kind: "query", needs: ["status:read"], linkOnly: false },
+  "library.setSettings": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "server.backup": { kind: "command", needs: ["server:manage"], linkOnly: false },
+  "history.export": { kind: "command", needs: ["folders:manage"], linkOnly: false },
+  "record.dismiss": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "link.invite": { kind: "session", needs: ["access:manage"], linkOnly: false },
+  "link.join": { kind: "command", needs: ["access:manage"], linkOnly: false },
+  "link.status": { kind: "query", needs: ["status:read"], linkOnly: false },
+  "link.tracks": { kind: "query", needs: ["library:read"], linkOnly: true },
+  "link.copies": { kind: "query", needs: ["library:read"], linkOnly: true },
+  "link.listen": { kind: "command", needs: ["library:read", "status:read"], linkOnly: true },
+  "link.event": { kind: "session", needs: ["library:read", "status:read"], linkOnly: true },
+  "link.handoff": { kind: "session", needs: ["playback:control"], linkOnly: true },
+  "link.ping": { kind: "session", needs: ["status:read"], linkOnly: true },
+  "server.settings": { kind: "query", needs: ["server:manage"], linkOnly: false },
+  "server.setSettings": { kind: "command", needs: ["server:manage"], linkOnly: false },
+  "corrections.discs": { kind: "query", needs: ["folders:manage"], linkOnly: false },
+  "corrections.lookup": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "corrections.summary": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "corrections.list": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "corrections.get": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "corrections.preview": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "corrections.confirm": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "corrections.undo": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "corrections.decline": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "corrections.keepApart": { kind: "command", needs: ["library:write"], linkOnly: false },
+  "corrections.answers": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "corrections.answer": { kind: "query", needs: ["library:read"], linkOnly: false },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -1036,9 +1048,10 @@ export type BackupFailure = {
    */
   at: number,
   /**
-   * What went wrong, as a person reads it.
+   * What went wrong, as a person reads it. Left out when the session lacks
+   * `folders:manage`, since OS errors may carry filesystem paths.
    */
-  message: string,
+  message?: string,
 };
 
 /**
@@ -1050,9 +1063,10 @@ export type BackupMade = {
    */
   at: number,
   /**
-   * Its folder, on the server's own disk.
+   * Its folder, on the server's own disk. Left out when the session lacks
+   * `folders:manage`.
    */
-  path: string,
+  path?: string,
   /**
    * Why it was taken.
    */
@@ -1387,9 +1401,17 @@ export type DeliveryCount = {
  */
 export type Descriptor = {
   /**
-   * What this session may do.
+   * The permissions this session holds.
    */
-  sessionKind: SessionKind,
+  permissions: Array<Permission>,
+  /**
+   * The named role this session's permissions match, when unchanged from it.
+   */
+  tokenRole?: TokenRole,
+  /**
+   * On a satellite, the permissions its hub link holds when known.
+   */
+  hubPermissions?: Array<Permission>,
   /**
    * The server's ID: made on first start and never changed.
    */
@@ -3744,6 +3766,16 @@ export type LinkInviteParams = {
    * multicast DNS name and the addresses it finds it has.
    */
   routes: Array<string>,
+  /**
+   * The named role to grant the joining satellite. Defaults to `personal`
+   * when neither `role` nor `permissions` is set.
+   */
+  role?: TokenRole,
+  /**
+   * Explicit permissions to grant the joining satellite. Every requested
+   * permission must be held by the caller.
+   */
+  permissions?: Array<Permission>,
 };
 
 /**
@@ -4372,6 +4404,11 @@ export type Penalties = {
    */
   sharedIdentifier: boolean,
 };
+
+/**
+ * One capability a session token may hold.
+ */
+export type Permission = "library:read" | "library:write" | "playback:control" | "status:read" | "folders:manage" | "server:manage" | "services:connect" | "access:manage";
 
 /**
  * A run of words in a sentence, set apart where it is `strong`: the facts
@@ -6097,6 +6134,14 @@ export type SatelliteStatus = {
    * When it joined, as Unix milliseconds.
    */
   linkedAtMs: number,
+  /**
+   * The permissions granted to this satellite's link session.
+   */
+  permissions: Array<Permission>,
+  /**
+   * The named role matching its permissions, if unchanged from it.
+   */
+  tokenRole?: TokenRole,
 };
 
 /**
@@ -6456,9 +6501,9 @@ export type ServerStatus = {
   freeDisk: FreeDisk,
   /**
    * The directory the server writes its logs in, on the server's own
-   * disk.
+   * disk. Left out when the session lacks `folders:manage`.
    */
-  logPath: string,
+  logPath?: string,
   /**
    * Whether the server watches its folders for changes, and what it last
    * did on its own. Left out by a server that does not say.
@@ -6501,12 +6546,6 @@ export type ServersList = {
    */
   servers: Array<ServerInfo>,
 };
-
-/**
- * What a session may do ("Local credentials, sessions, and tokens" in
- * docs/internals/linking.md).
- */
-export type SessionKind = "full" | "limited";
 
 /**
  * What gave a setting its value.
@@ -7137,6 +7176,13 @@ export type TierJoins = {
    */
   second: number,
 };
+
+/**
+ * A named permission bundle used as a starting point when issuing a token.
+ *
+ * Separate from [`crate::ServerRole`] (whether a server is a hub or satellite).
+ */
+export type TokenRole = "owner" | "personal" | "player" | "guest" | "monitor";
 
 /**
  * What a client can subscribe to.

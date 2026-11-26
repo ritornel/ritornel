@@ -4,7 +4,11 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::server_store::{ServerIdentity, read_identity};
+use ritornel_contract::{PermissionSet, TokenRole};
+
+use crate::server_store::{
+    ServerIdentity, permissions_from_json, permissions_to_json, read_identity,
+};
 use crate::{Error, Id, LibraryStore, ServerStore, SessionToken, WriteRequest, new_id};
 
 /// A satellite's link to its hub.
@@ -43,6 +47,10 @@ pub struct LinkSession {
     pub public_key: [u8; 32],
     /// The SHA-256 of the session's token.
     pub token_hash: [u8; 32],
+    /// The named role the session started from, if any.
+    pub role: Option<TokenRole>,
+    /// The permissions granted to this satellite's session.
+    pub permissions: PermissionSet,
     /// When it was issued, as Unix milliseconds.
     pub created_at_ms: i64,
 }
@@ -91,6 +99,23 @@ impl ServerStore {
         })
     }
 
+    /// Returns the recorded Ed25519 public key for a previously linked peer,
+    /// if any, so key conflicts can be caught before redeeming an invite or
+    /// updating the registry.
+    pub fn peer_public_key(&self, peer: Id) -> Result<Option<[u8; 32]>, Error> {
+        self.read(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT peer_public_key FROM session
+                     WHERE peer_server_pid = ?1 AND peer_public_key IS NOT NULL
+                     ORDER BY id DESC LIMIT 1",
+                    [peer.as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()?)
+        })
+    }
+
     /// Issues a link session for the satellite `peer`, which proved it
     /// holds `public_key`, labelled with its name, and returns its public ID
     /// and its token. The token is returned here only: the database keeps
@@ -103,8 +128,12 @@ impl ServerStore {
         peer: Id,
         public_key: [u8; 32],
         label: &str,
+        role: Option<TokenRole>,
+        permissions: PermissionSet,
     ) -> Result<(Id, SessionToken), Error> {
         let label = label.to_owned();
+        let role_name = role.map(TokenRole::as_str);
+        let permissions_json = permissions_to_json(permissions);
         self.transact(move |transaction, now_ms, entropy| {
             let known: Option<[u8; 32]> = transaction
                 .query_row(
@@ -129,12 +158,14 @@ impl ServerStore {
             let session = new_id(now_ms, entropy)?;
             transaction.execute(
                 "INSERT INTO session
-                   (public_id, subject_kind, label, kind, token_hash, created_at_ms, peer_server_pid,
-                    peer_public_key)
-                 VALUES (?1, 'server', ?2, 'full', ?3, ?4, ?5, ?6)",
+                   (public_id, subject_kind, label, kind, role, permissions_json, token_hash,
+                    created_at_ms, peer_server_pid, peer_public_key)
+                 VALUES (?1, 'server', ?2, 'full', ?3, ?4, ?5, ?6, ?7, ?8)",
                 (
                     session.as_bytes(),
                     &label,
+                    role_name,
+                    &permissions_json,
                     token.hash(),
                     now_ms,
                     peer.as_bytes(),
@@ -191,25 +222,33 @@ impl ServerStore {
         self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT public_id, peer_server_pid, label, token_hash, created_at_ms,
-                        peer_public_key, EXISTS (
+                        peer_public_key, role, permissions_json, EXISTS (
                             SELECT 1 FROM server_setting
                             WHERE key = 'player.' || hex(session.peer_server_pid))
                  FROM session
                  WHERE peer_server_pid IS NOT NULL AND revoked_at_ms IS NULL
                  ORDER BY id",
             )?;
-            let rows = statement.query_map([], |row| {
-                Ok(LinkSession {
+            let mut sessions = Vec::new();
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let role_raw: Option<String> = row.get(6)?;
+                let role = role_raw.as_deref().and_then(TokenRole::parse);
+                let perms_raw: String = row.get(7)?;
+                let permissions = permissions_from_json(&perms_raw)?;
+                sessions.push(LinkSession {
                     session: Id::from_bytes(row.get(0)?),
                     peer: Id::from_bytes(row.get(1)?),
                     label: row.get(2)?,
                     token_hash: row.get(3)?,
                     created_at_ms: row.get(4)?,
                     public_key: row.get(5)?,
-                    has_player: row.get(6)?,
-                })
-            })?;
-            Ok(rows.collect::<Result<_, _>>()?)
+                    role,
+                    permissions,
+                    has_player: row.get(8)?,
+                });
+            }
+            Ok(sessions)
         })
     }
 }
@@ -390,8 +429,13 @@ mod tests {
     fn a_satellite_holds_one_session_and_only_its_hash_is_kept() {
         let store = store();
         let peer = Id::from_bytes([0x55; 16]);
-        let (first, first_token) = store.issue_link_session(peer, [7; 32], "desk").unwrap();
-        let (second, second_token) = store.issue_link_session(peer, [7; 32], "desk").unwrap();
+        let personal = PermissionSet::for_role(TokenRole::Personal);
+        let (first, first_token) = store
+            .issue_link_session(peer, [7; 32], "desk", Some(TokenRole::Personal), personal)
+            .unwrap();
+        let (second, second_token) = store
+            .issue_link_session(peer, [7; 32], "desk", Some(TokenRole::Personal), personal)
+            .unwrap();
         assert_ne!(first, second);
         assert_ne!(first_token.expose(), second_token.expose());
         let sessions = store.link_sessions().unwrap();
@@ -399,9 +443,12 @@ mod tests {
         let held = sessions.first().unwrap();
         assert_eq!((held.session, held.peer), (second, peer));
         assert_eq!(held.token_hash, second_token.hash());
+        assert_eq!(held.role, Some(TokenRole::Personal));
+        assert_eq!(held.permissions, personal);
+        assert_eq!(store.peer_public_key(peer).unwrap(), Some([7; 32]));
         // Another key does not take the ID over.
         assert!(matches!(
-            store.issue_link_session(peer, [8; 32], "thief"),
+            store.issue_link_session(peer, [8; 32], "thief", Some(TokenRole::Personal), personal),
             Err(Error::Invalid(_))
         ));
         assert_eq!(store.link_sessions().unwrap().len(), 1);

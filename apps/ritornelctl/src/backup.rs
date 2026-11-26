@@ -28,5 +28,8 @@ pub(crate) fn backup(
 }
 
 fn render(backed_up: &BackedUp) -> String {
-    format!("Backed up to {}\n", backed_up.backup.path)
+    match &backed_up.backup.path {
+        Some(path) => format!("Backed up to {path}\n"),
+        None => "Backed up.\n".to_owned(),
+    }
 }

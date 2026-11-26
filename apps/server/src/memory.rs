@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use ritornel_contract::SessionKind;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::dispatch::Core;
+use crate::session::SessionGrant;
 use crate::transport::Wire;
 
 /// How many frames wait in a channel before its sender does.
@@ -43,13 +43,13 @@ impl Wire for Channels {
 /// Opens a session of this kind and returns its two ends: where the client
 /// sends frames, and where it receives them. The session ends when the
 /// client drops the first, and the second closes when the server stops.
-pub(crate) fn attach(core: &Arc<Core>, kind: SessionKind) -> (Sender<String>, Receiver<String>) {
+pub(crate) fn attach(core: &Arc<Core>, grant: SessionGrant) -> (Sender<String>, Receiver<String>) {
     let (to_server, from_client) = mpsc::channel::<String>(WAITING);
     let (to_client, from_server) = mpsc::channel(WAITING);
     // A server that is stopping, or full, opens no session. The channels
     // are dropped here, and the client finds both closed.
     let _ = core.run(
-        kind,
+        grant,
         None,
         Channels {
             from_client,

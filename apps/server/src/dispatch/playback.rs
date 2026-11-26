@@ -1061,7 +1061,7 @@ impl Core {
             return Err(RpcError::new(ErrorCode::Invalid, "the path is absolute")
                 .with_detail("field", "path"));
         }
-        let sources = self.sources_list(stores)?;
+        let sources = self.sources_list(stores, true)?;
         let found = sources
             .sources
             .iter()

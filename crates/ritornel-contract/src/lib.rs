@@ -3,7 +3,7 @@
 //!
 //! - [`Frame`] is a JSON-RPC 2.0 request, response or notification.
 //! - [`methods`] is the method table: each call's name, params and result,
-//!   what kind of call it is, and whether it needs a `full` session.
+//!   what kind of call it is, and which permissions it needs.
 //! - [`Receipt`] is what a command returns: a call that changes something
 //!   lasting, and carries an idempotency key.
 //! - [`Event`] is what the server pushes, by [`Topic`].
@@ -59,6 +59,7 @@ pub mod methods;
 pub mod transcode;
 pub use transcode::{JobStarted, TranscodeParams, TranscodePruneParams};
 mod pages;
+mod permissions;
 mod platform;
 pub use handoff::{
     HandoffEntry, HandoffResult, HandoffSnapshot, LinkHandoffParams, PlaybackMoveParams,
@@ -138,6 +139,7 @@ pub use methods::{METHODS, Method, MethodInfo, MethodKind, MethodVisitor, visit_
 pub use pages::{
     AlbumGetParams, AlbumPage, AlbumVersion, ArtColor, ArtistGetParams, ArtistPage, RecordType,
 };
+pub use permissions::{Permission, PermissionSet, TokenRole};
 pub use playback::{
     ContextKind, CopyInUse, OutputInfo, OutputMode, OutputProblem, PlayContext, PlaySource,
     PlaybackChanged, PlaybackCommandParams, PlaybackEvent, PlaybackGetParams, PlaybackJumpParams,
@@ -153,8 +155,8 @@ pub use server::{
     BackupStatus, ClientKind, Descriptor, DismissParams, Dismissed, FreeDisk, HelloParams,
     LibraryStatus, Limits, MAX_CLIENT_TEXT, NONCE_PARAM, NoParams, PlayerInfo, PlayerSummary,
     PlayersList, PresenceHello, PublicDescriptor, RecordProblem, RecordProblemKind, RecordStatus,
-    ServerInfo, ServerRole, ServerStatus, ServersList, SessionKind, Versions, WatchState,
-    WatchStatus, WatchedFolder, WatchedKind, WatchingParams, WatchingSet, descriptor_proof,
+    ServerInfo, ServerRole, ServerStatus, ServersList, Versions, WatchState, WatchStatus,
+    WatchedFolder, WatchedKind, WatchingParams, WatchingSet, descriptor_proof,
 };
 pub use settings::{
     LibrarySettings, LibrarySettingsSet, ListenNetwork, ListenOn, LogLevel, ServerSettings,
@@ -169,7 +171,7 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 /// one contract. A server refuses a client whose number is not its own,
 /// and a satellite refuses a hub of another ("Session and frames" in
 /// docs/internals/contract.md).
-pub const CONTRACT_VERSION: u32 = 6;
+pub const CONTRACT_VERSION: u32 = 7;
 
 /// The capability flags a server may list in its descriptor.
 pub mod capability {

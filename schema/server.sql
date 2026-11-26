@@ -7,6 +7,7 @@
 --   0001_server  dcd8fce9c43a2974357d2bcb8f016bde876f16f86ec8437e2786de62803ae0c7
 --   0002_hub_link  dd4608c7904bfdcf0e97bd4fef1a83f0f77051bb90189b6a7e9dccd467984cdb
 --   0003_transcode_cache  6d3ebee8a3899432d24eb529c7e10fa14a0945e4a3259a65d030c64443a44dab
+--   0004_session_permissions  932cbd123e4d7bba619aa88c22613c5d6b3170ae62fdbdafe80cf253b7efc523
 
 CREATE TABLE schema_migration (
   version        INTEGER PRIMARY KEY,
@@ -43,7 +44,9 @@ CREATE TABLE session (
   media_token_hash    BLOB UNIQUE,                                           -- hash of the media-only token from media.token (contract.md)
   created_at_ms       INTEGER NOT NULL,
   revoked_at_ms       INTEGER                                                -- sessions end by revocation, not by time
-, peer_server_pid BLOB CHECK (peer_server_pid IS NULL OR length(peer_server_pid) = 16), peer_public_key BLOB CHECK (peer_public_key IS NULL OR length(peer_public_key) = 32)) STRICT;
+, peer_server_pid BLOB CHECK (peer_server_pid IS NULL OR length(peer_server_pid) = 16), peer_public_key BLOB CHECK (peer_public_key IS NULL OR length(peer_public_key) = 32), role TEXT CHECK (
+  role IS NULL OR role IN ('owner', 'personal', 'player', 'guest', 'monitor')
+), permissions_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(permissions_json))) STRICT;
 
 CREATE TABLE root (
   id             INTEGER PRIMARY KEY,

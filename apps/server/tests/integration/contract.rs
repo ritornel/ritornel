@@ -23,9 +23,9 @@ use ritornel_client::contract::methods::{
 };
 use ritornel_client::contract::{
     ART_SIZES, CONTRACT_VERSION, ClientKind, Descriptor, ErrorCode, Event, HelloParams, Id,
-    JobState, JobTarget, LibraryStatus, Limits, ListSupport, PublicDescriptor, Receipt,
-    ReceiptStatus, ServerInfo, ServerRole, SessionKind, SourceKind, Topic, WatchingParams,
-    capability, descriptor_proof, hex, route,
+    JobState, JobTarget, LibraryStatus, Limits, ListSupport, Permission, PermissionSet,
+    PublicDescriptor, Receipt, ReceiptStatus, ServerInfo, ServerRole, SourceKind, TokenRole, Topic,
+    WatchingParams, capability, descriptor_proof, hex, route,
 };
 use ritornel_client::{Client, Credential, NotRunning, local};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -212,7 +212,9 @@ async fn hello_answers_with_the_descriptor(via: Via) {
         client.hello(&hello()).await.unwrap(),
         Descriptor {
             server: public_descriptor(&running),
-            session_kind: SessionKind::Full,
+            permissions: TokenRole::Owner.permissions().to_vec(),
+            token_role: Some(TokenRole::Owner),
+            hub_permissions: None,
         }
     );
     // The same descriptor, less the session, is served to anyone.
@@ -243,10 +245,11 @@ async fn hello_answers_with_the_descriptor(via: Via) {
             "limits",
             "lists",
             "name",
+            "permissions",
             "publicKey",
             "role",
             "serverId",
-            "sessionKind"
+            "tokenRole"
         ]
     );
 }
@@ -269,7 +272,10 @@ async fn the_status_reports_versions_role_and_server_id(via: Via) {
     assert_eq!(status.versions.library_schema, None);
     assert_eq!(status.library, None);
     assert!(status.free_disk.data_bytes.unwrap() > 0);
-    assert_eq!(Path::new(&status.log_path), running.data_dir().join("logs"));
+    assert_eq!(
+        status.log_path.as_deref().map(Path::new),
+        Some(running.data_dir().join("logs").as_path())
+    );
 }
 
 async fn creating_a_library_makes_the_server_its_hub(via: Via) {
@@ -824,7 +830,7 @@ impl Raw {
     async fn open(running: &Running, via: Via) -> Self {
         match via {
             Via::Memory => {
-                let (outgoing, incoming) = running.server.connect_in_memory(SessionKind::Full);
+                let (outgoing, incoming) = running.server.connect_in_memory(TokenRole::Owner);
                 Self::Memory(outgoing, incoming)
             }
             Via::Socket => {
@@ -996,11 +1002,13 @@ async fn status_of(endpoint: SocketAddr, path: &str, credential: Option<&Credent
 async fn a_limited_session_may_not_ask_for_the_status_or_change_anything() {
     bounded(async {
         let running = start().await;
-        let (outgoing, incoming) = running.server.connect_in_memory(SessionKind::Limited);
+        let (outgoing, incoming) = running.server.connect_in_memory(TokenRole::Guest);
         let client = Client::over_memory(outgoing, incoming);
+        let descriptor = client.hello(&hello()).await.unwrap();
+        assert_eq!(descriptor.token_role, Some(TokenRole::Guest));
         assert_eq!(
-            client.hello(&hello()).await.unwrap().session_kind,
-            SessionKind::Limited
+            descriptor.permissions,
+            TokenRole::Guest.permissions().to_vec()
         );
         let (code, retryable, _) = refused(client.status().await);
         assert_eq!((code, retryable), (ErrorCode::Forbidden, false));
@@ -1343,7 +1351,7 @@ async fn no_more_sessions_open_than_the_server_takes() {
                 .err(),
             Some(503)
         );
-        let (outgoing, incoming) = running.server.connect_in_memory(SessionKind::Full);
+        let (outgoing, incoming) = running.server.connect_in_memory(TokenRole::Owner);
         let refused = Client::over_memory(outgoing, incoming)
             .hello(&hello())
             .await;
@@ -1465,8 +1473,8 @@ async fn a_local_client_finds_the_server_through_its_data_directory() {
         assert_eq!(found.descriptor, public_descriptor(&running));
         let client = found.connect().await.unwrap();
         assert_eq!(
-            client.hello(&hello()).await.unwrap().session_kind,
-            SessionKind::Full
+            client.hello(&hello()).await.unwrap().token_role,
+            Some(TokenRole::Owner)
         );
         assert_eq!(
             client.status().await.unwrap().server_id,
@@ -1817,4 +1825,96 @@ impl Drop for Stranger {
     fn drop(&mut self) {
         self.serving.abort();
     }
+}
+
+#[tokio::test]
+async fn scoped_roles_redact_paths_and_enforce_method_and_topic_permissions() {
+    bounded(async {
+        let running = start().await;
+        let owner = running.greeted(Via::Memory).await;
+        owner.create_library(key()).await.unwrap();
+        let music = running.scratch.0.join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        owner
+            .add_source(key(), "Music", music.to_str().unwrap())
+            .await
+            .unwrap();
+
+        // Owner sees paths in status, settings, and sources.
+        let owner_status = owner.status().await.unwrap();
+        assert!(owner_status.log_path.is_some());
+        let owner_sources = owner.sources().await.unwrap();
+        assert_eq!(owner_sources.sources[0].path.as_deref(), music.to_str());
+
+        // Monitor sees status, jobs, and sources (without paths), but cannot read library catalog.
+        let (tx, rx) = running.server.connect_in_memory(TokenRole::Monitor);
+        let monitor = Client::over_memory(tx, rx);
+        let desc = monitor.hello(&hello()).await.unwrap();
+        assert_eq!(desc.token_role, Some(TokenRole::Monitor));
+        assert_eq!(desc.permissions, vec![Permission::StatusRead]);
+
+        let status = monitor.status().await.unwrap();
+        assert_eq!(status.log_path, None);
+        if let Some(backup) = &status.backup {
+            assert_eq!(backup.place, None);
+        }
+        let sources = monitor.sources().await.unwrap();
+        assert_eq!(sources.sources.len(), 1);
+        assert_eq!(sources.sources[0].name, "Music");
+        assert_eq!(sources.sources[0].path, None);
+        assert_eq!(
+            refused(monitor.call_raw("server.settings", json!({})).await).0,
+            ErrorCode::Forbidden
+        );
+        monitor.jobs().await.unwrap();
+        monitor
+            .subscribe(&[Topic::Servers, Topic::Jobs])
+            .await
+            .unwrap();
+        assert_eq!(
+            refused(monitor.library_stats().await).0,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(
+            refused(monitor.subscribe(&[Topic::Library]).await).0,
+            ErrorCode::Forbidden
+        );
+
+        // Personal can read and write library, read status (paths redacted), and control playback,
+        // but cannot manage folders, server settings, or access.
+        let (tx, rx) = running.server.connect_in_memory(TokenRole::Personal);
+        let personal = Client::over_memory(tx, rx);
+        let desc = personal.hello(&hello()).await.unwrap();
+        assert_eq!(desc.token_role, Some(TokenRole::Personal));
+        assert_eq!(personal.status().await.unwrap().log_path, None);
+        assert_eq!(personal.sources().await.unwrap().sources[0].path, None);
+        assert_eq!(
+            refused(
+                personal
+                    .add_source(key(), "More", music.to_str().unwrap())
+                    .await
+            )
+            .0,
+            ErrorCode::Forbidden
+        );
+
+        // Custom subset (LibraryRead + LibraryWrite + StatusRead) has token_role: None and exact permissions.
+        let custom_perms = PermissionSet::from_slice(&[
+            Permission::LibraryRead,
+            Permission::LibraryWrite,
+            Permission::StatusRead,
+        ]);
+        let (tx, rx) = running.server.connect_in_memory_with(custom_perms);
+        let custom = Client::over_memory(tx, rx);
+        let desc = custom.hello(&hello()).await.unwrap();
+        assert_eq!(desc.token_role, None);
+        assert_eq!(desc.permissions, custom_perms.to_vec());
+        custom.status().await.unwrap();
+        custom.library_stats().await.unwrap();
+        assert_eq!(
+            refused(custom.subscribe(&[Topic::Queue]).await).0,
+            ErrorCode::Forbidden
+        );
+    })
+    .await;
 }

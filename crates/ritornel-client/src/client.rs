@@ -590,7 +590,8 @@ mod tests {
             "contractVersion": 0,
             "capabilities": [],
             "limits": { "maxMessageBytes": 1024 },
-            "sessionKind": "full",
+            "permissions": ["library:read"],
+            "tokenRole": "guest",
         });
         to_client.send(result(id, descriptor)).await.unwrap();
         let (answer, _client) = call.await.unwrap();

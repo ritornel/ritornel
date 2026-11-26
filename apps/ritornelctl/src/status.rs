@@ -68,7 +68,9 @@ fn render(status: &ServerStatus) -> String {
         None => lines.push(("Library", "none".to_owned())),
     }
     lines.push(("Free disk, data", free));
-    lines.push(("Log path", status.log_path.clone()));
+    if let Some(log_path) = &status.log_path {
+        lines.push(("Log path", log_path.clone()));
+    }
     if let Some(watch) = &status.watch {
         watching(watch, &mut lines);
     }
@@ -131,21 +133,30 @@ fn backups(backup: &BackupStatus, lines: &mut Vec<(&str, String)>) {
     lines.push((
         "Backup",
         match &backup.last {
-            Some(last) if last.present => format!("{}, {}", crate::lastfm::utc(last.at), last.path),
-            Some(last) => format!(
-                "none: the last, {}, is no longer at {}",
-                crate::lastfm::utc(last.at),
-                last.path
-            ),
+            Some(last) if last.present => match &last.path {
+                Some(path) => format!("{}, {path}", crate::lastfm::utc(last.at)),
+                None => crate::lastfm::utc(last.at),
+            },
+            Some(last) => match &last.path {
+                Some(path) => format!(
+                    "none: the last, {}, is no longer at {path}",
+                    crate::lastfm::utc(last.at),
+                ),
+                None => format!(
+                    "none: the last, {}, is no longer present",
+                    crate::lastfm::utc(last.at),
+                ),
+            },
             None => "none yet: run `ritornelctl backup`".to_owned(),
         },
     ));
     lines.push(("Backup folder", place.clone()));
     if let Some(failed) = &backup.failed {
-        lines.push((
-            "Backup failed",
-            format!("{}: {}", crate::lastfm::utc(failed.at), failed.message),
-        ));
+        let detail = match &failed.message {
+            Some(message) => format!("{}: {message}", crate::lastfm::utc(failed.at)),
+            None => crate::lastfm::utc(failed.at),
+        };
+        lines.push(("Backup failed", detail));
     }
 }
 
@@ -241,7 +252,7 @@ mod tests {
             free_disk: FreeDisk {
                 data_bytes: Some(412_345_678_901),
             },
-            log_path: "/srv/ritornel/logs".to_owned(),
+            log_path: Some("/srv/ritornel/logs".to_owned()),
             watch: None,
             backup: None,
             record: None,
@@ -332,7 +343,7 @@ Backup folder     /Volumes/Backups/Ritornel
         );
         let last = BackupMade {
             at,
-            path: format!("{place}/ritornel-backup-2025-11-21-170102"),
+            path: Some(format!("{place}/ritornel-backup-2025-11-21-170102")),
             reason: BackupReason::OnDemand,
             present: true,
         };
@@ -342,9 +353,11 @@ Backup folder     /Volumes/Backups/Ritornel
                 last: Some(last.clone()),
                 failed: Some(BackupFailure {
                     at: at + 86_400_000,
-                    message: "the backup folder /Volumes/Backups/Ritornel is not there: is its \
-                              disk connected?"
-                        .to_owned(),
+                    message: Some(
+                        "the backup folder /Volumes/Backups/Ritornel is not there: is its \
+                         disk connected?"
+                            .to_owned()
+                    ),
                 }),
             }),
             "\

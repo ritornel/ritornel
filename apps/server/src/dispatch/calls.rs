@@ -48,8 +48,9 @@ pub(crate) fn job_state(state: ritornel_engine::JobState) -> JobState {
     }
 }
 
-/// A job as the contract carries it.
-pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
+/// A job as the contract carries it. Error messages that may hold host
+/// filesystem paths are omitted when `show_paths` is false.
+pub(crate) fn job_for(job: &ritornel_engine::Job, show_paths: bool) -> Job {
     Job {
         job_id: job.public_id,
         kind: job.kind.clone(),
@@ -79,7 +80,7 @@ pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
         failed: unsigned(job.failed),
         skipped: unsigned(job.skipped),
         label: job.label.clone(),
-        error: job.error.clone(),
+        error: if show_paths { job.error.clone() } else { None },
         created_at: job.created_at_ms,
         started_at: job.started_at_ms,
         finished_at: job.finished_at_ms,
@@ -88,6 +89,11 @@ pub(crate) fn job(job: &ritornel_engine::Job) -> Job {
             .then(|| serde_json::from_str(job.checkpoint_json.as_deref()?).ok())
             .flatten(),
     }
+}
+
+/// A job as the contract carries it, with full details included.
+pub(crate) fn job(changed: &ritornel_engine::Job) -> Job {
+    job_for(changed, true)
 }
 
 fn no_library() -> RpcError {
@@ -209,7 +215,13 @@ impl Core {
                 }
             }
         }
-        self.publish(&Event::Jobs(Box::new(JobsEvent { job: job(changed) })));
+        let sessions: Vec<_> = lock(&self.sessions).open.values().cloned().collect();
+        for session in sessions {
+            let show_paths = session.has(ritornel_contract::Permission::FoldersManage);
+            session.publish(Event::Jobs(Box::new(JobsEvent {
+                job: job_for(changed, show_paths),
+            })));
+        }
     }
 
     /// The session every command comes from: the only credential there is
@@ -233,8 +245,16 @@ impl Core {
         work(library.as_ref().ok_or_else(no_library)?)
     }
 
-    pub(super) fn sources_list(&self, stores: &Stores) -> Result<SourcesList, RpcError> {
-        let roots = stores.server.roots().map_err(stored)?;
+    pub(super) fn sources_list(
+        &self,
+        stores: &Stores,
+        show_paths: bool,
+    ) -> Result<SourcesList, RpcError> {
+        let roots = if show_paths {
+            stores.server.roots().map_err(stored)?
+        } else {
+            Vec::new()
+        };
         let sources = Self::library(stores, |library| library.sources().map_err(in_library))?;
         Ok(SourcesList {
             // A folder is the one kind the contract has. The account a
@@ -245,10 +265,14 @@ impl Core {
                 .map(|source| Source {
                     source_id: source.public_id,
                     kind: SourceKind::Folder,
-                    path: roots
-                        .iter()
-                        .find(|(name, _)| source.on_this_server && *name == source.name)
-                        .map(|(_, path)| path.clone()),
+                    path: if show_paths {
+                        roots
+                            .iter()
+                            .find(|(name, _)| source.on_this_server && *name == source.name)
+                            .map(|(_, path)| path.clone())
+                    } else {
+                        None
+                    },
                     name: source.name,
                 })
                 .collect(),
@@ -293,7 +317,7 @@ impl Core {
             )
             .with_detail("field", "path")
         })?;
-        let sources = self.sources_list(stores)?.sources;
+        let sources = self.sources_list(stores, true)?.sources;
         if let Some(source) = sources
             .iter()
             .find(|source| source.name == name && source.path.as_deref() == Some(&params.path))
@@ -512,10 +536,14 @@ impl Core {
         })
     }
 
-    pub(super) fn jobs_list(&self, stores: &Stores) -> Result<JobsList, RpcError> {
+    pub(super) fn jobs_list(
+        &self,
+        stores: &Stores,
+        show_paths: bool,
+    ) -> Result<JobsList, RpcError> {
         let jobs = stores.server.jobs(LISTED).map_err(stored)?;
         Ok(JobsList {
-            jobs: jobs.iter().map(job).collect(),
+            jobs: jobs.iter().map(|j| job_for(j, show_paths)).collect(),
         })
     }
 
@@ -527,6 +555,7 @@ impl Core {
         &self,
         stores: &Stores,
         params: &JobGetParams,
+        show_paths: bool,
     ) -> Result<JobDetail, RpcError> {
         let found = stores
             .server
@@ -553,11 +582,15 @@ impl Core {
             } else {
                 Vec::new()
             },
-            job: job(&found),
-            failed_items: items
-                .into_iter()
-                .map(|(item, detail)| JobItem { item, detail })
-                .collect(),
+            job: job_for(&found, show_paths),
+            failed_items: if show_paths {
+                items
+                    .into_iter()
+                    .map(|(item, detail)| JobItem { item, detail })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         })
     }
 

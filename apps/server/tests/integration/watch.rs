@@ -11,7 +11,7 @@ use std::time::Duration;
 use ritornel_client::Client;
 use ritornel_client::contract::methods::{LibrarySetWatching, LibraryStats};
 use ritornel_client::contract::{
-    AutoTrigger, CONTRACT_VERSION, ClientKind, Event, HelloParams, JobState, NoParams, SessionKind,
+    AutoTrigger, CONTRACT_VERSION, ClientKind, Event, HelloParams, JobState, NoParams, TokenRole,
     Topic, WatchState, WatchingParams,
 };
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -47,7 +47,7 @@ async fn a_file_copied_into_a_watched_root_is_scanned_in_on_its_own() {
         )
         .await
         .unwrap();
-        let (outgoing, incoming) = server.connect_in_memory(SessionKind::Full);
+        let (outgoing, incoming) = server.connect_in_memory(TokenRole::Owner);
         let mut client = Client::over_memory(outgoing, incoming);
         client
             .hello(&HelloParams {

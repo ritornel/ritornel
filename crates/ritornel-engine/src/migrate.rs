@@ -55,6 +55,11 @@ pub(crate) const SERVER: &[Migration] = &[
         name: "0003_transcode_cache",
         sql: include_str!("../migrations/server/0003_transcode_cache.sql"),
     },
+    Migration {
+        version: 4,
+        name: "0004_session_permissions",
+        sql: include_str!("../migrations/server/0004_session_permissions.sql"),
+    },
 ];
 
 /// The migrations of `library.db`.

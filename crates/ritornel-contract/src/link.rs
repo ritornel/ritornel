@@ -12,7 +12,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Id, ServerRole, TrackSummary, hex};
+use crate::{Id, Permission, ServerRole, TokenRole, TrackSummary, hex};
 
 /// The params of `link.invite`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +25,16 @@ pub struct LinkInviteParams {
     /// multicast DNS name and the addresses it finds it has.
     #[serde(default)]
     pub routes: Vec<String>,
+    /// The named role to grant the joining satellite. Defaults to `personal`
+    /// when neither `role` nor `permissions` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub role: Option<TokenRole>,
+    /// Explicit permissions to grant the joining satellite. Every requested
+    /// permission must be held by the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub permissions: Option<Vec<Permission>>,
 }
 
 /// The result of `link.invite`.
@@ -158,6 +168,13 @@ pub struct SatelliteStatus {
     pub name: String,
     /// When it joined, as Unix milliseconds.
     pub linked_at_ms: i64,
+    /// The permissions granted to this satellite's link session.
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
+    /// The named role matching its permissions, if unchanged from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub token_role: Option<TokenRole>,
 }
 
 /// The params of `link.tracks`.

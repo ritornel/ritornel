@@ -50,7 +50,12 @@ impl Core {
     }
 
     /// `server.settings`: this server's own, a satellite's included.
-    pub(super) fn server_settings(&self, stores: &Stores) -> Result<ServerSettings, RpcError> {
+    /// `backup_dir.value` is omitted when `show_paths` is false.
+    pub(super) fn server_settings(
+        &self,
+        stores: &Stores,
+        show_paths: bool,
+    ) -> Result<ServerSettings, RpcError> {
         let start_up = self.start_up.get().copied().unwrap_or(StartUp {
             listen: Listen::DEFAULT,
             log_level: Level::INFO,
@@ -92,10 +97,13 @@ impl Core {
                 set_by: set_by(origins.log_level),
             },
             backup_dir: Setting {
-                value: self
-                    .backups()
-                    .and_then(crate::backup::Backups::place)
-                    .map(|place| place.to_string_lossy().into_owned()),
+                value: if show_paths {
+                    self.backups()
+                        .and_then(crate::backup::Backups::place)
+                        .map(|place| place.to_string_lossy().into_owned())
+                } else {
+                    None
+                },
                 set_by: set_by(origins.backup_dir),
             },
         })
@@ -107,6 +115,7 @@ impl Core {
         &self,
         stores: &Stores,
         params: &SetServerSettingsParams,
+        show_paths: bool,
     ) -> Result<ServerSettingsSet, RpcError> {
         let Some(awake) = params.awake else {
             return Err(RpcError::new(
@@ -142,7 +151,7 @@ impl Core {
                 status: ReceiptStatus::Done,
                 revision: None,
             },
-            settings: self.server_settings(stores)?,
+            settings: self.server_settings(stores, show_paths)?,
         })
     }
 }

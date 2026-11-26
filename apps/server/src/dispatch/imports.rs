@@ -283,7 +283,7 @@ mod tests {
     use std::sync::Arc;
 
     use ritornel_contract::{
-        CONTRACT_VERSION, ErrorCode, Frame, Id, ImportReport, Request, RequestId, SessionKind,
+        CONTRACT_VERSION, ErrorCode, Frame, Id, ImportReport, Request, RequestId,
     };
     use ritornel_engine::{OsEntropy, ServerStore};
     use serde_json::{Value, json};
@@ -292,7 +292,7 @@ mod tests {
     use crate::Bounds;
     use crate::data_dir::DataDir;
     use crate::imports::KEEP_MS;
-    use crate::session::Session;
+    use crate::session::{Session, SessionGrant};
     use crate::testing::{Scratch, SetClock};
 
     /// 2026-11-16 12:00 UTC.
@@ -342,7 +342,7 @@ mod tests {
     /// run 9, in a run of `pieces` pieces.
     fn staged(clock: &Arc<SetClock>, pieces: u32) -> (Core, Scratch, Arc<Session>) {
         let (core, scratch) = server(clock);
-        let session = core.open_session(SessionKind::Full).unwrap();
+        let session = core.open_session(SessionGrant::OWNER).unwrap();
         let hello = json!({
             "name": "test", "kind": "cli", "version": "1", "contractVersion": CONTRACT_VERSION
         });

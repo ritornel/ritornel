@@ -20,8 +20,8 @@ use ritornel_client::contract::{
     HistoryRecentParams, Id, ListKind, ListOpenParams, PlaySource, PlaybackCommandParams,
     PlaybackGetParams, PlaybackPlayParams, PlaybackSetParams, PlaybackSkipParams, PlaybackStatus,
     Query, QueueAddParams, QueueClearParams, QueueOrder, QueuePlace, QueueRemoveParams,
-    QueueWindowParams, RatingSetParams, Repeat, Row, SessionKind, SkipDirection, SongRow,
-    SourcesTracksParams, Topic, ViewParams, Window, capability,
+    QueueWindowParams, RatingSetParams, Repeat, Row, SkipDirection, SongRow, SourcesTracksParams,
+    TokenRole, Topic, ViewParams, Window, capability,
 };
 use ritornel_engine::{OsEntropy, SystemClock};
 use ritornel_server::{Bounds, HeldDir, Listen, Output, PlaybackRun, Run, Server};
@@ -57,7 +57,7 @@ async fn server_at(scratch: &Scratch, speed: u32) -> (Server, Client) {
     )
     .await
     .unwrap();
-    let (outgoing, incoming) = server.connect_in_memory(SessionKind::Full);
+    let (outgoing, incoming) = server.connect_in_memory(TokenRole::Owner);
     let client = Client::over_memory(outgoing, incoming);
     let descriptor = client
         .hello(&HelloParams {

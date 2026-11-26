@@ -1,0 +1,6 @@
+INSERT INTO session(public_id, subject_kind, label, kind, token_hash, created_at_ms)
+VALUES (x'0102030405060708090a0b0c0d0e0f10', 'person', 'local owner', 'full', x'1111111111111111111111111111111111111111111111111111111111111111', 1794776400000);
+INSERT INTO session(public_id, subject_kind, label, kind, token_hash, created_at_ms, peer_server_pid, peer_public_key)
+VALUES (x'2122232425262728292a2b2c2d2e2f30', 'server', 'Invented desk', 'full', x'2222222222222222222222222222222222222222222222222222222222222222', 1794776400001, x'3132333435363738393a3b3c3d3e3f40', x'4444444444444444444444444444444444444444444444444444444444444444');
+INSERT INTO session(public_id, subject_kind, label, kind, token_hash, created_at_ms)
+VALUES (x'4142434445464748494a4b4c4d4e4f50', 'agent', 'Invented guest', 'limited', x'3333333333333333333333333333333333333333333333333333333333333333', 1794776400002);

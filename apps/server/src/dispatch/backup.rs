@@ -47,12 +47,16 @@ impl Core {
         self.backups.get()
     }
 
-    /// Backups, as `server.status` says them.
-    pub(super) fn backup_status(&self, stores: &Stores) -> BackupStatus {
-        let place = self
-            .backups()
-            .and_then(Backups::place)
-            .map(|place| place.to_string_lossy().into_owned());
+    /// Backups, as `server.status` says them. Paths and OS failure text are
+    /// omitted when `show_paths` is false (caller lacks `folders:manage`).
+    pub(super) fn backup_status(&self, stores: &Stores, show_paths: bool) -> BackupStatus {
+        let place = if show_paths {
+            self.backups()
+                .and_then(Backups::place)
+                .map(|place| place.to_string_lossy().into_owned())
+        } else {
+            None
+        };
         let (last, failed) = stores.server().backups().unwrap_or_else(|error| {
             warn!(%error, "what backups did could not be read from server.db");
             (None, None)
@@ -62,12 +66,12 @@ impl Core {
             last: last.map(|taken| BackupMade {
                 at: taken.at_ms,
                 present: std::path::Path::new(&taken.path).is_dir(),
-                path: taken.path,
+                path: show_paths.then_some(taken.path),
                 reason: BackupReason::from_wire(&taken.reason).unwrap_or(BackupReason::OnDemand),
             }),
             failed: failed.map(|failed| BackupFailure {
                 at: failed.at_ms,
-                message: failed.message,
+                message: show_paths.then_some(failed.message),
             }),
         }
     }
@@ -79,6 +83,7 @@ impl Core {
         &self,
         stores: &Stores,
         params: &BackupParams,
+        show_paths: bool,
     ) -> Result<BackedUp, RpcError> {
         let backups = self
             .backups()
@@ -108,7 +113,7 @@ impl Core {
                     },
                     backup: BackupMade {
                         at: taken.at_ms,
-                        path: taken.path.to_string_lossy().into_owned(),
+                        path: show_paths.then(|| taken.path.to_string_lossy().into_owned()),
                         reason: taken.reason,
                         present: true,
                     },
@@ -122,7 +127,14 @@ impl Core {
                     let message = error.to_string();
                     record_backup(stores.server(), at_ms, None, Some(&message));
                 }
-                Err(refused(&error))
+                Err(if show_paths {
+                    refused(&error)
+                } else {
+                    match error {
+                        BackupError::NoPlace | BackupError::Busy => refused(&error),
+                        _ => RpcError::new(ErrorCode::Unavailable, "backup failed"),
+                    }
+                })
             }
         }
     }
