@@ -688,6 +688,42 @@ methods! {
     /// as it was kept when it was given.
     CorrectionsAnswer: "corrections.answer", Query, needs: [LibraryRead],
     AnswerParams => AnswerGot;
+
+    /// `inspect.db`: read-only summary of `server.db` and (on a hub)
+    /// `library.db`—file/WAL sizes, migration checksums, tables grouped by
+    /// durability layer with columns, indexes, triggers, row counts, and
+    /// queue depths.
+    InspectDbCall: "inspect.db", Query, needs: [StatusRead, ServerManage],
+    NoParams => DbInspection;
+
+    /// `inspect.table`: paged read-only view of one allowlisted table in
+    /// `library.db` or `server.db`, excluding secret/session tables and
+    /// redacting host paths when the caller lacks `folders:manage`.
+    InspectTable: "inspect.table", Query, needs: [ServerManage, LibraryRead],
+    InspectTableParams => TablePage;
+
+    /// `inspect.entity`: full provenance chain for a recording, appearance,
+    /// release, source item, or audio asset across source items, revisions,
+    /// audio assets, claims, assignments, identity decisions, and exclusions.
+    /// Absolute paths are included only when the caller holds `folders:manage`.
+    InspectEntity: "inspect.entity", Query, needs: [LibraryRead],
+    InspectEntityParams => EntityProvenance;
+
+    /// `inspect.play`: derived `play_event` together with its raw
+    /// `history_observation` rows, join/dedupe reasons, `history_delivery`
+    /// rows, and targeting `observation_correction` rows.
+    InspectPlay: "inspect.play", Query, needs: [LibraryRead],
+    InspectPlayParams => PlayProvenance;
+
+    /// `inspect.conflicts`: paged `history_ingest_conflict` rows alongside
+    /// stuck/refused/unknown `history_delivery` rows and waiting `outbox`
+    /// items.
+    InspectConflicts: "inspect.conflicts", Query, needs: [StatusRead, LibraryRead],
+    InspectConflictsParams => ConflictsReport;
+
+    /// `library.revisions`: paged `library_revision` write log, newest first.
+    LibraryRevisions: "library.revisions", Query, needs: [StatusRead],
+    LibraryRevisionsParams => LibraryRevisionsPage;
 }
 
 /// The row of the table for the method named `name`, if there is one.
@@ -805,7 +841,13 @@ mod tests {
                 "corrections.decline",
                 "corrections.keepApart",
                 "corrections.answers",
-                "corrections.answer"
+                "corrections.answer",
+                "inspect.db",
+                "inspect.table",
+                "inspect.entity",
+                "inspect.play",
+                "inspect.conflicts",
+                "library.revisions"
             ]
         );
         assert_eq!(method("server.status").unwrap().result, "ServerStatus");

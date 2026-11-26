@@ -179,6 +179,12 @@ export const METHODS = {
   "corrections.keepApart": { kind: "command", needs: ["library:write"], linkOnly: false },
   "corrections.answers": { kind: "query", needs: ["library:read"], linkOnly: false },
   "corrections.answer": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "inspect.db": { kind: "query", needs: ["status:read", "server:manage"], linkOnly: false },
+  "inspect.table": { kind: "query", needs: ["server:manage", "library:read"], linkOnly: false },
+  "inspect.entity": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "inspect.play": { kind: "query", needs: ["library:read"], linkOnly: false },
+  "inspect.conflicts": { kind: "query", needs: ["status:read", "library:read"], linkOnly: false },
+  "library.revisions": { kind: "query", needs: ["status:read"], linkOnly: false },
 } as const;
 
 /** Every topic a client can subscribe to. */
@@ -286,6 +292,12 @@ export type MethodMap = {
   "corrections.keepApart": { params: KeepApartParams; result: Answered };
   "corrections.answers": { params: AnswersParams; result: AnswerList };
   "corrections.answer": { params: AnswerParams; result: AnswerGot };
+  "inspect.db": { params: NoParams; result: DbInspection };
+  "inspect.table": { params: InspectTableParams; result: TablePage };
+  "inspect.entity": { params: InspectEntityParams; result: EntityProvenance };
+  "inspect.play": { params: InspectPlayParams; result: PlayProvenance };
+  "inspect.conflicts": { params: InspectConflictsParams; result: ConflictsReport };
+  "library.revisions": { params: LibraryRevisionsParams; result: LibraryRevisionsPage };
 };
 
 /** The name of a method. */
@@ -1210,6 +1222,40 @@ export type Choice = {
 export type ClientKind = "desktop" | "browser" | "phone" | "cli" | "agent" | "server";
 
 /**
+ * One column in a SQLite table or view.
+ */
+export type ColumnSchema = {
+  /**
+   * The column's name.
+   */
+  name: string,
+  /**
+   * The declared SQLite column type (`INTEGER`, `TEXT`, `BLOB`, `REAL`, ...).
+   */
+  colType: string,
+  /**
+   * Whether the column is declared `NOT NULL`.
+   */
+  notNull: boolean,
+  /**
+   * Whether the column participates in the primary key.
+   */
+  pk: boolean,
+  /**
+   * SQL default expression, if any.
+   */
+  defaultValue?: string,
+  /**
+   * Referenced foreign-key table, if any.
+   */
+  fkTable?: string,
+  /**
+   * Referenced foreign-key column, if any.
+   */
+  fkColumn?: string,
+};
+
+/**
  * The params of `corrections.confirm`.
  */
 export type ConfirmParams = {
@@ -1244,6 +1290,36 @@ export type Confirmation = {
    * changed since is refused, and nothing is written.
    */
   fingerprint: string,
+};
+
+/**
+ * The result of `inspect.conflicts`.
+ */
+export type ConflictsReport = {
+  /**
+   * Total rows in `history_ingest_conflict`.
+   */
+  ingestConflictsTotal: number,
+  /**
+   * Paged rows from `history_ingest_conflict`, newest first.
+   */
+  ingestConflicts: Array<InspectedIngestConflict>,
+  /**
+   * Total stuck, refused, or unknown rows in `history_delivery`.
+   */
+  stuckDeliveriesTotal: number,
+  /**
+   * Paged stuck, refused, or unknown rows in `history_delivery`, newest first.
+   */
+  stuckDeliveries: Array<InspectedDelivery>,
+  /**
+   * Total rows waiting in this server's `outbox`.
+   */
+  outboxTotal: number,
+  /**
+   * Paged rows from this server's `outbox`, oldest due first.
+   */
+  outbox: Array<InspectedOutboxItem>,
 };
 
 /**
@@ -1346,6 +1422,70 @@ export type Credit = {
    * The artists it names, in order.
    */
   artistIds: Array<string>,
+};
+
+/**
+ * The result of `inspect.db`: schema, sizes, migrations, and queue depths.
+ */
+export type DbInspection = {
+  /**
+   * This server's `server.db` summary.
+   */
+  server: DbSummary,
+  /**
+   * This hub's `library.db` summary. Left out on satellites or unassigned servers.
+   */
+  library?: DbSummary,
+  /**
+   * Current `library_meta.rev`, when a library is open on this server.
+   */
+  libraryRevision?: number,
+  /**
+   * Queue and conflict counts.
+   */
+  queues: QueueDepths,
+};
+
+/**
+ * Storage, migration, and schema summary for one SQLite database.
+ */
+export type DbSummary = {
+  /**
+   * Which database this describes.
+   */
+  db: InspectDb,
+  /**
+   * Current migration version.
+   */
+  schemaVersion: number,
+  /**
+   * Size of the main database file on disk in bytes. Left out for in-memory databases.
+   */
+  fileBytes?: number,
+  /**
+   * Size of the `-wal` file on disk in bytes (0 when absent). Left out for in-memory databases.
+   */
+  walBytes?: number,
+  /**
+   * SQLite page size in bytes.
+   */
+  pageSize: number,
+  /**
+   * Total SQLite pages allocated.
+   */
+  pageCount: number,
+  /**
+   * Unused pages on SQLite's freelist.
+   */
+  freelistCount: number,
+  /**
+   * Applied migrations in version order.
+   */
+  migrations: Array<MigrationSummary>,
+  /**
+   * Tables and views with their columns, indexes, triggers, and counts.
+   */
+  tables: Array<TableSchema>,
 };
 
 /**
@@ -1787,6 +1927,41 @@ export type EncoderCapability = {
    * Output formats supported by this encoder.
    */
   formats: Array<string>,
+};
+
+/**
+ * The result of `inspect.entity`.
+ */
+export type EntityProvenance = {
+  /**
+   * Requested entity kind.
+   */
+  kind: InspectEntityKind,
+  /**
+   * Requested entity public ID.
+   */
+  id: string,
+  /**
+   * Canonical entity public ID when the requested entity was merged/redirected.
+   */
+  canonicalId?: string,
+  /**
+   * Display title of the entity, when applicable.
+   */
+  title?: string,
+  /**
+   * Display artist credit of the entity, when applicable.
+   */
+  artist?: string,
+  /**
+   * Underlying source items and their provenance chains.
+   */
+  sourceItems: Array<InspectedSourceItem>,
+  /**
+   * Entity-level merge/unmerge `identity_decision` rows naming this entity or
+   * its canonical target, newest first.
+   */
+  entityDecisions: Array<InspectedIdentityDecision>,
 };
 
 /**
@@ -2935,6 +3110,670 @@ export type ImportsStaged = {
 };
 
 /**
+ * One index on a SQLite table.
+ */
+export type IndexSchema = {
+  /**
+   * The index's name.
+   */
+  name: string,
+  /**
+   * Whether the index enforces uniqueness.
+   */
+  unique: boolean,
+  /**
+   * Whether the index carries a `WHERE` filter.
+   */
+  partial: boolean,
+  /**
+   * Indexed column names in index order.
+   */
+  columns: Array<string>,
+};
+
+/**
+ * The params of `inspect.conflicts`.
+ */
+export type InspectConflictsParams = {
+  /**
+   * Offset into each list (defaults to 0).
+   */
+  offset: number,
+  /**
+   * Page size (1..=[`MAX_INSPECT_ROWS`], defaults to 50).
+   */
+  limit?: number,
+};
+
+/**
+ * Which SQLite database an inspection call addresses.
+ */
+export type InspectDb = "library" | "server";
+
+/**
+ * Which entity kind `inspect.entity` resolves provenance for.
+ */
+export type InspectEntityKind = "recording" | "appearance" | "release" | "source_item" | "audio_asset";
+
+/**
+ * The params of `inspect.entity`.
+ */
+export type InspectEntityParams = {
+  /**
+   * The kind of entity `id` names.
+   */
+  kind: InspectEntityKind,
+  /**
+   * The entity's public UUID.
+   */
+  id: string,
+};
+
+/**
+ * Row sort order for `inspect.table`.
+ */
+export type InspectOrder = "asc" | "desc";
+
+/**
+ * The params of `inspect.play`.
+ */
+export type InspectPlayParams = {
+  /**
+   * Public ID of the `play_event` to inspect.
+   */
+  playId: string,
+};
+
+/**
+ * The params of `inspect.table`: paged read of one allowlisted table.
+ */
+export type InspectTableParams = {
+  /**
+   * Which database holds the table.
+   */
+  db: InspectDb,
+  /**
+   * Exact allowlisted table or view name.
+   */
+  table: string,
+  /**
+   * Row offset (defaults to 0).
+   */
+  offset: number,
+  /**
+   * Page size (1..=[`MAX_INSPECT_ROWS`], defaults to 50).
+   */
+  limit?: number,
+  /**
+   * Row order by primary key / rowid.
+   */
+  order?: InspectOrder,
+  /**
+   * Optional column name to filter by exact equality (paired with `equals`).
+   */
+  column?: string,
+  /**
+   * Exact value to match when `column` is given (matches integers, text, or UUID hex/strings).
+   */
+  equals?: string,
+};
+
+/**
+ * One insert-only binding row from `assignment`.
+ */
+export type InspectedAssignment = {
+  /**
+   * Internal assignment row ID.
+   */
+  id: number,
+  /**
+   * Bound recording's public ID.
+   */
+  recordingId: string,
+  /**
+   * Bound track appearance's public ID, when present.
+   */
+  appearanceId?: string,
+  /**
+   * `identity_decision.id` that created this assignment.
+   */
+  decisionId: number,
+  /**
+   * When this assignment took effect.
+   */
+  effectiveFromMs: number,
+  /**
+   * When a later assignment superseded this row, if superseded.
+   */
+  supersededAtMs?: number,
+  /**
+   * Whether this row is the active assignment.
+   */
+  current: boolean,
+};
+
+/**
+ * Hashed audio stream properties from `audio_asset`.
+ */
+export type InspectedAudioAsset = {
+  /**
+   * Public UUID of the audio asset.
+   */
+  audioAssetId: string,
+  /**
+   * Hash scheme version.
+   */
+  hashScheme: number,
+  /**
+   * Lowercase BLAKE3 hex digest of the decoded/packet audio stream.
+   */
+  audioHash: string,
+  /**
+   * Lowercase FLAC STREAMINFO MD5 hex digest, when present.
+   */
+  flacMd5?: string,
+  /**
+   * Codec name (`flac`, `mp3`, `aac`, ...).
+   */
+  codec: string,
+  /**
+   * Sample rate in Hz.
+   */
+  sampleRateHz: number,
+  /**
+   * Channel layout description (`stereo`, `mono`, ...).
+   */
+  channelLayout: string,
+  /**
+   * Bits per sample, when lossless/known.
+   */
+  bitDepth?: number,
+  /**
+   * Bitrate in kbps, when known.
+   */
+  bitrateKbps?: number,
+  /**
+   * Whether the audio stream is lossless.
+   */
+  lossless: boolean,
+  /**
+   * Measured duration in milliseconds.
+   */
+  durationMs: number,
+};
+
+/**
+ * One outbound delivery row from `history_delivery`.
+ */
+export type InspectedDelivery = {
+  /**
+   * Internal delivery row ID.
+   */
+  id: number,
+  /**
+   * Primary observation row ID.
+   */
+  observationId: number,
+  /**
+   * Destination endpoint display name.
+   */
+  endpointName: string,
+  /**
+   * Delivery state (`pending`, `sending`, `accepted`, `ignored`, `refused`, `unknown`, `withdrawn`).
+   */
+  state: string,
+  /**
+   * Unix timestamp in seconds sent to the service.
+   */
+  sentTimestampS: number,
+  /**
+   * Sent artist string.
+   */
+  artist: string,
+  /**
+   * Sent title string.
+   */
+  title: string,
+  /**
+   * Sent album string, if any.
+   */
+  album?: string,
+  /**
+   * Service-corrected artist string, when accepted.
+   */
+  acceptedArtist?: string,
+  /**
+   * Service-corrected title string, when accepted.
+   */
+  acceptedTitle?: string,
+  /**
+   * Service ignore reason code, when ignored.
+   */
+  ignoredCode?: number,
+  /**
+   * Service detail or refusal/withdrawal reason.
+   */
+  detail?: string,
+  /**
+   * Number of send attempts made.
+   */
+  attempts: number,
+  /**
+   * Next retry timestamp in milliseconds, when pending.
+   */
+  nextAttemptAtMs?: number,
+  /**
+   * Last update timestamp in milliseconds.
+   */
+  updatedAtMs: number,
+};
+
+/**
+ * One extracted identifier claim from `identifier_claim`.
+ */
+export type InspectedIdentifierClaim = {
+  /**
+   * Claim scope (`recording`, `release`, `artist`, ...).
+   */
+  scope: string,
+  /**
+   * Identifier namespace (`mb_recording`, `isrc`, ...).
+   */
+  namespace: string,
+  /**
+   * Claimed identifier value.
+   */
+  value: string,
+  /**
+   * Metadata source kind (`file_tags`, `musicbrainz`, ...).
+   */
+  source: string,
+};
+
+/**
+ * One immutable audit row from `identity_decision`.
+ */
+export type InspectedIdentityDecision = {
+  /**
+   * Internal decision row ID.
+   */
+  id: number,
+  /**
+   * Decision action (`bind`, `unbind`, `merge`, `unmerge`).
+   */
+  action: string,
+  /**
+   * Resolution method (`same_audio`, `identifier`, `tags_duration`, `new`, `user`, ...).
+   */
+  method: string,
+  /**
+   * Resolver version that made this decision.
+   */
+  resolverVersion: number,
+  /**
+   * Distance score in `0..=1`, when applicable.
+   */
+  score?: number,
+  /**
+   * Gap to runner-up candidate, when applicable.
+   */
+  runnerUpGap?: number,
+  /**
+   * Whether the decision was flagged for review.
+   */
+  needsReview: boolean,
+  /**
+   * Who made the decision (`resolver`, `person`, `agent`).
+   */
+  actorKind: string,
+  /**
+   * Optional human/resolver rationale.
+   */
+  rationale?: string,
+  /**
+   * Unix timestamp in milliseconds when decided.
+   */
+  decidedAtMs: number,
+  /**
+   * Parsed structured evidence payload.
+   */
+  evidence: JsonValue,
+};
+
+/**
+ * One exclusion preventing a source item from binding to a recording.
+ */
+export type InspectedIdentityExclusion = {
+  /**
+   * Internal exclusion row ID.
+   */
+  id: number,
+  /**
+   * Excluded recording's public ID.
+   */
+  recordingId: string,
+  /**
+   * Who recorded the exclusion (`person`, `agent`).
+   */
+  actorKind: string,
+  /**
+   * Optional reason text.
+   */
+  reason?: string,
+  /**
+   * Unix timestamp in milliseconds when created.
+   */
+  createdAtMs: number,
+};
+
+/**
+ * One row from `history_ingest_conflict`.
+ */
+export type InspectedIngestConflict = {
+  /**
+   * Internal conflict row ID.
+   */
+  id: number,
+  /**
+   * Endpoint display name.
+   */
+  endpointName: string,
+  /**
+   * Endpoint kind.
+   */
+  endpointKind: string,
+  /**
+   * Conflicting source key (UUID string when 16 bytes, otherwise hex).
+   */
+  sourceKey: string,
+  /**
+   * Existing observation row ID that already claimed `(endpoint, source_key)`.
+   */
+  existingObservationId: number,
+  /**
+   * Received conflicting payload.
+   */
+  payload: JsonValue,
+  /**
+   * Unix timestamp in milliseconds when the conflict arrived.
+   */
+  receivedAtUtcMs: number,
+  /**
+   * Library revision that recorded this conflict.
+   */
+  rev: number,
+};
+
+/**
+ * One extracted metadata claim from `metadata_claim`.
+ */
+export type InspectedMetadataClaim = {
+  /**
+   * Claim scope (`recording`, `release`, `artist`, ...).
+   */
+  scope: string,
+  /**
+   * Field name (`title`, `artist`, `album`, ...).
+   */
+  field: string,
+  /**
+   * Raw claimed value.
+   */
+  value: string,
+  /**
+   * Metadata source kind (`file_tags`, `inferred`, ...).
+   */
+  source: string,
+};
+
+/**
+ * One raw `history_observation` attached to a derived `play_event`.
+ */
+export type InspectedObservation = {
+  /**
+   * Internal observation row ID.
+   */
+  id: number,
+  /**
+   * Reporting endpoint display name.
+   */
+  endpointName: string,
+  /**
+   * Reporting endpoint kind (`player`, `service`, `import`, ...).
+   */
+  endpointKind: string,
+  /**
+   * Observation kind (`listen`, `import`, `device_log`, `correction`).
+   */
+  kind: string,
+  /**
+   * Role in the play event (`primary` or `corroborating`).
+   */
+  role: string,
+  /**
+   * Join/dedupe reason (`chain`, `echo`, `repeat`, `start`, `during`, `renamed`, `pin`).
+   */
+  joinedBy?: string,
+  /**
+   * Source key (UUID string when 16 bytes, otherwise lowercase hex).
+   */
+  sourceKey: string,
+  /**
+   * Reporter wall clock timestamp in milliseconds.
+   */
+  capturedAtUtcMs: number,
+  /**
+   * Hub ingest timestamp in milliseconds.
+   */
+  receivedAtUtcMs: number,
+  /**
+   * Measured sender-minus-hub clock skew in milliseconds, when stamped.
+   */
+  clockSkewMs?: number,
+  /**
+   * Rendered/reported milliseconds played, when available.
+   */
+  msPlayed?: number,
+  /**
+   * End reason (`finished`, `next`, `crash`, ...), for listens.
+   */
+  endReason?: string,
+  /**
+   * Reported artist spelling, for imports.
+   */
+  artist?: string,
+  /**
+   * Reported title spelling, for imports.
+   */
+  title?: string,
+  /**
+   * Reported album spelling, for imports.
+   */
+  album?: string,
+  /**
+   * Verbatim JSON payload stored on the observation.
+   */
+  payload: JsonValue,
+};
+
+/**
+ * One waiting row from `server.db`'s `outbox`.
+ */
+export type InspectedOutboxItem = {
+  /**
+   * Internal outbox row ID.
+   */
+  id: number,
+  /**
+   * Outbox item kind (for example `history.ingest`).
+   */
+  kind: string,
+  /**
+   * Deduplication key (UUID string when 16 bytes, otherwise hex).
+   */
+  dedupeKey: string,
+  /**
+   * Number of delivery attempts made so far.
+   */
+  attempts: number,
+  /**
+   * Next retry timestamp in milliseconds.
+   */
+  nextAttemptAtMs: number,
+  /**
+   * Last delivery error message, if any.
+   */
+  lastError?: string,
+  /**
+   * Unix timestamp in milliseconds when queued.
+   */
+  createdAtMs: number,
+};
+
+/**
+ * One `observation_correction` targeting an observation of a play.
+ */
+export type InspectedPlayCorrection = {
+  /**
+   * Correction's `history_observation.id`.
+   */
+  observationId: number,
+  /**
+   * Correction verb (`exclude`, `set_listener`, `split`, `join`, `set_clock_offset`, `set_recording`, `revoke`).
+   */
+  verb: string,
+  /**
+   * Optional note attached to the correction.
+   */
+  note?: string,
+  /**
+   * Specific target observation ID, when targeted directly.
+   */
+  targetObservationId?: number,
+  /**
+   * Target recording public ID for `set_recording`, when set.
+   */
+  recordingId?: string,
+  /**
+   * When the correction observation was recorded.
+   */
+  createdAtMs: number,
+};
+
+/**
+ * Full provenance chain for one `source_item`.
+ */
+export type InspectedSourceItem = {
+  /**
+   * Public UUID of the source item.
+   */
+  sourceItemId: string,
+  /**
+   * Source instance name (for example the folder name or Last.fm account).
+   */
+  sourceName: string,
+  /**
+   * Source instance kind (`folder`, `lastfm`, ...).
+   */
+  sourceKind: string,
+  /**
+   * Item kind (`file`, `scrobble_subject`, ...).
+   */
+  itemKind: string,
+  /**
+   * Server holding the root, when backed by a library root.
+   */
+  serverId?: string,
+  /**
+   * Display name of the server holding the root.
+   */
+  serverName?: string,
+  /**
+   * Logical root name in `library_root`, when backed by a root.
+   */
+  rootName?: string,
+  /**
+   * Provider key (root-relative path for files, service key for external sources).
+   */
+  relPath: string,
+  /**
+   * Absolute filesystem path on this server. Only included when the session holds
+   * `folders:manage` and the root is local to this server.
+   */
+  absPath?: string,
+  /**
+   * File size in bytes, for files.
+   */
+  sizeBytes?: number,
+  /**
+   * File modification timestamp in milliseconds, for files.
+   */
+  mtimeMs?: number,
+  /**
+   * When the file was first noticed missing, if missing.
+   */
+  missingSinceMs?: number,
+  /**
+   * When this source item was retired, if retired.
+   */
+  retiredAtMs?: number,
+  /**
+   * When this item was first scanned/seen.
+   */
+  firstSeenAtMs: number,
+  /**
+   * Current revision's hashed audio stream, if any.
+   */
+  audioAsset?: InspectedAudioAsset,
+  /**
+   * Revisions of this source item, newest first.
+   */
+  revisions: Array<InspectedSourceRevision>,
+  /**
+   * Identifier claims from the current revision.
+   */
+  identifierClaims: Array<InspectedIdentifierClaim>,
+  /**
+   * Metadata claims from the current revision.
+   */
+  metadataClaims: Array<InspectedMetadataClaim>,
+  /**
+   * Insert-only assignment history, newest first.
+   */
+  assignments: Array<InspectedAssignment>,
+  /**
+   * Identity decisions naming this source item, newest first.
+   */
+  decisions: Array<InspectedIdentityDecision>,
+  /**
+   * Identity exclusions on this source item.
+   */
+  exclusions: Array<InspectedIdentityExclusion>,
+};
+
+/**
+ * One immutable snapshot in `source_item_revision`.
+ */
+export type InspectedSourceRevision = {
+  /**
+   * Monotonic revision number within the source item.
+   */
+  revisionNo: number,
+  /**
+   * Unix timestamp in milliseconds when the revision was observed.
+   */
+  observedAtMs: number,
+  /**
+   * Lowercase hex digest of `payload_hash`.
+   */
+  payloadHash: string,
+  /**
+   * Audio asset linked to this revision, if audio was decoded.
+   */
+  audioAssetId?: string,
+};
+
+/**
  * One item that the dry run does not find unchanged.
  */
 export type ItemChange = {
@@ -3505,6 +4344,68 @@ export type LibraryEvent = {
    * What kind of change it was, in order and each once.
    */
   changed: Array<LibraryChange>,
+};
+
+/**
+ * One row from `library_revision`.
+ */
+export type LibraryRevisionEntry = {
+  /**
+   * Monotonic library revision number.
+   */
+  rev: number,
+  /**
+   * Client command ID, if the write came from an idempotent command.
+   */
+  commandId?: string,
+  /**
+   * Contract method or internal writer name (`scan.step`, `ratings.set`, ...).
+   */
+  method: string,
+  /**
+   * Handling session's public ID, when initiated by a session.
+   */
+  clientSessionId?: string,
+  /**
+   * Handling session's subject kind (`person`, `agent`, `server`).
+   */
+  clientKind?: string,
+  /**
+   * Unix timestamp in milliseconds when committed.
+   */
+  committedAtMs: number,
+};
+
+/**
+ * The result of `library.revisions`.
+ */
+export type LibraryRevisionsPage = {
+  /**
+   * Current `library_meta.rev`.
+   */
+  currentRev: number,
+  /**
+   * Total rows in `library_revision`.
+   */
+  total: number,
+  /**
+   * Revision log entries, newest first (`rev DESC`).
+   */
+  revisions: Array<LibraryRevisionEntry>,
+};
+
+/**
+ * The params of `library.revisions`.
+ */
+export type LibraryRevisionsParams = {
+  /**
+   * Offset from the newest revision (defaults to 0).
+   */
+  offset: number,
+  /**
+   * Page size (1..=[`MAX_INSPECT_ROWS`], defaults to 50).
+   */
+  limit?: number,
 };
 
 /**
@@ -4258,6 +5159,28 @@ export type MediaToken = {
 };
 
 /**
+ * One applied migration recorded in `schema_migration`.
+ */
+export type MigrationSummary = {
+  /**
+   * The migration's monotonic version number.
+   */
+  version: number,
+  /**
+   * The migration's filename stem.
+   */
+  name: string,
+  /**
+   * Lowercase SHA-256 hex digest of the applied migration SQL.
+   */
+  checksum: string,
+  /**
+   * Unix timestamp in milliseconds when the migration was applied.
+   */
+  appliedAtMs: number,
+};
+
+/**
  * LAME quality preset or constant bitrate in kbps.
  */
 export type Mp3 = "v0" | "v2" | { "cbr": number };
@@ -4622,6 +5545,116 @@ export type PlayCursor = {
  * What became of a play.
  */
 export type PlayOutcome = "listened" | "skipped" | "partial" | "unknown";
+
+/**
+ * The result of `inspect.play`.
+ */
+export type PlayProvenance = {
+  /**
+   * Public ID of the derived `play_event`.
+   */
+  playId: string,
+  /**
+   * Listener public ID.
+   */
+  listenerId: string,
+  /**
+   * Listener display name.
+   */
+  listenerName: string,
+  /**
+   * Bound canonical recording public ID, if bound.
+   */
+  recordingId?: string,
+  /**
+   * Bound track appearance public ID, if any.
+   */
+  appearanceId?: string,
+  /**
+   * Source item public ID, if any.
+   */
+  sourceItemId?: string,
+  /**
+   * Display title of the bound recording, if bound.
+   */
+  title?: string,
+  /**
+   * Display artist of the bound recording, if bound.
+   */
+  artist?: string,
+  /**
+   * Derived start instant in Unix milliseconds, if dated.
+   */
+  eventAtUtcMs?: number,
+  /**
+   * Time anchor (`start`, `end`, `none`).
+   */
+  timeAnchor: string,
+  /**
+   * Clock basis (`hub_age`, `server_wall`, `device_wall`, `device_offset`, `source_utc`, `none`).
+   */
+  clockBasis: string,
+  /**
+   * Resolved IANA time zone name, if known.
+   */
+  zoneName?: string,
+  /**
+   * Zone basis (`captured`, `assumed`, `offset_only`, `none`).
+   */
+  zoneBasis: string,
+  /**
+   * Calendar basis (`zone`, `device_wall`, `offset`, `none`).
+   */
+  calendarBasis: string,
+  /**
+   * Evidence class (`observed`, `manual`).
+   */
+  evidenceClass: string,
+  /**
+   * Played duration in milliseconds, if known.
+   */
+  msPlayed?: number,
+  /**
+   * Track duration in milliseconds, if known.
+   */
+  trackDurationMs?: number,
+  /**
+   * Derived outcome (`listened`, `skipped`, `partial`, `unknown`).
+   */
+  outcome: string,
+  /**
+   * Whether this play counts toward play totals.
+   */
+  counts: boolean,
+  /**
+   * How `counts` was decided (`play_rule`, `source_verdict`, `device_position`).
+   */
+  countBasis: string,
+  /**
+   * Play-rule version used to derive this row.
+   */
+  playRuleVersion: number,
+  /**
+   * Grouper version used to derive this row.
+   */
+  grouperVersion: number,
+  /**
+   * Whether an active `exclude` correction hides this play.
+   */
+  excluded: boolean,
+  /**
+   * Raw observations that produced or corroborated this play.
+   */
+  observations: Array<InspectedObservation>,
+  /**
+   * Outbound scrobble delivery rows for these observations.
+   */
+  deliveries: Array<InspectedDelivery>,
+  /**
+   * Corrections targeting any of this play's observations.
+   */
+  corrections: Array<InspectedPlayCorrection>,
+};
 
 /**
  * What `playback.play` plays.
@@ -5665,6 +6698,40 @@ export type QueueClearParams = {
    * As for `queue.add`.
    */
   expectedRevision?: number,
+};
+
+/**
+ * Operational queue depths across `server.db` and (on a hub) `library.db`.
+ */
+export type QueueDepths = {
+  /**
+   * Rows waiting in `server.db`'s `outbox`.
+   */
+  outbox: number,
+  /**
+   * Open listens currently staged in `server.db`'s `listen_staging`.
+   */
+  listenStagingOpen: number,
+  /**
+   * Closed listens still staged in `server.db`'s `listen_staging`.
+   */
+  listenStagingClosed: number,
+  /**
+   * Pending rows in `library.db`'s `history_delivery`.
+   */
+  historyDeliveryPending: number,
+  /**
+   * Refused rows in `library.db`'s `history_delivery`.
+   */
+  historyDeliveryRefused: number,
+  /**
+   * Unknown-outcome rows in `library.db`'s `history_delivery`.
+   */
+  historyDeliveryUnknown: number,
+  /**
+   * Recorded rows in `library.db`'s `history_ingest_conflict`.
+   */
+  historyIngestConflicts: number,
 };
 
 /**
@@ -7135,6 +8202,97 @@ export type SyncSummary = {
    * the end: newly bound, moved to another recording, or released.
    */
   matchedAfter: number,
+};
+
+/**
+ * The durability and architectural role of a database table or view.
+ */
+export type TableLayer = "evidence" | "decision" | "bookkeeping" | "rebuildable";
+
+/**
+ * Whether a schema object is a regular table or a view.
+ */
+export type TableObjectKind = "table" | "view";
+
+/**
+ * The result of `inspect.table`: one page of redacted rows.
+ */
+export type TablePage = {
+  /**
+   * Database queried.
+   */
+  db: InspectDb,
+  /**
+   * Table or view queried.
+   */
+  table: string,
+  /**
+   * Architectural durability layer.
+   */
+  layer: TableLayer,
+  /**
+   * Column definitions in row-cell order.
+   */
+  columns: Array<ColumnSchema>,
+  /**
+   * Total matching rows in the table.
+   */
+  total: number,
+  /**
+   * Offset of the first returned row.
+   */
+  offset: number,
+  /**
+   * Effective page limit.
+   */
+  limit: number,
+  /**
+   * Whether the page stopped before reaching `limit` to stay within the
+   * response byte budget; callers advance `offset` by `rows.len()`.
+   */
+  truncated: boolean,
+  /**
+   * Rows as positional JSON cell arrays matching `columns`.
+   */
+  rows: Array<Array<JsonValue>>,
+};
+
+/**
+ * Schema and row summary for one table or view.
+ */
+export type TableSchema = {
+  /**
+   * The table or view's name.
+   */
+  name: string,
+  /**
+   * Whether this object is a table or a view.
+   */
+  kind: TableObjectKind,
+  /**
+   * Architectural durability layer.
+   */
+  layer: TableLayer,
+  /**
+   * Whether `inspect.table` permits reading rows from this table.
+   */
+  browsable: boolean,
+  /**
+   * Current row count, when cheaply readable.
+   */
+  rowCount?: number,
+  /**
+   * Columns in declaration order.
+   */
+  columns: Array<ColumnSchema>,
+  /**
+   * Secondary and unique indexes on this table.
+   */
+  indexes: Array<IndexSchema>,
+  /**
+   * Trigger names attached to this table.
+   */
+  triggers: Array<string>,
 };
 
 /**

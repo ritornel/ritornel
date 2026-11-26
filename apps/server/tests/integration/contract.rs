@@ -19,13 +19,17 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use ritornel_client::contract::methods::{
-    EventsSubscribe, IdentityDryRun, IdentityReview, LibrarySetWatching, Method, ServerHello,
+    EventsSubscribe, IdentityDryRun, IdentityReview, InspectConflicts, InspectDbCall,
+    InspectEntity, InspectPlay, InspectTable, LibraryRevisions, LibrarySetWatching, Method,
+    ServerHello,
 };
 use ritornel_client::contract::{
     ART_SIZES, CONTRACT_VERSION, ClientKind, Descriptor, ErrorCode, Event, HelloParams, Id,
-    JobState, JobTarget, LibraryStatus, Limits, ListSupport, Permission, PermissionSet,
-    PublicDescriptor, Receipt, ReceiptStatus, ServerInfo, ServerRole, SourceKind, TokenRole, Topic,
-    WatchingParams, capability, descriptor_proof, hex, route,
+    InspectConflictsParams, InspectDb, InspectEntityKind, InspectEntityParams, InspectOrder,
+    InspectPlayParams, InspectTableParams, JobState, JobTarget, LibraryRevisionsParams,
+    LibraryStatus, Limits, ListKind, ListOpenParams, ListSupport, NoParams, Permission,
+    PermissionSet, PublicDescriptor, Query, Receipt, ReceiptStatus, Row, ServerInfo, ServerRole,
+    SourceKind, TokenRole, Topic, WatchingParams, Window, capability, descriptor_proof, hex, route,
 };
 use ritornel_client::{Client, Credential, NotRunning, local};
 use ritornel_engine::{OsEntropy, SystemClock};
@@ -1913,6 +1917,268 @@ async fn scoped_roles_redact_paths_and_enforce_method_and_topic_permissions() {
         custom.library_stats().await.unwrap();
         assert_eq!(
             refused(custom.subscribe(&[Topic::Queue]).await).0,
+            ErrorCode::Forbidden
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn inspect_methods_expose_schema_tables_provenance_revisions_and_enforce_redaction() {
+    bounded(async {
+        let running = start().await;
+        let mut owner = running.greeted(Via::Memory).await;
+        owner.create_library(key()).await.unwrap();
+
+        let music = running.scratch.0.join("music");
+        std::fs::create_dir_all(&music).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio/a.flac");
+        std::fs::copy(&fixture, music.join("a.flac")).unwrap();
+
+        let source = owner
+            .add_source(key(), "Music", music.to_str().unwrap())
+            .await
+            .unwrap()
+            .source;
+        owner.subscribe(&[Topic::Jobs]).await.unwrap();
+        let scan = owner.start_scan(key(), source.source_id).await.unwrap().job;
+        loop {
+            if let Some(Event::Jobs(e)) = owner.next_event().await
+                && e.job.job_id == scan.job_id
+                && e.job.state.ended()
+            {
+                assert_eq!(e.job.state, JobState::Succeeded);
+                break;
+            }
+        }
+
+        // inspect.db returns both server.db and library.db with sizes, migrations, layers, and queues.
+        let db = owner.call::<InspectDbCall>(&NoParams {}).await.unwrap();
+        assert_eq!(
+            db.server.schema_version,
+            ritornel_engine::SERVER_SCHEMA_VERSION as u32
+        );
+        assert!(db.server.file_bytes.unwrap_or(0) > 0);
+        assert_eq!(
+            db.server.migrations.len(),
+            db.server.schema_version as usize
+        );
+        let session_tbl = db
+            .server
+            .tables
+            .iter()
+            .find(|t| t.name == "session")
+            .unwrap();
+        assert!(!session_tbl.browsable);
+        let lib = db.library.as_ref().unwrap();
+        assert_eq!(
+            lib.schema_version,
+            ritornel_engine::LIBRARY_SCHEMA_VERSION as u32
+        );
+        assert!(lib.file_bytes.unwrap_or(0) > 0);
+        assert!(db.library_revision.unwrap_or(0) >= 2);
+        let rec_tbl = lib.tables.iter().find(|t| t.name == "recording").unwrap();
+        assert!(rec_tbl.browsable);
+        assert_eq!(rec_tbl.row_count, Some(1));
+
+        // inspect.table browses library.db and server.db, filters by UUID, and blocks secret tables.
+        let recs = owner
+            .call::<InspectTable>(&InspectTableParams {
+                db: InspectDb::Library,
+                table: "recording".to_owned(),
+                offset: 0,
+                limit: Some(10),
+                order: Some(InspectOrder::Desc),
+                column: None,
+                equals: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(recs.total, 1);
+        assert_eq!(recs.rows.len(), 1);
+        let pid_idx = recs
+            .columns
+            .iter()
+            .position(|c| c.name == "public_id")
+            .unwrap();
+        let rec_pid = recs.rows[0][pid_idx].as_str().unwrap().to_owned();
+
+        let filtered = owner
+            .call::<InspectTable>(&InspectTableParams {
+                db: InspectDb::Library,
+                table: "recording".to_owned(),
+                offset: 0,
+                limit: Some(10),
+                order: None,
+                column: Some("public_id".to_owned()),
+                equals: Some(rec_pid.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtered.total, 1);
+
+        for secret in ["server_identity", "session", "service_session", "hub_link"] {
+            let (code, ..) = refused(
+                owner
+                    .call::<InspectTable>(&InspectTableParams {
+                        db: InspectDb::Server,
+                        table: secret.to_owned(),
+                        offset: 0,
+                        limit: Some(5),
+                        order: None,
+                        column: None,
+                        equals: None,
+                    })
+                    .await,
+            );
+            assert_eq!(code, ErrorCode::Forbidden, "{secret}");
+        }
+
+        // inspect.entity returns full provenance with abs_path for Owner.
+        let songs = owner
+            .list_open(&ListOpenParams {
+                kind: ListKind::Songs,
+                query: Query::default(),
+                window: Some(Window {
+                    offset: 0,
+                    limit: 10,
+                }),
+                replaces: None,
+            })
+            .await
+            .unwrap();
+        let Row::Song(song) = &songs.rows[0] else {
+            panic!("expected song row");
+        };
+        let prov = owner
+            .call::<InspectEntity>(&InspectEntityParams {
+                kind: InspectEntityKind::Recording,
+                id: song.recording_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(prov.source_items.len(), 1);
+        let si = &prov.source_items[0];
+        assert_eq!(si.rel_path, "a.flac");
+        assert!(
+            si.abs_path
+                .as_deref()
+                .is_some_and(|p| p.ends_with("a.flac"))
+        );
+        assert!(si.audio_asset.is_some());
+        assert!(!si.assignments.is_empty());
+        assert!(!si.decisions.is_empty());
+
+        // library.revisions returns newest-first write history.
+        let revs = owner
+            .call::<LibraryRevisions>(&LibraryRevisionsParams {
+                offset: 0,
+                limit: Some(20),
+            })
+            .await
+            .unwrap();
+        assert!(revs.total >= 2);
+        assert_eq!(revs.revisions[0].rev, revs.current_rev);
+
+        // inspect.conflicts returns cleanly with zero conflicts on a fresh library.
+        let conflicts = owner
+            .call::<InspectConflicts>(&InspectConflictsParams::default())
+            .await
+            .unwrap();
+        assert_eq!(conflicts.ingest_conflicts_total, 0);
+        assert_eq!(conflicts.stuck_deliveries_total, 0);
+
+        // inspect.play returns NotFound for an unknown play ID.
+        assert_eq!(
+            refused(
+                owner
+                    .call::<InspectPlay>(&InspectPlayParams { play_id: key() })
+                    .await
+            )
+            .0,
+            ErrorCode::NotFound
+        );
+
+        // Scoped session with ServerManage + LibraryRead (no FoldersManage) can browse tables
+        // and entity provenance, with host paths redacted.
+        let no_paths_perms = PermissionSet::from_slice(&[
+            Permission::LibraryRead,
+            Permission::ServerManage,
+            Permission::StatusRead,
+        ]);
+        let (tx, rx) = running.server.connect_in_memory_with(no_paths_perms);
+        let no_paths = Client::over_memory(tx, rx);
+        no_paths.hello(&hello()).await.unwrap();
+
+        let root_page = no_paths
+            .call::<InspectTable>(&InspectTableParams {
+                db: InspectDb::Server,
+                table: "root".to_owned(),
+                offset: 0,
+                limit: Some(10),
+                order: None,
+                column: None,
+                equals: None,
+            })
+            .await
+            .unwrap();
+        let abs_idx = root_page
+            .columns
+            .iter()
+            .position(|c| c.name == "abs_path")
+            .unwrap();
+        assert_eq!(root_page.rows[0][abs_idx], Value::Null);
+
+        let prov_no_paths = no_paths
+            .call::<InspectEntity>(&InspectEntityParams {
+                kind: InspectEntityKind::Recording,
+                id: song.recording_id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(prov_no_paths.source_items[0].abs_path, None);
+
+        // Guest cannot call inspect.db, inspect.table, inspect.conflicts, or library.revisions.
+        let (tx, rx) = running.server.connect_in_memory(TokenRole::Guest);
+        let guest = Client::over_memory(tx, rx);
+        guest.hello(&hello()).await.unwrap();
+        assert_eq!(
+            refused(guest.call::<InspectDbCall>(&NoParams {}).await).0,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(
+            refused(
+                guest
+                    .call::<InspectTable>(&InspectTableParams {
+                        db: InspectDb::Library,
+                        table: "recording".to_owned(),
+                        offset: 0,
+                        limit: Some(5),
+                        order: None,
+                        column: None,
+                        equals: None,
+                    })
+                    .await
+            )
+            .0,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(
+            refused(
+                guest
+                    .call::<InspectConflicts>(&InspectConflictsParams::default())
+                    .await
+            )
+            .0,
+            ErrorCode::Forbidden
+        );
+        assert_eq!(
+            refused(
+                guest
+                    .call::<LibraryRevisions>(&LibraryRevisionsParams::default())
+                    .await
+            )
+            .0,
             ErrorCode::Forbidden
         );
     })

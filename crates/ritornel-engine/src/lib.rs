@@ -59,6 +59,7 @@ mod identity_store;
 #[cfg(test)]
 mod identity_tests;
 mod import_store;
+mod inspect;
 pub mod invent;
 mod jobs;
 mod library_store;
@@ -122,6 +123,9 @@ pub use identity_store::is_policy;
 pub use import_store::{
     Doubtful, ImportReport, LOVES_METHOD, LoveRow, MATCH_METHOD, SERVICES, ServiceAccount,
     TrackDetail,
+};
+pub use inspect::{
+    InspectTableError, LibraryConflicts, LibraryQueueDepths, ServerOutboxPage, ServerQueueDepths,
 };
 pub use jobs::{Job, JobCancel, JobState, JobStop, NewJob, Progress, step_command};
 pub use library_store::{

@@ -49,6 +49,7 @@ mod history;
 mod id;
 mod identity;
 mod imports;
+mod inspect;
 mod lastfm;
 mod library;
 mod link;
@@ -108,6 +109,17 @@ pub use imports::{
     ImportsJobStarted, ImportsRunParams, ImportsStageParams, ImportsStaged, JoinSample,
     LATEST_STREAM_END, LONGEST_STREAM_MS, MAX_STREAMS_PER_PIECE, SpotifyStream, StreamTier,
     TierJoins, is_track_uri,
+};
+pub use inspect::{
+    ColumnSchema, ConflictsReport, DbInspection, DbSummary, EntityProvenance, IndexSchema,
+    InspectConflictsParams, InspectDb, InspectEntityKind, InspectEntityParams, InspectOrder,
+    InspectPlayParams, InspectTableParams, InspectedAssignment, InspectedAudioAsset,
+    InspectedDelivery, InspectedIdentifierClaim, InspectedIdentityDecision,
+    InspectedIdentityExclusion, InspectedIngestConflict, InspectedMetadataClaim,
+    InspectedObservation, InspectedOutboxItem, InspectedPlayCorrection, InspectedSourceItem,
+    InspectedSourceRevision, LibraryRevisionEntry, LibraryRevisionsPage, LibraryRevisionsParams,
+    MAX_INSPECT_ROWS, MigrationSummary, PlayProvenance, QueueDepths, TableLayer, TableObjectKind,
+    TablePage, TableSchema,
 };
 pub use lastfm::{
     DeliveryCount, DoubtfulTrack, ImportSchedule, KeyParams, LastImport, LastfmReport,
