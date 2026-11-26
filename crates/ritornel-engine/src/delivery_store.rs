@@ -396,6 +396,8 @@ const NAME_JOINS: &str = "LEFT JOIN artist_credit ac
 /// would carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Playing {
+    /// The current track appearance after following its redirect.
+    pub appearance: Id,
     /// The artist.
     pub artist: String,
     /// The title.
@@ -545,8 +547,8 @@ impl LibraryStore {
             let found = connection
                 .query_row(
                     &format!(
-                        "SELECT {NAMES} FROM track_appearance ta
-                         JOIN recording r ON r.id = ta.recording_id
+                        "SELECT {NAMES}, ta.public_id FROM track_appearance ta
+                         JOIN recording r ON r.id = (SELECT canonical_id FROM recording WHERE id = ta.recording_id)
                          {NAME_JOINS}
                          WHERE ta.id =
                            (SELECT canonical_id FROM track_appearance WHERE public_id = ?1)"
@@ -559,13 +561,15 @@ impl LibraryStore {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            Id::from_bytes(row.get(5)?),
                         ))
                     },
                 )
                 .optional()?;
             Ok(
-                found.and_then(|(title, artist, album, album_artist, track_number)| {
+                found.and_then(|(title, artist, album, album_artist, track_number, appearance)| {
                     Some(Playing {
+                        appearance,
                         artist: artist?,
                         title: title?,
                         album,

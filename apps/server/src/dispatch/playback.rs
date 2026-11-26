@@ -252,9 +252,6 @@ impl Core {
                         );
                         #[cfg(feature = "media-session")]
                         self.show_in_media_session(state);
-                        if state.status != Status::Playing {
-                            self.nothing_playing();
-                        }
                     }
                 }
                 PlayerEvent::Began {
@@ -268,7 +265,6 @@ impl Core {
                             duration_ms: unsigned(duration_ms),
                         },
                     );
-                    self.now_playing(appearance, duration_ms);
                 }
                 PlayerEvent::Progress {
                     entry,
@@ -495,6 +491,10 @@ impl Core {
     /// Stops the player for a clean shutdown: the open listen is closed as
     /// `shutdown` and the position saved.
     pub(crate) fn shutdown_player(&self) {
+        #[cfg(feature = "lastfm")]
+        if let Some(lastfm) = self.lastfm() {
+            lastfm.cancel_now_playing(self.server_id);
+        }
         let done = self.with_stores(|stores| {
             let mut player = lock(&self.player);
             player.as_mut().map(|player| {

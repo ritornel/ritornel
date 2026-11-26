@@ -31,6 +31,8 @@ struct PeerPlayer {
     has_player: bool,
     since_ms: i64,
     newest_session: u64,
+    #[cfg(feature = "lastfm")]
+    sends_now_playing: bool,
     online: Option<Arc<Session>>,
     summary: Option<PlayerSummary>,
 }
@@ -50,6 +52,8 @@ impl PeerPlayer {
             has_player,
             since_ms,
             newest_session: 0,
+            #[cfg(feature = "lastfm")]
+            sends_now_playing: false,
             online: None,
             summary: None,
         }
@@ -231,6 +235,10 @@ impl Core {
 
     /// Publishes a report with the player's identity from this server or the authenticated session.
     pub(super) fn publish_player_event(&self, player: Option<Id>, mut report: LinkPlayerEvent) {
+        #[cfg(feature = "lastfm")]
+        if player.is_none() {
+            self.observe_now_playing(self.server_id, &report);
+        }
         let event = match &mut report {
             LinkPlayerEvent::Playback(e) => {
                 e.player = player;
@@ -264,8 +272,14 @@ impl Core {
             RpcError::new(ErrorCode::Forbidden, "link.event needs a satellite link")
         })?;
         let peers = lock(&self.players.peers);
-        if !peers.get(&peer).is_some_and(|p| p.is_current(session)) {
-            return Err(stale());
+        #[cfg_attr(not(feature = "lastfm"), allow(unused_variables))]
+        let presence = peers
+            .get(&peer)
+            .filter(|p| p.is_current(session))
+            .ok_or_else(stale)?;
+        #[cfg(feature = "lastfm")]
+        if !presence.sends_now_playing {
+            self.observe_now_playing(peer, &report);
         }
         // Order publication against replacement so a stale socket cannot publish after its successor.
         self.publish_player_event(Some(peer), report);
@@ -402,6 +416,13 @@ impl Core {
         if let Some(old) = p.online.take() {
             old.close();
         }
+        #[cfg(feature = "lastfm")]
+        {
+            p.sends_now_playing = presence.sends_now_playing;
+            if let Some(lastfm) = self.lastfm() {
+                lastfm.cancel_now_playing(peer);
+            }
+        }
         p.newest_session = session.id();
         p.name = name;
         p.has_player = presence.has_player;
@@ -429,6 +450,10 @@ impl Core {
             && p.newest_session == session.id()
             && p.online.take().is_some()
         {
+            #[cfg(feature = "lastfm")]
+            if let Some(lastfm) = self.lastfm() {
+                lastfm.cancel_now_playing(peer);
+            }
             p.since_ms = self.clock.now_ms();
             p.summary = None;
             if p.has_player {

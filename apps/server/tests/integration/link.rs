@@ -66,12 +66,9 @@ async fn start_playing_with(
     speed: u32,
     cache_bytes: Option<u64>,
 ) -> Server {
-    Server::start_run(
-        HeldDir::take(scratch.data_dir(name)).unwrap(),
-        Listen::on_port(0),
-        Arc::new(SystemClock),
-        Arc::new(OsEntropy),
-        Bounds::default(),
+    start_with_run(
+        scratch,
+        name,
         Run {
             playback: PlaybackRun {
                 output: Some(Output::Null { speed }),
@@ -82,13 +79,28 @@ async fn start_playing_with(
         },
     )
     .await
+}
+
+async fn start_with_run(scratch: &Scratch, name: &str, run: Run) -> Server {
+    Server::start_run(
+        HeldDir::take(scratch.data_dir(name)).unwrap(),
+        Listen::on_port(0),
+        Arc::new(SystemClock),
+        Arc::new(OsEntropy),
+        Bounds::default(),
+        run,
+    )
+    .await
     .unwrap()
 }
 
 /// Adds the album to the hub's library and scans it, and waits for the
 /// scan to end.
 async fn scan(scratch: &Scratch, hub: &mut Client) {
-    let folder = album(&scratch.0);
+    scan_folder(hub, &album(&scratch.0)).await;
+}
+
+async fn scan_folder(hub: &mut Client, folder: &Path) {
     let source = hub
         .add_source(key(), "music", folder.to_str().unwrap())
         .await
@@ -3407,6 +3419,124 @@ async fn recover_lost_load(destination_kept_queue: bool) {
                 .unwrap()["status"],
             "done"
         );
+    })
+    .await;
+}
+
+#[cfg(feature = "lastfm")]
+#[path = "../../../../fixtures/support/tone.rs"]
+mod tone;
+
+#[cfg(feature = "lastfm")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_to_a_satellite_and_repeat_one_each_show_a_new_now_playing() {
+    use ritornel_lastfm::fake::{API_KEY, API_SECRET, FakeLastfm};
+    use serde_json::json;
+
+    async fn shown(fake: &FakeLastfm, count: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while fake.now_playing().len() < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiting for update {count}: {:?}",
+                fake.now_playing()
+            );
+            // sleep: poll only until the loopback service has received the settled start.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(fake.now_playing().len(), count);
+    }
+
+    bounded(async {
+        let fake = FakeLastfm::start("someone", vec![]);
+        let scratch = Scratch::new();
+        let run = Run {
+            playback: PlaybackRun {
+                output: Some(Output::Null { speed: 1 }),
+                ..PlaybackRun::default()
+            },
+            lastfm: ritornel_server::LastfmRun {
+                credentials: Some(ritornel_lastfm::ApiCredentials::new(API_KEY, API_SECRET)),
+                base_url: Some(fake.base_url()),
+                ..Default::default()
+            },
+            ..Run::default()
+        };
+        let hub = start_with_run(&scratch, "hub", run).await;
+        let mut h = client(&scratch, "hub", &hub).await;
+        h.create_library(key()).await.unwrap();
+        let folder = scratch.data_dir("music");
+        std::fs::create_dir_all(&folder).unwrap();
+        tone::write_aiff(&folder.join("01.aiff"), "Paper Kites", "1", 440.0, 40);
+        tone::write_aiff(&folder.join("02.aiff"), "River Stones", "2", 660.0, 40);
+        scan_folder(&mut h, &folder).await;
+        let tracks = h.list_open(&songs()).await.unwrap().rows;
+        let appearance = |title| {
+            tracks
+                .iter()
+                .find_map(|row| match row {
+                    Row::Song(song) if song.title.as_deref() == Some(title) => {
+                        Some(song.appearance_id)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        fake.approve_after(0);
+        let login = h.call_raw("lastfm.signInStart", json!({})).await.unwrap();
+        let finish = json!({"signIn": login["signIn"], "idempotencyKey": key()});
+        h.call_raw("lastfm.signInFinish", finish).await.unwrap();
+        h.call_raw(
+            "lastfm.setScrobbling",
+            json!({"on": true, "idempotencyKey": key()}),
+        )
+        .await
+        .unwrap();
+        let desk = start_playing_with(&scratch, "desk", 1, None).await;
+        let d = client(&scratch, "desk", &desk).await;
+        join(&d, &invite(&hub, &h).await).await.unwrap();
+        wait_for_player(&mut h, desk.server_id()).await;
+
+        let state = move_track(&h, appearance("Paper Kites")).await;
+        h.call_raw(
+            "playback.set",
+            json!({"idempotencyKey": key(), "repeat": "one"}),
+        )
+        .await
+        .unwrap();
+        shown(&fake, 1).await;
+        let movement = json!({
+            "idempotencyKey": key(), "from": hub.server_id(), "to": desk.server_id(),
+            "entryId": state["entryId"]
+        });
+        h.call_raw("playback.move", movement).await.unwrap();
+        shown(&fake, 2).await;
+        let near_end =
+            json!({"idempotencyKey": key(), "entryId": state["entryId"], "positionMs": 39_950});
+        d.call_raw("playback.seek", near_end).await.unwrap();
+        shown(&fake, 3).await;
+        // Force the playing satellite to reconnect. Its new presence takes
+        // over this socket and reports a snapshot of the track already heard.
+        let (mut replacement, _requests) = scripted_peer(&scratch, &hub).await;
+        assert!(replacement.next_event().await.is_none());
+        // A later settled start on the hub gives the sender a chance to deliver
+        // any extra report from the move or repeat before the final assertion.
+        move_track(&h, appearance("River Stones")).await;
+        shown(&fake, 4).await;
+        let updates = fake.now_playing();
+        assert_eq!(
+            updates
+                .iter()
+                .map(|p| p["track"].as_str())
+                .collect::<Vec<_>>(),
+            ["Paper Kites", "Paper Kites", "Paper Kites", "River Stones"]
+        );
+        for fields in updates {
+            assert_eq!(fields["artist"], "Invented Artist");
+            assert_eq!(fields["album"], "Invented Album");
+            assert_eq!(fields["duration"], "40");
+        }
+        assert!(fake.scrobbled().is_empty());
     })
     .await;
 }
