@@ -5,7 +5,7 @@
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
-# Runs the checks in scripts/ (`deps`, `sleeps`, `contract-version`, `docs`),
+# Runs the checks in scripts/ (`deps`, `sleeps`, `build-version`, `contract-version`, `docs`),
 # the same code on macOS, Linux and Windows.
 python = "3.15.1"
 # For making the audio fixtures again, and the tones `scripts/desktop.sh
@@ -35,6 +35,7 @@ run = [
     { task = "fmt" },
     { task = "deps" },
     { task = "sleeps" },
+    { task = "build-version" },
     { task = "contract-version" },
     { task = "docs" },
     { task = "licenses" },
@@ -54,6 +55,10 @@ run = "python scripts/check-deps.py"
 [tasks.sleeps]
 description = "Check that every sleep in a test says why no event will do"
 run = "python scripts/check-test-sleeps.py"
+
+[tasks.build-version]
+description = "Check package versions and release tags"
+run = "python scripts/check-build-version.py"
 
 [tasks.contract-version]
 description = "Check that a change to the contract raises its version once, against main's"

@@ -85,7 +85,7 @@ pub(crate) fn ask_for<T>(
                         presence: None,
                         name: env!("CARGO_PKG_NAME").to_owned(),
                         kind: ClientKind::Cli,
-                        version: env!("CARGO_PKG_VERSION").to_owned(),
+                        version: env!("RITORNEL_VERSION_DISPLAY").to_owned(),
                         contract_version: CONTRACT_VERSION,
                     })
                     .await?;

@@ -29,6 +29,9 @@ musicbrainz = ["dep:ritornel-musicbrainz"]
 # docs/internals/playback.md.
 media-session = ["dep:souvlaki", "dep:objc2-core-foundation", "dep:zbus", "ritornel-windows/media"]
 
+[build-dependencies]
+ritornel-build.workspace = true
+
 [dependencies]
 # A satellite talks to its hub as any client does: the descriptor, the
 # socket and the routes, through the same client.

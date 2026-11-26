@@ -1,0 +1,10 @@
+[package]
+name = "ritornel-build"
+description = "Compile-time build identity for Ritornel binaries."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

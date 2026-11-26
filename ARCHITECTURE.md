@@ -19,10 +19,11 @@ The server can also be built without its default features but MusicBrainz (`--no
 
 ## Workspace and dependency direction
 
-The main Cargo workspace (`Cargo.toml`) holds eight library crates and two binaries. The desktop app (`apps/desktop`) is an excluded Cargo workspace of its own so the server and headless hub build without GPUI or any desktop library.
+The main Cargo workspace (`Cargo.toml`) holds nine library crates and two binaries. The desktop app (`apps/desktop`) is an excluded Cargo workspace of its own so the server and headless hub build without GPUI or any desktop library.
 
 | Path | Role |
 |---|---|
+| `crates/ritornel-build` | Build-script dependency for all three binaries. Computes their display version from release tags or explicit build inputs. |
 | `crates/ritornel-contract` | Every RPC call, event, and wire type, defined once (`methods.rs`). Generates `contract/contract.ts`. |
 | `crates/ritornel-domain` | Pure logic: tag extraction, normalization, recording resolution, catalog projection, history derivation, scrobble matching, and copy selection. No I/O, clock, or SQLite. |
 | `crates/ritornel-engine` | SQLite stores, migrations, library scanning, cover art, audio pipeline, backups, record health, and export. No networking. |

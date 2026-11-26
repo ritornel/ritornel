@@ -36,7 +36,7 @@ pub(super) fn render(model: &Model, cx: &App) -> impl IntoElement {
         .flex()
         .flex_col()
         .child(group(true).child(heading("Ritornel")).child(boxed(vec![
-            label_value("Version", env!("CARGO_PKG_VERSION")),
+            label_value("Version", env!("RITORNEL_VERSION_DISPLAY")),
             label_value("Contract", CONTRACT_VERSION.to_string()),
         ])))
         .child(group(false).child(heading("Server")).child(boxed(vec![

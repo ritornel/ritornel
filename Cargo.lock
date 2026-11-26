@@ -2073,6 +2073,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ritornel-build"
+version = "0.1.0"
+
+[[package]]
 name = "ritornel-client"
 version = "0.1.0"
 dependencies = [
@@ -2177,6 +2181,7 @@ dependencies = [
  "if-addrs",
  "notify",
  "objc2-core-foundation",
+ "ritornel-build",
  "ritornel-client",
  "ritornel-contract",
  "ritornel-engine",
@@ -2217,6 +2222,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "jiff",
+ "ritornel-build",
  "ritornel-client",
  "ritornel-lastfm",
  "serde",

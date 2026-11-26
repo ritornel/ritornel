@@ -14,6 +14,9 @@ publish = false
 name = "ritornel-gpui"
 path = "src/main.rs"
 
+[build-dependencies]
+ritornel-build = { path = "../../crates/ritornel-build" }
+
 [dependencies]
 ritornel-client = { path = "../../crates/ritornel-client" }
 ritornel-contract = { path = "../../crates/ritornel-contract" }
