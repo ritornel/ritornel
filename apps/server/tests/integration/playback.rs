@@ -61,6 +61,7 @@ async fn server_at(scratch: &Scratch, speed: u32) -> (Server, Client) {
     let client = Client::over_memory(outgoing, incoming);
     let descriptor = client
         .hello(&HelloParams {
+            presence: None,
             name: "playback-test".to_owned(),
             kind: ClientKind::Cli,
             version: "1".to_owned(),

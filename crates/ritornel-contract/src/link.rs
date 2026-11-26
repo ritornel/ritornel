@@ -276,12 +276,16 @@ pub struct LinkListened {
 }
 
 /// What a satellite tells its hub every few seconds with `link.ping`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct LinkPingParams {
     /// Whether the satellite's player is playing.
     pub playing: bool,
+    /// Current playback status, track title and output, from the presence connection alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<crate::PlayerSummary>,
 }
 
 /// The result of `link.ping`.

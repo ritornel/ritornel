@@ -51,6 +51,7 @@ async fn a_file_copied_into_a_watched_root_is_scanned_in_on_its_own() {
         let mut client = Client::over_memory(outgoing, incoming);
         client
             .hello(&HelloParams {
+                presence: None,
                 name: "watch-test".to_owned(),
                 kind: ClientKind::Cli,
                 version: "1".to_owned(),

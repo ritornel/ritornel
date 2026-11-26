@@ -153,6 +153,7 @@ impl Running {
             server,
             scratch,
             hello: HelloParams {
+                presence: None,
                 name: "test".to_owned(),
                 kind: ClientKind::Cli,
                 version: "1".to_owned(),

@@ -147,10 +147,10 @@ pub use search::{MAX_SEARCH_RESULTS, SearchParams, SearchResults, SongFound};
 pub use server::{
     AutoRun, AutoTrigger, BackedUp, BackupFailure, BackupMade, BackupParams, BackupReason,
     BackupStatus, ClientKind, Descriptor, DismissParams, Dismissed, FreeDisk, HelloParams,
-    LibraryStatus, Limits, MAX_CLIENT_TEXT, NONCE_PARAM, NoParams, PublicDescriptor, RecordProblem,
-    RecordProblemKind, RecordStatus, ServerInfo, ServerRole, ServerStatus, ServersList,
-    SessionKind, Versions, WatchState, WatchStatus, WatchedFolder, WatchedKind, WatchingParams,
-    WatchingSet, descriptor_proof,
+    LibraryStatus, Limits, MAX_CLIENT_TEXT, NONCE_PARAM, NoParams, PlayerInfo, PlayerSummary,
+    PlayersList, PresenceHello, PublicDescriptor, RecordProblem, RecordProblemKind, RecordStatus,
+    ServerInfo, ServerRole, ServerStatus, ServersList, SessionKind, Versions, WatchState,
+    WatchStatus, WatchedFolder, WatchedKind, WatchingParams, WatchingSet, descriptor_proof,
 };
 pub use settings::{
     LibrarySettings, LibrarySettingsSet, ListenNetwork, ListenOn, LogLevel, ServerSettings,
@@ -165,7 +165,7 @@ pub use ticket::{SocketTicket, TICKET_PARAM};
 /// one contract. A server refuses a client whose number is not its own,
 /// and a satellite refuses a hub of another ("Session and frames" in
 /// docs/internals/contract.md).
-pub const CONTRACT_VERSION: u32 = 5;
+pub const CONTRACT_VERSION: u32 = 6;
 
 /// The capability flags a server may list in its descriptor.
 pub mod capability {
@@ -188,6 +188,8 @@ pub mod capability {
     /// The server can be linked to another: `link.invite` on a hub,
     /// `link.join` on a server with no library, and `link.status`.
     pub const LINK: &str = "link";
+    /// The hub lists the places this library can play.
+    pub const PLAYERS: &str = "players";
     /// The server has a player: the `playback.*` and `queue.*` calls and
     /// the `playback`, `progress` and `queue` topics. A server with no
     /// audio output has none, and refuses those calls as `unsupported`

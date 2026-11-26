@@ -82,6 +82,7 @@ pub(crate) fn ask_for<T>(
                 let client = local::find(&data_dir).await?.connect().await?;
                 client
                     .hello(&HelloParams {
+                        presence: None,
                         name: env!("CARGO_PKG_NAME").to_owned(),
                         kind: ClientKind::Cli,
                         version: env!("CARGO_PKG_VERSION").to_owned(),

@@ -172,6 +172,7 @@ fn bare(appearance: Id) -> TrackSummary {
 impl Core {
     /// Gives the server its player.
     pub(crate) fn set_player(&self, player: Player) {
+        self.player_state_changed(&self.playback_state(&player.state()));
         *lock(&self.player) = Some(player);
         self.has_player.store(true, Ordering::SeqCst);
     }
@@ -239,8 +240,10 @@ impl Core {
             match event {
                 PlayerEvent::State => {
                     if let Some(state) = &state {
+                        let playback = self.playback_state(state);
+                        self.player_state_changed(&playback);
                         self.publish(&Event::Playback(Box::new(PlaybackEvent {
-                            state: self.playback_state(state),
+                            state: playback,
                         })));
                         #[cfg(feature = "media-session")]
                         self.show_in_media_session(state);

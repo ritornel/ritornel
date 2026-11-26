@@ -37,6 +37,8 @@ pub struct LinkSession {
     pub peer: Id,
     /// The satellite's name when it joined. Untrusted text.
     pub label: String,
+    /// Whether this peer last announced a player.
+    pub has_player: bool,
     /// The public key the satellite proved it holds when it joined.
     pub public_key: [u8; 32],
     /// The SHA-256 of the session's token.
@@ -164,12 +166,34 @@ impl ServerStore {
         })
     }
 
+    /// Remembers player membership between runs. The live socket and its state
+    /// belong to this run alone.
+    pub fn set_peer_player(&self, peer: Id, present: bool) -> Result<(), Error> {
+        self.transact(move |tx, _, _| {
+            if present {
+                tx.execute(
+                    "INSERT OR IGNORE INTO server_setting(key, value_json)
+                            VALUES ('player.' || hex(?1), 'true')",
+                    [peer.as_bytes()],
+                )?;
+            } else {
+                tx.execute(
+                    "DELETE FROM server_setting WHERE key = 'player.' || hex(?1)",
+                    [peer.as_bytes()],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     /// The link sessions that have not been revoked, oldest first.
     pub fn link_sessions(&self) -> Result<Vec<LinkSession>, Error> {
         self.read(|connection| {
             let mut statement = connection.prepare(
                 "SELECT public_id, peer_server_pid, label, token_hash, created_at_ms,
-                        peer_public_key
+                        peer_public_key, EXISTS (
+                            SELECT 1 FROM server_setting
+                            WHERE key = 'player.' || hex(session.peer_server_pid))
                  FROM session
                  WHERE peer_server_pid IS NOT NULL AND revoked_at_ms IS NULL
                  ORDER BY id",
@@ -182,6 +206,7 @@ impl ServerStore {
                     token_hash: row.get(3)?,
                     created_at_ms: row.get(4)?,
                     public_key: row.get(5)?,
+                    has_player: row.get(6)?,
                 })
             })?;
             Ok(rows.collect::<Result<_, _>>()?)

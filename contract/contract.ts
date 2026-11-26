@@ -10,7 +10,7 @@
 // Every integer fits in 53 bits, so each is a `number`.
 
 /** The version of the contract these types are. */
-export const CONTRACT_VERSION = 5;
+export const CONTRACT_VERSION = 6;
 
 /** The HTTP routes. Each is a `GET` but `ticket` and `link`, which are `POST`s. */
 export const ROUTES = {
@@ -38,6 +38,7 @@ export const CAPABILITIES = {
   lists: "lists",
   mediaArt: "media.art",
   playback: "playback",
+  players: "players",
 } as const;
 
 /** The method of every event notification. */
@@ -69,6 +70,7 @@ export const METHODS = {
   "server.hello": { kind: "session", needsFull: false },
   "server.status": { kind: "query", needsFull: true },
   "servers.list": { kind: "query", needsFull: false },
+  "players.list": { kind: "query", needsFull: false },
   "events.subscribe": { kind: "session", needsFull: false },
   "events.unsubscribe": { kind: "session", needsFull: false },
   "library.create": { kind: "command", needsFull: true },
@@ -165,13 +167,14 @@ export const METHODS = {
 } as const;
 
 /** Every topic a client can subscribe to. */
-export const TOPICS = ["servers", "jobs", "library", "list", "playback", "progress", "queue"] as const;
+export const TOPICS = ["servers", "players", "jobs", "library", "list", "playback", "progress", "queue"] as const;
 
 /** The params and the result of each method. */
 export type MethodMap = {
   "server.hello": { params: HelloParams; result: Descriptor };
   "server.status": { params: NoParams; result: ServerStatus };
   "servers.list": { params: NoParams; result: ServersList };
+  "players.list": { params: NoParams; result: PlayersList };
   "events.subscribe": { params: TopicsParams; result: Subscriptions };
   "events.unsubscribe": { params: TopicsParams; result: Subscriptions };
   "library.create": { params: LibraryCreateParams; result: LibraryCreated };
@@ -276,6 +279,7 @@ export type MethodName = keyof MethodMap;
  */
 export type EventMap = {
   "servers": Extract<Event, { topic: "servers" }>;
+  "players": Extract<Event, { topic: "players" }>;
   "jobs": Extract<Event, { topic: "jobs" }>;
   "library": Extract<Event, { topic: "library" }>;
   "list": Extract<Event, { topic: "list" }>;
@@ -1785,7 +1789,7 @@ export type ErrorData = {
 /**
  * The params of an event notification: the topic, and what it carries.
  */
-export type Event = { "topic": "servers" } & ServersEvent | { "topic": "jobs" } & JobsEvent | { "topic": "library" } & LibraryEvent | { "topic": "list" } & ListEvent | { "topic": "playback" } & PlaybackEvent | { "topic": "progress" } & ProgressEvent | { "topic": "queue" } & QueueEvent;
+export type Event = { "topic": "servers" } & ServersEvent | { "topic": "players" } | { "topic": "jobs" } & JobsEvent | { "topic": "library" } & LibraryEvent | { "topic": "list" } & ListEvent | { "topic": "playback" } & PlaybackEvent | { "topic": "progress" } & ProgressEvent | { "topic": "queue" } & QueueEvent;
 
 /**
  * One thing worth saying about what is playing, as Lean back sets it: a
@@ -2109,6 +2113,10 @@ export type HelloParams = {
    * built with. A server refuses one that is not its own.
    */
   contractVersion: number,
+  /**
+   * Present only on the satellite server's own link.
+   */
+  presence?: PresenceHello,
 };
 
 /**
@@ -3717,6 +3725,10 @@ export type LinkPingParams = {
    * Whether the satellite's player is playing.
    */
   playing: boolean,
+  /**
+   * Current playback status, track title and output, from the presence connection alone.
+   */
+  player?: PlayerSummary,
 };
 
 /**
@@ -4810,6 +4822,76 @@ export type PlayedTrack = {
 export type PlayedVia = "app" | "web" | "cast" | "connect" | "airplay" | "other";
 
 /**
+ * One place the library can play.
+ */
+export type PlayerInfo = {
+  /**
+   * Stable ID for this place. Clients use the ID returned by the list.
+   */
+  playerId: string,
+  /**
+   * Name of the place as shown to the listener.
+   */
+  name: string,
+  /**
+   * The server driving this output.
+   */
+  serverId: string,
+  /**
+   * Whether this is the player on the server the client called.
+   */
+  isLocal: boolean,
+  /**
+   * Whether the player can be reached.
+   */
+  reachable: boolean,
+  /**
+   * When this reachability was established, in Unix milliseconds.
+   */
+  sinceMs: number,
+  /**
+   * Current status, while reachable.
+   */
+  status?: PlaybackStatus,
+  /**
+   * Current title, when known.
+   */
+  title?: string,
+  /**
+   * Open output, when known.
+   */
+  output?: OutputInfo,
+};
+
+/**
+ * The fields shown for a reachable player.
+ */
+export type PlayerSummary = {
+  /**
+   * What the player is doing.
+   */
+  status: PlaybackStatus,
+  /**
+   * The current track while playing, paused or buffering.
+   */
+  title?: string,
+  /**
+   * The output once opened.
+   */
+  output?: OutputInfo,
+};
+
+/**
+ * The result of `players.list`.
+ */
+export type PlayersList = {
+  /**
+   * The places this library can play.
+   */
+  players: Array<PlayerInfo>,
+};
+
+/**
  * The policy one dry run decides by: a named policy, and values to put in
  * place of its own. A value left out is the named policy's.
  */
@@ -4959,6 +5041,24 @@ export type Predicate = { "is": "by_artist",
  * The name of a predicate, as the descriptor lists what a list supports.
  */
 export type PredicateName = "by_artist" | "with_artist" | "no_record" | "all";
+
+/**
+ * What a satellite announces on its own connection.
+ */
+export type PresenceHello = {
+  /**
+   * Whether this satellite drives an output.
+   */
+  hasPlayer: boolean,
+  /**
+   * Whether it tells Last.fm what is playing itself.
+   */
+  sendsNowPlaying: boolean,
+  /**
+   * Initial state when this satellite has a player.
+   */
+  player?: PlayerSummary,
+};
 
 /**
  * The params of `corrections.preview`.
@@ -6853,7 +6953,7 @@ export type TierJoins = {
 /**
  * What a client can subscribe to.
  */
-export type Topic = "servers" | "jobs" | "library" | "list" | "playback" | "progress" | "queue";
+export type Topic = "servers" | "players" | "jobs" | "library" | "list" | "playback" | "progress" | "queue";
 
 /**
  * The params of `events.subscribe` and `events.unsubscribe`.

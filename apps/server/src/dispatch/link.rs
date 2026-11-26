@@ -68,7 +68,7 @@ pub(super) enum Route {
 pub(super) fn on_a_satellite(method: &str) -> Route {
     const FOLDERS: &str = "the library's folders are on its hub's machine: do this on the hub";
     match method {
-        "server.hello" | "server.status" | "servers.list" | "events.subscribe"
+        "server.hello" | "server.status" | "servers.list" | "players.list" | "events.subscribe"
         | "events.unsubscribe" | "media.token" | "server.backup" | "server.settings"
         | "server.setSettings" => Route::Here,
         _ if method.starts_with("playback.")
@@ -155,7 +155,7 @@ fn not_through_a_link(session: &Session, method: &str) -> Result<(), RpcError> {
 
 /// A name from another machine as it is kept and shown: control
 /// characters gone, and no longer than a client's name may be.
-fn untrusted_name(name: &str) -> String {
+pub(super) fn untrusted_name(name: &str) -> String {
     let name: String = name
         .chars()
         .filter(|c| !c.is_control())
@@ -221,6 +221,7 @@ impl Core {
             }
         });
         if relabelled || registered {
+            self.player_renamed(peer, &name);
             info!(satellite = %peer, %name, "a satellite has a new name");
         }
     }
@@ -580,6 +581,9 @@ impl Core {
                 "link.ping is for a satellite's link session",
             ));
         };
+        if let Some(summary) = params.player {
+            self.player_reported(peer, session, summary)?;
+        }
         Ok(LinkPinged {
             kept_awake: self.linked_server_pinged(peer, params.playing),
         })

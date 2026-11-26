@@ -505,6 +505,7 @@ async fn a_write_tells_each_view_and_each_subscriber_once_for_what_was_not_yet_r
             | Event::Jobs(_)
             | Event::Playback(_)
             | Event::Progress(_)
+            | Event::Players
             | Event::Queue(_) => {}
         }
     }
@@ -608,6 +609,7 @@ async fn a_session_holds_at_most_its_limit_of_views(via: Via) {
     let client = running.greeted(via).await;
     let descriptor = client
         .hello(&HelloParams {
+            presence: None,
             name: "lists-test".to_owned(),
             kind: ClientKind::Cli,
             version: "1".to_owned(),
@@ -933,6 +935,7 @@ async fn neither_the_media_token_nor_a_cover_url_is_in_the_log_at_its_most_verbo
             .unwrap();
         client
             .hello(&HelloParams {
+                presence: None,
                 name: "lists-test".to_owned(),
                 kind: ClientKind::Cli,
                 version: "1".to_owned(),

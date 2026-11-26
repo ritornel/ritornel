@@ -23,11 +23,11 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use ritornel_client::contract::{
-    CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, HubStatus, Id, RpcError, Topic,
+    CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, HubStatus, Id, PresenceHello,
+    RpcError, Topic,
 };
 use ritornel_client::{Client, Credential};
 use ritornel_engine::{Clock, Entropy, HubLink};
@@ -40,7 +40,8 @@ use crate::session::Session;
 
 /// The topics whose events come from the hub. The rest are this server's
 /// own: its player, its queue, and its status.
-pub(crate) const HUB_TOPICS: [Topic; 3] = [Topic::Library, Topic::List, Topic::Jobs];
+pub(crate) const HUB_TOPICS: [Topic; 4] =
+    [Topic::Library, Topic::List, Topic::Jobs, Topic::Players];
 
 /// Whether the hub answers, as the satellite last found.
 #[derive(Debug, Clone, Default)]
@@ -79,7 +80,7 @@ fn wait_for(method: &str, call_wait: std::time::Duration) -> std::time::Duration
 #[derive(Debug)]
 pub(crate) struct Uplink {
     link: HubLink,
-    name: String,
+    name: tokio::sync::watch::Sender<String>,
     runtime: Handle,
     clock: Arc<dyn Clock>,
     entropy: Arc<dyn Entropy>,
@@ -117,7 +118,7 @@ impl Uplink {
     ) -> Self {
         Self {
             link,
-            name,
+            name: tokio::sync::watch::Sender::new(name),
             runtime,
             clock,
             entropy,
@@ -194,6 +195,21 @@ impl Uplink {
                 () = waited => None,
             }
         })
+    }
+
+    pub(crate) fn renamed(&self, name: &str) {
+        self.name.send_if_modified(|held| {
+            if held == name {
+                return false;
+            }
+            name.clone_into(held);
+            true
+        });
+    }
+
+    /// Whether a connection attempt has already found the hub away.
+    pub(crate) fn away(&self) -> bool {
+        lock(&self.reach).answers == Some(false)
     }
 
     /// The library the hub holds.
@@ -296,7 +312,7 @@ impl Uplink {
     }
 
     /// Opens a connection to the hub at `address`, once it has proved it
-    /// holds the hub's key, and says hello.
+    /// holds the hub's key.
     async fn open(&self, address: SocketAddr) -> Result<Client, String> {
         link::reach(
             address,
@@ -305,24 +321,29 @@ impl Uplink {
             &*self.entropy,
         )
         .await?;
-        let client = Client::connect(address, &self.credential())
+        Client::connect(address, &self.credential())
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string())
+    }
+
+    async fn hello(&self, client: &Client, presence: Option<PresenceHello>) -> Result<(), String> {
+        let name = self.name.borrow().clone();
         client
             .hello(&HelloParams {
-                name: self.name.clone(),
+                presence,
+                name,
                 kind: ClientKind::Server,
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 contract_version: CONTRACT_VERSION,
             })
             .await
             .map_err(|error| error.to_string())?;
-        Ok(client)
+        Ok(())
     }
 
     /// Opens a connection to the hub on the first route that works, and
     /// says hello.
-    async fn connect(&self) -> Result<Client, String> {
+    async fn connect(&self, presence: Option<PresenceHello>) -> Result<Client, String> {
         {
             let reach = lock(&self.reach);
             if let (Some(failed), Some(problem)) = (reach.failed_at_ms, &reach.problem)
@@ -336,8 +357,29 @@ impl Uplink {
         // to it is chosen again: this network before a tailnet, and the
         // next tried soon when one does not answer (`link::first_answer`).
         let (candidates, mut tried) = link::candidates(&self.link.routes).await;
-        match link::first_answer(candidates, |address| self.open(address)).await {
+        let ordinary = presence.is_none();
+        match link::first_answer(candidates, |address| async move {
+            let client = self.open(address).await?;
+            if ordinary {
+                self.hello(&client, None).await?;
+            }
+            Ok(client)
+        })
+        .await
+        {
             Ok((via, address, client)) => {
+                // Only the winning route may register a presence socket.
+                if let Some(presence) = presence {
+                    let hello = tokio::time::timeout(
+                        link::CONNECT_WAIT,
+                        self.hello(&client, Some(presence)),
+                    )
+                    .await;
+                    if let Err(why) = hello.map_err(|e| e.to_string()).and_then(|answer| answer) {
+                        self.lost(&why);
+                        return Err(why);
+                    }
+                }
                 self.answered(Some((via, address)));
                 return Ok(client);
             }
@@ -470,7 +512,7 @@ impl Uplink {
             Some(client) => (client, subscribe),
             None => {
                 let mut client = self
-                    .wait_on(None, self.connect())
+                    .wait_on(None, self.connect(None))
                     .ok_or_else(Self::stopping)?
                     .map_err(|_| self.unreachable())?;
                 let events = client.take_events();
@@ -540,7 +582,7 @@ impl Uplink {
                 Some(client) => client,
                 None => {
                     let client = Arc::new(
-                        self.wait_on(None, self.connect())
+                        self.wait_on(None, self.connect(None))
                             .ok_or_else(Self::stopping)?
                             .map_err(|_| self.unreachable())?,
                     );
@@ -645,7 +687,7 @@ impl Cut {
     }
 }
 
-/// Of `topics`, those the hub is asked for: its library and job events. A
+/// Of `topics`, those the hub is asked for: its library, job and player events. A
 /// view's list events come on the connection that holds it, unasked.
 fn followed(topics: &[Topic]) -> Vec<Topic> {
     topics
@@ -700,12 +742,8 @@ async fn relay(
 /// hub is away, or back.
 const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Follows a satellite's hub for as long as the server runs: tells its
-/// clients, with a `servers` event, each time the hub begins or stops
-/// answering, and pings the hub every [`CHECK_EVERY`] so that a hub that
-/// went while nothing was asked of it is found out. The ping says whether
-/// this server plays, which keeps the hub awake while it does. A server
-/// that is no satellite yet is looked at again until it is one.
+/// Maintains satellite presence and restores subscriptions when the hub returns.
+/// A server can join a library after startup, so wait until it has an uplink.
 pub(crate) async fn follow(core: std::sync::Arc<crate::dispatch::Core>) {
     loop {
         let Some(uplink) = core.uplink() else {
@@ -715,23 +753,22 @@ pub(crate) async fn follow(core: std::sync::Arc<crate::dispatch::Core>) {
         let mut changes = uplink.changes();
         // What changed before this began to look is told as well.
         core.hub_changed();
-        let pinging = Arc::new(AtomicBool::new(false));
-        loop {
-            tokio::select! {
-                changed = changes.changed() => {
-                    if changed.is_err() {
-                        break;
+        let monitor = async {
+            loop {
+                tokio::select! {
+                    changed = changes.changed() => {
+                        if changed.is_err() { return; }
+                        // Subscribe before telling clients the hub is back.
+                        restore(&uplink).await;
+                        core.hub_changed();
                     }
-                    // Subscribed again before the clients are told, so
-                    // that a client told the hub is back hears its events.
-                    restore(&uplink).await;
-                    core.hub_changed();
-                }
-                () = tokio::time::sleep(CHECK_EVERY) => {
-                    restore(&uplink).await;
-                    ping(&core, &uplink, &pinging);
+                    () = tokio::time::sleep(CHECK_EVERY) => restore(&uplink).await,
                 }
             }
+        };
+        tokio::select! {
+            () = monitor => (),
+            () = presence(&core, &uplink) => return,
         }
     }
 }
@@ -748,24 +785,71 @@ async fn restore(uplink: &Arc<Uplink>) {
     let _ = tokio::task::spawn_blocking(move || uplink.restore()).await;
 }
 
-/// Pings the hub, saying whether this server plays, unless a ping is still
-/// out. The ping may wait on the hub as long as a call does, so it runs on
-/// a thread of its own: news of the hub is told while it waits, and a
-/// server that stops does not wait for it.
-fn ping(core: &crate::dispatch::Core, uplink: &Arc<Uplink>, pinging: &Arc<AtomicBool>) {
-    if pinging.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let params = serde_json::json!({ "playing": core.playing() });
-    let (asked, out) = (Arc::clone(uplink), Arc::clone(pinging));
-    let started = std::thread::Builder::new()
-        .name("hub ping".to_owned())
-        .spawn(move || {
-            let _ = asked.call("link.ping", params);
-            out.store(false, Ordering::Release);
-        });
-    if started.is_err() {
-        pinging.store(false, Ordering::Release);
+/// Owns the satellite's presence socket through reconnects. A separate socket
+/// carries library reads so a slow query cannot delay a heartbeat.
+async fn presence(core: &crate::dispatch::Core, uplink: &Uplink) {
+    let run = async {
+        let mut backoff = std::time::Duration::from_millis(250);
+        let mut name = uplink.name.subscribe();
+        loop {
+            name.borrow_and_update();
+            let mut updates = core.player_updates();
+            let player = updates.borrow().as_ref().map(|(_, state)| state.clone());
+            let hello = PresenceHello {
+                has_player: player.is_some(),
+                player,
+                // Only a library hub sends Now Playing in this version.
+                sends_now_playing: false,
+            };
+            if let Ok(mut client) = uplink.connect(Some(hello)).await {
+                backoff = std::time::Duration::from_millis(250);
+                let mut events = client.take_events();
+                loop {
+                    let player = updates
+                        .borrow_and_update()
+                        .as_ref()
+                        .map(|(_, state)| state.clone());
+                    let params = serde_json::json!({"playing":core.playing(), "player":player});
+                    match tokio::time::timeout(
+                        uplink.call_wait,
+                        client.call_raw("link.ping", params),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => uplink.answered(None),
+                        Ok(Err(ritornel_client::Error::Call(_))) => {
+                            // Even a refusal is an answer. Register again on a fresh socket.
+                            uplink.answered(None);
+                            break;
+                        }
+                        _ => {
+                            uplink.lost("the presence ping was not answered");
+                            break;
+                        }
+                    }
+                    tokio::select! {
+                        _ = name.changed() => {
+                            // A hello on the live link updates the name without interrupting playback presence.
+                            if !matches!(tokio::time::timeout(uplink.call_wait, uplink.hello(&client, None)).await, Ok(Ok(()))) {
+                                break;
+                            }
+                        }
+                        _ = events.recv() => {
+                            uplink.lost("the presence connection closed");
+                            break;
+                        }
+                        _ = updates.changed() => (),
+                        () = tokio::time::sleep(CHECK_EVERY) => (),
+                    }
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (2 * backoff).min(std::time::Duration::from_secs(5));
+        }
+    };
+    tokio::select! {
+        () = uplink.stop_passed() => (),
+        () = run => (),
     }
 }
 

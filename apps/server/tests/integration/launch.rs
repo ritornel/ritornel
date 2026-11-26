@@ -63,6 +63,7 @@ async fn find_or_start(launcher: &Launcher) -> LocalServer {
 async fn hello(client: &Client) {
     client
         .hello(&HelloParams {
+            presence: None,
             name: "launch-test".to_owned(),
             kind: ClientKind::Desktop,
             version: "1".to_owned(),

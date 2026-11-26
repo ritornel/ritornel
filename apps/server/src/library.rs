@@ -135,6 +135,7 @@ mod tests {
         let client = Client::over_memory(outgoing, incoming);
         client
             .hello(&HelloParams {
+                presence: None,
                 name: "library-test".to_owned(),
                 kind: ClientKind::Cli,
                 version: "1".to_owned(),

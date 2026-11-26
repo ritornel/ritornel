@@ -756,18 +756,23 @@ async fn socket(
 
 /// The socket as a transport: one text message is one frame.
 impl Wire for WebSocket {
-    async fn recv(&mut self) -> Option<String> {
-        loop {
-            match WebSocket::recv(self).await? {
-                Ok(Message::Text(text)) => return Some(text.as_str().to_owned()),
-                // The socket layer answers a ping by itself.
-                Ok(Message::Ping(_) | Message::Pong(_)) => {}
-                // A frame is text. Bytes are not this contract, and neither
-                // is a message over the limit, which arrives as an error
-                // before it has been buffered.
-                Ok(Message::Binary(_) | Message::Close(_)) | Err(_) => return None,
-            }
+    async fn recv(&mut self) -> Option<crate::transport::Incoming> {
+        use crate::transport::Incoming;
+        match WebSocket::recv(self).await? {
+            Ok(Message::Text(text)) => Some(Incoming::Text(text.as_str().to_owned())),
+            // The socket layer answers a ping by itself.
+            Ok(Message::Ping(_) | Message::Pong(_)) => Some(Incoming::Alive),
+            // A frame is text. Bytes are not this contract, and neither
+            // is a message over the limit, which arrives as an error
+            // before it has been buffered.
+            Ok(Message::Binary(_) | Message::Close(_)) | Err(_) => None,
         }
+    }
+
+    async fn ping(&mut self) -> bool {
+        WebSocket::send(self, Message::Ping(Default::default()))
+            .await
+            .is_ok()
     }
 
     async fn send(&mut self, text: String) -> bool {

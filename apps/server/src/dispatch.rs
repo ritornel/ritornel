@@ -66,6 +66,7 @@ mod lists;
 mod media_keys;
 mod pages;
 mod playback;
+mod players;
 mod ratings;
 mod record;
 mod settings;
@@ -119,6 +120,7 @@ impl Stores {
 #[derive(Debug)]
 pub(crate) struct Core {
     server_id: Id,
+    players: players::Players,
     schema_version: i64,
     dir: DataDir,
     /// What can change about this server while it runs.
@@ -278,8 +280,9 @@ impl Core {
             .ok_or(Error::Store(ritornel_engine::Error::Corrupt(
                 "a running server with no identity",
             )))?;
-        let link_sessions =
-            crate::link::LinkSessions::new(stores.server.link_sessions().map_err(Error::Store)?);
+        let peers = stores.server.link_sessions().map_err(Error::Store)?;
+        let players = players::Players::new(clock.now_ms(), &peers);
+        let link_sessions = crate::link::LinkSessions::new(peers);
         let runtime = tokio::runtime::Handle::try_current().ok();
         let uplink = match (stores.server.hub_link().map_err(Error::Store)?, &runtime) {
             (Some(link), Some(runtime)) => Some(Arc::new(crate::uplink::Uplink::new(
@@ -308,6 +311,7 @@ impl Core {
             local_credential,
             signer,
             invites: crate::link::Invites::default(),
+            players,
             link_sessions,
             private_port: std::sync::OnceLock::new(),
             runtime,
@@ -423,6 +427,8 @@ impl Core {
     pub(crate) fn hub_changed(&self) {
         let mut this = lock(&self.this);
         self.changed(&mut this);
+        drop(this);
+        self.publish(&Event::Players);
     }
 
     /// Follows the wake setting `server.db` keeps: at start, and after
@@ -534,6 +540,11 @@ impl Core {
         ]
         .map(str::to_owned)
         .to_vec();
+        // Every hub speaks players.list. A satellite also serves its local
+        // fallback, including before the first connection after startup.
+        if matches!(this.role, ServerRole::Hub | ServerRole::Satellite) {
+            capabilities.push(capability::PLAYERS.to_owned());
+        }
         if self.has_player() {
             capabilities.push(capability::PLAYBACK.to_owned());
         }
@@ -652,6 +663,7 @@ impl Core {
     /// Ends a session whose transport has gone.
     pub(crate) fn close_session(&self, session: &Session) {
         session.close();
+        self.player_disconnected(session);
         self.fanout.remove(session.id());
         self.media_tokens.revoke(session.id());
         lock(&self.sessions).open.remove(&session.id());
@@ -745,6 +757,14 @@ impl Core {
         let registry = library.as_ref().map_or(Ok(()), |library| {
             crate::library::keep_registry_name(library, &identity)
         });
+        if this.name != identity.name {
+            if let Some(uplink) = self.uplink() {
+                uplink.renamed(&identity.name);
+            }
+            if self.has_player() {
+                self.publish(&Event::Players);
+            }
+        }
         this.name = identity.name;
         self.changed(&mut this);
         registry.map_err(Error::Library)
@@ -892,6 +912,9 @@ impl Core {
                 run::<ServerHello>(params, |hello| self.hello(stores, session, &hello))
             }
             ServerStatus::NAME => run::<ServerStatus>(params, |_| self.status(stores)),
+            methods::PlayersListCall::NAME => {
+                run::<methods::PlayersListCall>(params, |_| self.players_list())
+            }
             ServersList::NAME => run::<ServersList>(params, |_| {
                 Ok(ritornel_contract::ServersList {
                     servers: vec![self.info(&lock(&self.this))],
@@ -1210,8 +1233,12 @@ impl Core {
                 .with_detail("field", field));
             }
         }
+        if let Some(presence) = &hello.presence {
+            self.player_connected(stores, session, hello, presence)?;
+        }
         session.greet();
-        if let Some(peer) = session.peer()
+        if hello.presence.is_none()
+            && let Some(peer) = session.peer()
             && hello.kind == ritornel_contract::ClientKind::Server
         {
             self.satellite_named(stores, peer, &hello.name);

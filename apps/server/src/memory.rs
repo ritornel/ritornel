@@ -21,8 +21,15 @@ struct Channels {
 }
 
 impl Wire for Channels {
-    async fn recv(&mut self) -> Option<String> {
-        self.from_client.recv().await
+    async fn recv(&mut self) -> Option<crate::transport::Incoming> {
+        self.from_client
+            .recv()
+            .await
+            .map(crate::transport::Incoming::Text)
+    }
+
+    async fn ping(&mut self) -> bool {
+        true
     }
 
     async fn send(&mut self, text: String) -> bool {

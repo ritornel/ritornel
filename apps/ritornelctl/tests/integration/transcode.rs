@@ -47,6 +47,7 @@ fn transcode_inspects_the_hub_packages_lossless_tracks_and_prunes() {
                 version: "1".into(),
                 kind: ClientKind::Cli,
                 contract_version: CONTRACT_VERSION,
+                presence: None,
             })
             .await
             .unwrap();

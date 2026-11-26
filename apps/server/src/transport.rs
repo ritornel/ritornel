@@ -13,11 +13,42 @@ use tokio::task::JoinSet;
 use crate::dispatch::{Core, Received};
 use crate::session::Session;
 
+/// A data frame or evidence that the peer is still there.
+pub(crate) enum Incoming {
+    /// A contract frame to dispatch.
+    Text(String),
+    /// A transport ping or pong.
+    Alive,
+}
+
+const PING_EVERY: Duration = Duration::from_secs(5);
+const SILENT_FOR: Duration = Duration::from_secs(15);
+
+async fn silent(session: &Session) {
+    let mut heard = session.heartbeat();
+    loop {
+        let last = *heard.borrow_and_update();
+        tokio::select! {
+            biased;
+            _ = heard.changed() => {}
+            () = async {
+                match last {
+                    Some(at) => tokio::time::sleep_until(at + SILENT_FOR).await,
+                    None => std::future::pending().await,
+                }
+            } => return,
+        }
+    }
+}
+
 /// Something that carries text frames to and from one client.
 pub(crate) trait Wire: Send {
     /// The next frame from the client. `None` when the client has gone, or
     /// has sent something the transport itself refuses.
-    fn recv(&mut self) -> impl Future<Output = Option<String>> + Send;
+    fn recv(&mut self) -> impl Future<Output = Option<Incoming>> + Send;
+
+    /// Sends a transport heartbeat.
+    fn ping(&mut self) -> impl Future<Output = bool> + Send;
 
     /// Sends one frame to the client. `false` when the client has gone.
     fn send(&mut self, text: String) -> impl Future<Output = bool> + Send;
@@ -39,14 +70,37 @@ pub(crate) trait Wire: Send {
 /// A write to a client that has stopped reading never finishes by itself,
 /// and neither that nor anything else here may outlast the server.
 pub(crate) async fn pump(core: &Arc<Core>, session: &Arc<Session>, wire: &mut impl Wire) {
+    tokio::select! {
+        () = silent(session) => (),
+        () = exchange(core, session, wire) => (),
+    }
+}
+
+async fn exchange(core: &Arc<Core>, session: &Arc<Session>, wire: &mut impl Wire) {
+    let mut ping = tokio::time::interval(PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let presence = session.heartbeat();
+    let mut timing = false;
     let closed = session.closed();
     tokio::pin!(closed);
     // Whether the client can still be told that the server is closing.
     let goodbye = loop {
+        if !timing && presence.borrow().is_some() {
+            timing = true;
+            ping.reset();
+        }
         tokio::select! {
             () = &mut closed => break true,
+            _ = ping.tick(), if timing => {
+                tokio::select! {
+                    () = &mut closed => break false,
+                    sent = wire.ping() => if !sent {break false;},
+                }
+            }
             text = wire.recv() => {
-                let Some(text) = text else { break false };
+                let Some(message) = text else { break false };
+                session.heard();
+                let Incoming::Text(text) = message else { continue };
                 let (core, session) = (Arc::clone(core), Arc::clone(session));
                 let answering = tokio::task::spawn_blocking(move || core.receive(&session, &text));
                 tokio::select! {

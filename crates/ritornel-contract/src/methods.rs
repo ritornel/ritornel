@@ -148,6 +148,10 @@ methods! {
     ServersList: "servers.list", Query, needs_full: false,
     NoParams => ServersList;
 
+    /// `players.list`: the places this library can play.
+    PlayersListCall: "players.list", Query, needs_full: false,
+    NoParams => PlayersList;
+
     /// `events.subscribe`: adds topics to what this session is sent.
     EventsSubscribe: "events.subscribe", Session, needs_full: false,
     TopicsParams => Subscriptions;
@@ -672,6 +676,7 @@ mod tests {
                 "server.hello",
                 "server.status",
                 "servers.list",
+                "players.list",
                 "events.subscribe",
                 "events.unsubscribe",
                 "library.create",
