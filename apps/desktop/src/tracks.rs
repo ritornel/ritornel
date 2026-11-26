@@ -204,7 +204,7 @@ impl Tracks {
         &self,
         at: usize,
         song: &SongRow,
-        playing_now: Option<Id>,
+        playing_id: Option<Id>,
         stars: u32,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -217,7 +217,7 @@ impl Tracks {
             (Some(_), Some(number)) => number.to_string(),
             _ => "·".to_owned(),
         };
-        let current = playing_now == Some(song.appearance_id);
+        let current = playing_id == Some(song.appearance_id);
         let added = self.added.contains_key(&song.appearance_id);
         let group: SharedString = format!("track-{at}").into();
         // The song playing is marked where its number was; on the pointer,
@@ -458,7 +458,7 @@ impl Tracks {
 impl Render for Tracks {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let player = self.player.read(cx);
-        let playing = player.appearance();
+        let playing_id = player.appearance();
         let stars: Vec<u32> = self
             .songs
             .iter()
@@ -500,8 +500,13 @@ impl Render for Tracks {
                 let mut each = div().flex_1().min_w_0().flex().flex_col();
                 for at in column * rows..((column + 1) * rows).min(songs.len()) {
                     if let Some(song) = songs.get(at) {
-                        let row =
-                            self.row(at, song, playing, stars.get(at).copied().unwrap_or(0), cx);
+                        let row = self.row(
+                            at,
+                            song,
+                            playing_id,
+                            stars.get(at).copied().unwrap_or(0),
+                            cx,
+                        );
                         each = each.child(row);
                     }
                 }
@@ -532,7 +537,13 @@ impl Render for Tracks {
                     .enumerate()
                     .filter(|(_, song)| song.disc.unwrap_or(1) == *disc)
                 {
-                    let row = self.row(at, song, playing, stars.get(at).copied().unwrap_or(0), cx);
+                    let row = self.row(
+                        at,
+                        song,
+                        playing_id,
+                        stars.get(at).copied().unwrap_or(0),
+                        cx,
+                    );
                     list = list.child(row);
                 }
             }

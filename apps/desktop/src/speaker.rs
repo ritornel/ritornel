@@ -685,12 +685,8 @@ impl Speaker {
                     )
                     .when(playing, |row| {
                         row.child(
-                            crate::marks::Equalizer::playback(
-                                Duration::ZERO,
-                                self.picker_opened,
-                                cx,
-                            )
-                            .draw(theme::acc()),
+                            crate::marks::Equalizer::for_picker(self.picker_opened, cx)
+                                .draw(theme::acc()),
                         )
                     })
                     .when(chosen == Some(id), |row| {
