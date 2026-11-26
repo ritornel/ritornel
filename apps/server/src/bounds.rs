@@ -44,6 +44,10 @@ pub const TICKET_LIFE: Duration = Duration::from_secs(10);
 /// away hears so in seconds, not after its own wait runs out.
 pub const HUB_CALL_WAIT: Duration = Duration::from_secs(8);
 
+/// A hub gives a player four seconds to answer so a routed call can return
+/// within the controlling satellite's eight-second [`HUB_CALL_WAIT`].
+pub(crate) const PLAYER_CALL_WAIT: Duration = Duration::from_secs(4);
+
 /// The longest a satellite waits for its hub to look an album's discs up
 /// (`corrections.lookup`): the hub asks MusicBrainz about each disc in
 /// turn, a second apart, each request with a timeout of its own, so a

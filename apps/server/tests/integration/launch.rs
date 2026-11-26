@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use ritornel_client::contract::methods::{PlaybackGet, PlaybackPlay, SourcesTracks};
 use ritornel_client::contract::{
-    CONTRACT_VERSION, ClientKind, Event, HelloParams, NoParams, PlaySource, PlaybackPlayParams,
-    PlaybackStatus, SourcesTracksParams, Topic,
+    CONTRACT_VERSION, ClientKind, Event, HelloParams, PlaySource, PlaybackGetParams,
+    PlaybackPlayParams, PlaybackStatus, SourcesTracksParams, Topic,
 };
 use ritornel_client::launch::{Launcher, Program, STOP_WAIT, Stopped};
 use ritornel_client::local::LocalServer;
@@ -268,6 +268,7 @@ async fn quitting_pauses_what_plays_and_the_next_start_is_where_it_stopped() {
         client.subscribe(&[Topic::Progress]).await.unwrap();
         client
             .call::<PlaybackPlay>(&PlaybackPlayParams {
+                player: None,
                 idempotency_key: key(),
                 source: PlaySource::Tracks {
                     ids: tracks.iter().map(|track| track.appearance_id).collect(),
@@ -300,7 +301,10 @@ async fn quitting_pauses_what_plays_and_the_next_start_is_where_it_stopped() {
             .await
             .unwrap();
         hello(&client).await;
-        let state = client.call::<PlaybackGet>(&NoParams {}).await.unwrap();
+        let state = client
+            .call::<PlaybackGet>(&PlaybackGetParams::default())
+            .await
+            .unwrap();
         assert_eq!(state.status, PlaybackStatus::Paused);
         assert!(
             (1_000..40_000).contains(&state.position_ms),

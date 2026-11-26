@@ -198,7 +198,7 @@ export type MethodMap = {
   "album.get": { params: AlbumGetParams; result: AlbumPage };
   "artist.get": { params: ArtistGetParams; result: ArtistPage };
   "media.token": { params: NoParams; result: MediaToken };
-  "playback.get": { params: NoParams; result: PlaybackState };
+  "playback.get": { params: PlaybackGetParams; result: PlaybackState };
   "playback.play": { params: PlaybackPlayParams; result: PlaybackChanged };
   "playback.pause": { params: PlaybackCommandParams; result: PlaybackChanged };
   "playback.resume": { params: PlaybackCommandParams; result: PlaybackChanged };
@@ -4544,6 +4544,10 @@ export type PlaybackChanged = {
  */
 export type PlaybackCommandParams = {
   /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
+  /**
    * The command's ID, made by the client.
    */
   idempotencyKey: string,
@@ -4560,9 +4564,23 @@ export type PlaybackEvent = {
 };
 
 /**
+ * The params of `playback.get`.
+ */
+export type PlaybackGetParams = {
+  /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
+};
+
+/**
  * The params of `playback.jump`.
  */
 export type PlaybackJumpParams = {
+  /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
   /**
    * The command's ID, made by the client.
    */
@@ -4577,6 +4595,10 @@ export type PlaybackJumpParams = {
  * The params of `playback.play`.
  */
 export type PlaybackPlayParams = {
+  /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
   /**
    * The command's ID, made by the client.
    */
@@ -4607,6 +4629,10 @@ export type PlaybackPlayParams = {
  */
 export type PlaybackSeekParams = {
   /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
+  /**
    * The command's ID, made by the client.
    */
   idempotencyKey: string,
@@ -4625,6 +4651,10 @@ export type PlaybackSeekParams = {
  * One left out stays as it is.
  */
 export type PlaybackSetParams = {
+  /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
   /**
    * The command's ID, made by the client.
    */
@@ -4652,6 +4682,10 @@ export type PlaybackSetParams = {
  * The params of `playback.skip`.
  */
 export type PlaybackSkipParams = {
+  /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
   /**
    * The command's ID, made by the client.
    */
@@ -5418,6 +5452,10 @@ export type Query = {
  */
 export type QueueAddParams = {
   /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
+  /**
    * The command's ID, made by the client.
    */
   idempotencyKey: string,
@@ -5452,6 +5490,10 @@ export type QueueAddParams = {
  * The params of `queue.clear`.
  */
 export type QueueClearParams = {
+  /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
   /**
    * The command's ID, made by the client.
    */
@@ -5497,6 +5539,10 @@ export type QueueEvent = {
  */
 export type QueueMoveParams = {
   /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
+  /**
    * The command's ID, made by the client.
    */
   idempotencyKey: string,
@@ -5534,6 +5580,10 @@ export type QueuePlace = { "type": "next" } | { "type": "end" } | { "type": "aft
  * The params of `queue.remove`.
  */
 export type QueueRemoveParams = {
+  /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
   /**
    * The command's ID, made by the client.
    */
@@ -5576,6 +5626,10 @@ export type QueueWindow = {
  * The params of `queue.window`.
  */
 export type QueueWindowParams = {
+  /**
+   * Target from `players.list`. Omit to use this server's own player.
+   */
+  player?: string,
   /**
    * The first entry, from 0.
    */

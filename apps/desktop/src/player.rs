@@ -21,11 +21,11 @@ use ritornel_contract::methods::{
 };
 use ritornel_contract::{
     AlbumGetParams, AlbumRef, ContextKind, ErrorCode, FILTER_VERSION, Filter, Id, ListKind,
-    ListOpenParams, NoParams, PlayContext, PlaySource, PlaybackCommandParams, PlaybackJumpParams,
-    PlaybackPlayParams, PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState,
-    PlaybackStatus, Predicate, ProgressEvent, Query, QueueAddParams, QueueEntry, QueueMoveParams,
-    QueueOrder, QueuePlace, QueueRemoveParams, QueueWindowParams, RatingSetParams, Repeat,
-    SkipDirection, Sort, SortKey, ViewParams,
+    ListOpenParams, PlayContext, PlaySource, PlaybackCommandParams, PlaybackGetParams,
+    PlaybackJumpParams, PlaybackPlayParams, PlaybackSeekParams, PlaybackSetParams,
+    PlaybackSkipParams, PlaybackState, PlaybackStatus, Predicate, ProgressEvent, Query,
+    QueueAddParams, QueueEntry, QueueMoveParams, QueueOrder, QueuePlace, QueueRemoveParams,
+    QueueWindowParams, RatingSetParams, Repeat, SkipDirection, Sort, SortKey, ViewParams,
 };
 
 use crate::link::{Link, LinkEvent};
@@ -421,9 +421,11 @@ impl Player {
     fn read(&mut self, cx: &mut Context<Self>) {
         let Some(net) = self.net.clone() else { return };
         let client = Arc::clone(&net.client);
-        let read = net
-            .rt()
-            .spawn(async move { client.call::<PlaybackGet>(&NoParams {}).await });
+        let read = net.rt().spawn(async move {
+            client
+                .call::<PlaybackGet>(&PlaybackGetParams::default())
+                .await
+        });
         cx.spawn(async move |this, cx| {
             let answer = read.await;
             this.update(cx, |player, cx| {
@@ -641,6 +643,7 @@ impl Player {
         };
         let sent = self.send::<PlaybackPlay>(
             PlaybackPlayParams {
+                player: None,
                 idempotency_key: key,
                 source,
                 start,
@@ -659,6 +662,7 @@ impl Player {
         }
         let Some(key) = self.key(cx) else { return };
         let params = PlaybackCommandParams {
+            player: None,
             idempotency_key: key,
         };
         if self.playing() {
@@ -675,6 +679,7 @@ impl Player {
         let Some(key) = self.key(cx) else { return };
         self.send::<PlaybackSkip>(
             PlaybackSkipParams {
+                player: None,
                 idempotency_key: key,
                 from_entry_id: from,
                 direction,
@@ -695,6 +700,7 @@ impl Player {
         cx.notify();
         self.send::<PlaybackSeek>(
             PlaybackSeekParams {
+                player: None,
                 idempotency_key: key,
                 entry_id: entry,
                 position_ms,
@@ -708,6 +714,7 @@ impl Player {
         let Some(key) = self.key(cx) else { return };
         self.send::<PlaybackSet>(
             PlaybackSetParams {
+                player: None,
                 idempotency_key: key,
                 volume: None,
                 muted: None,
@@ -737,6 +744,7 @@ impl Player {
         let Some(key) = self.key(cx) else { return };
         self.send::<PlaybackJump>(
             PlaybackJumpParams {
+                player: None,
                 idempotency_key: key,
                 entry_id: entry,
             },
@@ -766,6 +774,7 @@ impl Player {
             .is_none_or(|state| state.queue_length == 0);
         let sent = self.send::<QueueAdd>(
             QueueAddParams {
+                player: None,
                 idempotency_key: key,
                 source,
                 place,
@@ -811,6 +820,7 @@ impl Player {
         }
         self.send::<QueueRemove>(
             QueueRemoveParams {
+                player: None,
                 idempotency_key: key,
                 entry_ids: vec![entry],
                 expected_revision: revision,
@@ -840,6 +850,7 @@ impl Player {
         }
         self.send::<QueueMove>(
             QueueMoveParams {
+                player: None,
                 idempotency_key: key,
                 entry_ids: entries,
                 place,
@@ -860,6 +871,7 @@ impl Player {
         let read = net.rt().spawn(async move {
             client
                 .call::<QueueWindow>(&QueueWindowParams {
+                    player: None,
                     offset: 0,
                     limit: Some(UP_NEXT),
                     order: Some(QueueOrder::UpNext),

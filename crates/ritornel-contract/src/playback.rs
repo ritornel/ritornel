@@ -261,11 +261,26 @@ pub enum PlaySource {
     },
 }
 
+/// The params of `playback.get`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackGetParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
+}
+
 /// The params of `playback.play`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackPlayParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// What to play. It replaces the queue.
@@ -292,6 +307,10 @@ pub struct PlaybackPlayParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackJumpParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// The entry to play now, from its beginning.
@@ -303,6 +322,10 @@ pub struct PlaybackJumpParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackCommandParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
 }
@@ -312,6 +335,10 @@ pub struct PlaybackCommandParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackSeekParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// The entry to seek in. If the player has left it, nothing changes.
@@ -337,6 +364,10 @@ pub enum SkipDirection {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackSkipParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// The entry to skip from. If the player has left it, nothing changes,
@@ -352,6 +383,10 @@ pub struct PlaybackSkipParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackSetParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// The player's own gain, 0 to 1. It is not the system's volume.
@@ -413,6 +448,10 @@ pub enum QueueOrder {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct QueueWindowParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The first entry, from 0.
     #[serde(default)]
     pub offset: u32,
@@ -449,6 +488,10 @@ pub enum QueuePlace {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct QueueAddParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// What to add.
@@ -479,6 +522,10 @@ pub struct QueueAddParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct QueueRemoveParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// The entries. One the queue no longer has is passed over. Taking out
@@ -495,6 +542,10 @@ pub struct QueueRemoveParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct QueueMoveParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// The entries, in the order they are to have.
@@ -513,6 +564,10 @@ pub struct QueueMoveParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct QueueClearParams {
+    /// Target from `players.list`. Omit to use this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The command's ID, made by the client.
     pub idempotency_key: Id,
     /// As for `queue.add`.
@@ -620,6 +675,7 @@ mod tests {
     #[test]
     fn a_source_is_tagged_and_a_context_names_what_it_refers_to_as_ref() {
         let params = PlaybackPlayParams {
+            player: None,
             idempotency_key: Id::from_bytes([0xc0; 16]),
             source: PlaySource::Release {
                 id: Id::from_bytes([0x7e; 16]),

@@ -823,18 +823,7 @@ impl Core {
     pub(crate) fn dispatch(&self, session: &Session, frame: Frame) -> Option<Frame> {
         match frame {
             Frame::Request(request) => {
-                // Held for the whole call: closing the database waits for
-                // every call that has started, and a call that starts
-                // after it finds none.
-                let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
-                let outcome = match stores.as_ref() {
-                    Some(stores) => self.call(stores, session, &request.method, request.params),
-                    None => Err(RpcError::new(
-                        ErrorCode::Unavailable,
-                        "the server is stopping",
-                    )),
-                };
-                drop(stores);
+                let outcome = self.call(session, &request.method, request.params);
                 if let Err(failed) = &outcome
                     && failed.kind() == ErrorCode::Internal
                 {
@@ -845,19 +834,19 @@ impl Core {
                     outcome,
                 }))
             }
-            // No method of this contract is called as a notification, and
-            // JSON-RPC answers none. The server calls nothing, so nothing
-            // is a response to it.
-            Frame::Notification(_) | Frame::Response(_) => None,
+            Frame::Response(response) => {
+                session.answered(response);
+                None
+            }
+            Frame::Notification(_) => None,
         }
     }
 
     fn call(
         &self,
-        stores: &Stores,
         session: &Session,
         method: &str,
-        params: Option<Value>,
+        mut params: Option<Value>,
     ) -> Result<Value, RpcError> {
         let Some(row) = methods::method(method) else {
             return Err(RpcError::new(
@@ -892,14 +881,34 @@ impl Core {
         {
             self.linked_server_called(peer);
         }
+        // Route before taking the stores: a player may need this hub to answer
+        // a library call before it can answer the controller.
+        if players::is_player_method(method)
+            && let Some(target) = params.as_ref().and_then(|p| p.get("player"))
+            && !target.is_null()
+        {
+            let target: Id = serde_json::from_value(target.clone())
+                .map_err(|_| RpcError::new(ErrorCode::Invalid, "player must be a player ID"))?;
+            if target != self.server_id
+                && let Some(uplink) = self.uplink()
+            {
+                return self.forward_session(&uplink, session, method, params);
+            }
+            if let Some(Value::Object(fields)) = &mut params {
+                fields.remove("player");
+            }
+            if target != self.server_id {
+                let rt = self.runtime.as_ref().ok_or_else(|| {
+                    RpcError::new(ErrorCode::Unavailable, "the server is stopping")
+                })?;
+                return rt.block_on(self.call_player(target, method, params));
+            }
+        }
         if let Some(uplink) = self.uplink() {
             match link::on_a_satellite(row.name) {
                 link::Route::Here => {}
                 link::Route::Hub => {
-                    let session = self.shared(session).ok_or_else(|| {
-                        RpcError::new(ErrorCode::Unavailable, "the session has closed")
-                    })?;
-                    return uplink.forward(&session, row.name, params);
+                    return self.forward_session(&uplink, session, method, params);
                 }
                 link::Route::Refused(why) => {
                     return Err(RpcError::new(ErrorCode::Unsupported, why)
@@ -907,6 +916,12 @@ impl Core {
                 }
             }
         }
+        // Shutdown waits for local handlers to finish using the stores.
+        // Calls routed to the hub or another player have already returned.
+        let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
+        let stores = stores
+            .as_ref()
+            .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "the server is stopping"))?;
         match row.name {
             ServerHello::NAME => {
                 run::<ServerHello>(params, |hello| self.hello(stores, session, &hello))
@@ -1209,6 +1224,19 @@ impl Core {
                 format!("{} is in the method table and has no handler", row.name),
             )),
         }
+    }
+
+    fn forward_session(
+        &self,
+        uplink: &crate::uplink::Uplink,
+        session: &Session,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, RpcError> {
+        let shared = self
+            .shared(session)
+            .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "the session has closed"))?;
+        uplink.forward(&shared, method, params)
     }
 
     fn hello(
@@ -2270,7 +2298,7 @@ mod tests {
         let session = greeted(&core, SessionKind::Limited);
         assert_eq!(
             call(&core, &session, "playback.get", None),
-            Err((ErrorCode::Unsupported, json!({})))
+            Err((ErrorCode::Unsupported, json!({"reason":"no_player"})))
         );
         with_player(&core);
         assert_eq!(

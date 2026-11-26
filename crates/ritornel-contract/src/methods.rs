@@ -272,7 +272,7 @@ methods! {
     NoParams => MediaToken;
     /// `playback.get`: the player's state, whole.
     PlaybackGet: "playback.get", Query, needs_full: false,
-    NoParams => PlaybackState;
+    PlaybackGetParams => PlaybackState;
 
     /// `playback.play`: replaces the queue with what it names and plays it.
     PlaybackPlay: "playback.play", Command, needs_full: false,
