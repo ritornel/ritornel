@@ -1901,9 +1901,10 @@ fn an_output_closed_while_paused_is_let_go_and_play_carries_the_listen_on_throug
     use std::sync::Arc;
 
     use crate::playback::Status;
-    // An output at 16 kHz mono; the one opened again is the null output's
-    // own, at 48 kHz stereo, so the listen is counted across two rates.
-    let (opened, _tap) = AudioRenderer::tapped(AS_IS, 4).unwrap();
+    // An output at 16 kHz mono, held half a second in; the one opened
+    // again is the null output's own, at 48 kHz stereo, so the listen is
+    // counted across two rates.
+    let (opened, _tap, hold) = AudioRenderer::held(AS_IS, 4, 8_000).unwrap();
     let device = Arc::clone(&opened.shared);
     let renderer = super::OnDemand {
         output: Output::Null { speed: 4 },
@@ -1915,10 +1916,12 @@ fn an_output_closed_while_paused_is_let_go_and_play_carries_the_listen_on_throug
     };
     let mut rig = Pipeline::closing_after(&[2_000], Box::new(renderer), 0);
     rig.play();
-    rig.until(|state| state.position_ms >= 500);
+    rig.until(|_| hold.waiting().is_some());
     let request = rig.request("playback.pause");
     rig.player.pause(request, &rig.server).unwrap();
     let paused = rig.player.state();
+    // It takes the pause, and fades out.
+    hold.let_go();
     // The next tick closes it: the output is let go, and the state says
     // nothing new.
     rig.player.tick(&rig.server, Some(&rig.library)).unwrap();
@@ -1945,6 +1948,97 @@ fn an_output_closed_while_paused_is_let_go_and_play_carries_the_listen_on_throug
     );
     assert!((listen.heard.ms_played - 2_000).abs() <= 1, "{listen:?}");
     assert_eq!(listen.heard.ranges_json, "[[0,2000]]");
+}
+
+/// Waits until `done` holds, for what `what` says.
+fn eventually(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what} never happened");
+        // sleep: between looks; the deadline bounds them.
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn an_output_told_to_play_is_stale_only_if_it_has_not_asked_once_since() {
+    let track = fixture("g1.flac");
+    // It asks as it plays: not stale, however long it plays.
+    let (mut playing, _) = AudioRenderer::tapped(AS_IS, 1).unwrap();
+    playing.stale_after = Duration::from_millis(100);
+    playing.load(&track, facts(&track), 0, 1).unwrap();
+    playing.play();
+    eventually("a quarter of a second played", || {
+        playing.progress().frames >= 4_000
+    });
+    assert!(!playing.stale());
+    // Held, it asks for nothing more: played again, it is stale once it
+    // has not asked since, long before it would count as stalled.
+    let (mut held, _, hold) = AudioRenderer::held(AS_IS, 1, 1_600).unwrap();
+    held.stale_after = Duration::from_millis(100);
+    held.stall_after = Duration::from_secs(600);
+    held.load(&track, facts(&track), 0, 1).unwrap();
+    held.play();
+    eventually("the hold", || hold.waiting().is_some());
+    held.pause();
+    held.play();
+    eventually("the output going stale", || held.stale());
+    assert_eq!(held.progress().lost, None);
+}
+
+#[test]
+fn a_stale_output_with_nothing_loaded_is_let_go_and_a_load_opens_a_fresh_one() {
+    use std::sync::Arc;
+
+    // Held before it hands over a frame: it never asks for one.
+    let (mut held, _, _hold) = AudioRenderer::held(AS_IS, 1, 0).unwrap();
+    held.stale_after = Duration::from_millis(100);
+    let device = Arc::clone(&held.shared);
+    let mut renderer = super::OnDemand {
+        output: Output::Null { speed: 4 },
+        opened: Some(held),
+        gain: ReplayGain::Off,
+        volume: 1.0,
+        said: Vec::new(),
+        closed: None,
+    };
+    eventually("the output going stale", || renderer.stale());
+    let track = fixture("g1.flac");
+    renderer.load(&track, facts(&track), 0, 1).unwrap();
+    assert_eq!(Arc::strong_count(&device), 1);
+    renderer.play();
+    eventually("a frame played", || renderer.progress().frames > 0);
+}
+
+#[test]
+fn an_output_that_stops_asking_just_before_a_resume_is_opened_afresh_and_plays_on() {
+    use std::sync::Arc;
+
+    use crate::playback::Status;
+    // It stops half a second in; the pause and the resume come before or
+    // after it is stale while paused, and either way the first resume
+    // plays to the end, through a fresh output.
+    let (mut renderer, _tap, hold) = on_demand_held(500, Duration::from_secs(600));
+    let held = renderer.opened.as_mut().unwrap();
+    held.stale_after = Duration::from_millis(300);
+    let device = Arc::clone(&held.shared);
+    let mut rig = Pipeline::new(&[1_000], Box::new(renderer));
+    rig.play();
+    rig.until(|_| hold.waiting().is_some());
+    let request = rig.request("playback.pause");
+    rig.player.pause(request, &rig.server).unwrap();
+    let request = rig.request("playback.resume");
+    let (server, library): (_, Option<&dyn Catalog>) = (&rig.server, Some(&rig.library));
+    rig.player.resume(request, server, library).unwrap();
+    rig.until(|state| state.status == Status::Stopped);
+    assert_eq!(Arc::strong_count(&device), 1);
+    assert_eq!(rig.player.state().output_failing, None);
+    let [listen] = rig.staged().try_into().unwrap();
+    assert_eq!(
+        listen.ended.as_ref().unwrap().end_reason.as_str(),
+        "finished"
+    );
+    assert!((listen.heard.ms_played - 1_000).abs() <= 1, "{listen:?}");
 }
 
 #[test]

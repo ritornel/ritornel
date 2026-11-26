@@ -292,6 +292,12 @@ impl Recorder {
         self.held = self.open.as_ref().map(|listen| listen.started.listen_id);
     }
 
+    /// What the held listen records, while one is held.
+    pub(crate) fn held(&self) -> Option<&Started> {
+        let open = self.open.as_ref()?;
+        (Some(open.started.listen_id) == self.held).then_some(&open.started)
+    }
+
     /// The listener moved the held listen to `to_ms` while its output was
     /// closed.
     pub(crate) fn seek_held(&mut self, to_ms: i64) {

@@ -395,6 +395,12 @@ pub struct Player {
     /// With a track loaded, paused, play opens it again and loads that
     /// track where it was, carrying its listen on.
     output_closed: bool,
+    /// Whether the output has been opened afresh since the last play, in
+    /// place of one gone stale: it is done once a play.
+    reopened_stale: bool,
+    /// Whether the listen carried on by a resume is to be said to begin
+    /// once its first frame is heard, its output having been opened again.
+    began_unsaid: bool,
     /// How the loaded track's audio ran out, and whether any of it was
     /// heard: the tick moves on from it.
     ran_out: Option<(End, bool)>,
@@ -519,6 +525,8 @@ impl Player {
             progress: Progress::default(),
             quiet_since: None,
             output_closed: false,
+            reopened_stale: false,
+            began_unsaid: false,
             ran_out: None,
             span: 0,
             save_failing: None,
@@ -676,11 +684,12 @@ impl Player {
             self.recorder.fold(event, &time);
             let heard = self.recorder.last_closed() != closed;
             self.follow(event, heard, events);
-            // A new listen, not a seek within the one open.
+            // A new listen, not a seek within the one open, or one a resume
+            // carried on through an output opened again.
             if matches!(event, Event::Began { .. })
-                && let Some(began) = self
-                    .began()
-                    .filter(|_| self.recorder.open().map(|listen| listen.started.listen_id) != open)
+                && (std::mem::take(&mut self.began_unsaid)
+                    | (self.recorder.open().map(|listen| listen.started.listen_id) != open))
+                && let Some(began) = self.began()
             {
                 events.push(began);
             }
@@ -845,6 +854,7 @@ impl Player {
         // A listen held open across a closed output ends now.
         let now = (self.setup.clock.now_ms(), self.setup.timekeeper.mono_ms());
         self.recorder.close_held(reason, now);
+        self.began_unsaid = false;
         self.prepared = None;
         self.ran_out = None;
         // What was asked for the track after it no longer is; a copy fetched
@@ -897,6 +907,7 @@ impl Player {
                 }
                 Opened::Loaded(loaded) => {
                     self.loaded = Some(*loaded);
+                    self.reopened_stale = false;
                     self.output_failing = None;
                     // Before it plays, so that its decoder has the next
                     // before it can reach its end, however short it is.
@@ -917,6 +928,8 @@ impl Player {
                     );
                 }
                 Opened::Failed(failure) => {
+                    let now = (self.setup.clock.now_ms(), self.setup.timekeeper.mono_ms());
+                    self.recorder.close_held(EndReason::Error, now);
                     events.push(PlayerEvent::Failed {
                         entry: entry.entry_id,
                         reason: failure.to_string(),
@@ -1006,7 +1019,20 @@ impl Player {
                         track_duration_ms: duration_ms,
                         ..listen
                     };
-                    self.register(span, &listen, from_ms, None);
+                    // A listen held across a closed output carries on in the
+                    // same audio, and ends where another copy takes its place.
+                    let held = self
+                        .recorder
+                        .held()
+                        .map(|held| (held.listen_id, held.asset));
+                    let continues = held
+                        .filter(|(_, asset)| *asset == copy.asset)
+                        .map(|(id, _)| id);
+                    if held.is_some() && continues.is_none() {
+                        let now = (self.setup.clock.now_ms(), self.setup.timekeeper.mono_ms());
+                        self.recorder.close_held(EndReason::Replaced, now);
+                    }
+                    self.register(span, &listen, from_ms, continues);
                     return Ok(Opened::Loaded(Box::new(Loaded {
                         span,
                         format,
@@ -1205,6 +1231,7 @@ impl Player {
                 }
                 self.recorder.paused();
                 self.status = Status::Paused;
+                self.began_unsaid = false;
                 self.sync(server, events);
                 self.changed(events);
             }
@@ -1243,9 +1270,11 @@ impl Player {
                     self.close_output(&mut events);
                 }
                 // Playing from here, a track that cannot be loaded again is
-                // moved on from as one that cannot be started is.
+                // opened afresh as play opens any.
                 self.status = Status::Playing;
-                if self.output_closed {
+                self.reopened_stale = false;
+                let reopening = self.output_closed;
+                if reopening {
                     let reopened = self.reopen(server, library, &mut events);
                     if !reopened.inspect_err(|_| self.status = Status::Paused)? {
                         self.changed(&mut events);
@@ -1253,7 +1282,13 @@ impl Player {
                     }
                 }
                 self.renderer.play();
-                events.extend(self.began());
+                // Through an output opened again, it is said to begin once
+                // it is heard, should that output never play.
+                if reopening {
+                    self.began_unsaid = true;
+                } else {
+                    events.extend(self.began());
+                }
                 self.changed(&mut events);
             }
             _ if self.current.is_some() => {
@@ -1348,6 +1383,10 @@ impl Player {
             return Ok(());
         };
         let target = position_ms.clamp(0, loaded.duration_ms);
+        // A stale output, paused, would never take the seek: it is closed.
+        if !self.output_closed && !self.status.wants_sound() && self.renderer.stale() {
+            self.close_output(events);
+        }
         // With its output closed, the track is loaded again there on play.
         if self.output_closed {
             self.recorder.seek_held(target);
@@ -1508,8 +1547,9 @@ impl Player {
             }
             None => {}
         }
-        self.prepare_next(server, library)?;
+        self.reopen_if_stale(server, library, &mut events)?;
         self.close_if_idle(&mut events);
+        self.prepare_next(server, library)?;
         let mono = self.setup.timekeeper.mono_ms();
         if self.status == Status::Playing
             && mono - self.last_progress_mono >= PROGRESS_EVERY_MS
@@ -1554,22 +1594,53 @@ impl Player {
     /// let go with it, but its listen stays open, and play loads it again
     /// where it was: nothing the state says changes.
     fn close_output(&mut self, events: &mut Vec<PlayerEvent>) {
-        if self.loaded.is_some() {
-            self.recorder.hold();
-            // The renderer lets it go with the track; it is prepared again
-            // once the output is open.
-            self.prepared = None;
+        if self.renderer.close() {
+            self.output_closed = true;
+            if self.loaded.is_some() {
+                // Before its span's end is taken in.
+                self.recorder.hold();
+                // The renderer let it go with the track; it is prepared
+                // again once the output is open.
+                self.prepared = None;
+            }
         }
-        self.renderer.close();
-        self.output_closed = true;
         self.take_in(events);
     }
 
-    /// Opens the output again under the loaded track, closed while paused,
-    /// and loads the track where it was, as a span that carries its listen
-    /// on. Whether it loaded: a track that cannot be is failed as any track
-    /// that cannot be played on is, and an output that cannot be opened
-    /// leaves the player waiting on it.
+    /// An output told to play that has not asked for a frame since, its
+    /// stream gone stale, is closed and opened afresh under the track, once
+    /// a play: a second that does no better stalls, and the player waits on
+    /// it as on any output lost. See "Audio pipeline" in
+    /// docs/internals/playback.md.
+    fn reopen_if_stale(
+        &mut self,
+        server: &ServerStore,
+        library: Option<&dyn Catalog>,
+        events: &mut Vec<PlayerEvent>,
+    ) -> Result<(), Error> {
+        if self.status != Status::Playing
+            || self.loaded.is_none()
+            || self.reopened_stale
+            || !self.renderer.stale()
+        {
+            return Ok(());
+        }
+        self.close_output(events);
+        if self.output_closed && self.reopen(server, library, events)? {
+            self.renderer.play();
+        }
+        self.reopened_stale = true;
+        Ok(())
+    }
+
+    /// Opens the output again under the loaded track, closed under it, and
+    /// loads the track where it was, as a span that carries its listen on.
+    /// Whether it loaded. An output that cannot be opened leaves the player
+    /// waiting on it. A file that cannot be read again, as a master a
+    /// satellite kept and has since let go, is not blamed: the entry is
+    /// opened afresh from its copies, as play opens any, and its listen
+    /// carries on in the same audio. The next track is prepared at the next
+    /// tick, so that nothing but the output is opened before it plays.
     fn reopen(
         &mut self,
         server: &ServerStore,
@@ -1591,9 +1662,20 @@ impl Player {
         let span = self.next_span();
         let start = u64::try_from(from_ms).unwrap_or(0);
         self.output_closed = false;
-        if let Err(failure) = self.renderer.load(&loaded.path, loaded.facts, start, span) {
-            self.fail_track(server, library, &failure, events)?;
-            return Ok(false);
+        match self.renderer.load(&loaded.path, loaded.facts, start, span) {
+            Ok(_) => {}
+            Err(failure) if failure.is_output() => {
+                self.lose_output(server, &failure, events)?;
+                return Ok(false);
+            }
+            Err(_) => {
+                let library = library.ok_or(no_library())?;
+                self.position_ms = from_ms;
+                self.loaded = None;
+                self.start_reason = loaded.listen.start_reason;
+                self.start(server, library, events)?;
+                return Ok(false);
+            }
         }
         let continues = self.open_listen();
         self.register(span, &listen, from_ms, continues);
@@ -1605,7 +1687,6 @@ impl Player {
             ..loaded
         });
         self.output_failing = None;
-        self.prepare_next(server, library)?;
         Ok(true)
     }
 

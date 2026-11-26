@@ -2065,34 +2065,205 @@ fn the_track_after_one_whose_output_was_closed_is_joined_again_once_it_plays() {
     assert_eq!(rig.fake.loads().len(), 2);
 }
 
+impl Rig {
+    /// Lets `ms` pass on every clock with no tick, as between two ticks.
+    fn between_ticks(&mut self, ms: i64) {
+        self.clock.set(self.clock.now_ms() + ms);
+        self.hub_clock.set(self.hub_clock.now_ms() + ms);
+        self.keeper.advance(ms);
+    }
+}
+
 #[test]
-fn a_stale_output_is_closed_at_once_while_paused_and_the_first_resume_plays_on_a_fresh_one() {
-    // Noticed by a tick.
+fn a_paused_output_gone_stale_is_closed_a_second_later_and_the_first_resume_plays_on_a_fresh_one() {
     let mut rig = Rig::new();
     rig.play(0);
     rig.pass(60_000);
     rig.pause();
     rig.wait(1_000);
     rig.fake.go_stale();
-    rig.tick();
+    rig.wait(999);
+    assert_eq!(rig.fake.closes(), 0);
+    rig.wait(1);
     assert_eq!(rig.fake.closes(), 1);
     rig.resume();
     rig.pass(1_000);
     let state = rig.player.state();
     assert_eq!((state.status, state.position_ms), (Status::Playing, 61_000));
     assert_eq!(state.output_failing, None);
+}
 
-    // Noticed by the resume itself, before any tick.
+#[test]
+fn an_output_gone_stale_just_before_a_resume_is_opened_afresh_once_and_plays_on() {
     let mut rig = Rig::new();
     rig.play(0);
     rig.pass(60_000);
     rig.pause();
+    rig.wait(5_000);
+    // The stream stops a moment before play: it is not stale yet, and is
+    // played through.
     rig.fake.go_stale();
     rig.resume();
-    assert_eq!(rig.fake.closes(), 1);
+    assert_eq!((rig.fake.closes(), rig.fake.loads().len()), (0, 1));
+    let began = rig.began.len();
+    // It asks for nothing for a second: it is opened afresh, there, and
+    // plays on, with nothing said but that it plays.
     rig.pass(1_000);
-    assert_eq!(rig.player.state().position_ms, 61_000);
+    assert_eq!(rig.fake.closes(), 1);
+    assert_eq!(rig.fake.loads().last(), Some(&(file(0), 60_000)));
+    rig.pass(1_000);
+    let state = rig.player.state();
+    assert_eq!((state.status, state.position_ms), (Status::Playing, 61_000));
+    assert_eq!(state.output_failing, None);
+    assert_eq!(rig.began.len(), began);
     rig.pass(179_000);
+    let [listen] = rig.staged().try_into().unwrap();
+    assert_eq!(
+        (
+            listen.ended.unwrap().end_reason.as_str(),
+            listen.heard.ms_played,
+            listen.heard.pause_count
+        ),
+        ("finished", 240_000, 1)
+    );
+}
+
+#[test]
+fn an_output_opened_afresh_that_goes_stale_too_is_not_opened_again_and_is_lost() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(60_000);
+    rig.pause();
+    rig.wait(5_000);
+    // Every stream stops as it opens, as on a device that is gone.
+    rig.fake.stay_stale();
+    rig.resume();
+    rig.pass(1_000);
+    assert_eq!(rig.fake.loads().len(), 2);
+    // The second is not replaced: it stalls, and the player waits on it.
+    rig.pass(5_000);
+    let state = rig.player.state();
+    assert_eq!((state.status, state.position_ms), (Status::Paused, 60_000));
+    assert_eq!(
+        state.output_failing.unwrap().detail,
+        "the output stopped taking sound"
+    );
+    let [lost] = rig.staged().try_into().unwrap();
+    assert_eq!(lost.ended.unwrap().end_reason.as_str(), "output_lost");
+    rig.wait(60_000);
+    assert_eq!(rig.fake.loads().len(), 2);
+}
+
+#[test]
+fn a_seek_on_a_paused_output_gone_stale_before_a_tick_closes_it_and_moves_the_place() {
+    let mut rig = Rig::new();
+    rig.play(0);
+    rig.pass(60_000);
+    rig.pause();
+    rig.wait(1_000);
+    rig.fake.go_stale();
+    rig.between_ticks(1_000);
+    rig.seek(100_000);
+    assert_eq!(rig.fake.closes(), 1);
+    let state = rig.player.state();
+    assert_eq!((state.status, state.position_ms), (Status::Paused, 100_000));
+    assert_eq!(state.output_failing, None);
+    let [open] = rig.staged().try_into().unwrap();
+    assert_eq!(open.ended, None);
+    rig.resume();
+    assert_eq!(rig.fake.loads().last(), Some(&(file(0), 100_000)));
+}
+
+#[test]
+fn a_resume_through_an_output_opened_again_is_said_to_begin_once_it_is_heard() {
+    let mut rig = Rig::new();
+    rig.paused_with_output_closed(60_000);
+    let began = rig.began.len();
+    rig.resume();
+    assert_eq!(rig.began.len(), began);
+    rig.pass(1_000);
+    assert_eq!(rig.began.len(), began + 1);
+    assert_eq!(rig.began.last().unwrap().0, rig.tracks[0]);
+    let [listen] = rig.staged().try_into().unwrap();
+    assert_eq!(listen.ended, None);
+}
+
+#[test]
+fn a_shutdown_with_the_output_closed_ends_the_listen_where_it_was_moved_to() {
+    let mut rig = Rig::new();
+    rig.paused_with_output_closed(60_000);
+    rig.seek(100_000);
+    rig.player.shutdown(&rig.server).unwrap();
+    let [listen] = rig.staged().try_into().unwrap();
+    let ended = listen.ended.clone().unwrap();
+    assert_eq!(
+        (
+            ended.end_reason.as_str(),
+            ended.end_position_ms,
+            listen.heard.ms_played,
+            listen.heard.seek_count
+        ),
+        ("shutdown", 100_000, 60_000, 1)
+    );
+    let session = rig.server.playback_session().unwrap();
+    assert_eq!(
+        (session.position_ms, session.resume_listen),
+        (100_000, Some(listen.started.listen_id))
+    );
+    // After the restart, play carries it on from there.
+    rig.restart(0xb1);
+    rig.resume();
+    rig.pass(1_000);
+    let [_, resumed] = rig.staged().try_into().unwrap();
+    assert_eq!(resumed.started.continues, Some(listen.started.listen_id));
+    assert_eq!(resumed.started.start_position_ms, 100_000);
+}
+
+#[test]
+fn a_mute_while_the_output_is_closed_is_what_it_opens_again_with() {
+    let mut rig = Rig::new();
+    rig.paused_with_output_closed(60_000);
+    let request = rig.request("playback.set");
+    rig.player
+        .set_volume(request, Some(0.4), Some(true), &rig.server)
+        .unwrap();
+    rig.resume();
+    assert_eq!(rig.fake.volume(), Some(0.0));
+    let request = rig.request("playback.set");
+    rig.player
+        .set_volume(request, None, Some(false), &rig.server)
+        .unwrap();
+    assert_eq!(rig.fake.volume(), Some(0.4));
+}
+
+#[test]
+fn a_kept_master_let_go_while_the_output_was_closed_is_fetched_again_and_its_listen_carries_on() {
+    let mut rig = Rig::new();
+    rig.elsewhere(&[0]);
+    rig.play(0);
+    let wanted = rig.player.wanted().unwrap();
+    rig.hand_back(wanted, Ok(()));
+    rig.pass(60_000);
+    rig.pause();
+    rig.wait(super::CLOSE_OUTPUT_AFTER_MS);
+    assert_eq!(rig.fake.closes(), 1);
+    // The satellite lets the master it kept go, to make room.
+    rig.fake.broken(file(0), "missing");
+    rig.resume();
+    // Not blamed: it is fetched again, and waited for, its listen open.
+    let state = rig.player.state();
+    assert_eq!(
+        (state.status, state.position_ms),
+        (Status::Buffering, 60_000)
+    );
+    assert_eq!(rig.queue()[0].2, None);
+    let [open] = rig.staged().try_into().unwrap();
+    assert_eq!(open.ended, None);
+    rig.fake.track(file(0), 240_000);
+    let wanted = rig.player.wanted().unwrap();
+    rig.fetched(wanted, Ok(()));
+    assert_eq!(rig.fake.loads().last(), Some(&(file(0), 60_000)));
+    rig.pass(180_000);
     let [listen] = rig.staged().try_into().unwrap();
     assert_eq!(
         (
@@ -3924,6 +4095,8 @@ fn a_delayed_handoff_release_closes_at_take_and_replaying_load_keeps_the_same_li
     assert_eq!(dst.player.open_listen(), Some(continued));
     let paused_at = src.clock.now_ms();
     src.wait(120_000);
+    // The source closed its output while it waited to be released.
+    assert_eq!(src.fake.closes(), 1);
     let release = LinkHandoffParams::Release { movement };
     src.player
         .handoff(release.clone(), &src.server, &mut Vec::new())
