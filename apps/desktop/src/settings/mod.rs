@@ -486,6 +486,9 @@ impl Render for Settings {
     }
 }
 
+/// The title row's height where the system draws its own window buttons.
+const TITLE_HEIGHT: f32 = 28.;
+
 type OnSection = Rc<dyn Fn(Section, &mut Window, &mut App)>;
 
 /// The window's header: title, section toolbar, and on systems where the
@@ -497,7 +500,11 @@ fn header(
     app_buttons: bool,
     on_select: OnSection,
 ) -> impl IntoElement {
-    let title_height = if app_buttons { 32. } else { 28. };
+    let title_height = if app_buttons {
+        crate::frame::CAPTION_HEIGHT
+    } else {
+        TITLE_HEIGHT
+    };
     div()
         .id("header")
         .relative()
@@ -507,10 +514,8 @@ fn header(
         // On Windows the area answers the system's hit test as the caption.
         .window_control_area(WindowControlArea::Drag)
         // Elsewhere a press here moves the window, as a title bar's does.
-        .when(!app_buttons, |header| {
-            header.on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                window.start_window_move();
-            })
+        .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+            window.start_window_move();
         })
         .child(
             div()
@@ -614,7 +619,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn app_buttons_draws_close_button_flush_top_right_and_tabs_stay_clickable(
+    fn app_buttons_lays_out_close_button_flush_top_right_and_switches_tabs(
         cx: &mut gpui::TestAppContext,
     ) {
         let (host, cx) = cx.add_window_view(|_, _| HeaderHost {
@@ -624,23 +629,26 @@ mod tests {
         cx.simulate_window_resize(cx.window_handle(), size(px(WIDTH), px(FIRST_HEIGHT)));
         assert!(cx.refresh().is_ok());
 
-        let close = cx.debug_bounds("settings-close");
-        assert!(
-            close.is_some(),
-            "close caption button should render when app_buttons is true"
+        assert_eq!(
+            cx.debug_bounds("settings-close").map(|bounds| (
+                bounds.origin.y,
+                bounds.right(),
+                bounds.size
+            )),
+            Some((
+                px(0.),
+                px(WIDTH),
+                size(
+                    px(crate::frame::CAPTION_BUTTON_WIDTH),
+                    px(crate::frame::CAPTION_HEIGHT),
+                ),
+            )),
         );
-        if let Some(close) = close {
-            assert_eq!(close.origin.y, px(0.));
-            assert_eq!(close.right(), px(WIDTH));
-            assert_eq!(close.size.width, px(46.));
-            assert_eq!(close.size.height, px(32.));
-        }
-
-        let title = cx.debug_bounds("settings-title");
-        assert!(title.is_some(), "title row should render");
-        if let Some(title) = title {
-            assert_eq!(title.size.height, px(32.));
-        }
+        assert_eq!(
+            cx.debug_bounds("settings-title")
+                .map(|bounds| bounds.size.height),
+            Some(px(crate::frame::CAPTION_HEIGHT)),
+        );
 
         let appearance = cx.debug_bounds("settings-tab-appearance");
         assert!(appearance.is_some(), "Appearance tab should render");
@@ -663,10 +671,10 @@ mod tests {
         assert!(cx.refresh().is_ok());
 
         assert!(cx.debug_bounds("settings-close").is_none());
-        let title = cx.debug_bounds("settings-title");
-        assert!(title.is_some(), "title row should render");
-        if let Some(title) = title {
-            assert_eq!(title.size.height, px(28.));
-        }
+        assert_eq!(
+            cx.debug_bounds("settings-title")
+                .map(|bounds| bounds.size.height),
+            Some(px(TITLE_HEIGHT)),
+        );
     }
 }

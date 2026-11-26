@@ -381,6 +381,10 @@ fn menu_button() -> impl IntoElement {
         .child(icon("menu", 16., theme::dim()))
 }
 
+/// Standard Windows 11 caption button width and compact title-bar height, in points.
+pub(crate) const CAPTION_BUTTON_WIDTH: f32 = 46.;
+pub(crate) const CAPTION_HEIGHT: f32 = 32.;
+
 /// Windows draws no caption buttons on a window whose title bar is the
 /// app's: GPUI leaves them to the app. These answer the system's hit test
 /// as its own minimize, maximize and close (`WindowControlArea`), so the
@@ -394,14 +398,12 @@ fn caption_buttons() -> impl IntoElement {
             "minimize",
             "\u{E921}",
             WindowControlArea::Min,
-            false,
             TITLE_BAR,
         ))
         .child(caption_button(
             "maximize",
             "\u{E922}",
             WindowControlArea::Max,
-            false,
             TITLE_BAR,
         ))
         .child(close_button(TITLE_BAR))
@@ -410,16 +412,16 @@ fn caption_buttons() -> impl IntoElement {
 /// A single close caption button for a non-resizable, non-minimizable
 /// window whose title bar is the app's (such as Settings on Windows).
 pub(crate) fn close_button(height: f32) -> impl IntoElement {
-    caption_button("close", "\u{E8BB}", WindowControlArea::Close, true, height)
+    caption_button("close", "\u{E8BB}", WindowControlArea::Close, height)
 }
 
 fn caption_button(
     id: &'static str,
     glyph: &'static str,
     area: WindowControlArea,
-    close: bool,
     height: f32,
 ) -> impl IntoElement {
+    let close = area == WindowControlArea::Close;
     div()
         .id(id)
         .window_control_area(area)
@@ -427,7 +429,7 @@ fn caption_button(
         // the pointer, outermost first: the bar's caption, unless each
         // button hides what is behind it.
         .occlude()
-        .w(px(46.))
+        .w(px(CAPTION_BUTTON_WIDTH))
         .h(px(height))
         .flex()
         .items_center()
