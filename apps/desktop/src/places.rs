@@ -43,11 +43,32 @@ pub(crate) enum VolumeControl {
 }
 
 impl VolumeControl {
+    /// Each, in the order Settings lists them.
+    pub(crate) const ALL: [Self; 3] = [Self::Remote, Self::Always, Self::Never];
+
     pub(crate) fn named(name: &str) -> Self {
         match name {
             "always" => Self::Always,
             "never" => Self::Never,
             _ => Self::Remote,
+        }
+    }
+
+    /// Its name in `remembered.json`.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    /// What Settings calls it.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Remote => "Other places only",
+            Self::Always => "Always",
+            Self::Never => "Never",
         }
     }
 }
@@ -390,7 +411,6 @@ pub(crate) struct Places {
     /// same key on the next: the hub answers a resend with what it did.
     unanswered: Option<Move>,
     pub picker: Option<Picker>,
-    pub control: VolumeControl,
     /// The place remembered from the last run, until the first list read
     /// says whether it still plays.
     remembered: Option<Id>,
@@ -443,7 +463,6 @@ impl Places {
             move_call: None,
             unanswered: None,
             picker: None,
-            control: VolumeControl::named(&remembered.volume_control),
             remembered: remembered.play_on.and_then(|id| id.parse().ok()),
             restored: false,
             away_said: None,
@@ -454,6 +473,9 @@ impl Places {
             places.net = Some(net);
             places.read(cx);
         }
+        // A volume control chosen in Settings shows at once.
+        cx.observe_global::<crate::remember::Looks>(|_, cx| cx.notify())
+            .detach();
         places
     }
 
@@ -495,10 +517,11 @@ impl Places {
         // Through a move the place left's level stays shown, so the widget
         // keeps its shape; it does not answer until the new place reports.
         let state = self.player.read(cx).state.as_ref();
+        let control = crate::remember::looks(cx).volume;
         if !self.available() {
-            return look(&[], None, self.control, state);
+            return look(&[], None, control, state);
         }
-        look(&self.list, self.chosen(cx), self.control, state)
+        look(&self.list, self.chosen(cx), control, state)
     }
 
     /// Whether the volume answers: a slider is shown that is not in
@@ -1799,8 +1822,7 @@ pub(crate) mod tests {
         let (net, asked) = hub(places(), Answers::default());
         connect(&rig, net, cx);
         until(cx, "read the places and the player", |cx| listed(&rig, cx));
-        rig.places
-            .update(cx, |places, _| places.control = VolumeControl::Always);
+        cx.update(|cx| crate::remember::set_volume_control(VolumeControl::Always, cx));
         rig.player
             .update(cx, |player, cx| player.set_muted(true, cx));
         let look = rig.places.read_with(cx, |places, cx| places.look(cx));
@@ -1821,6 +1843,49 @@ pub(crate) mod tests {
         assert_eq!(
             (sets[1]["muted"].clone(), sets[1]["volume"].clone()),
             (json!(false), json!(0.6))
+        );
+    }
+
+    #[gpui::test]
+    fn a_volume_control_chosen_in_settings_shows_in_the_bar_at_once(cx: &mut TestAppContext) {
+        let rig = rig(cx, None);
+        let (net, _) = hub(places(), Answers::default());
+        connect(&rig, net, cx);
+        until(cx, "read the places and the player", |cx| listed(&rig, cx));
+        let notified = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = std::rc::Rc::clone(&notified);
+        let _watch =
+            cx.update(|cx| cx.observe(&rig.places, move |_, _| counted.set(counted.get() + 1)));
+        let look = |cx: &mut TestAppContext| rig.places.read_with(cx, |places, cx| places.look(cx));
+        // The default, `remote`: this computer has the icon alone.
+        assert_eq!(
+            look(cx),
+            Look::Here {
+                icon: true,
+                slider: None
+            }
+        );
+        cx.update(|cx| crate::remember::set_volume_control(VolumeControl::Always, cx));
+        cx.run_until_parked();
+        assert!(notified.get() > 0, "the bar was not told");
+        assert_eq!(
+            look(cx),
+            Look::Here {
+                icon: true,
+                slider: Some(0.4)
+            }
+        );
+        // Under `never` another place shows its name alone.
+        cx.update(|cx| crate::remember::set_volume_control(VolumeControl::Never, cx));
+        rig.player
+            .update(cx, |player, cx| player.retarget(Some(STUDIO), cx));
+        until(cx, "read the studio", |cx| {
+            rig.player.read_with(cx, |player, _| player.state.is_some())
+        });
+        assert!(matches!(look(cx), Look::There { slider: None, .. }));
+        assert_eq!(
+            VolumeControl::ALL.map(|each| VolumeControl::named(each.name())),
+            VolumeControl::ALL
         );
     }
 

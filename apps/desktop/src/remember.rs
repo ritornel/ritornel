@@ -12,6 +12,8 @@
 use std::path::PathBuf;
 
 use gpui::{App, Global};
+
+use crate::places::VolumeControl;
 use serde_json::{Value, json};
 
 /// What is remembered.
@@ -30,8 +32,8 @@ pub(crate) struct Remembered {
     /// its ID in `players.list`. A restart goes back to it only if it is
     /// still playing (`places.rs`).
     pub play_on: Option<String>,
-    /// When the bar shows a volume slider: "remote", "always" or "never".
-    /// Settings does not offer it yet.
+    /// When the bar shows a volume slider: "remote", "always" or "never",
+    /// as Settings › Appearance chooses.
     pub volume_control: String,
 }
 
@@ -62,11 +64,16 @@ fn path() -> Option<PathBuf> {
 }
 
 pub(crate) fn load() -> Remembered {
-    let read = path()
+    path()
         .and_then(|path| std::fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .map_or_else(Remembered::default, |read| read_from(&read))
+}
+
+/// What a file says is remembered: what it does not say, or says wrongly,
+/// is the default.
+fn read_from(read: &Value) -> Remembered {
     let mut remembered = Remembered::default();
-    let Some(read) = read else { return remembered };
     if read.get("wall").and_then(Value::as_str) == Some("albums") {
         remembered.wall = "albums".to_owned();
     }
@@ -103,18 +110,23 @@ pub(crate) fn load() -> Remembered {
 
 pub(crate) fn save(remembered: &Remembered) {
     let Some(path) = path() else { return };
-    let text = json!({
+    let text = written(remembered);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, text.to_string());
+}
+
+/// What the file says.
+fn written(remembered: &Remembered) -> Value {
+    json!({
         "wall": remembered.wall,
         "albumsSort": remembered.albums_sort,
         "letters": remembered.letters,
         "settingsSection": remembered.settings_section,
         "playOn": remembered.play_on,
         "volumeControl": remembered.volume_control,
-    });
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(path, text.to_string());
+    })
 }
 
 /// How the app looks on this computer, as chosen in Settings › Appearance:
@@ -123,23 +135,52 @@ pub(crate) fn save(remembered: &Remembered) {
 pub(crate) struct Looks {
     /// Whether the walls under letters have the large letter beside them.
     pub letters: bool,
+    /// When the player bar shows a volume slider.
+    pub volume: VolumeControl,
+}
+
+impl Looks {
+    /// What is remembered, or the defaults.
+    pub(crate) fn remembered() -> Self {
+        let remembered = load();
+        Self {
+            letters: remembered.letters,
+            volume: VolumeControl::named(&remembered.volume_control),
+        }
+    }
 }
 
 impl Global for Looks {}
 
 /// What the app looks like now.
 pub(crate) fn looks(cx: &App) -> Looks {
-    cx.try_global::<Looks>()
-        .copied()
-        .unwrap_or(Looks { letters: true })
+    cx.try_global::<Looks>().copied().unwrap_or(Looks {
+        letters: true,
+        volume: VolumeControl::Remote,
+    })
 }
 
 /// Turns the large letters on or off: remembered, and followed at once by
 /// whatever observes the looks.
 pub(crate) fn set_letters(on: bool, cx: &mut App) {
-    cx.set_global(Looks { letters: on });
+    cx.set_global(Looks {
+        letters: on,
+        ..looks(cx)
+    });
     let mut remembered = load();
     remembered.letters = on;
+    save(&remembered);
+}
+
+/// Sets when the player bar shows a volume slider: remembered, and
+/// followed at once by the bar.
+pub(crate) fn set_volume_control(volume: VolumeControl, cx: &mut App) {
+    cx.set_global(Looks {
+        volume,
+        ..looks(cx)
+    });
+    let mut remembered = load();
+    remembered.volume_control = volume.name().to_owned();
     save(&remembered);
 }
 
@@ -150,5 +191,24 @@ pub(crate) fn set_play_on(place: Option<String>) {
     if remembered.play_on != place {
         remembered.play_on = place;
         save(&remembered);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_volume_control_and_the_place_played_on_are_kept_and_read_back() {
+        let remembered = Remembered {
+            play_on: Some("0193f2c4-0000-7000-8000-000000000001".to_owned()),
+            volume_control: VolumeControl::Always.name().to_owned(),
+            ..Remembered::default()
+        };
+        assert_eq!(read_from(&written(&remembered)), remembered);
+        // An unknown control is the default, and none is `remote`.
+        let odd = json!({ "volumeControl": "loud" });
+        assert_eq!(read_from(&odd).volume_control, "remote");
+        assert_eq!(read_from(&json!({})), Remembered::default());
     }
 }

@@ -4,11 +4,13 @@
 
 use gpui::{App, InteractiveElement, IntoElement, ParentElement, Styled, div};
 
-use super::controls::{boxed, group, grow, heading, sub_wraps, switch_row};
+use super::controls::{boxed, group, grow, heading, pop_up, row, sub_wraps, switch_row};
+use crate::places::VolumeControl;
 use crate::remember;
 
 pub(super) fn render(active: bool, cx: &App) -> impl IntoElement {
-    let letters = remember::looks(cx).letters;
+    let looks = remember::looks(cx);
+    let letters = looks.letters;
     div()
         .id("appearance")
         .flex()
@@ -24,5 +26,36 @@ pub(super) fn render(active: bool, cx: &App) -> impl IntoElement {
                 active,
                 move |_, _, cx| remember::set_letters(!letters, cx),
             ),
+        ])))
+        .child(group(false).child(heading("Player bar")).child(boxed(vec![
+            row()
+                .child(grow().child("Volume slider").child(sub_wraps(
+                    "Shown for another place you play on. Music here keeps the system’s volume \
+                     unless you choose Always.",
+                )))
+                .child(pop_up(
+                    "volume-control",
+                    looks.volume.label(),
+                    move |event, window, cx| {
+                        let handle = window.window_handle();
+                        let at = event.position();
+                        let checked = VolumeControl::ALL
+                            .iter()
+                            .position(|each| *each == remember::looks(cx).volume);
+                        cx.spawn(async move |cx| {
+                            let labels = VolumeControl::ALL
+                                .iter()
+                                .map(|each| each.label().to_owned())
+                                .collect();
+                            let chosen = crate::menu::choose(handle, labels, checked, at, cx).await;
+                            if let Some(volume) =
+                                chosen.and_then(|index| VolumeControl::ALL.get(index).copied())
+                            {
+                                cx.update(|cx| remember::set_volume_control(volume, cx));
+                            }
+                        })
+                        .detach();
+                    },
+                )),
         ])))
 }

@@ -558,7 +558,11 @@ impl Speaker {
                             return;
                         }
                         // A press a little above or below the line takes it too.
-                        let reach = bounds.dilate(px(GRAB));
+                        // Its ends stay exact: a press on an icon beside it is the icon's.
+                        let reach = Bounds::new(
+                            gpui::point(bounds.origin.x, bounds.origin.y - px(GRAB)),
+                            gpui::size(bounds.size.width, bounds.size.height + px(2. * GRAB)),
+                        );
                         let down = this.clone();
                         window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
                             if phase.bubble()
@@ -645,7 +649,8 @@ impl Speaker {
                     .when(at, |row| row.bg(theme::fill()))
                     .when(!choosable, |row| row.opacity(0.45))
                     .when(choosable, |row| {
-                        row.hover(|style| style.bg(theme::fill()))
+                        row.hover(theme::hovered)
+                            .active(theme::pressed)
                             .on_hover(cx.listener(move |speaker, over: &bool, _, cx| {
                                 if *over {
                                     speaker.places.update(cx, |places, cx| {
@@ -793,7 +798,7 @@ impl Render for Speaker {
         }
         let color = theme::mix(theme::acc(), theme::warn(), shown.warn);
         // The tint's colour over the bar, for the name's fade to end in.
-        let ground = theme::mix(theme::bar_bg(), color, 0.13);
+        let ground = theme::mix(theme::bar_bg(), color, theme::LIT_TINT);
         let (icon_shown, slider, answers, trouble, name) = match &look {
             Look::Empty => (false, None, false, None, None),
             Look::Here { icon, slider } => (*icon, *slider, true, None, None),
@@ -816,7 +821,7 @@ impl Render for Speaker {
         let unread = lit
             && slider.is_none()
             && player.state.is_none()
-            && self.places.read(cx).control != crate::places::VolumeControl::Never;
+            && crate::remember::looks(cx).volume != crate::places::VolumeControl::Never;
         let slider = slider.or(self.last_level.filter(|_| unread));
         let answers = answers && !moving && !unread && !player.stale();
         self.last_level = slider.or(self.last_level);
@@ -852,11 +857,18 @@ impl Render for Speaker {
             .flex()
             .items_center()
             .justify_center()
-            .when(open, |button| button.bg(theme::fill()))
+            // Open, it is lit as Up next's button is while its card is.
+            .when(open, |button| {
+                button.bg(gpui::Rgba {
+                    a: 0.16,
+                    ..theme::acc()
+                })
+            })
+            .active(theme::pressed)
             .on_click(toggles)
             .child(
-                icon("speaker", 15., icon_color)
-                    .group_hover("speaker-icon", |style| style.text_color(theme::ink())),
+                icon("speaker", 15., if open { theme::acc() } else { icon_color })
+                    .group_hover("speaker-icon", theme::hovered_ink),
             )
             .child(
                 canvas(
@@ -886,12 +898,12 @@ impl Render for Speaker {
                         side,
                         theme::dim(),
                     )
-                    .when(answers, |icon| {
-                        icon.group_hover("mute", |style| style.text_color(theme::ink()))
-                    }),
+                    .when(answers, |icon| icon.group_hover("mute", theme::hovered_ink)),
                 )
                 .when(answers, |button| {
-                    button.on_click(cx.listener(|speaker, _, _, cx| speaker.toggle_mute(cx)))
+                    button
+                        .active(theme::pressed)
+                        .on_click(cx.listener(|speaker, _, _, cx| speaker.toggle_mute(cx)))
                 })
         };
 
@@ -1017,7 +1029,7 @@ impl Render for Speaker {
                         .w(gpui::relative(shown.reach))
                         .rounded(px(9.))
                         .bg(gpui::Rgba {
-                            a: 0.13 * shown.tint,
+                            a: theme::LIT_TINT * shown.tint,
                             ..color
                         }),
                 )
@@ -1193,9 +1205,8 @@ mod tests {
     ) {
         let (rig, speaker, asked, cx) = widget(cx);
         // Under `always`, this computer's own slider shows.
-        rig.places.update(cx, |places, cx| {
-            places.control = crate::places::VolumeControl::Always;
-            cx.notify();
+        cx.update(|_, cx| {
+            crate::remember::set_volume_control(crate::places::VolumeControl::Always, cx);
         });
         let settle = |cx: &mut VisualTestContext, count: usize| {
             let deadline = Instant::now() + Duration::from_secs(60);
@@ -1254,10 +1265,9 @@ mod tests {
 
     #[gpui::test]
     fn a_click_on_the_volume_icon_ends_a_scroll_before_it_mutes(cx: &mut TestAppContext) {
-        let (rig, speaker, asked, cx) = widget(cx);
-        rig.places.update(cx, |places, cx| {
-            places.control = crate::places::VolumeControl::Always;
-            cx.notify();
+        let (_rig, speaker, asked, cx) = widget(cx);
+        cx.update(|_, cx| {
+            crate::remember::set_volume_control(crate::places::VolumeControl::Always, cx);
         });
         // A scroll: one level sent, the next waiting on the throttle.
         speaker.update(cx, |speaker, cx| {

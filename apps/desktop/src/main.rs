@@ -172,9 +172,7 @@ fn main() {
         .detach();
         let link = link::new(args.data_dir.as_deref(), cx);
         // How the app looks, as remembered, for every window to follow.
-        cx.set_global(remember::Looks {
-            letters: remember::load().letters,
-        });
+        cx.set_global(remember::Looks::remembered());
         settings::install(link.clone(), args.script.is_some(), cx);
         // Quit stops a server the app started; one it found it leaves.
         let quitting = link.clone();
