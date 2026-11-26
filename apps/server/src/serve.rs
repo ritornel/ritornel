@@ -157,7 +157,13 @@ fn run(
         .map(|id| format!("{} {}", id.family, id.version))
         .collect::<Vec<_>>()
         .join(", ");
-    info!(server_id = %server.server_id(), name = %server.name(), encoders, "ready");
+    info!(
+        server_id = %server.server_id(),
+        name = %server.name(),
+        encoders,
+        volume_curve = settings.volume_curve.as_str(),
+        "ready"
+    );
     let ready = writeln!(
         out,
         "{} pid={} server_id={}",

@@ -375,6 +375,22 @@ fn a_name_given_in_the_settings_wins_over_the_stored_one_and_is_kept_after() {
 }
 
 #[test]
+fn ready_log_records_the_volume_curve() {
+    let scratch = scratch();
+    let data_dir = scratch.data_dir();
+    Server::start(&data_dir, &[]).stop(&data_dir);
+    Server::start(&data_dir, &["--volume-curve", "log"]).stop(&data_dir);
+
+    let lines = log_lines(&data_dir);
+    let curves: Vec<_> = lines
+        .iter()
+        .filter(|line| line["message"] == "ready")
+        .map(|line| line["volume_curve"].as_str().unwrap())
+        .collect();
+    assert_eq!(curves, ["cubic", "log"]);
+}
+
+#[test]
 fn a_lost_credential_file_is_replaced_at_the_next_start() {
     let scratch = scratch();
     let data_dir = scratch.data_dir();

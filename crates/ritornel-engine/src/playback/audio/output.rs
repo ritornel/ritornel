@@ -48,6 +48,14 @@ impl VolumeCurve {
     /// Level below which [`Self::Log`] tapers linearly to exact silence.
     const LOG_TOE: f32 = 0.1;
 
+    /// The curve's configuration name (`"cubic"` or `"log"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cubic => "cubic",
+            Self::Log => "log",
+        }
+    }
+
     /// Converts a `0..=1` player volume to a linear amplitude factor in
     /// `0..=1`.
     pub fn gain(self, volume: f32) -> f32 {
