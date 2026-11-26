@@ -70,7 +70,7 @@ pub(super) fn on_a_satellite(method: &str) -> Route {
     match method {
         "server.hello" | "server.status" | "servers.list" | "players.list" | "events.subscribe"
         | "events.unsubscribe" | "media.token" | "server.backup" | "server.settings"
-        | "server.setSettings" => Route::Here,
+        | "server.setSettings" | "inspect.db" | "inspect.table" => Route::Here,
         "playback.move" => Route::Hub,
         _ if method.starts_with("playback.")
             || method.starts_with("queue.")

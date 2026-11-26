@@ -172,7 +172,7 @@ Every RPC failure returns a JSON-RPC error object `{ code, message, data: { code
 | `plan_stale` | `-32000` | `false` | A previously computed plan is no longer valid. |
 | `view_expired` | `-32000` | `false` | List view closed, evicted, or timed out; reopen it. |
 | `unavailable` | `-32000` | `true` | Resource exists or server is healthy, but cannot serve now (for example no library yet, stopping, or missing export folder). |
-| `forbidden` | `-32000` | `false` | Call or topic requires a `full` session. |
+| `forbidden` | `-32000` | `false` | Call, topic, or table requires a permission or link session the caller does not hold. |
 | `unsupported` | `-32601` | `false` | Unknown method, contract version mismatch, unsupported filter version, or missing server capability (such as no audio output). |
 | `idempotency_mismatch` | `-32000` | `false` | Same `idempotencyKey` reused with different parameters. |
 | `internal` | `-32603` | `false` | Unexpected server failure (logged by server). |
@@ -187,6 +187,17 @@ Clients gate optional behavior on `PublicDescriptor.capabilities` rather than ve
 - `media.art` — `media.token` and `GET /v1/art/{artId}/{size}` (supported sizes in `artSizes`).
 - `players` — player discovery, the `players` topic, and routing playback and queue calls on a hub or a linked satellite.
 - `playback` — `playback.*` and `queue.*` calls and `playback`, `progress`, `queue` topics (advertised only when the server has a player).
+
+## Database inspection
+
+Developer tools inspect `library.db` and `server.db` through six read-only RPCs (`crates/ritornel-contract/src/inspect.rs`, `crates/ritornel-engine/src/inspect.rs`, `apps/server/src/dispatch/inspect.rs`) without exposing arbitrary SQL over the wire:
+
+- **`inspect.db`** (`status:read`, `server:manage`): returns file/WAL sizes, SQLite page stats, applied migrations with SHA-256 checksums, every table and view grouped by durability layer (`evidence`, `decision`, `bookkeeping`, `rebuildable`) with row counts, columns, foreign keys, indexes, triggers, and operational queue depths (`outbox`, `listen_staging`, `history_delivery`, `history_ingest_conflict`). On a satellite, answers locally for the satellite's own `server.db` (`library` is omitted).
+- **`inspect.table`** (`server:manage`, `library:read`): returns paged rows (up to `MAX_INSPECT_ROWS` = 200, stopping early with `truncated: true` if a page reaches the 512 KiB response budget) and optional single-column exact equality filtering for explicitly allowlisted tables in `library.db` and `server.db`. Secret-bearing tables in `server.db` (`server_identity`, `session`, `service_session`, `hub_link`) are strictly forbidden, FTS5 virtual/shadow tables are excluded, large binary blobs are summarized as `{ "blobBytes": N }`, and path-bearing or error-bearing columns in `server.db` (`root.abs_path`, `server_setting.value_json` for `backup_dir`/`backup.last`/`backup.failed`, path-carrying `command_receipt.result_json`, `job.params_json`/`current_label`/`error_json`/`checkpoint_json`, `job_item.item_ref`/`detail_json`, and `outbox.last_error`) are redacted to `null` (and refused as filter targets) unless the session holds `folders:manage`. On a satellite, `db: "server"` reads the satellite's `server.db` and `db: "library"` returns `unsupported` (`reason: "on_the_hub"`).
+- **`inspect.entity`** (`library:read`): traces a `recording`, `appearance`, `release`, `source_item`, or `audio_asset` through its `source_item`, `source_item_revision`, `audio_asset`, identifier/metadata claims, insert-only `assignment` history, `identity_decision` (both item-level and entity-level merge/unmerge `entityDecisions`), and `identity_exclusion` rows. Absolute host paths (`absPath`) are included only when the session holds `folders:manage` and the root lives on this server. On a satellite, forwarded to the hub.
+- **`inspect.play`** (`library:read`): returns a derived `play_event` alongside its raw `history_observation` rows, join/dedupe reasons, `history_delivery` rows, and targeting `observation_correction` rows (both direct `correction_target` and endpoint-window corrections). On a satellite, forwarded to the hub.
+- **`inspect.conflicts`** (`status:read`, `library:read`): pages `history_ingest_conflict`, stuck/refused/unknown `history_delivery` rows, and waiting `outbox` items (`lastError` omitted without `folders:manage`). On a satellite, forwarded to the hub (inspect a satellite's own `outbox` via `inspect.table` on `db: "server"`).
+- **`library.revisions`** (`status:read`): pages the `library_revision` write log newest first. On a satellite, forwarded to the hub.
 
 ## Method summary
 
@@ -204,6 +215,7 @@ The methods registered in `crates/ritornel-contract/src/methods.rs`, by area (se
 | History & ratings | `history.recent`, `history.onThisDay`, `history.artist`, `history.album`, `history.artists`, `history.albums`, `history.track`, `history.stream`, `history.rebuild`, `history.zones`, `history.setZones`, `history.export`, `ratings.set` |
 | Last.fm | `lastfm.status`, `lastfm.signInStart`, `lastfm.signInFinish`, `lastfm.signOut`, `lastfm.sync`, `lastfm.setScrobbling`, `lastfm.report` |
 | Imports | `imports.stage`, `imports.dryRun`, `imports.apply`, `imports.undo`, `imports.get`, `imports.list` |
+| Inspection | `inspect.db`, `inspect.table`, `inspect.entity`, `inspect.play`, `inspect.conflicts`, `library.revisions` |
 
 ## Decisions
 

@@ -19,9 +19,10 @@ use ritornel_contract::methods::{
     HistoryAlbums, HistoryArtist, HistoryArtists, HistoryExport, HistoryOnThisDay, HistoryRebuild,
     HistoryRecent, HistorySetZones, HistoryStreamCall, HistoryTrack, HistoryZones, IdentityDryRun,
     IdentityReview, ImportsApply, ImportsDryRun, ImportsGet, ImportsList, ImportsStage,
-    ImportsUndo, JobsCancel, JobsGet, JobsList, LastfmReportCall, LastfmSetScrobbling,
-    LastfmSignInFinish, LastfmSignInStart, LastfmSignOut, LastfmStatusCall, LastfmSync,
-    LibraryCreate, LibrarySearch, LibrarySetSettings, LibrarySetWatching, LibrarySettingsCall,
+    ImportsUndo, InspectConflicts, InspectDbCall, InspectEntity, InspectPlay, InspectTable,
+    JobsCancel, JobsGet, JobsList, LastfmReportCall, LastfmSetScrobbling, LastfmSignInFinish,
+    LastfmSignInStart, LastfmSignOut, LastfmStatusCall, LastfmSync, LibraryCreate,
+    LibraryRevisions, LibrarySearch, LibrarySetSettings, LibrarySetWatching, LibrarySettingsCall,
     LibraryStats, LinkCopiesCall, LinkInvite, LinkJoin, LinkListen, LinkPing, LinkStatusCall,
     LinkTracksCall, ListClose, ListLocate, ListOpen, ListSectionsCall, ListWindowCall,
     MediaTokenCall, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume,
@@ -60,6 +61,7 @@ mod export;
 mod handoff;
 mod history;
 mod imports;
+mod inspect;
 mod lastfm;
 mod link;
 mod lists;
@@ -1245,6 +1247,22 @@ impl Core {
             ImportsList::NAME => run::<ImportsList>(params, |_| self.imports_list(stores)),
             LastfmReportCall::NAME => {
                 run::<LastfmReportCall>(params, |params| self.lastfm_report(stores, &params))
+            }
+            InspectDbCall::NAME => run::<InspectDbCall>(params, |_| self.inspect_db(stores)),
+            InspectTable::NAME => run::<InspectTable>(params, |params| {
+                self.inspect_table(stores, &params, show_paths)
+            }),
+            InspectEntity::NAME => run::<InspectEntity>(params, |params| {
+                self.inspect_entity(stores, &params, show_paths)
+            }),
+            InspectPlay::NAME => {
+                run::<InspectPlay>(params, |params| self.inspect_play(stores, &params))
+            }
+            InspectConflicts::NAME => run::<InspectConflicts>(params, |params| {
+                self.inspect_conflicts(stores, &params, show_paths)
+            }),
+            LibraryRevisions::NAME => {
+                run::<LibraryRevisions>(params, |params| self.library_revisions(stores, &params))
             }
             _ => Err(RpcError::new(
                 ErrorCode::Internal,
