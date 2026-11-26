@@ -30,8 +30,8 @@ pub(super) fn render(active: bool, cx: &App) -> impl IntoElement {
         .child(group(false).child(heading("Player bar")).child(boxed(vec![
             row()
                 .child(grow().child("Volume slider").child(sub_wraps(
-                    "Shown for another place you play on. Music here keeps the system’s volume \
-                     unless you choose Always.",
+                    "When the player bar shows one. Other places only shows it while music \
+                     plays somewhere else.",
                 )))
                 .child(pop_up(
                     "volume-control",

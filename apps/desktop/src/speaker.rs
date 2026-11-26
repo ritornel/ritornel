@@ -857,12 +857,18 @@ impl Render for Speaker {
             .flex()
             .items_center()
             .justify_center()
-            // Open, it is lit as Up next's button is while its card is.
+            // Open, it is lit as Up next's button is while its card is;
+            // inside the lit widget, whose tint it already wears, it takes
+            // the ground a control on a ground takes instead.
             .when(open, |button| {
-                button.bg(gpui::Rgba {
-                    a: 0.16,
-                    ..theme::acc()
-                })
+                if shown.tint > 0. {
+                    button.bg(theme::fill2())
+                } else {
+                    button.bg(gpui::Rgba {
+                        a: 0.16,
+                        ..theme::acc()
+                    })
+                }
             })
             .active(theme::pressed)
             .on_click(toggles)
@@ -1050,6 +1056,7 @@ impl Render for Speaker {
 #[cfg(test)]
 #[allow(
     clippy::indexing_slicing,
+    clippy::panic,
     reason = "a test fails by saying what it found"
 )]
 mod tests {
@@ -1261,6 +1268,42 @@ mod tests {
         });
         assert_eq!(shown, Some(0.35));
         assert_eq!(speaker.read_with(cx, |speaker, _| speaker.held), None);
+    }
+
+    #[gpui::test]
+    fn a_press_just_above_the_slider_takes_it_and_one_past_its_ends_does_not(
+        cx: &mut TestAppContext,
+    ) {
+        let (_rig, speaker, _, cx) = widget(cx);
+        cx.update(|_, cx| {
+            crate::remember::set_volume_control(crate::places::VolumeControl::Always, cx);
+        });
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let Some(slider) = speaker.read_with(cx, |speaker, _| speaker.slider.get()) else {
+            panic!("the slider was not drawn");
+        };
+        let middle = slider.center().y;
+        let press = |at: gpui::Point<Pixels>, cx: &mut VisualTestContext| {
+            cx.simulate_mouse_down(at, MouseButton::Left, gpui::Modifiers::default());
+            let held = speaker.read_with(cx, |speaker, _| speaker.holding);
+            cx.simulate_mouse_up(at, MouseButton::Left, gpui::Modifiers::default());
+            held
+        };
+        // Past either end, though level with it: the icons beside it are there.
+        assert!(!press(gpui::point(slider.left() - px(2.), middle), cx));
+        assert!(!press(gpui::point(slider.right() + px(2.), middle), cx));
+        // A little above or below it.
+        let across = slider.center().x;
+        assert!(press(gpui::point(across, slider.top() - px(GRAB - 1.)), cx));
+        assert!(press(
+            gpui::point(across, slider.bottom() + px(GRAB - 1.)),
+            cx
+        ));
+        assert!(!press(
+            gpui::point(across, slider.top() - px(GRAB + 2.)),
+            cx
+        ));
     }
 
     #[gpui::test]

@@ -206,15 +206,18 @@ const VOLUME_SETTLES: Duration = Duration::from_millis(1500);
 /// The sound set here last, and when: a volume, or none for muting alone.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SoundSet {
+    /// Counts the sets, so that one is told from a later one alike.
+    id: u64,
     volume: Option<f64>,
     muted: bool,
+    /// When it was answered, or sent while it is not yet.
     at: Instant,
 }
 
 /// What the player's state says of its sound, given what was set here
-/// last and how many sets are still unanswered: a report of another sound
-/// soon after is one sent before it, and what was set stands, as it does
-/// while any set is unanswered. Whether the set is still waited for.
+/// last and how many sets are still unanswered: while any is, and for a
+/// while after the last is answered, a report of another sound is one sent
+/// before it, and what was set stands. Whether the set is still waited for.
 fn settled(
     state: &mut PlaybackState,
     set: Option<SoundSet>,
@@ -228,7 +231,7 @@ fn settled(
         .volume
         .is_none_or(|volume| (state.volume - volume).abs() < 1e-6)
         && state.muted == set.muted;
-    if now.duration_since(set.at) >= VOLUME_SETTLES || (same && unanswered == 0) {
+    if unanswered == 0 && (same || now.duration_since(set.at) >= VOLUME_SETTLES) {
         return false;
     }
     if let Some(volume) = set.volume {
@@ -300,16 +303,15 @@ impl Ratings {
     }
 }
 
-/// Takes a state unless it is older than the one held, or as old unless
-/// `again`: a read asked for to undo what was shown ahead of the place.
+/// Takes a state unless it is no newer than the one held.
 fn keep_state(
     kept: &mut Option<PlaybackState>,
     state: PlaybackState,
-    again: bool,
 ) -> Option<&mut PlaybackState> {
-    if kept.as_ref().is_some_and(|previous| {
-        state.revision < previous.revision || (state.revision == previous.revision && !again)
-    }) {
+    if kept
+        .as_ref()
+        .is_some_and(|previous| state.revision <= previous.revision)
+    {
         return None;
     }
     Some(kept.insert(state))
@@ -382,8 +384,8 @@ pub(crate) struct Player {
     held_back: Option<PlaybackState>,
     /// Sound sets not yet answered.
     sounds_unanswered: usize,
-    /// Whether the next state read may replace one of the same revision.
-    read_again: bool,
+    /// Counts the sound sets (`SoundSet::id`).
+    sound_sets: u64,
     /// Reads the state again after a read failed while the song kept
     /// through a move waits on it.
     read_again_later: Option<Task<()>>,
@@ -504,7 +506,7 @@ impl Player {
             moving: false,
             held_back: None,
             sounds_unanswered: 0,
-            read_again: false,
+            sound_sets: 0,
             read_again_later: None,
             volume_sent: None,
             volume_check: None,
@@ -657,8 +659,7 @@ impl Player {
         if std::mem::take(&mut self.stale) {
             self.state = None;
         }
-        let again = std::mem::take(&mut self.read_again);
-        let Some(state) = keep_state(&mut self.state, state, again) else {
+        let Some(state) = keep_state(&mut self.state, state) else {
             return;
         };
         // The song moved keeps its name and cover until the place names it.
@@ -983,7 +984,9 @@ impl Player {
             state.volume = volume;
         }
         state.muted = muted;
+        self.sound_sets += 1;
         let set = SoundSet {
+            id: self.sound_sets,
             volume,
             muted,
             at: Instant::now(),
@@ -1021,14 +1024,20 @@ impl Player {
                 player.sounds_unanswered = player.sounds_unanswered.saturating_sub(1);
                 if failed {
                     player.say("The volume could not be set", cx);
-                    player.check_sound(set, cx);
-                } else if player.volume_set == Some(set) {
-                    // If no report confirms it in a while, the state is read again.
+                    player.check_sound(set.id, cx);
+                } else if let Some(latest) = player
+                    .volume_set
+                    .as_mut()
+                    .filter(|latest| latest.id == set.id)
+                {
+                    // The last set is answered: its while begins now, and if
+                    // no report confirms it by then, the state is read again.
+                    latest.at = Instant::now();
                     player.volume_check = Some(cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(VOLUME_SETTLES).await;
                         this.update(cx, |player, cx| {
                             if player.generation == generation {
-                                player.check_sound(set, cx);
+                                player.check_sound(set.id, cx);
                             }
                         })
                         .ok();
@@ -1042,12 +1051,50 @@ impl Player {
 
     /// Reads the state again in place of the sound `set` showed, unless a
     /// later set or a report has taken its place.
-    fn check_sound(&mut self, set: SoundSet, cx: &mut Context<Self>) {
-        if self.volume_set != Some(set) {
+    fn check_sound(&mut self, set: u64, cx: &mut Context<Self>) {
+        if self.volume_set.is_none_or(|latest| latest.id != set) {
             return;
         }
         self.volume_set = None;
-        self.read_again = true;
+        self.read_sound(cx);
+    }
+
+    /// Reads the place's sound again, to put right what was shown ahead of
+    /// it: a state of the revision shown gives its volume and muting alone,
+    /// so the read cannot move the clock or the wait back; a newer one is
+    /// taken whole.
+    fn read_sound(&mut self, cx: &mut Context<Self>) {
+        let Some(net) = self.net.clone() else { return };
+        let client = Arc::clone(&net.client);
+        let target = self.target;
+        let generation = self.generation;
+        let read = net.rt().spawn(async move {
+            client
+                .call::<PlaybackGet>(&PlaybackGetParams { player: target })
+                .await
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(read)) = read.await else { return };
+            this.update(cx, |player, cx| {
+                if player.generation != generation || player.volume_set.is_some() {
+                    return;
+                }
+                match &mut player.state {
+                    Some(shown) if shown.revision == read.revision => {
+                        shown.volume = read.volume;
+                        shown.muted = read.muted;
+                        cx.notify();
+                    }
+                    _ => player.took(read, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reads the place's state again.
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         self.read(cx);
     }
 
@@ -1700,20 +1747,15 @@ mod tests {
             "queueLength": 1, "output": {"name": "null", "mode": "shared", "sampleRateHz": 44100, "channels": 2}
         }))?;
         let mut kept = None;
-        assert!(keep_state(&mut kept, event.clone(), false).is_some());
+        assert!(keep_state(&mut kept, event.clone()).is_some());
         let mut reply = event.clone();
         reply.position_ms = 0;
         for revision in [11, 12] {
             reply.revision = revision;
-            assert!(keep_state(&mut kept, reply.clone(), false).is_none());
+            assert!(keep_state(&mut kept, reply.clone()).is_none());
         }
         assert_eq!(kept, Some(event));
-        assert!(keep_state(&mut None, reply.clone(), false).is_some());
-        // A read asked for again may replace one of the same revision, never an older one.
-        reply.revision = 12;
-        assert!(keep_state(&mut kept, reply.clone(), true).is_some());
-        reply.revision = 11;
-        assert!(keep_state(&mut kept, reply, true).is_none());
+        assert!(keep_state(&mut None, reply).is_some());
         Ok(())
     }
 
@@ -1767,6 +1809,42 @@ mod tests {
         assert_eq!(carried(5_000, second, Some(200_000)), 6_000);
         assert_eq!(carried(199_500, second, Some(200_000)), 200_000);
         assert_eq!(carried(5_000, second, None), 6_000);
+    }
+
+    #[test]
+    fn a_set_sound_stands_while_any_set_is_unanswered_and_a_while_after() {
+        let Ok(mut state) = serde_json::from_value::<PlaybackState>(serde_json::json!({
+            "revision": 1, "status": "paused", "positionMs": 0, "volume": 0.2,
+            "muted": false, "shuffle": false, "repeat": "off", "queueRevision": 1,
+            "queueLength": 1, "output": {"name": "null", "mode": "shared", "sampleRateHz": 44100, "channels": 2}
+        })) else {
+            return;
+        };
+        let t0 = Instant::now();
+        let set = SoundSet {
+            id: 2,
+            volume: Some(0.6),
+            muted: false,
+            at: t0,
+        };
+        // A late report of an earlier set, long after, while this one is unanswered.
+        let late = t0 + Duration::from_secs(5);
+        assert!(settled(&mut state, Some(set), 1, late));
+        assert!((state.volume - 0.6).abs() < 1e-9);
+        // Answered: a report of another sound still passes for a while.
+        state.volume = 0.2;
+        assert!(settled(
+            &mut state,
+            Some(set),
+            0,
+            t0 + Duration::from_millis(500)
+        ));
+        // Then the place's word stands, and so does one that confirms it.
+        state.volume = 0.2;
+        assert!(!settled(&mut state, Some(set), 0, late));
+        assert!((state.volume - 0.2).abs() < 1e-9);
+        state.volume = 0.6;
+        assert!(!settled(&mut state, Some(set), 0, t0));
     }
 
     #[test]

@@ -516,12 +516,21 @@ impl Places {
     pub(crate) fn look(&self, cx: &gpui::App) -> Look {
         // Through a move the place left's level stays shown, so the widget
         // keeps its shape; it does not answer until the new place reports.
-        let state = self.player.read(cx).state.as_ref();
+        let player = self.player.read(cx);
+        let state = player.state.as_ref();
         let control = crate::remember::looks(cx).volume;
         if !self.available() {
             return look(&[], None, control, state);
         }
-        look(&self.list, self.chosen(cx), control, state)
+        let chosen = self.chosen(cx);
+        let mut shown = look(&self.list, chosen, control, state);
+        // What is wrong with the place left is not the new place's.
+        if player.stale()
+            && let (Look::There { trouble, .. }, Some(row)) = (&mut shown, chosen)
+        {
+            *trouble = self::trouble(row, None);
+        }
+        shown
     }
 
     /// Whether the volume answers: a slider is shown that is not in
@@ -642,6 +651,10 @@ impl Places {
         self.player.update(cx, |player, cx| {
             if player.out_of_reach != out {
                 player.out_of_reach = out;
+                // Back in reach: what it did meanwhile is read.
+                if !out {
+                    player.refresh(cx);
+                }
                 cx.notify();
             }
         });
@@ -1814,6 +1827,36 @@ pub(crate) mod tests {
             rig.player.read_with(cx, |player, _| !player.stale())
         });
         assert!(rig.places.read_with(cx, |places, cx| places.adjustable(cx)));
+    }
+
+    #[gpui::test]
+    fn the_place_lefts_speaker_trouble_is_not_shown_for_the_new_place(cx: &mut TestAppContext) {
+        let rig = rig(cx, None);
+        let (net, _) = hub(places(), Answers::default());
+        connect(&rig, net, cx);
+        until(cx, "read the places and the player", |cx| listed(&rig, cx));
+        rig.player.update(cx, |player, _| {
+            if let Some(state) = &mut player.state {
+                state.output.problem = Some(OutputProblem {
+                    since: 1_794_776_400_000,
+                    detail: "no device is there".to_owned(),
+                });
+            }
+        });
+        rig.player
+            .update(cx, |player, cx| player.moved_to(Some(LIVING_ROOM), cx));
+        let look = rig.places.read_with(cx, |places, cx| places.look(cx));
+        assert!(
+            matches!(
+                look,
+                Look::There {
+                    trouble: None,
+                    slider: Some(_),
+                    ..
+                }
+            ),
+            "{look:?}"
+        );
     }
 
     #[gpui::test]

@@ -322,7 +322,8 @@ impl Render for PlayerBar {
         // the seek bar's empty part breathes, and after a while the line
         // under the title says where it is coming from. The clock and the
         // moving bars hold already: they move only while it plays.
-        let waited = player.buffering();
+        // Out of reach, the place's wait says nothing: that it is out of reach does.
+        let waited = player.buffering().filter(|_| reachable);
         let breath = waited.map_or(0., crate::player::breath);
         let getting = waited
             .filter(|waited| *waited >= crate::player::BUFFER_SAY)
@@ -330,13 +331,14 @@ impl Render for PlayerBar {
         let breathing = waited.is_some_and(|waited| waited >= crate::player::BUFFER_QUIET);
         // While the sound output isn't working, the words under the title
         // say so in place of the artist, or of the hint with nothing on;
-        // for another place, briefly, since the widget names it.
-        let remote_trouble = there.as_ref().and_then(|row| {
-            let trouble = crate::places::trouble(row, state.as_ref())?;
-            Some(trouble.lines(&crate::away::clock()))
-        });
-        let trouble = remote_trouble.or_else(|| {
-            state.as_ref().and_then(|state| {
+        // for another place, briefly, since the widget names it. A state
+        // kept through a move is the place left's: its trouble is not the
+        // new place's.
+        let current = state.as_ref().filter(|_| !player.stale());
+        let trouble = match &there {
+            Some(row) => crate::places::trouble(row, current)
+                .map(|trouble| trouble.lines(&crate::away::clock())),
+            None => current.and_then(|state| {
                 let problem = state.output.problem.as_ref()?;
                 let clock = Clock {
                     now: now_ms(),
@@ -344,8 +346,8 @@ impl Render for PlayerBar {
                     style: self.style,
                 };
                 Some(output_trouble(&state.output.name, problem, on, &clock))
-            })
-        });
+            }),
+        };
 
         if let Some(entry) = entry
             && self.arrived.as_ref().is_none_or(|(id, _)| *id != entry)
