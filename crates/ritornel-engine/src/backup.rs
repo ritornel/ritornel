@@ -404,6 +404,57 @@ mod tests {
     }
 
     #[test]
+    fn the_id_of_a_database_in_use_is_its_last_commit_and_reading_it_changes_nothing() {
+        let scratch = Scratch::new("recorded-wal");
+        let path = scratch.0.join("server.db");
+        let mut writer = rusqlite::Connection::open(&path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        // What is committed stays in the log, not the file.
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        migrate::run(
+            &mut writer,
+            &migrate::SERVER[..1],
+            &FixedClock::at(1_763_000_000_000),
+        )
+        .unwrap();
+        writer
+            .execute(
+                "INSERT INTO server_identity
+                   (id, server_id, signing_key, public_key, name, created_at_ms)
+                 VALUES (1, ?1, zeroblob(32), zeroblob(32), 'desk', 0)",
+                [vec![0x0a_u8; 16]],
+            )
+            .unwrap();
+        let log = scratch.0.join("server.db-wal");
+        assert!(std::fs::metadata(&log).unwrap().len() > 0);
+        // And a change not yet committed.
+        writer
+            .execute_batch(
+                "BEGIN; UPDATE server_identity SET server_id = zeroblob(16) WHERE id = 1",
+            )
+            .unwrap();
+        let before = (std::fs::read(&path).unwrap(), std::fs::read(&log).unwrap());
+
+        assert_eq!(
+            recorded_id(&path, Database::Server).unwrap(),
+            Some(Id::from_bytes([0x0a; 16]))
+        );
+        assert_eq!(
+            (std::fs::read(&path).unwrap(), std::fs::read(&log).unwrap()),
+            before
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_database_has_no_id_to_read() {
+        let scratch = Scratch::new("recorded-corrupt");
+        let path = scratch.0.join("library.db");
+        std::fs::write(&path, b"not a database at all ".repeat(200)).unwrap();
+        assert!(recorded_id(&path, Database::Library).is_err());
+    }
+
+    #[test]
     fn only_a_database_with_data_and_an_older_schema_is_pending() {
         let scratch = Scratch::new("pending");
         let path = scratch.0.join("server.db");

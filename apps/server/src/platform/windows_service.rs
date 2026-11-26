@@ -25,6 +25,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use super::windows::plain_path as plain;
+
 use ritornel_windows::window::{self, Window};
 
 use super::service::{installed, prepare};
@@ -171,32 +173,6 @@ fn quote(path: &str) -> String {
     let kept = path.trim_end_matches('\\');
     let trailing = path.len() - kept.len();
     format!("\"{kept}{}\"", "\\".repeat(trailing * 2))
-}
-
-/// A path without the `\\?\` that `canonicalize` puts before it, where the
-/// path means the same without it: within `MAX_PATH`, and with no name
-/// ending in a dot or a space, which Windows would otherwise drop.
-fn plain(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    let (plain, rest) = if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
-        (format!(r"\\{share}"), share)
-    } else if let Some(local) = text
-        .strip_prefix(r"\\?\")
-        .filter(|local| local.as_bytes().get(1) == Some(&b':'))
-    {
-        (local.to_owned(), local)
-    } else {
-        return path.to_owned();
-    };
-    let same = plain.len() < 260
-        && rest
-            .split('\\')
-            .all(|name| !name.ends_with('.') && !name.ends_with(' '));
-    if same {
-        PathBuf::from(plain)
-    } else {
-        path.to_owned()
-    }
 }
 
 /// Text as XML holds it.

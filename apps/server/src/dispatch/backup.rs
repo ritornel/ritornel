@@ -135,6 +135,7 @@ fn refused(error: &BackupError) -> RpcError {
         BackupError::Missing(_) => (ErrorCode::Unavailable, "backup_place_missing"),
         BackupError::Inside(_) => (ErrorCode::Unavailable, "backup_place_inside"),
         BackupError::Foreign { .. } => (ErrorCode::Unavailable, "backup_place_foreign"),
+        BackupError::Unclear { .. } => (ErrorCode::Unavailable, "backup_place_unclear"),
         BackupError::Busy => (ErrorCode::Unavailable, "backup_running"),
         BackupError::Io { .. } | BackupError::Copy(..) => (ErrorCode::Unavailable, "backup_failed"),
     };

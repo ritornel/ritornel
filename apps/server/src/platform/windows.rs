@@ -7,7 +7,7 @@
 //! `ritornel-windows`.
 
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use ritornel_contract::local;
@@ -103,6 +103,32 @@ pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
 /// (docs/internals/platforms.md, "Windows").
 pub(crate) fn sync_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+/// A path without the `\\?\` that `canonicalize` puts before it, where the
+/// path means the same without it: within `MAX_PATH`, and with no name
+/// ending in a dot or a space, which Windows would otherwise drop.
+pub(crate) fn plain_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let (plain, rest) = if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        (format!(r"\\{share}"), share)
+    } else if let Some(local) = text
+        .strip_prefix(r"\\?\")
+        .filter(|local| local.as_bytes().get(1) == Some(&b':'))
+    {
+        (local.to_owned(), local)
+    } else {
+        return path.to_owned();
+    };
+    let same = plain.len() < 260
+        && rest
+            .split('\\')
+            .all(|name| !name.ends_with('.') && !name.ends_with(' '));
+    if same {
+        PathBuf::from(plain)
+    } else {
+        path.to_owned()
+    }
 }
 
 /// Renames the folder at `from` to `to`, asking for the rename to be

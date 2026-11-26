@@ -68,9 +68,9 @@ use other_unix as system;
 pub(crate) use system::{HAS_MEDIA_SESSION, MediaControls, STOP_MEDIA_SESSION_WITH_SERVER};
 pub(crate) use system::{
     close_to_others, create_new_private_dir, create_owner_only, create_private_dir,
-    create_private_file, free_bytes, install_service, is_private, lock_shareable, rename_dir,
-    run_service, service_status, stay_awake, sync_dir, take_lock, uninstall_service, wait,
-    watch_signals,
+    create_private_file, free_bytes, install_service, is_private, lock_shareable, plain_path,
+    rename_dir, run_service, service_status, stay_awake, sync_dir, take_lock, uninstall_service,
+    wait, watch_signals,
 };
 
 /// The computer's name, as the person who set it up named it: what a server

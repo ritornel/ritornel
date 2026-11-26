@@ -2,7 +2,7 @@
 //! the whole file, free space from `statvfs`, and SIGINT and SIGTERM.
 
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use tokio::runtime::Runtime;
@@ -36,6 +36,12 @@ pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
 /// in it survive a loss of power.
 pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+/// A path as it is shown and written down: as it is, on Unix, where
+/// `canonicalize` adds nothing to it.
+pub(crate) fn plain_path(path: &Path) -> PathBuf {
+    path.to_owned()
 }
 
 /// Renames the folder at `from` to `to`, and nothing more: a caller that

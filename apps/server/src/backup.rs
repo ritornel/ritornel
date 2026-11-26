@@ -28,14 +28,15 @@
 //! that finished.
 //!
 //! A place holds the backups of one data directory, which
-//! `ritornel-data-dir.txt` in it names on its first line, written after the
-//! first backup there. A copy of a data directory carries its settings, and
-//! with them where its backups go, and its databases, and with them the
+//! `ritornel-data-dir.txt` in it names on its first line. The first backup
+//! there makes the file, only if no other writer has, and removes it again
+//! if the backup fails. A copy of a data directory carries its settings,
+//! and with them where its backups go, and its databases, and with them the
 //! same server and library IDs: only the data directory's path tells the
 //! copy from what it copied. So a server whose data directory is not the
 //! one named writes no backup there. A place that older versions wrote to
 //! without the file belongs to the data directory of the earliest backup in
-//! it.
+//! it, and a place whose owner is in doubt is written to by no one.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -51,8 +52,8 @@ use tracing::{info, warn};
 
 use crate::data_dir::DataDir;
 use crate::platform::{
-    close_to_others, create_new_private_dir, create_private_dir, create_private_file, rename_dir,
-    sync_dir,
+    close_to_others, create_new_private_dir, create_private_dir, create_private_file, plain_path,
+    rename_dir, sync_dir,
 };
 
 /// The version of `backup.json`.
@@ -105,12 +106,16 @@ start the server on that directory. Keep server.db and library.db together:
 the library names the server that may write it, and that server is the one
 in server.db.
 
-Restored to the data directory above, the server writes its backups where it
-did before. Restored anywhere else, it writes none into a folder that holds
-the backups of the data directory above, as the folder this backup is in
-does when {OWNER_FILE} beside it names it. Give the new data directory a
-backup folder of its own with --backup-dir or RITORNEL_BACKUP_DIR, or, if it
-replaces the one above, put its path on the first line of that file.
+Restored to the data directory above, and started with the same backup
+folder setting (--backup-dir, RITORNEL_BACKUP_DIR or backup_dir in
+config.toml), the server writes its backups where it did before.
+
+A server started on any other data directory writes no backups into a folder
+that holds the backups of the data directory above. When {OWNER_FILE} beside
+this backup names that data directory, this folder is one of those. To back
+up a data directory restored to a new place, give it a backup folder of its
+own. If it replaces the data directory above, put its new path on the first
+line of {OWNER_FILE} instead.
 
 To look inside without changing anything: sqlite3 -readonly library.db
 ",
@@ -142,6 +147,8 @@ pub(crate) enum BackupError {
         /// The data directory of this server.
         ours: PathBuf,
     },
+    /// Whose backups the place named holds cannot be told.
+    Unclear { place: PathBuf, why: String },
     /// Another backup is being taken.
     Busy,
     /// A file could not be written.
@@ -175,14 +182,23 @@ impl fmt::Display for BackupError {
             Self::Foreign { place, owner, ours } => write!(
                 f,
                 "the backup folder {place} holds the backups of the data directory {owner}, not of \
-                 this one, {ours}: give this data directory a backup folder of its own with \
-                 `ritornel-server serve --backup-dir` or RITORNEL_BACKUP_DIR, or, if this is that \
-                 data directory moved or restored to a new place, put {ours} on the first line \
-                 of {marker}",
-                place = place.display(),
-                owner = owner.display(),
-                ours = ours.display(),
-                marker = place.join(OWNER_FILE).display(),
+                 this one, {ours}. Give this data directory a backup folder of its own with \
+                 `ritornel-server serve --backup-dir`, RITORNEL_BACKUP_DIR or backup_dir in \
+                 config.toml. If this data directory replaces that one, moved or restored to a \
+                 new place, put {ours} on the first line of {marker} instead",
+                place = plain_path(place).display(),
+                owner = plain_path(owner).display(),
+                ours = plain_path(ours).display(),
+                marker = plain_path(&place.join(OWNER_FILE)).display(),
+            ),
+            Self::Unclear { place, why } => write!(
+                f,
+                "cannot tell whose backups the backup folder {place} holds: {why}. Put the path of \
+                 the data directory whose backups it holds on the first line of {marker}, or give \
+                 this data directory a backup folder of its own with `ritornel-server serve \
+                 --backup-dir`, RITORNEL_BACKUP_DIR or backup_dir in config.toml",
+                place = plain_path(place).display(),
+                marker = plain_path(&place.join(OWNER_FILE)).display(),
             ),
             Self::Busy => f.write_str("a backup is already being taken"),
             Self::Io {
@@ -259,8 +275,8 @@ impl Backups {
 
 /// Writes a backup into a place named for backups: one that is there,
 /// outside the data directory, and that holds no other data directory's
-/// backups. After it, the place names this data directory as the one whose
-/// backups it holds, if it did not already.
+/// backups. A place that is no one's yet is claimed first, and given up
+/// again if the backup fails.
 fn to_place(
     dir: &DataDir,
     place: &Path,
@@ -272,25 +288,57 @@ fn to_place(
     if !place.is_dir() {
         return Err(BackupError::Missing(place.to_owned()));
     }
-    let ours = resolved(dir.root());
-    let named = match owner(place)? {
-        Owner::Named(owner) | Owner::Inferred(owner) if !same_dir(&owner, &ours) => {
-            return Err(BackupError::Foreign {
-                place: place.to_owned(),
-                owner,
-                ours,
-            });
+    let claimed = claim(place, &resolved(dir.root()))?;
+    write(dir, place, at_ms, reason, about).inspect_err(|_| {
+        if claimed {
+            // The place is left as it was found: no one's.
+            let _ = std::fs::remove_file(place.join(OWNER_FILE));
+            let _ = sync_dir(place);
         }
-        Owner::Named(_) => true,
-        Owner::Inferred(_) | Owner::Unknown => false,
-    };
-    let taken = write(dir, place, at_ms, reason, about)?;
-    if !named && let Err(error) = name_owner(place, &ours) {
-        // The backup is whole. Without the file, the place is still known
-        // as this data directory's by the backup just written.
-        warn!(%error, "the backup folder could not be marked as this data directory's");
+    })
+}
+
+/// Makes sure `place` holds the backups of the data directory `ours`, as
+/// resolved, and answers whether this call is what made it so. A place
+/// that holds another's is refused, before anything is written in it.
+fn claim(place: &Path, ours: &Path) -> Result<bool, BackupError> {
+    match owner(place)? {
+        Owner::Named(owner) | Owner::Inferred(owner) if !same_dir(&owner, ours) => {
+            return Err(foreign(place, owner, ours));
+        }
+        Owner::Named(_) => return Ok(false),
+        Owner::Inferred(_) | Owner::Unknown => {}
     }
-    Ok(taken)
+    match name_owner(place, ours) {
+        Ok(()) => Ok(true),
+        // Another writer named its owner since: the place is this data
+        // directory's only if it named this one.
+        Err(BackupError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            match owner(place)? {
+                Owner::Named(owner) if same_dir(&owner, ours) => Ok(false),
+                Owner::Named(owner) | Owner::Inferred(owner) => Err(foreign(place, owner, ours)),
+                Owner::Unknown => Err(unclear(place, format!("{OWNER_FILE} came and went"))),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn foreign(place: &Path, owner: PathBuf, ours: &Path) -> BackupError {
+    BackupError::Foreign {
+        place: place.to_owned(),
+        owner,
+        ours: ours.to_owned(),
+    }
+}
+
+fn unclear(place: &Path, why: String) -> BackupError {
+    BackupError::Unclear {
+        place: place.to_owned(),
+        why,
+    }
 }
 
 /// Whose backups a place holds.
@@ -301,94 +349,139 @@ enum Owner {
     /// With no [`OWNER_FILE`], as older versions left a place: the data
     /// directory of the earliest backup in it.
     Inferred(PathBuf),
-    /// No one's yet.
+    /// No one's yet: no [`OWNER_FILE`] and no backup.
     Unknown,
 }
 
+/// Whose backups `place` holds. Whatever leaves that in doubt is an error,
+/// never taken for a place that is no one's.
 fn owner(place: &Path) -> Result<Owner, BackupError> {
     let file = place.join(OWNER_FILE);
-    match std::fs::read(&file) {
-        Ok(text) => {
-            let text = String::from_utf8_lossy(&text);
-            // As an editor may leave it: a byte-order mark, or `\r\n`.
-            let first = text
-                .trim_start_matches('\u{feff}')
-                .lines()
-                .next()
-                .unwrap_or_default();
-            if first.is_empty() {
-                return Err(BackupError::Io {
-                    doing: "read a data directory from",
-                    path: file,
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "its first line is empty",
-                    ),
-                });
-            }
-            return Ok(Owner::Named(PathBuf::from(first)));
-        }
+    match std::fs::symlink_metadata(&file) {
+        Ok(found) if found.is_file() => return named(place, &file).map(Owner::Named),
+        // A link, even one that leads nowhere, or a folder.
+        Ok(_) => return Err(unclear(place, format!("{OWNER_FILE} is not a plain file"))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(io("read", &file)(error)),
     }
-    // Each backup's name begins with when it was taken, so the first name
-    // is the earliest.
-    let mut names: Vec<String> = std::fs::read_dir(place)
-        .map_err(io("read", place))?
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| name.starts_with("ritornel-backup-"))
-        .collect();
-    names.sort();
-    for name in names {
-        let Ok(text) = std::fs::read(place.join(&name).join("backup.json")) else {
-            continue;
-        };
-        let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&text) else {
-            continue;
-        };
-        if let Some(from) = manifest.get("from").and_then(serde_json::Value::as_str) {
-            return Ok(Owner::Inferred(PathBuf::from(from)));
-        }
+    inferred(place)
+}
+
+/// The data directory on the first line of [`OWNER_FILE`], as an editor
+/// may leave it: after a byte-order mark, and ending in `\r\n`.
+fn named(place: &Path, file: &Path) -> Result<PathBuf, BackupError> {
+    let bytes = std::fs::read(file).map_err(io("read", file))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| unclear(place, format!("{OWNER_FILE} is not UTF-8 text")))?;
+    let first = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .next()
+        .unwrap_or_default();
+    if first.trim().is_empty() {
+        return Err(unclear(
+            place,
+            format!("{OWNER_FILE} names no data directory on its first line"),
+        ));
     }
-    Ok(Owner::Unknown)
+    let path = PathBuf::from(first);
+    if !path.is_absolute() {
+        return Err(unclear(
+            place,
+            format!("{OWNER_FILE} names {first}, which is not an absolute path"),
+        ));
+    }
+    Ok(path)
+}
+
+/// The data directory of the earliest backup in `place`, by when each was
+/// taken, for a place older versions wrote to without [`OWNER_FILE`].
+fn inferred(place: &Path) -> Result<Owner, BackupError> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(place).map_err(io("read", place))? {
+        let entry = entry.map_err(io("read", place))?;
+        let path = entry.path();
+        let is_backup = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("ritornel-backup-"));
+        if !is_backup || !path.is_dir() {
+            continue;
+        }
+        let (at_ms, from) = taken_from(&path)
+            .map_err(|why| unclear(place, format!("{}: {why}", plain_path(&path).display())))?;
+        found.push((at_ms, path, from));
+    }
+    found.sort();
+    let Some((earliest, _, from)) = found.first() else {
+        return Ok(Owner::Unknown);
+    };
+    let from_one = found
+        .iter()
+        .take_while(|(at_ms, ..)| at_ms == earliest)
+        .all(|(.., other)| resolved(other) == resolved(from));
+    if !from_one {
+        return Err(unclear(
+            place,
+            "its earliest backups were taken at the same moment from different data directories"
+                .to_owned(),
+        ));
+    }
+    Ok(Owner::Inferred(from.clone()))
+}
+
+/// When the backup in `folder` was taken, and from which data directory,
+/// as its `backup.json` says.
+fn taken_from(folder: &Path) -> Result<(i64, PathBuf), String> {
+    let text = std::fs::read(folder.join("backup.json"))
+        .map_err(|error| format!("cannot read backup.json: {error}"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&text)
+        .map_err(|error| format!("backup.json is not JSON: {error}"))?;
+    let at_ms = manifest
+        .get("takenAtMs")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or("backup.json does not say when it was taken")?;
+    let from = manifest
+        .get("from")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .filter(|from| from.is_absolute())
+        .ok_or("backup.json does not name the data directory it was taken from")?;
+    Ok((at_ms, from))
 }
 
 /// Whether `path`, as the system resolves it now, is the data directory
 /// `ours`, already resolved.
 fn same_dir(path: &Path, ours: &Path) -> bool {
-    resolved(path).to_string_lossy() == ours.to_string_lossy()
+    resolved(path) == ours
 }
 
-/// Writes [`OWNER_FILE`] in `place`, naming `ours`, whole or not at all.
+/// Writes [`OWNER_FILE`] in `place`, naming `ours`, if there is none: it
+/// is made only if it is not there, and never written over. On an error
+/// nothing of it is left but one another writer made.
 fn name_owner(place: &Path, ours: &Path) -> Result<(), BackupError> {
+    use std::io::Write;
+    let shown = plain_path(ours);
+    let Some(line) = shown.to_str().filter(|line| !line.contains(['\n', '\r'])) else {
+        return Err(unclear(
+            place,
+            format!(
+                "this data directory's path, {}, cannot be written on one line of {OWNER_FILE}",
+                shown.display()
+            ),
+        ));
+    };
     let file = place.join(OWNER_FILE);
-    let text = format!("{}\n{OWNER_NOTE}", ours.display());
-    let mut written = None;
-    for n in 1..=SAME_SECOND {
-        let partial = place.join(format!(".{OWNER_FILE}.{n}.partial"));
-        match write_synced(&partial, text.as_bytes()) {
-            Ok(()) => {
-                written = Some(partial);
-                break;
-            }
-            Err(BackupError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                let _ = std::fs::remove_file(&partial);
-                return Err(error);
-            }
-        }
-    }
-    let partial = written.ok_or_else(|| BackupError::Io {
-        doing: "name a new file in",
-        path: place.to_owned(),
-        source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
-    })?;
-    if let Err(error) = rename_dir(&partial, &file) {
-        let _ = std::fs::remove_file(&partial);
-        return Err(io("write", &file)(error));
-    }
-    sync_dir(place).map_err(io("sync", place))
+    let mut made = create_private_file(&file).map_err(io("create", &file))?;
+    let written = made
+        .write_all(format!("{line}\n{OWNER_NOTE}").as_bytes())
+        .and_then(|()| made.sync_all())
+        .and_then(|()| sync_dir(place));
+    drop(made);
+    written.map_err(|error| {
+        let _ = std::fs::remove_file(&file);
+        io("write", &file)(error)
+    })
 }
 
 /// Whether opening a database would migrate it: [`pending_migrations`],
@@ -450,7 +543,20 @@ pub(crate) fn before_migrations(
         }
     }
     let rollback = dir.backups();
+    // A `backups/` that leads out of the data directory, as a link to
+    // the folder just refused would, is not written through.
+    let leads_out = || crate::Error::Io {
+        doing: "copy the databases before migrating them into",
+        path: rollback.clone(),
+        source: std::io::Error::other("it leads out of the data directory"),
+    };
+    if !is_inside(&rollback, dir.root()) {
+        return Err(leads_out());
+    }
     create_private_dir(&rollback)?;
+    if !is_inside(&rollback, dir.root()) {
+        return Err(leads_out());
+    }
     let kept = write(dir, &rollback, at_ms, reason, about).map_err(|error| crate::Error::Io {
         doing: "copy the databases before migrating them into",
         path: rollback.clone(),
@@ -527,7 +633,9 @@ fn resolved(path: &Path) -> PathBuf {
                 rest.push(last);
                 existing = parent;
             }
-            _ => break PathBuf::new(),
+            // A root that is not there, such as a drive not connected,
+            // is kept as it is.
+            _ => break existing.to_path_buf(),
         }
     };
     let mut resolved = base;
@@ -933,9 +1041,11 @@ mod tests {
         let scratch = Scratch::new();
         let place = scratch.path().join("shared");
         std::fs::create_dir(&place).unwrap();
-        // Two servers on one data directory, one after the other, write
-        // as two writers in one server do.
+        // Two writers backing up one data directory, as servers on it
+        // one after the other do, into a place that is already its.
         let dir = data(&scratch);
+        let first = backup(&dir, &place, About::default()).unwrap();
+        std::fs::remove_dir_all(first.path).unwrap();
         let taken: Vec<_> = (0..2)
             .map(|n| {
                 let dir = dir.clone();
@@ -1238,20 +1348,19 @@ mod tests {
         let copy = data(&other);
         // As older versions left it: no file naming its data directory, a
         // backup of the original, and a later one a copy wrote there.
-        for (name, from) in [
-            ("ritornel-backup-2025-01-01-000000", original.root()),
-            (
-                "ritornel-backup-2025-06-01-000000-before-migration",
-                copy.root(),
-            ),
-        ] {
-            std::fs::create_dir(place.join(name)).unwrap();
-            std::fs::write(
-                place.join(name).join("backup.json"),
-                serde_json::to_vec(&json!({ "from": from.to_string_lossy() })).unwrap(),
-            )
-            .unwrap();
-        }
+        // The copy's sorts first by name, as an on-demand backup sorts
+        // before one taken before a migration in the same second, but it
+        // was taken later.
+        legacy(
+            &place,
+            "ritornel-backup-2025-01-01-000000",
+            json!({ "takenAtMs": 2_000, "from": copy.root() }),
+        );
+        legacy(
+            &place,
+            "ritornel-backup-2025-01-01-000000-before-migration",
+            json!({ "takenAtMs": 1_000, "from": original.root() }),
+        );
         let refused = backup(&copy, &place, About::default()).unwrap_err();
         assert!(matches!(refused, BackupError::Foreign { .. }), "{refused}");
         assert!(!place.join(OWNER_FILE).exists());
@@ -1268,6 +1377,247 @@ mod tests {
             backup(&copy, &place, About::default()),
             Err(BackupError::Foreign { .. })
         ));
+    }
+
+    /// A backup as an older version left it, with only `manifest` in it.
+    fn legacy(place: &Path, name: &str, manifest: serde_json::Value) {
+        std::fs::create_dir(place.join(name)).unwrap();
+        std::fs::write(
+            place.join(name).join("backup.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn two_data_directories_racing_for_an_empty_backup_folder_leave_it_one_owner() {
+        for _ in 0..20 {
+            let scratch = Scratch::new();
+            let place = elsewhere(&scratch);
+            let dirs = [
+                DataDir::prepare(scratch.path().join("one")).unwrap(),
+                DataDir::prepare(scratch.path().join("two")).unwrap(),
+            ];
+            for dir in &dirs {
+                ServerStore::open(&dir.server_db(), Arc::new(SystemClock), Arc::new(OsEntropy))
+                    .unwrap()
+                    .ensure_identity("desk")
+                    .unwrap();
+            }
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let done: Vec<_> = dirs
+                .iter()
+                .cloned()
+                .map(|dir| {
+                    let (place, start) = (place.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        let done = backup(&dir, &place, About::default());
+                        (dir.root().to_owned(), done)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            let won: Vec<_> = done.iter().filter(|(_, done)| done.is_ok()).collect();
+            assert_eq!(won.len(), 1, "{done:?}");
+            let (winner, _) = won[0];
+            for (_, lost) in done.iter().filter(|(_, done)| done.is_err()) {
+                assert!(
+                    matches!(
+                        lost,
+                        Err(BackupError::Foreign { .. } | BackupError::Unclear { .. })
+                    ),
+                    "{lost:?}"
+                );
+            }
+            // Only the winner's backup is there, and the folder is its.
+            let backups = finished(&place);
+            assert_eq!(backups.len(), 1);
+            assert_eq!(manifest_of(&backups[0])["from"], winner.to_str().unwrap());
+            assert!(matches!(
+                owner(&place).unwrap(),
+                Owner::Named(owner) if same_dir(&owner, &resolved(winner))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_first_backup_that_fails_leaves_the_folder_no_ones() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = elsewhere(&scratch);
+        std::fs::remove_file(dir.server_db()).unwrap();
+        let about = About {
+            server_id: Some(Id::from_bytes([0x11; 16])),
+            ..About::default()
+        };
+        assert!(backup(&dir, &place, about).is_err());
+        assert_eq!(std::fs::read_dir(&place).unwrap().count(), 0);
+        // So another data directory may still have it.
+        let other = Scratch::new();
+        backup(&data(&other), &place, About::default()).unwrap();
+    }
+
+    #[test]
+    fn a_backup_folder_older_versions_wrote_to_is_written_to_by_none_while_its_owner_is_in_doubt() {
+        let scratch = Scratch::new();
+        let original = data(&scratch);
+        let other = Scratch::new();
+        let copy = data(&other);
+        let earliest = "ritornel-backup-2025-01-01-000000";
+        type Make<'a> = Box<dyn Fn(&Path) + 'a>;
+        let cases: Vec<(&str, Make<'_>)> = vec![
+            (
+                "cannot read backup.json",
+                Box::new(|place| std::fs::create_dir(place.join(earliest)).unwrap()),
+            ),
+            (
+                "is not JSON",
+                Box::new(|place| {
+                    std::fs::create_dir(place.join(earliest)).unwrap();
+                    std::fs::write(place.join(earliest).join("backup.json"), b"{ not").unwrap();
+                }),
+            ),
+            (
+                "does not say when",
+                Box::new(|place| legacy(place, earliest, json!({ "from": original.root() }))),
+            ),
+            (
+                "does not name the data directory",
+                Box::new(|place| {
+                    legacy(place, earliest, json!({ "takenAtMs": 1_000, "from": "" }));
+                }),
+            ),
+            (
+                "does not name the data directory",
+                Box::new(|place| {
+                    legacy(
+                        place,
+                        earliest,
+                        json!({ "takenAtMs": 1_000, "from": "relative/data" }),
+                    );
+                }),
+            ),
+            (
+                "same moment from different data directories",
+                Box::new(|place| {
+                    legacy(
+                        place,
+                        earliest,
+                        json!({ "takenAtMs": 1_000, "from": original.root() }),
+                    );
+                    legacy(
+                        place,
+                        "ritornel-backup-2025-01-01-000000-2",
+                        json!({ "takenAtMs": 1_000, "from": copy.root() }),
+                    );
+                }),
+            ),
+        ];
+        for (why, make) in cases {
+            let folder = Scratch::new();
+            let place = elsewhere(&folder);
+            // A backup of the original, after the one in doubt.
+            legacy(
+                &place,
+                "ritornel-backup-2025-06-01-000000",
+                json!({ "takenAtMs": 9_000, "from": original.root() }),
+            );
+            make(&place);
+            let before = std::fs::read_dir(&place).unwrap().count();
+            for dir in [&original, &copy] {
+                let refused = backup(dir, &place, About::default()).unwrap_err();
+                assert!(
+                    matches!(refused, BackupError::Unclear { .. }),
+                    "{why}: {refused}"
+                );
+                assert!(refused.to_string().contains(why), "{refused}");
+                assert!(refused.to_string().contains(OWNER_FILE), "{refused}");
+            }
+            assert_eq!(std::fs::read_dir(&place).unwrap().count(), before, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_file_that_names_no_absolute_data_directory_is_written_past_by_none() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let cases: [(&[u8], &str); 4] = [
+            (b"\nsomething\n", "names no data directory"),
+            (b"   \r\n", "names no data directory"),
+            (b"relative/data\n", "not an absolute path"),
+            (b"/data/\xff\xfe\n", "not UTF-8"),
+        ];
+        for (text, why) in cases {
+            let folder = Scratch::new();
+            let place = elsewhere(&folder);
+            std::fs::write(place.join(OWNER_FILE), text).unwrap();
+            let refused = backup(&dir, &place, About::default()).unwrap_err();
+            assert!(matches!(refused, BackupError::Unclear { .. }), "{refused}");
+            assert!(refused.to_string().contains(why), "{refused}");
+            assert!(finished(&place).is_empty());
+            assert_eq!(std::fs::read(place.join(OWNER_FILE)).unwrap(), text);
+        }
+
+        // Nor one that is a folder.
+        let folder = Scratch::new();
+        let place = elsewhere(&folder);
+        std::fs::create_dir(place.join(OWNER_FILE)).unwrap();
+        let refused = backup(&dir, &place, About::default()).unwrap_err();
+        assert!(
+            refused.to_string().contains("not a plain file"),
+            "{refused}"
+        );
+    }
+
+    // A link is made differently on each system, and on Windows only with
+    // a privilege a test does not have.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_naming_the_owner_that_is_a_link_is_written_past_by_none() {
+        let scratch = Scratch::new();
+        let dir = data(&scratch);
+        let place = elsewhere(&scratch);
+        // Even one that leads nowhere, which reading would take for no
+        // file at all.
+        std::os::unix::fs::symlink(scratch.path().join("nowhere"), place.join(OWNER_FILE)).unwrap();
+        let refused = backup(&dir, &place, About::default()).unwrap_err();
+        assert!(
+            refused.to_string().contains("not a plain file"),
+            "{refused}"
+        );
+        assert!(finished(&place).is_empty());
+        assert!(!scratch.path().join("nowhere").exists());
+    }
+
+    // A link is made differently on each system, and on Windows only with
+    // a privilege a test does not have.
+    #[cfg(unix)]
+    #[test]
+    fn a_way_back_that_leads_out_of_the_data_directory_is_not_written_through() {
+        let scratch = Scratch::new();
+        let original = data(&scratch);
+        let place = elsewhere(&scratch);
+        backup(&original, &place, About::default()).unwrap();
+        let other = Scratch::new();
+        let copy = data(&other);
+        // The copy's `backups/` leads to the folder it is refused.
+        std::os::unix::fs::symlink(&place, copy.backups()).unwrap();
+        let Err(error) = before_migrations(&copy, Some(&place), AT, server_pending(), &|_| {})
+        else {
+            panic!("migrated through a link out of the data directory");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("leads out of the data directory"),
+            "{error}"
+        );
+        assert_eq!(finished(&place).len(), 1);
+        assert!(before_migrations(&copy, None, AT, server_pending(), &|_| {}).is_err());
+        assert_eq!(finished(&place).len(), 1);
     }
 
     #[test]
@@ -1314,17 +1664,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_backup_folder_whose_file_names_no_data_directory_is_written_to_by_none() {
-        let scratch = Scratch::new();
-        let dir = data(&scratch);
-        let place = elsewhere(&scratch);
-        std::fs::write(place.join(OWNER_FILE), b"\nsomething\n").unwrap();
-        let refused = backup(&dir, &place, About::default()).unwrap_err();
-        assert!(refused.to_string().contains(OWNER_FILE), "{refused}");
-        assert!(finished(&place).is_empty());
-    }
-
     // A link is made differently on each system, and on Windows only with
     // a privilege a test does not have.
     #[cfg(unix)]
@@ -1355,14 +1694,13 @@ mod tests {
         assert_eq!(finished(&place).len(), 4);
 
         // A backup older versions wrote from the link is the folder's too.
-        let legacy = Scratch::new();
-        let place = elsewhere(&legacy);
-        std::fs::create_dir(place.join("ritornel-backup-2025-01-01-000000")).unwrap();
-        std::fs::write(
-            place.join("ritornel-backup-2025-01-01-000000/backup.json"),
-            serde_json::to_vec(&json!({ "from": by_link.to_string_lossy() })).unwrap(),
-        )
-        .unwrap();
+        let older = Scratch::new();
+        let place = elsewhere(&older);
+        legacy(
+            &place,
+            "ritornel-backup-2025-01-01-000000",
+            json!({ "takenAtMs": 1_000, "from": by_link }),
+        );
         backup(&dir, &place, About::default()).unwrap();
     }
 
