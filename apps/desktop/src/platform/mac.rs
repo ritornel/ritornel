@@ -175,6 +175,9 @@ pub(crate) const FITTING_SHOWS: bool = true;
 /// What a button that shows a folder in Finder says.
 pub(crate) const SHOW_FOLDER: &str = "Show in Finder";
 
+/// What the picker calls the computer the app runs on.
+pub(crate) const THIS_COMPUTER: &str = "This Mac";
+
 /// Makes the window's content `height` points tall, keeping its top where
 /// it is, and shows it if it is hidden (`mac_window.rs`).
 pub(crate) fn fit_window(window: &mut gpui::Window, height: f32, quietly: bool) {

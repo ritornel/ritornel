@@ -239,6 +239,7 @@ pub(crate) struct Settings {
     _model: Subscription,
     _appearance: Subscription,
     _active: Subscription,
+    _looks: Subscription,
 }
 
 impl Settings {
@@ -255,6 +256,8 @@ impl Settings {
             window.refresh();
         });
         let active = cx.observe_window_activation(window, |_, _, cx| cx.notify());
+        // A look chosen here, from a menu that answers later, shows at once.
+        let looks = cx.observe_global::<crate::remember::Looks>(|_, cx| cx.notify());
         if let Ok(held) = std::env::var("RITORNEL_GPUI_APPEARANCE") {
             platform::hold_appearance(window, held == "dark");
         }
@@ -297,6 +300,7 @@ impl Settings {
             _model: followed,
             _appearance: appearance,
             _active: active,
+            _looks: looks,
         }
     }
 

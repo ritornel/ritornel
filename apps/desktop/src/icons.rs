@@ -61,6 +61,24 @@ const ICONS: &[(&str, &str, bool)] = &[
     ("chevron", "M4 6.2 8 10.2l4-4", true),
     ("chevronRight", "M6.2 4l4 4-4 4", true),
     ("menu", "M2.5 4h11M2.5 8h11M2.5 12h11", true),
+    // A place to play: a speaker's cabinet, its cone and its tweeter.
+    (
+        "speaker",
+        "M4.5 1.5h7a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1zM8 7.2a2.6 2.6 0 1 0 0 5.2 2.6 2.6 0 1 0 0-5.2zM8 4.1v.1",
+        true,
+    ),
+    // The volume: silent, up to a third, and above.
+    ("volume0", "M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5z", true),
+    (
+        "volume1",
+        "M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5zM10.4 6.2a2.6 2.6 0 0 1 0 3.6",
+        true,
+    ),
+    (
+        "volume2",
+        "M2.5 6h2.2L8 3.2v9.6L4.7 10H2.5zM10.4 6.2a2.6 2.6 0 0 1 0 3.6M12.3 4.3a5.2 5.2 0 0 1 0 7.4",
+        true,
+    ),
 ];
 
 /// Whole SVG icons outside the 16-point icon set: the Settings toolbar icons

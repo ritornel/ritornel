@@ -2,6 +2,11 @@
 //! what is up next, the calls that change them, optimistic star ratings,
 //! and transient error notices.
 //!
+//! The player followed is this server's own, or another place chosen in the
+//! bar's picker (`places.rs`): then every call names it as `player`, its
+//! events are followed on their own subscription, and the server's own are
+//! let pass.
+//!
 //! The state comes whole on the `playback` topic and the position on
 //! `progress`, carried on between ticks. Every command carries a key of its
 //! own, so sending it again is safe ("Commands, playback, and jobs" in
@@ -15,9 +20,9 @@ use std::time::{Duration, Instant};
 use gpui::{Context, Entity, SharedString, Subscription, Task};
 use ritornel_client::{Error, idempotency_key};
 use ritornel_contract::methods::{
-    AlbumGet, ListClose, ListOpen, Method, PlaybackGet, PlaybackJump, PlaybackPause, PlaybackPlay,
-    PlaybackResume, PlaybackSeek, PlaybackSet, PlaybackSkip, QueueAdd, QueueMove, QueueRemove,
-    QueueWindow, RatingsSet,
+    AlbumGet, EventsSubscribe, EventsUnsubscribe, ListClose, ListOpen, Method, PlaybackGet,
+    PlaybackJump, PlaybackPause, PlaybackPlay, PlaybackResume, PlaybackSeek, PlaybackSet,
+    PlaybackSkip, QueueAdd, QueueMove, QueueRemove, QueueWindow, RatingsSet,
 };
 use ritornel_contract::{
     AlbumGetParams, AlbumRef, ContextKind, ErrorCode, FILTER_VERSION, Filter, Id, ListKind,
@@ -25,8 +30,10 @@ use ritornel_contract::{
     PlaybackJumpParams, PlaybackPlayParams, PlaybackSeekParams, PlaybackSetParams,
     PlaybackSkipParams, PlaybackState, PlaybackStatus, Predicate, ProgressEvent, Query,
     QueueAddParams, QueueEntry, QueueMoveParams, QueueOrder, QueuePlace, QueueRemoveParams,
-    QueueWindowParams, RatingSetParams, Repeat, SkipDirection, Sort, SortKey, ViewParams,
+    QueueWindowParams, RatingSetParams, Repeat, SkipDirection, Sort, SortKey, Topic, TopicsParams,
+    TrackSummary, ViewParams,
 };
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::link::{Link, LinkEvent};
 use crate::net::Net;
@@ -169,8 +176,11 @@ pub(crate) fn move_to(place: QueuePlace, moving: &[Id]) -> Option<QueuePlace> {
 /// conflict, which says nothing: Up next is read again instead.
 fn said(error: &Error) -> Option<&'static str> {
     Some(match error {
+        // Another place's trouble is said briefly: the bar names the place.
+        Error::Call(rpc) if reason(rpc) == Some("player_unreachable") => "Out of reach right now",
+        Error::Call(rpc) if reason(rpc) == Some("player_busy") => "Busy. Try again in a moment",
         Error::Call(rpc) => match rpc.data.code {
-            ErrorCode::Unsupported => "This server has no player",
+            ErrorCode::Unsupported => "There’s no player there",
             ErrorCode::Unavailable => "The server cannot play that now",
             ErrorCode::NotFound => "That is no longer in the library",
             ErrorCode::Conflict => return None,
@@ -180,6 +190,62 @@ fn said(error: &Error) -> Option<&'static str> {
         _ => "That did not work",
     })
 }
+
+/// The `reason` an error gives, if any.
+pub(crate) fn reason(rpc: &ritornel_contract::RpcError) -> Option<&str> {
+    rpc.data
+        .details
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+}
+
+/// How long a volume set here is shown over the place's own reports of
+/// it, until one says the same: those sent before it arrive late.
+const VOLUME_SETTLES: Duration = Duration::from_millis(1500);
+
+/// The sound set here last, and when: a volume, or none for muting alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SoundSet {
+    /// Counts the sets, so that one is told from a later one alike.
+    id: u64,
+    volume: Option<f64>,
+    muted: bool,
+    /// When it was answered, or sent while it is not yet.
+    at: Instant,
+}
+
+/// What the player's state says of its sound, given what was set here
+/// last and how many sets are still unanswered: while any is, and for a
+/// while after the last is answered, a report of another sound is one sent
+/// before it, and what was set stands. Whether the set is still waited for.
+fn settled(
+    state: &mut PlaybackState,
+    set: Option<SoundSet>,
+    unanswered: usize,
+    now: Instant,
+) -> bool {
+    let Some(set) = set else {
+        return false;
+    };
+    let same = set
+        .volume
+        .is_none_or(|volume| (state.volume - volume).abs() < 1e-6)
+        && state.muted == set.muted;
+    if unanswered == 0 && (same || now.duration_since(set.at) >= VOLUME_SETTLES) {
+        return false;
+    }
+    if let Some(volume) = set.volume {
+        state.volume = volume;
+    }
+    state.muted = set.muted;
+    true
+}
+
+/// The topics followed for another place.
+const PLACE_TOPICS: [Topic; 3] = [Topic::Playback, Topic::Progress, Topic::Queue];
+
+/// How long to wait before asking again to follow a place's events.
+const FOLLOW_AGAIN: Duration = Duration::from_secs(2);
 
 /// Pending clicks take precedence over a receipt, then the stars in the row.
 #[derive(Default)]
@@ -237,7 +303,11 @@ impl Ratings {
     }
 }
 
-fn keep_state(kept: &mut Option<PlaybackState>, state: PlaybackState) -> Option<&PlaybackState> {
+/// Takes a state unless it is no newer than the one held.
+fn keep_state(
+    kept: &mut Option<PlaybackState>,
+    state: PlaybackState,
+) -> Option<&mut PlaybackState> {
     if kept
         .as_ref()
         .is_some_and(|previous| state.revision <= previous.revision)
@@ -247,8 +317,85 @@ fn keep_state(kept: &mut Option<PlaybackState>, state: PlaybackState) -> Option<
     Some(kept.insert(state))
 }
 
+/// Keeps a session following the events of the place `wanted` names, and
+/// of no other, telling `followed` each place once it is followed. It ends,
+/// letting the last place go, when `wanted`'s sender is dropped.
+async fn follow_places(
+    client: Arc<ritornel_client::Client>,
+    mut wanted: watch::Receiver<Option<Id>>,
+    followed: mpsc::UnboundedSender<Id>,
+) {
+    let topics = |player| TopicsParams {
+        player: Some(player),
+        topics: PLACE_TOPICS.to_vec(),
+    };
+    let mut held: Option<Id> = None;
+    loop {
+        let want = *wanted.borrow_and_update();
+        if want != held {
+            if let Some(old) = held.take() {
+                let _ = client.call::<EventsUnsubscribe>(&topics(old)).await;
+            }
+            if let Some(new) = want {
+                if client.call::<EventsSubscribe>(&topics(new)).await.is_ok() {
+                    held = Some(new);
+                    let _ = followed.send(new);
+                } else {
+                    tokio::select! {
+                        () = tokio::time::sleep(FOLLOW_AGAIN) => {}
+                        changed = wanted.changed() => if changed.is_err() { return },
+                    }
+                }
+            }
+            continue;
+        }
+        if wanted.changed().await.is_err() {
+            if let Some(old) = held {
+                let _ = client.call::<EventsUnsubscribe>(&topics(old)).await;
+            }
+            return;
+        }
+    }
+}
+
 pub(crate) struct Player {
     net: Option<Arc<Net>>,
+    /// The place played on, from `players.list`, or `None` for this
+    /// server's own player.
+    target: Option<Id>,
+    /// Counts changes of place and session: an answer for an earlier one
+    /// is dropped.
+    generation: u64,
+    /// The place whose events this session follows (`follow`), and what
+    /// reads its state once it is followed.
+    following: Option<(watch::Sender<Option<Id>>, Task<()>)>,
+    /// The sound last set here, until the place says the same.
+    volume_set: Option<SoundSet>,
+    /// Whether the state shown is the place left's, kept through a move
+    /// until the new place's first report replaces it.
+    stale: bool,
+    /// The song shown through a move, by its entry: the new place's first
+    /// reports of that entry may not name it yet.
+    kept_track: Option<(Id, TrackSummary, Option<u64>)>,
+    /// Whether a move is under way: the place it leaves may say it is
+    /// empty before the move is answered, and that is held back here, to
+    /// be shown only if the move fails.
+    moving: bool,
+    held_back: Option<PlaybackState>,
+    /// Sound sets not yet answered.
+    sounds_unanswered: usize,
+    /// Counts the sound sets (`SoundSet::id`).
+    sound_sets: u64,
+    /// Reads the state again after a read failed while the song kept
+    /// through a move waits on it.
+    read_again_later: Option<Task<()>>,
+    /// Ends when the last volume sent has been answered: the next waits
+    /// for it, so the place hears them in order.
+    volume_sent: Option<oneshot::Receiver<()>>,
+    /// Reads the state again if the volume set is never confirmed.
+    volume_check: Option<Task<()>>,
+    /// Whether the place is out of reach: the clock holds.
+    pub out_of_reach: bool,
     /// The player's state, whole, or `None` before it is read or on a server with none.
     pub state: Option<PlaybackState>,
     tick: Tick,
@@ -288,9 +435,16 @@ impl Player {
             LinkEvent::Connected(net) => {
                 player.state = None;
                 player.end_wait();
+                player.stale = false;
+                player.sounds_unanswered = 0;
                 player.rated = Ratings::default();
+                player.generation += 1;
+                player.volume_set = None;
+                player.volume_sent = None;
                 player.net = Some(Arc::clone(net));
                 player.say_of_hub(net, cx);
+                // A new session follows nothing of another place's yet.
+                player.follow(cx);
                 player.read(cx);
             }
             // The same session: nothing it read has changed, but what it
@@ -301,13 +455,21 @@ impl Player {
             }
             LinkEvent::Away => {
                 player.net = None;
+                player.generation += 1;
+                player.following = None;
+                player.volume_sent = None;
                 player.rated = Ratings::default();
                 player.state = None;
                 player.end_wait();
+                player.stale = false;
+                player.sounds_unanswered = 0;
                 player.tick.playing = false;
                 player.ticker = None;
                 cx.notify();
             }
+            // Only the place followed: the others' events pass.
+            LinkEvent::Server(event)
+                if event.topic().is_per_player() && event.player() != player.target => {}
             LinkEvent::Server(ritornel_contract::Event::Playback(event)) => {
                 player.took(event.state.clone(), cx);
             }
@@ -335,6 +497,20 @@ impl Player {
         });
         let mut player = Self {
             net: None,
+            target: None,
+            generation: 0,
+            following: None,
+            volume_set: None,
+            stale: false,
+            kept_track: None,
+            moving: false,
+            held_back: None,
+            sounds_unanswered: 0,
+            sound_sets: 0,
+            read_again_later: None,
+            volume_sent: None,
+            volume_check: None,
+            out_of_reach: false,
             state: None,
             tick: Tick {
                 position_ms: 0,
@@ -408,10 +584,11 @@ impl Player {
             .map(|track| track.appearance_id)
     }
 
-    /// Where the playing entry is now, carried on between ticks.
+    /// Where the playing entry is now, carried on between ticks, and held
+    /// while the place is out of reach.
     pub(crate) fn position(&self) -> u64 {
         let duration = self.state.as_ref().and_then(|state| state.duration_ms);
-        if self.tick.playing {
+        if self.tick.playing && !self.out_of_reach {
             carried(self.tick.position_ms, self.tick.at.elapsed(), duration)
         } else {
             self.tick.position_ms
@@ -421,23 +598,36 @@ impl Player {
     fn read(&mut self, cx: &mut Context<Self>) {
         let Some(net) = self.net.clone() else { return };
         let client = Arc::clone(&net.client);
+        let target = self.target;
+        let generation = self.generation;
         let read = net.rt().spawn(async move {
             client
-                .call::<PlaybackGet>(&PlaybackGetParams::default())
+                .call::<PlaybackGet>(&PlaybackGetParams { player: target })
                 .await
         });
         cx.spawn(async move |this, cx| {
             let answer = read.await;
             this.update(cx, |player, cx| {
-                if !player
-                    .net
-                    .as_ref()
-                    .is_some_and(|current| current.same_session(&net))
-                {
+                // A place left meanwhile, or a session ended, says nothing.
+                if player.generation != generation {
                     return;
                 }
-                if let Ok(Ok(state)) = answer {
-                    player.took(state, cx);
+                match answer {
+                    Ok(Ok(state)) => player.took(state, cx),
+                    // The song kept through a move waits on this read, and a
+                    // place that is paused says nothing more by itself: ask again.
+                    _ if player.stale => {
+                        player.read_again_later = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(FOLLOW_AGAIN).await;
+                            this.update(cx, |player, cx| {
+                                if player.generation == generation && player.stale {
+                                    player.read(cx);
+                                }
+                            })
+                            .ok();
+                        }));
+                    }
+                    _ => {}
                 }
                 if player.open {
                     player.read_up_next(cx);
@@ -454,14 +644,43 @@ impl Player {
             "playback: revision {}, {:?}, entry {:?} at {} ms, queue {}",
             state.revision, state.status, state.entry_id, state.position_ms, state.queue_length
         ));
+        // The place a move leaves may say it is empty before the move is
+        // answered: that waits, to be shown if the move fails.
+        if self.moving && state.entry_id.is_none() {
+            self.held_back = Some(state);
+            return;
+        }
         let before = self.state.as_ref().and_then(|kept| kept.entry_id);
         let was_buffering = self
             .state
             .as_ref()
             .is_some_and(|kept| kept.status == PlaybackStatus::Buffering);
+        // The place left's state gives way to the new place's first, whatever its revision.
+        if std::mem::take(&mut self.stale) {
+            self.state = None;
+        }
         let Some(state) = keep_state(&mut self.state, state) else {
             return;
         };
+        // The song moved keeps its name and cover until the place names it.
+        match &self.kept_track {
+            Some((entry, track, duration))
+                if state.entry_id == Some(*entry) && state.track.is_none() =>
+            {
+                state.track = Some(track.clone());
+                state.duration_ms = state.duration_ms.or(*duration);
+            }
+            Some(_) => self.kept_track = None,
+            None => {}
+        }
+        if !settled(
+            state,
+            self.volume_set,
+            self.sounds_unanswered,
+            Instant::now(),
+        ) {
+            self.volume_set = None;
+        }
         let entry = state.entry_id;
         let buffering = state.status == PlaybackStatus::Buffering;
         self.tick = Tick {
@@ -483,7 +702,10 @@ impl Player {
             "progress: {} at {} ms, playing {}",
             event.entry_id, event.position_ms, event.playing
         ));
-        if Some(event.entry_id) != self.state.as_ref().and_then(|state| state.entry_id) {
+        // The song kept through a move holds still until the place reports it whole.
+        if self.stale
+            || Some(event.entry_id) != self.state.as_ref().and_then(|state| state.entry_id)
+        {
             return;
         }
         self.tick = Tick {
@@ -602,16 +824,23 @@ impl Player {
             return Task::ready(None);
         };
         let client = Arc::clone(&net.client);
+        let generation = self.generation;
         let call = net
             .rt()
             .spawn(async move { client.call::<M>(&params).await });
         cx.spawn(async move |this, cx| match call.await {
             Ok(Ok(result)) => Some(result),
             Ok(Err(error)) => {
-                this.update(cx, |player, cx| match said(&error) {
-                    Some(words) => player.say(words, cx),
-                    // Up next changed under the edit: what it is now is read again.
-                    None => player.read_up_next(cx),
+                this.update(cx, |player, cx| {
+                    // The place it was sent to has been left: nothing is said over another.
+                    if player.generation != generation {
+                        return;
+                    }
+                    match said(&error) {
+                        Some(words) => player.say(words, cx),
+                        // Up next changed under the edit: what it is now is read again.
+                        None => player.read_up_next(cx),
+                    }
                 })
                 .ok();
                 None
@@ -643,7 +872,7 @@ impl Player {
         };
         let sent = self.send::<PlaybackPlay>(
             PlaybackPlayParams {
-                player: None,
+                player: self.target,
                 idempotency_key: key,
                 source,
                 start,
@@ -662,7 +891,7 @@ impl Player {
         }
         let Some(key) = self.key(cx) else { return };
         let params = PlaybackCommandParams {
-            player: None,
+            player: self.target,
             idempotency_key: key,
         };
         if self.playing() {
@@ -679,7 +908,7 @@ impl Player {
         let Some(key) = self.key(cx) else { return };
         self.send::<PlaybackSkip>(
             PlaybackSkipParams {
-                player: None,
+                player: self.target,
                 idempotency_key: key,
                 from_entry_id: from,
                 direction,
@@ -700,7 +929,7 @@ impl Player {
         cx.notify();
         self.send::<PlaybackSeek>(
             PlaybackSeekParams {
-                player: None,
+                player: self.target,
                 idempotency_key: key,
                 entry_id: entry,
                 position_ms,
@@ -714,7 +943,7 @@ impl Player {
         let Some(key) = self.key(cx) else { return };
         self.send::<PlaybackSet>(
             PlaybackSetParams {
-                player: None,
+                player: self.target,
                 idempotency_key: key,
                 volume: None,
                 muted: None,
@@ -724,6 +953,269 @@ impl Player {
             cx,
         )
         .detach();
+    }
+
+    /// Sets the place's volume, from 0 to 1, and unmutes it.
+    pub(crate) fn set_volume(&mut self, volume: f64, cx: &mut Context<Self>) {
+        self.set_sound(Some(volume.clamp(0., 1.)), false, cx);
+    }
+
+    /// Mutes the place, or unmutes it, leaving its volume as it is.
+    pub(crate) fn set_muted(&mut self, muted: bool, cx: &mut Context<Self>) {
+        self.set_sound(None, muted, cx);
+    }
+
+    /// Sets the place's sound and shows it at once. Each set waits for the
+    /// one before, so the place hears them in order. Reports of another
+    /// sound that follow soon after were sent before it, and pass
+    /// (`settled`); if none confirms it, or it fails, the state is read
+    /// again.
+    fn set_sound(&mut self, volume: Option<f64>, muted: bool, cx: &mut Context<Self>) {
+        if self.stale {
+            return;
+        }
+        let (Some(state), Some(net)) = (self.state.as_mut(), self.net.clone()) else {
+            return;
+        };
+        let Ok(key) = idempotency_key() else {
+            return;
+        };
+        if let Some(volume) = volume {
+            state.volume = volume;
+        }
+        state.muted = muted;
+        self.sound_sets += 1;
+        let set = SoundSet {
+            id: self.sound_sets,
+            volume,
+            muted,
+            at: Instant::now(),
+        };
+        self.volume_set = Some(set);
+        cx.notify();
+        let params = PlaybackSetParams {
+            player: self.target,
+            idempotency_key: key,
+            volume,
+            muted: Some(muted),
+            shuffle: None,
+            repeat: None,
+        };
+        self.sounds_unanswered += 1;
+        let client = Arc::clone(&net.client);
+        let before = self.volume_sent.take();
+        let (sent, answered) = oneshot::channel();
+        self.volume_sent = Some(answered);
+        let call = net.rt().spawn(async move {
+            if let Some(before) = before {
+                let _ = before.await;
+            }
+            let answer = client.call::<PlaybackSet>(&params).await;
+            let _ = sent.send(());
+            answer
+        });
+        let generation = self.generation;
+        cx.spawn(async move |this, cx| {
+            let failed = !matches!(call.await, Ok(Ok(_)));
+            this.update(cx, |player, cx| {
+                if player.generation != generation {
+                    return;
+                }
+                player.sounds_unanswered = player.sounds_unanswered.saturating_sub(1);
+                if failed {
+                    player.say("The volume could not be set", cx);
+                    player.check_sound(set.id, cx);
+                } else if let Some(latest) = player
+                    .volume_set
+                    .as_mut()
+                    .filter(|latest| latest.id == set.id)
+                {
+                    // The last set is answered: its while begins now, and if
+                    // no report confirms it by then, the state is read again.
+                    latest.at = Instant::now();
+                    player.volume_check = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(VOLUME_SETTLES).await;
+                        this.update(cx, |player, cx| {
+                            if player.generation == generation {
+                                player.check_sound(set.id, cx);
+                            }
+                        })
+                        .ok();
+                    }));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reads the state again in place of the sound `set` showed, unless a
+    /// later set or a report has taken its place.
+    fn check_sound(&mut self, set: u64, cx: &mut Context<Self>) {
+        if self.volume_set.is_none_or(|latest| latest.id != set) {
+            return;
+        }
+        self.volume_set = None;
+        self.read_sound(cx);
+    }
+
+    /// Reads the place's sound again, to put right what was shown ahead of
+    /// it: a state of the revision shown gives its volume and muting alone,
+    /// so the read cannot move the clock or the wait back; a newer one is
+    /// taken whole.
+    fn read_sound(&mut self, cx: &mut Context<Self>) {
+        let Some(net) = self.net.clone() else { return };
+        let client = Arc::clone(&net.client);
+        let target = self.target;
+        let generation = self.generation;
+        let read = net.rt().spawn(async move {
+            client
+                .call::<PlaybackGet>(&PlaybackGetParams { player: target })
+                .await
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(read)) = read.await else { return };
+            this.update(cx, |player, cx| {
+                if player.generation != generation || player.volume_set.is_some() {
+                    return;
+                }
+                match &mut player.state {
+                    Some(shown) if shown.revision == read.revision => {
+                        shown.volume = read.volume;
+                        shown.muted = read.muted;
+                        cx.notify();
+                    }
+                    _ => player.took(read, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Reads the place's state again.
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.read(cx);
+    }
+
+    /// A move begins: what the place it leaves says while it is empty is
+    /// held back until the move is answered.
+    pub(crate) fn move_began(&mut self) {
+        self.moving = true;
+    }
+
+    /// The move failed: the place stays, as it now is.
+    pub(crate) fn move_failed(&mut self, cx: &mut Context<Self>) {
+        self.moving = false;
+        if let Some(state) = self.held_back.take() {
+            self.took(state, cx);
+        }
+    }
+
+    /// Whether the state shown is the place left's, until the new place reports.
+    pub(crate) fn stale(&self) -> bool {
+        self.stale
+    }
+
+    /// The place played on: `None` for this server's own player.
+    pub(crate) fn target(&self) -> Option<Id> {
+        self.target
+    }
+
+    /// The count of changes of place and session, for what must not
+    /// outlive one.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Plays on another place from here on, or on this server's own player
+    /// with `None`: its events are followed in place of the last one's,
+    /// and its state, read again, replaces what was shown.
+    pub(crate) fn retarget(&mut self, target: Option<Id>, cx: &mut Context<Self>) {
+        self.switch(target, false, cx);
+    }
+
+    /// Plays on the place the music has just moved to: what was shown
+    /// stays, the clock held, until the place's first report replaces it,
+    /// so the song does not blink out and back between two places.
+    pub(crate) fn moved_to(&mut self, target: Option<Id>, cx: &mut Context<Self>) {
+        self.switch(target, true, cx);
+    }
+
+    fn switch(&mut self, target: Option<Id>, moved: bool, cx: &mut Context<Self>) {
+        if target == self.target {
+            return;
+        }
+        crate::debug(format_args!("player: from {:?} to {target:?}", self.target));
+        self.target = target;
+        self.generation += 1;
+        self.volume_set = None;
+        self.volume_sent = None;
+        self.volume_check = None;
+        self.out_of_reach = false;
+        let kept = moved && self.state.is_some();
+        self.stale = kept;
+        // A wait for the place left's audio is not the new place's.
+        self.end_wait();
+        self.moving = false;
+        self.held_back = None;
+        self.sounds_unanswered = 0;
+        self.kept_track = self
+            .state
+            .as_ref()
+            .filter(|_| kept)
+            .and_then(|state| Some((state.entry_id?, state.track.clone()?, state.duration_ms)));
+        self.tick = Tick {
+            position_ms: if kept { self.position() } else { 0 },
+            at: Instant::now(),
+            playing: false,
+        };
+        self.carry(cx);
+        if !kept {
+            self.state = None;
+            self.up_next = None;
+            self.up_next_version = self.up_next_version.wrapping_add(1);
+        }
+        // A read of the place left that answers late is dropped.
+        self.reading += 1;
+        match &self.following {
+            Some((wanted, _)) => {
+                wanted.send_replace(target);
+            }
+            None => self.follow(cx),
+        }
+        self.read(cx);
+        if self.open {
+            self.read_up_next(cx);
+        }
+        cx.notify();
+    }
+
+    /// Follows the target's events on this session: one task changes what
+    /// the session follows, a change at a time and in order, asking again
+    /// every `FOLLOW_AGAIN` until it works, and lets the last place go when
+    /// the player or the session does. Once a place is followed, its state
+    /// is read again, since it may have changed before.
+    fn follow(&mut self, cx: &mut Context<Self>) {
+        self.following = None;
+        let Some(net) = self.net.clone() else { return };
+        let (wanted, asked) = watch::channel(self.target);
+        let (followed, mut heard) = mpsc::unbounded_channel();
+        net.rt()
+            .spawn(follow_places(Arc::clone(&net.client), asked, followed));
+        let reads = cx.spawn(async move |this, cx| {
+            while let Some(place) = heard.recv().await {
+                let done = this.update(cx, |player, cx| {
+                    if player.target == Some(place) {
+                        player.read(cx);
+                    }
+                });
+                if done.is_err() {
+                    return;
+                }
+            }
+        });
+        self.following = Some((wanted, reads));
     }
 
     pub(crate) fn set_shuffle(&mut self, shuffle: bool, cx: &mut Context<Self>) {
@@ -744,7 +1236,7 @@ impl Player {
         let Some(key) = self.key(cx) else { return };
         self.send::<PlaybackJump>(
             PlaybackJumpParams {
-                player: None,
+                player: self.target,
                 idempotency_key: key,
                 entry_id: entry,
             },
@@ -774,7 +1266,7 @@ impl Player {
             .is_none_or(|state| state.queue_length == 0);
         let sent = self.send::<QueueAdd>(
             QueueAddParams {
-                player: None,
+                player: self.target,
                 idempotency_key: key,
                 source,
                 place,
@@ -820,7 +1312,7 @@ impl Player {
         }
         self.send::<QueueRemove>(
             QueueRemoveParams {
-                player: None,
+                player: self.target,
                 idempotency_key: key,
                 entry_ids: vec![entry],
                 expected_revision: revision,
@@ -850,7 +1342,7 @@ impl Player {
         }
         self.send::<QueueMove>(
             QueueMoveParams {
-                player: None,
+                player: self.target,
                 idempotency_key: key,
                 entry_ids: entries,
                 place,
@@ -868,10 +1360,11 @@ impl Player {
         let asked = self.reading;
         let ratings_revision = self.rated.revision;
         let client = Arc::clone(&net.client);
+        let target = self.target;
         let read = net.rt().spawn(async move {
             client
                 .call::<QueueWindow>(&QueueWindowParams {
-                    player: None,
+                    player: target,
                     offset: 0,
                     limit: Some(UP_NEXT),
                     order: Some(QueueOrder::UpNext),
@@ -1316,6 +1809,42 @@ mod tests {
         assert_eq!(carried(5_000, second, Some(200_000)), 6_000);
         assert_eq!(carried(199_500, second, Some(200_000)), 200_000);
         assert_eq!(carried(5_000, second, None), 6_000);
+    }
+
+    #[test]
+    fn a_set_sound_stands_while_any_set_is_unanswered_and_a_while_after() {
+        let Ok(mut state) = serde_json::from_value::<PlaybackState>(serde_json::json!({
+            "revision": 1, "status": "paused", "positionMs": 0, "volume": 0.2,
+            "muted": false, "shuffle": false, "repeat": "off", "queueRevision": 1,
+            "queueLength": 1, "output": {"name": "null", "mode": "shared", "sampleRateHz": 44100, "channels": 2}
+        })) else {
+            return;
+        };
+        let t0 = Instant::now();
+        let set = SoundSet {
+            id: 2,
+            volume: Some(0.6),
+            muted: false,
+            at: t0,
+        };
+        // A late report of an earlier set, long after, while this one is unanswered.
+        let late = t0 + Duration::from_secs(5);
+        assert!(settled(&mut state, Some(set), 1, late));
+        assert!((state.volume - 0.6).abs() < 1e-9);
+        // Answered: a report of another sound still passes for a while.
+        state.volume = 0.2;
+        assert!(settled(
+            &mut state,
+            Some(set),
+            0,
+            t0 + Duration::from_millis(500)
+        ));
+        // Then the place's word stands, and so does one that confirms it.
+        state.volume = 0.2;
+        assert!(!settled(&mut state, Some(set), 0, late));
+        assert!((state.volume - 0.2).abs() < 1e-9);
+        state.volume = 0.6;
+        assert!(!settled(&mut state, Some(set), 0, t0));
     }
 
     #[test]

@@ -19,7 +19,7 @@ use ritornel_client::Client;
 use ritornel_client::local::LocalServer;
 use ritornel_contract::{
     CONTRACT_VERSION, ClientKind, ErrorCode, Event, HelloParams, Id, MEDIA_TOKEN_PARAM, ServerRole,
-    ServerStatus, Topic, Versions, route,
+    ServerStatus, Topic, Versions, capability, route,
 };
 use tokio::net::TcpStream;
 use tokio::runtime::{Handle, Runtime};
@@ -75,6 +75,9 @@ pub(crate) struct Net {
     pub holds: bool,
     /// On a satellite, its hub, and whether it answers.
     pub hub: Option<ritornel_contract::HubStatus>,
+    /// Whether the server lists places to play (`players.list`), so the
+    /// bar may offer to play somewhere else.
+    pub players: bool,
 }
 
 impl Net {
@@ -96,18 +99,21 @@ impl Net {
             })
             .await?;
         let events = client.take_events();
-        client
-            .subscribe(&[
-                Topic::Servers,
-                // Scans and imports as they run, for Settings.
-                Topic::Jobs,
-                Topic::Library,
-                Topic::List,
-                Topic::Playback,
-                Topic::Progress,
-                Topic::Queue,
-            ])
-            .await?;
+        let players = descriptor.server.has(capability::PLAYERS);
+        let mut topics = vec![
+            Topic::Servers,
+            // Scans and imports as they run, for Settings.
+            Topic::Jobs,
+            Topic::Library,
+            Topic::List,
+            Topic::Playback,
+            Topic::Progress,
+            Topic::Queue,
+        ];
+        if players {
+            topics.push(Topic::Players);
+        }
+        client.subscribe(&topics).await?;
         let token = client.media_token().await?.token;
         // A session of the local owner is `full`, and may read the status.
         let status = client.status().await.ok();
@@ -133,6 +139,7 @@ impl Net {
                     .as_ref()
                     .is_none_or(|status| status.library.is_some()),
                 hub: status.as_ref().and_then(|status| status.hub.clone()),
+                players,
             },
             events,
         ))
@@ -149,6 +156,9 @@ impl Net {
             versions: Some(status.versions.clone()),
             holds: status.library.is_some(),
             hub: status.hub.clone(),
+            // A hub and a satellite list places (`players` in their
+            // descriptor): a server set up as one in this session does too.
+            players: self.players || matches!(status.role, ServerRole::Hub | ServerRole::Satellite),
         }
     }
 
@@ -175,6 +185,7 @@ impl Net {
             versions: None,
             holds: role != ServerRole::Unassigned,
             hub: None,
+            players: false,
         }
     }
 
@@ -208,7 +219,15 @@ impl Net {
                 route: None,
                 problem: None,
             }),
+            players: false,
         }
+    }
+
+    /// The same, on a server that lists places to play, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_players(mut self) -> Self {
+        self.players = true;
+        self
     }
 
     /// The same, reading pictures from `endpoint` at `sizes`, for tests.

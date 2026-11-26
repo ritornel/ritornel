@@ -43,9 +43,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
 use super::{Chrome, Feel};
 
 pub(crate) use super::fallback::{
-    FITTING_SHOWS, KEYS, bring_forward_quietly, choose_folder, dismiss_menu, fit_window,
-    forget_main_window, give_back, hold_appearance, keep_out_of_the_dock, key_text, locale,
-    main_window, pop_up_menu, reduce_motion, scroll_details, start, swiped_back,
+    FITTING_SHOWS, KEYS, THIS_COMPUTER, bring_forward_quietly, choose_folder, dismiss_menu,
+    fit_window, forget_main_window, give_back, hold_appearance, keep_out_of_the_dock, key_text,
+    locale, main_window, pop_up_menu, reduce_motion, scroll_details, start, swiped_back,
 };
 
 /// The bar is the caption, by the system's hit test, and the app draws the

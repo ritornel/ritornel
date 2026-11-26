@@ -251,6 +251,8 @@ pub(crate) struct Shell {
     link: Entity<Link>,
     pub wall: Entity<Wall>,
     pub player: Entity<Player>,
+    /// Where the music plays, and the bar's picker of places.
+    places: Entity<crate::places::Places>,
     bar: Entity<PlayerBar>,
     search: Entity<SearchBox>,
     pages: History<Page>,
@@ -301,7 +303,8 @@ impl Shell {
         let followed = cx.observe(&link, |_, _, cx| cx.notify());
         // The notice, and the song playing marked on the page.
         let heard = cx.observe(&player, |_, _, cx| cx.notify());
-        let bar = cx.new(|cx| PlayerBar::new(link.clone(), player.clone(), cx));
+        let places = cx.new(|cx| crate::places::Places::new(&link, player.clone(), cx));
+        let bar = cx.new(|cx| PlayerBar::new(link.clone(), player.clone(), places.clone(), cx));
         // The bar's cover, or its album's name, opens the album.
         let from_bar = cx.subscribe_in(
             &bar,
@@ -343,6 +346,7 @@ impl Shell {
             link,
             wall,
             player,
+            places,
             bar,
             search,
             pages: History::new(Page::Library),
@@ -1901,7 +1905,11 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|shell, _: &crate::frame::Find, window, cx| {
-                // Search is in the title bar, under Lean back.
+                // Search is in the title bar, under Lean back. It takes the
+                // keys, so the picker of places, which needs them, closes.
+                shell
+                    .places
+                    .update(cx, |places, cx| places.close_picker(cx));
                 shell.close_lean(cx);
                 shell
                     .search
@@ -1909,6 +1917,9 @@ impl Render for Shell {
             }))
             .on_action(
                 cx.listener(|shell, _: &crate::frame::LeanBack, window, cx| {
+                    shell
+                        .places
+                        .update(cx, |places, cx| places.close_picker(cx));
                     shell.toggle_lean(window, cx);
                 }),
             )
@@ -1918,6 +1929,15 @@ impl Render for Shell {
                 cx.listener(|shell, event: &gpui::KeyDownEvent, window, cx| {
                     // Typing in the search field is the field's.
                     if shell.search.read(cx).focused(window, cx) {
+                        return;
+                    }
+                    // The picker's keys while it is open, and ⌥↑ and ⌥↓
+                    // while a volume slider is shown.
+                    if shell
+                        .places
+                        .update(cx, |places, cx| places.key(&event.keystroke, cx))
+                    {
+                        cx.stop_propagation();
                         return;
                     }
                     let keys = &event.keystroke;
