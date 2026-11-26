@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use ritornel_engine::playback::{
-    CHECKPOINT_EVERY_MS, CLOSE_OUTPUT_AFTER_MS, OnDemand, Output, Player, PlayerSetup,
+    CHECKPOINT_EVERY_MS, CLOSE_OUTPUT_AFTER_MS, OnDemand, Output, Player, PlayerSetup, VolumeCurve,
     deliver_listens,
 };
 use ritornel_engine::{
@@ -36,6 +36,8 @@ const IDLE: Duration = Duration::from_secs(60);
 pub struct PlaybackRun {
     /// The output, or `None` for a server with no player.
     pub output: Option<Output>,
+    /// How the player's `0..=1` volume maps to linear output amplitude.
+    pub volume_curve: VolumeCurve,
     /// For the crash test alone: the server aborts once the playing track
     /// passes this position, without saving anything.
     pub fail_at_position_ms: Option<i64>,
@@ -101,7 +103,7 @@ pub(crate) fn restore(
     };
     // The output is opened when the first track is, so a server restored
     // paused opens no device until it is asked to play.
-    let renderer = OnDemand::new(output);
+    let renderer = OnDemand::new(output).with_volume_curve(run.volume_curve);
     match SystemTimekeeper.boot() {
         Some(boot) => debug!(%boot, "listens are stamped with the machine's boot"),
         None => warn!(

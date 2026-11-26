@@ -22,7 +22,7 @@ pub(crate) mod store;
 #[cfg(test)]
 pub(crate) mod tests;
 
-pub use audio::{AudioRenderer, OnDemand, Output};
+pub use audio::{AudioRenderer, OnDemand, Output, VolumeCurve};
 pub use catalog::{Catalog, Copy, TrackDisplay};
 pub use move_store::PendingMove;
 pub use outbox::{

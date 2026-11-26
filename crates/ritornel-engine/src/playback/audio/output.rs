@@ -26,6 +26,60 @@ const RAMP_MS: u32 = 20;
 /// reads of it, which are a tick apart at most.
 pub(crate) const EVENTS: usize = 1024;
 
+/// How a player's `0..=1` volume maps to linear output amplitude.
+///
+/// Both curves map `0.0` to exact silence (`0.0`) and `1.0` to exact unity
+/// (`1.0`). See "Audio pipeline" in docs/internals/playback.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VolumeCurve {
+    /// `v^3`: matches PipeWire and mpv (−18.1 dB at 50%), with finer trim in
+    /// the upper half and a smooth fade to zero.
+    #[default]
+    Cubic,
+    /// 60 dB exponential taper (−3 dB per 5% step above the toe, −30 dB at
+    /// 50%), with a continuous linear toe below `0.1` down to exact `0.0`.
+    Log,
+}
+
+impl VolumeCurve {
+    /// Dynamic range of [`Self::Log`], in decibels, above its bottom toe.
+    const LOG_DB_RANGE: f32 = 60.0;
+
+    /// Level below which [`Self::Log`] tapers linearly to exact silence.
+    const LOG_TOE: f32 = 0.1;
+
+    /// The curve's configuration name (`"cubic"` or `"log"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cubic => "cubic",
+            Self::Log => "log",
+        }
+    }
+
+    /// Converts a `0..=1` player volume to a linear amplitude factor in
+    /// `0..=1`.
+    pub fn gain(self, volume: f32) -> f32 {
+        if volume.is_nan() || volume <= 0.0 {
+            return 0.0;
+        }
+        if volume >= 1.0 {
+            return 1.0;
+        }
+        match self {
+            Self::Cubic => volume * volume * volume,
+            Self::Log => {
+                let exponent = Self::LOG_DB_RANGE / 20.0;
+                if volume >= Self::LOG_TOE {
+                    10_f32.powf((volume - 1.0) * exponent)
+                } else {
+                    let at_toe = 10_f32.powf((Self::LOG_TOE - 1.0) * exponent);
+                    at_toe * (volume / Self::LOG_TOE)
+                }
+            }
+        }
+    }
+}
+
 /// Where a joined track begins in a ring, and the span it plays as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Marker {
@@ -92,7 +146,7 @@ pub(crate) enum Message {
     Play,
     /// Fade out, then hand nothing more until `Play`.
     Pause,
-    /// The player's volume, 0 to 1, ramped to.
+    /// The player's volume as linear amplitude gain, 0 to 1, ramped to.
     Volume(f32),
 }
 
@@ -1023,6 +1077,58 @@ mod tests {
         rig.send(Message::Play);
         assert_eq!(rig.render(&mut out), 20);
         assert_eq!(out, [0.5; 20]);
+    }
+
+    #[test]
+    fn volume_curves_hit_exact_endpoints_and_scale_perceptually() {
+        for curve in [VolumeCurve::Cubic, VolumeCurve::Log] {
+            assert_eq!(curve.gain(0.0), 0.0);
+            assert_eq!(curve.gain(-0.5), 0.0);
+            assert_eq!(curve.gain(f32::NAN), 0.0);
+            assert_eq!(curve.gain(1.0), 1.0);
+            assert_eq!(curve.gain(1.5), 1.0);
+
+            // Strictly monotonic across 0..=1.
+            let mut previous = 0.0_f32;
+            for step in 1..=100 {
+                let gain = curve.gain(step as f32 / 100.0);
+                assert!(
+                    gain > previous,
+                    "{curve:?} step {step}: {gain} <= {previous}"
+                );
+                previous = gain;
+            }
+            assert_eq!(previous, 1.0);
+        }
+
+        // Cubic: v^3 (-18.06 dB at 50%, -60 dB at 10%).
+        assert_eq!(VolumeCurve::Cubic.gain(0.5), 0.125);
+        assert!((20.0 * VolumeCurve::Cubic.gain(0.1).log10() - (-60.0)).abs() < 1e-4);
+
+        // Log: 60 dB exponential taper (-3 dB per 5% step above 0.1), continuous
+        // linear toe from 0.1 down to exact silence.
+        for (level, expected_db) in [
+            (0.95, -3.0),
+            (0.75, -15.0),
+            (0.50, -30.0),
+            (0.25, -45.0),
+            (0.10, -54.0),
+        ] {
+            let db = 20.0 * VolumeCurve::Log.gain(level).log10();
+            assert!(
+                (db - expected_db).abs() < 1e-3,
+                "log at {level}: got {db} dB, want {expected_db} dB"
+            );
+        }
+        // Linear toe below 0.1: halfway to zero is exact half amplitude (-6.02 dB).
+        assert_eq!(
+            VolumeCurve::Log.gain(0.05),
+            VolumeCurve::Log.gain(0.10) * 0.5
+        );
+        // Continuous across the 0.1 toe boundary.
+        let below = VolumeCurve::Log.gain(0.0999);
+        let at_toe = VolumeCurve::Log.gain(0.1);
+        assert!(below < at_toe && (at_toe - below) / at_toe < 0.002);
     }
 
     #[test]

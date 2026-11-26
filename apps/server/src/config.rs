@@ -6,7 +6,8 @@
 //! container needs no file at all. The settings so far are the log level,
 //! the listen address, where backups go, which a migration needs before it
 //! opens a database, the server's name, which a machine nobody sits at can
-//! be given no other way, and the size of a satellite's cache of masters.
+//! be given no other way, the size of a satellite's cache of masters, and
+//! the player's volume curve.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -14,6 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use ritornel_contract::MAX_CLIENT_TEXT;
+use ritornel_engine::playback::VolumeCurve;
 use serde::Deserialize;
 use tracing::Level;
 
@@ -34,6 +36,9 @@ pub(crate) const NAME_VAR: &str = "RITORNEL_NAME";
 
 /// The environment variable that sets the size of the cache of masters.
 pub(crate) const CACHE_SIZE_VAR: &str = "RITORNEL_CACHE_SIZE";
+
+/// The environment variable that sets the player's volume curve.
+pub(crate) const VOLUME_CURVE_VAR: &str = "RITORNEL_VOLUME_CURVE";
 
 /// The port a server listens on when nobody has said and it is free.
 pub(crate) const DEFAULT_PORT: u16 = 4747;
@@ -219,6 +224,8 @@ pub(crate) struct Settings {
     /// The most a satellite's cache of masters pulled from its hub holds,
     /// in bytes. With none it is the default.
     pub(crate) cache_bytes: Option<u64>,
+    /// How the player's `0..=1` volume maps to linear output amplitude.
+    pub(crate) volume_curve: VolumeCurve,
     /// Where each was given.
     pub(crate) origins: Origins,
 }
@@ -253,6 +260,7 @@ pub(crate) struct Flags {
     pub(crate) backup_dir: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) cache_size: Option<String>,
+    pub(crate) volume_curve: Option<String>,
 }
 
 /// `config.toml`. A key it does not know is refused, so a misspelt setting
@@ -269,6 +277,7 @@ struct File {
     backup_dir: Option<String>,
     name: Option<String>,
     cache_size: Option<String>,
+    volume_curve: Option<String>,
 }
 
 /// Where a setting's value came from.
@@ -314,6 +323,8 @@ pub enum ConfigError {
     Name(Origin),
     /// The cache size is not a whole number of MiB or GiB above 0.
     CacheSize(Origin),
+    /// The volume curve is not `cubic` or `log`.
+    VolumeCurve(Origin),
 }
 
 impl fmt::Display for ConfigError {
@@ -354,6 +365,11 @@ impl fmt::Display for ConfigError {
                 "{} must be a whole number of MiB or GiB above 0, such as 512 MiB or 8 GiB",
                 origin.place("--cache-size", CACHE_SIZE_VAR, "cache_size")
             ),
+            Self::VolumeCurve(origin) => write!(
+                f,
+                "{} must be cubic or log",
+                origin.place("--volume-curve", VOLUME_CURVE_VAR, "volume_curve")
+            ),
         }
     }
 }
@@ -368,7 +384,8 @@ impl std::error::Error for ConfigError {
             | Self::BackupRelative(_)
             | Self::BackupInside(_)
             | Self::Name(_)
-            | Self::CacheSize(_) => None,
+            | Self::CacheSize(_)
+            | Self::VolumeCurve(_) => None,
         }
     }
 }
@@ -453,6 +470,14 @@ fn resolve(
             )
         }
         None => None,
+    };
+    let volume_curve = match chosen(
+        flags.volume_curve.as_deref(),
+        env(VOLUME_CURVE_VAR),
+        file.volume_curve,
+    ) {
+        Some((text, origin)) => volume_curve(text.as_deref(), origin)?,
+        None => VolumeCurve::default(),
     };
     let mut transcode = TranscodeConfig::default();
     if let Some((text, origin)) = chosen(
@@ -544,6 +569,7 @@ fn resolve(
         backup_dir,
         name,
         cache_bytes,
+        volume_curve,
         origins,
     })
 }
@@ -623,6 +649,14 @@ fn level(text: Option<&str>, origin: Origin) -> Result<Level, ConfigError> {
         Some("debug") => Ok(Level::DEBUG),
         Some("trace") => Ok(Level::TRACE),
         _ => Err(ConfigError::LogLevel(origin)),
+    }
+}
+
+fn volume_curve(text: Option<&str>, origin: Origin) -> Result<VolumeCurve, ConfigError> {
+    match text.map(str::to_ascii_lowercase).as_deref() {
+        Some("cubic") => Ok(VolumeCurve::Cubic),
+        Some("log") => Ok(VolumeCurve::Log),
+        _ => Err(ConfigError::VolumeCurve(origin)),
     }
 }
 
@@ -1098,6 +1132,7 @@ mod tests {
                 name: None,
                 transcode: Default::default(),
                 cache_bytes: None,
+                volume_curve: VolumeCurve::Cubic,
                 origins: Origins::default(),
             }
         );
@@ -1263,6 +1298,70 @@ mod tests {
                 cache_size: None,
                 ..Origins::default()
             }
+        );
+    }
+
+    fn resolved_volume_curve(
+        flag: Option<&str>,
+        variable: Option<&str>,
+        file: Option<&str>,
+    ) -> Result<VolumeCurve, String> {
+        let variables: Vec<_> = variable
+            .map(|value| (VOLUME_CURVE_VAR, value))
+            .into_iter()
+            .collect();
+        let flags = Flags {
+            volume_curve: flag.map(str::to_owned),
+            ..Flags::default()
+        };
+        resolve(Path::new(ROOT), &flags, &env(&variables), file)
+            .map(|settings| settings.volume_curve)
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn the_volume_curve_defaults_to_cubic_and_follows_the_same_order() {
+        const FILE: &str = "volume_curve = \"log\"\n";
+        assert_eq!(
+            resolved_volume_curve(None, None, None),
+            Ok(VolumeCurve::Cubic)
+        );
+        assert_eq!(
+            resolved_volume_curve(None, None, Some(FILE)),
+            Ok(VolumeCurve::Log)
+        );
+        assert_eq!(
+            resolved_volume_curve(None, Some("cubic"), Some(FILE)),
+            Ok(VolumeCurve::Cubic)
+        );
+        assert_eq!(
+            resolved_volume_curve(Some("LOG"), Some("cubic"), Some(FILE)),
+            Ok(VolumeCurve::Log)
+        );
+        assert_eq!(
+            resolved_volume_curve(None, Some(""), Some(FILE)),
+            Ok(VolumeCurve::Log)
+        );
+    }
+
+    #[test]
+    fn a_volume_curve_other_than_cubic_or_log_is_refused() {
+        assert_eq!(
+            resolved_volume_curve(Some("linear"), None, None),
+            Err("--volume-curve must be cubic or log".to_owned())
+        );
+        assert_eq!(
+            resolved_volume_curve(None, Some("linear"), None),
+            Err("RITORNEL_VOLUME_CURVE must be cubic or log".to_owned())
+        );
+        assert_eq!(
+            resolved_volume_curve(None, None, Some("volume_curve = \"linear\"\n")),
+            Err("volume_curve in config.toml must be cubic or log".to_owned())
+        );
+        assert!(
+            resolved_volume_curve(None, None, Some("volume_curve = 3\n"))
+                .unwrap_err()
+                .starts_with("config.toml:")
         );
     }
 }

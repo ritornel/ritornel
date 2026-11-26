@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use self::decode::{Opened, OutputSpec, Source};
+pub use self::output::VolumeCurve;
 use self::output::{Callback, EVENTS, Feed, Gate, Marker, Message, Shared};
 use crate::playback::renderer::{
     End, Event, FileFacts, Format, Progress, RenderError, Renderer, ReplayGain, ran_on,
@@ -310,6 +311,7 @@ pub struct AudioRenderer {
     shared: Arc<Shared>,
     decoding: Option<Decoding>,
     gain: ReplayGain,
+    volume_curve: VolumeCurve,
     /// Whether the output was last told to play.
     playing: bool,
     /// When it was, on the output's clock.
@@ -350,23 +352,29 @@ impl std::fmt::Debug for Message {
 }
 
 impl AudioRenderer {
-    /// Opens an output.
+    /// Opens an output with the default [`VolumeCurve`].
     pub fn open(output: Output) -> Result<Self, RenderError> {
+        Self::open_with_curve(output, VolumeCurve::default())
+    }
+
+    /// Opens an output using `volume_curve` to scale the player's volume.
+    pub fn open_with_curve(output: Output, volume_curve: VolumeCurve) -> Result<Self, RenderError> {
         match output {
             Output::Null { speed } => {
                 let spec = OutputSpec {
                     rate: 48_000,
                     channels: 2,
                 };
-                Self::null(spec, speed, None, None)
+                Self::null(spec, speed, volume_curve, None, None)
             }
-            Output::Default => Self::open_device(Arc::new(Shared::default())),
+            Output::Default => Self::open_device(Arc::new(Shared::default()), volume_curve),
         }
     }
 
     fn null(
         spec: OutputSpec,
         speed: u32,
+        volume_curve: VolumeCurve,
         tap: Option<null::Tap>,
         hold: Option<Arc<null::Hold>>,
     ) -> Result<Self, RenderError> {
@@ -378,6 +386,7 @@ impl AudioRenderer {
             spec,
             ends,
             shared,
+            volume_curve,
             Box::new(running),
         ))
     }
@@ -386,8 +395,21 @@ impl AudioRenderer {
     /// frame it is handed, for a test to read.
     #[cfg(test)]
     pub(crate) fn tapped(spec: OutputSpec, speed: u32) -> Result<(Self, null::Tap), RenderError> {
+        Self::tapped_with_curve(spec, speed, VolumeCurve::default())
+    }
+
+    /// As [`tapped`](Self::tapped), with a chosen [`VolumeCurve`].
+    #[cfg(test)]
+    pub(crate) fn tapped_with_curve(
+        spec: OutputSpec,
+        speed: u32,
+        volume_curve: VolumeCurve,
+    ) -> Result<(Self, null::Tap), RenderError> {
         let tap = null::Tap::default();
-        Ok((Self::null(spec, speed, Some(Arc::clone(&tap)), None)?, tap))
+        Ok((
+            Self::null(spec, speed, volume_curve, Some(Arc::clone(&tap)), None)?,
+            tap,
+        ))
     }
 
     /// As [`tapped`](Self::tapped), and the output holds once it has
@@ -399,7 +421,13 @@ impl AudioRenderer {
         at: u64,
     ) -> Result<(Self, null::Tap, Arc<null::Hold>), RenderError> {
         let (tap, hold) = (null::Tap::default(), null::Hold::at(at));
-        let renderer = Self::null(spec, speed, Some(Arc::clone(&tap)), Some(Arc::clone(&hold)))?;
+        let renderer = Self::null(
+            spec,
+            speed,
+            VolumeCurve::default(),
+            Some(Arc::clone(&tap)),
+            Some(Arc::clone(&hold)),
+        )?;
         Ok((renderer, tap, hold))
     }
 
@@ -407,13 +435,14 @@ impl AudioRenderer {
         feature = "audio-output",
         any(target_os = "macos", target_os = "linux", windows)
     ))]
-    fn open_device(shared: Arc<Shared>) -> Result<Self, RenderError> {
+    fn open_device(shared: Arc<Shared>, volume_curve: VolumeCurve) -> Result<Self, RenderError> {
         let (running, spec, ends) = device::start(&shared, queues)?;
         Ok(Self::new(
             running.name(),
             spec,
             ends,
             shared,
+            volume_curve,
             Box::new(running),
         ))
     }
@@ -422,7 +451,7 @@ impl AudioRenderer {
         feature = "audio-output",
         any(target_os = "macos", target_os = "linux", windows)
     )))]
-    fn open_device(_shared: Arc<Shared>) -> Result<Self, RenderError> {
+    fn open_device(_shared: Arc<Shared>, _volume_curve: VolumeCurve) -> Result<Self, RenderError> {
         Err(RenderError::new(
             "output",
             "this build has no audio output: it was built without the audio-output feature, or \
@@ -435,6 +464,7 @@ impl AudioRenderer {
         spec: OutputSpec,
         ends: Ends,
         shared: Arc<Shared>,
+        volume_curve: VolumeCurve,
         running: Box<dyn Running>,
     ) -> Self {
         Self {
@@ -444,6 +474,7 @@ impl AudioRenderer {
             shared,
             decoding: None,
             gain: ReplayGain::Off,
+            volume_curve,
             playing: false,
             played_at: 0,
             plays: 0,
@@ -909,7 +940,7 @@ impl Renderer for AudioRenderer {
     }
 
     fn set_volume(&mut self, volume: f32) {
-        self.send(Message::Volume(volume));
+        self.send(Message::Volume(self.volume_curve.gain(volume)));
     }
 
     fn queue_next(
@@ -987,6 +1018,7 @@ impl Drop for AudioRenderer {
 #[derive(Debug)]
 pub struct OnDemand {
     output: Output,
+    volume_curve: VolumeCurve,
     opened: Option<AudioRenderer>,
     gain: ReplayGain,
     volume: f32,
@@ -1002,12 +1034,19 @@ impl OnDemand {
     pub fn new(output: Output) -> Self {
         Self {
             output,
+            volume_curve: VolumeCurve::default(),
             opened: None,
             gain: ReplayGain::Off,
             volume: 1.0,
             said: Vec::new(),
             closed: None,
         }
+    }
+
+    /// Sets the [`VolumeCurve`] used each time the output opens.
+    pub fn with_volume_curve(mut self, volume_curve: VolumeCurve) -> Self {
+        self.volume_curve = volume_curve;
+        self
     }
 
     /// Lets an output go that went away, or whose stream went stale, which
@@ -1061,7 +1100,7 @@ impl Renderer for OnDemand {
         let opened = match &mut self.opened {
             Some(opened) => opened,
             None => {
-                let mut opened = AudioRenderer::open(self.output)?;
+                let mut opened = AudioRenderer::open_with_curve(self.output, self.volume_curve)?;
                 opened.set_volume(self.volume);
                 self.opened.insert(opened)
             }
