@@ -1320,58 +1320,117 @@ fn missing(d: f32) -> f32 {
     0.5 * (1. - erf)
 }
 
+/// Snaps a logical coordinate to an integer device pixel using GPUI's
+/// half-toward-zero rule so shared band boundaries round identically on both
+/// sides of a seam.
+fn snap_dp(logical: f32, scale: f32) -> f32 {
+    let value = logical * scale;
+    (value.abs() - 0.5).ceil().copysign(value)
+}
+
+/// Logical origin and extent for a band running between two snapped
+/// device-pixel cutoffs `start_dp` and `end_dp`.
+fn band_span(start_dp: f32, end_dp: f32, scale: f32) -> (f32, f32) {
+    (start_dp / scale, (end_dp - start_dp).max(0.) / scale)
+}
+
+#[cfg(not(test))]
+fn observe(_name: impl FnOnce() -> String, element: gpui::Div) -> gpui::Div {
+    element
+}
+
+#[cfg(test)]
+fn observe(name: impl FnOnce() -> String, element: gpui::Div) -> gpui::Div {
+    let key = name();
+    element.child(
+        gpui::canvas(
+            move |bounds, _, _| fade_tests::record(key.clone(), bounds),
+            |_, (), _, _| {},
+        )
+        .absolute()
+        .size_full(),
+    )
+}
+
 /// The wash's fade at the window's four edges (`missing`), in bands of the
 /// window's colour: where two edges meet, two bands laid over each other
 /// leave the product of what each lets through, as a Gaussian blur fades at
-/// a corner. Each edge's bands sit inside one flex strip so GPUI's
-/// post-layout edge snapping closes every seam between them at any scale.
-fn edge_fade(width: f32, height: f32, bg: gpui::Rgba) -> Vec<AnyElement> {
+/// a corner. Every seam derives both sides from one snapped device-pixel
+/// cutoff so adjacent bands meet without gap or overlap at any scale.
+fn edge_fade(width: f32, height: f32, scale: f32, bg: gpui::Rgba) -> Vec<AnyElement> {
+    let scale = scale.max(1e-3);
     let with = |alpha: f32| gpui::Rgba { a: alpha, ..bg };
+    let (w_dp, h_dp) = (snap_dp(width, scale), snap_dp(height, scale));
+    let cut = |band: usize| snap_dp(band as f32 * FADE_BAND, scale);
+    let mut bands = Vec::with_capacity(FADE_BANDS * 4);
     for band in 0..FADE_BANDS {
         let near = band as f32 * FADE_BAND;
         let (inner, outer) = (missing(near + FADE_BAND), missing(near));
-        // Top, bottom, left and right: where the band is, which way its
-        // gradient runs, and its alpha at the start and end of that way.
+        let (d0, d1) = (cut(band), cut(band + 1));
+        let (top_y, top_h) = band_span(d0, d1, scale);
+        let (bottom_y, bottom_h) = band_span(h_dp - d1, h_dp - d0, scale);
+        let (left_x, left_w) = band_span(d0, d1, scale);
+        let (right_x, right_w) = band_span(w_dp - d1, w_dp - d0, scale);
+        let far_slot = FADE_BANDS - 1 - band;
+        // Top, bottom, left and right: nominal geometry for `frost::note`,
+        // snapped placement for GPUI, gradient direction, and stops.
         let edges = [
             (
                 0.,
                 near,
                 width,
                 FADE_BAND,
+                None,
+                Some((top_y, top_h)),
                 frost::Toward::Down,
                 outer,
                 inner,
+                ("top", band),
             ),
             (
                 0.,
                 height - near - FADE_BAND,
                 width,
                 FADE_BAND,
+                None,
+                Some((bottom_y, bottom_h)),
                 frost::Toward::Down,
                 inner,
                 outer,
+                ("bottom", far_slot),
             ),
             (
                 near,
                 0.,
                 FADE_BAND,
                 height,
+                Some((left_x, left_w)),
+                None,
                 frost::Toward::Right,
                 outer,
                 inner,
+                ("left", band),
             ),
             (
                 width - near - FADE_BAND,
                 0.,
                 FADE_BAND,
                 height,
+                Some((right_x, right_w)),
+                None,
                 frost::Toward::Right,
                 inner,
                 outer,
+                ("right", far_slot),
             ),
         ];
-        for (x, y, w, h, toward, from, to) in edges {
+        for (x, y, w, h, horiz, vert, toward, from, to, (side, slot)) in edges {
             let rect = gpui::Bounds::new(gpui::point(px(x), px(y)), gpui::size(px(w), px(h)));
+            let angle = if matches!(toward, frost::Toward::Down) {
+                180.
+            } else {
+                90.
+            };
             frost::note(
                 rect,
                 rect,
@@ -1384,99 +1443,20 @@ fn edge_fade(width: f32, height: f32, bg: gpui::Rgba) -> Vec<AnyElement> {
                 },
                 1.,
             );
+            let mut strip = div().absolute().bg(linear_gradient(
+                angle,
+                linear_color_stop(with(from), 0.),
+                linear_color_stop(with(to), 1.),
+            ));
+            strip = match (horiz, vert) {
+                (Some((sx, sw)), None) => strip.top_0().h_full().left(px(sx)).w(px(sw)),
+                (None, Some((sy, sh))) => strip.left_0().w_full().top(px(sy)).h(px(sh)),
+                _ => strip,
+            };
+            bands.push(observe(|| format!("edge-{side}-{slot}"), strip).into_any_element());
         }
     }
-    let reach = FADE_BANDS as f32 * FADE_BAND;
-    let band_alphas = |band: usize| {
-        let near = band as f32 * FADE_BAND;
-        (missing(near + FADE_BAND), missing(near))
-    };
-    let mut top = div()
-        .absolute()
-        .left_0()
-        .top_0()
-        .w_full()
-        .h(px(reach))
-        .flex()
-        .flex_col();
-    let mut bottom = div()
-        .absolute()
-        .left_0()
-        .bottom_0()
-        .w_full()
-        .h(px(reach))
-        .flex()
-        .flex_col();
-    let mut left = div()
-        .absolute()
-        .left_0()
-        .top_0()
-        .w(px(reach))
-        .h_full()
-        .flex()
-        .flex_row();
-    let mut right = div()
-        .absolute()
-        .right_0()
-        .top_0()
-        .w(px(reach))
-        .h_full()
-        .flex()
-        .flex_row();
-    for slot in 0..FADE_BANDS {
-        let (inner, outer) = band_alphas(slot);
-        top = top.child(
-            div()
-                .w_full()
-                .flex_1()
-                .debug_selector(|| format!("edge-top-{slot}"))
-                .bg(linear_gradient(
-                    180.,
-                    linear_color_stop(with(outer), 0.),
-                    linear_color_stop(with(inner), 1.),
-                )),
-        );
-        left = left.child(
-            div()
-                .h_full()
-                .flex_1()
-                .debug_selector(|| format!("edge-left-{slot}"))
-                .bg(linear_gradient(
-                    90.,
-                    linear_color_stop(with(outer), 0.),
-                    linear_color_stop(with(inner), 1.),
-                )),
-        );
-        let (inner, outer) = band_alphas(FADE_BANDS - 1 - slot);
-        bottom = bottom.child(
-            div()
-                .w_full()
-                .flex_1()
-                .debug_selector(|| format!("edge-bottom-{slot}"))
-                .bg(linear_gradient(
-                    180.,
-                    linear_color_stop(with(inner), 0.),
-                    linear_color_stop(with(outer), 1.),
-                )),
-        );
-        right = right.child(
-            div()
-                .h_full()
-                .flex_1()
-                .debug_selector(|| format!("edge-right-{slot}"))
-                .bg(linear_gradient(
-                    90.,
-                    linear_color_stop(with(inner), 0.),
-                    linear_color_stop(with(outer), 1.),
-                )),
-        );
-    }
-    vec![
-        top.into_any_element(),
-        bottom.into_any_element(),
-        left.into_any_element(),
-        right.into_any_element(),
-    ]
+    bands
 }
 
 /// The veil the wash is seen through: the window's colour, thinnest at the
@@ -1489,18 +1469,18 @@ const VEIL: [(f32, f32, f32, f32); 3] = [
     (0.72, 1., 0.90, 0.95),
 ];
 
-/// The veil laid over the wash: one flex column of its bands sized as shares
-/// of the window's height rather than rounded `px` offsets, so GPUI's
-/// post-layout edge snapping closes every seam between bands without leaving
-/// an unveiled 1-pixel line or a double-blended overlap.
-fn veil(width: f32, height: f32, bg: gpui::Rgba) -> AnyElement {
+/// The veil laid over the wash: each band's top and bottom are snapped to a
+/// shared device-pixel cutoff so adjacent bands meet without leaving an
+/// unveiled 1-pixel line or a double-blended overlap at any window size or
+/// display scale.
+fn veil(width: f32, height: f32, scale: f32, bg: gpui::Rgba) -> Vec<AnyElement> {
+    let scale = scale.max(1e-3);
     let with = |alpha: f32| gpui::Rgba { a: alpha, ..bg };
-    let mut column = div().absolute().inset_0().flex().flex_col();
+    let mut bands = Vec::with_capacity(VEIL.len());
     for (index, (from, to, alpha_from, alpha_to)) in VEIL.into_iter().enumerate() {
-        let (top, band) = (height * from, height * (to - from));
         let rect = gpui::Bounds::new(
-            gpui::point(px(0.), px(top)),
-            gpui::size(px(width), px(band)),
+            gpui::point(px(0.), px(height * from)),
+            gpui::size(px(width), px(height * (to - from))),
         );
         frost::note(
             rect,
@@ -1514,21 +1494,27 @@ fn veil(width: f32, height: f32, bg: gpui::Rgba) -> AnyElement {
             },
             1.,
         );
-        let strip = div()
-            .w_full()
-            .debug_selector(|| format!("veil-{index}"))
-            .bg(linear_gradient(
-                180.,
-                linear_color_stop(with(alpha_from), 0.),
-                linear_color_stop(with(alpha_to), 1.),
-            ));
-        column = column.child(if index + 1 == VEIL.len() {
-            strip.flex_1()
-        } else {
-            strip.flex_none().h(gpui::relative(to - from))
-        });
+        let (y0, y1) = (snap_dp(height * from, scale), snap_dp(height * to, scale));
+        let (top, band) = band_span(y0, y1, scale);
+        bands.push(
+            observe(
+                || format!("veil-{index}"),
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(top))
+                    .w_full()
+                    .h(px(band))
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(with(alpha_from), 0.),
+                        linear_color_stop(with(alpha_to), 1.),
+                    )),
+            )
+            .into_any_element(),
+        );
     }
-    column.into_any_element()
+    bands
 }
 
 impl Shell {
@@ -1714,8 +1700,9 @@ impl Render for Shell {
         animating |= self.ebbing.is_some();
         if washed {
             let bg = theme::bg();
-            layers.extend(edge_fade(width, height, bg));
-            layers.push(veil(width, height, bg));
+            let scale = window.scale_factor();
+            layers.extend(edge_fade(width, height, scale, bg));
+            layers.extend(veil(width, height, scale, bg));
         }
 
         // The page left, fading out under the one that arrives: all of it,
@@ -2133,12 +2120,32 @@ impl Render for Shell {
 
 #[cfg(test)]
 mod fade_tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
     use gpui::{
-        Context, InteractiveElement, IntoElement, ParentElement, Pixels, Render, Styled, Window,
-        div, px, size,
+        Bounds, Context, IntoElement, ParentElement, Pixels, Render, Styled, Window, div, px, size,
     };
 
-    use super::{FADE_BANDS, VEIL, edge_fade, missing, veil};
+    use super::{FADE_BAND, FADE_BANDS, VEIL, edge_fade, missing, observe, snap_dp, veil};
+
+    thread_local! {
+        static RECORDED: RefCell<HashMap<String, Bounds<Pixels>>> = RefCell::new(HashMap::new());
+    }
+
+    pub(super) fn record(key: String, bounds: Bounds<Pixels>) {
+        RECORDED.with_borrow_mut(|map| {
+            map.insert(key, bounds);
+        });
+    }
+
+    fn clear_recorded() {
+        RECORDED.with_borrow_mut(HashMap::clear);
+    }
+
+    fn recorded(key: &str) -> Option<Bounds<Pixels>> {
+        RECORDED.with_borrow(|map| map.get(key).copied())
+    }
 
     #[test]
     fn half_the_wash_is_missing_at_the_edge_and_none_three_deviations_in() {
@@ -2154,13 +2161,17 @@ mod fade_tests {
         fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let viewport = window.viewport_size();
             let (width, height) = (f32::from(viewport.width), f32::from(viewport.height));
+            let scale = window.scale_factor();
             let bg = crate::theme::bg();
-            div()
-                .relative()
-                .size_full()
-                .debug_selector(|| "backdrop-root".into())
-                .children(edge_fade(width, height, bg))
-                .child(veil(width, height, bg))
+            observe(
+                || "backdrop-root".to_owned(),
+                div()
+                    .relative()
+                    .size_full()
+                    .overflow_hidden()
+                    .children(edge_fade(width, height, scale, bg))
+                    .children(veil(width, height, scale, bg)),
+            )
         }
     }
 
@@ -2203,34 +2214,50 @@ mod fade_tests {
         debug_assert_eq!(veil_names.len(), VEIL.len());
         debug_assert_eq!(top_names.len(), FADE_BANDS);
 
-        // Sweep window sizes across integer and fractional scales, including
-        // heights like 674, 749, 924 and 999 where rounding `0.38 * h` and
-        // `0.34 * h` independently left a 1-device-pixel gap at `0.72 * h`.
-        let scales = [1.0f32, 1.25, 1.333_333_4, 1.5, 2.0, 3.0];
-        let heights: Vec<f32> = (660..=760).chain(900..=1010).map(|h| h as f32).collect();
+        // Cover integer and fractional scales (including 560 pt @ 2.1x, a
+        // viewport smaller than the 192 pt fade reach, and heights where
+        // rounding 0.38*h and 0.34*h independently split the 0.72*h seam).
+        let scales = [1.0f32, 1.25, 1.333_333_4, 1.5, 2.0, 2.1, 3.0];
+        let mut sizes: Vec<(f32, f32)> = vec![
+            (120., 100.),
+            (860., 560.),
+            (861., 561.),
+            (923., 665.),
+            (1000., 671.),
+            (1001., 674.),
+            (1117., 749.),
+            (1235., 924.),
+            (1400., 999.),
+            (1403., 1003.),
+            (1440., 1009.),
+        ];
+        for h in 660..=685 {
+            sizes.push((860. + (h - 660) as f32 * 7., h as f32));
+        }
+
         for scale in scales {
             cx.simulate_scale_factor_change(scale);
-            for (step, &height) in heights.iter().enumerate() {
-                let width = 860. + (step as f32 % 53.) * 7.;
+            let expected_reach = snap_dp(FADE_BANDS as f32 * FADE_BAND, scale);
+            for &(width, height) in &sizes {
+                clear_recorded();
                 cx.simulate_resize(size(px(width), px(height)));
                 cx.update(|window, _| window.refresh());
                 cx.run_until_parked();
 
-                let root = cx.debug_bounds("backdrop-root");
+                let root = recorded("backdrop-root");
                 assert!(
                     root.is_some(),
                     "backdrop-root missing at {width}x{height} @{scale}x"
                 );
                 let root = root.unwrap_or_default();
-                let bounds_of = |cx: &mut gpui::VisualTestContext, name: &'static str| {
-                    let bounds = cx.debug_bounds(name);
+                let bounds_of = |name: &str| {
+                    let bounds = recorded(name);
                     assert!(
                         bounds.is_some(),
                         "{name} missing at {width}x{height} @{scale}x"
                     );
                     bounds.unwrap_or_default()
                 };
-
                 let assert_same_edge = |a: Pixels, b: Pixels, what: &str| {
                     let (a_dev, b_dev) = (f32::from(a) * scale, f32::from(b) * scale);
                     assert!(
@@ -2240,8 +2267,7 @@ mod fade_tests {
                 };
 
                 // Veil bands partition the full window height seamlessly.
-                let veil_bounds: Vec<_> =
-                    veil_names.iter().map(|&name| bounds_of(cx, name)).collect();
+                let veil_bounds: Vec<_> = veil_names.iter().map(|&name| bounds_of(name)).collect();
                 if let Some(first) = veil_bounds.first() {
                     assert_same_edge(first.top(), root.top(), "veil top");
                 }
@@ -2254,14 +2280,14 @@ mod fade_tests {
                     assert_same_edge(last.bottom(), root.bottom(), "veil bottom");
                 }
 
-                // Edge-fade bands close every seam along all four edges.
+                // Edge-fade bands close every seam and span the full fade reach.
                 for (label, names, vertical, flush_start, flush_end) in [
                     ("top", &top_names, true, true, false),
                     ("bottom", &bottom_names, true, false, true),
                     ("left", &left_names, false, true, false),
                     ("right", &right_names, false, false, true),
                 ] {
-                    let bands: Vec<_> = names.iter().map(|&name| bounds_of(cx, name)).collect();
+                    let bands: Vec<_> = names.iter().map(|&name| bounds_of(name)).collect();
                     if vertical {
                         if flush_start && let Some(first) = bands.first() {
                             assert_same_edge(
@@ -2275,6 +2301,13 @@ mod fade_tests {
                                 last.bottom(),
                                 root.bottom(),
                                 &format!("{label} bottom flush"),
+                            );
+                        }
+                        if let (Some(first), Some(last)) = (bands.first(), bands.last()) {
+                            let span_dp = f32::from(last.bottom() - first.top()) * scale;
+                            assert!(
+                                (span_dp - expected_reach).abs() < 1e-3,
+                                "{label} extent at {width}x{height} @{scale}x: {span_dp} dp vs {expected_reach} dp"
                             );
                         }
                         for pair in bands.windows(2) {
@@ -2295,6 +2328,13 @@ mod fade_tests {
                                 last.right(),
                                 root.right(),
                                 &format!("{label} right flush"),
+                            );
+                        }
+                        if let (Some(first), Some(last)) = (bands.first(), bands.last()) {
+                            let span_dp = f32::from(last.right() - first.left()) * scale;
+                            assert!(
+                                (span_dp - expected_reach).abs() < 1e-3,
+                                "{label} extent at {width}x{height} @{scale}x: {span_dp} dp vs {expected_reach} dp"
                             );
                         }
                         for pair in bands.windows(2) {

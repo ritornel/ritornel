@@ -2353,10 +2353,11 @@ mod tests {
                     .iter()
                     .take_while(|at| Some(at.origin.y) == top)
                     .count();
-                // A row holds every album that fits.
-                assert!(
-                    columns == count || (columns + 1) as f32 * step - 20. > wide,
-                    "{count} albums at {width}: {columns} in the first row, room for more",
+                // A row holds the exact number of albums that fit.
+                let expected = (((wide + 20.) / step).floor() as usize).max(1).min(count);
+                assert_eq!(
+                    columns, expected,
+                    "{count} albums at {width}: expected {expected} in the first row, got {columns}",
                 );
                 // Each row lies level, its albums under the first row's.
                 let first: Vec<_> = covers.iter().take(columns).map(|at| at.origin.x).collect();
