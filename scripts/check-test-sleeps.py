@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 # Checks that a test never sleeps to let something happen. Every
 # `thread::sleep` or `time::sleep` in test code needs a comment beginning
 # `sleep:`, on its line or in the comment right above it, that says why no
@@ -10,14 +9,14 @@
 # `*_tests.rs` or `testing.rs`, and in any other file the item that a `cfg`
 # holding for tests stands on, such as `#[cfg(test)] mod tests { .. }`, to
 # its closing brace, or the `;` or `,` that ends it.
-set -euo pipefail
-cd "$(dirname "$0")/.."
 
-python3 - <<'PY'
+import os
 import pathlib
 import re
 import subprocess
 import sys
+
+os.chdir(pathlib.Path(__file__).resolve().parent.parent)
 
 # A call to sleep, written in full or brought in by `use`.
 SLEEP = re.compile(r"(?<![\w.])(?:\w+::)*sleep(?:_until)?\s*\(")
@@ -96,7 +95,7 @@ def test_lines(lines: list[str]) -> set[int]:
 
 files = subprocess.check_output(
     ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "*.rs"],
-    text=True,
+    encoding="utf-8",
 ).split("\0")
 errors = []
 for name in filter(None, files):
@@ -116,10 +115,9 @@ for name in filter(None, files):
             said.append(lines[above])
             above -= 1
         if not any(REASON.search(text) for text in said):
-            errors.append(f"{path}:{index + 1}: {line.strip()}")
+            errors.append(f"{path.as_posix()}:{index + 1}: {line.strip()}")
 
 if errors:
     print("A sleep in a test needs a `// sleep:` comment saying why no event will do:")
     print("\n".join(f"  {error}" for error in errors))
     sys.exit(1)
-PY

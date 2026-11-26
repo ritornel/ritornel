@@ -14,7 +14,7 @@ ritornel-source ◄── ritornel-lastfm ◄── ritornel-server (feature = "
 ritornel-source ◄── ritornel-musicbrainz ◄── ritornel-server (feature = "musicbrainz")
 ```
 
-This boundary is checked in CI by `scripts/check-deps.sh`:
+This boundary is checked in CI by `scripts/check-deps.py`:
 
 - `ritornel-source` depends on no other workspace crate.
 - `ritornel-lastfm` depends only on `ritornel-source` among workspace crates and never links `rusqlite`.
@@ -61,4 +61,4 @@ Alongside `lastfm` and `musicbrainz`, `ritornel-server` gates `audio-output` and
 ## Later
 
 - `Question::kind` and `includes` leave room for questions other than a disc ID, such as a search by name, on the same trait.
-- `scripts/check-deps.sh` already enforces the one-way isolation pattern for optional crates and `--no-default-features` hub builds so future optional features follow the same boundary.
+- `scripts/check-deps.py` already enforces the one-way isolation pattern for optional crates and `--no-default-features` hub builds so future optional features follow the same boundary.

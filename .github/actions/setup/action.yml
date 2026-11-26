@@ -16,8 +16,9 @@ inputs:
       The tools of mise.toml not to install, as MISE_DISABLE_TOOLS takes
       them. A tool no step uses is not installed: ffmpeg alone is some
       ninety conda packages, and the fixtures it made are committed, so it
-      comes off this list with the first step that needs it.
-    default: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny
+      comes off this list with the first step that needs it. Python runs
+      only the checks in scripts/, which only the `checks` job runs.
+    default: conda:ffmpeg,aqua:EmbarkStudios/cargo-deny,python
   rust-cache:
     description: >-
       The Rust build cache the job uses. `own` restores the job's cache and,

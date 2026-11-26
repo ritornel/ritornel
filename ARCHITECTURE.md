@@ -35,7 +35,7 @@ The main Cargo workspace (`Cargo.toml`) holds eight library crates and two binar
 | `apps/ritornelctl` | Command-line client over `ritornel-client`. |
 | `apps/desktop` | GPUI desktop app (`ritornel-desktop-gpui`), built on `ritornel-client` and `ritornel-contract`. |
 
-Dependencies point strictly one way, enforced by `scripts/check-deps.sh` in CI:
+Dependencies point strictly one way, enforced by `scripts/check-deps.py` in CI:
 
 ```text
 ritornel-contract ◄── ritornel-domain ◄── ritornel-engine ◄── ritornel-server

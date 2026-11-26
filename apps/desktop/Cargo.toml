@@ -2,7 +2,7 @@
 # reaches neither the main workspace's build nor its lock file; the main
 # workspace excludes `apps/desktop`. It depends on the contract and the
 # client, as every client program does, and on nothing of the engine
-# (scripts/check-deps.sh). See docs/internals/desktop.md.
+# (scripts/check-deps.py). See docs/internals/desktop.md.
 [package]
 name = "ritornel-desktop-gpui"
 version = "0.1.0"
