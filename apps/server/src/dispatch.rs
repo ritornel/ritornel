@@ -916,6 +916,19 @@ impl Core {
                 }
             }
         }
+        match method {
+            EventsSubscribe::NAME => {
+                return run::<EventsSubscribe>(params, |p| {
+                    self.change_subscription(session, p, true)
+                });
+            }
+            EventsUnsubscribe::NAME => {
+                return run::<EventsUnsubscribe>(params, |p| {
+                    self.change_subscription(session, p, false)
+                });
+            }
+            _ => {}
+        }
         // Shutdown waits for local handlers to finish using the stores.
         // Calls routed to the hub or another player have already returned.
         let stores = self.stores.read().unwrap_or_else(PoisonError::into_inner);
@@ -934,37 +947,6 @@ impl Core {
                 Ok(ritornel_contract::ServersList {
                     servers: vec![self.info(&lock(&self.this))],
                 })
-            }),
-            EventsSubscribe::NAME => run::<EventsSubscribe>(params, |params| {
-                if session.kind() != SessionKind::Full
-                    && params.topics.contains(&ritornel_contract::Topic::Jobs)
-                {
-                    return Err(RpcError::new(
-                        ErrorCode::Forbidden,
-                        "Job events need a full session. Subscribe without the jobs topic.",
-                    ));
-                }
-                let topics = session.subscribe(&params.topics);
-                if let Some(uplink) = self.uplink()
-                    && params
-                        .topics
-                        .iter()
-                        .any(|topic| crate::uplink::HUB_TOPICS.contains(topic))
-                    && let Some(session) = self.shared(session)
-                {
-                    uplink.subscribe(&session);
-                }
-                Ok(ritornel_contract::Subscriptions { topics })
-            }),
-            EventsUnsubscribe::NAME => run::<EventsUnsubscribe>(params, |params| {
-                let topics = session.unsubscribe(&params.topics);
-                // The hub's events it no longer follows are not sent to it.
-                if let Some(uplink) = self.uplink()
-                    && let Some(session) = self.shared(session)
-                {
-                    uplink.unsubscribe(&session, &params.topics);
-                }
-                Ok(ritornel_contract::Subscriptions { topics })
             }),
             // Each of these may give the hub a folder to watch.
             LibraryCreate::NAME => run::<LibraryCreate>(params, |params| {
@@ -1170,6 +1152,9 @@ impl Core {
             LinkListen::NAME => {
                 run::<LinkListen>(params, |params| self.link_listen(stores, session, params))
             }
+            methods::LinkEvent::NAME => {
+                run::<methods::LinkEvent>(params, |report| self.link_event(session, report))
+            }
             LinkPing::NAME => run::<LinkPing>(params, |params| self.link_ping(session, params)),
             ServerSettingsCall::NAME => {
                 run::<ServerSettingsCall>(params, |_| self.server_settings(stores))
@@ -1224,6 +1209,51 @@ impl Core {
                 format!("{} is in the method table and has no handler", row.name),
             )),
         }
+    }
+
+    fn change_subscription(
+        &self,
+        session: &Session,
+        params: ritornel_contract::TopicsParams,
+        add: bool,
+    ) -> Result<ritornel_contract::Subscriptions, RpcError> {
+        if params.player.is_some() && params.topics.iter().any(|t| !t.is_per_player()) {
+            return Err(RpcError::new(
+                ErrorCode::Invalid,
+                "a player can be named only for playback, progress and queue topics",
+            ));
+        }
+        if add
+            && session.kind() != SessionKind::Full
+            && params.topics.contains(&ritornel_contract::Topic::Jobs)
+        {
+            return Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "Job events need a full session. Subscribe without the jobs topic.",
+            ));
+        }
+        let player = params.player.filter(|p| *p != self.server_id);
+        let topics = session.change_topics(player, &params.topics, add)?;
+        if let Some(uplink) = self.uplink()
+            && let Some(shared) = self.shared(session)
+        {
+            if add {
+                if player.is_some()
+                    || params
+                        .topics
+                        .iter()
+                        .any(|t| crate::uplink::HUB_TOPICS.contains(t))
+                {
+                    uplink.subscribe(&shared, player);
+                }
+            } else {
+                uplink.unsubscribe(&shared, player, &params.topics);
+            }
+        }
+        Ok(ritornel_contract::Subscriptions {
+            player: params.player,
+            topics,
+        })
     }
 
     fn forward_session(
@@ -2290,6 +2320,55 @@ mod tests {
             .unwrap()
             .0;
         core.set_player(player);
+    }
+
+    #[tokio::test]
+    async fn a_slow_hub_gets_a_fresh_snapshot_when_the_player_feed_overflows() {
+        use ritornel_client::Client;
+        use ritornel_contract::LinkPlayerEvent;
+        use std::time::Duration;
+        let (core, _scratch) = core();
+        let core = Arc::new(core);
+        with_player(&core);
+        let session = greeted(&core, SessionKind::Full);
+        let (out, mut requests) = tokio::sync::mpsc::channel(1);
+        let (replies, incoming) = tokio::sync::mpsc::channel(1);
+        let client = Client::over_memory(out, incoming);
+        let hub = async {
+            for (index, topic) in ["playback", "queue", "playback", "queue"]
+                .into_iter()
+                .enumerate()
+            {
+                let frame: Value = serde_json::from_str(&requests.recv().await.unwrap()).unwrap();
+                assert_eq!(frame["params"]["topic"], topic);
+                if index == 0 {
+                    let mut change = key(0xc5);
+                    change["volume"] = json!(0.29);
+                    call(&core, &session, "playback.set", Some(change)).unwrap();
+                    // Hold the response until the state change has fallen out of the live buffer.
+                    for _ in 0..80 {
+                        core.publish_player_event(
+                            None,
+                            LinkPlayerEvent::Began {
+                                appearance_id: Id::from_bytes([5; 16]),
+                                duration_ms: 1000,
+                            },
+                        );
+                    }
+                }
+                if index == 2 {
+                    assert_eq!(frame["params"]["state"]["volume"], 0.29);
+                }
+                replies
+                    .send(json!({"jsonrpc":"2.0","id":frame["id"],"result":{}}).to_string())
+                    .await
+                    .unwrap();
+            }
+        };
+        tokio::select! {
+            () = hub => (),
+            result = crate::uplink::send_player_events(&core,&client, Duration::from_secs(5)) => panic!("feed ended: {result:?}"),
+        }
     }
 
     #[test]

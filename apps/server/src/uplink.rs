@@ -21,7 +21,7 @@
 //! checks that the server there proves it holds the hub's pinned key
 //! before it presents its link session.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
@@ -74,6 +74,13 @@ fn wait_for(method: &str, call_wait: std::time::Duration) -> std::time::Duration
     } else {
         call_wait
     }
+}
+
+/// Subscriptions to send on an existing connection. A new connection always restores all.
+enum Subscribe {
+    OnConnect,
+    Player(Option<Id>),
+    All,
 }
 
 /// A satellite's link to its hub.
@@ -440,7 +447,7 @@ impl Uplink {
             if self.stopped() {
                 return Err(Self::stopping());
             }
-            let client = self.session_client(session, false)?;
+            let client = self.session_client(session, Subscribe::OnConnect)?;
             let (sent, again) = self.ask(&client, method, params.clone());
             let lost =
                 matches!(&sent, Err(error) if !matches!(error, ritornel_client::Error::Call(_)));
@@ -498,8 +505,11 @@ impl Uplink {
     /// hub's events, and need not call first. The hub not answering is
     /// not an error here: the next call says so, and the session is
     /// subscribed once the hub answers.
-    pub(crate) fn subscribe(&self, session: &Arc<Session>) {
-        if self.session_client(session, true).is_err() {
+    pub(crate) fn subscribe(&self, session: &Arc<Session>, player: Option<Id>) {
+        if self
+            .session_client(session, Subscribe::Player(player))
+            .is_err()
+        {
             self.cut.mark(session);
         }
     }
@@ -509,8 +519,9 @@ impl Uplink {
     fn session_client(
         &self,
         session: &Arc<Session>,
-        subscribe: bool,
+        subscribe: Subscribe,
     ) -> Result<Arc<Client>, RpcError> {
+        let _updating = lock(&session.upstream);
         let held = lock(&self.sessions).get(&session.id()).cloned();
         let (client, subscribe) = match held {
             Some(client) => (client, subscribe),
@@ -535,19 +546,25 @@ impl Uplink {
                 }
                 self.runtime.spawn(relay(
                     events,
+                    self.link.hub,
                     Arc::downgrade(session),
                     Arc::downgrade(&client),
                     Arc::clone(&self.sessions),
                     Arc::clone(&self.cut),
                 ));
-                (client, true)
+                (client, Subscribe::All)
             }
         };
         // The topics as they are once connected: one unsubscribed from
         // meanwhile is not asked for.
-        let topics = followed(&session.topics());
-        if subscribe && !topics.is_empty() {
-            let params = serde_json::json!({ "topics": topics });
+        if matches!(subscribe, Subscribe::OnConnect) {
+            return Ok(client);
+        }
+        for (player, topics) in followed(session) {
+            if matches!(subscribe, Subscribe::Player(selected) if selected != player) {
+                continue;
+            }
+            let params = serde_json::json!({ "topics": topics, "player":player });
             match self.ask(&client, "events.subscribe", params) {
                 (Ok(_), _) => {}
                 // The hub refused: asking again would be refused again.
@@ -567,6 +584,7 @@ impl Uplink {
                     }
                     drop(sessions);
                     self.cut.mark(session);
+                    return Err(self.unreachable());
                 }
             }
         }
@@ -627,20 +645,28 @@ impl Uplink {
     /// Tells the hub that the session no longer follows these topics, on
     /// its connection, if it has one: the hub stops sending what would
     /// only be dropped here.
-    pub(crate) fn unsubscribe(&self, session: &Arc<Session>, topics: &[Topic]) {
-        let topics = followed(topics);
+    pub(crate) fn unsubscribe(&self, session: &Arc<Session>, player: Option<Id>, topics: &[Topic]) {
+        let _updating = lock(&session.upstream);
+        let topics: Vec<_> = topics
+            .iter()
+            .filter(|t| player.is_some() || HUB_TOPICS.contains(t))
+            .collect();
         if topics.is_empty() {
             return;
         }
-        if followed(&session.topics()).is_empty() {
+        if followed(session).is_empty() {
             lock(&self.cut.sessions).remove(&session.id());
         }
         let Some(client) = lock(&self.sessions).get(&session.id()).cloned() else {
             return;
         };
-        let params = serde_json::json!({ "topics": topics });
+        let params = serde_json::json!({ "topics": topics, "player":player });
         if let (Err(error), _) = self.ask(&client, "events.unsubscribe", params) {
             warn!(%error, "the hub's events could not be unsubscribed from");
+            if !matches!(error, ritornel_client::Error::Call(_)) {
+                lock(&self.sessions).remove(&session.id());
+                self.cut.mark(session);
+            }
         }
     }
 
@@ -656,10 +682,10 @@ impl Uplink {
             .collect();
         for session in cut.iter().filter_map(Weak::upgrade) {
             // Closed, or no longer following the hub, since it was marked.
-            if session.is_closed() || followed(&session.topics()).is_empty() {
+            if session.is_closed() || followed(&session).is_empty() {
                 continue;
             }
-            if self.session_client(&session, true).is_err() {
+            if self.session_client(&session, Subscribe::All).is_err() {
                 self.cut.mark(&session);
             }
         }
@@ -685,20 +711,24 @@ impl Cut {
     /// Marks `session` to be subscribed when the hub next answers, if it
     /// is open and follows the hub's events.
     fn mark(&self, session: &Arc<Session>) {
-        if !session.is_closed() && !followed(&session.topics()).is_empty() {
-            lock(&self.sessions).insert(session.id(), Arc::downgrade(session));
+        let mut cut = lock(&self.sessions);
+        if !session.is_closed() && !followed(session).is_empty() {
+            cut.insert(session.id(), Arc::downgrade(session));
         }
     }
 }
 
 /// Of `topics`, those the hub is asked for: its library, job and player events. A
 /// view's list events come on the connection that holds it, unasked.
-fn followed(topics: &[Topic]) -> Vec<Topic> {
-    topics
-        .iter()
-        .copied()
-        .filter(|topic| HUB_TOPICS.contains(topic) && *topic != Topic::List)
-        .collect()
+fn followed(session: &Session) -> BTreeMap<Option<Id>, BTreeSet<Topic>> {
+    let mut groups = session.subscriptions();
+    if let Some(local) = groups.get_mut(&None) {
+        local.retain(|topic| HUB_TOPICS.contains(topic) && *topic != Topic::List);
+        if local.is_empty() {
+            groups.remove(&None);
+        }
+    }
+    groups
 }
 
 /// Hands the hub's events on one connection to the session it is for,
@@ -707,16 +737,30 @@ fn followed(topics: &[Topic]) -> Vec<Topic> {
 /// marked to be subscribed again on a new one.
 async fn relay(
     mut events: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    hub: Id,
     session: Weak<Session>,
     client: Weak<Client>,
     sessions: Arc<Mutex<HashMap<u64, Arc<Client>>>>,
     cut: Arc<Cut>,
 ) {
-    while let Some(event) = events.recv().await {
+    while let Some(mut event) = events.recv().await {
         let Some(session) = session.upgrade() else {
             return;
         };
-        if HUB_TOPICS.contains(&event.topic()) {
+        let active = lock(&sessions);
+        if !active
+            .get(&session.id())
+            .zip(client.upgrade())
+            .is_some_and(|(held, ours)| Arc::ptr_eq(held, &ours))
+        {
+            break;
+        }
+        if event.topic().is_per_player() {
+            if event.player().is_none() {
+                event.set_player(Some(hub));
+            }
+            session.publish(event);
+        } else if HUB_TOPICS.contains(&event.topic()) {
             session.publish(event);
         }
     }
@@ -816,6 +860,50 @@ async fn answer_player_calls(
     }
 }
 
+/// Refreshes a hub watcher's snapshot on each connection and after a buffer overrun.
+pub(crate) async fn send_player_events(
+    core: &Arc<crate::dispatch::Core>,
+    client: &Client,
+    wait: std::time::Duration,
+) -> Result<(), &'static str> {
+    use ritornel_contract::methods::LinkEvent;
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        let source = Arc::clone(core);
+        let Ok((snapshot, mut live)) =
+            tokio::task::spawn_blocking(move || source.player_feed()).await
+        else {
+            return Ok(());
+        };
+        let mut snapshot = snapshot.into_iter();
+        loop {
+            let event = if let Some(event) = snapshot.next() {
+                event
+            } else {
+                match live.recv().await {
+                    Ok((id, event)) if id == core.server_id() => event,
+                    Ok(_) => continue,
+                    Err(RecvError::Lagged(_)) => break,
+                    Err(RecvError::Closed) => return Ok(()),
+                }
+            };
+            match tokio::time::timeout(wait, client.call::<LinkEvent>(&event)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(ritornel_client::Error::Call(error))) => {
+                    // A refusal means the hub answered. An obsolete presence must register again.
+                    warn!(%error, "the hub refused a player report");
+                    if matches!(error.kind(), ErrorCode::Unavailable | ErrorCode::Forbidden) {
+                        return Ok(());
+                    }
+                }
+                _ => {
+                    return Err("the player report was not answered");
+                }
+            }
+        }
+    }
+}
+
 /// Owns the satellite's presence socket through reconnects. A separate socket
 /// carries library reads so a slow query cannot delay a heartbeat.
 async fn presence(core: &Arc<crate::dispatch::Core>, uplink: &Uplink) {
@@ -879,6 +967,9 @@ async fn presence(core: &Arc<crate::dispatch::Core>, uplink: &Uplink) {
                 };
                 tokio::select! {
                     () = report => (),
+                    result = send_player_events(core, &client, uplink.call_wait) => {
+                        if let Err(why) = result { uplink.lost(why); }
+                    }
                     () = answer_player_calls(core, &client, requests) => uplink.lost("the presence connection closed"),
                 }
             }

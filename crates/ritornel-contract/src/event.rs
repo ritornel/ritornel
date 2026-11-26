@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Job, PlaybackEvent, ProgressEvent, QueueEvent, ServerInfo};
+use crate::{Id, Job, PlaybackEvent, ProgressEvent, QueueEvent, ServerInfo};
 
 /// The method of every event notification.
 pub const EVENT_METHOD: &str = "event";
@@ -41,6 +41,11 @@ pub enum Topic {
 }
 
 impl Topic {
+    /// Whether this topic can be followed for a particular player.
+    pub const fn is_per_player(self) -> bool {
+        matches!(self, Self::Playback | Self::Progress | Self::Queue)
+    }
+
     /// Every topic.
     pub const ALL: &[Self] = &[
         Self::Servers,
@@ -92,6 +97,26 @@ pub enum Event {
 }
 
 impl Event {
+    /// The player named on this event, or none for a local or unscoped event.
+    pub fn player(&self) -> Option<Id> {
+        match self {
+            Self::Playback(e) => e.player,
+            Self::Progress(e) => e.player,
+            Self::Queue(e) => e.player,
+            _ => None,
+        }
+    }
+
+    /// Expresses a player event relative to the server delivering it.
+    pub fn set_player(&mut self, player: Option<Id>) {
+        match self {
+            Self::Playback(e) => e.player = player,
+            Self::Progress(e) => e.player = player,
+            Self::Queue(e) => e.player = player,
+            _ => {}
+        }
+    }
+
     /// The topic the event is on.
     pub const fn topic(&self) -> Topic {
         match self {
@@ -183,6 +208,10 @@ pub struct JobsEvent {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct TopicsParams {
+    /// The selected player. Omitted for this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The topics to add or to remove. Naming one twice, adding one the
     /// session has, or removing one it has not, changes nothing.
     pub topics: Vec<Topic>,
@@ -193,7 +222,11 @@ pub struct TopicsParams {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct Subscriptions {
-    /// Every topic the session is subscribed to after the call.
+    /// The player ID from the request, if supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
+    /// Topics held for the requested player, or local topics when the request omitted the player.
     pub topics: Vec<Topic>,
 }
 
@@ -238,6 +271,7 @@ mod tests {
             assert_eq!(serde_json::to_value(topic).unwrap(), topic.as_str());
         }
         let params = TopicsParams {
+            player: None,
             topics: vec![Topic::Servers],
         };
         assert_eq!(

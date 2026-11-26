@@ -615,6 +615,10 @@ pub struct QueueWindow {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackEvent {
+    /// The selected player. Omitted for this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The state.
     pub state: PlaybackState,
 }
@@ -626,6 +630,10 @@ pub struct PlaybackEvent {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct ProgressEvent {
+    /// The selected player. Omitted for this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The entry.
     pub entry_id: Id,
     /// Where in it.
@@ -640,6 +648,10 @@ pub struct ProgressEvent {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct QueueEvent {
+    /// The selected player. Omitted for this server's own player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub player: Option<Id>,
     /// The queue's revision after the change.
     pub queue_revision: u64,
 }

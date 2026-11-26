@@ -1192,6 +1192,7 @@ mod tests {
         player.update(cx, |player, cx| {
             player.ticked(
                 &ProgressEvent {
+                    player: None,
                     entry_id: first,
                     position_ms: 0,
                     playing: true,
@@ -1204,6 +1205,7 @@ mod tests {
         player.update(cx, |player, cx| {
             player.ticked(
                 &ProgressEvent {
+                    player: None,
                     entry_id: second,
                     position_ms: 10,
                     playing: true,

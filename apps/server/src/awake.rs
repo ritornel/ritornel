@@ -40,7 +40,7 @@ pub(crate) fn keeps_awake(setting: Awake, activity: &Activity, now_ms: i64) -> b
 pub(crate) fn is_activity(method: &str) -> bool {
     !matches!(
         method,
-        "server.hello" | "events.subscribe" | "events.unsubscribe" | "link.ping"
+        "server.hello" | "events.subscribe" | "events.unsubscribe" | "link.ping" | "link.event"
     )
 }
 
@@ -166,7 +166,12 @@ mod tests {
 
     #[test]
     fn keeping_the_link_is_not_activity() {
-        for kept in ["server.hello", "events.subscribe", "link.ping"] {
+        for kept in [
+            "server.hello",
+            "events.subscribe",
+            "link.ping",
+            "link.event",
+        ] {
             assert!(!is_activity(kept), "{kept}");
         }
         for used in ["list.open", "link.copies", "link.listen", "servers.list"] {

@@ -14,13 +14,13 @@ use ritornel_contract::methods::{
     PlaybackSkip, PlaybackStop, QueueAdd, QueueClear, QueueMove, QueueRemove,
 };
 use ritornel_contract::{
-    ContextKind, CopyInUse, ErrorCode, Event, Id, ListKind, OutputInfo, OutputMode, OutputProblem,
-    PlaySource, PlaybackChanged, PlaybackCommandParams, PlaybackEvent, PlaybackJumpParams,
-    PlaybackPlayParams, PlaybackSeekParams, PlaybackSetParams, PlaybackSkipParams, PlaybackState,
-    PlaybackStatus, ProgressEvent, QueueAddParams, QueueClearParams, QueueEntry, QueueEvent,
-    QueueMoveParams, QueueOrder, QueuePlace, QueueRemoveParams, QueueWindow, QueueWindowParams,
-    Receipt, ReceiptStatus, Repeat, RpcError, SkipDirection, SourceTracks, SourcesTracksParams,
-    TrackSummary,
+    ContextKind, CopyInUse, ErrorCode, Id, LinkPlayerEvent, ListKind, OutputInfo, OutputMode,
+    OutputProblem, PlaySource, PlaybackChanged, PlaybackCommandParams, PlaybackEvent,
+    PlaybackJumpParams, PlaybackPlayParams, PlaybackSeekParams, PlaybackSetParams,
+    PlaybackSkipParams, PlaybackState, PlaybackStatus, ProgressEvent, QueueAddParams,
+    QueueClearParams, QueueEntry, QueueEvent, QueueMoveParams, QueueOrder, QueuePlace,
+    QueueRemoveParams, QueueWindow, QueueWindowParams, Receipt, ReceiptStatus, Repeat, RpcError,
+    SkipDirection, SourceTracks, SourcesTracksParams, TrackSummary,
 };
 use ritornel_engine::playback::{
     self as engine, AddTracks, Catalog, Direction, Done, Fetch, Order, Place, PlayTracks, Player,
@@ -243,9 +243,13 @@ impl Core {
                     if let Some(state) = &state {
                         let playback = self.playback_state(state);
                         self.player_state_changed(&playback);
-                        self.publish(&Event::Playback(Box::new(PlaybackEvent {
-                            state: playback,
-                        })));
+                        self.publish_player_event(
+                            None,
+                            LinkPlayerEvent::Playback(Box::new(PlaybackEvent {
+                                player: None,
+                                state: playback,
+                            })),
+                        );
                         #[cfg(feature = "media-session")]
                         self.show_in_media_session(state);
                         if state.status != Status::Playing {
@@ -256,19 +260,36 @@ impl Core {
                 PlayerEvent::Began {
                     appearance,
                     duration_ms,
-                } => self.now_playing(appearance, duration_ms),
+                } => {
+                    self.publish_player_event(
+                        None,
+                        LinkPlayerEvent::Began {
+                            appearance_id: appearance,
+                            duration_ms: unsigned(duration_ms),
+                        },
+                    );
+                    self.now_playing(appearance, duration_ms);
+                }
                 PlayerEvent::Progress {
                     entry,
                     position_ms,
                     playing,
-                } => self.publish(&Event::Progress(ProgressEvent {
-                    entry_id: entry,
-                    position_ms: unsigned(position_ms),
-                    playing,
-                })),
-                PlayerEvent::Queue(revision) => self.publish(&Event::Queue(QueueEvent {
-                    queue_revision: unsigned(revision),
-                })),
+                } => self.publish_player_event(
+                    None,
+                    LinkPlayerEvent::Progress(ProgressEvent {
+                        player: None,
+                        entry_id: entry,
+                        position_ms: unsigned(position_ms),
+                        playing,
+                    }),
+                ),
+                PlayerEvent::Queue(revision) => self.publish_player_event(
+                    None,
+                    LinkPlayerEvent::Queue(QueueEvent {
+                        player: None,
+                        queue_revision: unsigned(revision),
+                    }),
+                ),
                 PlayerEvent::ListenClosed => self.deliveries.wake(),
                 PlayerEvent::Failed { entry, reason } => {
                     warn!(entry_id = %entry, %reason, "a track could not be played");
@@ -528,6 +549,39 @@ impl Core {
                 ),
             )
         })
+    }
+
+    /// Takes a snapshot and opens the live feed under the same player lock
+    /// commands and ticks hold while publishing. The first live event is newer
+    /// than the snapshot. Historical track starts are never synthesized.
+    pub(crate) fn player_feed(
+        &self,
+    ) -> (
+        Vec<LinkPlayerEvent>,
+        tokio::sync::broadcast::Receiver<(Id, LinkPlayerEvent)>,
+    ) {
+        let player = lock(&self.player);
+        let mut snapshot = Vec::new();
+        if let Some(player) = player.as_ref() {
+            let state = self.playback_state(&player.state());
+            let queue_revision = state.queue_revision;
+            let progress = state.entry_id.map(|entry_id| ProgressEvent {
+                player: None,
+                entry_id,
+                position_ms: state.position_ms,
+                playing: state.status == PlaybackStatus::Playing,
+            });
+            snapshot.push(LinkPlayerEvent::Playback(Box::new(PlaybackEvent {
+                player: None,
+                state,
+            })));
+            snapshot.push(LinkPlayerEvent::Queue(QueueEvent {
+                player: None,
+                queue_revision,
+            }));
+            snapshot.extend(progress.map(LinkPlayerEvent::Progress));
+        }
+        (snapshot, self.player_events())
     }
 
     pub(super) fn playback_get(&self, _stores: &Stores) -> Result<PlaybackState, RpcError> {

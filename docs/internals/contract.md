@@ -48,6 +48,8 @@ A hub links a satellite with a one-time invite (`link.invite`): an `InviteLink` 
 
 A link session is a `full` session that knows its satellite (`Session::peer`). It authenticates on the socket upgrade with the bearer token, never with a ticket, and the hub refuses it the calls that name the hub's own folders, backups, settings and links (`kept_from_a_link`). A satellite joining again closes the sockets of its previous session.
 
+A satellite sends `link.event` on its current player presence connection. The params name a `topic` of `playback`, `progress`, `queue`, or `began`. The first three carry the same fields as the corresponding client event. The hub takes the player ID from the authenticated session and overwrites any player ID in the payload. A `began` report carries `appearanceId` and `durationMs` for each track start, including repeat-one. `link.event` is internal to the link. Presence summaries continue to travel in `link.ping`. On connection and after the live buffer overflows, the satellite sends its current playback state, queue revision and current entry's position before continuing with new reports. Missed track starts are lost. A refresh never creates a `began` report.
+
 ### Satellites
 
 A satellite (`apps/server/src/uplink.rs`) answers its own status, settings, events, player and queue, link and backups, and forwards every other call to its hub unchanged, on a hub connection of the client session's own, with the client's request IDs. That connection is opened on the session's first forwarded call or subscription, subscribed to the hub's `library`, `players` and `jobs` topics the session holds, and closed with the session; the hub's `library`, `list`, `players` and `jobs` events on it go to that session alone. Unsubscribing from those topics unsubscribes the connection at the hub too. When the hub closes the connection, as it does when it stops, the satellite lets it go; if the session still follows `library`, `players` or `jobs`, a new connection is opened and subscribed when the hub begins to answer again, before the satellite's `servers` event says it is back, or at the next ten-second check if the hub was back before it was missed. A session that subscribes while the hub is away, or whose subscription at the hub fails on its connection, is subscribed the same way. Views held on the old connection end with it, and a call on one is answered `view_expired`. Calls that name the hub's folders are refused with `unsupported` and the reason `on_the_hub`. Covers are fetched from the hub with the link session, on the route where the hub last proved its key, and kept in the satellite's cover cache.
@@ -119,9 +121,11 @@ Sessions opt into server-pushed notifications via `events.subscribe` and `events
 | `jobs` | Full `Job` summary (`target` included) | `jobId` | Replace job entry (requires `full` session). |
 | `library` | `libraryRevision` + `changed` (`membership`, `metadata`, `stats`, `ratings`) | Singleton | Re-read non-view screens older than `libraryRevision`. |
 | `list` | `view`, `libraryRevision`, `reorder` | `view` | Re-read visible windows (`reorder: false`) or replace view (`reorder: true`). |
-| `playback` | Full `PlaybackState` snapshot | Singleton | Replace playback state (keep `revision >=` current). |
-| `progress` | `entryId`, `positionMs`, `playing` | Singleton | Anchor position and extrapolate locally between ~1 s ticks. |
-| `queue` | `queueRevision` | Singleton | Re-read visible queue windows. |
+| `playback` | Full `PlaybackState` snapshot | Player | Replace playback state (keep `revision >=` current). |
+| `progress` | `entryId`, `positionMs`, `playing` | Player | Anchor position and extrapolate locally between ~1 s ticks. |
+| `queue` | `queueRevision` | Player | Re-read visible queue windows. |
+
+For `playback`, `progress` and `queue`, `events.subscribe` and `events.unsubscribe` accept a `player` ID from `players.list`. The reply echoes the requested player and lists the topics held for that player. Without a target the reply lists the local session topics. Remote player subscriptions coexist with local topics. A satellite restores its clients' remote subscriptions when their hub connections return, and drops them when the client disconnects. Delivered player events carry `player` only for another server's player.
 
 Events never carry deltas and are never replayed across disconnects. Each session maintains an ordered outbound queue (`apps/server/src/session.rs`) that never drops responses and holds at most one unsent event per `(topic, key)`. Merging a newer event into an unsent slot preserves its queue position while taking the highest revision, the union of `LibraryChange` values, and `reorder |= new.reorder` so a reorder signal is never masked by a subsequent play-count update. After reconnecting, clients re-handshake, resubscribe, reopen views, and re-read visible state.
 
@@ -178,7 +182,7 @@ The methods registered in `crates/ritornel-contract/src/methods.rs`, by area (se
 |---|---|
 | Session & server | `server.hello`, `server.status`, `servers.list`, `players.list`, `events.subscribe`, `events.unsubscribe`, `server.backup`, `record.dismiss`, `server.settings`, `server.setSettings` |
 | Transcoding | `transcode.start`, `transcode.prune` |
-| Linking | `link.invite`, `link.join`, `link.status`, `link.tracks`, `link.copies`, `link.listen`, `link.ping` |
+| Linking | `link.invite`, `link.join`, `link.status`, `link.tracks`, `link.copies`, `link.listen`, `link.event`, `link.ping` |
 | Library & sources | `library.create`, `sources.list`, `sources.add`, `sources.tracks`, `scan.start`, `library.stats`, `library.setWatching`, `library.settings`, `library.setSettings`, `artists.importPictures`, `artists.pictureFolders` |
 | Jobs & identity | `jobs.list`, `jobs.get`, `jobs.cancel`, `identity.dryRun`, `identity.review` |
 | Browse & media | `list.open`, `list.window`, `list.sections`, `list.locate`, `list.close`, `library.search`, `album.get`, `artist.get`, `tracks.get`, `media.token` |

@@ -8,7 +8,7 @@
 //! a newer one into it, so a client that reads slowly cannot build a
 //! backlog.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -36,17 +36,19 @@ pub(crate) struct Session {
     last_heard: watch::Sender<Option<tokio::time::Instant>>,
     /// The views it holds.
     views: Mutex<Views>,
+    /// Only the uplink takes this lock, to order connection and subscription changes for this session.
+    pub(crate) upstream: Mutex<()>,
 }
 
 #[derive(Debug, Default)]
 struct State {
     /// Whether `server.hello` has succeeded.
     greeted: bool,
-    topics: BTreeSet<Topic>,
+    topics: BTreeMap<Option<Id>, BTreeSet<Topic>>,
     /// What is waiting to be sent, oldest first.
     queue: VecDeque<Queued>,
     /// The unsent event behind each [`Queued::Event`].
-    events: HashMap<(Topic, String), Event>,
+    events: HashMap<(Option<Id>, Topic, String), Event>,
     closed: bool,
     next_request: i64,
     pending: HashMap<i64, tokio::sync::oneshot::Sender<PlayerAnswer>>,
@@ -89,7 +91,7 @@ enum Queued {
     Frame(Frame),
     /// The unsent event with this topic and key. It keeps the place in the
     /// queue of the first event it was merged from.
-    Event(Topic, String),
+    Event(Option<Id>, Topic, String),
 }
 
 /// What tells one resource of a topic from another: the key the queue keeps
@@ -164,6 +166,7 @@ impl Session {
             wake: Notify::new(),
             shut: watch::Sender::new(false),
             views: Mutex::default(),
+            upstream: Mutex::default(),
         }
     }
 
@@ -217,32 +220,69 @@ impl Session {
         self.state().greeted
     }
 
-    /// Adds topics, and returns every topic the session then has.
-    pub(crate) fn subscribe(&self, topics: &[Topic]) -> Vec<Topic> {
+    /// Adds or removes only the subscriptions in the requested scope.
+    pub(crate) fn change_topics(
+        &self,
+        player: Option<Id>,
+        topics: &[Topic],
+        add: bool,
+    ) -> Result<Vec<Topic>, ritornel_contract::RpcError> {
         let mut state = self.state();
-        state.topics.extend(topics);
-        state.topics.iter().copied().collect()
-    }
-
-    /// The topics the session is subscribed to.
-    pub(crate) fn topics(&self) -> Vec<Topic> {
-        self.state().topics.iter().copied().collect()
-    }
-
-    /// Removes topics and drops the unsent events on them, and returns
-    /// every topic the session then has. Whatever is queued after this is
-    /// sent after every event on those topics that the session will ever
-    /// get.
-    pub(crate) fn unsubscribe(&self, topics: &[Topic]) -> Vec<Topic> {
-        let mut state = self.state();
-        for topic in topics {
-            state.topics.remove(topic);
+        if state.closed {
+            return Err(ritornel_contract::RpcError::new(
+                ritornel_contract::ErrorCode::Unavailable,
+                "the session has closed",
+            ));
         }
-        state.events.retain(|(topic, _), _| !topics.contains(topic));
-        state
-            .queue
-            .retain(|queued| !matches!(queued, Queued::Event(topic, _) if topics.contains(topic)));
-        state.topics.iter().copied().collect()
+        if add {
+            // Bound the number of distinct targets even when the hub is offline.
+            if !topics.is_empty() {
+                if player.is_some()
+                    && !state.topics.contains_key(&player)
+                    && state.topics.keys().flatten().count() >= crate::bounds::MAX_FOLLOWED_PLAYERS
+                {
+                    return Err(ritornel_contract::RpcError::new(
+                        ritornel_contract::ErrorCode::Invalid,
+                        "too many players followed on this session",
+                    ));
+                }
+                state.topics.entry(player).or_default().extend(topics);
+            }
+        } else {
+            if let Some(held) = state.topics.get_mut(&player) {
+                held.retain(|t| !topics.contains(t));
+                if held.is_empty() {
+                    state.topics.remove(&player);
+                }
+            }
+            state
+                .events
+                .retain(|(p, t, _), _| *p != player || !topics.contains(t));
+            state.queue.retain(
+                |q| !matches!(q, Queued::Event(p,t,_) if *p == player && topics.contains(t)),
+            );
+        }
+        Ok(state
+            .topics
+            .get(&player)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect())
+    }
+
+    pub(crate) fn subscriptions(&self) -> BTreeMap<Option<Id>, BTreeSet<Topic>> {
+        self.state().topics.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribe(&self, topics: &[Topic]) -> Vec<Topic> {
+        self.change_topics(None, topics, true).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unsubscribe(&self, topics: &[Topic]) -> Vec<Topic> {
+        self.change_topics(None, topics, false).unwrap()
     }
 
     /// Queues an event, if the session is subscribed to its topic. A
@@ -251,15 +291,22 @@ impl Session {
     pub(crate) fn publish(&self, event: Event) {
         let mut state = self.state();
         let topic = event.topic();
-        if state.closed || (topic != Topic::List && !state.topics.contains(&topic)) {
+        let player = event.player();
+        if state.closed
+            || (topic != Topic::List
+                && !state
+                    .topics
+                    .get(&player)
+                    .is_some_and(|topics| topics.contains(&topic)))
+        {
             return;
         }
         let key = key(&event);
-        match state.events.get_mut(&(topic, key.clone())) {
+        match state.events.get_mut(&(player, topic, key.clone())) {
             Some(unsent) => merge(unsent, event),
             None => {
-                state.events.insert((topic, key.clone()), event);
-                state.queue.push_back(Queued::Event(topic, key));
+                state.events.insert((player, topic, key.clone()), event);
+                state.queue.push_back(Queued::Event(player, topic, key));
             }
         }
         drop(state);
@@ -353,6 +400,7 @@ impl Session {
         *self.views() = Views::default();
         let mut state = self.state();
         state.closed = true;
+        state.topics.clear();
         state.queue.clear();
         state.events.clear();
         state.pending.clear();
@@ -398,8 +446,8 @@ impl Session {
         while let Some(queued) = state.queue.pop_front() {
             match queued {
                 Queued::Frame(frame) => return Ok(Some(frame)),
-                Queued::Event(topic, key) => {
-                    if let Some(event) = state.events.remove(&(topic, key)) {
+                Queued::Event(player, topic, key) => {
+                    if let Some(event) = state.events.remove(&(player, topic, key)) {
                         match serde_json::to_value(&event) {
                             Ok(params) => {
                                 return Ok(Some(Frame::Notification(Notification {
@@ -526,6 +574,44 @@ mod tests {
         let sent = drain(&session);
         assert_eq!(sent.len(), 1);
         assert_eq!(carried(&sent[0]), ("newer".to_owned(), 7));
+    }
+
+    #[test]
+    fn unsent_player_events_coalesce_and_unsubscribe_within_one_player_only() {
+        use ritornel_contract::QueueEvent;
+        let session = Session::new(1, SessionKind::Limited);
+        let remote = Some(Id::from_bytes([5; 16]));
+        let another = Some(Id::from_bytes([6; 16]));
+        for player in [None, remote, another] {
+            session
+                .change_topics(player, &[Topic::Queue], true)
+                .unwrap();
+            for queue_revision in [3, 5, 2] {
+                session.publish(Event::Queue(QueueEvent {
+                    player,
+                    queue_revision,
+                }));
+            }
+        }
+        assert_eq!(session.unsent(), 3);
+        session
+            .change_topics(remote, &[Topic::Queue], false)
+            .unwrap();
+        let events = drain(&session);
+        assert_eq!(events.len(), 2);
+        for (frame, player) in events.iter().zip([None, another]) {
+            let Frame::Notification(note) = frame else {
+                panic!("expected an event")
+            };
+            let event: Event = serde_json::from_value(note.params.clone().unwrap()).unwrap();
+            assert_eq!(
+                event,
+                Event::Queue(QueueEvent {
+                    player,
+                    queue_revision: 5
+                })
+            );
+        }
     }
 
     #[test]

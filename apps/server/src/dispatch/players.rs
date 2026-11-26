@@ -3,12 +3,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use ritornel_contract::LinkPlayerEvent;
 use ritornel_contract::{
     ClientKind, ErrorCode, Event, HelloParams, Id, PlaybackState, PlaybackStatus, PlayerInfo,
     PlayerSummary, PlayersList, PresenceHello, RpcError,
 };
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use super::{Core, Stores, link::untrusted_name, lock};
 use crate::session::Session;
@@ -16,6 +17,8 @@ use crate::session::Session;
 #[derive(Debug)]
 pub(super) struct Players {
     started_ms: i64,
+    /// Live player reports, including each track start. Offline reports are not replayed.
+    events: broadcast::Sender<(Id, LinkPlayerEvent)>,
     local: watch::Sender<Option<(u64, PlayerSummary)>>,
     peers: Mutex<BTreeMap<Id, PeerPlayer>>,
     /// Orders the durable membership change and registration of two hellos.
@@ -33,6 +36,14 @@ struct PeerPlayer {
 }
 
 impl PeerPlayer {
+    fn is_current(&self, session: &Session) -> bool {
+        self.has_player
+            && self
+                .online
+                .as_ref()
+                .is_some_and(|s| s.id() == session.id() && !s.is_closed())
+    }
+
     fn away(name: String, has_player: bool, since_ms: i64) -> Self {
         Self {
             name,
@@ -49,6 +60,7 @@ impl Players {
     pub(super) fn new(started_ms: i64, sessions: &[ritornel_engine::LinkSession]) -> Self {
         Self {
             started_ms,
+            events: broadcast::Sender::new(64),
             local: watch::Sender::new(None),
             peers: Mutex::new(
                 sessions
@@ -192,6 +204,53 @@ impl Core {
             id: Some(request.id),
             outcome,
         }
+    }
+
+    pub(crate) fn player_events(&self) -> broadcast::Receiver<(Id, LinkPlayerEvent)> {
+        self.players.events.subscribe()
+    }
+
+    /// Publishes a report with the player's identity from this server or the authenticated session.
+    pub(super) fn publish_player_event(&self, player: Option<Id>, mut report: LinkPlayerEvent) {
+        let event = match &mut report {
+            LinkPlayerEvent::Playback(e) => {
+                e.player = player;
+                Some(Event::Playback(e.clone()))
+            }
+            LinkPlayerEvent::Progress(e) => {
+                e.player = player;
+                Some(Event::Progress(*e))
+            }
+            LinkPlayerEvent::Queue(e) => {
+                e.player = player;
+                Some(Event::Queue(*e))
+            }
+            LinkPlayerEvent::Began { .. } => None,
+        };
+        if let Some(event) = event {
+            self.publish(&event);
+        }
+        let _ = self
+            .players
+            .events
+            .send((player.unwrap_or(self.server_id), report));
+    }
+
+    pub(super) fn link_event(
+        &self,
+        session: &Session,
+        report: LinkPlayerEvent,
+    ) -> Result<ritornel_contract::NoParams, RpcError> {
+        let peer = session.peer().ok_or_else(|| {
+            RpcError::new(ErrorCode::Forbidden, "link.event needs a satellite link")
+        })?;
+        let peers = lock(&self.players.peers);
+        if !peers.get(&peer).is_some_and(|p| p.is_current(session)) {
+            return Err(stale());
+        }
+        // Order publication against replacement so a stale socket cannot publish after its successor.
+        self.publish_player_event(Some(peer), report);
+        Ok(ritornel_contract::NoParams {})
     }
 
     pub(crate) fn player_updates(&self) -> watch::Receiver<Option<(u64, PlayerSummary)>> {
@@ -381,12 +440,7 @@ impl Core {
         let mut peers = lock(&self.players.peers);
         let p = peers
             .get_mut(&peer)
-            .filter(|p| {
-                p.has_player
-                    && p.online
-                        .as_ref()
-                        .is_some_and(|s| s.id() == session.id() && !s.is_closed())
-            })
+            .filter(|p| p.is_current(session))
             .ok_or_else(stale)?;
         let summary = clean(summary);
         if p.summary.as_ref() != Some(&summary) {
@@ -551,6 +605,39 @@ mod tests {
         let away = &core.players_list().unwrap().players[0];
         assert!(!away.reachable);
         assert!(away.status.is_none());
+    }
+
+    #[test]
+    fn only_the_current_presence_can_report_and_the_hub_stamps_its_player() {
+        use ritornel_contract::{LinkPlayerEvent, QueueEvent};
+        let (core, _scratch) = crate::testing::core();
+        let id = Id::from_bytes([5; 16]);
+        let local = core.open_session(SessionKind::Full).unwrap();
+        let report = LinkPlayerEvent::Queue(QueueEvent {
+            player: Some(core.server_id),
+            queue_revision: 9,
+        });
+        assert_eq!(
+            core.link_event(&local, report.clone()).unwrap_err().kind(),
+            ErrorCode::Forbidden
+        );
+        let old = peer_session(&core, id);
+        announce(&core, &old, "Room");
+        let current = peer_session(&core, id);
+        announce(&core, &current, "Room");
+        assert_eq!(
+            core.link_event(&old, report.clone()).unwrap_err().kind(),
+            ErrorCode::Unavailable
+        );
+        local
+            .change_topics(Some(id), &[Topic::Queue], true)
+            .unwrap();
+        core.link_event(&current, report).unwrap();
+        let frames = local.drain();
+        assert!(
+            matches!(&frames[..], [ritornel_contract::Frame::Notification(n)] if
+            n.params == Some(serde_json::json!({"topic":"queue","player":id,"queueRevision":9})))
+        );
     }
 
     #[test]

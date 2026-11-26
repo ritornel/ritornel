@@ -676,6 +676,161 @@ mod tests {
         });
     }
 
+    /// Observes the hub's internal track-start reports, which are not client topics.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeat_one_reports_each_start_on_the_satellites_presence_connection() {
+        use ritornel_client::Client;
+        use ritornel_contract::{Event, LinkPlayerEvent, Topic};
+        let exercise = async {
+            let scratch = Scratch::new();
+            let hub = start(&scratch).await;
+            let desk = Server::start_run(
+                HeldDir::take(scratch.path().join("desk")).unwrap(),
+                Listen::on_port(0),
+                Arc::new(SystemClock),
+                Arc::new(OsEntropy),
+                Bounds::default(),
+                Run {
+                    playback: crate::PlaybackRun {
+                        output: Some(crate::Output::Null { speed: 5 }),
+                        ..Default::default()
+                    },
+                    ..Run::default()
+                },
+            )
+            .await
+            .unwrap();
+            let controller = async |s: &Server| {
+                let (out, incoming) = s.connect_in_memory(ritornel_contract::SessionKind::Full);
+                let c = Client::over_memory(out, incoming);
+                c.call_raw("server.hello", json!({"name":"listener", "kind":"cli", "version":"1", "contractVersion":ritornel_contract::CONTRACT_VERSION})).await.unwrap();
+                c
+            };
+            let key = || ritornel_client::idempotency_key().unwrap();
+            let mut h = controller(&hub).await;
+            let d = controller(&desk).await;
+            h.create_library(key()).await.unwrap();
+            let music = scratch.path().join("album");
+            std::fs::create_dir(&music).unwrap();
+            std::fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/audio/a.flac"),
+                music.join("one.flac"),
+            )
+            .unwrap();
+            let source = h
+                .add_source(key(), "album", music.to_str().unwrap())
+                .await
+                .unwrap()
+                .source;
+            h.subscribe(&[Topic::Jobs, Topic::Players]).await.unwrap();
+            let scan = h.start_scan(key(), source.source_id).await.unwrap().job;
+            loop {
+                if let Some(Event::Jobs(e)) = h.next_event().await
+                    && e.job.job_id == scan.job_id
+                    && e.job.state.ended()
+                {
+                    break;
+                }
+            }
+            let list = h
+                .call_raw("sources.tracks", json!({"path":music}))
+                .await
+                .unwrap();
+            let appearance = list["tracks"][0]["appearanceId"].clone();
+            let invite = h
+                .call_raw(
+                    "link.invite",
+                    json!({"routes":[hub.endpoint().to_string()]}),
+                )
+                .await
+                .unwrap();
+            d.call_raw(
+                "link.join",
+                json!({"idempotencyKey":key(),"link":invite["link"]}),
+            )
+            .await
+            .unwrap();
+            loop {
+                if matches!(h.next_event().await, Some(Event::Players)) {
+                    break;
+                }
+            }
+            let topics = [Topic::Playback, Topic::Progress, Topic::Queue];
+            h.call_raw(
+                "events.subscribe",
+                json!({"player":desk.server_id(), "topics":topics}),
+            )
+            .await
+            .unwrap();
+            let forged = json!({"topic":"queue", "player":desk.server_id(), "queueRevision":1});
+            assert!(
+                matches!(h.call_raw("link.event", forged).await, Err(ritornel_client::Error::Call(e)) if e.kind() == ritornel_contract::ErrorCode::Forbidden)
+            );
+            let mut events = hub.core.player_events();
+            d.call_raw(
+                "playback.set",
+                json!({"idempotencyKey":key(),"repeat":"one"}),
+            )
+            .await
+            .unwrap();
+            d.call_raw(
+                "playback.play",
+                json!({"idempotencyKey":key(),"source":{"type":"tracks","ids":[appearance]}}),
+            )
+            .await
+            .unwrap();
+            for _ in 0..2 {
+                loop {
+                    let (player, event) = events.recv().await.unwrap();
+                    if let LinkPlayerEvent::Began {
+                        appearance_id,
+                        duration_ms,
+                    } = event
+                    {
+                        assert_eq!(player, desk.server_id());
+                        assert_eq!(json!(appearance_id), appearance);
+                        assert!(duration_ms > 0);
+                        break;
+                    }
+                }
+            }
+            let mut received = std::collections::BTreeSet::new();
+            while received.len() < topics.len() {
+                let event = h.next_event().await.unwrap();
+                if event.topic().is_per_player() {
+                    assert_eq!(event.player(), Some(desk.server_id()));
+                    received.insert(event.topic());
+                }
+            }
+            // This client holds a subscription on its own connection to the hub.
+            // Dropping it releases that session even while the desk stays online.
+            d.call_raw(
+                "events.subscribe",
+                json!({"player":hub.server_id(), "topics":["queue"]}),
+            )
+            .await
+            .unwrap();
+            let upstream = hub
+                .core
+                .sessions()
+                .into_iter()
+                .find(|s| {
+                    s.peer() == Some(desk.server_id())
+                        && s.subscriptions()
+                            .get(&None)
+                            .is_some_and(|t| t.contains(&Topic::Queue))
+                })
+                .unwrap();
+            drop(d);
+            upstream.closed().await;
+            assert!(upstream.subscriptions().is_empty());
+            desk.stop().await.unwrap();
+            hub.stop().await.unwrap();
+        };
+        tokio::time::timeout(WAIT, exercise).await.unwrap();
+    }
+
     async fn start_with(scratch: &Scratch, bounds: Bounds) -> Server {
         Server::start_with(
             HeldDir::take(scratch.path().join("data")).unwrap(),

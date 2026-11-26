@@ -18,6 +18,9 @@ pub const MAX_CONNECTIONS: usize = 128;
 /// descriptors a process on macOS gets by default.
 pub const MAX_SESSIONS: usize = 64;
 
+/// Maximum number of remote players one client session can watch.
+pub(crate) const MAX_FOLLOWED_PLAYERS: usize = 64;
+
 /// How long a connection has to send the whole head of a request, counted
 /// from when the server starts waiting for one. It is also how long a
 /// connection may sit between requests, so one that says nothing is closed
