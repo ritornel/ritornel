@@ -61,6 +61,45 @@ pub(crate) fn carried(position_ms: u64, elapsed: Duration, duration_ms: Option<u
     duration_ms.map_or(at, |end| at.min(end))
 }
 
+/// How long a player may wait for its audio before the bar shows it: a song
+/// the place already has never flickers.
+pub(crate) const BUFFER_QUIET: Duration = Duration::from_millis(500);
+/// How long it waits before the bar says where the audio is coming from.
+pub(crate) const BUFFER_SAY: Duration = Duration::from_secs(5);
+/// One slow breath of the seek bar's empty part while it waits, in seconds.
+const BREATH: f32 = 1.6;
+
+/// How far into a breath the seek bar's empty part is, 0 to 1, after the
+/// player has waited `waited` for its audio: nothing at first, then up and
+/// down from nothing, so it starts without a jump.
+pub(crate) fn breath(waited: Duration) -> f32 {
+    let Some(breathing) = waited.checked_sub(BUFFER_QUIET) else {
+        return 0.;
+    };
+    let turn = breathing.as_secs_f32() / BREATH * std::f32::consts::TAU;
+    0.5 - 0.5 * turn.cos()
+}
+
+/// What the line under the title says once the wait has gone on: where the
+/// audio is coming from.
+pub(crate) fn getting_from(hub: Option<&str>) -> String {
+    match hub.map(str::trim).filter(|hub| !hub.is_empty()) {
+        Some(hub) => format!("Getting it from {hub}…"),
+        None => "Getting it from the hub…".to_owned(),
+    }
+}
+
+/// Since when the player has waited for its audio, given whether it was
+/// waiting and is waiting now: a wait that goes on keeps its start, even
+/// across songs, so the bar does not start over.
+fn waiting_since(was: bool, is: bool, since: Option<Instant>, now: Instant) -> Option<Instant> {
+    match (was, is) {
+        (_, false) => None,
+        (true, true) => since.or(Some(now)),
+        (false, true) => Some(now),
+    }
+}
+
 /// What the repeat button turns repeat to: off, all, one, and off again.
 pub(crate) fn next_repeat(repeat: Repeat) -> Repeat {
     match repeat {
@@ -236,6 +275,10 @@ pub(crate) struct Player {
     pub open: bool,
     /// The last read of Up next asked for: an older one that answers late is dropped.
     reading: u64,
+    /// Since when the player has waited for its audio (`Buffering`), and
+    /// what wakes the bar when the wait is long enough to show and to say.
+    buffering_since: Option<Instant>,
+    buffering_wakes: Option<Task<()>>,
     _link: Subscription,
 }
 
@@ -244,6 +287,7 @@ impl Player {
         let followed = cx.subscribe(link, |player, _, event: &LinkEvent, cx| match event {
             LinkEvent::Connected(net) => {
                 player.state = None;
+                player.end_wait();
                 player.rated = Ratings::default();
                 player.net = Some(Arc::clone(net));
                 player.say_of_hub(net, cx);
@@ -259,6 +303,7 @@ impl Player {
                 player.net = None;
                 player.rated = Ratings::default();
                 player.state = None;
+                player.end_wait();
                 player.tick.playing = false;
                 player.ticker = None;
                 cx.notify();
@@ -307,6 +352,8 @@ impl Player {
             up_next_version: 0,
             open: false,
             reading: 0,
+            buffering_since: None,
+            buffering_wakes: None,
             _link: followed,
         };
         if let Some(net) = link.read(cx).net() {
@@ -326,6 +373,23 @@ impl Player {
                 PlaybackStatus::Playing | PlaybackStatus::Buffering
             )
         })
+    }
+
+    /// How long the player has waited for its audio, while it waits.
+    pub(crate) fn buffering(&self) -> Option<Duration> {
+        let waiting = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.status == PlaybackStatus::Buffering);
+        waiting
+            .then_some(self.buffering_since)
+            .flatten()
+            .map(|since| since.elapsed())
+    }
+
+    /// The hub's name, on a satellite.
+    pub(crate) fn hub_name(&self) -> Option<&str> {
+        Some(self.net.as_ref()?.hub.as_ref()?.name.as_str())
     }
 
     /// Whether the player is on an entry: the transport works.
@@ -389,15 +453,21 @@ impl Player {
             state.revision, state.status, state.entry_id, state.position_ms, state.queue_length
         ));
         let before = self.state.as_ref().and_then(|kept| kept.entry_id);
+        let was_buffering = self
+            .state
+            .as_ref()
+            .is_some_and(|kept| kept.status == PlaybackStatus::Buffering);
         let Some(state) = keep_state(&mut self.state, state) else {
             return;
         };
         let entry = state.entry_id;
+        let buffering = state.status == PlaybackStatus::Buffering;
         self.tick = Tick {
             position_ms: state.position_ms,
             at: Instant::now(),
             playing: state.status == PlaybackStatus::Playing,
         };
+        self.wait_for_audio(was_buffering, buffering, cx);
         self.carry(cx);
         // What is next moves on with the entry.
         if self.open && before != entry {
@@ -419,8 +489,39 @@ impl Player {
             at: Instant::now(),
             playing: event.playing,
         };
+        // Sound has come, though the state that says so may not have yet:
+        // the two topics are sent apart.
+        if event.playing {
+            self.end_wait();
+        }
         self.carry(cx);
         cx.notify();
+    }
+
+    /// Follows a wait for audio: the bar is woken when it has gone on long
+    /// enough to show and again to say, and is shown no more once it ends.
+    fn wait_for_audio(&mut self, was: bool, is: bool, cx: &mut Context<Self>) {
+        let since = waiting_since(was, is, self.buffering_since, Instant::now());
+        if since.is_some() && self.buffering_since.is_none() {
+            self.buffering_wakes = Some(cx.spawn(async move |this, cx| {
+                for wait in [BUFFER_QUIET, BUFFER_SAY.saturating_sub(BUFFER_QUIET)] {
+                    cx.background_executor().timer(wait).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        if since.is_none() {
+            self.buffering_wakes = None;
+        }
+        self.buffering_since = since;
+    }
+
+    /// Ends a wait for audio and what would wake the bar for it.
+    fn end_wait(&mut self) {
+        self.buffering_since = None;
+        self.buffering_wakes = None;
     }
 
     /// How far the bars of the song playing have moved, in seconds.
@@ -1016,6 +1117,119 @@ impl Doing {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_short_wait_for_audio_shows_nothing_then_breathes_from_nothing() {
+        let ms = Duration::from_millis;
+        assert_eq!(breath(ms(0)), 0.);
+        assert_eq!(breath(ms(499)), 0.);
+        assert!(breath(BUFFER_QUIET) < 1e-6);
+        // A breath is 1.6 s: full at its middle, and back to nothing.
+        assert!((breath(BUFFER_QUIET + ms(800)) - 1.).abs() < 1e-4);
+        assert!(breath(BUFFER_QUIET + ms(1600)) < 1e-4);
+        for at in (0..4000).step_by(37) {
+            let b = breath(ms(at));
+            assert!((0. ..=1.).contains(&b), "{at} ms: {b}");
+        }
+    }
+
+    #[test]
+    fn a_wait_keeps_its_start_until_it_ends() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(3);
+        // Starting to wait starts the clock.
+        assert_eq!(waiting_since(false, true, None, start), Some(start));
+        // Still waiting, as on the next song, keeps it.
+        assert_eq!(waiting_since(true, true, Some(start), later), Some(start));
+        // Playing, paused or stopped, the wait is over at once.
+        assert_eq!(waiting_since(true, false, Some(start), later), None);
+        assert_eq!(waiting_since(false, false, None, later), None);
+        // A wait that starts again starts over.
+        assert_eq!(waiting_since(false, true, Some(start), later), Some(later));
+    }
+
+    /// A state of the player on `entry`, at `revision`, with `status`.
+    fn state_of(revision: u64, status: &str, entry: Id) -> PlaybackState {
+        serde_json::from_value(serde_json::json!({
+            "revision": revision, "status": status, "positionMs": 0, "volume": 1.0,
+            "muted": false, "shuffle": false, "repeat": "off", "queueRevision": 1,
+            "queueLength": 2, "entryId": entry,
+            "output": {"name": "null", "mode": "shared", "sampleRateHz": 44100, "channels": 2}
+        }))
+        .unwrap_or_else(|error| unreachable!("an invented state reads: {error}"))
+    }
+
+    #[gpui::test]
+    fn a_wait_ends_with_the_first_sound_or_a_new_session(cx: &mut gpui::TestAppContext) {
+        let (first, second) = (Id::from_bytes([1; 16]), Id::from_bytes([2; 16]));
+        let link = cx.update(crate::link::unlinked);
+        let player = gpui::AppContext::new(cx, |cx| Player::new(&link, cx));
+        let waiting = |cx: &mut gpui::TestAppContext| {
+            player.read_with(cx, |player, _| player.buffering().is_some())
+        };
+        player.update(cx, |player, cx| {
+            player.took(state_of(1, "buffering", first), cx)
+        });
+        assert!(waiting(cx), "a buffering state starts the wait");
+        // The next song still waits: the wait goes on.
+        player.update(cx, |player, cx| {
+            player.took(state_of(2, "buffering", second), cx)
+        });
+        assert!(waiting(cx));
+        // Progress on another entry says nothing of this one.
+        player.update(cx, |player, cx| {
+            player.ticked(
+                &ProgressEvent {
+                    entry_id: first,
+                    position_ms: 0,
+                    playing: true,
+                },
+                cx,
+            );
+        });
+        assert!(waiting(cx));
+        // Sound on this one ends it, before the state says so.
+        player.update(cx, |player, cx| {
+            player.ticked(
+                &ProgressEvent {
+                    entry_id: second,
+                    position_ms: 10,
+                    playing: true,
+                },
+                cx,
+            );
+        });
+        assert!(!waiting(cx), "the first sound ends the wait");
+        player.update(cx, |player, cx| {
+            player.took(state_of(3, "playing", second), cx)
+        });
+        assert!(!waiting(cx));
+        // A new wait, then the session goes: it ends with it, timer and all.
+        player.update(cx, |player, cx| {
+            player.took(state_of(4, "buffering", first), cx)
+        });
+        assert!(waiting(cx));
+        link.update(cx, |_, cx| cx.emit(LinkEvent::Away));
+        player.read_with(cx, |player, _| {
+            assert!(player.buffering().is_none());
+            assert!(player.buffering_since.is_none() && player.buffering_wakes.is_none());
+        });
+        // And a wait in the next session starts afresh, with its timer.
+        player.update(cx, |player, cx| {
+            player.took(state_of(1, "buffering", first), cx)
+        });
+        player.read_with(cx, |player, _| {
+            assert!(player.buffering().is_some() && player.buffering_wakes.is_some());
+        });
+    }
+
+    #[test]
+    fn a_long_wait_says_where_the_audio_comes_from() {
+        assert_eq!(getting_from(Some("Kestrel")), "Getting it from Kestrel…");
+        assert_eq!(getting_from(Some("  ")), "Getting it from the hub…");
+        assert_eq!(getting_from(None), "Getting it from the hub…");
+    }
+
     use super::*;
 
     #[test]
