@@ -2,7 +2,7 @@
 //! the whole file, free space from `statvfs`, and SIGINT and SIGTERM.
 
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use tokio::runtime::Runtime;
@@ -36,6 +36,33 @@ pub(crate) fn create_new_private_dir(path: &Path) -> std::io::Result<()> {
 /// in it survive a loss of power.
 pub(crate) fn sync_dir(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+/// A path as it is shown and written down: as it is, on Unix, where
+/// `canonicalize` adds nothing to it.
+pub(crate) fn plain_path(path: &Path) -> PathBuf {
+    path.to_owned()
+}
+
+/// Puts the whole file at `from` at `to` too, only if nothing is at `to`,
+/// and at once: a hard link, which no one sees half made, and which fails
+/// if something is there. The name `from` is then let go. A caller that
+/// needs the new name to survive a loss of power syncs the folder after.
+pub(crate) fn rename_new_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+/// Whether [`rename_new_file`] failed because the disk has no hard
+/// links, such as FAT or exFAT, rather than for what any file may fail.
+pub(crate) fn no_hard_links(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::CrossesDevices
+    )
 }
 
 /// Renames the folder at `from` to `to`, and nothing more: a caller that

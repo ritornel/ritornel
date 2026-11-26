@@ -1966,6 +1966,36 @@ mod tests {
         // Removed since: there is no backup.
         std::fs::remove_dir_all(taken["backup"]["path"].as_str().unwrap()).unwrap();
         assert_eq!(status()["backup"]["last"]["present"], false);
+
+        // The folder handed to another data directory: refused, and said.
+        std::fs::write(
+            place.join(crate::backup::OWNER_FILE),
+            format!("{}\n", scratch.path().join("another").display()),
+        )
+        .unwrap();
+        let refused = call(&core, &session, "server.backup", Some(key(0xb3))).unwrap_err();
+        assert_eq!(refused.0, ErrorCode::Unavailable);
+        assert_eq!(refused.1["reason"], "backup_place_foreign");
+        let backup = status()["backup"].clone();
+        assert!(
+            backup["failed"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("holds the backups of the data directory"),
+            "{backup}"
+        );
+
+        // A folder whose owner is in doubt: refused, and said.
+        std::fs::write(place.join(crate::backup::OWNER_FILE), "relative/data\n").unwrap();
+        let refused = call(&core, &session, "server.backup", Some(key(0xb4))).unwrap_err();
+        assert_eq!(refused.0, ErrorCode::Unavailable);
+        assert_eq!(refused.1["reason"], "backup_place_unclear");
+        assert!(
+            status()["backup"]["failed"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot tell whose backups"),
+        );
     }
 
     #[test]

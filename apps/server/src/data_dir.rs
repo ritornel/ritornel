@@ -13,7 +13,8 @@
 //!   logs/          JSON lines, one file a day
 //!   cache/         covers/, made on demand, and tmp/, where each is written first
 //!   backups/       made only when a database is migrated with no backup folder
-//!                  named: the copy taken before, as a way back from it
+//!                  named, or one that cannot be written: the copy taken
+//!                  before, as a way back from it
 //!   imports/       runs of streams staged for a dry run, removed at every
 //!                  start (`crate::imports`)
 //! ```

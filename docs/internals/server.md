@@ -66,7 +66,7 @@ A sleeping hub is one its satellites cannot reach, but a satellite or a player s
   library.db     library SQLite database (hub only)
   logs/          daily JSON-line log files
   cache/         covers/, transcodes/, packaged/, and tmp/ for staging
-  backups/       pre-migration rollback copy, created only when no backup folder is configured
+  backups/       pre-migration rollback copy, created only when no backup folder is configured or it cannot be written
   imports/       runs of streams staged for a dry run, owner-only, removed at every start
 ```
 
@@ -83,15 +83,28 @@ Backups are never written inside the data directory, so losing the data director
 Each backup—taken on demand (`ritornelctl backup` / `server.backup`) or automatically before a database migration—writes into a dotted temporary folder inside `<backup-dir>` and renames it to `ritornel-backup-<UTC-timestamp>/` (with a `-before-migration` suffix for pre-migration copies and `-2`, `-3`, … on same-second collisions) only once every file is complete:
 
 ```text
-<backup-dir>/ritornel-backup-YYYY-MM-DD-HHMMSS/
-  server.db     consistent copy of server.db
-  library.db    consistent copy of library.db (on a hub)
-  config.toml   copy of config.toml, if present
-  backup.json   manifest (version 1): timestamp, reason, files
-  README.txt    plain-text restore instructions
+<backup-dir>/
+  ritornel-data-dir.txt   the data directory whose backups this folder holds, on its first line
+  ritornel-backup-YYYY-MM-DD-HHMMSS/
+    server.db     consistent copy of server.db
+    library.db    consistent copy of library.db (on a hub)
+    config.toml   copy of config.toml, if present
+    backup.json   manifest (version 1): timestamp, reason, data directory, server and library IDs, schemas, files
+    README.txt    plain-text restore instructions, naming the data directory and the server and library IDs
 ```
 
-Each database copy runs `VACUUM INTO` on its own read-only SQLite connection (`crates/ritornel-engine/src/backup.rs`), followed by `sync_all()` and `PRAGMA quick_check`. Because it runs beside the writer, playback and recording continue while a backup runs, and the output is a single self-contained file with no WAL sidecar. The two databases are copied sequentially rather than at a single cross-file instant, and `README.txt` records the data directory the backup came from. When the backed-up library has a Last.fm account, the backup writes a per-account hold on the copy so scrobbling for each account waits for an import after restore (after draining local staged/outbox listens) and plays accepted after the backup are reconciled instead of sent twice. If a migration runs with no `--backup-dir` configured, the server still saves a pre-migration rollback copy inside `<data-dir>/backups/` (explicitly distinguished from a backup in `ritornelctl status`).
+Each database copy runs `VACUUM INTO` on its own read-only SQLite connection (`crates/ritornel-engine/src/backup.rs`), followed by `sync_all()` and `PRAGMA quick_check`. Because it runs beside the writer, playback and recording continue while a backup runs, and the output is a single self-contained file with no WAL sidecar. The two databases are copied sequentially rather than at a single cross-file instant, and `README.txt` records the data directory the backup came from. When the backed-up library has a Last.fm account, the backup writes a per-account hold on the copy so scrobbling for each account waits for an import after restore (after draining local staged/outbox listens) and plays accepted after the backup are reconciled instead of sent twice. If a migration runs with no `--backup-dir` configured, or the configured folder cannot be written, the server still saves a pre-migration rollback copy inside `<data-dir>/backups/` (explicitly distinguished from a backup in `ritornelctl status`). Before a migration, the server and library IDs are read from the databases on read-only connections (`recorded_id` in `crates/ritornel-engine/src/backup.rs`), so pre-migration copies name them as on-demand backups do; a database that is missing, empty or lacks the row records none, and a read that fails leaves the ID out without stopping the migration.
+
+A backup folder holds the backups of one data directory. A copy of a data directory (`cp -R`, or a restore into a scratch folder) carries `config.toml`, and with it `backup_dir`, and its databases carry the same server and library IDs as the original, so only the data directory's path tells them apart. Before the first backup into a folder, the server claims it by creating `ritornel-data-dir.txt` there (`OWNER_FILE` in `apps/server/src/backup.rs`) with the data directory's resolved path on its first line. The file is written whole and synced under a dotted name, then given its name only if nothing has it (a hard link on Unix, a rename without replace on Windows), so no reader finds it half written and none is written over; on a disk without hard links, such as FAT or exFAT, it is created in place, still only if it is not there. If another server created it first, the folder is this one's only if the file names it. If that first backup fails, the file is removed and the folder is left unclaimed. Paths are compared as the system resolves them at the time (links followed, `.` and `..` removed), so a data directory reached through a link, or a recorded path such as `/var/…` that resolves to `/private/var/…`, is the same data directory. On Windows the path is written and shown without the `\\?\` prefix `canonicalize` adds, where it means the same without it.
+
+The file must be a plain file (not a link, even a dangling one, nor a folder) in UTF-8, and its first line, after an optional byte-order mark and with `\r\n` endings allowed, must be an absolute path. A folder that older versions wrote to without the file belongs to the `from` data directory of its earliest `ritornel-backup-*/backup.json`, ordered by `takenAtMs` with the folder name breaking ties. Whenever the owner is in doubt, the folder is written to by no one, and the refusal says how to settle it: when the file is not as described or cannot be read, when the folder cannot be listed, when a `ritornel-backup-*` entry's details cannot be read (a link that leads nowhere, for example), when any `ritornel-backup-*` folder's `backup.json` cannot be read, is not JSON, or lacks `takenAtMs` or an absolute `from`, or when the earliest backups were taken at the same moment from different data directories.
+
+A server whose data directory is not the folder's owner, or cannot tell whose it is, writes nothing there, whether the folder comes from `--backup-dir`, `RITORNEL_BACKUP_DIR` or `backup_dir` in `config.toml`:
+
+- **Before a migration**, the copy goes to `<data-dir>/backups/` instead. The server logs a warning and records a failure that `ritornelctl status` shows, naming the folder, the data directory that owns it, and how to give this data directory a folder of its own. If `<data-dir>/backups/` is a link, even one that leads nowhere, or resolves outside the data directory, nothing is written through it and the migration does not run, so the server does not start.
+- **On demand**, `server.backup` (`ritornelctl backup`) is refused with `reason: backup_place_foreign` (another data directory's folder) or `backup_place_unclear` (no owner can be told, so the folder is no one's to write to), naming the folder and how to settle it.
+
+A backup restored into the data directory it was taken from, with the same backup folder setting, goes on writing to the same folder. One restored to a new path that replaces the old one takes the folder over when the new path is put on the first line of `ritornel-data-dir.txt`; `README.txt` in every backup says so.
 
 ## Transcode cache
 
@@ -226,6 +239,7 @@ The GitHub Actions workflows that run these checks are described in the comments
 - **`synchronous = FULL` on both WAL databases.** Pays one sync per committed batch so acknowledged writes and staged listens survive power loss.
 - **Typed settings, each with what gave it.** `server.settings` answers with a struct of named settings rather than a bag of keys, so `contract.ts` and `ritornelctl settings` carry every setting the day it is added, and a person can tell a value they chose from one a start-up setting forces.
 - **Backups live outside `<data-dir>` and run beside the writer.** Putting backups on a separate path prevents losing the backup with the data directory, and running `VACUUM INTO` on a separate read-only connection keeps playback uninterrupted.
+- **A backup folder belongs to one data directory, known by its path.** A copy of a data directory has the same settings and the same server and library IDs as the original, so keying the folder by ID would let a scratch copy mix its backups, including automatic pre-migration ones, into the original's. The path is the one thing a copy cannot share, and a plain text file holding it gives a moved or restored data directory a one-line way to take its folder over.
 
 ## Later
 
